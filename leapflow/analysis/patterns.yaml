@@ -1,0 +1,281 @@
+# LEAP Agent Action Pattern Library
+# Patterns are matched against SemanticAction sequences during trajectory abstraction.
+# Supports wildcards (ui.*, file.*) and constraints (app.switch(Safari|Chrome))
+
+version: "1.0"
+
+patterns:
+  # === Data Transfer Patterns ===
+  - name: cross_app_paste
+    sequence: ["clipboard.copy", "app.switch", "ui.type"]
+    semantic_name: "transfer_data"
+    category: "data_transfer"
+    confidence: 0.85
+    description: "Copy content from one app and paste into another"
+    parameters:
+      - name: source_app
+        from_field: "0.app_bundle_id"
+      - name: target_app
+        from_field: "1.parameters.app_bundle_id"
+      - name: content_preview
+        from_field: "0.parameters.text_preview"
+
+  - name: copy_and_switch
+    sequence: ["clipboard.copy", "app.switch"]
+    semantic_name: "copy_and_switch"
+    category: "data_transfer"
+    confidence: 0.75
+    description: "Copy and switch to target app (paste may follow)"
+    parameters:
+      - name: target_app
+        from_field: "1.parameters.app_bundle_id"
+
+  - name: drag_drop_equivalent
+    sequence: ["file.*", "app.switch", "ui.click"]
+    semantic_name: "file_to_app"
+    category: "data_transfer"
+    confidence: 0.7
+    parameters:
+      - name: file_path
+        from_field: "0.parameters.path"
+      - name: target_app
+        from_field: "1.parameters.app_bundle_id"
+
+  - name: clipboard_accumulate
+    sequence: ["clipboard.copy", "clipboard.copy", "clipboard.copy"]
+    semantic_name: "multi_copy"
+    category: "data_transfer"
+    confidence: 0.7
+    description: "Multiple consecutive copies (gathering data)"
+
+  - name: clipboard_transform
+    sequence: ["clipboard.copy", "app.switch", "ui.type", "clipboard.copy"]
+    semantic_name: "transform_data"
+    category: "data_transfer"
+    confidence: 0.8
+    description: "Copy, paste into tool, copy transformed result"
+
+  # === File Operation Patterns ===
+  - name: create_and_edit
+    sequence: ["file.create", "file.modify"]
+    semantic_name: "create_and_edit"
+    category: "file_ops"
+    confidence: 0.9
+    description: "Create a new file and edit it"
+    parameters:
+      - name: file_path
+        from_field: "0.parameters.path"
+
+  - name: batch_rename
+    sequence: ["file.rename", "file.rename"]
+    semantic_name: "batch_rename"
+    category: "file_ops"
+    confidence: 0.8
+    parameters:
+      - name: directory
+        from_field: "0.parameters.path"
+
+  - name: batch_move_to_folder
+    sequence: ["file.create", "file.rename", "file.rename"]
+    semantic_name: "batch_move_to_folder"
+    category: "file_ops"
+    confidence: 0.9
+    description: "Create a target folder and batch-move files into it"
+    parameters:
+      - name: target_dir
+        from_field: "0.parameters.path"
+      - name: first_file
+        from_field: "1.parameters.path"
+
+  - name: move_to_new_folder
+    sequence: ["file.create", "file.rename"]
+    semantic_name: "move_to_new_folder"
+    category: "file_ops"
+    confidence: 0.75
+    description: "Create a folder and move a file into it"
+    parameters:
+      - name: target_dir
+        from_field: "0.parameters.path"
+      - name: source_path
+        from_field: "1.parameters.path"
+
+  - name: drag_to_folder
+    sequence: ["ui.drag", "file.*"]
+    semantic_name: "drag_move_file"
+    category: "file_ops"
+    confidence: 0.9
+    description: "Drag file to a folder (Finder drag-and-drop)"
+    parameters:
+      - name: source_element
+        from_field: "0.parameters.target_label"
+      - name: destination
+        from_field: "1.parameters.path"
+
+  - name: cross_app_drag
+    sequence: ["ui.drag"]
+    semantic_name: "cross_app_drag_drop"
+    category: "data_transfer"
+    confidence: 0.85
+    description: "Drag content between different applications"
+    constraints:
+      - field: "0.parameters.cross_app"
+        value: true
+    parameters:
+      - name: source_app
+        from_field: "0.parameters.start_app"
+      - name: target_app
+        from_field: "0.parameters.end_app"
+
+  - name: backup_file
+    sequence: ["file.copy", "file.modify"]
+    semantic_name: "edit_with_backup"
+    category: "file_ops"
+    confidence: 0.8
+
+  - name: archive_workflow
+    sequence: ["file.create", "file.modify", "file.rename"]
+    semantic_name: "create_and_archive"
+    category: "file_ops"
+    confidence: 0.75
+
+  # === Web/Browser Patterns ===
+  - name: web_search_copy
+    sequence: ["app.switch", "ui.type", "ui.click", "clipboard.copy"]
+    semantic_name: "web_search_extract"
+    category: "web"
+    confidence: 0.8
+    description: "Search on web and copy result"
+    parameters:
+      - name: search_query
+        from_field: "1.parameters.text"
+      - name: browser_app
+        from_field: "0.parameters.app_bundle_id"
+
+  - name: web_download
+    sequence: ["ui.click", "file.create"]
+    semantic_name: "web_download"
+    category: "web"
+    confidence: 0.7
+    parameters:
+      - name: download_path
+        from_field: "1.parameters.path"
+
+  - name: form_fill
+    sequence: ["ui.click", "ui.type", "ui.click", "ui.type"]
+    semantic_name: "form_fill"
+    category: "web"
+    confidence: 0.75
+    description: "Fill multiple form fields"
+
+  - name: login_flow
+    sequence: ["ui.click", "ui.type", "ui.click", "ui.type", "ui.click"]
+    semantic_name: "authentication"
+    category: "web"
+    confidence: 0.7
+    description: "Username/password login sequence"
+
+  # === Cross-App Edit Patterns ===
+  - name: cross_app_edit
+    sequence: ["app.switch", "file.modify", "app.switch"]
+    semantic_name: "cross_app_edit"
+    category: "editing"
+    confidence: 0.8
+    description: "Switch to app, modify file, switch back"
+    parameters:
+      - name: editor_app
+        from_field: "0.parameters.app_bundle_id"
+      - name: return_app
+        from_field: "2.parameters.app_bundle_id"
+
+  - name: reference_and_write
+    sequence: ["app.switch", "clipboard.copy", "app.switch", "ui.type"]
+    semantic_name: "reference_transfer"
+    category: "editing"
+    confidence: 0.85
+    description: "Look up reference in one app, write in another"
+
+  - name: compare_documents
+    sequence: ["app.switch", "app.switch", "app.switch"]
+    semantic_name: "app_comparison"
+    category: "editing"
+    confidence: 0.6
+    description: "Rapid switching between apps (comparing content)"
+
+  # === Automation Patterns ===
+  - name: shortcut_action
+    sequence: ["ui.shortcut"]
+    semantic_name: "keyboard_shortcut"
+    category: "automation"
+    confidence: 0.9
+    parameters:
+      - name: shortcut_keys
+        from_field: "0.parameters.modifiers"
+      - name: key
+        from_field: "0.parameters.key_code"
+
+  - name: save_document
+    sequence: ["ui.shortcut", "ui.click"]
+    semantic_name: "save_with_dialog"
+    category: "automation"
+    confidence: 0.8
+    description: "Save shortcut followed by dialog confirmation"
+
+  - name: undo_redo
+    sequence: ["ui.shortcut", "ui.shortcut"]
+    semantic_name: "edit_correction"
+    category: "automation"
+    confidence: 0.65
+
+  # === Communication Patterns ===
+  - name: compose_and_send
+    sequence: ["ui.click", "ui.type", "ui.click"]
+    semantic_name: "compose_message"
+    category: "communication"
+    confidence: 0.7
+    description: "Click compose, type message, click send"
+
+  - name: reply_to_message
+    sequence: ["ui.click", "ui.click", "ui.type", "ui.click"]
+    semantic_name: "reply_message"
+    category: "communication"
+    confidence: 0.7
+
+  # === Multi-step Research Patterns ===
+  - name: research_and_note
+    sequence: ["app.switch", "ui.type", "ui.click", "clipboard.copy", "app.switch", "ui.type"]
+    semantic_name: "research_note_taking"
+    category: "research"
+    confidence: 0.8
+    description: "Search, copy findings, switch to notes app and write"
+
+  - name: multi_source_gather
+    sequence: ["clipboard.copy", "app.switch", "ui.type", "app.switch", "clipboard.copy"]
+    semantic_name: "multi_source_collection"
+    category: "research"
+    confidence: 0.75
+
+  # === System/Utility Patterns ===
+  - name: screenshot_and_annotate
+    sequence: ["ui.shortcut", "app.switch", "ui.click"]
+    semantic_name: "capture_annotate"
+    category: "utility"
+    confidence: 0.7
+
+  - name: open_file_in_app
+    sequence: ["app.switch", "ui.shortcut", "ui.type", "ui.click"]
+    semantic_name: "open_file_dialog"
+    category: "utility"
+    confidence: 0.75
+    description: "Switch to app, Cmd+O, type filename, open"
+
+  - name: print_document
+    sequence: ["ui.shortcut", "ui.click", "ui.click"]
+    semantic_name: "print_workflow"
+    category: "utility"
+    confidence: 0.75
+
+  - name: install_and_configure
+    sequence: ["file.create", "app.switch", "ui.click", "ui.type"]
+    semantic_name: "install_configure"
+    category: "utility"
+    confidence: 0.65

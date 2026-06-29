@@ -1,0 +1,1 @@
+"""Offline VLM extraction pipeline."""

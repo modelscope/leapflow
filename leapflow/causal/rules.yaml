@@ -1,0 +1,77 @@
+# Tier-1 deterministic causal rules.
+#
+# Each rule defines a parent → child relationship that establishes a
+# causal edge whenever both events match within a time/spatial window.
+#
+# Adding a new rule (no code changes required):
+#   1. Append a new entry under `rules:` with the fields below.
+#   2. Restart or call CausalInferenceEngine.reload_rules().
+#
+# Schema:
+#   name (str, required):                Stable identifier for diagnostics.
+#   parent_channel (str, required):      Channel that triggers the rule.
+#   parent_type (str, optional):         EventType filter — TRIGGER | RESPONSE | EFFECT | BOUNDARY | NAVIGATION | NOISE.
+#   parent_payload_match (dict, opt):    Payload key/value equality filter.
+#   child_channel (str, optional):       Required child channel (empty = any).
+#   child_type (str, optional):          EventType filter for the child.
+#   time_delta_max (float, opt):         Max parent→child time gap in seconds (default 0.5).
+#   spatial_distance_max (float, opt):   Max pixel distance when both events expose x/y.
+#   confidence (float, opt):             Edge confidence applied to the child (default 0.95).
+
+rules:
+  - name: click_to_visual
+    parent_channel: click
+    parent_type: TRIGGER
+    child_channel: visual_change
+    child_type: RESPONSE
+    time_delta_max: 0.5
+    spatial_distance_max: 200.0
+    confidence: 0.95
+
+  - name: keyboard_to_visual
+    parent_channel: keyboard
+    parent_type: TRIGGER
+    child_channel: visual_change
+    child_type: RESPONSE
+    time_delta_max: 0.5
+    confidence: 0.90
+
+  - name: app_switch_to_visual
+    parent_channel: app_switch
+    child_channel: visual_change
+    time_delta_max: 0.3
+    confidence: 0.90
+
+  - name: cmd_c_to_clipboard
+    parent_channel: keyboard
+    parent_payload_match:
+      combo: Cmd+C
+    child_channel: clipboard
+    child_type: EFFECT
+    time_delta_max: 0.2
+    confidence: 0.99
+
+  - name: cmd_v_to_visual
+    parent_channel: keyboard
+    parent_payload_match:
+      combo: Cmd+V
+    child_channel: visual_change
+    child_type: RESPONSE
+    time_delta_max: 0.5
+    confidence: 0.95
+
+  - name: cmd_tab_to_app_switch
+    parent_channel: keyboard
+    parent_payload_match:
+      combo: Cmd+Tab
+    child_channel: app_switch
+    time_delta_max: 0.3
+    confidence: 0.95
+
+  - name: drag_to_visual
+    parent_channel: drag
+    parent_type: TRIGGER
+    child_channel: visual_change
+    child_type: RESPONSE
+    time_delta_max: 0.5
+    confidence: 0.90

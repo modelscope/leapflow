@@ -1,0 +1,58 @@
+[project]
+name = "leapflow"
+dynamic = ["version"]
+description = "LEAP Agent — Learning and Evolving from Actual Practice"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "LEAP Agent Team" }]
+keywords = ["agent", "ai", "macos", "automation", "imitation-learning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "openai>=1.40",
+    "python-dotenv>=1.0.1",
+    "msgpack>=1.0.8",
+    "duckdb>=1.0.0",
+    "pyyaml>=6.0",
+    "Pillow>=10.0",
+    "gnureadline>=8.0; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+leap = "leapflow.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = {attr = "leapflow.version.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["leapflow*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["tests"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
