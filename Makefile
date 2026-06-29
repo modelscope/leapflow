@@ -5,13 +5,22 @@ HOST_SOCKET   := $(LEAPFLOW_DATA_DIR)/var/host.sock
 HOST_PID      := $(LEAPFLOW_DATA_DIR)/var/host.pid
 HOST_LOG      := $(LEAPFLOW_DATA_DIR)/var/host.log
 
-# OS Host build (direct swiftc — workaround for CLT 26.x SPM manifest bug)
-HOST_SRC      := os_host/Sources/OSHost
-HOST_SOURCES  := $(shell find $(HOST_SRC) -name '*.swift')
-SWIFTC_FLAGS  := -module-name OSHost -swift-version 5 \
-                -target arm64-apple-macosx14.0 \
-                -sdk $(shell xcrun --show-sdk-path) \
-                -vfsoverlay os_host/vfs_overlay.yaml
+# ── OS Host platform detection ────────────────────────────────────────────────
+HOST_OS       := $(shell uname -s)
+
+ifeq ($(HOST_OS),Darwin)
+  # macOS: direct swiftc (workaround for CLT 26.x SPM manifest bug)
+  HOST_SRC      := os_host/darwin/Sources/OSHost
+  HOST_SOURCES  := $(shell find $(HOST_SRC) -name '*.swift')
+  SWIFTC_FLAGS  := -module-name OSHost -swift-version 5 \
+                  -target arm64-apple-macosx14.0 \
+                  -sdk $(shell xcrun --show-sdk-path) \
+                  -vfsoverlay os_host/darwin/vfs_overlay.yaml
+else ifeq ($(HOST_OS),Linux)
+  $(info OS Host for Linux: not yet implemented)
+else
+  $(info OS Host for $(HOST_OS): not yet implemented)
+endif
 
 .PHONY: setup sync test brain host swift-build lint \
         host-build host-install host-start host-stop host-restart \
@@ -35,26 +44,34 @@ brain:  ## Start Brain process
 	uv run leap $(ARGS)
 
 swift-build:  ## Build OS Host (debug)
-	@mkdir -p os_host/.build/debug
-	swiftc $(SWIFTC_FLAGS) -g -Onone -o os_host/.build/debug/OSHost $(HOST_SOURCES)
-	@echo "Built: os_host/.build/debug/OSHost"
+ifeq ($(HOST_OS),Darwin)
+	@mkdir -p os_host/darwin/.build/debug
+	swiftc $(SWIFTC_FLAGS) -g -Onone -o os_host/darwin/.build/debug/OSHost $(HOST_SOURCES)
+	@echo "Built: os_host/darwin/.build/debug/OSHost"
+else
+	@echo "Error: OS Host build not yet supported on $(HOST_OS)" && exit 1
+endif
 
 host:  ## Run OS Host in foreground (debug)
 	@$(MAKE) swift-build
-	LEAPFLOW_BRIDGE_SOCKET=$${LEAPFLOW_BRIDGE_SOCKET:-$(HOST_SOCKET)} os_host/.build/debug/OSHost
+	LEAPFLOW_BRIDGE_SOCKET=$${LEAPFLOW_BRIDGE_SOCKET:-$(HOST_SOCKET)} os_host/darwin/.build/debug/OSHost
 
 # ── OS Host Service Management ────────────────────────────────────────────────
 
 host-build:  ## Build OS Host (release)
-	@mkdir -p os_host/.build/release
-	swiftc $(SWIFTC_FLAGS) -O -o os_host/.build/release/OSHost $(HOST_SOURCES)
-	@echo "Built: os_host/.build/release/OSHost"
+ifeq ($(HOST_OS),Darwin)
+	@mkdir -p os_host/darwin/.build/release
+	swiftc $(SWIFTC_FLAGS) -O -o os_host/darwin/.build/release/OSHost $(HOST_SOURCES)
+	@echo "Built: os_host/darwin/.build/release/OSHost"
+else
+	@echo "Error: OS Host build not yet supported on $(HOST_OS)" && exit 1
+endif
 
 host-install: host-build  ## Build + package as .app bundle + deploy to ~/.leapflow/host/
 	@mkdir -p $(HOST_ROOT)/LeapHost.app/Contents/MacOS
 	@mkdir -p $(HOST_ROOT)/LeapHost.app/Contents/Resources
-	@cp os_host/.build/release/OSHost $(HOST_ROOT)/LeapHost.app/Contents/MacOS/LeapHost
-	@cp os_host/Resources/Info.plist $(HOST_ROOT)/LeapHost.app/Contents/Info.plist
+	@cp os_host/darwin/.build/release/OSHost $(HOST_ROOT)/LeapHost.app/Contents/MacOS/LeapHost
+	@cp os_host/darwin/Resources/Info.plist $(HOST_ROOT)/LeapHost.app/Contents/Info.plist
 	@chmod +x $(HOST_ROOT)/LeapHost.app/Contents/MacOS/LeapHost
 	@echo "Installed to $(HOST_ROOT)/LeapHost.app"
 
