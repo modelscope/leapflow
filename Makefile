@@ -5,6 +5,14 @@ HOST_SOCKET   := $(LEAPFLOW_DATA_DIR)/var/host.sock
 HOST_PID      := $(LEAPFLOW_DATA_DIR)/var/host.pid
 HOST_LOG      := $(LEAPFLOW_DATA_DIR)/var/host.log
 
+# OS Host build (direct swiftc — workaround for CLT 26.x SPM manifest bug)
+HOST_SRC      := os_host/Sources/OSHost
+HOST_SOURCES  := $(shell find $(HOST_SRC) -name '*.swift')
+SWIFTC_FLAGS  := -module-name OSHost -swift-version 5 \
+                -target arm64-apple-macosx14.0 \
+                -sdk $(shell xcrun --show-sdk-path) \
+                -vfsoverlay os_host/vfs_overlay.yaml
+
 .PHONY: setup sync test brain host swift-build lint \
         host-build host-install host-start host-stop host-restart \
         host-status host-setup host-clean host-dev
@@ -27,15 +35,20 @@ brain:  ## Start Brain process
 	uv run leap $(ARGS)
 
 swift-build:  ## Build OS Host (debug)
-	cd os_host && swift build -c debug
+	@mkdir -p os_host/.build/debug
+	swiftc $(SWIFTC_FLAGS) -g -Onone -o os_host/.build/debug/OSHost $(HOST_SOURCES)
+	@echo "Built: os_host/.build/debug/OSHost"
 
 host:  ## Run OS Host in foreground (debug)
-	cd os_host && LEAPFLOW_BRIDGE_SOCKET=$${LEAPFLOW_BRIDGE_SOCKET:-$(HOST_SOCKET)} swift run -c debug OSHost
+	@$(MAKE) swift-build
+	LEAPFLOW_BRIDGE_SOCKET=$${LEAPFLOW_BRIDGE_SOCKET:-$(HOST_SOCKET)} os_host/.build/debug/OSHost
 
 # ── OS Host Service Management ────────────────────────────────────────────────
 
 host-build:  ## Build OS Host (release)
-	cd os_host && swift build -c release
+	@mkdir -p os_host/.build/release
+	swiftc $(SWIFTC_FLAGS) -O -o os_host/.build/release/OSHost $(HOST_SOURCES)
+	@echo "Built: os_host/.build/release/OSHost"
 
 host-install: host-build  ## Build + package as .app bundle + deploy to ~/.leapflow/host/
 	@mkdir -p $(HOST_ROOT)/LeapHost.app/Contents/MacOS
