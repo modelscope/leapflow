@@ -41,61 +41,217 @@ LeapFlow implements a layered cognitive pipeline:
 
 **Perception** fuses raw signals into a causal timeline. The **Causal Engine** infers why things happened, not just what. The **World Model** builds an internal representation of the environment and learns from prediction errors. **Skill Synthesis** distills observations into parameterized, reusable skills with maturity tracking. The **Copilot** predicts your next workflow step and offers proactive suggestions — like GitHub Copilot, but for everything you do on your computer.
 
-## Quick Start
+---
 
-### Prerequisites
+## Prerequisites
 
-| Component | Version | Notes |
-|-----------|---------|-------|
-| Python | 3.11+ | Required |
-| [uv](https://github.com/astral-sh/uv) | latest | Package manager |
-| macOS | 14+ | Native Host (optional — `--mock-host` bypasses this) |
+| Component | Version | Purpose |
+|-----------|---------|---------|
+| Python | ≥ 3.11 | Runtime (3.11–3.14 supported) |
+| [uv](https://github.com/astral-sh/uv) | latest | Fast package manager & virtualenv |
+| macOS | 14.0+ (Sonoma) | Required for native OS Host perception |
+| Xcode Command Line Tools | latest | Swift compiler for OS Host build |
+| LLM API Key | — | DashScope, OpenAI, DeepSeek, or any OpenAI-compatible provider |
 
-### Install
+> **Note:** You can run LeapFlow on any platform with `--mock-host` (no native perception), but full signal capture requires macOS with Accessibility permissions.
+
+## Installation
+
+### 1. Clone & Setup
 
 ```bash
 git clone https://github.com/modelscope/leapflow.git
 cd leapflow
-make setup        # Creates venv, installs deps, generates .env
+make setup
 ```
 
-### Configure
+`make setup` handles everything: creates a virtualenv via `uv`, installs all dependencies, and generates a `.env` file from the template.
 
-Edit `.env` — the only required field is your LLM API key:
+<details>
+<summary>Manual steps (if you prefer)</summary>
+
+```bash
+uv sync --all-extras          # Install Python deps
+cp .env.example .env          # Create config file
+```
+</details>
+
+### 2. Configure Your LLM
+
+Edit `.env` — only one field is required:
 
 ```bash
 LEAPFLOW_LLM_API_KEY=sk-your-key-here
-# Defaults to DashScope (qwen3.7-plus); any OpenAI-compatible endpoint works.
-# LEAPFLOW_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-# LEAPFLOW_LLM_MODEL=qwen3.7-plus
 ```
 
-See [`.env.example`](.env.example) for the full configuration reference.
-
-### Run
+Defaults point to DashScope (Qwen). To use a different provider:
 
 ```bash
-# Mock mode — works on any platform, no native Host required
+LEAPFLOW_LLM_BASE_URL=https://api.openai.com/v1
+LEAPFLOW_LLM_MODEL=gpt-4o
+```
+
+### 3. Build OS Host (Optional — macOS only)
+
+The native OS Host captures screen recordings, accessibility trees, and input events. Skip this step if you just want to explore with `--mock-host`.
+
+```bash
+make swift-build              # Debug build
+```
+
+This compiles the Swift host binary to `os_host/darwin/.build/debug/OSHost`.
+
+For production deployment:
+
+```bash
+make host-install             # Release build + .app bundle → ~/.leapflow/host/
+```
+
+### 4. Verify Installation
+
+```bash
+uv run leap --mock-host "hello, are you ready?"
+```
+
+> Expected: LeapFlow responds with a greeting confirming it's operational.
+
+---
+
+## Configuration Reference
+
+The `.env` file lives in your project root (or `~/.leapflow/.env` for global defaults). Key variables:
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `LEAPFLOW_LLM_API_KEY` | **Yes** | — | Your LLM provider API key |
+| `LEAPFLOW_LLM_BASE_URL` | No | DashScope endpoint | OpenAI-compatible base URL |
+| `LEAPFLOW_LLM_MODEL` | No | `qwen3.7-plus` | Model identifier |
+| `LEAPFLOW_MOCK_HOST` | No | `0` | Set `1` to skip native Host |
+| `LEAPFLOW_RECORDING_MODE` | No | `video` | `video` / `default` / `vision_only` |
+| `LEAPFLOW_LOG_LEVEL` | No | `INFO` | `DEBUG` / `INFO` / `WARNING` |
+| `LEAPFLOW_DUCKDB_PATH` | No | `~/.leapflow/memory.duckdb` | Persistent storage location |
+| `LEAPFLOW_DATA_DIR` | No | `~/.leapflow` | Root data directory |
+
+See [`.env.example`](.env.example) for the complete reference (50+ tunable parameters).
+
+---
+
+## Quick Start — First Experience
+
+### Step 1: Launch Interactive Mode
+
+```bash
 uv run leap --mock-host
-
-# Full mode (macOS) — start the native Host first
-make host          # Terminal 1: build & launch OS Host
-uv run leap        # Terminal 2: interactive REPL
 ```
 
-### A Taste of the Loop: Record → Distill → Execute → Evolve
+> You'll see the LeapFlow banner and a `>` prompt — you're in the interactive REPL.
+
+### Step 2: Have a Conversation
+
+```
+> What can you help me with?
+```
+
+> LeapFlow explains its capabilities: task execution, skill learning, workflow automation.
+
+### Step 3: Teach a Skill (Learn Mode)
+
+Open a new terminal and start a learning session:
 
 ```bash
-> learn start organize PDF files in Downloads
-# [Work normally — LeapFlow observes in the background]
+uv run leap learn "organize screenshots by date"
+```
 
-> learn stop
-# → Skill "Organize PDF Files" distilled (confidence: 72%, tier: DRAFT)
+> LeapFlow begins observing your actions (screen recording + event capture). Work normally — move files, rename, create folders. When done:
 
-> run organize my PDFs
-# → Executing… done. Skill confidence rises to 81%.
+```
+> stop
+```
 
-# Each execution feeds back into the skill — it literally gets better every time.
+> LeapFlow distills your demonstration into a reusable skill with confidence scoring.
+
+### Step 4: Execute a Learned Skill
+
+```bash
+uv run leap run "organize my screenshots"
+```
+
+> LeapFlow matches your request to the learned skill and executes it. Each successful run increases skill confidence.
+
+### Step 5: Manage Your Skills
+
+```bash
+uv run leap skills list              # View all learned skills
+uv run leap skills show "skill-name" # Inspect a specific skill
+```
+
+---
+
+## Usage Patterns
+
+### Interactive Mode — Conversational Agent
+
+```bash
+uv run leap                          # Enter REPL
+uv run leap "summarize this PDF"     # Single-turn (answer + exit)
+```
+
+The REPL supports multi-turn conversation with tool use, memory, and real-time streaming.
+
+### Teach Mode — Learn from Demonstration
+
+```bash
+uv run leap learn "describe what you'll demonstrate"
+```
+
+LeapFlow records your actions as a trajectory, then distills them into a parameterized skill. The skill progresses through maturity tiers: `DRAFT → VERIFIED → PRODUCTION`.
+
+Options:
+- `--timeout 600` — Custom idle timeout (seconds) before auto-stopping
+- `--field "Safari:browsing:full"` — Per-app perception rules
+
+### Autonomous Mode — Execute Learned Skills
+
+```bash
+uv run leap run "trigger phrase"         # Match by natural language
+uv run leap run --skill "exact-name"     # Match by skill name
+uv run leap run --step "careful task"    # Step-through with confirmation
+uv run leap run --auto "routine task"    # Skip confirmations
+```
+
+Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` as confidence grows.
+
+---
+
+## OS Host Management
+
+For full perception (screen capture, accessibility tree, input events), you need the native OS Host running:
+
+```bash
+# Development (foreground, debug build)
+make host                        # Terminal 1: builds + runs OS Host
+uv run leap                      # Terminal 2: interactive REPL
+
+# Production (daemon mode)
+uv run leap host setup           # Build, install, register as LaunchAgent
+uv run leap host start           # Start the daemon
+uv run leap host status          # Check if running
+uv run leap host stop            # Stop gracefully
+```
+
+> **Important:** macOS will prompt for Accessibility and Screen Recording permissions on first launch. Grant both in System Settings → Privacy & Security.
+
+---
+
+## Development
+
+```bash
+make setup            # Initialize environment
+make test             # Run tests (pytest)
+make lint             # Lint (ruff)
+make swift-build      # Build Swift Host (debug)
+make host-build       # Build Swift Host (release)
+make host-dev         # Auto-rebuild on source changes
 ```
 
 ## Key Modules
@@ -115,14 +271,20 @@ uv run leap        # Terminal 2: interactive REPL
 | `platform/` | Platform adaptation layer and RPC bridge |
 | `os_host/` | Native host service — macOS (Swift), Linux & Windows (planned) |
 
-## Development
+---
 
-```bash
-make setup            # Initialize environment
-make test             # Run tests (pytest)
-make lint             # Lint (ruff)
-make host             # Build & run Swift Host (debug)
-```
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `OS Host connection failed` | Host not running or socket mismatch | Run `make host` in another terminal, or use `--mock-host` |
+| `LEAPFLOW_LLM_API_KEY is empty` | Missing API key | Set `LEAPFLOW_LLM_API_KEY` in `.env` |
+| `Accessibility permission denied` | macOS privacy gate | System Settings → Privacy & Security → Accessibility → enable LeapHost |
+| `Screen Recording blocked` | macOS privacy gate | System Settings → Privacy & Security → Screen Recording → enable LeapHost |
+| `swiftc: command not found` | Xcode CLT missing | `xcode-select --install` |
+| Host builds but crashes | SDK version mismatch | Ensure macOS 14+ and latest Xcode CLT |
+
+---
 
 ## License
 
