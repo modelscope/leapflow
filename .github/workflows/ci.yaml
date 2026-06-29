@@ -34,7 +34,7 @@
 #        run: uv sync --all-extras
 #
 #      - name: Lint
-#        run: uv run ruff check leapflow/ tests/
+#        run: uv run ruff check src/leapflow/ tests/
 #
 #      - name: Run tests
 #        run: uv run pytest tests/ -q --tb=short

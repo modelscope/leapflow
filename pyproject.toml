@@ -46,13 +46,14 @@ build-backend = "setuptools.build_meta"
 version = {attr = "leapflow.version.__version__"}
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["leapflow*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = ["tests"]
+pythonpath = ["src", "tests"]
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py311"

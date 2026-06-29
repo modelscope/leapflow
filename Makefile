@@ -20,7 +20,7 @@ test:  ## Run tests
 	uv run pytest tests/ -q
 
 lint:  ## Lint source code
-	uv run ruff check leapflow/ tests/
+	uv run ruff check src/leapflow/ tests/
 
 # LEAP Agent CLI (pass PROMPT via ARGS, e.g. make brain ARGS='--mock-host --prompt "hello"')
 brain:  ## Start Brain process

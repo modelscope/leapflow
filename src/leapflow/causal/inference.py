@@ -69,7 +69,7 @@ def load_rules_from_yaml(path: Path) -> List[CausalRule]:
     """Load CausalRule definitions from a YAML file.
 
     The YAML schema mirrors the CausalRule dataclass fields. See
-    ``leapflow/causal/rules.yaml`` for the canonical example and field
+    ``src/leapflow/causal/rules.yaml`` for the canonical example and field
     documentation.
 
     Parameters

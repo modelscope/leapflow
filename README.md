@@ -985,7 +985,7 @@ exit / quit            — End session
 
 ```
 leapflow/
-├── leapflow/                  # Python Brain (layered architecture)
+├── src/leapflow/              # Python Brain (layered architecture)
 │   ├── domain/                  # L0 — Shared types (zero internal deps)
 │   │   ├── trajectory.py        #   Trajectory, Episode, SemanticAction, RawAction, etc.
 │   │   ├── events.py            #   SystemEvent, UINode, PerceptionPort, ExecutionPort
@@ -1096,7 +1096,7 @@ After [Installation](#installation), use the Makefile for common workflows:
 
 ```bash
 make test     # uv run pytest tests/ -q
-make lint     # uv run ruff check leapflow/ tests/
+make lint     # uv run ruff check src/leapflow/ tests/
 make host     # build + run Swift Host
 make brain ARGS='--prompt "hello"'  # run Brain
 ```
