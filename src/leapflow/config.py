@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict
 
 from dotenv import load_dotenv
 
+from leapflow._env_template import ENV_TEMPLATE
 from leapflow.domain.trajectory import RecordingMode
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,48 @@ ALL_SIGNAL_CHANNELS = frozenset({
 
 def _expand_path(value: str) -> Path:
     return Path(value.replace("~", str(Path.home()))).expanduser()
+
+
+# Standard subdirectories created under the data directory on first run.
+_STANDARD_SUBDIRS = [
+    "var",
+    "cache",
+    "cache/frames",
+    "cache/video",
+    "skills",
+]
+
+
+def ensure_data_dir(data_dir: Path) -> None:
+    """Create the LeapFlow data directory and standard subdirectories.
+
+    Idempotent — safe to call on every startup.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for sub in _STANDARD_SUBDIRS:
+        (data_dir / sub).mkdir(parents=True, exist_ok=True)
+
+
+def ensure_default_env(data_dir: Path) -> bool:
+    """Create a default ``.env`` in *data_dir* if one does not already exist.
+
+    The content mirrors ``.env.example`` from the project repository so that
+    users have a ready-to-edit configuration file on first run.
+
+    Returns ``True`` when a new file was written, ``False`` if it already existed.
+    """
+    env_path = data_dir / ".env"
+    if env_path.exists():
+        return False
+
+    env_path.write_text(ENV_TEMPLATE, encoding="utf-8")
+    # Inform the user (logging may not be configured yet at this point).
+    sys.stderr.write(
+        f"\033[2m→ Created default config: {env_path}\033[0m\n"
+        f"\033[2m  Edit LEAPFLOW_LLM_API_KEY to configure your LLM provider.\033[0m\n"
+    )
+    sys.stderr.flush()
+    return True
 
 
 @dataclass(frozen=True)
@@ -282,8 +326,19 @@ class Settings:
 def load_config(*, env_file: str | Path | None = None) -> Settings:
     """Load settings from `.env` and process environment.
 
+    On the very first run the function bootstraps the data directory
+    (default ``~/.leapflow/``) and writes a default ``.env`` there so
+    the user has a ready-to-edit configuration file.
+
+    Loading priority (highest wins):
+        1. Real environment variables (always honoured)
+        2. CWD ``.env`` — project-specific overrides
+        3. ``<data_dir>/.env`` — global user defaults
+        4. Hard-coded fallbacks in this function
+
     Args:
-        env_file: Optional explicit path to a dotenv file.
+        env_file: Optional explicit path to a dotenv file.  When given,
+            *only* this file is loaded (no CWD or global layering).
 
     Returns:
         Frozen settings snapshot.
@@ -291,7 +346,22 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     if env_file is not None:
         load_dotenv(env_file, override=False)
     else:
+        # Layer 1: CWD .env — project-specific overrides
         load_dotenv(override=False)
+
+    # Resolve data directory early — it may come from env or CWD .env.
+    _data_dir_raw = os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip()
+    _data_dir = _expand_path(_data_dir_raw)
+
+    # Bootstrap: create directory structure + default .env on first run.
+    ensure_data_dir(_data_dir)
+    ensure_default_env(_data_dir)
+
+    if env_file is None:
+        # Layer 2: global user .env — fills in any variables not already set.
+        _global_env = _data_dir / ".env"
+        if _global_env.exists():
+            load_dotenv(_global_env, override=False)
 
     api_key = os.getenv("LEAPFLOW_LLM_API_KEY", "").strip()
     base_url = os.getenv(
