@@ -33,7 +33,7 @@ def require_initialized(ctx: "Context") -> None:
     """Guard: abort early if async initialization failed."""
     if ctx.engine is None or ctx.session is None or ctx.registry is None:
         raise RuntimeError(
-            "LEAP Agent failed to initialize. Check logs for errors."
+            "LeapFlow failed to initialize. Check logs for errors."
         )
 
 

@@ -1,11 +1,11 @@
 [project]
 name = "leapflow"
 dynamic = ["version"]
-description = "LEAP Agent — Learning and Evolving from Actual Practice"
+description = "LeapFlow — Learning and Evolving from Actual Practice"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
-authors = [{ name = "LEAP Agent Team" }]
+authors = [{ name = "LeapFlow Team" }]
 keywords = ["agent", "ai", "macos", "automation", "imitation-learning"]
 classifiers = [
     "Development Status :: 3 - Alpha",

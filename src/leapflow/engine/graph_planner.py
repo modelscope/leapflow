@@ -23,7 +23,7 @@ _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
 
 # ── Planning prompt template ──
 _PLANNING_SYSTEM_PROMPT = """\
-You are a task planner for LEAP Agent. Given a user goal, generate a structured \
+You are a task planner for LeapFlow. Given a user goal, generate a structured \
 execution plan as a JSON DAG (directed acyclic graph).
 
 ## Available Skills

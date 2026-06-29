@@ -39,7 +39,7 @@ test:  ## Run tests
 lint:  ## Lint source code
 	uv run ruff check src/leapflow/ tests/
 
-# LEAP Agent CLI (pass PROMPT via ARGS, e.g. make brain ARGS='--mock-host --prompt "hello"')
+# LeapFlow CLI (pass PROMPT via ARGS, e.g. make brain ARGS='--mock-host --prompt "hello"')
 brain:  ## Start Brain process
 	uv run leap $(ARGS)
 

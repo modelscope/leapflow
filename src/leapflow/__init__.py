@@ -1,4 +1,4 @@
-"""LEAP Agent — Learning and Evolving from Actual Practice."""
+"""LeapFlow — Learning and Evolving from Actual Practice."""
 
 from leapflow.config import load_config
 from leapflow.version import __version__

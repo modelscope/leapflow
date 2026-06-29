@@ -1,1 +1,1 @@
-"""LEAP Agent test package."""
+"""LeapFlow test package."""
