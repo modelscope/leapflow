@@ -249,6 +249,8 @@ class Settings:
     react_warning_threshold: int = 10
     tool_max_iterations: int = 30
     native_tool_calling_enabled: bool = True   # Use native OpenAI tool_calls when available
+    stream_output: bool = True                   # Enable LLM streaming in interactive mode
+    verbose_progress: bool = True                # Show detailed tool execution progress
 
     # Context Compression
     compress_threshold: int = 16
@@ -516,6 +518,8 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     react_warning_threshold = int(os.getenv("LEAPFLOW_REACT_WARNING_THRESHOLD", "10"))
     tool_max_iterations = int(os.getenv("LEAPFLOW_TOOL_MAX_ITERATIONS", "30"))
     native_tool_calling_enabled = os.getenv("LEAPFLOW_NATIVE_TOOL_CALLING_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+    stream_output = os.getenv("LEAPFLOW_STREAM_OUTPUT", "1").strip().lower() in ("1", "true", "yes")
+    verbose_progress = os.getenv("LEAPFLOW_VERBOSE_PROGRESS", "1").strip().lower() in ("1", "true", "yes")
 
     # Context Compression
     compress_threshold = int(os.getenv("LEAPFLOW_COMPRESS_THRESHOLD", "16"))
@@ -703,6 +707,8 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         react_warning_threshold=react_warning_threshold,
         tool_max_iterations=tool_max_iterations,
         native_tool_calling_enabled=native_tool_calling_enabled,
+        stream_output=stream_output,
+        verbose_progress=verbose_progress,
         # Context Compression
         compress_threshold=compress_threshold,
         compress_keep_tail=compress_keep_tail,
