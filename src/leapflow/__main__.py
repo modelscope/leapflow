@@ -1,4 +1,4 @@
-"""CLI entrypoint for LEAP Agent.
+"""CLI entrypoint for LeapFlow.
 
 Subcommands:
     leap learn  — Interactive learning mode (record → distill)

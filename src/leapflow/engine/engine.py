@@ -1226,7 +1226,7 @@ class AgentEngine:
         """
         if intent.label == "conversational":
             if not self._settings.has_llm_credentials:
-                return "LEAP Agent ready. Configure LEAPFLOW_LLM_API_KEY to enable full conversations."
+                return "LeapFlow ready. Configure LEAPFLOW_LLM_API_KEY to enable full conversations."
             # Route conversational intent through unified tool loop
             return await self._unified_tool_loop(user_text)
         if intent.label == "file_organize":
@@ -1376,7 +1376,7 @@ class AgentEngine:
         events_json = json.dumps(events, ensure_ascii=False)
         messages = [
             build_system_message(
-                "You are LEAP Agent's memory assistant. "
+                "You are LeapFlow's memory assistant. "
                 "Given a list of recent system events (file changes, clipboard, app focus, etc.), "
                 "answer the user's question accurately and concisely.\n"
                 "Rules:\n"

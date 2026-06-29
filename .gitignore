@@ -217,7 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# LEAP Agent local runtime / IDE
+# LeapFlow local runtime / IDE
 *.duckdb
 *.duckdb.wal
 .leapflow/

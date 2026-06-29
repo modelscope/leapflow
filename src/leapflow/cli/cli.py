@@ -1,4 +1,4 @@
-"""CLI entrypoint for LEAP Agent.
+"""CLI entrypoint for LeapFlow.
 
 Usage:
     leap              — Show banner, enter interactive REPL
@@ -26,7 +26,7 @@ from leapflow.config import load_config
 async def _async_main(args: argparse.Namespace) -> int:
     settings = load_config()
     mock_host = getattr(args, "mock_host", False)
-    sys.stderr.write("\033[2m→ Initializing LEAP Agent...\033[0m\n")
+    sys.stderr.write("\033[2m→ Initializing LeapFlow...\033[0m\n")
     sys.stderr.flush()
     ctx = Context(settings, mock_host)
     await ctx.initialize()
@@ -97,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="leap",
         parents=[common],
-        description="LEAP Agent — Learning and Evolving from Actual Practice",
+        description="LeapFlow — Learning and Evolving from Actual Practice",
     )
 
     parser.add_argument("--thinking", action="store_true", help="Enable LLM reasoning mode")

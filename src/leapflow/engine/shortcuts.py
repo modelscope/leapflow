@@ -15,19 +15,19 @@ import yaml
 
 _DEFAULTS: dict[str, str] = {
     # English greetings
-    "hi": "你好！我是 LEAP Agent，有什么可以帮你的？",
-    "hey": "你好！我是 LEAP Agent，有什么可以帮你的？",
-    "hello": "你好！我是 LEAP Agent，有什么可以帮你的？",
-    "yo": "你好！我是 LEAP Agent，有什么可以帮你的？",
-    "sup": "你好！我是 LEAP Agent，有什么可以帮你的？",
-    "howdy": "你好！我是 LEAP Agent，有什么可以帮你的？",
-    "what's up": "你好！我是 LEAP Agent，有什么可以帮你的？",
-    "whats up": "你好！我是 LEAP Agent，有什么可以帮你的？",
+    "hi": "你好！我是 LeapFlow，有什么可以帮你的？",
+    "hey": "你好！我是 LeapFlow，有什么可以帮你的？",
+    "hello": "你好！我是 LeapFlow，有什么可以帮你的？",
+    "yo": "你好！我是 LeapFlow，有什么可以帮你的？",
+    "sup": "你好！我是 LeapFlow，有什么可以帮你的？",
+    "howdy": "你好！我是 LeapFlow，有什么可以帮你的？",
+    "what's up": "你好！我是 LeapFlow，有什么可以帮你的？",
+    "whats up": "你好！我是 LeapFlow，有什么可以帮你的？",
     # Chinese greetings
-    "你好": "你好！我是 LEAP Agent，有什么可以帮你的？",
-    "您好": "你好！我是 LEAP Agent，有什么可以帮你的？",
-    "嗨": "你好！我是 LEAP Agent，有什么可以帮你的？",
-    "嘿": "你好！我是 LEAP Agent，有什么可以帮你的？",
+    "你好": "你好！我是 LeapFlow，有什么可以帮你的？",
+    "您好": "你好！我是 LeapFlow，有什么可以帮你的？",
+    "嗨": "你好！我是 LeapFlow，有什么可以帮你的？",
+    "嘿": "你好！我是 LeapFlow，有什么可以帮你的？",
     # Time-of-day
     "good morning": "早上好！今天有什么可以帮你的？",
     "morning": "早上好！今天有什么可以帮你的？",

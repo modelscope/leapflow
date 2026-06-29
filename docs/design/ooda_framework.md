@@ -4,7 +4,7 @@
 
 ## 1. Problem Statement
 
-LEAP Agent addresses a specific and challenging class of problems: **learning reusable automation skills from noisy, unstructured human demonstrations in open-ended desktop environments**.
+LeapFlow addresses a specific and challenging class of problems: **learning reusable automation skills from noisy, unstructured human demonstrations in open-ended desktop environments**.
 
 This differs from classical Learning from Demonstration (LfD) in three fundamental ways:
 

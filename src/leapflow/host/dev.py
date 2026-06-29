@@ -313,14 +313,14 @@ class HostDevServer:
 def create_dev_server(settings: Optional[Settings] = None) -> HostDevServer:
     """Create a HostDevServer from project configuration.
 
-    Automatically locates os_host/ relative to the project root.
+    Automatically locates os_host/darwin/ relative to the project root.
     """
     if settings is None:
         settings = load_config()
 
-    # Locate os_host directory relative to this package
-    project_root = Path(__file__).resolve().parents[2]
-    os_host_dir = project_root / "os_host"
+    # Locate os_host/darwin directory relative to this package
+    project_root = Path(__file__).resolve().parents[3]
+    os_host_dir = project_root / "os_host" / "darwin"
 
     return HostDevServer(
         source_dir=os_host_dir / "Sources",

@@ -1,4 +1,4 @@
-"""LEAP Agent welcome banner.
+"""LeapFlow welcome banner.
 
 Animated TUI splash shown by `leap` when invoked without a subcommand.
 Pure ANSI escape codes — no third-party dependencies.

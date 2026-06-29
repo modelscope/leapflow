@@ -1,4 +1,4 @@
-"""Shared fixtures, factories, and stubs for LEAP Agent scenario tests."""
+"""Shared fixtures, factories, and stubs for LeapFlow scenario tests."""
 
 from __future__ import annotations
 

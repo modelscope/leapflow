@@ -1,4 +1,4 @@
-"""CLI runtime context — assembles and manages the LEAP Agent component graph."""
+"""CLI runtime context — assembles and manages the LeapFlow component graph."""
 
 from __future__ import annotations
 

@@ -480,10 +480,10 @@ The native Host provides real-time system perception (FSEvents, AXTree, Clipboar
 
 ```bash
 # Build
-cd os_host 
+make swift-build
 
 # Build and Run (stays in foreground, listens on Unix socket)
-swift build -c debug && swift run -c debug OSHost
+make host
 
 ```
 
@@ -557,7 +557,7 @@ leap host dev
 make host-dev
 ```
 
-This watches `os_host/Sources/` for Swift file changes, automatically rebuilds (debug),
+This watches `os_host/darwin/Sources/` for Swift file changes, automatically rebuilds (debug),
 and restarts the host process. Press Ctrl+C to stop.
 
 For one-off manual runs without packaging:
@@ -1063,15 +1063,12 @@ leapflow/
 │   │   └── message_builder.py   #   Multimodal message construction
 │   ├── config.py                # Settings from .env
 │   └── __main__.py              # Entry point → cli.app.main()
-├── os_host/                     # Swift Host (macOS)
-│   ├── Package.swift
-│   └── Sources/OSHost/
-│       ├── main.swift           #   Entry point
-│       ├── Bridge/              #   SocketServer + MessageCodec (MsgPack)
-│       ├── Perception/          #   AXTree, Clipboard, FSEvents, UIAction observers
-│       ├── Execution/           #   File ops, App control, Shell
-│       ├── Platform/            #   Legacy/Tahoe provider factory + capability detection
-│       └── Security/            #   PermissionGuard + AuditLog
+├── os_host/                     # Native Host (cross-platform)
+│   ├── protocol/                #   Shared RPC schema (rpc_schema.yaml)
+│   ├── darwin/                  #   macOS implementation (Swift)
+│   │   └── Sources/OSHost/      #     Bridge, Perception, Execution, Platform, Security
+│   ├── linux/                   #   Linux implementation (planned, Rust)
+│   └── windows/                 #   Windows implementation (planned, Rust)
 ├── tests/                       # Pytest suite (610+ tests)
 ├── scripts/
 │   ├── setup.sh                 #   One-line install

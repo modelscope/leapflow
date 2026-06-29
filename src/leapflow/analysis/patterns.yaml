@@ -1,4 +1,4 @@
-# LEAP Agent Action Pattern Library
+# LeapFlow Action Pattern Library
 # Patterns are matched against SemanticAction sequences during trajectory abstraction.
 # Supports wildcards (ui.*, file.*) and constraints (app.switch(Safari|Chrome))
 

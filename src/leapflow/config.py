@@ -26,7 +26,7 @@ def _expand_path(value: str) -> Path:
 
 @dataclass(frozen=True)
 class Settings:
-    """Runtime settings for LEAP Agent."""
+    """Runtime settings for LeapFlow."""
 
     llm_api_key: str
     llm_base_url: str
