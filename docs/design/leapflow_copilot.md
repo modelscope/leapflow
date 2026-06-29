@@ -1,210 +1,180 @@
-# Workflow Copilot Design Document
+# Workflow Copilot
 
-## Overview
+## Vision
 
-Workflow Copilot is LeapFlow's context-aware operation prediction engine. It continuously observes the user's operation signal stream and presents next-step suggestions as ghost-hints the moment the user pauses — similar to IDE code completion, but operating across application workflows. Core value: **Transform repetitive operation patterns from "user recall" to "system proactive prompting", reducing operation decision latency.**
+What GitHub Copilot did for code, LeapFlow Copilot does for workflows.
 
-## Design Philosophy
+Code completion predicts the next line of code from cursor context. Workflow completion predicts the next operation from the user's current application state and recent action history. The trigger is not a keystroke, but a natural pause between operations. The suggestion is not a text insertion, but a ghost hint for the next step — accepted with a tap, dismissed by continuing to work.
 
-| SOLID Principle | Mapping in Copilot |
-|:---:|:---|
-| **S** — Single Responsibility | Each module does one thing: encoding, prediction, rendering, and feedback are independent |
-| **O** — Open/Closed | `PredictorLayer` Protocol allows adding new prediction algorithms without modifying the engine |
-| **L** — Liskov Substitution | Any implementation satisfying the Protocol can be hot-swapped directly |
-| **I** — Interface Segregation | `Signal`, `HintRenderer`, `SignalChannel` are each minimized |
-| **D** — Dependency Inversion | Engine depends on Protocols rather than concrete implementations; Store/LLM are injected |
+Core value: **transform repetitive workflow decisions from "user recall" into "system proactive suggestion"**, reducing operational decision latency to near-zero for learned patterns.
 
-**Ultimate Goal**: Through Loop γ (execution-as-learning) closed loop, Copilot's prediction accuracy monotonically increases over usage time, ultimately achieving self-evolving operation assistance.
+## Key Insight
 
-## Architecture Overview
+Workflow completion holds structural advantages over code completion:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Workflow Copilot                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  EventBus ─→ ContextEncoder ─→ SpeculativePipeline              │
-│                                      │                          │
-│                              ┌───────┴───────┐                  │
-│                              │ PredictionEngine                  │
-│                              │  ┌──┐┌──┐┌──┐┌──┐               │
-│                              │  │L0││L1││L2││L3│                │
-│                              │  └──┘└──┘└──┘└──┘               │
-│                              └───────┬───────┘                  │
-│                                      │                          │
-│  IdleDetector ─→ DisplayGate ─→ SuggestionRenderer              │
-│                                      │                          │
-│                              FeedbackCollector                   │
-│                                      │                          │
-│                              EvolutionLoop ──→ (write back to Layers) │
-│                                                                 │
-│  [DegradationPolicy] ←── SystemMetrics                          │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Dimension | Code Completion | Workflow Completion | Implication |
+|:---|:---|:---|:---|
+| Time budget | ~50ms between keystrokes | 300–3000ms between operations | **10× more compute time** before the user expects a response |
+| Network dependency | Cloud model required | L0–L2 run entirely local | Works offline, no latency penalty |
+| Personalization | Global model, slow RLHF cycle | Local model, real-time adaptation | Each user's model evolves independently |
+| Cold start | Needs index upload | Local index + in-memory state | First response is instant |
+| Evolution | Centralized model updates | **Decentralized, per-user evolution** | Gets better with every interaction |
 
-| Module | Responsibility |
-|:---|:---|
-| `ContextEncoder` | Incrementally encodes SystemEvent stream into `ContextState` (O(1)/event) |
-| `PredictionEngine` | Cascades all PredictorLayers, aggregates with deduplication + consensus boosting |
-| `SpeculativePipeline` | Predicts during operations, three-tier cache ensures zero-latency retrieval on pause |
-| `IdleDetector` | Adaptive pause threshold detection with EMA dynamic adjustment |
-| `DisplayGate` | Display gating: better to not show than to show with delay |
-| `SuggestionRenderer` | Manages suggestion display/dismiss lifecycle |
-| `FeedbackCollector` | Tracks user reactions to suggestions, converts to structured feedback signals |
-| `EvolutionLoop` | EMA confidence update + feedback broadcast to each Layer |
-| `DegradationPolicy` | Resource-aware five-level degradation, ensures foreground operations are never blocked |
+The fundamental insight: because operation intervals are orders of magnitude longer than keystroke intervals, LeapFlow can run multi-layer prediction pipelines *during the operation itself*, making results available *before* the user pauses. This turns the prediction problem from "race against a deadline" into "fill idle time with useful speculation."
 
-## Core Protocols
+## How It Works
 
-```python
-class Signal(Protocol):
-    event_type: str
-    timestamp: float
-    payload: Dict[str, Any]
-    source: str
-
-@dataclass
-class ContextState:
-    app_bundle: str
-    window_title: str
-    action_ring: List[str]       # Sliding window
-    context_hash: str            # MD5[:16], O(1) index key
-
-@dataclass(frozen=True)
-class PredictionCandidate:
-    action_description: str
-    confidence: float            # [0.0, 1.0]
-    source_layer: str            # "L0" | "L1" | "L2" | "L3"
-    context_hash: str
-    display_delay_ms: int
-    is_destructive: bool = False
-
-class PredictorLayer(Protocol):
-    layer_id: str
-    priority: int                # Lower value = higher priority
-    timeout_ms: int
-    async def predict(ctx: ContextState) -> List[PredictionCandidate]
-    async def on_feedback(signal: FeedbackSignal) -> None
-```
-
-## Multi-Layer Prediction Engine
-
-| Layer | Algorithm | Latency Budget | Accuracy Profile | Trigger Condition |
-|:---:|:---|:---:|:---|:---|
-| **L0** | Context-Hash exact match | 5ms | High precision (driven by historical hit rate) | Every context update |
-| **L1** | N-gram Markov transition probability | 10ms | Medium (sequential patterns) | Every context update |
-| **L2** | Embedding nearest-neighbor retrieval | 100ms | Medium (semantic similarity) | Async warm-up |
-| **L3** | LLM + RAG reasoning | 3000ms | High precision (complex scenarios) | Complexity gate passes |
-
-**Aggregation Strategy**: When multiple layers predict the same action, confidence is fused using an independence assumption:
+The end-to-end flow follows a six-stage loop:
 
 ```
-P(combined) = 1 - ∏(1 - Pᵢ)
+Signal → Context → Predict → Suggest → Feedback → Evolve
 ```
 
-During cascade execution, if any layer produces a result with confidence > 0.9, early termination is triggered (fast-path).
+1. **Signal**: Raw events arrive from the perception layer — app focus changes, file operations, clipboard updates, UI interactions, keyboard/mouse activity.
+
+2. **Context**: An incremental encoder maintains a rolling context state. Only changed fields are updated per event (O(1) cost), producing a compact representation of "where the user is and what they just did."
+
+3. **Predict**: Multiple prediction layers run in parallel, from fast exact-match lookups to deep LLM reasoning. Results are cached in a tiered structure as they complete.
+
+4. **Suggest**: When a pause is detected, the best available prediction is rendered as a non-intrusive ghost hint — only if confidence exceeds threshold and the result arrived within the time window.
+
+5. **Feedback**: The user's response (accept / ignore / correct) is captured as a structured signal.
+
+6. **Evolve**: Feedback updates prediction confidence, adjusts layer weights, and refines the underlying models. This is Loop γ — "suggestion as learning."
+
+## Prediction Architecture
+
+Predictions are organized as a cascade of layers, each trading latency for reasoning depth:
+
+| Layer | Strategy | Latency | When It Shines |
+|:---:|:---|:---:|:---|
+| **L0** | Context-hash exact match | <5ms | Daily routines, highly repetitive patterns |
+| **L1** | N-gram / Markov transition | <10ms | Sequential patterns within a single app |
+| **L2** | Embedding nearest-neighbor | <100ms | Semantically similar but not identical contexts |
+| **L3** | LLM + RAG reasoning | <3000ms | Novel cross-application scenarios |
+
+**Design philosophy**: Lower layers are always attempted first. If L0 hits with high confidence, higher layers are never invoked — the fast path dominates for learned patterns. When multiple layers agree on the same prediction, their confidences fuse:
+
+```
+P(combined) = 1 − ∏(1 − Pᵢ)
+```
+
+This creates a natural "consensus boost" — if both L0 and L1 predict the same action, the combined confidence rises sharply, enabling faster display.
+
+Over time, the system self-optimizes: frequent patterns migrate from expensive L3 reasoning down to cheap L0 exact-match. The user experiences this as the system "getting faster" — because it literally is.
 
 ## Speculative Pre-computation
 
-Core idea: **Predict during operations, display on pause.**
+The core principle: **predict during the operation, display on the pause.**
+
+This is analogous to CPU branch prediction. A modern CPU doesn't wait for a branch instruction to resolve before fetching the next instruction — it speculates. Similarly, LeapFlow doesn't wait for the user to pause before computing predictions — it speculates the moment an action occurs.
 
 ```
-User action ──→ on_action_observed()
-               │
-               ├─ sync: L0+L1 → instant cache (< 5ms)
-               ├─ async: L2   → warm cache    (< 100ms)
-               └─ async: L3   → deep cache    (conditional trigger)
-               
-User pause ──→ IdleDetector.on_idle()
-               │
-               └─ get_best() → instant > warm > deep
-                               → DisplayGate → show()
+Timeline:
+│── User Action A ──│── Pause 300ms ──│── User Action B ──│
+│                   │                  │                   │
+│  ↓ event fires    │  ↓ show hint     │                   │
+│  L0+L1: instant   │  read from cache │                   │
+│  L2: async fill   │                  │                   │
+│  L3: conditional  │                  │                   │
 ```
 
-**Three-Tier Cache**:
+**Three-tier cache architecture**:
 
-| Tier | Data Source | Fill Method | Priority |
+| Tier | Source | Fill strategy | Access time |
 |:---:|:---|:---|:---:|
-| instant | L0 + L1 | Synchronous (during event handling) | Highest |
-| warm | L2 | Async task | Medium |
-| deep | L3 | Conditional async task | Lowest |
+| Instant | L0 + L1 | Synchronous with event | <1ms |
+| Warm | L2 | Async task, callback to cache | <1ms (read) |
+| Deep | L3 | Conditional async, high-value contexts only | <1ms (read) |
 
-Cache control: LRU eviction (default 100 slots) + TTL expiration (default 30s).
+When a pause is detected, the system reads the best available result from cache — not computes it. Display latency drops from "prediction time" to "memory read time." If no result is ready, no suggestion is shown. The principle is strict: **better to show nothing than to show late.**
 
-## Feedback Evolution Loop
+## Application Scenarios
 
-```
-         ┌──────────────┐
-         │  Show Suggestion │
-         └──────┬───────┘
-                │
-    ┌───────────┼───────────┐
-    ▼           ▼           ▼
- Accept      Ignore      Correct/Reject
- (+1.0)      (-0.1)      (-0.5 / -1.0)
-    │           │           │
-    └───────────┼───────────┘
-                ▼
-        EMA Confidence Update
-     new = α·reward + (1-α)·old
-                │
-                ▼
-     Broadcast on_feedback → Each Layer performs online learning
-```
+**Scenario 1 — File Organization Completion**
 
-- L0: Updates accept_count / total_count
-- L1: Updates N-gram transition frequency table
-- L2/L3: External updates (Embedding index / LLM fine-tune)
+The user drags `report_q1.pdf` from Downloads to `Documents/Reports/2025/`. The system detects the pattern and suggests: *"report_q2.pdf and report_q3.pdf are also in Downloads — move them too?"* The prediction comes from L1 recognizing the file-batch pattern and L0 matching the specific directory context.
 
-## Degradation Strategy
+**Scenario 2 — Application Switch Completion**
 
-| Level | Trigger Condition | Allowed Layers | Behavior |
-|:---:|:---|:---:|:---|
-| FULL | Normal | L0 L1 L2 L3 | Full functionality |
-| NO_L3 | CPU > 70% | L0 L1 L2 | LLM reasoning disabled |
-| NO_L2_L3 | CPU > 90% | L0 L1 | Statistical models only |
-| L0_ONLY | Memory > 90% budget | L0 | Exact match only |
-| DISABLED | Event queue backlog | ∅ | Copilot silently stops |
+The user opens Zoom, then checks the calendar for the next meeting. The system suggests: *"Open the related meeting document and last week's notes?"* This fires because historical data shows 80% of Zoom+Calendar sequences are followed by document access.
 
-Design constraint: Degradation is automatic, observable, and recoverable. In the worst case, Copilot silently stops — **foreground operations are never blocked**.
+**Scenario 3 — Terminal Workflow Completion**
 
-## Module Structure
+The user runs `cd ~/project && git pull`. The system suggests: *"Last time you ran npm install && npm run dev after pulling — continue?"* L0 exact-matches the context hash (same repo, same command sequence).
+
+**Scenario 4 — Form Auto-fill Completion**
+
+The user opens an expense report form and fills in the date and amount. The system suggests: *"Category: Travel, Cost Center: R&D — auto-fill based on your last 5 reports?"* L2 retrieves semantically similar past form-filling sessions.
+
+**Scenario 5 — Cross-Application Workflow Completion**
+
+The user copies a requirement description from Slack. The system suggests: *"Create a Jira ticket with this description?"* L1's Markov model knows that Slack→Copy transitions to Jira→Create 70% of the time for this user.
+
+## Self-Evolution Loop
+
+The system improves with every interaction through a tight feedback cycle:
 
 ```
-src/leapflow/copilot/
-├── __init__.py          # Public API exports
-├── types.py             # All Protocols + data types (zero behavior)
-├── config.py            # CopilotConfig — centralized parameter tuning surface
-├── context.py           # ContextEncoder + EventBus bridge
-├── engine.py            # PredictionEngine — multi-layer cascade scheduling
-├── pipeline.py          # SpeculativePipeline — speculative cache
-├── idle.py              # IdleDetector — adaptive pause detection
-├── renderer.py          # DisplayGate + SuggestionRenderer
-├── feedback.py          # FeedbackCollector + EvolutionLoop
-├── degradation.py       # DegradationPolicy — five-level degradation
-└── predictors/
-    ├── l0_hash.py       # O(1) exact match
-    ├── l1_markov.py     # N-gram transition probability
-    ├── l2_embed.py      # Vector nearest-neighbor retrieval
-    └── l3_llm.py        # LLM + RAG reasoning
+Predict → Display → User Response → Learn → (better) Predict
 ```
 
-## Extension Guide
+User responses carry different signal strengths:
 
-### Adding a New Predictor
+| Response | Signal | Effect |
+|:---|:---:|:---|
+| **Accept** (Tab) | +1.0 | Strong positive reinforcement; pattern is confirmed |
+| **Ignore** (continue working) | −0.1 | Weak negative; pattern confidence decays slowly |
+| **Correct** (do something else) | −0.5 | Moderate negative; correct action is stored as ground truth |
+| **Reject** (Esc) | −1.0 | Strong negative; pattern is actively suppressed |
 
-1. Implement the `PredictorLayer` Protocol (define `layer_id`, `priority`, `timeout_ms`, `predict`, `on_feedback`)
-2. Pass the instance when constructing `PredictionEngine`; the engine automatically schedules by priority order
-3. If degradation control is needed, register the new layer_id in `DegradationPolicy._LAYER_SETS`
+Confidence updates use exponential moving average: `new = α·reward + (1−α)·old`. This ensures recent feedback matters most while preserving long-term trends.
 
-### Adding a New Signal Channel
+The critical property: **the system's prediction accuracy is monotonically non-decreasing over usage time.** Patterns that work get reinforced; patterns that fail get suppressed; new patterns emerge from corrective signals.
 
-1. Implement the `SignalChannel` Protocol (`channel_id`, `start`, `stop`, `subscribe`)
-2. Bridge to `ContextEncoder` via `CopilotEventSubscriber`
-3. Add corresponding event_type incremental encoding logic in `ContextEncoder.on_event`
+## Design Principles
 
-### Adding a New Renderer
+**1. Ghost Hints — Non-Intrusive by Default**
 
-1. Implement the `HintRenderer` Protocol (`show`, `dismiss`, `is_visible`)
-2. Inject into `SuggestionRenderer` constructor parameters to replace the display backend
-3. Can implement TUI overlay / system notification / GUI floating window or any other form
+Suggestions appear as faint overlays (analogous to Copilot's gray text). They never block the user's current operation, never steal focus, never require dismissal. The user can simply continue working — the hint fades on its own.
+
+**2. Never Late, Rather Absent**
+
+If prediction hasn't completed by the time display is needed, the opportunity is forfeit. A delayed suggestion is worse than no suggestion — it interrupts flow rather than assisting it. Results are cached for the next similar context.
+
+**3. Confidence-Gated Display**
+
+| Confidence | Behavior |
+|:---:|:---|
+| < 0.5 | Silent — logged but never shown |
+| 0.5 – 0.8 | Faint ghost hint — low visual weight |
+| 0.8 – 0.95 | Clear suggestion with accept shortcut |
+| > 0.95 + non-destructive + historical 100% accept | **Auto-execute** — zero-click completion |
+
+This is the **trust gradient** applied to prediction: earned trust unlocks progressively autonomous behavior.
+
+**4. Graceful Degradation**
+
+Under resource pressure, the system sheds layers top-down (L3 → L2 → L1 → L0 → disabled). In the worst case, Copilot silently pauses — foreground operations are never impacted. Recovery is automatic when resources free up.
+
+**5. Safety-First for Destructive Actions**
+
+Predictions involving irreversible operations (file deletion, message sending, data modification) are never auto-executed regardless of confidence. They require explicit user confirmation even at the highest trust level.
+
+## Integration with LeapFlow
+
+Workflow Copilot is not a standalone system — it is a natural composition of LeapFlow's existing infrastructure:
+
+| Copilot Component | LeapFlow Subsystem | Role |
+|:---|:---|:---|
+| Event sensing | Perception Layer + EventBus | Provides raw signal stream |
+| Context state | WorkingMemory + RecordingContext | Maintains operational context |
+| L0 exact-match | SkillLibrary (DuckDB) | Hash-indexed pattern lookup |
+| L1 sequence prediction | Causal Pipeline | Markov transition statistics |
+| L2 embedding retrieval | ExperienceStore + SemanticMemory | Vector similarity search |
+| L3 reasoning | LLM Provider + WorldModel | Deep inference for novel scenarios |
+| Feedback learning | Loop γ + FeedbackEvaluator | Closed-loop model updates |
+
+**~70% of the required infrastructure already exists.** The primary gaps are three connecting layers: idle detection (recognizing pause windows), speculative pre-computation (filling cache during operations), and overlay rendering (showing ghost hints). The core perception, memory, and reasoning capabilities are already in place.
+
+This means Workflow Copilot can be incrementally activated — starting with L0 exact-match over existing skill trajectories, progressively enabling deeper layers as confidence data accumulates.

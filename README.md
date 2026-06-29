@@ -1,168 +1,128 @@
 # LeapFlow
 
-**A desktop automation framework that learns and evolves from real user operations**
+**A signal-driven, self-evolving agent framework that learns autonomously from the real world.**
 
-LeapFlow observes your daily interactions with the computer and automatically distills operation demonstrations into reusable, parameterized skills. Skills continuously evolve with each execution — the more you use them, the smarter they get.
+---
 
-## Core Features
+## What is LeapFlow?
 
-- **Zero-Intrusion Recording** — Observes in the background without disrupting normal operations
-- **Six-Layer Noise Filtering** — Distills 4-5 clean skill steps from 50 noisy recorded steps
-- **Progressive Trust** — New skills require step-by-step confirmation; mature skills execute autonomously (STEP → CONFIRM → AUTO)
-- **Video-First Perception** — Continuous video recording + VLM multi-scale analysis for precise intent reconstruction
-- **Workflow Copilot** — Next-step prediction and proactive suggestions powered by a world model
+LeapFlow is a **general-purpose intelligent agent framework** designed around a single conviction: agents should learn the way humans do — by observing the world, forming causal understanding, and continuously refining their skills through practice.
+
+Unlike instruction-driven agents (Computer-Use, RPA) that reason from scratch on every request, LeapFlow **accumulates knowledge across episodes**. It perceives multi-modal signals from the operating environment, distills reusable skills from demonstrations, and self-improves every time those skills are executed. The result is an agent that gets smarter the more you use it.
+
+**LeapFlow is not another desktop automation tool.** Where RPA replays brittle scripts and Computer-Use agents burn tokens re-deriving every action, LeapFlow builds a persistent, evolving cognitive model — fusing perception, causal reasoning, world modeling, and skill synthesis into a self-reinforcing learning loop.
+
+## Core Philosophy
+
+- **Evolution over Instruction** — Learning is not a one-shot prompt; it is a continuous loop of observation, hypothesis, verification, and refinement across episodes.
+- **Signals as First-Class Citizens** — Multi-modal signals (visual, accessibility tree, file system, clipboard, keyboard, etc.) are fused into a unified causal timeline, not treated as isolated events.
+- **Persistent Knowledge** — Skills, world-model experiences, and causal patterns are durably stored and compound over time. Nothing learned is ever lost to a session boundary.
+- **Trust Gradient** — New skills start under full human supervision (`STEP`) and progressively earn autonomy (`CONFIRM → NOTIFY → AUTO`) by proving competence through successful executions.
+- **Prediction-Error-Driven Learning** — The world model predicts outcomes before execution and learns from the delta between prediction and reality — mirroring predictive coding in cognitive neuroscience.
+- **Safety as Architecture** — Tiered autonomy, sandbox verification, and reversibility checks are structural guarantees, not bolt-on constraints.
+
+## Architecture Overview
+
+LeapFlow implements a layered cognitive pipeline:
+
+```
+┌───────────────────────────────────────────────────────────┐
+│  Copilot           Workflow-level next-step prediction    │
+├───────────────────────────────────────────────────────────┤
+│  World Model       State prediction · Experience replay   │
+├───────────────────────────────────────────────────────────┤
+│  Skill Synthesis   Hypothesis → Draft → Verified → Prod  │
+├───────────────────────────────────────────────────────────┤
+│  Causal Engine     Rule · Heuristic · VLM verification    │
+├───────────────────────────────────────────────────────────┤
+│  Perception        Multi-channel signal fusion (7 ch)     │
+└───────────────────────────────────────────────────────────┘
+```
+
+**Perception** fuses raw signals into a causal timeline. The **Causal Engine** infers why things happened, not just what. The **World Model** builds an internal representation of the environment and learns from prediction errors. **Skill Synthesis** distills observations into parameterized, reusable skills with maturity tracking. The **Copilot** predicts your next workflow step and offers proactive suggestions — like GitHub Copilot, but for everything you do on your computer.
 
 ## Quick Start
 
-### Requirements
+### Prerequisites
 
 | Component | Version | Notes |
-|------|------|------|
+|-----------|---------|-------|
 | Python | 3.11+ | Required |
 | [uv](https://github.com/astral-sh/uv) | latest | Package manager |
-| macOS | 14+ | Native Host (optional, `--mock-host` bypasses this) |
+| macOS | 14+ | Native Host (optional — `--mock-host` bypasses this) |
 
-### Installation
+### Install
 
 ```bash
 git clone https://github.com/modelscope/leapflow.git
 cd leapflow
-make setup
+make setup        # Creates venv, installs deps, generates .env
 ```
 
-`make setup` automatically: creates a virtual environment, installs dependencies, and generates the `.env` configuration file.
+### Configure
 
-### Configuration
-
-Edit `.env` to set your LLM API Key (the only required field):
+Edit `.env` — the only required field is your LLM API key:
 
 ```bash
 LEAPFLOW_LLM_API_KEY=sk-your-key-here
-# Defaults to DashScope (qwen3.7-plus), supports any OpenAI-compatible endpoint
+# Defaults to DashScope (qwen3.7-plus); any OpenAI-compatible endpoint works.
 # LEAPFLOW_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 # LEAPFLOW_LLM_MODEL=qwen3.7-plus
 ```
 
-### Launch
+See [`.env.example`](.env.example) for the full configuration reference.
+
+### Run
 
 ```bash
-# Mock mode (any platform, no Swift Host required)
+# Mock mode — works on any platform, no native Host required
 uv run leap --mock-host
 
-# Full mode (macOS, Host must be started first)
-make host          # Terminal 1: Start the native Host
-uv run leap        # Terminal 2: Enter the interactive REPL
+# Full mode (macOS) — start the native Host first
+make host          # Terminal 1: build & launch OS Host
+uv run leap        # Terminal 2: interactive REPL
 ```
 
-## Usage
-
-### Command Overview
+### A Taste of the Loop: Record → Distill → Execute → Evolve
 
 ```bash
-leap                    # Interactive REPL (default)
-leap "your question"    # Single-turn conversation
-leap learn              # Record an operation demonstration
-leap run "organize PDF" # Trigger skill execution
-leap skills list        # List learned skills
-leap host start/stop    # Manage the OS Host service
-```
-
-### Interactive Mode
-
-The following commands are available in the REPL:
-
-```
-learn start [goal]    — Start recording
-learn stop           — Stop recording and distill
-annotate <text>      — Annotate the current step
-skip [n]             — Mark noisy steps
-run <trigger>        — Execute a skill
-skills list/show     — Manage skills
-help                 — Show all commands
-exit                 — Exit
-```
-
-### Typical Workflow: Record → Distill → Execute
-
-```bash
-# 1. Record a demonstration
 > learn start organize PDF files in Downloads
+# [Work normally — LeapFlow observes in the background]
 
-# [Perform operations normally, LeapFlow observes in the background...]
-
-# 2. Stop recording (auto-distills)
 > learn stop
-# → New skill "Organize PDF Files" is ready (confidence: 72%)
+# → Skill "Organize PDF Files" distilled (confidence: 72%, tier: DRAFT)
 
-# 3. Trigger directly next time
 > run organize my PDFs
-# → Executing "Organize PDF Files", done.
+# → Executing… done. Skill confidence rises to 81%.
+
+# Each execution feeds back into the skill — it literally gets better every time.
 ```
 
-## OS Host Service (macOS)
+## Key Modules
 
-The OS Host provides native system perception capabilities (AXTree, screen recording, file monitoring):
-
-```bash
-leap host setup      # Build + install + register for auto-start
-leap host start      # Start
-leap host stop       # Stop
-leap host status     # Check status
-```
-
-First-time use requires granting Accessibility and Screen Recording permissions in **System Settings → Privacy & Security**.
-
-## Project Structure
-
-```
-leapflow/
-├── src/leapflow/           # Python Brain
-│   ├── cli/                  # CLI entry point (leap command)
-│   ├── copilot/              # Workflow Copilot (next-step prediction)
-│   ├── domain/               # Domain type definitions
-│   ├── engine/               # Session orchestration & ReAct engine
-│   ├── recording/            # Real-time recording
-│   ├── perception/           # Video perception & VLM analysis
-│   ├── analysis/             # Offline analysis pipeline
-│   ├── learning/             # Skill distillation & code generation
-│   ├── skills/               # Skill runtime & registry
-│   ├── platform/             # Platform adaptation layer (RPC Bridge)
-│   ├── memory/               # Three-tier event-driven memory
-│   ├── world_model/          # World model & predictive coding
-│   ├── causal/               # Causal reasoning engine
-│   ├── signal_fusion/        # Multi-modal signal fusion
-│   └── llm/                  # LLM Provider abstraction
-├── os_host/                # Native Host (cross-platform)
-│   ├── darwin/               # macOS implementation (Swift)
-│   ├── linux/                # Linux (planned)
-│   └── windows/              # Windows (planned)
-├── tests/                  # Test suite
-├── Makefile                # Build shortcuts
-└── pyproject.toml          # Project configuration
-```
+| Module | Role |
+|--------|------|
+| `perception/` | Multi-channel signal capture and fusion (video, AX tree, clipboard, keyboard, file system, etc.) |
+| `signal_fusion/` | Cross-modal temporal alignment and surprise detection |
+| `causal/` | Three-tier causal inference engine (rule → heuristic → VLM) |
+| `world_model/` | Predictive coding loop, experience store, curiosity-driven learning |
+| `learning/` | Skill distillation, parameterization, and maturity lifecycle |
+| `skills/` | Skill library, runtime execution, and self-evolution (Loop γ) |
+| `copilot/` | Workflow-level next-step prediction and proactive suggestion |
+| `analysis/` | Six-layer denoising pipeline for trajectory refinement |
+| `engine/` | Session orchestration and ReAct execution loop |
+| `memory/` | Three-tier event-driven memory (working → episodic → long-term) |
+| `platform/` | Platform adaptation layer and RPC bridge |
+| `os_host/` | Native host service — macOS (Swift), Linux & Windows (planned) |
 
 ## Development
 
 ```bash
 make setup            # Initialize environment
 make test             # Run tests (pytest)
-make lint             # Code linting (ruff)
-make host             # Build and run Swift Host (debug)
-make brain ARGS='--mock-host --prompt "hello"'  # Run Brain
+make lint             # Lint (ruff)
+make host             # Build & run Swift Host (debug)
 ```
-
-### Common Environment Variables
-
-| Variable | Default | Description |
-|------|--------|------|
-| `LEAPFLOW_LLM_API_KEY` | — | LLM API Key (required) |
-| `LEAPFLOW_LLM_BASE_URL` | DashScope | OpenAI-compatible endpoint |
-| `LEAPFLOW_LLM_MODEL` | `qwen3.7-plus` | Model name |
-| `LEAPFLOW_MOCK_HOST` | `0` | `1` to enable Mock mode |
-| `LEAPFLOW_RECORDING_MODE` | `video` | Recording mode: video / default / vision_only |
-| `LEAPFLOW_LOG_LEVEL` | `INFO` | Log level |
-
-See [`.env.example`](.env.example) for the full configuration reference.
 
 ## License
 
