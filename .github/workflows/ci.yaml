@@ -1,0 +1,43 @@
+#name: CI
+#
+#on:
+#  push:
+#    branches: [main]
+#  pull_request:
+#    branches: [main]
+#
+#concurrency:
+#  group: ${{ github.workflow }}-${{ github.ref }}
+#  cancel-in-progress: true
+#
+#jobs:
+#  test:
+#    runs-on: ${{ matrix.os }}
+#    strategy:
+#      fail-fast: false
+#      matrix:
+#        os: [ubuntu-latest, macos-latest]
+#        python-version: ['3.11', '3.12', '3.13']
+#
+#    steps:
+#      - uses: actions/checkout@v4
+#
+#      - name: Set up Python ${{ matrix.python-version }}
+#        uses: actions/setup-python@v5
+#        with:
+#          python-version: ${{ matrix.python-version }}
+#
+#      - name: Install uv
+#        uses: astral-sh/setup-uv@v4
+#
+#      - name: Install dependencies
+#        run: uv sync --all-extras
+#
+#      - name: Lint
+#        run: uv run ruff check leapflow/ tests/
+#
+#      - name: Run tests
+#        run: uv run pytest tests/ -q --tb=short
+#        env:
+#          LEAPFLOW_MOCK_HOST: '1'
+#          LEAPFLOW_LLM_API_KEY: 'test-key-ci'
