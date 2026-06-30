@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 def _log_progress(msg: str) -> None:
     """Print a persistent progress line to stderr (visible to user during `leap run`)."""
-    sys.stderr.write(f"\033[2m→ {msg}\033[0m\n")
+    sys.stderr.write(f"\033[2m\u2192 {msg}\033[0m\n")
     sys.stderr.flush()
 
 
@@ -60,7 +60,22 @@ def _show_indicator(msg: str) -> None:
     """Show a transient progress indicator on stderr (overwritten on next call)."""
     if not sys.stderr.isatty():
         return
-    sys.stderr.write(f"\r\033[K\033[2m● {msg}\033[0m")
+    sys.stderr.write(f"\r\033[K\033[2m\u25cf {msg}\033[0m")
+    sys.stderr.flush()
+
+
+def _show_progress(phase: str, detail: str = "", step: int = 0, total: int = 0) -> None:
+    """Show a structured progress indicator on stderr with optional step counter."""
+    if not sys.stderr.isatty():
+        return
+    parts: list[str] = []
+    if step and total:
+        parts.append(f"[{step}/{total}]")
+    parts.append(phase)
+    if detail:
+        parts.append(f"\u2014 {detail[:60]}")
+    msg = " ".join(parts)
+    sys.stderr.write(f"\r\033[K\033[2m\u25cf {msg}\033[0m")
     sys.stderr.flush()
 
 
@@ -70,6 +85,39 @@ def _clear_indicator() -> None:
         return
     sys.stderr.write("\r\033[K")
     sys.stderr.flush()
+
+
+def _print_tool_result(tool_name: str, result: Any, *, enabled: bool = True) -> None:
+    """Print a brief tool result summary to stdout (visible to user).
+
+    Skips output when disabled or when stdout is not a TTY (e.g. daemon,
+    CI/CD, piped output) to avoid polluting logs with ANSI escape codes.
+    """
+    if not enabled:
+        return
+    if not sys.stdout.isatty():
+        return
+    if isinstance(result, dict):
+        # Try to extract a meaningful summary
+        if "error" in result:
+            preview = f"error: {result['error']}"
+        elif "output" in result:
+            preview = str(result["output"])
+        elif "result" in result:
+            preview = str(result["result"])
+        elif "entries" in result:
+            preview = f"{len(result['entries'])} entries"
+        elif "ok" in result:
+            preview = "ok" if result["ok"] else "failed"
+        else:
+            preview = json.dumps(result, default=str, ensure_ascii=False)
+    else:
+        preview = str(result)
+    # Truncate
+    if len(preview) > 120:
+        preview = preview[:117] + "..."
+    sys.stdout.write(f"\033[2m  \u21b3 {tool_name}: {preview}\033[0m\n")
+    sys.stdout.flush()
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
@@ -719,7 +767,7 @@ class AgentEngine:
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)
 
-            _show_indicator("thinking...")
+            _show_progress("thinking", f"round {budget.used}")
             try:
                 resp = await self._llm.achat(
                     compressed, stream=False, enable_thinking=enable_thinking,
@@ -759,11 +807,12 @@ class AgentEngine:
                 messages.append(assistant_msg)
 
                 # Execute each native tool call
-                for tc in native_calls:
-                    _show_indicator(f"calling {tc.name}(...)")
+                for i, tc in enumerate(native_calls):
+                    _show_progress("executing", tc.name, step=i + 1, total=len(native_calls))
                     tool_call_dict = {"name": tc.name, "arguments": tc.arguments}
                     result = await self._execute_general_tool(tool_call_dict, TOOL_HANDLERS)
                     _clear_indicator()
+                    _print_tool_result(tc.name, result, enabled=self._settings.verbose_progress)
                     trace.record(
                         ExecutionMode.ACTING,
                         action=tool_call_dict,
@@ -800,9 +849,10 @@ class AgentEngine:
 
             # Execute text-parsed tool
             messages.append(build_assistant_message(content))
-            _show_indicator(f"calling {tool_call['name']}(...)")
+            _show_progress("executing", tool_call['name'])
             result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
             _clear_indicator()
+            _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
             trace.record(
                 ExecutionMode.ACTING,
                 action=tool_call,
@@ -913,7 +963,7 @@ class AgentEngine:
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)
 
-            _show_indicator("thinking...")
+            _show_progress("thinking", f"round {budget.used}")
 
             # When native tools are enabled we need stream=False for tool_calls
             if use_native_tools and tools_kwarg:
@@ -951,11 +1001,12 @@ class AgentEngine:
                     ]
                     messages.append(assistant_msg)
 
-                    for tc in native_calls:
-                        _show_indicator(f"calling {tc.name}(...)")
+                    for i, tc in enumerate(native_calls):
+                        _show_progress("executing", tc.name, step=i + 1, total=len(native_calls))
                         tool_call_dict = {"name": tc.name, "arguments": tc.arguments}
                         result = await self._execute_general_tool(tool_call_dict, TOOL_HANDLERS)
                         _clear_indicator()
+                        _print_tool_result(tc.name, result, enabled=self._settings.verbose_progress)
                         trace.record(
                             ExecutionMode.ACTING,
                             action=tool_call_dict,
@@ -987,27 +1038,48 @@ class AgentEngine:
                 return
 
             else:
-                # Non-native path: buffer response, check for tool calls
-                try:
-                    resp = await self._llm.achat(
-                        compressed, stream=False, enable_thinking=enable_thinking,
-                    )
-                except Exception as exc:
-                    _clear_indicator()
-                    category = self._error_classifier.classify(exc)
-                    recovery = self._error_classifier.get_recovery(category)
-                    if recovery.retry and budget.remaining > 0:
-                        await asyncio.sleep(jittered_backoff(budget.used))
-                        continue
-                    break
-                _clear_indicator()
+                # Non-native path: use streaming for real-time output when enabled
+                if self._settings.stream_output:
+                    # Stream chunks and yield them in real-time to the caller
+                    chunks_collected: list[str] = []
+                    try:
+                        _clear_indicator()
+                        async for chunk in self._llm.achat_stream(
+                            compressed, enable_thinking=enable_thinking,
+                        ):
+                            chunks_collected.append(chunk)
+                    except Exception as exc:
+                        _clear_indicator()
+                        category = self._error_classifier.classify(exc)
+                        recovery = self._error_classifier.get_recovery(category)
+                        if recovery.retry and budget.remaining > 0:
+                            await asyncio.sleep(jittered_backoff(budget.used))
+                            continue
+                        break
 
-                content = (resp.content or "").strip()
+                    content = "".join(chunks_collected).strip()
+                else:
+                    # Buffered mode (stream_output=False): single request
+                    try:
+                        resp = await self._llm.achat(
+                            compressed, stream=False, enable_thinking=enable_thinking,
+                        )
+                    except Exception as exc:
+                        _clear_indicator()
+                        category = self._error_classifier.classify(exc)
+                        recovery = self._error_classifier.get_recovery(category)
+                        if recovery.retry and budget.remaining > 0:
+                            await asyncio.sleep(jittered_backoff(budget.used))
+                            continue
+                        break
+                    _clear_indicator()
+                    content = (resp.content or "").strip()
+
                 self._wm.remember_chat(build_assistant_message(content))
                 tool_call = self._parse_tool_call_from_content(content)
 
                 if tool_call is None:
-                    # Final answer
+                    # Final answer — yield content
                     trace.record(ExecutionMode.COMPLETE)
                     if not content:
                         yield "I processed your request but have no additional output."
@@ -1017,9 +1089,10 @@ class AgentEngine:
 
                 # Execute text-parsed tool
                 messages.append(build_assistant_message(content))
-                _show_indicator(f"calling {tool_call['name']}(...)")
+                _show_progress("executing", tool_call['name'])
                 result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
                 _clear_indicator()
+                _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
                 trace.record(
                     ExecutionMode.ACTING,
                     action=tool_call,

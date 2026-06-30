@@ -30,7 +30,7 @@ async def cmd_interactive(ctx: "Context") -> int:
     def _on_complete(result) -> None:
         if result and result.new_skills:
             sys.stderr.write(
-                f"\n\033[2m[LEAP] Learning complete — "
+                f"\n\033[2m[LeapFlow] Learning complete \u2014 "
                 f"{len(result.new_skills)} new skill(s)\033[0m\n"
             )
             for name in result.new_skills:

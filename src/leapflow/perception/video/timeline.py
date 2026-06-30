@@ -8,7 +8,9 @@ guide the model's attention within the video.
 from __future__ import annotations
 
 import logging
+import os.path
 import threading
+import time
 from typing import Dict, FrozenSet, List, Optional, Protocol, TYPE_CHECKING
 
 from leapflow.perception.types import TimelineMarker
@@ -51,6 +53,11 @@ class SignalTimeline:
     TimelineReader (for Analyzer consumption) protocols.
     """
 
+    # fs burst throttle window (seconds)
+    _FS_BURST_WINDOW_S: float = 2.0
+    # Fraction of fs events to evict when timeline is full
+    _EVICT_RATIO: float = 0.2
+
     def __init__(
         self,
         *,
@@ -65,6 +72,8 @@ class SignalTimeline:
         self._lock = threading.Lock()
         self._start_time: float = 0.0
         self._overflow_count: int = 0
+        # Throttle: maps directory path -> monotonic timestamp of last recorded fs event
+        self._fs_burst_window: Dict[str, float] = {}
 
     def set_start_time(self, t: float) -> None:
         with self._lock:
@@ -75,6 +84,21 @@ class SignalTimeline:
         channel, action, coords, digest = _extract_marker_fields(event)
         if not channel:
             return
+
+        # --- fs burst throttle: skip redundant fs events in the same directory ---
+        if channel == "fs":
+            dir_path = os.path.dirname(digest) if digest else ""
+            now_mono = time.monotonic()
+            last_ts = self._fs_burst_window.get(dir_path, 0.0)
+            if now_mono - last_ts < self._FS_BURST_WINDOW_S:
+                return
+            self._fs_burst_window[dir_path] = now_mono
+            # Periodically prune stale entries to avoid unbounded growth
+            if len(self._fs_burst_window) > 200:
+                cutoff = now_mono - self._FS_BURST_WINDOW_S
+                self._fs_burst_window = {
+                    k: v for k, v in self._fs_burst_window.items() if v > cutoff
+                }
 
         marker = TimelineMarker(
             timestamp=event.timestamp,
@@ -87,8 +111,11 @@ class SignalTimeline:
         )
         with self._lock:
             if len(self._markers) >= self._max_markers:
+                self._evict_old_events()
+
+            # After eviction attempt, check again
+            if len(self._markers) >= self._max_markers:
                 self._overflow_count += 1
-                # Log first occurrence and every 100th drop to avoid log flooding
                 if self._overflow_count == 1 or self._overflow_count % 100 == 0:
                     logger.warning(
                         "SignalTimeline overflow: %d events dropped "
@@ -100,6 +127,34 @@ class SignalTimeline:
                     )
                 return
             self._markers.append(marker)
+
+    def _evict_old_events(self) -> None:
+        """Evict oldest low-priority (fs) events to make room for new ones.
+
+        Must be called while holding self._lock.
+        """
+        # Collect indices of fs events (lowest priority channel)
+        fs_indices = [i for i, m in enumerate(self._markers) if m.channel == "fs"]
+        if not fs_indices:
+            return
+
+        # Evict the oldest 20% of fs events
+        evict_count = max(1, int(len(fs_indices) * self._EVICT_RATIO))
+        # fs_indices are already in insertion order (oldest first)
+        indices_to_remove = set(fs_indices[:evict_count])
+
+        self._markers = [
+            m for i, m in enumerate(self._markers) if i not in indices_to_remove
+        ]
+
+        # Reset overflow counter since we freed space
+        self._overflow_count = 0
+        logger.info(
+            "SignalTimeline compacted: evicted %d oldest fs events (remaining=%d/%d)",
+            evict_count,
+            len(self._markers),
+            self._max_markers,
+        )
 
     def markers_in_range(self, start: float, end: float) -> List[TimelineMarker]:
         with self._lock:

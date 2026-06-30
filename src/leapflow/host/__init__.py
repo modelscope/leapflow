@@ -10,7 +10,7 @@ Public surface:
 """
 
 from leapflow.host.launchd import LaunchdError, LaunchdService
-from leapflow.host.manager import HostManager, HostState, HostStatus
+from leapflow.host.manager import HostDiagnosis, HostManager, HostState, HostStatus
 from leapflow.host.permissions import (
     PermissionStatus,
     check_accessibility,
@@ -26,6 +26,7 @@ __all__ = [
     "HostManager",
     "HostStatus",
     "HostState",
+    "HostDiagnosis",
     "LaunchdService",
     "LaunchdError",
     "PermissionStatus",
