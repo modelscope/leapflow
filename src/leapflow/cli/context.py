@@ -949,8 +949,33 @@ class Context:
                 L0HashPredictor(l0_store),
                 L1MarkovPredictor(),
             ]
-            # L2/L3 need external providers — only add if available
-            # (留空，未来通过 Memory adapter 注入)
+            # L2/L3: wire Memory adapters when ExperienceStore is available
+            if hasattr(self, 'experience_store') and self.experience_store is not None:
+                from leapflow.copilot.adapters import ExperienceEmbedAdapter, MemoryRAGAdapter
+                from leapflow.copilot.predictors.l2_embed import L2EmbeddingPredictor
+                from leapflow.copilot.predictors.l3_llm import L3LLMPredictor
+
+                l2_provider = ExperienceEmbedAdapter(self.experience_store)
+                predictors.append(L2EmbeddingPredictor(l2_provider))
+
+                if settings.has_llm_credentials:
+                    from leapflow.copilot.adapters import MemoryRAGAdapter as _RAG
+                    rag_provider = _RAG(self.wm, self.experience_store)
+
+                    class _CopilotLLMClient:
+                        """Adapt OpenAIChat to L3's LLMClient protocol."""
+                        def __init__(self, llm):
+                            self._llm = llm
+                        async def complete(self, prompt: str) -> str:
+                            from leapflow.llm.message_builder import build_user_message_text
+                            resp = await self._llm.achat(
+                                [build_user_message_text(prompt)], stream=False,
+                            )
+                            return resp.content or ""
+
+                    predictors.append(L3LLMPredictor(
+                        _CopilotLLMClient(self.llm), rag_provider=rag_provider,
+                    ))
 
             # Prediction engine
             copilot_engine = PredictionEngine(predictors, copilot_config)
