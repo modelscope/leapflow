@@ -318,6 +318,14 @@ class Settings:
     # overrides live in ``leapflow.platform.client._RPC_TIMEOUT_MAP``.
     rpc_timeout_default: float = 30.0
 
+    # ── Workflow Copilot ──
+    copilot_enabled: bool = True
+    copilot_min_idle_ms: int = 500
+    copilot_max_idle_ms: int = 5000
+    copilot_cache_ttl_s: float = 30.0
+    copilot_speculative_cache_size: int = 100
+    copilot_action_ring_size: int = 10
+
     @property
     def has_llm_credentials(self) -> bool:
         return bool(self.llm_api_key.strip())
@@ -619,6 +627,14 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     # RPC Transport
     rpc_timeout_default = float(os.getenv("LEAPFLOW_RPC_TIMEOUT_DEFAULT", "30.0"))
 
+    # Workflow Copilot
+    copilot_enabled = _bool("LEAPFLOW_COPILOT_ENABLED", "true")
+    copilot_min_idle_ms = int(os.getenv("LEAPFLOW_COPILOT_MIN_IDLE_MS", "500"))
+    copilot_max_idle_ms = int(os.getenv("LEAPFLOW_COPILOT_MAX_IDLE_MS", "5000"))
+    copilot_cache_ttl_s = float(os.getenv("LEAPFLOW_COPILOT_CACHE_TTL_S", "30.0"))
+    copilot_speculative_cache_size = int(os.getenv("LEAPFLOW_COPILOT_SPECULATIVE_CACHE_SIZE", "100"))
+    copilot_action_ring_size = int(os.getenv("LEAPFLOW_COPILOT_ACTION_RING_SIZE", "10"))
+
     settings = Settings(
         llm_api_key=api_key,
         llm_base_url=base_url.rstrip("/"),
@@ -791,6 +807,13 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         signal_reactive_capture=signal_reactive_capture,
         # RPC Transport
         rpc_timeout_default=rpc_timeout_default,
+        # Workflow Copilot
+        copilot_enabled=copilot_enabled,
+        copilot_min_idle_ms=copilot_min_idle_ms,
+        copilot_max_idle_ms=copilot_max_idle_ms,
+        copilot_cache_ttl_s=copilot_cache_ttl_s,
+        copilot_speculative_cache_size=copilot_speculative_cache_size,
+        copilot_action_ring_size=copilot_action_ring_size,
     )
 
     if not settings.llm_api_key:

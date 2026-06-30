@@ -201,3 +201,11 @@ class L0HashPredictor:
             )
         except Exception as exc:
             logger.error("L0 feedback recording failed: %s", exc)
+
+    async def observe(self, context: ContextState, action: str) -> None:
+        """Unsupervised observation — record context-action mapping.
+
+        Called on every user action regardless of hint display.
+        Populates the hash store so future predict() calls can find matches.
+        """
+        await self._store.record_observation(context.context_hash, action, accepted=True)
