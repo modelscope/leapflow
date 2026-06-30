@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from typing import TYPE_CHECKING
+import time
+from typing import TYPE_CHECKING, Optional
 
 from leapflow.cli.banner import BRIGHT_CYAN, DIM, RESET, VERSION
 from leapflow.cli.commands.run import _print_execution_result
@@ -13,6 +14,14 @@ from leapflow.cli.tui import finish_input_frame, render_input_frame
 
 if TYPE_CHECKING:
     from leapflow.cli.context import Context
+    from leapflow.copilot.types import PredictionCandidate
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+_CLI_INTERACTION_EVENT = "cli.interaction"
+_CLI_EVENT_SOURCE = "interactive_repl"
+
+# Module-level state for tracking the last displayed ghost hint
+_last_hint: Optional["PredictionCandidate"] = None
 
 
 async def cmd_interactive(ctx: "Context") -> int:
@@ -77,6 +86,29 @@ async def cmd_interactive(ctx: "Context") -> int:
             prompt = render_input_frame(
                 _mode_name(), _skill_count(), _bridge_online()
             )
+            # ── Ghost Hint: show Copilot suggestion before prompt ──
+            global _last_hint
+            if (
+                not _learning
+                and ctx.copilot_pipeline is not None
+                and ctx.copilot_config is not None
+            ):
+                best = ctx.copilot_pipeline.get_best(
+                    min_confidence=ctx.copilot_config.min_confidence_display
+                )
+                if best is not None:
+                    _render_ghost_hint(best)
+                    _last_hint = best
+                    # Track shown for feedback collection
+                    if ctx.copilot_feedback is not None and ctx.copilot_encoder is not None:
+                        ctx.copilot_feedback.track_shown(
+                            best, ctx.copilot_encoder.current_state
+                        )
+                else:
+                    _last_hint = None
+            else:
+                _last_hint = None
+
             line = await loop.run_in_executor(None, lambda: input(prompt).strip())
             finish_input_frame()
         except (EOFError, KeyboardInterrupt):
@@ -85,6 +117,26 @@ async def cmd_interactive(ctx: "Context") -> int:
 
         if not line:
             continue
+
+        # ── Copilot: Idle timestamp update ──
+        if ctx.copilot_idle is not None:
+            ctx.copilot_idle.on_event_timestamp(time.time())
+
+        # ── Copilot: Feedback collection ──
+        if ctx.copilot_feedback is not None and _last_hint is not None:
+            if _is_hint_accepted(line, _last_hint):
+                signal = ctx.copilot_feedback.on_accept()
+            elif ctx.copilot_encoder is not None:
+                signal = ctx.copilot_feedback.on_next_action(
+                    line, ctx.copilot_encoder.current_state
+                )
+            else:
+                signal = None
+
+            if signal and ctx.copilot_evolution:
+                await ctx.copilot_evolution.process_feedback(signal)
+
+            _last_hint = None
 
         if _learning:
             ctx.imitation.mark_control_input()
@@ -406,6 +458,7 @@ async def cmd_interactive(ctx: "Context") -> int:
         if ctx.session and ctx.session.mode == SessionMode.LEARNING:
             ctx.session.annotate(line)
             print("(Noted as annotation during learning)")
+            await _inject_copilot_event(ctx, line, _mode_name)
             continue
 
         matched = ctx.session.find_skill(line) if ctx.session else None
@@ -417,4 +470,60 @@ async def cmd_interactive(ctx: "Context") -> int:
                 print(chunk, end="", flush=True)
             print()
 
+        # ── Copilot: Synthetic event injection after command processing ──
+        await _inject_copilot_event(ctx, line, _mode_name)
+
     return 0
+
+
+# ── Copilot helper functions ──────────────────────────────────────────────────
+
+
+def _render_ghost_hint(candidate: "PredictionCandidate") -> None:
+    """Render a ghost hint below the prompt line.
+
+    Uses dim ANSI escape codes for unobtrusive display.
+    Only emits ANSI when stdout is a TTY.
+    """
+    hint_text = f"  \U0001f4a1 {candidate.action_description}"
+    confidence_pct = int(candidate.confidence * 100)
+    if sys.stdout.isatty():
+        print(f"\033[2m{hint_text} ({confidence_pct}% confidence \u2014 Tab to accept)\033[0m")
+    else:
+        print(f"{hint_text} ({confidence_pct}% confidence)")
+
+
+def _is_hint_accepted(user_input: str, hint: "PredictionCandidate") -> bool:
+    """Check if the user input effectively accepts the ghost hint.
+
+    MVP heuristic: exact match or first-word prefix match.
+    Limitations: may false-positive on commands sharing the same verb
+    (e.g., hint="run skill_a" vs input="run skill_b").
+    Future: replace with explicit Tab-to-accept or high-similarity scoring.
+    """
+    desc = hint.action_description.lower().strip()
+    inp = user_input.lower().strip()
+    # Exact match or the input starts with the suggestion's key verb
+    return inp == desc or (desc and inp.startswith(desc.split()[0]) and len(inp) > 2)
+
+
+async def _inject_copilot_event(
+    ctx: "Context", line: str, mode_fn
+) -> None:
+    """Synthesize a CLI interaction event and inject into EventBus for Copilot."""
+    if ctx.copilot_pipeline is None or ctx.copilot_encoder is None:
+        return
+    from leapflow.domain.events import PRIORITY_NORMAL, SystemEvent
+
+    synth_event = SystemEvent(
+        event_type=_CLI_INTERACTION_EVENT,
+        source=_CLI_EVENT_SOURCE,
+        payload={"input": line, "mode": mode_fn()},
+        timestamp=time.time(),
+        priority=PRIORITY_NORMAL,
+    )
+    # 1) Inject event into EventBus → CopilotEventSubscriber → ContextEncoder
+    await ctx.event_bus.handle_event(synth_event.event_type, synth_event.payload)
+
+    # 2) Drive SpeculativePipeline with updated context (snapshot to avoid shared state)
+    await ctx.copilot_pipeline.on_action_observed(ctx.copilot_encoder.snapshot())

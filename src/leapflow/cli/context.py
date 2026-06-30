@@ -906,6 +906,85 @@ class Context:
         self.intent_classifier = classifier
         if settings.has_llm_credentials:
             self.assessor = LLMSituationalAssessor(self.llm)
+
+        # ── Workflow Copilot (proactive prediction pipeline) ──
+        if settings.copilot_enabled:
+            from leapflow.copilot import (
+                CopilotConfig,
+                ContextEncoder,
+                CopilotEventSubscriber,
+                PredictionEngine,
+                SpeculativePipeline,
+                IdleDetector,
+                FeedbackCollector,
+                EvolutionLoop,
+            )
+            from leapflow.copilot.predictors import (
+                L0HashPredictor,
+                L1MarkovPredictor,
+            )
+
+            copilot_config = CopilotConfig(
+                enabled=True,
+                action_ring_size=settings.copilot_action_ring_size,
+                min_idle_ms=settings.copilot_min_idle_ms,
+                max_idle_ms=settings.copilot_max_idle_ms,
+                cache_ttl_seconds=settings.copilot_cache_ttl_s,
+                speculative_cache_size=settings.copilot_speculative_cache_size,
+            )
+
+            # Context encoder
+            copilot_encoder = ContextEncoder(copilot_config)
+
+            # Predictors (L0 + L1 always; L2/L3 only if LLM available)
+            predictors = [
+                L0HashPredictor(),
+                L1MarkovPredictor(),
+            ]
+            # L2/L3 need external providers — only add if available
+            # (留空，未来通过 Memory adapter 注入)
+
+            # Prediction engine
+            copilot_engine = PredictionEngine(predictors, copilot_config)
+
+            # Speculative pipeline
+            copilot_pipeline = SpeculativePipeline(copilot_engine, copilot_config)
+
+            # Feedback
+            copilot_feedback = FeedbackCollector()
+            copilot_evolution = EvolutionLoop(copilot_config, predictors)
+
+            # Idle detector (callback will be wired in Phase 2)
+            async def _copilot_on_idle(duration_ms: int) -> None:
+                pass  # Phase 2 will implement ghost hint rendering here
+
+            copilot_idle = IdleDetector(copilot_config, on_idle=_copilot_on_idle)
+
+            # Event subscriber — register to EventBus
+            copilot_subscriber = CopilotEventSubscriber(
+                copilot_encoder,
+                tracker=None,  # CrossAppContextTracker if available
+                working_memory=self.wm if hasattr(self, 'wm') else None,
+            )
+            self.event_bus.subscribe(copilot_subscriber.on_system_event)
+
+            # Store references on Context for Phase 2 access
+            self.copilot_pipeline = copilot_pipeline
+            self.copilot_idle = copilot_idle
+            self.copilot_encoder = copilot_encoder
+            self.copilot_feedback = copilot_feedback
+            self.copilot_evolution = copilot_evolution
+            self.copilot_config = copilot_config
+
+            logger.info("Copilot initialized: L0+L1 predictors active, idle detection armed")
+        else:
+            self.copilot_pipeline = None
+            self.copilot_idle = None
+            self.copilot_encoder = None
+            self.copilot_feedback = None
+            self.copilot_evolution = None
+            self.copilot_config = None
+
         self.engine = AgentEngine(
             settings, self.rpc, self.llm, self.wm, self.lt, self.imm,
             self.registry, classifier,
