@@ -95,6 +95,8 @@ class SpeculativePipeline:
         self._cache: OrderedDict[str, Dict[str, CacheEntry]] = OrderedDict()
         # Track pending async tasks to prevent over-scheduling
         self._pending_tasks: List[asyncio.Task] = []  # type: ignore[type-arg]
+        # Previous context for unsupervised observation (observe path)
+        self._prev_context: Optional[ContextState] = None
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -105,6 +107,21 @@ class SpeculativePipeline:
         """
         # Shallow-copy to avoid mutation by later events in async tasks
         context = copy.copy(context)
+
+        # ── Unsupervised observation: record prev_context → current_action ──
+        if self._prev_context is not None and context.action_ring:
+            current_action = context.action_ring[-1]
+            for layer in self._engine.layers:
+                if hasattr(layer, "observe"):
+                    try:
+                        await layer.observe(self._prev_context, current_action)
+                    except Exception:
+                        logger.debug(
+                            "observe failed for layer %s",
+                            getattr(layer, "layer_id", "?"),
+                        )
+        self._prev_context = copy.copy(context)
+
         ctx_hash = context.context_hash
 
         # Clean up completed background tasks

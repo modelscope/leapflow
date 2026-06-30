@@ -142,6 +142,22 @@ class L1MarkovPredictor:
         if len(self._transitions) > self._max_keys:
             self.prune(min_count=2)
 
+    async def observe(self, context: ContextState, action: str) -> None:
+        """Unsupervised observation — record transition in Markov matrix.
+
+        Called on every user action regardless of hint display.
+        Records the transition: context.action_ring → action.
+        """
+        key = self._make_key(context.action_ring)
+        self._transitions.setdefault(key, {})[action] = (
+            self._transitions.get(key, {}).get(action, 0) + 1
+        )
+        self._totals[key] = self._totals.get(key, 0) + 1
+
+        # Auto-prune when key count exceeds threshold
+        if len(self._transitions) > self._max_keys:
+            self.prune(min_count=2)
+
     # ── Public utilities ───────────────────────────────────────────────────
 
     def prune(self, min_count: int = 2) -> int:
