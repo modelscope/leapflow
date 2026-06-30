@@ -73,6 +73,7 @@ def _emit_status(msg: str) -> None:
     sys.stderr.write(f"\033[2m\u2192 {msg}\033[0m\n")
     sys.stderr.flush()
 
+
 def configure_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -346,10 +347,10 @@ class Context:
 
     async def _bg_connect(self) -> None:
         """Background bridge reconnection with post-connect initialization.
-
+    
         After connecting, sends fs.subscribe and fires reconnect callbacks
         so the system transitions from offline/mock state to live.
-
+    
         Uses longer retry window (up to ~90s) with increasing delays to
         handle slow host startup and transient unavailability.
         """
@@ -360,12 +361,10 @@ class Context:
             await asyncio.sleep(delay)
             ok = await self.rpc.try_connect()
             if ok:
-                sys.stderr.write("\033[2m→ Bridge connected\033[0m\n")
-                sys.stderr.flush()
+                _emit_status("Bridge connected")
                 await self._post_connect_setup()
                 return
-        sys.stderr.write("\033[2m→ Bridge unavailable, running offline\033[0m\n")
-        sys.stderr.flush()
+        _emit_status("Bridge unavailable, running offline")
 
     async def _resubscribe_fs(self) -> None:
         """Re-subscribe to FS events after reconnect."""
@@ -411,7 +410,7 @@ class Context:
         Returns:
             HostReadiness indicating whether the host is usable or degraded.
         """
-        from leapflow.host import HostManager, HostState
+        from leapflow.host import HostState
 
         mgr = self._build_host_manager()
         diag = mgr.diagnose()
@@ -447,6 +446,10 @@ class Context:
             _emit_status("OS Host: start timed out")
             _emit_status("  Check 'leap host logs' for details.")
             return HostReadiness.DEGRADED
+        except RuntimeError as exc:
+            _emit_status(f"OS Host: crashed on startup")
+            _emit_status(f"  {exc}")
+            return HostReadiness.DEGRADED
         except OSError as exc:
             _emit_status(f"OS Host: start failed ({exc})")
             return HostReadiness.DEGRADED
@@ -470,9 +473,16 @@ class Context:
         await self.memory.initialize_all()
 
         # Phase 1: OS Host readiness — diagnose, auto-start, report status
-        host_readiness = HostReadiness.DEGRADED
-        if not self.effective_mock and settings.host_auto_start:
+        host_readiness: HostReadiness
+        if self.effective_mock:
+            # Mock mode: no host needed, bridge is in-process.
+            host_readiness = HostReadiness.RUNNING
+        elif settings.host_auto_start:
             host_readiness = await self._ensure_host_ready()
+        else:
+            # Auto-start disabled: user manages host externally (e.g. launchd).
+            # Assume available; bridge connection will validate.
+            host_readiness = HostReadiness.RUNNING
 
         # Phase 2: Bridge connection
         vsi = VirtualSystemInterface(self.rpc)

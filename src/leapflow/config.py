@@ -371,9 +371,8 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     model = os.getenv("LEAPFLOW_LLM_MODEL", "qwen-plus").strip()
     max_retries = int(os.getenv("LEAPFLOW_LLM_MAX_RETRIES", "3"))
 
-    # Data Root – derives all default host paths
-    data_dir_raw = os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip()
-    data_dir = _expand_path(data_dir_raw)
+    # Data Root – reuse the early-resolved path; derives all default host paths
+    data_dir = _data_dir
 
     # OS Host paths (default derived from data_dir)
     host_root = _expand_path(
