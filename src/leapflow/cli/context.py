@@ -937,8 +937,16 @@ class Context:
             copilot_encoder = ContextEncoder(copilot_config)
 
             # Predictors (L0 + L1 always; L2/L3 only if LLM available)
+            from leapflow.copilot.predictors.l0_hash import InMemoryContextHashStore
+
+            l0_store = InMemoryContextHashStore()
+            # Use SemanticHashAdapter for persistent storage if semantic provider available
+            if hasattr(self, 'lt') and self.lt is not None:
+                from leapflow.copilot.adapters import SemanticHashAdapter
+                l0_store = SemanticHashAdapter(self.lt)
+
             predictors = [
-                L0HashPredictor(),
+                L0HashPredictor(l0_store),
                 L1MarkovPredictor(),
             ]
             # L2/L3 need external providers — only add if available
