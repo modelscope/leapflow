@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import sys
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -55,6 +56,22 @@ from leapflow.platform.normalizer import EventNormalizer
 
 logger = logging.getLogger(__name__)
 
+
+# ─── Host Readiness ────────────────────────────────────────────────────────
+
+
+class HostReadiness(str, Enum):
+    """Result of OS Host pre-flight check during initialization."""
+
+    RUNNING = "running"       # Host confirmed running, proceed normally
+    STARTED = "started"       # Host just started by this process
+    DEGRADED = "degraded"     # Host unavailable, running in offline mode
+
+
+def _emit_status(msg: str) -> None:
+    """Write a dim status line to stderr (non-blocking, safe pre-logging)."""
+    sys.stderr.write(f"\033[2m\u2192 {msg}\033[0m\n")
+    sys.stderr.flush()
 
 def configure_logging(level: str) -> None:
     logging.basicConfig(
@@ -371,51 +388,112 @@ class Context:
             self.rpc.on_reconnect(self._resubscribe_fs)
             await self.rpc.fire_reconnect_callbacks()
 
+    # ── Host Readiness ──────────────────────────────────────────────────────
+
+    def _build_host_manager(self) -> "HostManager":  # noqa: F821
+        """Construct a HostManager from current settings."""
+        from leapflow.host import HostManager
+        return HostManager(
+            host_root=self.settings.host_root,
+            host_socket=self.settings.host_socket,
+            pid_file=self.settings.host_pid_file,
+            log_file=self.settings.host_log_file,
+            bundle_id=self.settings.host_bundle_id,
+        )
+
+    async def _ensure_host_ready(self) -> HostReadiness:
+        """Structured OS Host health check with transparent status feedback.
+
+        Performs fast-path diagnosis, attempts auto-start when needed, and
+        reports state to the user in real-time. Never blocks longer than the
+        configured start timeout (default 5s).
+
+        Returns:
+            HostReadiness indicating whether the host is usable or degraded.
+        """
+        from leapflow.host import HostManager, HostState
+
+        mgr = self._build_host_manager()
+        diag = mgr.diagnose()
+
+        # Fast path: already running
+        if diag.state == HostState.RUNNING:
+            pid_info = f" (PID {diag.pid})" if diag.pid else ""
+            _emit_status(f"OS Host: running{pid_info}")
+            return HostReadiness.RUNNING
+
+        # Binary not installed — guide user, degrade gracefully
+        if not diag.executable_found:
+            _emit_status("OS Host: not installed")
+            _emit_status("  Run 'leap host setup' to install and configure.")
+            return HostReadiness.DEGRADED
+
+        # Stale state detected — announce cleanup
+        if diag.state == HostState.STALE:
+            _emit_status("OS Host: cleaning stale state...")
+
+        # Attempt start
+        _emit_status("OS Host: starting...")
+        try:
+            status = await mgr.start(timeout=5.0)
+            pid_info = f" (PID {status.pid})" if status.pid else ""
+            _emit_status(f"OS Host: started{pid_info}")
+            return HostReadiness.STARTED
+        except FileNotFoundError:
+            _emit_status("OS Host: binary not found")
+            _emit_status("  Run 'leap host setup' to install and configure.")
+            return HostReadiness.DEGRADED
+        except TimeoutError:
+            _emit_status("OS Host: start timed out")
+            _emit_status("  Check 'leap host logs' for details.")
+            return HostReadiness.DEGRADED
+        except OSError as exc:
+            _emit_status(f"OS Host: start failed ({exc})")
+            return HostReadiness.DEGRADED
+        except Exception as exc:
+            logger.debug("OS Host start unexpected error: %s", exc, exc_info=True)
+            _emit_status(f"OS Host: error ({type(exc).__name__})")
+            return HostReadiness.DEGRADED
+
     async def initialize(self) -> None:
         """Async initialization: VSI handshake, pipeline assembly.
 
-        Bridge connection is non-blocking: if the first attempt fails,
-        we proceed with mock adapters and reconnect in the background.
+        Phases:
+            1. Memory providers initialization
+            2. OS Host readiness check (diagnose → auto-start → feedback)
+            3. Bridge connection (non-blocking, background fallback)
+            4. Platform adapter registration
         """
         settings = self.settings
 
         # Initialize all memory providers (opens DB, starts GC, etc.)
         await self.memory.initialize_all()
 
-        # Auto-start OS Host if configured and not in mock mode.
+        # Phase 1: OS Host readiness — diagnose, auto-start, report status
+        host_readiness = HostReadiness.DEGRADED
         if not self.effective_mock and settings.host_auto_start:
-            from leapflow.host import HostManager
-            host_mgr = HostManager(
-                host_root=settings.host_root,
-                host_socket=settings.host_socket,
-                pid_file=settings.host_pid_file,
-                log_file=settings.host_log_file,
-                bundle_id=settings.host_bundle_id,
-            )
-            try:
-                await host_mgr.ensure_running(timeout=5.0)
-            except Exception as e:
-                logger.warning(
-                    "OS Host auto-start failed: %s. "
-                    "Run 'leap host setup' to install and configure.",
-                    e,
-                )
+            host_readiness = await self._ensure_host_ready()
 
+        # Phase 2: Bridge connection
         vsi = VirtualSystemInterface(self.rpc)
         bridge_online = False
 
         if isinstance(self.rpc, BridgeClient):
-            bridge_online = await self.rpc.try_connect()
-            if bridge_online:
-                manifest = await vsi.handshake()
-            else:
-                sys.stderr.write(
-                    "\033[2m→ Bridge not available, connecting in background...\033[0m\n"
-                )
-                sys.stderr.flush()
+            # Skip connection attempt when host is known-degraded
+            if host_readiness == HostReadiness.DEGRADED:
+                _emit_status("Running in offline mode")
                 manifest = PlatformManifest.default_darwin()
                 vsi._manifest = manifest
                 self._bg_connect_task = asyncio.create_task(self._bg_connect())
+            else:
+                bridge_online = await self.rpc.try_connect()
+                if bridge_online:
+                    manifest = await vsi.handshake()
+                else:
+                    _emit_status("Bridge not available, connecting in background...")
+                    manifest = PlatformManifest.default_darwin()
+                    vsi._manifest = manifest
+                    self._bg_connect_task = asyncio.create_task(self._bg_connect())
         else:
             manifest = await vsi.handshake()
             bridge_online = True

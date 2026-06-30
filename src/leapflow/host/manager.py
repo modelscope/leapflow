@@ -59,6 +59,25 @@ class HostStatus:
         return self.state == HostState.RUNNING
 
 
+@dataclass(frozen=True)
+class HostDiagnosis:
+    """Lightweight diagnostic for fast init-time health checks.
+
+    Unlike :class:`HostStatus`, skips expensive operations (permission queries,
+    socket connectivity probes) to achieve <10ms on the hot path.
+    """
+
+    state: HostState
+    pid: Optional[int] = None
+    executable_found: bool = False
+    detail: str = ""
+
+    @property
+    def is_startable(self) -> bool:
+        """True if the host can potentially be started."""
+        return self.state != HostState.RUNNING and self.executable_found
+
+
 # ─── Constants ──────────────────────────────────────────────────────────
 
 _DEFAULT_BUNDLE_NAME = "LeapHost.app"
@@ -185,6 +204,46 @@ class HostManager:
         if not self._socket_exists():
             return False
         return self._socket_responsive(retries=1, timeout=2.0)
+
+    def diagnose(self) -> HostDiagnosis:
+        """Fast-path diagnostic without network I/O or permission checks.
+
+        Examines only PID file, process table, and filesystem to deliver
+        a diagnosis in <10ms. Suitable for startup health checks where
+        latency matters more than completeness.
+        """
+        pid = self._read_pid()
+        executable_found = self._resolve_executable() is not None
+
+        if pid is not None:
+            if self._process_alive(pid):
+                return HostDiagnosis(
+                    state=HostState.RUNNING,
+                    pid=pid,
+                    executable_found=executable_found,
+                )
+            return HostDiagnosis(
+                state=HostState.STALE,
+                pid=pid,
+                executable_found=executable_found,
+                detail="PID file present but process gone",
+            )
+
+        # No PID file — check if socket exists (externally managed host)
+        if self._socket_exists():
+            return HostDiagnosis(
+                state=HostState.RUNNING,
+                pid=None,
+                executable_found=executable_found,
+                detail="Socket present (external host)",
+            )
+
+        return HostDiagnosis(
+            state=HostState.STOPPED,
+            pid=None,
+            executable_found=executable_found,
+            detail="" if executable_found else "Host binary not installed",
+        )
 
     def status(self) -> HostStatus:
         pid = self._read_pid()
