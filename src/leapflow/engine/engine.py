@@ -1032,29 +1032,48 @@ class AgentEngine:
                 return
 
             else:
-                # Non-native path: use stream=True for real-time output
-                chunks_collected: list[str] = []
-                try:
-                    async for chunk in self._llm.achat_stream(
-                        compressed, enable_thinking=enable_thinking,
-                    ):
-                        chunks_collected.append(chunk)
-                except Exception as exc:
-                    _clear_indicator()
-                    category = self._error_classifier.classify(exc)
-                    recovery = self._error_classifier.get_recovery(category)
-                    if recovery.retry and budget.remaining > 0:
-                        await asyncio.sleep(jittered_backoff(budget.used))
-                        continue
-                    break
-                _clear_indicator()
+                # Non-native path: use streaming for real-time output when enabled
+                if self._settings.stream_output:
+                    # Stream chunks and yield them in real-time to the caller
+                    chunks_collected: list[str] = []
+                    try:
+                        _clear_indicator()
+                        async for chunk in self._llm.achat_stream(
+                            compressed, enable_thinking=enable_thinking,
+                        ):
+                            chunks_collected.append(chunk)
+                    except Exception as exc:
+                        _clear_indicator()
+                        category = self._error_classifier.classify(exc)
+                        recovery = self._error_classifier.get_recovery(category)
+                        if recovery.retry and budget.remaining > 0:
+                            await asyncio.sleep(jittered_backoff(budget.used))
+                            continue
+                        break
 
-                content = "".join(chunks_collected).strip()
+                    content = "".join(chunks_collected).strip()
+                else:
+                    # Buffered mode (stream_output=False): single request
+                    try:
+                        resp = await self._llm.achat(
+                            compressed, stream=False, enable_thinking=enable_thinking,
+                        )
+                    except Exception as exc:
+                        _clear_indicator()
+                        category = self._error_classifier.classify(exc)
+                        recovery = self._error_classifier.get_recovery(category)
+                        if recovery.retry and budget.remaining > 0:
+                            await asyncio.sleep(jittered_backoff(budget.used))
+                            continue
+                        break
+                    _clear_indicator()
+                    content = (resp.content or "").strip()
+
                 self._wm.remember_chat(build_assistant_message(content))
                 tool_call = self._parse_tool_call_from_content(content)
 
                 if tool_call is None:
-                    # Final answer — yield chunks for real-time display
+                    # Final answer — yield content
                     trace.record(ExecutionMode.COMPLETE)
                     if not content:
                         yield "I processed your request but have no additional output."

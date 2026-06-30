@@ -31,9 +31,10 @@ logger = logging.getLogger(__name__)
 
 
 class FeedbackCollector:
-    """反馈信号采集器 — 追踪已展示建议的用户反应。
+    """Feedback signal collector — tracks user reactions to displayed suggestions.
 
-    职责：将用户行为（接受/忽略/纠正/拒绝）转化为结构化 FeedbackSignal。
+    Responsibility: converts user behaviour (accept/ignore/correct/reject)
+    into structured FeedbackSignal objects.
 
     Usage:
         1. Call `track_shown()` when a suggestion is displayed.
@@ -184,9 +185,11 @@ class FeedbackCollector:
 
 
 class EvolutionLoop:
-    """反馈驱动的模型演化循环 — 将 FeedbackSignal 转化为预测模型权重更新。
+    """Feedback-driven model evolution loop — converts FeedbackSignal into
+    prediction model weight updates.
 
-    EMA 置信度更新 + 信任梯度延伸。与 Loop γ 的"执行即学习"理念一致。
+    Uses EMA confidence updates and trust gradient extension.  Consistent
+    with Loop γ's "execution as learning" philosophy.
 
     Reward mapping:
         ACCEPT          → +config.accept_boost (default +1.0)

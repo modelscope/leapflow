@@ -21,12 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 class IdleDetector:
-    """操作间隙检测器 — 基于事件时间戳流判断用户是否处于停顿状态。
+    """Idle gap detector — infers user pause state from event timestamp stream.
 
-    设计原则：
-    - 自适应阈值：根据用户操作节奏动态调整停顿判定
-    - 零延迟通知：停顿一旦达到阈值，立即触发回调
-    - 取消机制：新事件到达时立即取消当前停顿状态
+    Design principles:
+    - Adaptive threshold: dynamically adjusts pause detection based on user tempo
+    - Zero-delay notification: triggers callback immediately once threshold is met
+    - Cancellation: new events instantly cancel the current idle state
     """
 
     # EMA window for adaptive threshold

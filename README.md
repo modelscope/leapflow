@@ -223,6 +223,64 @@ Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` 
 
 ---
 
+## Workflow Copilot (Preview)
+
+LeapFlow includes a **Workflow Copilot** that predicts your next action and offers proactive suggestions — like GitHub Copilot, but for any workflow on your computer.
+
+### How It Works
+
+```
+You work normally → LeapFlow observes patterns → Suggests next steps → You accept/ignore
+       │                                                                    │
+       └──────────────── Gets smarter (Loop γ) ──────────────────┘
+```
+
+The Copilot operates on a **multi-tier prediction model**:
+
+| Tier | Method | Latency | Use Case |
+|------|--------|---------|----------|
+| L0 | Context hash → exact history match | <1ms | Daily routines |
+| L1 | N-gram sequence prediction | <5ms | Common action chains |
+| L2 | Embedding retrieval from experience store | <50ms | Cross-app patterns |
+| L3 | LLM reasoning + RAG | 200–2000ms | Novel situations |
+
+### Real-Time Design
+
+Predictions are **speculative** — computed while you work, not after you pause:
+
+- When you perform action A, the system immediately predicts Top-K next steps
+- Results are cached in memory; displayed only when you naturally pause (>300ms)
+- If you start your next action before the suggestion appears, it’s silently discarded
+- L0–L2 are fully local (no network); L3 runs asynchronously in the background
+
+### Example Scenarios
+
+- **File operations:** Move one PDF → system suggests moving matching PDFs too
+- **App switching:** Open Zoom + Calendar → system offers to open meeting docs
+- **Terminal:** `cd project && git pull` → system suggests `npm install && npm run dev`
+- **Cross-app:** Copy text from Slack → system offers to create a Jira ticket
+
+### Trust Gradient for Suggestions
+
+Suggestions follow the same trust model as skills:
+
+- **Low confidence (<0.5):** Silent — logged but not shown
+- **Medium (0.5–0.8):** Ghost hint (dim text, Tab to accept)
+- **High (>0.8):** Explicit suggestion with shortcut key
+- **Very high (>0.95) + non-destructive + always accepted:** Auto-execute
+
+### Configuration
+
+```bash
+# .env
+LEAPFLOW_STREAM_OUTPUT=true        # Enable real-time token streaming
+LEAPFLOW_VERBOSE_PROGRESS=true     # Show tool execution progress inline
+```
+
+> **Status:** The interactive mode already provides real-time progress indicators and streaming responses. Full predictive Copilot (idle detection + ghost hints) is the next evolution milestone.
+
+---
+
 ## OS Host Management
 
 For full perception (screen capture, accessibility tree, input events), you need the native OS Host running:

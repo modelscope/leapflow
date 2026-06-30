@@ -31,11 +31,11 @@ class DegradationLevel(Enum):
     Lower levels shed more expensive layers to preserve responsiveness.
     """
 
-    FULL = 0  # 所有层正常运行
-    NO_L3 = 1  # 禁用 LLM 层
-    NO_L2_L3 = 2  # 仅保留 L0+L1
-    L0_ONLY = 3  # 仅保留 Hash 精确匹配
-    DISABLED = 4  # 完全停止预测
+    FULL = 0  # All layers active
+    NO_L3 = 1  # LLM layer disabled
+    NO_L2_L3 = 2  # Only L0+L1 retained
+    L0_ONLY = 3  # Hash exact-match only
+    DISABLED = 4  # Predictions fully stopped
 
 
 # Layer IDs corresponding to each tier
@@ -75,9 +75,10 @@ class SystemMetricsProvider(Protocol):
 
 
 class DefaultMetricsProvider:
-    """基于 os 模块的简易系统指标提供者。
+    """Lightweight system metrics provider based on the os module.
 
-    精度有限但零外部依赖。生产环境建议替换为 psutil 实现。
+    Limited precision but zero external dependencies.  Replace with a
+    psutil-backed implementation for production environments.
     """
 
     def cpu_percent(self) -> float:
@@ -120,17 +121,18 @@ class DefaultMetricsProvider:
 
 
 class DegradationPolicy:
-    """分级降级策略 — 系统负载过高时自动裁剪预测功能。
+    """Resource-aware tiered degradation policy.
 
-    五级降级：
-        FULL     → 全功能
-        NO_L3    → 禁 LLM（CPU > 70%）
-        NO_L2_L3 → 仅 L0+L1（CPU > 90%）
-        L0_ONLY  → 仅 Hash 匹配（内存 > 90% budget）
-        DISABLED → 停止预测（事件队列积压 > max_event_queue * 0.1）
+    Five levels of graceful degradation:
+        FULL     → All layers active
+        NO_L3    → Disable LLM layer (CPU > 70%)
+        NO_L2_L3 → L0+L1 only (CPU > 90%)
+        L0_ONLY  → Hash match only (memory > 90% budget)
+        DISABLED → Stop predictions (event queue backlog > max * 0.1)
 
-    设计约束：降级是自动的、可观测的、可恢复的。系统在任何负载条件下
-    都不会 crash 或阻塞用户操作。最差情况是 Copilot 静默停止。
+    Design constraints: degradation is automatic, observable, and recoverable.
+    The system never crashes or blocks user operations under any load condition.
+    Worst case is that the Copilot silently stops predicting.
     """
 
     def __init__(self, config: CopilotConfig) -> None:

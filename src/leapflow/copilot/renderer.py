@@ -25,10 +25,10 @@ logger = logging.getLogger(__name__)
 
 
 class DisplayGate:
-    """展示门控 — 决定何时、以何种方式展示建议。
+    """Display gate — decides when and how to show suggestions.
 
-    核心原则："宁可不展示，不可延迟展示。"
-    如果计算未在停顿窗口内完成，丢弃本次建议。
+    Core principle: "Better to not show than to show late."
+    If computation did not finish within the idle window, discard the suggestion.
     """
 
     # Destructive operations require confidence above this threshold
@@ -102,12 +102,12 @@ class DisplayGate:
 
 
 class SuggestionRenderer:
-    """建议渲染协调器 — 管理建议的展示/撤回生命周期。
+    """Suggestion rendering coordinator — manages the display/dismiss lifecycle.
 
-    职责：
-    - 通过 DisplayGate 选择最佳候选
-    - 调用 HintRenderer 展示/撤回
-    - 追踪当前展示中的建议
+    Responsibilities:
+    - Select best candidate via DisplayGate
+    - Invoke HintRenderer to show/dismiss
+    - Track the currently displayed suggestion
     """
 
     def __init__(
@@ -180,9 +180,9 @@ class SuggestionRenderer:
 
 
 class LogHintRenderer:
-    """HintRenderer 的默认 logging 实现 — 用于测试/调试。
+    """Default logging-based HintRenderer implementation — for testing/debugging.
 
-    将建议渲染为 logger.info 输出，不产生任何 UI 副作用。
+    Renders suggestions as logger.info output with no UI side effects.
     """
 
     def __init__(self) -> None:
