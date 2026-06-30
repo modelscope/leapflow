@@ -217,21 +217,18 @@ class L3LLMPredictor:
         """
         # Try to extract JSON array from response
         text = response.strip()
-        # Handle markdown code blocks
-        if text.startswith("```"):
-            lines = text.split("\n")
-            # Remove first and last lines (``` markers)
-            json_lines = []
-            in_block = False
-            for line in lines:
-                if line.strip().startswith("```") and not in_block:
-                    in_block = True
-                    continue
-                if line.strip() == "```" and in_block:
-                    break
-                if in_block:
-                    json_lines.append(line)
-            text = "\n".join(json_lines)
+
+        # Strategy 1: Find JSON array boundaries directly (most robust)
+        arr_start = text.find("[")
+        arr_end = text.rfind("]")
+        if arr_start != -1 and arr_end > arr_start:
+            text = text[arr_start: arr_end + 1]
+        else:
+            # Strategy 2: Extract from markdown code block (```json ... ```)
+            import re
+            md_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+            if md_match:
+                text = md_match.group(1).strip()
 
         try:
             data = json.loads(text)

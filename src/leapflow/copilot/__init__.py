@@ -1,5 +1,11 @@
 """Workflow Copilot — context-triggered workflow auto-completion engine."""
 
+from leapflow.copilot.adapters import (
+    EpisodicSequenceAdapter,
+    ExperienceEmbedAdapter,
+    MemoryRAGAdapter,
+    SemanticHashAdapter,
+)
 from leapflow.copilot.config import CopilotConfig
 from leapflow.copilot.context import ContextEncoder, CopilotEventSubscriber
 from leapflow.copilot.degradation import DegradationLevel, DegradationPolicy
@@ -60,4 +66,9 @@ __all__ = [
     "L1MarkovPredictor",
     "L2EmbeddingPredictor",
     "L3LLMPredictor",
+    # memory adapters
+    "EpisodicSequenceAdapter",
+    "ExperienceEmbedAdapter",
+    "MemoryRAGAdapter",
+    "SemanticHashAdapter",
 ]

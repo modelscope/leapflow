@@ -75,6 +75,7 @@ class ContextState:
     clipboard_hash: int = 0
     time_bucket: str = ""
     fs_context_hash: int = 0
+    conversation_hint: str = ""  # Latest user intent extracted from WorkingMemory
     # metadata
     last_update_ts: float = 0.0
     dirty_fields: Set[str] = field(default_factory=set)

@@ -20,6 +20,7 @@ from leapflow.copilot.types import ContextState
 
 if TYPE_CHECKING:
     from leapflow.domain.events import SystemEvent
+    from leapflow.memory.providers.working import WorkingMemoryProvider
     from leapflow.signal_fusion.cross_app import CrossAppContextTracker
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ class ContextEncoder:
 
         # Always append to the rolling action ring
         action_desc = f"{event.event_type}:{event.source}"
-        ring = self._state.action_ring[-(self._ring_size - 1):] + [action_desc]
+        ring = (self._state.action_ring + [action_desc])[-self._ring_size:]
         self._state.delta_update("action_ring", ring)
 
         # Refresh time bucket at most once per interval
@@ -101,23 +102,27 @@ class CopilotEventSubscriber:
     """Bridge between EventBus and the Copilot ContextEncoder.
 
     Subscribes to the platform EventBus, forwards events to the encoder,
-    and optionally enriches context with CrossAppContextTracker hypotheses.
+    and optionally enriches context with CrossAppContextTracker hypotheses
+    and WorkingMemory conversation hints.
 
     Usage::
 
-        subscriber = CopilotEventSubscriber(encoder, tracker)
+        subscriber = CopilotEventSubscriber(encoder, tracker, working_memory=wm)
         event_bus.subscribe(subscriber.on_system_event)
     """
 
-    __slots__ = ("_encoder", "_tracker")
+    __slots__ = ("_encoder", "_tracker", "_working_memory", "_last_hint")
 
     def __init__(
         self,
         encoder: ContextEncoder,
         tracker: Optional["CrossAppContextTracker"] = None,
+        working_memory: Optional["WorkingMemoryProvider"] = None,
     ) -> None:
         self._encoder = encoder
         self._tracker = tracker
+        self._working_memory = working_memory
+        self._last_hint: str = ""
 
     def on_system_event(self, event: "SystemEvent") -> None:
         """EventBus callback — matches the standard EventCallback signature.
@@ -125,6 +130,7 @@ class CopilotEventSubscriber:
         Forwards the event to ContextEncoder for incremental processing.
         When CrossAppContextTracker has an active hypothesis, injects a
         workflow_hint field into the context for downstream predictors.
+        When WorkingMemory is available, injects a conversation_hint.
         """
         state = self._encoder.on_event(event)
 
@@ -133,3 +139,19 @@ class CopilotEventSubscriber:
                 "workflow_hint",
                 self._tracker.current_hypothesis.workflow_type.value,
             )
+
+        if self._working_memory is not None:
+            hint = self._extract_conversation_hint()
+            if hint != self._last_hint:
+                state.delta_update("conversation_hint", hint)
+                self._last_hint = hint
+
+    def _extract_conversation_hint(self) -> str:
+        """Extract latest user intent from WorkingMemory (lightweight, <0.1ms)."""
+        messages = self._working_memory.as_chat_messages()  # type: ignore[union-attr]
+        # Scan backwards for the most recent user message
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = str(msg.get("content", ""))
+                return content[:80].strip()
+        return ""

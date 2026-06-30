@@ -107,19 +107,31 @@ class L1MarkovPredictor:
         return candidates
 
     async def on_feedback(self, signal: FeedbackSignal) -> None:
-        """Online update: record the actual action taken after this context."""
+        """Online update: record the actual action taken after this context.
+
+        Only records transitions for confirmed actions:
+        - ACCEPT: the suggested action was correct
+        - CORRECT: user provided the actual action they took
+
+        IGNORE and EXPLICIT_REJECT without an actual_action are skipped
+        to avoid reinforcing bad predictions.
+        """
         ctx = signal.context_at_feedback
         if ctx is None:
             return
 
         key = self._make_key(ctx.action_ring)
-        # Determine the action to record
+
+        # Determine the action to record (only for confirmed signals)
         if signal.feedback_type == FeedbackType.ACCEPT:
             actual = signal.candidate.action_description
         elif signal.actual_action:
+            # CORRECT feedback with explicit user-provided action
             actual = signal.actual_action
         else:
-            actual = signal.candidate.action_description
+            # IGNORE / EXPLICIT_REJECT without a known actual action —
+            # do NOT record, as it would reinforce the rejected prediction.
+            return
 
         self._transitions.setdefault(key, {})[actual] = (
             self._transitions.get(key, {}).get(actual, 0) + 1

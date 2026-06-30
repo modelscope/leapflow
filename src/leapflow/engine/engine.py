@@ -88,8 +88,14 @@ def _clear_indicator() -> None:
 
 
 def _print_tool_result(tool_name: str, result: Any, *, enabled: bool = True) -> None:
-    """Print a brief tool result summary to stdout (visible to user)."""
+    """Print a brief tool result summary to stdout (visible to user).
+
+    Skips output when disabled or when stdout is not a TTY (e.g. daemon,
+    CI/CD, piped output) to avoid polluting logs with ANSI escape codes.
+    """
     if not enabled:
+        return
+    if not sys.stdout.isatty():
         return
     if isinstance(result, dict):
         # Try to extract a meaningful summary

@@ -95,22 +95,36 @@ class DefaultMetricsProvider:
             return 0.0
 
     def memory_mb(self) -> float:
-        """Estimate current process RSS via /proc or resource module.
+        """Return current process RSS in megabytes.
 
-        Falls back to 0 if unavailable.
+        Strategy (in order of preference):
+        1. /proc/self/status VmRSS (Linux, current RSS)
+        2. mach_task_info via resource module (macOS, current RSS approximation)
+        3. Fallback to 0.0
         """
+        import sys as _sys
+
+        # Linux: read current RSS from /proc (not peak)
+        if _sys.platform == "linux":
+            try:
+                with open("/proc/self/status", "r") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            # Format: "VmRSS:    12345 kB"
+                            return int(line.split()[1]) / 1024.0
+            except (OSError, ValueError, IndexError):
+                pass
+
+        # macOS / fallback: use resource module
         try:
             import resource
-
-            # ru_maxrss is in KB on Linux, bytes on macOS
             usage = resource.getrusage(resource.RUSAGE_SELF)
-            maxrss_kb = usage.ru_maxrss
-            # macOS reports bytes, Linux reports KB
-            import sys
-
-            if sys.platform == "darwin":
-                return maxrss_kb / (1024 * 1024)
-            return maxrss_kb / 1024
+            rss = usage.ru_maxrss
+            if _sys.platform == "darwin":
+                # macOS reports bytes
+                return rss / (1024 * 1024)
+            # Other Unix: KB
+            return rss / 1024
         except (ImportError, OSError):
             return 0.0
 
