@@ -2,6 +2,11 @@
 
 **A signal-driven, self-evolving agent framework that learns autonomously from the real world.**
 
+
+### News
+
+- **2025-06-30**: LeapFlow Preview released — initial public release with record & replay, multi-modal signal fusion, and Workflow Copilot.
+
 ---
 
 ## What is LeapFlow?
