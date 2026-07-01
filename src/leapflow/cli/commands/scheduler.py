@@ -45,9 +45,9 @@ def _format_trigger(task) -> str:
             return f"every {int(sec / 3600)}h"
         return f"every {int(sec / 86400)}d"
     if task.trigger_type == "cron":
-        return task.trigger_config.get("cron_expression", "cron")
+        return task.trigger_config.get("expression", "cron")
     if task.trigger_type == "event":
-        return f"event:{task.trigger_config.get('event_name', '?')}"
+        return f"event:{task.trigger_config.get('event_pattern', '?')}"
     if task.trigger_type == "condition":
         expr = task.trigger_config.get("expression", "?")
         return f"cond:{expr[:20]}"
@@ -57,6 +57,7 @@ def _format_trigger(task) -> str:
 def _get_coordinator(ctx: "Context"):
     """Get or create a TaskCoordinator from context."""
     from leapflow.scheduler.coordinator import TaskCoordinator
+    from leapflow.scheduler.local_scheduler import LocalScheduler
     from leapflow.scheduler.store import TaskStore
 
     # Use existing coordinator if available
@@ -66,10 +67,48 @@ def _get_coordinator(ctx: "Context"):
     # Build one from settings
     db_path = ctx.settings.data_dir / "scheduler.duckdb"
     store = TaskStore(db_path)
+
+    # Local scheduler with a simple skill executor
+    class _SimpleExecutor:
+        """Minimal skill executor for scheduled tasks."""
+
+        async def execute(self, skill_name: str, parameters: dict) -> dict:
+            # Try to execute via session if available
+            if ctx.session:
+                try:
+                    result = await ctx.session.execute_skill(skill_name, params=parameters)
+                    return {"ok": True, "output": str(result)[:200]}
+                except Exception as e:
+                    return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": "No session available"}
+
+    local_scheduler = LocalScheduler(
+        store=store,
+        executor=_SimpleExecutor(),
+        tick_seconds=ctx.settings.scheduler_tick_seconds,
+        grace_seconds=ctx.settings.scheduler_grace_seconds,
+    )
+
+    # Cloud dispatcher (optional, only if compute backend available)
+    cloud_dispatcher = None
+    try:
+        from leapflow.scheduler.cloud_dispatcher import CloudDispatcher
+        from leapflow.scheduler.compute.modelscope_studio import ModelScopeStudioBackend
+        from leapflow.scheduler.worker_packager import WorkerPackager
+
+        backend = ModelScopeStudioBackend()
+        packager = WorkerPackager()
+        cloud_dispatcher = CloudDispatcher(backend, packager)
+    except (ImportError, Exception):
+        pass  # Cloud not available — local-only mode
+
     coordinator = TaskCoordinator(
         store=store,
+        local_scheduler=local_scheduler,
+        cloud_dispatcher=cloud_dispatcher,
         default_tier=ctx.settings.scheduler_default_tier,
     )
+    ctx.coordinator = coordinator
     return coordinator
 
 

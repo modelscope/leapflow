@@ -65,7 +65,7 @@ def parse_trigger_expression(expr: str) -> tuple[str, dict]:
         event_name = expr[len(_EVENT_PREFIX):].strip()
         if not event_name:
             raise ValueError("Event trigger must specify an event name, e.g. 'event:ci.passed'")
-        return "event", {"event_name": event_name}
+        return "event", {"event_pattern": event_name}
 
     # Condition trigger
     if expr.lower().startswith(_CONDITION_PREFIX):
@@ -78,7 +78,7 @@ def parse_trigger_expression(expr: str) -> tuple[str, dict]:
 
     # Cron trigger (5 fields separated by spaces)
     if _CRON_PATTERN.match(expr):
-        return "cron", {"cron_expression": expr}
+        return "cron", {"expression": expr}
 
     # Interval trigger
     match = _INTERVAL_PATTERN.match(expr)
@@ -275,7 +275,7 @@ class TaskCoordinator:
 
         if trigger_type == "cron":
             # Heuristic: check if frequency is daily or less often
-            cron_expr = trigger_config.get("cron_expression", "")
+            cron_expr = trigger_config.get("expression", "")
             parts = cron_expr.split()
             if len(parts) >= 5:
                 # If minute and hour are specific (not */N), it's likely daily+
