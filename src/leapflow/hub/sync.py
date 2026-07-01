@@ -66,14 +66,24 @@ class SyncPlan:
 
 
 def _parse_version(v: str) -> Tuple[int, ...]:
-    """Parse semver-like version string to comparable tuple.
+    """Parse semver-like version string to comparable 3-tuple.
 
-    Handles formats like "0.1.0", "v1.2.3", "1.0".
+    Handles: "0.1.0", "v1.2.3", "1.0", "2.0.0-beta.1", "1.2.3+sha.abc".
+    Strips 'v' prefix, pre-release labels, and build metadata before parsing.
+    Normalizes to 3 components (padded with zeros, limited to first 3).
     Returns (0, 0, 0) on parse failure for safe fallback.
     """
+    import re
+
     cleaned = v.strip().lstrip("v")
+    # Strip pre-release (after '-') and build metadata (after '+')
+    cleaned = re.split(r"[\-+]", cleaned, maxsplit=1)[0]
     try:
-        return tuple(int(x) for x in cleaned.split("."))
+        parts = [int(x) for x in cleaned.split(".")[:3]]
+        # Normalize to 3 components
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts)
     except (ValueError, AttributeError):
         return (0, 0, 0)
 

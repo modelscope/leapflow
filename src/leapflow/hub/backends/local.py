@@ -171,10 +171,10 @@ class LocalBackend:
             if owner and not repo_id.startswith(f"{owner}/"):
                 continue
 
-            # Get latest version info
+            # Get latest version info (semantic version sort)
             versions = sorted(
                 [d.name for d in repo_dir.iterdir() if d.is_dir()],
-                reverse=True,
+                key=_semver_key, reverse=True,
             )
             latest_version = versions[0] if versions else ""
 

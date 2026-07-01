@@ -171,6 +171,11 @@ class GitHubBackend:
             file_resp = await self._http.get(download_url)
             if file_resp.status_code == 200:
                 files[name] = file_resp.text
+            else:
+                logger.warning(
+                    "Failed to download file '%s' from %s (status: %d)",
+                    name, download_url, file_resp.status_code,
+                )
 
         return self._serializer.files_to_bundle(files)
 
