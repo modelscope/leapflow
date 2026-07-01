@@ -24,7 +24,9 @@ async def hub_push_tool(
     version: str = "",
     **kwargs: Any,
 ) -> str:
-    """Push a skill to the Hub. Returns status message.
+    """Push a local skill to the Hub. Returns status message.
+
+    Requires a Context with skill_lib to load real skill data.
 
     Args:
         skill_name: Name of the local skill to push.
@@ -37,26 +39,43 @@ async def hub_push_tool(
     if not skill_name:
         return "Error: skill_name is required."
 
+    ctx = kwargs.get("ctx")
+
+    # Try to load real skill from library
+    stored_dict: Dict[str, Any] = {"name": skill_name}
+    if ctx is not None and hasattr(ctx, "skill_lib") and ctx.skill_lib is not None:
+        try:
+            stored = ctx.skill_lib.load_skill_by_title(skill_name)
+            if stored is None:
+                return f"Error: Skill '{skill_name}' not found in local library."
+            stored_dict = {
+                "name": getattr(stored, "title", skill_name),
+                "version": version or getattr(stored, "version", "0.1.0"),
+                "description": getattr(stored, "description", ""),
+                "source_code": getattr(stored, "source_code", ""),
+                "parameters": getattr(stored, "parameters", []),
+                "triggers": list(getattr(stored, "trigger_phrases", [])),
+                "trajectory_skeleton": getattr(stored, "trajectory_skeleton", ""),
+                "copilot_prior": getattr(stored, "copilot_prior", ""),
+                "readme": getattr(stored, "readme", f"# {skill_name}\n"),
+                "source_tag": getattr(stored, "source_tag", "learned"),
+                "tier": getattr(stored, "tier", 1),
+            }
+        except Exception as e:
+            return f"Error loading skill '{skill_name}': {e}"
+    else:
+        return "Error: Skill library context not available. Use 'leap hub push' CLI command instead."
+
     settings = get_settings()
     client = HubClient(
         hub_type=settings.hub_type,
         default_owner=settings.hub_default_owner,
         default_visibility=settings.hub_default_visibility,
+        repo_prefix=settings.hub_repo_prefix,
     )
 
-    # Build a minimal bundle for push
+    # Serialize to bundle
     serializer = SkillSerializer()
-    stored_dict: Dict[str, Any] = {
-        "name": skill_name,
-        "version": version or "0.1.0",
-        "description": f"Skill: {skill_name}",
-        "source_code": "",
-        "parameters": [],
-        "triggers": [],
-        "trajectory_skeleton": "",
-        "copilot_prior": "",
-        "readme": "",
-    }
     bundle = serializer.export_skill(stored_dict)
 
     # Sanitize
@@ -103,6 +122,7 @@ async def hub_pull_tool(
         hub_type=settings.hub_type,
         default_owner=settings.hub_default_owner,
         default_visibility=settings.hub_default_visibility,
+        repo_prefix=settings.hub_repo_prefix,
     )
 
     try:
@@ -154,6 +174,7 @@ async def hub_search_tool(
         hub_type=settings.hub_type,
         default_owner=settings.hub_default_owner,
         default_visibility=settings.hub_default_visibility,
+        repo_prefix=settings.hub_repo_prefix,
     )
 
     try:
@@ -173,11 +194,14 @@ async def hub_search_tool(
 
 
 async def hub_sync_tool(
-    mode: str = "full",
+    mode: str = "preview",
     dry_run: bool = True,
     **kwargs: Any,
 ) -> str:
-    """Preview or execute skill sync between local and remote Hub.
+    """Preview skill sync plan between local and remote Hub.
+
+    Note: Actual sync execution is available via 'leap hub sync' CLI command.
+    This tool provides a preview of what would be synchronized.
 
     Args:
         mode: 'full', 'push-only', or 'pull-only'.
@@ -192,6 +216,7 @@ async def hub_sync_tool(
         hub_type=settings.hub_type,
         default_owner=settings.hub_default_owner,
         default_visibility=settings.hub_default_visibility,
+        repo_prefix=settings.hub_repo_prefix,
     )
 
     # For tool context we use empty manifests as placeholder
@@ -219,7 +244,7 @@ async def hub_sync_tool(
             lines.append(f"    !! {name}")
 
     if dry_run:
-        lines.append("\n(dry-run — use 'leap hub sync' in CLI to execute)")
+        lines.append("\n(preview only — use 'leap hub sync' CLI command to execute actual sync)")
 
     return "\n".join(lines)
 

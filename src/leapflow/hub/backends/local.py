@@ -159,7 +159,20 @@ class LocalBackend:
                     if manifest_path.exists():
                         try:
                             text = manifest_path.read_text(encoding="utf-8")
-                            data = json.loads(text) if manifest_name.endswith(".json") else {}
+                            if manifest_name.endswith(".json"):
+                                data = json.loads(text)
+                            else:
+                                # Try yaml import, fallback to basic key: value parsing
+                                try:
+                                    import yaml
+                                    data = yaml.safe_load(text) or {}
+                                except ImportError:
+                                    # Basic YAML-like parsing for simple key: value files
+                                    data = {}
+                                    for line in text.splitlines():
+                                        if ":" in line and not line.startswith("#"):
+                                            k, _, v = line.partition(":")
+                                            data[k.strip()] = v.strip().strip('"').strip("'")
                             description = data.get("description", "")
                         except Exception:
                             pass

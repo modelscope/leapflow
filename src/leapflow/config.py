@@ -332,6 +332,7 @@ class Settings:
     hub_default_visibility: str = "private"
     hub_sync_strategy: str = "remote-wins"
     hub_sync_copilot: bool = True
+    hub_repo_prefix: str = "leapflow-"
 
     @property
     def has_llm_credentials(self) -> bool:
@@ -648,6 +649,7 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     hub_default_visibility = os.getenv("LEAPFLOW_HUB_DEFAULT_VISIBILITY", "private")
     hub_sync_strategy = os.getenv("LEAPFLOW_HUB_SYNC_STRATEGY", "remote-wins")
     hub_sync_copilot = _bool("LEAPFLOW_HUB_SYNC_COPILOT", "true")
+    hub_repo_prefix = os.getenv("LEAPFLOW_HUB_REPO_PREFIX", "leapflow-")
 
     settings = Settings(
         llm_api_key=api_key,
@@ -834,6 +836,7 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         hub_default_visibility=hub_default_visibility,
         hub_sync_strategy=hub_sync_strategy,
         hub_sync_copilot=hub_sync_copilot,
+        hub_repo_prefix=hub_repo_prefix,
     )
 
     if not settings.llm_api_key:

@@ -85,6 +85,7 @@ class HubClient:
         hub_type: str = "modelscope",
         default_owner: str = "",
         default_visibility: str = "private",
+        repo_prefix: str = "leapflow-",
     ):
         """Initialize HubClient with config-driven defaults.
 
@@ -92,10 +93,12 @@ class HubClient:
             hub_type: Which backend to use for operations.
             default_owner: Default owner/org for repo_id construction.
             default_visibility: Default visibility for new repos.
+            repo_prefix: Prefix prepended to skill names in repo_id construction.
         """
         self._hub_type = hub_type
         self._default_owner = default_owner
         self._default_visibility = Visibility(default_visibility)
+        self._repo_prefix = repo_prefix
         self._backend: Optional[HubBackend] = None
 
     @property
@@ -124,12 +127,12 @@ class HubClient:
         return self._backend
 
     def _build_repo_id(self, skill_name: str) -> str:
-        """Construct repo_id from owner and skill name.
+        """Construct repo_id from owner, prefix and skill name.
 
-        Format: {owner}/leapflow-{skill_name}
+        Format: {owner}/{repo_prefix}{skill_name}
         """
         prefix = f"{self._default_owner}/" if self._default_owner else ""
-        return f"{prefix}leapflow-{skill_name}"
+        return f"{prefix}{self._repo_prefix}{skill_name}"
 
     # ─── Public API ──────────────────────────────────────────────────────────
 

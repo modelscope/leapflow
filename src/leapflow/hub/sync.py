@@ -30,6 +30,7 @@ class SyncAction:
     local_version: str  # "" if not local
     remote_version: str  # "" if not remote
     reason: str  # "local_newer" | "remote_newer" | "local_only" | "remote_only"
+    repo_id: str = ""  # Remote repo_id (used for pull actions)
 
 
 @dataclass
@@ -199,6 +200,7 @@ class SyncEngine:
                                 local_version=local.version,
                                 remote_version=remote.version,
                                 reason="local_newer",
+                                repo_id=getattr(remote, "repo_id", ""),
                             )
                         )
                 elif cmp < 0:
@@ -211,6 +213,7 @@ class SyncEngine:
                                 local_version=local.version,
                                 remote_version=remote.version,
                                 reason="remote_newer",
+                                repo_id=getattr(remote, "repo_id", ""),
                             )
                         )
                 else:
@@ -229,6 +232,7 @@ class SyncEngine:
                             local_version="",
                             remote_version=remote.version,
                             reason="remote_only",
+                            repo_id=getattr(remote, "repo_id", ""),
                         )
                     )
 
@@ -354,7 +358,7 @@ class SyncEngine:
         )
 
         # Determine repo_id to pull from
-        repo_id = self._client._build_repo_id(action.skill_name)
+        repo_id = action.repo_id or self._client._build_repo_id(action.skill_name)
         bundle = await self._client.pull(repo_id)
 
         desc = (

@@ -46,6 +46,7 @@ def _build_hub_client(ctx: "Context"):
         hub_type=ctx.settings.hub_type,
         default_owner=ctx.settings.hub_default_owner,
         default_visibility=ctx.settings.hub_default_visibility,
+        repo_prefix=ctx.settings.hub_repo_prefix,
     )
 
 
@@ -351,6 +352,7 @@ async def _hub_sync(ctx: "Context", args: List[str]) -> int:
             ))
 
     # Compute sync plan
+    print(f"  Sync strategy: {ctx.settings.hub_sync_strategy}")
     print("  Computing sync plan...")
     plan = await client.sync_skills(local_manifests)
 
