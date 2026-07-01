@@ -146,11 +146,33 @@ async def hub_pull_tool(
     serializer = SkillSerializer()
     skill_data = serializer.import_skill(bundle)
 
+    # Attempt to save to local skill library if context available
+    ctx = kwargs.get("ctx")
+    if ctx is not None and hasattr(ctx, "skill_lib") and ctx.skill_lib is not None:
+        if high_risk:
+            return (
+                f"Pulled '{bundle.manifest.name}' v{bundle.manifest.version} "
+                f"from {repo_id} but NOT installed due to {len(high_risk)} "
+                f"high-risk finding(s).{finding_text}\n"
+                f"Use CLI 'leap hub pull {repo_id} --trust' to install with risks accepted."
+            )
+        try:
+            ctx.skill_lib.save_from_hub(skill_data)
+            return (
+                f"Pulled and installed '{bundle.manifest.name}' "
+                f"v{bundle.manifest.version} from {repo_id}.{finding_text}"
+            )
+        except Exception as e:
+            return (
+                f"Pulled '{bundle.manifest.name}' v{bundle.manifest.version} "
+                f"from {repo_id} but install failed: {e}.{finding_text}"
+            )
+
     return (
         f"Pulled '{bundle.manifest.name}' v{bundle.manifest.version} "
         f"from {repo_id}.{finding_text}\n"
-        f"Skill is ready for local installation. "
-        f"Use 'hub pull {repo_id} --trust' in CLI to install directly."
+        f"Skill library context not available; skill was not installed. "
+        f"Use 'leap hub pull {repo_id}' in CLI to install."
     )
 
 
@@ -219,10 +241,22 @@ async def hub_sync_tool(
         repo_prefix=settings.hub_repo_prefix,
     )
 
-    # For tool context we use empty manifests as placeholder
-    # Real implementation would access skill_lib from ctx
+    # Load actual local skills from context if available
+    ctx = kwargs.get("ctx")
+    local_manifests: list = []
+    if ctx is not None and hasattr(ctx, "skill_lib") and ctx.skill_lib is not None:
+        try:
+            stored_skills = ctx.skill_lib.load_all_active()
+            for s in stored_skills:
+                local_manifests.append(SkillManifest(
+                    name=getattr(s, "title", ""),
+                    version=str(getattr(s, "version", "0.1.0")),
+                ))
+        except Exception:
+            pass  # Fall through to empty manifests
+
     try:
-        plan = await client.sync_skills([])
+        plan = await client.sync_skills(local_manifests)
     except Exception as e:
         return f"Sync failed: {type(e).__name__}: {e}"
 

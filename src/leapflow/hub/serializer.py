@@ -75,13 +75,20 @@ def _serialize_manifest(manifest: SkillManifest) -> str:
 
 
 def _deserialize_manifest(text: str) -> SkillManifest:
-    """Deserialize manifest from YAML or JSON."""
+    """Deserialize manifest from YAML or JSON with graceful fallback."""
+    data = None
     if _YAML_AVAILABLE:
-        data = yaml.safe_load(text)
-    else:
-        # Try JSON first, fallback to basic parsing
-        data = json.loads(text)
-    return _dict_to_manifest(data if data else {})
+        try:
+            data = yaml.safe_load(text)
+        except Exception:
+            logger.debug("YAML parse failed for manifest; trying JSON fallback")
+    if data is None:
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("Failed to parse manifest as YAML or JSON")
+            data = None
+    return _dict_to_manifest(data if isinstance(data, dict) else {})
 
 
 # ─── SkillSerializer ─────────────────────────────────────────────────────────

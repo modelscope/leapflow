@@ -26,8 +26,11 @@ logger = logging.getLogger(__name__)
 # ─── Sync Plan ───────────────────────────────────────────────────────────────
 
 
-class SyncPlan:
-    """Plan describing what needs to happen during a sync operation."""
+class ClientSyncPlan:
+    """Lightweight sync plan for HubClient.sync_skills() preview.
+
+    Distinct from leapflow.hub.sync.SyncPlan (full engine-level plan).
+    """
 
     def __init__(
         self,
@@ -325,7 +328,7 @@ class HubClient:
             if name not in local_by_name:
                 to_pull.append(remote)
 
-        return SyncPlan(to_push=to_push, to_pull=to_pull, conflicts=conflicts)
+        return ClientSyncPlan(to_push=to_push, to_pull=to_pull, conflicts=conflicts)
 
     async def login(self) -> UserInfo:
         """Authenticate with the hub backend.

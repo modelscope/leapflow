@@ -224,25 +224,45 @@ class GitHubBackend:
     # ── Private Helpers ───────────────────────────────────────────────────
 
     async def _ensure_repo(self, repo_id: str, visibility: Visibility) -> None:
-        """Create repository if it doesn't exist."""
+        """Create repository if it doesn't exist.
+
+        Handles both personal repos (POST /user/repos) and org repos
+        (POST /orgs/{org}/repos) based on owner identity.
+        """
         parts = repo_id.split("/")
         if len(parts) != 2:
             raise ValueError(f"Invalid repo_id format: '{repo_id}' (expected 'owner/name')")
-        _, name = parts
+        owner, name = parts
 
         # Check if repo exists
         resp = await self._http.get(f"/repos/{repo_id}")
         if resp.status_code == 200:
             return  # Already exists
 
-        # Create repo
+        # Determine if owner is the authenticated user or an org
         private = visibility != Visibility.PUBLIC
-        create_resp = await self._http.post("/user/repos", json={
-            "name": name,
-            "private": private,
-            "auto_init": True,
-            "description": f"LeapFlow skill: {name}",
-        })
+        user_resp = await self._http.get("/user")
+        is_personal = (
+            user_resp.status_code == 200
+            and user_resp.json().get("login", "") == owner
+        )
+
+        if is_personal:
+            create_resp = await self._http.post("/user/repos", json={
+                "name": name,
+                "private": private,
+                "auto_init": True,
+                "description": f"LeapFlow skill: {name}",
+            })
+        else:
+            # Organization repo
+            create_resp = await self._http.post(f"/orgs/{owner}/repos", json={
+                "name": name,
+                "private": private,
+                "auto_init": True,
+                "description": f"LeapFlow skill: {name}",
+            })
+
         if create_resp.status_code not in (201, 422):
             create_resp.raise_for_status()
 

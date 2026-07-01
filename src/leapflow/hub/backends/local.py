@@ -27,6 +27,19 @@ from leapflow.hub.serializer import SkillSerializer
 logger = logging.getLogger(__name__)
 
 
+def _semver_key(version: str) -> tuple:
+    """Parse version string to comparable tuple for correct semver sorting.
+
+    Handles formats: '0.1.0', 'v1.2.3', '1.0'.
+    Returns (0, 0, 0) on parse failure for safe fallback.
+    """
+    cleaned = version.strip().lstrip("v")
+    try:
+        return tuple(int(x) for x in cleaned.split("."))
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+
+
 class LocalBackend:
     """HubBackend using local filesystem as storage.
 
@@ -54,6 +67,26 @@ class LocalBackend:
         """Return the base directory for local storage."""
         return self._base_dir
 
+    def _safe_repo_path(self, repo_id: str) -> Path:
+        """Validate repo_id and resolve to safe path under base_dir.
+
+        Prevents path traversal attacks via '..' segments or absolute paths.
+        """
+        from pathlib import PurePosixPath
+
+        parts = PurePosixPath(repo_id).parts
+        if not parts:
+            raise ValueError(f"Empty repo_id")
+        if any(p == ".." for p in parts):
+            raise ValueError(f"Path traversal detected in repo_id: '{repo_id}'")
+        if PurePosixPath(repo_id).is_absolute():
+            raise ValueError(f"Absolute path not allowed in repo_id: '{repo_id}'")
+
+        resolved = (self._base_dir / repo_id).resolve()
+        if not str(resolved).startswith(str(self._base_dir.resolve())):
+            raise ValueError(f"repo_id escapes base directory: '{repo_id}'")
+        return resolved
+
     async def authenticate(self) -> UserInfo:
         """Return local user info (no actual authentication needed)."""
         username = os.environ.get("USER", os.environ.get("USERNAME", "local"))
@@ -65,13 +98,9 @@ class LocalBackend:
         repo_id: str,
         visibility: Visibility = Visibility.PRIVATE,
     ) -> PushResult:
-        """Write skill bundle to local filesystem.
-
-        Creates a versioned directory structure:
-        base_dir/repo_id/version/files...
-        """
+        """Write skill bundle to local filesystem."""
         version = bundle.manifest.version or "0.1.0"
-        repo_path = self._base_dir / repo_id / version
+        repo_path = self._safe_repo_path(repo_id) / version
         repo_path.mkdir(parents=True, exist_ok=True)
 
         # Write files
@@ -95,20 +124,18 @@ class LocalBackend:
         version: Optional[str] = None,
     ) -> SkillBundle:
         """Read skill bundle from local filesystem."""
-        repo_base = self._base_dir / repo_id
+        repo_base = self._safe_repo_path(repo_id)
 
         if not repo_base.exists():
             raise FileNotFoundError(f"Skill repository not found: {repo_id}")
 
         # Resolve version
         if version is None:
-            # Get latest version (sorted lexicographically)
-            versions = sorted(
-                [d.name for d in repo_base.iterdir() if d.is_dir()],
-                reverse=True,
-            )
-            if not versions:
+            # Get latest version (semantic version sort, not lexicographic)
+            version_dirs = [d.name for d in repo_base.iterdir() if d.is_dir()]
+            if not version_dirs:
                 raise FileNotFoundError(f"No versions found for: {repo_id}")
+            versions = sorted(version_dirs, key=_semver_key, reverse=True)
             version = versions[0]
 
         version_path = repo_base / version
@@ -221,7 +248,7 @@ class LocalBackend:
         """Delete a skill from local storage."""
         import shutil
 
-        repo_base = self._base_dir / repo_id
+        repo_base = self._safe_repo_path(repo_id)
 
         if not repo_base.exists():
             raise FileNotFoundError(f"Skill repository not found: {repo_id}")

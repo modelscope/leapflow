@@ -142,13 +142,17 @@ class ModelScopeBackend:
                 **kwargs,
             )
 
-            # Read all files from downloaded directory
+            # Read all files in a thread to avoid blocking the event loop
+            def _read_files(local_path: Path) -> dict:
+                files: dict[str, str] = {}
+                for file_path in local_path.rglob("*"):
+                    if file_path.is_file() and not file_path.name.startswith("."):
+                        rel = file_path.relative_to(local_path)
+                        files[str(rel)] = file_path.read_text(encoding="utf-8")
+                return files
+
             local_path = Path(local_dir)
-            files: dict[str, str] = {}
-            for file_path in local_path.rglob("*"):
-                if file_path.is_file() and not file_path.name.startswith("."):
-                    rel = file_path.relative_to(local_path)
-                    files[str(rel)] = file_path.read_text(encoding="utf-8")
+            files = await asyncio.to_thread(_read_files, local_path)
 
             return self._serializer.files_to_bundle(files)
 
