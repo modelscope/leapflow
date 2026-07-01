@@ -335,6 +335,12 @@ class Settings:
     hub_repo_prefix: str = "leapflow-"
     hub_search_sources: str = "modelscope"  # comma-separated backend names for multi-source search
 
+    # ── Scheduler ──
+    scheduler_enabled: bool = True
+    scheduler_tick_seconds: int = 60
+    scheduler_grace_seconds: float = 120.0
+    scheduler_default_tier: str = "auto"  # auto | local | cloud
+
     @property
     def has_llm_credentials(self) -> bool:
         return bool(self.llm_api_key.strip())
@@ -653,6 +659,12 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     hub_repo_prefix = os.getenv("LEAPFLOW_HUB_REPO_PREFIX", "leapflow-")
     hub_search_sources = os.getenv("LEAPFLOW_HUB_SEARCH_SOURCES", "modelscope")
 
+    # Scheduler
+    scheduler_enabled = _bool("LEAPFLOW_SCHEDULER_ENABLED", "true")
+    scheduler_tick_seconds = int(os.getenv("LEAPFLOW_SCHEDULER_TICK_SECONDS", "60"))
+    scheduler_grace_seconds = float(os.getenv("LEAPFLOW_SCHEDULER_GRACE_SECONDS", "120.0"))
+    scheduler_default_tier = os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_TIER", "auto")
+
     settings = Settings(
         llm_api_key=api_key,
         llm_base_url=base_url.rstrip("/"),
@@ -840,6 +852,11 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         hub_sync_copilot=hub_sync_copilot,
         hub_repo_prefix=hub_repo_prefix,
         hub_search_sources=hub_search_sources,
+        # Scheduler
+        scheduler_enabled=scheduler_enabled,
+        scheduler_tick_seconds=scheduler_tick_seconds,
+        scheduler_grace_seconds=scheduler_grace_seconds,
+        scheduler_default_tier=scheduler_default_tier,
     )
 
     if not settings.llm_api_key:

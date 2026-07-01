@@ -174,6 +174,8 @@ async def cmd_interactive(ctx: "Context") -> int:
             print("  skills disable <name> — Disable a learned skill")
             print("  skills delete <name>  — Delete a learned skill")
             print("  hub <subcommand>      — Hub operations (push/pull/sync/search)")
+            print("  arm <skill> --trigger — Arm a skill for scheduled execution")
+            print("  tasks                 — List/manage scheduled tasks")
             print("  shortcut list         — List quick-reply shortcuts")
             print("  shortcut add <p>=<r>  — Add shortcut (pattern = reply)")
             print("  shortcut remove <p>   — Remove a shortcut")
@@ -403,6 +405,19 @@ async def cmd_interactive(ctx: "Context") -> int:
             from leapflow.cli.commands.hub import cmd_hub
             hub_args = line.split()[1:] if len(line.split()) > 1 else []
             await cmd_hub(ctx, hub_args)
+            continue
+
+        # ── Scheduler commands ──
+        if line.startswith("arm"):
+            from leapflow.cli.commands.scheduler import cmd_arm
+            arm_args = line.split()[1:] if len(line.split()) > 1 else []
+            await cmd_arm(ctx, arm_args)
+            continue
+
+        if line.startswith("tasks"):
+            from leapflow.cli.commands.scheduler import cmd_tasks
+            tasks_args = line.split()[1:] if len(line.split()) > 1 else []
+            await cmd_tasks(ctx, tasks_args)
             continue
 
         # ── Run command ──
