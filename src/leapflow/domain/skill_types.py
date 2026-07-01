@@ -108,6 +108,12 @@ class SkillMetadata:
     created_at: float = field(default_factory=time.time)
     tags: tuple = ()           # immutable tag set
 
+    # Hub source tracking
+    source_tag: str = "learned"        # builtin | learned | hub | third_party
+    source_repo_id: str = ""           # Hub repo_id (hub source only)
+    source_version: str = ""           # Hub version (hub source only)
+    source_hub_type: str = ""          # hub_type (hub source only)
+
     @property
     def tier(self) -> SkillTier:
         """Derived maturity tier based on version, confidence, and source."""
