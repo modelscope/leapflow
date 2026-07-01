@@ -173,6 +173,7 @@ async def cmd_interactive(ctx: "Context") -> int:
             print("  skills sessions       — List learning sessions")
             print("  skills disable <name> — Disable a learned skill")
             print("  skills delete <name>  — Delete a learned skill")
+            print("  hub <subcommand>      — Hub operations (push/pull/sync/search)")
             print("  shortcut list         — List quick-reply shortcuts")
             print("  shortcut add <p>=<r>  — Add shortcut (pattern = reply)")
             print("  shortcut remove <p>   — Remove a shortcut")
@@ -395,6 +396,13 @@ async def cmd_interactive(ctx: "Context") -> int:
             if ctx.registry and ctx.registry.unregister(name):
                 found = True
             print(f"Skill '{name}' deleted." if found else f"Skill '{name}' not found.")
+            continue
+
+        # ── Hub commands ──
+        if line.startswith("hub"):
+            from leapflow.cli.commands.hub import cmd_hub
+            hub_args = line.split()[1:] if len(line.split()) > 1 else []
+            await cmd_hub(ctx, hub_args)
             continue
 
         # ── Run command ──

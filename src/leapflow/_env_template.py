@@ -259,4 +259,21 @@ LEAPFLOW_RECORDING_MODE=video
 # LEAPFLOW_COPILOT_CACHE_TTL_S=30.0
 # LEAPFLOW_COPILOT_SPECULATIVE_CACHE_SIZE=100
 # LEAPFLOW_COPILOT_ACTION_RING_SIZE=10
+
+# ═════════════════════════════════════════════════════════════════════
+# Hub — Cloud collaboration (skill sharing and multi-device sync)
+# ═════════════════════════════════════════════════════════════════════
+# LEAPFLOW_HUB_TYPE=modelscope
+# LEAPFLOW_HUB_DEFAULT_OWNER=my-org
+# LEAPFLOW_HUB_DEFAULT_VISIBILITY=private
+# LEAPFLOW_HUB_SYNC_STRATEGY=remote-wins
+# LEAPFLOW_HUB_SYNC_COPILOT=true
+
+# ModelScope Hub credentials
+# MODELSCOPE_API_TOKEN=ms-xxxxx
+# MODELSCOPE_ENDPOINT=https://modelscope.cn
+
+# HuggingFace Hub credentials (future)
+# HF_TOKEN=hf_xxxxx
+# HF_ENDPOINT=https://huggingface.co
 """

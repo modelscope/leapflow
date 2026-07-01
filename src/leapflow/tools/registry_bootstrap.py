@@ -13,6 +13,11 @@ from leapflow.tools.shell_tools import shell_run
 from leapflow.tools.system_tools import env_info, time_get
 from leapflow.tools.text_tools import text_replace, text_search
 from leapflow.skills.discovery import skills_list, skill_view
+from leapflow.tools.hub_tool import (
+    HUB_BRIDGE_TOOLS,
+    HUB_TOOL_DEFINITIONS,
+    HUB_TOOL_HANDLERS,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -158,7 +163,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
-]
+] + HUB_TOOL_DEFINITIONS
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -258,7 +263,7 @@ _BRIDGE_TOOLS = [
         },
         "handler": skill_view,
     },
-]
+] + HUB_BRIDGE_TOOLS
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -270,6 +275,8 @@ _BRIDGE_TOOLS = [
 # ─────────────────────────────────────────────────────────────────────
 
 TOOL_HANDLERS: Dict[str, Any] = {t["name"]: t["handler"] for t in _BRIDGE_TOOLS}
+# Add hub tool handlers
+TOOL_HANDLERS.update(HUB_TOOL_HANDLERS)
 # Add unprefixed aliases matching TOOL_DEFINITIONS names for native tool_calls
 for _td in TOOL_DEFINITIONS:
     _func_name = _td.get("function", {}).get("name", "")

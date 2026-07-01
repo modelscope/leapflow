@@ -326,6 +326,13 @@ class Settings:
     copilot_speculative_cache_size: int = 100
     copilot_action_ring_size: int = 10
 
+    # ── Hub (cloud collaboration) ──
+    hub_type: str = "modelscope"
+    hub_default_owner: str = ""
+    hub_default_visibility: str = "private"
+    hub_sync_strategy: str = "remote-wins"
+    hub_sync_copilot: bool = True
+
     @property
     def has_llm_credentials(self) -> bool:
         return bool(self.llm_api_key.strip())
@@ -635,6 +642,13 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     copilot_speculative_cache_size = int(os.getenv("LEAPFLOW_COPILOT_SPECULATIVE_CACHE_SIZE", "100"))
     copilot_action_ring_size = int(os.getenv("LEAPFLOW_COPILOT_ACTION_RING_SIZE", "10"))
 
+    # Hub (cloud collaboration)
+    hub_type = os.getenv("LEAPFLOW_HUB_TYPE", "modelscope")
+    hub_default_owner = os.getenv("LEAPFLOW_HUB_DEFAULT_OWNER", "")
+    hub_default_visibility = os.getenv("LEAPFLOW_HUB_DEFAULT_VISIBILITY", "private")
+    hub_sync_strategy = os.getenv("LEAPFLOW_HUB_SYNC_STRATEGY", "remote-wins")
+    hub_sync_copilot = _bool("LEAPFLOW_HUB_SYNC_COPILOT", "true")
+
     settings = Settings(
         llm_api_key=api_key,
         llm_base_url=base_url.rstrip("/"),
@@ -814,6 +828,12 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         copilot_cache_ttl_s=copilot_cache_ttl_s,
         copilot_speculative_cache_size=copilot_speculative_cache_size,
         copilot_action_ring_size=copilot_action_ring_size,
+        # Hub
+        hub_type=hub_type,
+        hub_default_owner=hub_default_owner,
+        hub_default_visibility=hub_default_visibility,
+        hub_sync_strategy=hub_sync_strategy,
+        hub_sync_copilot=hub_sync_copilot,
     )
 
     if not settings.llm_api_key:
