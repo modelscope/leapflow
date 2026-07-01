@@ -6,8 +6,9 @@ backend-specific implementations based on hub_type configuration.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from leapflow.hub.protocol import (
     HubBackend,
@@ -86,6 +87,7 @@ class HubClient:
         default_owner: str = "",
         default_visibility: str = "private",
         repo_prefix: str = "leapflow-",
+        search_sources: str = "",
     ):
         """Initialize HubClient with config-driven defaults.
 
@@ -94,12 +96,17 @@ class HubClient:
             default_owner: Default owner/org for repo_id construction.
             default_visibility: Default visibility for new repos.
             repo_prefix: Prefix prepended to skill names in repo_id construction.
+            search_sources: Comma-separated backend names for multi-source search.
         """
         self._hub_type = hub_type
         self._default_owner = default_owner
         self._default_visibility = Visibility(default_visibility)
         self._repo_prefix = repo_prefix
+        self._search_sources: List[str] = [
+            s.strip() for s in (search_sources or hub_type).split(",") if s.strip()
+        ]
         self._backend: Optional[HubBackend] = None
+        self._backend_cache: Dict[str, HubBackend] = {}
 
     @property
     def hub_type(self) -> str:
@@ -133,6 +140,43 @@ class HubClient:
         """
         prefix = f"{self._default_owner}/" if self._default_owner else ""
         return f"{prefix}{self._repo_prefix}{skill_name}"
+
+    # ─── Identifier Routing ────────────────────────────────────────────────
+
+    # Protocol prefixes that route to specific backends.
+    _IDENTIFIER_PREFIXES: Dict[str, str] = {
+        "github://": "github",
+        "hf://": "huggingface",
+        "ms://": "modelscope",
+        "git://": "git",
+    }
+
+    def _route_identifier(self, identifier: str) -> Tuple[str, str]:
+        """Route an identifier to the appropriate backend.
+
+        Returns (backend_name, normalized_identifier).
+        Supports prefix-based routing (github://, hf://, ms://) and
+        URL-based inference (https:// -> git backend).
+        """
+        for prefix, backend_name in self._IDENTIFIER_PREFIXES.items():
+            if identifier.startswith(prefix):
+                return backend_name, identifier[len(prefix):]
+        if identifier.startswith("http"):
+            return "git", identifier
+        return self._hub_type, identifier
+
+    def _get_backend_for(self, backend_name: str) -> HubBackend:
+        """Get or create a backend instance by name (cached)."""
+        if backend_name == self._hub_type:
+            return self.backend
+        if backend_name in self._backend_cache:
+            return self._backend_cache[backend_name]
+        factory = self._registry.get(backend_name)
+        if factory is None:
+            raise ValueError(f"Unknown hub backend: '{backend_name}'")
+        instance = factory()
+        self._backend_cache[backend_name] = instance
+        return instance
 
     # ─── Public API ──────────────────────────────────────────────────────────
 
@@ -169,14 +213,18 @@ class HubClient:
     ) -> SkillBundle:
         """Pull a skill bundle from the remote hub.
 
+        Supports identifier routing: github://owner/repo, hf://owner/repo, etc.
+
         Args:
-            repo_id: Repository identifier to pull from.
+            repo_id: Repository identifier (may include protocol prefix).
             version: Specific version (None = latest).
 
         Returns:
             Complete SkillBundle.
         """
-        return await self.backend.pull_skill(repo_id, version)
+        backend_name, normalized = self._route_identifier(repo_id)
+        backend = self._get_backend_for(backend_name)
+        return await backend.pull_skill(normalized, version)
 
     async def search(
         self,
@@ -193,6 +241,46 @@ class HubClient:
             List of matching skill summaries.
         """
         return await self.backend.list_remote_skills(owner=owner, query=query)
+
+    async def search_all(
+        self,
+        query: str,
+        owner: str | None = None,
+    ) -> List[SkillSummary]:
+        """Search across all configured search sources in parallel.
+
+        Queries each backend in ``search_sources`` concurrently and merges
+        results with deduplication (by name, prefer first occurrence).
+
+        Args:
+            query: Free-text search query.
+            owner: Optional owner filter (applied to all backends).
+
+        Returns:
+            Merged and deduplicated list of skill summaries.
+        """
+
+        async def _query_one(backend_name: str) -> List[SkillSummary]:
+            try:
+                backend = self._get_backend_for(backend_name)
+                return await backend.list_remote_skills(owner=owner, query=query)
+            except Exception as exc:
+                logger.warning("Search failed for backend '%s': %s", backend_name, exc)
+                return []
+
+        tasks = [_query_one(name) for name in self._search_sources]
+        all_results = await asyncio.gather(*tasks)
+
+        # Merge: flatten + deduplicate by name (first occurrence wins)
+        seen: set = set()
+        merged: List[SkillSummary] = []
+        for result_list in all_results:
+            if isinstance(result_list, list):
+                for s in result_list:
+                    if s.name not in seen:
+                        seen.add(s.name)
+                        merged.append(s)
+        return merged
 
     async def sync_skills(
         self,
@@ -285,6 +373,14 @@ def _register_defaults() -> None:
         return HuggingFaceBackend()  # type: ignore[return-value]
 
     HubClient.register("huggingface", _huggingface_factory)
+
+    # GitHub backend — available if httpx installed (standard dep)
+    def _github_factory() -> HubBackend:
+        from leapflow.hub.backends.github import GitHubBackend
+
+        return GitHubBackend()  # type: ignore[return-value]
+
+    HubClient.register("github", _github_factory)
 
 
 _register_defaults()

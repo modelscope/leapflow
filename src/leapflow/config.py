@@ -333,6 +333,7 @@ class Settings:
     hub_sync_strategy: str = "remote-wins"
     hub_sync_copilot: bool = True
     hub_repo_prefix: str = "leapflow-"
+    hub_search_sources: str = "modelscope"  # comma-separated backend names for multi-source search
 
     @property
     def has_llm_credentials(self) -> bool:
@@ -650,6 +651,7 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     hub_sync_strategy = os.getenv("LEAPFLOW_HUB_SYNC_STRATEGY", "remote-wins")
     hub_sync_copilot = _bool("LEAPFLOW_HUB_SYNC_COPILOT", "true")
     hub_repo_prefix = os.getenv("LEAPFLOW_HUB_REPO_PREFIX", "leapflow-")
+    hub_search_sources = os.getenv("LEAPFLOW_HUB_SEARCH_SOURCES", "modelscope")
 
     settings = Settings(
         llm_api_key=api_key,
@@ -837,6 +839,7 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         hub_sync_strategy=hub_sync_strategy,
         hub_sync_copilot=hub_sync_copilot,
         hub_repo_prefix=hub_repo_prefix,
+        hub_search_sources=hub_search_sources,
     )
 
     if not settings.llm_api_key:

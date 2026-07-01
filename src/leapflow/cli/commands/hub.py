@@ -47,6 +47,7 @@ def _build_hub_client(ctx: "Context"):
         default_owner=ctx.settings.hub_default_owner,
         default_visibility=ctx.settings.hub_default_visibility,
         repo_prefix=ctx.settings.hub_repo_prefix,
+        search_sources=ctx.settings.hub_search_sources,
     )
 
 
@@ -440,24 +441,34 @@ async def _hub_sync(ctx: "Context", args: List[str]) -> int:
 
 async def _hub_search(ctx: "Context", args: List[str]) -> int:
     """Search for skills on the Hub."""
-    if not args:
-        print("  Usage: hub search <query>")
+    search_all = "--all" in args
+    filtered_args = [a for a in args if a != "--all"]
+
+    if not filtered_args:
+        print("  Usage: hub search <query> [--all]")
         return 1
 
-    query = " ".join(args)
+    query = " ".join(filtered_args)
     client = _build_hub_client(ctx)
-    print(f"  Searching '{query}' on {client.hub_type}...")
 
-    results = await client.search(query)
+    if search_all:
+        sources = client._search_sources
+        print(f"  Searching '{query}' across {', '.join(sources)}...")
+        results = await client.search_all(query)
+    else:
+        print(f"  Searching '{query}' on {client.hub_type}...")
+        results = await client.search(query)
+
     if not results:
         print("  No results found.")
         return 0
 
-    print(f"\n  {'Name':<30} {'Version':<10} {'Downloads':<10} Description")
-    print(f"  {'-'*75}")
+    print(f"\n  {'Name':<30} {'Source':<12} {'Version':<10} Description")
+    print(f"  {'-'*80}")
     for r in results:
-        desc = (r.description[:35] + "...") if len(r.description) > 38 else r.description
-        print(f"  {r.name:<30} {r.version:<10} {r.downloads:<10} {desc}")
+        desc = (r.description[:30] + "...") if len(r.description) > 33 else r.description
+        source = r.hub_type or client.hub_type
+        print(f"  {r.name:<30} {source:<12} {r.version:<10} {desc}")
 
     print(f"\n  {len(results)} result(s) found.")
     return 0
