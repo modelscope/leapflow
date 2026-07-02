@@ -275,12 +275,13 @@ class SyncEngine:
         (user must resolve manually).
         """
         if self._strategy == "manual":
-            # In manual mode, skip any action where both versions exist
-            # and a clear winner isn't determined by version comparison
+            # In manual mode, keep clear-cut actions and explicit conflicts
+            # (conflicts are surfaced to user for manual resolution)
             return [
                 a
                 for a in actions
-                if a.reason in ("local_only", "remote_only")
+                if a.direction == "conflict"
+                or a.reason in ("local_only", "remote_only")
                 or (a.reason == "local_newer" and a.direction == "push")
                 or (a.reason == "remote_newer" and a.direction == "pull")
             ]

@@ -56,6 +56,10 @@ def _manifest_to_dict(manifest: SkillManifest) -> dict:
         "author": manifest.author,
         "hub_type": manifest.hub_type,
         "repo_id": manifest.repo_id,
+        "content_hash": manifest.content_hash,
+        "updated_by": manifest.updated_by,
+        "updated_at": manifest.updated_at,
+        "tags": manifest.tags,
     }
 
 
@@ -74,6 +78,10 @@ def _dict_to_manifest(data: dict) -> SkillManifest:
         author=data.get("author", ""),
         hub_type=data.get("hub_type", ""),
         repo_id=data.get("repo_id", ""),
+        content_hash=data.get("content_hash", ""),
+        updated_by=data.get("updated_by", ""),
+        updated_at=data.get("updated_at", ""),
+        tags=data.get("tags", []) or [],
     )
 
 
@@ -171,6 +179,10 @@ class SkillSerializer:
             "readme": bundle.readme,
             "hub_type": m.hub_type,
             "repo_id": m.repo_id,
+            "content_hash": m.content_hash,
+            "updated_by": m.updated_by,
+            "updated_at": m.updated_at,
+            "tags": m.tags,
         }
 
     def bundle_to_files(self, bundle: SkillBundle) -> Dict[str, str]:
