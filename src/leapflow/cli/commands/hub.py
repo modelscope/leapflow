@@ -162,6 +162,7 @@ async def _hub_whoami(ctx: "Context", args: List[str]) -> int:
 async def _hub_push(ctx: "Context", args: List[str]) -> int:
     """Push a skill to the Hub."""
     from leapflow.hub import ContentSanitizer, SkillSerializer, Visibility
+    from leapflow.hub.protocol import VersionConflictError
 
     if not args:
         print("  Usage: hub push <skill-name> [--visibility private|public] [--version v1.0.0]")
@@ -215,6 +216,14 @@ async def _hub_push(ctx: "Context", args: List[str]) -> int:
     warnings = sanitizer.scan(bundle)
     _print_warnings(warnings, "Sanitization")
 
+    # Step 3b: Check for blocking findings
+    if sanitizer.has_blocking_findings(warnings) and "--force" not in args:
+        print("  HIGH severity findings detected. Use --force to push anyway.")
+        confirmed = await _confirm("Push despite high-severity warnings?", dangerous=True, skill_name=skill_name)
+        if not confirmed:
+            print("  Push aborted.")
+            return 0
+
     # Step 4: Show summary
     visibility = Visibility(visibility_str)
     client = _build_hub_client(ctx)
@@ -241,8 +250,38 @@ async def _hub_push(ctx: "Context", args: List[str]) -> int:
         print("  Cancelled.")
         return 0
 
-    # Step 6: Push
-    result = await client.push(bundle, skill_name=bundle.manifest.name, visibility=visibility)
+    # Step 6: Auto-fill author info
+    import dataclasses
+    from datetime import datetime, timezone
+
+    try:
+        user_info = await client.backend.authenticate()
+        username = user_info.username
+    except Exception:
+        username = ""
+
+    if username:
+        manifest = dataclasses.replace(
+            bundle.manifest,
+            author=bundle.manifest.author or username,
+            updated_by=username,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        bundle = dataclasses.replace(bundle, manifest=manifest)
+
+    # Step 7: Push
+    force = "--force" in args
+    try:
+        result = await client.push(bundle, skill_name=bundle.manifest.name, visibility=visibility, force=force)
+    except VersionConflictError as e:
+        print(f"  Version conflict: {e}")
+        confirmed = await _confirm("Force push anyway?")
+        if confirmed:
+            result = await client.push(bundle, skill_name=bundle.manifest.name, visibility=visibility, force=True)
+        else:
+            print("  Push aborted.")
+            return 0
+
     print(f"\n  Pushed successfully!")
     print(f"    Repo: {result.repo_id}")
     print(f"    Version: {result.version}")

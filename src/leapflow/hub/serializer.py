@@ -6,6 +6,8 @@ Uses YAML for manifest serialization with JSON fallback if PyYAML is unavailable
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import logging
 from typing import TYPE_CHECKING, Dict
@@ -25,6 +27,15 @@ try:
 except ImportError:
     _YAML_AVAILABLE = False
     logger.debug("PyYAML not available; using JSON fallback for manifest serialization")
+
+
+def compute_content_hash(bundle: "SkillBundle") -> str:
+    """Compute SHA256[:16] over skill's semantic content for integrity tracking."""
+    hasher = hashlib.sha256()
+    hasher.update((bundle.source_code or "").encode())
+    hasher.update(json.dumps(bundle.manifest.parameters, sort_keys=True).encode())
+    hasher.update(json.dumps(sorted(bundle.manifest.triggers)).encode())
+    return hasher.hexdigest()[:16]
 
 
 # ─── YAML Helpers ────────────────────────────────────────────────────────────
@@ -121,13 +132,20 @@ class SkillSerializer:
             author=stored_skill.get("author", ""),
         )
 
-        return SkillBundle(
+        bundle = SkillBundle(
             manifest=manifest,
             source_code=stored_skill.get("source_code", ""),
             trajectory_skeleton=stored_skill.get("trajectory_skeleton", ""),
             copilot_prior=stored_skill.get("copilot_prior", ""),
             readme=stored_skill.get("readme", ""),
         )
+
+        # Auto-fill content hash if not already set
+        if not bundle.manifest.content_hash:
+            updated_manifest = dataclasses.replace(bundle.manifest, content_hash=compute_content_hash(bundle))
+            bundle = dataclasses.replace(bundle, manifest=updated_manifest)
+
+        return bundle
 
     def import_skill(self, bundle: SkillBundle) -> dict:
         """Convert bundle back to fields suitable for SkillLibraryStore.save().

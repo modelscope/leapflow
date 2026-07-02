@@ -17,6 +17,7 @@ from leapflow.hub.protocol import (
     SkillManifest,
     SkillSummary,
     UserInfo,
+    VersionConflictError,
     Visibility,
 )
 
@@ -189,6 +190,8 @@ class HubClient:
         skill_name: str | None = None,
         repo_id: str | None = None,
         visibility: Visibility | None = None,
+        *,
+        force: bool = False,
     ) -> PushResult:
         """Push a skill bundle to the remote hub.
 
@@ -197,9 +200,13 @@ class HubClient:
             skill_name: Skill name (used to construct repo_id if repo_id not given).
             repo_id: Explicit repo_id (overrides auto-construction).
             visibility: Repository visibility (defaults to client default).
+            force: Skip version conflict check if True.
 
         Returns:
             PushResult with published version and URL.
+
+        Raises:
+            VersionConflictError: If remote has same or newer version (unless force=True).
         """
         if repo_id is None:
             name = skill_name or bundle.manifest.name
@@ -207,7 +214,41 @@ class HubClient:
 
         vis = visibility or self._default_visibility
 
+        if not force:
+            conflict = await self._check_push_conflict(repo_id, bundle.manifest.version)
+            if conflict:
+                raise VersionConflictError(conflict)
+
         return await self.backend.push_skill(bundle, repo_id, vis)
+
+    async def _check_push_conflict(self, repo_id: str, local_version: str) -> str | None:
+        """Check if remote already has same or newer version."""
+        try:
+            versions = await self.backend.get_skill_versions(repo_id)
+            if not versions:
+                return None
+            latest = versions[0]
+            if self._version_gte(latest.version, local_version):
+                return (
+                    f"Remote already has v{latest.version} "
+                    f"(pushing v{local_version}). "
+                    f"Increment version or use force=True."
+                )
+        except Exception:
+            return None  # Repo doesn't exist yet or network error
+        return None
+
+    @staticmethod
+    def _version_gte(remote: str, local: str) -> bool:
+        """Check if remote version >= local version (semver comparison)."""
+        def _parse(v: str):
+            v = v.lstrip("vV")
+            parts = v.split(".")
+            return tuple(int(p) for p in parts if p.isdigit())
+        try:
+            return _parse(remote) >= _parse(local)
+        except (ValueError, IndexError):
+            return remote >= local  # Fallback to string comparison
 
     async def pull(
         self,

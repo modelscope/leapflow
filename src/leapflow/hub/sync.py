@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class SyncAction:
     """A single sync operation to perform."""
 
-    direction: str  # "push" | "pull"
+    direction: str  # "push" | "pull" | "conflict"
     skill_name: str
     local_version: str  # "" if not local
     remote_version: str  # "" if not remote
@@ -227,9 +227,19 @@ class SyncEngine:
                             )
                         )
                 else:
-                    # Same version — resolve based on strategy for edge cases
-                    # (versions equal means no action needed)
-                    pass
+                    # Same version — check content hash for silent divergence
+                    local_hash = getattr(local, "content_hash", "")
+                    remote_hash = getattr(remote, "content_hash", "") if hasattr(remote, "content_hash") else ""
+                    if local_hash and remote_hash and local_hash != remote_hash:
+                        actions.append(SyncAction(
+                            direction="conflict",
+                            skill_name=name,
+                            local_version=local.version,
+                            remote_version=remote.version,
+                            reason="content_diverged",
+                            repo_id=getattr(remote, "repo_id", ""),
+                        ))
+                    # else: truly identical, skip
 
         # Process skills only on remote
         if not push_only:
@@ -298,7 +308,11 @@ class SyncEngine:
 
         for action in plan.actions:
             try:
-                if action.direction == "push":
+                if action.direction == "conflict":
+                    logger.warning("Conflict: skill '%s' v%s has diverged content. Resolve manually.", action.skill_name, action.local_version)
+                    completed.append(f"CONFLICT: {action.skill_name} (content diverged, resolve manually)")
+                    continue
+                elif action.direction == "push":
                     desc = await self._execute_push(action)
                 else:
                     desc = await self._execute_pull(action)
