@@ -25,7 +25,7 @@ _last_hint: Optional["PredictionCandidate"] = None
 
 
 async def cmd_interactive(ctx: "Context") -> int:
-    """Persistent REPL session supporting learn/run/skills/chat switching."""
+    """Persistent REPL session supporting teach/run/skills/chat switching."""
     require_initialized(ctx)
     from leapflow.utils.terminal_io import TerminalIOProvider
     from leapflow.engine.session import SessionMode
@@ -184,15 +184,13 @@ async def cmd_interactive(ctx: "Context") -> int:
             continue
 
         # ── Teach/Learn commands ──
-        if line.startswith("teach start") or line.startswith("learn start") or line.startswith("教学开始") or line in ("teach", "learn"):
+        if line.startswith("teach start") or line.startswith("教学开始") or line == "teach":
             if ctx.session and ctx.session.mode == SessionMode.LEARNING:
                 print("Already in teaching mode. Say 'teach stop' to end.")
                 continue
             goal = ""
             if line.startswith("teach start "):
                 goal = line[len("teach start "):]
-            elif line.startswith("learn start "):
-                goal = line[len("learn start "):]
             elif line.startswith("教学开始 "):
                 goal = line[len("教学开始 "):]
             try:
@@ -206,7 +204,7 @@ async def cmd_interactive(ctx: "Context") -> int:
                 print(f"Error: {e}")
             continue
 
-        if line in ("teach stop", "learn stop", "stop", "done", "教学结束", "结束"):
+        if line in ("teach stop", "stop", "done", "教学结束", "结束"):
             if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
                 if _learning:
                     ctx.imitation.end_control_input()
@@ -265,7 +263,7 @@ async def cmd_interactive(ctx: "Context") -> int:
                 print(f"Error: {e}")
             continue
 
-        if line in ("teach quit", "teach discard", "learn quit", "learn discard", "quit", "discard", "退出教学", "放弃"):
+        if line in ("teach quit", "teach discard", "quit", "discard", "退出教学", "放弃"):
             if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
                 print("Not in teaching mode.")
                 continue
@@ -276,7 +274,7 @@ async def cmd_interactive(ctx: "Context") -> int:
                 print(f"Error: {e}")
             continue
 
-        if line in ("teach save", "learn save", "save", "保存"):
+        if line in ("teach save", "save", "保存"):
             if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
                 print("Not in teaching mode.")
                 continue
@@ -295,13 +293,13 @@ async def cmd_interactive(ctx: "Context") -> int:
         if _learning:
             ctx.imitation.end_control_input()
 
-        if line in ("teach pause", "learn pause", "pause", "暂停"):
+        if line in ("teach pause", "pause", "暂停"):
             if ctx.session:
                 ctx.session.pause_learning()
                 print("Recording paused.")
             continue
 
-        if line in ("teach resume", "learn resume", "resume", "继续"):
+        if line in ("teach resume", "resume", "继续"):
             if ctx.session and ctx.session.mode == SessionMode.LEARNING:
                 ctx.session.resume_learning()
                 print("Recording resumed.")
@@ -309,11 +307,8 @@ async def cmd_interactive(ctx: "Context") -> int:
                 print("Not in teaching mode. Use 'teach resume <id>' to resume a saved session.")
             continue
 
-        if line.startswith("teach resume ") or line.startswith("learn resume "):
-            if line.startswith("teach resume "):
-                resume_id = line[len("teach resume "):].strip()
-            else:
-                resume_id = line[len("learn resume "):].strip()
+        if line.startswith("teach resume "):
+            resume_id = line[len("teach resume "):].strip()
             if not resume_id:
                 print("Usage: teach resume <session_id>")
                 continue

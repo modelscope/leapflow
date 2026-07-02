@@ -249,8 +249,8 @@ class AgentEngine:
         self._inject_pending_skill_reminder()
         self._wm.remember_chat(build_user_message_text(user_text))
 
-        # 3. Learn/teach command (special session mode switch)
-        if self._is_learn_command(user_text):
+        # 3. Teach command (special session mode switch)
+        if self._is_teach_command(user_text):
             return await self._handle_learn_command(user_text)
 
         # 4. Everything else → unified tool loop (LLM decides tools vs direct response)
@@ -284,8 +284,8 @@ class AgentEngine:
         self._inject_pending_skill_reminder()
         self._wm.remember_chat(build_user_message_text(user_text))
 
-        # 3. Learn/teach command (special session mode switch)
-        if self._is_learn_command(user_text):
+        # 3. Teach command (special session mode switch)
+        if self._is_teach_command(user_text):
             result = await self._handle_learn_command(user_text)
             yield result
             return
@@ -1592,36 +1592,34 @@ class AgentEngine:
 
     # ── Learn Command Detection ─────────────────────────────────────────
 
-    # Patterns that indicate a genuine learn/teach session command.
+    # Patterns that indicate a genuine teach session command.
     # Uses regex word-boundary checks to avoid false positives like
-    # "learn about python" or "teaching methods for math".
-    _LEARN_COMMAND_RE = re.compile(
+    # "teaching methods for math".
+    _TEACH_COMMAND_RE = re.compile(
         r"^(?:"
-        r"(?:start\s+)?learn(?:ing)?(?:\s+(?:this|that|it|now))?$"
-        r"|(?:start\s+)?teach(?:ing)?(?:\s+(?:this|that|it|me|now))?$"
-        r"|stop\s+(?:learn|teach)(?:ing)?"
-        r"|pause\s+(?:learn|teach)(?:ing)?"
-        r"|resume\s+(?:learn|teach)(?:ing)?"
-        r"|done\s+(?:learn|teach)(?:ing)?"
-        r"|finish\s+(?:learn|teach)(?:ing)?"
-        r"|end\s+(?:learn|teach)(?:ing)?"
+        r"(?:start\s+)?teach(?:ing)?(?:\s+(?:this|that|it|me|now))?$"
+        r"|stop\s+teach(?:ing)?"
+        r"|pause\s+teach(?:ing)?"
+        r"|resume\s+teach(?:ing)?"
+        r"|done\s+teach(?:ing)?"
+        r"|finish\s+teach(?:ing)?"
+        r"|end\s+teach(?:ing)?"
         r"|教(?:我|一下)?$"
-        r"|学习(?:这个|一下)?$"
-        r"|开始(?:学习|教学)"
-        r"|停止学习|暂停学习|继续学习|结束学习"
+        r"|开始教学"
+        r"|停止教学|暂停教学|继续教学|结束教学"
         r"|watch\s+me"
         r")",
         re.IGNORECASE,
     )
 
-    def _is_learn_command(self, text: str) -> bool:
-        """Check if text is a learn/teach command that needs special session handling.
+    def _is_teach_command(self, text: str) -> bool:
+        """Check if text is a teach command that needs special session handling.
 
-        Uses regex matching to avoid false positives like 'learn about python'
-        or 'teach me how to cook' which should go through the unified tool loop.
+        Uses regex matching to avoid false positives like 'teach me how to cook'
+        which should go through the unified tool loop.
         """
         stripped = text.strip()
-        return bool(self._LEARN_COMMAND_RE.match(stripped))
+        return bool(self._TEACH_COMMAND_RE.match(stripped))
 
     async def _handle_learn_command(self, user_text: str) -> str:
         """Route learn/teach commands through intent classifier for sub-intent dispatch."""

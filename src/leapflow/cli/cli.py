@@ -42,7 +42,7 @@ async def _async_main(args: argparse.Namespace) -> int:
         elif cmd == "chat":
             from leapflow.cli.commands.chat import cmd_chat
             return await cmd_chat(ctx, args.prompt, getattr(args, "thinking", False))
-        elif cmd in ("teach", "learn"):  # "learn" kept as backward-compat alias
+        elif cmd == "teach":
             resume_id = getattr(args, "resume", None)
             if resume_id:
                 from leapflow.cli.commands.teach import cmd_teach_resume
@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
 
     subparsers = parser.add_subparsers(dest="command")
 
-    # leap teach (primary) + leap learn (backward-compat alias)
+    # leap teach
     teach_parser = subparsers.add_parser("teach", parents=[common], help="Interactive teaching mode")
     teach_parser.add_argument("goal", nargs="?", default="", help="Goal description")
     teach_parser.add_argument("--prompt", dest="goal_flag", help="Goal description (alternative)")
@@ -112,17 +112,6 @@ def main(argv: list[str] | None = None) -> int:
     teach_parser.add_argument("--timeout", type=float, help="Idle timeout in seconds")
     teach_parser.add_argument("--resume", metavar="ID", help="Resume a previous teaching session")
     teach_parser.add_argument(
-        "--field", action="append", default=[],
-        help="Session-scoped perceptual field rule (app:context[:level])",
-    )
-    # Hidden backward-compat alias
-    learn_parser = subparsers.add_parser("learn", parents=[common])
-    learn_parser.add_argument("goal", nargs="?", default="", help="Goal description")
-    learn_parser.add_argument("--prompt", dest="goal_flag", help="Goal description (alternative)")
-    learn_parser.add_argument("--goal", dest="goal_opt", default="", help="Goal description (alternative)")
-    learn_parser.add_argument("--timeout", type=float, help="Idle timeout in seconds")
-    learn_parser.add_argument("--resume", metavar="ID", help="Resume a previous teaching session")
-    learn_parser.add_argument(
         "--field", action="append", default=[],
         help="Session-scoped perceptual field rule (app:context[:level])",
     )
@@ -166,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Pre-parse: detect if first non-flag arg is a known subcommand ──
     # If not, treat everything non-flag as a chat prompt.
-    known_commands = {"teach", "learn", "run", "skills", "relearn", "host"}
+    known_commands = {"teach", "run", "skills", "relearn", "host"}
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
 
     # Find first non-flag argument
@@ -186,8 +175,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(effective_argv)
 
-    # Resolve teach/learn goal from positional, --prompt, or --goal
-    if args.command in ("teach", "learn"):
+    # Resolve teach goal from positional, --prompt, or --goal
+    if args.command == "teach":
         goal = getattr(args, "goal", "") or ""
         if not goal:
             goal = getattr(args, "goal_flag", "") or getattr(args, "goal_opt", "") or ""

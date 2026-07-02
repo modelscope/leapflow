@@ -308,7 +308,6 @@ Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` 
 | _(default)_ | `leap` | Launch interactive REPL with multi-turn conversation |
 | _(prompt)_ | `leap "question"` | Single-turn chat (answer + exit) |
 | `teach` | `leap teach [goal] [options]` | Record a demonstration and distill into a skill |
-| `learn` | `leap learn [goal] [options]` | Record a demonstration and distill into a skill (alias for `teach`) |
 | `run` | `leap run [prompt] [options]` | Execute a matched skill |
 | `skills` | `leap skills [action] [name]` | Manage the skill library |
 | `relearn` | `leap relearn <trajectory_id>` | Re-run learning pipeline on a saved trajectory |
