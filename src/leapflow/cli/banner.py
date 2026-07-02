@@ -162,7 +162,7 @@ def _print_quickstart() -> None:
     rows = (
         ("leap",            "Interactive REPL mode"),
         ("leap \"...\"",    "Single-turn chat"),
-        ("leap learn",      "Learn a new skill"),
+        ("leap teach",      "Teach a new skill"),
         ("leap run",        "Execute a learned skill"),
     )
     cmd_w = 18  # padded command column width

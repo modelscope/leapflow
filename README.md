@@ -233,12 +233,12 @@ uv run leap --mock-host
 
 > LeapFlow explains its capabilities: task execution, skill learning, workflow automation.
 
-### Step 3: Teach a Skill (Learn Mode)
+### Step 3: Teach a Skill (Teaching Mode)
 
-Open a new terminal and start a learning session:
+Open a new terminal and start a teaching session:
 
 ```bash
-uv run leap learn "organize screenshots by date"
+uv run leap teach "organize screenshots by date"
 ```
 
 > LeapFlow begins observing your actions (screen recording + event capture). Work normally — move files, rename, create folders. When done:
@@ -280,7 +280,7 @@ The REPL supports multi-turn conversation with tool use, memory, and real-time s
 ### Teach Mode — Learn from Demonstration
 
 ```bash
-uv run leap learn "describe what you'll demonstrate"
+uv run leap teach "describe what you'll demonstrate"
 ```
 
 LeapFlow records your actions as a trajectory, then distills them into a parameterized skill. The skill progresses through maturity tiers: `DRAFT → VERIFIED → PRODUCTION`.
@@ -307,7 +307,7 @@ Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` 
 |---------|--------|-------------|
 | _(default)_ | `leap` | Launch interactive REPL with multi-turn conversation |
 | _(prompt)_ | `leap "question"` | Single-turn chat (answer + exit) |
-| `learn` | `leap learn [goal] [options]` | Record a demonstration and distill into a skill |
+| `teach` | `leap teach [goal] [options]` | Record a demonstration and distill into a skill |
 | `run` | `leap run [prompt] [options]` | Execute a matched skill |
 | `skills` | `leap skills [action] [name]` | Manage the skill library |
 | `relearn` | `leap relearn <trajectory_id>` | Re-run learning pipeline on a saved trajectory |
@@ -320,7 +320,7 @@ Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` 
 | `--mock-host` | Use in-process mock host (no native perception) |
 | `--thinking` | Enable LLM extended reasoning mode |
 
-**`leap learn` options:**
+**`leap teach` options:**
 
 | Flag | Description |
 |------|-------------|
@@ -521,7 +521,7 @@ leapflow/
 
 ### Adding a New Skill (Plugin)
 
-1. Create a skill JSON (or teach via `leap learn`).
+1. Create a skill JSON (or teach via `leap teach`).
 2. Import it: `leap skills import my_skill.json`
 3. The skill appears in the registry with `DRAFT` maturity.
 4. Each successful execution increases confidence → `VERIFIED` → `PRODUCTION`.
