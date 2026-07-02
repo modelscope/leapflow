@@ -163,7 +163,7 @@ async def cmd_skills(
         resumable = [s for s in sessions if s["status"] == "recording"]
         if resumable:
             print()
-            print(f"Resumable: {len(resumable)} session(s). Use: leap learn --resume <ID>")
+            print(f"Resumable: {len(resumable)} session(s). Use: leap teach --resume <ID>")
         return 0
 
     print(f"Unknown skills action: {action}")

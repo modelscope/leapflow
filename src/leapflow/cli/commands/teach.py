@@ -1,4 +1,4 @@
-"""Learn subcommand — interactive learning mode (record → distill)."""
+"""Teach subcommand — interactive teaching mode (record → distill)."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ def parse_field_args(field_args: List[str]) -> "List[Any]":
 
 
 def _handle_field_command(ctx: "Context", subcmd: str) -> None:
-    """Handle 'field <subcmd>' during learn mode."""
+    """Handle 'field <subcmd>' during teach mode."""
     from leapflow.domain.perception import FieldRule, PerceptionLevel
 
     pf_filter = get_perceptual_field_filter(ctx)
@@ -153,7 +153,7 @@ def _print_perception_summary(ctx: "Context") -> None:
     print()
 
 
-async def cmd_learn(ctx: "Context", goal: str, timeout: Optional[float], field_args: Optional[List[str]] = None) -> int:
+async def cmd_teach(ctx: "Context", goal: str, timeout: Optional[float], field_args: Optional[List[str]] = None) -> int:
     require_initialized(ctx)
     if timeout:
         ctx.session.idle_timeout = timeout
@@ -189,7 +189,7 @@ async def cmd_learn(ctx: "Context", goal: str, timeout: Optional[float], field_a
     else:
         mode = ctx.imitation.recorder.recording_mode.value
 
-    print("[ LEARNING STARTED ]")
+    print("[ TEACHING STARTED ]")
     print(f"  Trajectory: {session.trajectory_id}")
     print(f"  Mode:       {mode}")
     print()
@@ -293,7 +293,7 @@ async def cmd_learn(ctx: "Context", goal: str, timeout: Optional[float], field_a
 
     if user_command == "quit":
         await ctx.session.discard_learning()
-        print("Learning discarded. No skill generated.")
+        print("Teaching discarded. No skill generated.")
         return 0
 
     # Note: auto_learn is controlled by LEAPFLOW_LEARN_AUTO_DISTILL config.
@@ -314,7 +314,7 @@ async def cmd_learn(ctx: "Context", goal: str, timeout: Optional[float], field_a
         return 0
 
     print()
-    print("[ LEARNING STOPPED ]")
+    print("[ TEACHING STOPPED ]")
     print(f"  Trajectory: {result.trajectory_id}")
     print(f"  Steps:      {result.step_count}")
     print(f"  Duration:   {result.duration:.1f}s")
@@ -341,13 +341,13 @@ async def cmd_learn(ctx: "Context", goal: str, timeout: Optional[float], field_a
         from leapflow.learning.learnability import LearnabilityDecision
         if report.decision == LearnabilityDecision.SKIP:
             print()
-            print("[ SKIPPED \u2014 NOT WORTH LEARNING ]")
+            print("[ SKIPPED — NOT WORTH LEARNING ]")
             print(f"  Reason: {report.reason}")
             print(f"  Score:  {report.score:.2f}")
             return 0
         elif report.decision == LearnabilityDecision.ASK:
             print()
-            print(f"[ UNCERTAIN \u2014 Score: {report.score:.2f} ]")
+            print(f"[ UNCERTAIN — Score: {report.score:.2f} ]")
             print(f"  {report.reason}")
             try:
                 answer = (await asyncio.to_thread(
@@ -458,7 +458,7 @@ async def _health_check_loop(
         try:
             health = await monitor.check()
             for warning in health.warnings:
-                sys.stderr.write(f"\033[33m  \u26a0 {warning}\033[0m\n")
+                sys.stderr.write(f"\033[33m  ⚠ {warning}\033[0m\n")
                 sys.stderr.flush()
         except Exception:
             pass
@@ -469,8 +469,8 @@ async def _health_check_loop(
             pass
 
 
-async def cmd_learn_resume(ctx: "Context", resume_id: str, timeout: Optional[float]) -> int:
-    """Resume a previous learning session."""
+async def cmd_teach_resume(ctx: "Context", resume_id: str, timeout: Optional[float]) -> int:
+    """Resume a previous teaching session."""
     require_initialized(ctx)
     if timeout:
         ctx.session.idle_timeout = timeout
@@ -484,7 +484,7 @@ async def cmd_learn_resume(ctx: "Context", resume_id: str, timeout: Optional[flo
     traj = ctx.imitation.recorder.current_trajectory
     prior_steps = traj.step_count if traj else 0
 
-    print("[ LEARNING RESUMED ]")
+    print("[ TEACHING RESUMED ]")
     print(f"  Session:    {session.session_id}")
     print(f"  Trajectory: {session.trajectory_id}")
     if session.goal:
@@ -548,7 +548,7 @@ async def cmd_learn_resume(ctx: "Context", resume_id: str, timeout: Optional[flo
 
     if user_command == "quit":
         await ctx.session.discard_learning()
-        print("Learning discarded. No skill generated.")
+        print("Teaching discarded. No skill generated.")
         return 0
 
     print()
@@ -564,7 +564,7 @@ async def cmd_learn_resume(ctx: "Context", resume_id: str, timeout: Optional[flo
         return 0
 
     print()
-    print("[ LEARNING STOPPED ]")
+    print("[ TEACHING STOPPED ]")
     print(f"  Trajectory: {result.trajectory_id}")
     print(f"  Steps:      {result.step_count}")
     print(f"  Duration:   {result.duration:.1f}s")
@@ -575,13 +575,13 @@ async def cmd_learn_resume(ctx: "Context", resume_id: str, timeout: Optional[flo
         from leapflow.learning.learnability import LearnabilityDecision
         if report.decision == LearnabilityDecision.SKIP:
             print()
-            print("[ SKIPPED \u2014 NOT WORTH LEARNING ]")
+            print("[ SKIPPED — NOT WORTH LEARNING ]")
             print(f"  Reason: {report.reason}")
             print(f"  Score:  {report.score:.2f}")
             return 0
         elif report.decision == LearnabilityDecision.ASK:
             print()
-            print(f"[ UNCERTAIN \u2014 Score: {report.score:.2f} ]")
+            print(f"[ UNCERTAIN — Score: {report.score:.2f} ]")
             print(f"  {report.reason}")
             try:
                 answer = (await asyncio.to_thread(
