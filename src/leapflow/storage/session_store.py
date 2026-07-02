@@ -1,6 +1,6 @@
 """Persistent store for learning session metadata.
 
-Enables `leap learn --resume` by persisting LearningSession records across
+Enables `leap teach --resume` by persisting LearningSession records across
 process restarts. Uses the same DuckDB instance as TrajectoryStore.
 """
 
