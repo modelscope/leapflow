@@ -95,6 +95,11 @@ class SkillManifest:
     author: str = ""
     hub_type: str = ""
     repo_id: str = ""
+    # ── Team collaboration fields ──
+    content_hash: str = ""           # SHA256[:16] of (source_code + parameters + triggers)
+    updated_by: str = ""             # Last modifier username
+    updated_at: str = ""             # Last modification ISO timestamp
+    tags: List[str] = field(default_factory=list)  # Classification tags
 
 
 @dataclass(frozen=True)
@@ -209,3 +214,8 @@ class HubBackend(Protocol):
             PermissionError: If the user lacks delete permissions.
         """
         ...
+
+
+class VersionConflictError(Exception):
+    """Raised when push detects a version conflict with remote."""
+    pass

@@ -76,6 +76,38 @@ class ContentSanitizer:
             "pii",
             "Possible phone number: {match}",
         ),
+        # SSH private keys
+        (
+            re.compile(r"-----BEGIN\s+(?:RSA|DSA|EC|OPENSSH)\s+PRIVATE\s+KEY-----"),
+            "high",
+            "token",
+            "SSH private key detected",
+        ),
+        # AWS access key
+        (
+            re.compile(r"AKIA[0-9A-Z]{16}"),
+            "high",
+            "token",
+            "AWS access key: {match}",
+        ),
+        # AWS secret key pattern
+        (
+            re.compile(r"(?i)aws[_-]?secret[_-]?access[_-]?key\s*[=:]\s*[^\s]{20,}"),
+            "high",
+            "token",
+            "AWS secret key pattern: {match}",
+        ),
+        # Hardcoded IP addresses (non-loopback, non-placeholder)
+        (
+            re.compile(
+                r"\b(?!127\.0\.0\.1|0\.0\.0\.0|localhost)"
+                r"(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}"
+                r"(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
+            ),
+            "low",
+            "pii",
+            "IP address: {match}",
+        ),
     ]
 
     def scan(self, bundle: SkillBundle) -> List[SanitizationWarning]:
@@ -127,6 +159,10 @@ class ContentSanitizer:
                             line_number=line_idx,
                         )
                     )
+
+    def has_blocking_findings(self, warnings: List[SanitizationWarning]) -> bool:
+        """Check if any findings are severe enough to block push without --force."""
+        return any(w.severity == "high" for w in warnings)
 
 
 # ─── Security Auditor ────────────────────────────────────────────────────────

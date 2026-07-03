@@ -6,6 +6,8 @@ Uses YAML for manifest serialization with JSON fallback if PyYAML is unavailable
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import logging
 from typing import TYPE_CHECKING, Dict
@@ -27,6 +29,15 @@ except ImportError:
     logger.debug("PyYAML not available; using JSON fallback for manifest serialization")
 
 
+def compute_content_hash(bundle: "SkillBundle") -> str:
+    """Compute SHA256[:16] over skill's semantic content for integrity tracking."""
+    hasher = hashlib.sha256()
+    hasher.update((bundle.source_code or "").encode())
+    hasher.update(json.dumps(bundle.manifest.parameters, sort_keys=True).encode())
+    hasher.update(json.dumps(sorted(bundle.manifest.triggers)).encode())
+    return hasher.hexdigest()[:16]
+
+
 # ─── YAML Helpers ────────────────────────────────────────────────────────────
 
 
@@ -45,6 +56,10 @@ def _manifest_to_dict(manifest: SkillManifest) -> dict:
         "author": manifest.author,
         "hub_type": manifest.hub_type,
         "repo_id": manifest.repo_id,
+        "content_hash": manifest.content_hash,
+        "updated_by": manifest.updated_by,
+        "updated_at": manifest.updated_at,
+        "tags": manifest.tags,
     }
 
 
@@ -63,6 +78,10 @@ def _dict_to_manifest(data: dict) -> SkillManifest:
         author=data.get("author", ""),
         hub_type=data.get("hub_type", ""),
         repo_id=data.get("repo_id", ""),
+        content_hash=data.get("content_hash", ""),
+        updated_by=data.get("updated_by", ""),
+        updated_at=data.get("updated_at", ""),
+        tags=data.get("tags", []) or [],
     )
 
 
@@ -121,13 +140,20 @@ class SkillSerializer:
             author=stored_skill.get("author", ""),
         )
 
-        return SkillBundle(
+        bundle = SkillBundle(
             manifest=manifest,
             source_code=stored_skill.get("source_code", ""),
             trajectory_skeleton=stored_skill.get("trajectory_skeleton", ""),
             copilot_prior=stored_skill.get("copilot_prior", ""),
             readme=stored_skill.get("readme", ""),
         )
+
+        # Auto-fill content hash if not already set
+        if not bundle.manifest.content_hash:
+            updated_manifest = dataclasses.replace(bundle.manifest, content_hash=compute_content_hash(bundle))
+            bundle = dataclasses.replace(bundle, manifest=updated_manifest)
+
+        return bundle
 
     def import_skill(self, bundle: SkillBundle) -> dict:
         """Convert bundle back to fields suitable for SkillLibraryStore.save().
@@ -153,6 +179,10 @@ class SkillSerializer:
             "readme": bundle.readme,
             "hub_type": m.hub_type,
             "repo_id": m.repo_id,
+            "content_hash": m.content_hash,
+            "updated_by": m.updated_by,
+            "updated_at": m.updated_at,
+            "tags": m.tags,
         }
 
     def bundle_to_files(self, bundle: SkillBundle) -> Dict[str, str]:
