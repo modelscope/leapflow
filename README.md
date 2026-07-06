@@ -28,40 +28,47 @@ Unlike instruction-driven agents (Computer-Use, RPA) that reason from scratch on
 
 ## Architecture Overview
 
-LeapFlow implements a **hybrid architecture** — a Python intelligence core paired with `cua-driver` as the native execution layer, communicating via MCP (Model Control Protocol):
+LeapFlow implements a **three-layer hybrid architecture** — a Python intelligence core, a protocol-driven platform adaptation layer, and pluggable execution backends — communicating via the MCP (Model Control Protocol) standard:
 
 ```
-LeapFlow Core (Python)
-├── Engine / OODA Loop + Learning + Copilot
-├── Platform Layer
-│   ├── CuaDriverClient (MCP stdio → cua-driver)   [Execution Layer]
-│   └── Observers (Python native)                    [Event Layer]
-└── EventBus → Signal Fusion → World Model
-
-cua-driver (Native)                                  [External Process]
-├── Screen capture, input injection, accessibility
-└── MCP protocol server (stdio transport)
+┌─────────────────────────────────────────────────────────┐
+│  Intelligence Core (Python)                             │
+│  ├── Engine / OODA Loop + Learning + Copilot           │
+│  ├── Signal Fusion → Causal Engine → World Model       │
+│  └── Skill Synthesis + Memory System                   │
+├─────────────────────────────────────────────────────────┤
+│  Platform Adaptation Layer                              │
+│  ├── Protocol Client (MCP stdio / WebSocket / gRPC)    │
+│  ├── Event Normalizer + Reorder Buffer                 │
+│  └── Capability Negotiation                            │
+├─────────────────────────────────────────────────────────┤
+│  Execution Layer (pluggable backends)                   │
+│  ├── cua-driver (macOS native — default)               │
+│  ├── Mock Host (in-process, for testing)               │
+│  └── (future: remote VM, cloud sandbox, ...)           │
+└─────────────────────────────────────────────────────────┘
 ```
 
 The cognitive pipeline built on top:
 
 ```
-┌───────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────┐
 │  Copilot           Workflow-level next-step prediction    │
-├───────────────────────────────────────────────────────────┤
+├───────────────────────────────────────────────────────────────┤
 │  World Model       State prediction · Experience replay   │
-├───────────────────────────────────────────────────────────┤
+├───────────────────────────────────────────────────────────────┤
 │  Skill Synthesis   Hypothesis → Draft → Verified → Prod  │
-├───────────────────────────────────────────────────────────┤
+├───────────────────────────────────────────────────────────────┤
 │  Causal Engine     Rule · Heuristic · VLM verification    │
-├───────────────────────────────────────────────────────────┤
+├───────────────────────────────────────────────────────────────┤
 │  Perception        Multi-channel signal fusion (7 ch)     │
-├───────────────────────────────────────────────────────────┤
-│  cua-driver        Native execution (MCP protocol)        │
-└───────────────────────────────────────────────────────────┘
+├───────────────────────────────────────────────────────────────┤
+│  Execution Layer   OS interaction (screen, input, AX)     │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-**cua-driver** handles all native OS interactions — screen capture, accessibility tree queries, and input injection — via MCP stdio transport. **Perception** fuses raw signals into a causal timeline. The **Causal Engine** infers why things happened, not just what. The **World Model** builds an internal representation of the environment and learns from prediction errors. **Skill Synthesis** distills observations into parameterized, reusable skills with maturity tracking. The **Copilot** predicts your next workflow step and offers proactive suggestions — like GitHub Copilot, but for everything you do on your computer.
+The **Execution Layer** provides native OS interactions — screen capture, accessibility tree queries, and input injection. The default backend is `cua-driver` (macOS, MCP stdio transport), but the architecture is backend-agnostic via the Platform Adaptation Layer. **Perception** fuses raw signals into a causal timeline. The **Causal Engine** infers why things happened, not just what. The **World Model** builds an internal representation of the environment and learns from prediction errors. **Skill Synthesis** distills observations into parameterized, reusable skills with maturity tracking. The **Copilot** predicts your next workflow step and offers proactive suggestions — like GitHub Copilot, but for everything you do on your computer.
+
 
 ---
 
@@ -71,11 +78,11 @@ The cognitive pipeline built on top:
 |-----------|---------|----------|
 | Python | ≥ 3.11 | Runtime (3.11–3.14 supported) |
 | [uv](https://github.com/astral-sh/uv) | latest | Fast package manager & virtualenv |
-| macOS | 14.0+ (Sonoma) | Required for native perception |
-| [cua-driver](https://github.com/trycua/cua) | latest | Execution layer — screen capture, input injection, accessibility |
+| macOS | 14.0+ (Sonoma) | Required for native perception (execution backend) |
+| [cua-driver](https://github.com/trycua/cua) | latest | Default execution backend — screen capture, input injection, accessibility |
 | LLM API Key | — | DashScope, OpenAI, DeepSeek, or any OpenAI-compatible provider |
 
-> **Note:** You can run LeapFlow on any platform with `--mock-host` (no native perception), but full signal capture requires macOS with `cua-driver` installed and Accessibility permissions granted.
+> **Note:** You can run LeapFlow on any platform with `--mock-host` (no native perception), but full signal capture requires macOS with an execution backend (currently `cua-driver`) installed and Accessibility permissions granted.
 
 ## Installation
 
@@ -113,9 +120,9 @@ LEAPFLOW_LLM_BASE_URL=https://api.openai.com/v1
 LEAPFLOW_LLM_MODEL=gpt-4o
 ```
 
-### 3. Install cua-driver (macOS only)
+### 3. Install Execution Backend (macOS only)
 
-`cua-driver` is the native execution layer that provides screen capture, accessibility tree access, and input injection via the MCP protocol. Skip this step if you just want to explore with `--mock-host`.
+The default execution backend is `cua-driver`, which provides screen capture, accessibility tree access, and input injection via the MCP protocol. Skip this step if you just want to explore with `--mock-host`.
 
 ```bash
 brew install trycua/tap/cua-driver
@@ -124,7 +131,7 @@ brew install trycua/tap/cua-driver
 Verify the driver is available:
 
 ```bash
-uv run leap host doctor       # Checks cua-driver status and permissions
+uv run leap host doctor       # Checks execution backend status and permissions
 ```
 
 > **Tip:** macOS will prompt for Accessibility and Screen Recording permissions on first use. Grant both in System Settings → Privacy & Security.
@@ -328,7 +335,7 @@ Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` 
 | `run` | `leap run [prompt] [options]` | Execute a matched skill |
 | `skills` | `leap skills [action] [name]` | Manage the skill library |
 | `relearn` | `leap relearn <trajectory_id>` | Re-run learning pipeline on a saved trajectory |
-| `host` | `leap host <action>` | Manage cua-driver connection and diagnostics |
+| `host` | `leap host <action>` | Manage execution backend connection and diagnostics |
 
 **Global Flags:**
 
@@ -372,8 +379,8 @@ Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` 
 
 | Action | Description |
 |--------|-------------|
-| `doctor` | Check cua-driver installation, version, and macOS permissions |
-| `status` | Show connection status to cua-driver |
+| `doctor` | Check execution backend installation, version, and macOS permissions |
+| `status` | Show connection status to execution backend |
 
 </details>
 
@@ -465,19 +472,19 @@ LEAPFLOW_VERBOSE_PROGRESS=true     # Show tool execution progress inline
 
 ---
 
-## Host Management (cua-driver)
+## Host Management (Execution Backend)
 
-For full perception (screen capture, accessibility tree, input events), you need `cua-driver` installed:
+For full perception (screen capture, accessibility tree, input events), you need an execution backend installed. The default is `cua-driver`:
 
 ```bash
-# Check cua-driver and permissions
-uv run leap host doctor          # Verifies cua-driver binary, version, permissions
+# Check execution backend and permissions
+uv run leap host doctor          # Verifies backend binary, version, permissions
 
 # Start with full perception
-uv run leap                      # Connects to cua-driver via MCP automatically
+uv run leap                      # Connects to execution backend via MCP automatically
 
 # Without native perception
-uv run leap --mock-host          # Runs without cua-driver (for testing/exploration)
+uv run leap --mock-host          # Runs with in-process mock (for testing/exploration)
 ```
 
 > **Important:** macOS will prompt for Accessibility and Screen Recording permissions on first use. Grant both in System Settings → Privacy & Security.
@@ -591,7 +598,7 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | `analysis/` | Six-layer denoising pipeline for trajectory refinement |
 | `engine/` | Session orchestration and ReAct execution loop |
 | `memory/` | Three-tier event-driven memory (working → episodic → long-term) |
-| `platform/` | Platform adaptation layer and MCP client (cua-driver communication) |
+| `platform/` | Platform adaptation layer — protocol abstraction for pluggable execution backends |
 | `hub/` | Multi-source skill hub (ModelScope, GitHub, local) |
 
 <details>
@@ -610,13 +617,13 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | Engine | `src/leapflow/engine/` | session, react_loop, tools | Session orchestration, ReAct loop, tool dispatch, context compression |
 | Memory | `src/leapflow/memory/` | working, episodic, long_term | Three-tier event-driven memory with promotion/eviction |
 | LLM | `src/leapflow/llm/` | provider, message_builder | LLM abstraction (OpenAI-compatible), streaming, retry logic |
-| Platform | `src/leapflow/platform/` | mcp_client, bridge, adapter | MCP protocol client (stdio transport to cua-driver), platform abstraction |
+| Platform | `src/leapflow/platform/` | mcp_client, bridge, adapter | Platform adaptation layer — protocol client, event normalization, capability negotiation |
 | Domain | `src/leapflow/domain/` | events, perception, types | Shared domain types, event definitions, perception models |
 | Recording | `src/leapflow/recording/` | recorder, video, segmenter | Video recording orchestration, segmentation, caching |
 | Tools | `src/leapflow/tools/` | registry, builtins | Built-in tool definitions for the ReAct loop |
 | CLI | `src/leapflow/cli/` | cli, commands/, banner | Argument parsing, subcommand dispatch, interactive REPL |
 | Storage | `src/leapflow/storage/` | duckdb, skill_library | DuckDB-backed persistent storage for skills, trajectories, audit |
-| OS Host (macOS) | external: `cua-driver` | — | Native execution layer: screen capture, AX tree, input events (installed via Homebrew) |
+| Execution Backend | external (pluggable) | — | OS interaction: screen capture, AX tree, input injection (default: `cua-driver` via MCP) |
 
 </details>
 
@@ -639,18 +646,18 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | `FeedbackSignal` | Structured user response (accept/ignore/correct/reject + latency) |
 | `FeedbackType` | Enum: `ACCEPT`, `IGNORE`, `CORRECT`, `EXPLICIT_REJECT` |
 
-**MCP Protocol (LeapFlow → cua-driver):**
+**MCP Protocol (LeapFlow → Execution Backend):**
 
-Transport: stdio (JSON-RPC over stdin/stdout). The `CuaDriverClient` in `platform/` manages the connection lifecycle.
+Transport: stdio (JSON-RPC over stdin/stdout) by default. The `PlatformClient` in `platform/` manages the connection lifecycle and abstracts the specific backend.
 
 | Method | Direction | Description |
 |--------|-----------|-------------|
-| `screen.capture` | LeapFlow → cua | Capture screen frame(s) |
-| `accessibility.tree` | LeapFlow → cua | Query accessibility tree |
-| `accessibility.perform` | LeapFlow → cua | Perform action on UI element |
-| `input.type` / `input.shortcut` | LeapFlow → cua | Inject keyboard input |
-| `input.click` / `input.scroll` | LeapFlow → cua | Inject mouse input |
-| `system.info` | LeapFlow → cua | Query platform capabilities |
+| `screen.capture` | LeapFlow → Backend | Capture screen frame(s) |
+| `accessibility.tree` | LeapFlow → Backend | Query accessibility tree |
+| `accessibility.perform` | LeapFlow → Backend | Perform action on UI element |
+| `input.type` / `input.shortcut` | LeapFlow → Backend | Inject keyboard input |
+| `input.click` / `input.scroll` | LeapFlow → Backend | Inject mouse input |
+| `system.info` | LeapFlow → Backend | Query platform capabilities |
 
 </details>
 
@@ -660,11 +667,11 @@ Transport: stdio (JSON-RPC over stdin/stdout). The `CuaDriverClient` in `platfor
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `cua-driver not found` | Driver not installed | `brew install trycua/tap/cua-driver` |
-| `MCP connection failed` | cua-driver not responding | Run `leap host doctor` to diagnose; ensure driver is on PATH |
+| `cua-driver not found` | Execution backend not installed | `brew install trycua/tap/cua-driver` |
+| `MCP connection failed` | Backend process not responding | Run `leap host doctor` to diagnose; ensure backend is on PATH |
 | `LEAPFLOW_LLM_API_KEY is empty` | Missing API key | Set `LEAPFLOW_LLM_API_KEY` in `.env` |
-| `Accessibility permission denied` | macOS privacy gate | System Settings → Privacy & Security → Accessibility → enable cua-driver |
-| `Screen Recording blocked` | macOS privacy gate | System Settings → Privacy & Security → Screen Recording → enable cua-driver |
+| `Accessibility permission denied` | macOS privacy gate | System Settings → Privacy & Security → Accessibility → grant permission |
+| `Screen Recording blocked` | macOS privacy gate | System Settings → Privacy & Security → Screen Recording → grant permission |
 
 ---
 
