@@ -55,8 +55,14 @@ class IOProvider(Protocol):
 class ConfirmationHandler:
     """Determines and manages confirmation levels for skill execution."""
 
-    def __init__(self, *, skill_store: Optional["SkillLibraryStore"] = None) -> None:
+    def __init__(
+        self,
+        *,
+        skill_store: Optional["SkillLibraryStore"] = None,
+        risk_detector: Optional["DangerousOperationDetector"] = None,
+    ) -> None:
         self._skill_store = skill_store
+        self._risk_detector = risk_detector or DangerousOperationDetector()
         self._step_callback: Optional[StepCallback] = None
 
     def set_on_step(self, callback: Optional[StepCallback]) -> None:
@@ -71,6 +77,7 @@ class ConfirmationHandler:
         skill: Skill,
         *,
         override: Optional[ConfirmLevel] = None,
+        action_params: Optional[Dict[str, Any]] = None,
     ) -> ConfirmLevel:
         if override is not None:
             return override
@@ -82,6 +89,15 @@ class ConfirmationHandler:
 
         if tier <= SkillTier.DRAFT:
             return ConfirmLevel.STEP
+
+        # Risk detector: elevate confirmation for dangerous operations
+        if self._risk_detector and action_params:
+            for trigger in skill.triggers:
+                assessment = self._risk_detector.assess_risk(trigger, action_params)
+                if assessment.requires_double_confirmation:
+                    return ConfirmLevel.STEP
+                if assessment.requires_confirmation:
+                    return ConfirmLevel.CONFIRM
 
         if self._has_destructive_ops(skill):
             return ConfirmLevel.CONFIRM
@@ -218,7 +234,7 @@ class ConfirmationHandler:
             return "skip"
         if r in ("stop", "中止", "停"):
             return "stop"
-        return "yes"
+        return "no"
 
 
 @dataclass(frozen=True)

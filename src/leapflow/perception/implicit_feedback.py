@@ -17,6 +17,13 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from leapflow.domain.event_types import (
+    ImplicitFeedbackType,
+    NormalizedEventType,
+    UIActionSubType,
+    UNDO_SHORTCUTS,
+)
+
 if TYPE_CHECKING:
     from leapflow.platform.event_bus import EventBus
 
@@ -109,34 +116,51 @@ class ImplicitFeedbackObserver:
     def _on_event(self, event: Any) -> None:
         """Process incoming SystemEvent to detect patterns."""
         if not self._running:
-            return  # Stopped — ignore events
+            return
         now = time.time()
         self._last_event_ts = now
 
         event_type = getattr(event, "event_type", "")
         payload = getattr(event, "payload", {})
 
-        # Track undo events
         if self._is_undo_event(event_type, payload):
             self._undo_timestamps.append(now)
             self._check_undo_storm(now)
 
-        # Track app switches
-        if event_type in ("app.activate", "app.focus", "app_focus.changed", "app.focus_change"):
+        if event_type == NormalizedEventType.APP_FOCUS_CHANGE:
             self._app_switch_timestamps.append(now)
             self._check_app_thrashing(now)
 
-        # Track repeated actions
-        action_key = f"{event_type}:{payload.get('target', '')}"
+        action_key = self._build_action_key(event_type, payload)
         self._recent_actions.append((now, action_key))
         self._check_retry_pattern(now)
 
     def _is_undo_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
-        """Detect undo/redo operations."""
-        if event_type in ("keyboard.shortcut", "input.shortcut"):
-            shortcut = payload.get("shortcut", "").lower()
-            return shortcut in ("cmd+z", "ctrl+z", "cmd+shift+z", "ctrl+shift+z")
-        return False
+        """Detect undo/redo operations from normalized ui.action events."""
+        if event_type != NormalizedEventType.UI_ACTION:
+            return False
+        sub_type = payload.get("sub_type", "")
+        if sub_type != UIActionSubType.SHORTCUT:
+            return False
+        modifiers = payload.get("modifiers", [])
+        key_code = payload.get("key_code", 0)
+        char = payload.get("char", "").lower()
+        if char == "z" and any(m in modifiers for m in ("cmd", "meta", "ctrl", "control")):
+            return True
+        if char == "y" and any(m in modifiers for m in ("ctrl", "control")):
+            return True
+        shortcut = payload.get("shortcut", "").lower()
+        return shortcut in UNDO_SHORTCUTS
+
+    @staticmethod
+    def _build_action_key(event_type: str, payload: Dict[str, Any]) -> str:
+        """Build a stable key for retry detection from normalized events."""
+        if event_type == NormalizedEventType.UI_ACTION:
+            sub_type = payload.get("sub_type", "")
+            label = payload.get("label", "")
+            node_id = payload.get("node_id", "")
+            return f"{event_type}:{sub_type}:{label or node_id}"
+        return f"{event_type}:{payload.get('source', '')}"
 
     def _check_undo_storm(self, now: float) -> None:
         """Check if undo frequency exceeds threshold."""
@@ -221,11 +245,12 @@ class ImplicitFeedbackObserver:
             "ImplicitFeedback: %s (confidence=%.2f) %s",
             event.signal_type, event.confidence, event.context,
         )
+        event_type = f"{ImplicitFeedbackType.PREFIX}.{event.signal_type}"
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(
                 self._bus.handle_event(
-                    f"implicit_feedback.{event.signal_type}",
+                    event_type,
                     {
                         "confidence": event.confidence,
                         "signal_type": event.signal_type,
@@ -234,7 +259,6 @@ class ImplicitFeedbackObserver:
                 )
             )
         except RuntimeError:
-            # No running loop — just log, don't crash
             pass
         except Exception:
             logger.debug("Failed to emit implicit feedback event", exc_info=True)

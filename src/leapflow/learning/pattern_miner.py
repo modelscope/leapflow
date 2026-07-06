@@ -2,9 +2,12 @@
 
 LLM-Native design: uses simple frequency statistics to identify candidate
 sequences, then delegates to LLM for semantic pattern recognition and
-skill candidate generation. Does NOT build an N-gram engine.
+skill candidate generation.
 
 Implements EventConsumer protocol for integration with EventBus.
+Discovery results are delivered via an async callback (on_candidates),
+enabling downstream consumers (ActiveLearningObserver, CLI) to act on
+discovered patterns without tight coupling.
 """
 
 from __future__ import annotations
@@ -13,13 +16,15 @@ import logging
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from leapflow.memory.providers.episodic import EpisodicMemoryProvider
     from leapflow.domain.events import SystemEvent
 
 logger = logging.getLogger(__name__)
+
+CandidateCallback = Callable[[List["SkillCandidate"]], Union[None, Awaitable[None]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,9 +41,20 @@ class SkillCandidate:
 
 
 class LLMClient(Protocol):
-    """Minimal LLM interface needed by PatternMiner."""
+    """Minimal LLM interface needed by PatternMiner.
 
-    async def chat(self, messages: list[dict]) -> str: ...
+    Compatible with leapflow.llm.base.LLMProvider via structural subtyping:
+    callers use ``achat(messages, stream=False)`` and extract ``.content``.
+    """
+
+    async def achat(
+        self,
+        messages: list[dict],
+        *,
+        stream: bool = ...,
+        enable_thinking: bool = ...,
+        **kwargs: Any,
+    ) -> Any: ...
 
 
 class PatternMiner:
@@ -64,6 +80,7 @@ class PatternMiner:
         max_candidates_per_run: int = 3,
         discovery_cooldown_s: float = 3600.0,
         max_events_per_query: int = 500,
+        on_candidates: Optional[CandidateCallback] = None,
     ) -> None:
         self._memory = memory
         self._llm = llm
@@ -73,6 +90,7 @@ class PatternMiner:
         self._max_candidates = max_candidates_per_run
         self._cooldown_s = discovery_cooldown_s
         self._max_events = max_events_per_query
+        self._on_candidates = on_candidates
 
         self._last_discovery_ts: float = 0.0
         self._event_accumulator: list[Dict[str, Any]] = []
@@ -98,13 +116,14 @@ class PatternMiner:
                 "payload": event.payload,
             })
 
-        # Auto-trigger discovery if cooldown elapsed and enough events
         now = time.time()
         if (
             now - self._last_discovery_ts >= self._cooldown_s
             and len(self._event_accumulator) >= self._min_frequency * self._min_seq_len
         ):
-            await self.discover()
+            candidates = await self.discover()
+            if candidates:
+                await self._deliver_candidates(candidates)
 
     # ── Core Discovery ──
 
@@ -135,9 +154,8 @@ class PatternMiner:
             frequent_sequences[: self._max_candidates * 2]
         )
 
-        # Clear accumulator after successful discovery
-        self._event_accumulator.clear()
-
+        if candidates:
+            self._event_accumulator.clear()
         return candidates[: self._max_candidates]
 
     def _get_recent_events(self) -> list[Dict[str, Any]]:
@@ -146,15 +164,14 @@ class PatternMiner:
         if self._event_accumulator:
             return self._event_accumulator[-self._max_events :]
 
-        # Fallback: query EpisodicMemory
         try:
             recent = self._memory.recent(limit=self._max_events)
             return [
                 {
-                    "type": r.get("event_type", ""),
-                    "source": r.get("source", ""),
-                    "ts": r.get("timestamp", 0),
-                    "payload": r.get("metadata", {}),
+                    "type": getattr(r, "event_type", ""),
+                    "source": getattr(r, "path", "") or "",
+                    "ts": getattr(r, "created_at", 0),
+                    "payload": getattr(r, "metadata", {}),
                 }
                 for r in recent
             ]
@@ -255,14 +272,16 @@ class PatternMiner:
         )
 
         try:
-            response = await self._llm.chat([
-                {
-                    "role": "system",
-                    "content": "You are a pattern analysis expert. Respond only in valid JSON.",
-                },
-                {"role": "user", "content": prompt},
-            ])
-            candidates = self._parse_llm_response(response, sequences)
+            resp = await self._llm.achat(
+                [
+                    {"role": "system", "content": "You are a pattern analysis expert. Respond only in valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                stream=False,
+                enable_thinking=False,
+            )
+            content = getattr(resp, "content", None) or str(resp)
+            candidates = self._parse_llm_response(content, sequences)
             return candidates
         except Exception:
             logger.warning("PatternMiner: LLM evaluation failed", exc_info=True)
@@ -274,7 +293,6 @@ class PatternMiner:
         """Parse LLM JSON response into SkillCandidates."""
         import json
 
-        # Extract JSON from response (handle markdown code blocks)
         text = response.strip()
         if text.startswith("```"):
             lines = text.split("\n")
@@ -289,28 +307,48 @@ class PatternMiner:
         if not isinstance(items, list):
             items = [items]
 
+        max_frequency = max((s[1] for s in sequences), default=self._min_frequency)
+
         candidates: list[SkillCandidate] = []
-        for i, item in enumerate(items):
+        for item in items:
             if not isinstance(item, dict):
                 continue
             if not item.get("meaningful", False):
                 continue
 
-            # Map back to original sequence for frequency
-            frequency = sequences[i][1] if i < len(sequences) else self._min_frequency
-
             candidates.append(
                 SkillCandidate(
-                    title=item.get("title", f"Pattern {i+1}"),
+                    title=item.get("title", f"Pattern {len(candidates)+1}"),
                     description=f"Auto-discovered pattern: {item.get('title', '')}",
                     trigger_phrases=[item["trigger"]] if item.get("trigger") else [],
                     steps=item.get("steps", []),
-                    frequency=frequency,
+                    frequency=max_frequency,
                     confidence=float(item.get("confidence", 0.5)),
                 )
             )
 
         return candidates
+
+    # ── Delivery ──
+
+    async def _deliver_candidates(self, candidates: list[SkillCandidate]) -> None:
+        """Deliver discovered candidates to the registered callback."""
+        if not self._on_candidates or not candidates:
+            return
+        try:
+            result = self._on_candidates(candidates)
+            if result is not None:
+                await result
+        except Exception:
+            logger.warning("PatternMiner: on_candidates callback failed", exc_info=True)
+
+    def set_on_candidates(self, callback: Optional[CandidateCallback]) -> None:
+        """Late-bind the candidate delivery callback."""
+        self._on_candidates = callback
+
+    def set_min_frequency(self, value: int) -> None:
+        """Adjust min_frequency at runtime (used by ColdStartManager)."""
+        self._min_frequency = max(2, value)
 
     # ── Control ──
 

@@ -1,86 +1,90 @@
 """Privacy policy — configuration-driven data retention, opt-out, and audit.
 
 Design principles (from Active Learning Design doc):
-- "本地处理端侧推理"
-- "用户完全掌控可审计的记录"
-- "默认 opt-in per observer + EpisodicMemory TTL 自动过期"
+- Local processing, user-controlled, auditable records
+- Opt-in per observer + EpisodicMemory TTL auto-expiry
 
-Ensures that 24/7 observation doesn't become "无节制的隐私侵犯".
+Ensures that continuous observation respects user privacy boundaries.
 """
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Optional, Set
+from typing import Any, Dict, FrozenSet, List, Optional, Protocol, Set, runtime_checkable
 
 logger = logging.getLogger(__name__)
+
+_SENSITIVE_PATTERNS = re.compile(
+    r"(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key"
+    r"|credential|authorization|bearer\s)",
+)
 
 
 @dataclass(frozen=True)
 class DataRetentionConfig:
     """Data retention policy configuration."""
-    episodic_ttl_s: float = 86400.0 * 7    # 7 days for episodic memory
-    trajectory_ttl_s: float = 86400.0 * 30  # 30 days for trajectories
-    audit_ttl_s: float = 86400.0 * 90      # 90 days for audit logs
-    max_episodic_entries: int = 10000       # Hard cap on episodic entries
-    max_trajectory_entries: int = 1000      # Hard cap on trajectories
+    episodic_ttl_s: float = 86400.0 * 7
+    trajectory_ttl_s: float = 86400.0 * 30
+    audit_ttl_s: float = 86400.0 * 90
+    max_episodic_entries: int = 10000
+    max_trajectory_entries: int = 1000
 
 
-@dataclass
+@dataclass(frozen=True)
 class PrivacyPolicy:
-    """User-configurable privacy policy for observation and data collection.
-    
+    """Immutable privacy policy snapshot.
+
     Controls what is observed, how long data is retained, and provides
     user-facing opt-out granularity at the observer level.
     """
-    # Observer opt-out (per observer name)
-    disabled_observers: Set[str] = field(default_factory=set)
-    
-    # Data retention
-    retention: DataRetentionConfig = field(default_factory=DataRetentionConfig)
-    
-    # Content filtering
-    exclude_apps: FrozenSet[str] = field(default_factory=frozenset)  # Apps to never observe
-    exclude_paths: FrozenSet[str] = field(default_factory=frozenset)  # Paths to never watch
-    
-    # Audit
-    audit_all_access: bool = True  # Log all memory/data access
-    
-    # Sensitivity
-    redact_passwords: bool = True  # Redact password-like fields from events
-    redact_clipboard_sensitive: bool = True  # Redact clipboard if contains sensitive patterns
+    disabled_observers: frozenset[str] = frozenset()
+    retention: DataRetentionConfig = DataRetentionConfig()
+    exclude_apps: frozenset[str] = frozenset()
+    exclude_paths: frozenset[str] = frozenset()
+    audit_all_access: bool = True
+    redact_passwords: bool = True
+    redact_clipboard_sensitive: bool = True
 
     def is_observer_allowed(self, observer_name: str) -> bool:
-        """Check if an observer is allowed to run."""
         return observer_name not in self.disabled_observers
 
-    def is_app_allowed(self, app_name: str) -> bool:
-        """Check if an app is allowed to be observed."""
-        return app_name.lower() not in {a.lower() for a in self.exclude_apps}
+    def is_app_allowed(self, app_id: str) -> bool:
+        if not self.exclude_apps:
+            return True
+        return app_id.lower() not in {a.lower() for a in self.exclude_apps}
 
     def is_path_allowed(self, path: str) -> bool:
-        """Check if a path is allowed to be watched."""
         return not any(path.startswith(excluded) for excluded in self.exclude_paths)
 
     def should_redact(self, content: str) -> bool:
-        """Check if content should be redacted based on sensitivity patterns."""
-        if not self.redact_passwords:
+        if not self.redact_passwords and not self.redact_clipboard_sensitive:
             return False
-        # Simple heuristic: check for common sensitive patterns
-        sensitive_indicators = ("password", "secret", "token", "api_key", "private_key")
-        content_lower = content.lower()
-        return any(indicator in content_lower for indicator in sensitive_indicators)
+        return bool(_SENSITIVE_PATTERNS.search(content))
+
+
+@runtime_checkable
+class EventPrivacyFilter(Protocol):
+    """Protocol for privacy filtering in the EventBus pipeline.
+
+    Implementations decide whether an event should be ingested into memory
+    and optionally redact sensitive content before storage.
+    """
+
+    def should_ingest(self, event_type: str, source: str, payload: Dict[str, Any]) -> bool:
+        """Return False to block the event from entering memory."""
+        ...
+
+    def redact_payload(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a sanitized copy of the payload for memory storage."""
+        ...
 
 
 class PrivacyManager:
     """Manages privacy policy enforcement and data lifecycle.
-    
-    Responsibilities:
-    - Enforce observer opt-out
-    - Apply data retention policies (TTL expiry)
-    - Audit data access
-    - Provide user-facing privacy report
+
+    Implements EventPrivacyFilter so it can be injected directly into EventBus.
     """
 
     def __init__(self, policy: PrivacyPolicy = PrivacyPolicy()) -> None:
@@ -91,25 +95,55 @@ class PrivacyManager:
     def policy(self) -> PrivacyPolicy:
         return self._policy
 
-    def update_policy(self, **kwargs: Any) -> None:
-        """Update policy fields dynamically."""
-        for key, value in kwargs.items():
-            if hasattr(self._policy, key):
-                setattr(self._policy, key, value)
-        logger.info("Privacy policy updated: %s", list(kwargs.keys()))
+    def update_policy(self, policy: PrivacyPolicy) -> None:
+        """Replace the current policy with a new immutable snapshot."""
+        self._policy = policy
+        logger.info("Privacy policy updated")
 
-    def disable_observer(self, observer_name: str) -> None:
-        """User opt-out: disable a specific observer."""
-        self._policy.disabled_observers.add(observer_name)
-        logger.info("Observer '%s' disabled by user", observer_name)
+    # ── EventPrivacyFilter implementation ──
 
-    def enable_observer(self, observer_name: str) -> None:
-        """User opt-in: re-enable a specific observer."""
-        self._policy.disabled_observers.discard(observer_name)
-        logger.info("Observer '%s' re-enabled by user", observer_name)
+    def should_ingest(self, event_type: str, source: str, payload: Dict[str, Any]) -> bool:
+        """Deny ingestion for excluded apps and paths."""
+        if event_type in ("app.focus_change", "ui.action", "context.change"):
+            app_id = payload.get("bundle_id", "") or payload.get("app_bundle_id", "") or source
+            if app_id and not self._policy.is_app_allowed(app_id):
+                return False
+
+        if event_type == "fs.change":
+            path = payload.get("path", "") or source
+            if path and not self._policy.is_path_allowed(path):
+                return False
+
+        return True
+
+    def redact_payload(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Redact sensitive fields from clipboard and text content."""
+        if event_type == "clipboard.change" and self._policy.redact_clipboard_sensitive:
+            text = payload.get("text", "")
+            if text and self._policy.should_redact(text):
+                redacted = dict(payload)
+                redacted["text"] = "[REDACTED]"
+                redacted["redacted"] = True
+                return redacted
+
+        for key in ("content", "text", "value"):
+            value = payload.get(key, "")
+            if isinstance(value, str) and value and self._policy.should_redact(value):
+                redacted = dict(payload)
+                redacted[key] = "[REDACTED]"
+                redacted["redacted"] = True
+                return redacted
+
+        return payload
+
+    # ── Observer opt-out ──
+
+    def is_observer_allowed(self, observer_name: str) -> bool:
+        return self._policy.is_observer_allowed(observer_name)
+
+    # ── Audit ──
 
     def record_access(self, accessor: str, data_type: str, purpose: str) -> None:
-        """Audit: record a data access event."""
         if self._policy.audit_all_access:
             entry = {
                 "ts": time.time(),
@@ -118,21 +152,13 @@ class PrivacyManager:
                 "purpose": purpose,
             }
             self._access_log.append(entry)
-            # Keep bounded
             if len(self._access_log) > 10000:
                 self._access_log = self._access_log[-5000:]
 
-    def redact_if_sensitive(self, content: str) -> str:
-        """Redact content if it matches sensitivity patterns."""
-        if self._policy.should_redact(content):
-            return "[REDACTED — sensitive content]"
-        return content
-
     def get_privacy_report(self) -> Dict[str, Any]:
-        """Generate a user-facing privacy report."""
         return {
-            "disabled_observers": list(self._policy.disabled_observers),
-            "excluded_apps": list(self._policy.exclude_apps),
+            "disabled_observers": sorted(self._policy.disabled_observers),
+            "excluded_apps": sorted(self._policy.exclude_apps),
             "data_retention": {
                 "episodic_days": self._policy.retention.episodic_ttl_s / 86400,
                 "trajectory_days": self._policy.retention.trajectory_ttl_s / 86400,
@@ -140,4 +166,5 @@ class PrivacyManager:
             },
             "recent_accesses": len(self._access_log),
             "redaction_enabled": self._policy.redact_passwords,
+            "clipboard_redaction": self._policy.redact_clipboard_sensitive,
         }

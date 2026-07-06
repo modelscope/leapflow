@@ -690,7 +690,10 @@ class SessionController:
                 )
 
         self._audit_log("skill.execute", skill=skill_name, level=level.value)
-        sys.stderr.write(f"\033[2m→ Running skill '{skill_name}' (confirm={level.value})\033[0m\n")
+        if sys.stderr.isatty():
+            sys.stderr.write(f"\033[2m→ Running skill '{skill_name}' (confirm={level.value})\033[0m\n")
+        else:
+            sys.stderr.write(f"→ Running skill '{skill_name}' (confirm={level.value})\n")
         sys.stderr.flush()
 
         invoke_kwargs = dict(params or {})
@@ -736,9 +739,12 @@ class SessionController:
         self._apply_evolution_policy(skill_name, exec_result)
 
         status = "✓" if exec_result.ok else "✗"
-        sys.stderr.write(
-            f"\033[2m→ {status} Skill '{skill_name}' finished in {elapsed:.1f}s\033[0m\n"
-        )
+        if sys.stderr.isatty():
+            sys.stderr.write(
+                f"\033[2m→ {status} Skill '{skill_name}' finished in {elapsed:.1f}s\033[0m\n"
+            )
+        else:
+            sys.stderr.write(f"→ {status} Skill '{skill_name}' finished in {elapsed:.1f}s\n")
         sys.stderr.flush()
         return exec_result
 

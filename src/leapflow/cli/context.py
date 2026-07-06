@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import sys
 import time
@@ -73,15 +74,26 @@ class HostReadiness(str, Enum):
 
 def _emit_status(msg: str) -> None:
     """Write a dim status line to stderr (non-blocking, safe pre-logging)."""
-    sys.stderr.write(f"\033[2m\u2192 {msg}\033[0m\n")
+    if sys.stderr.isatty():
+        sys.stderr.write(f"\033[2m\u2192 {msg}\033[0m\n")
+    else:
+        sys.stderr.write(f"→ {msg}\n")
     sys.stderr.flush()
 
 
 def configure_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    log_level = getattr(logging, level.upper(), logging.INFO)
+
+    # Install RedactingFormatter to prevent secret leakage in logs
+    try:
+        from leapflow.security.redact import RedactingFormatter
+        formatter = RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    except ImportError:
+        formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    logging.basicConfig(level=log_level, handlers=[handler])
 
 
 def _build_visual_components(
@@ -295,7 +307,27 @@ class Context:
         self.imm = episodic
         self._evolution = evolution
 
-        self.event_bus = EventBus(immediate=self.imm, working=self.wm)
+        from leapflow.privacy.policy import PrivacyManager, PrivacyPolicy, DataRetentionConfig
+
+        _exclude_paths_raw = os.environ.get("LEAPFLOW_PRIVACY_EXCLUDE_PATHS", "")
+        _exclude_paths = frozenset(
+            p.strip() for p in _exclude_paths_raw.split(",") if p.strip()
+        ) if _exclude_paths_raw else frozenset()
+
+        privacy_policy = PrivacyPolicy(
+            exclude_apps=frozenset(settings.privacy_sensitive_apps),
+            exclude_paths=_exclude_paths,
+            retention=DataRetentionConfig(
+                episodic_ttl_s=settings.memory_episodic_ttl_s,
+            ),
+        )
+        self.privacy_manager = PrivacyManager(privacy_policy)
+
+        self.event_bus = EventBus(
+            immediate=self.imm,
+            working=self.wm,
+            privacy_filter=self.privacy_manager,
+        )
         self.rpc: BridgeClient | CuaDriverClient | MockBridge
         if self.effective_mock:
             self.rpc = MockBridge()
@@ -785,36 +817,40 @@ class Context:
             )
             _tuner = self.attention_tuner
 
-            _evo_policy = self._evolution_policy
-            _skill_lib = self.skill_lib
+            _ctx = self
 
             def _on_prediction_outcome(outcome: Any) -> None:
-                score = self.curiosity.compute(outcome)
+                score = _ctx.curiosity.compute(outcome)
                 exp_id = getattr(outcome, "experience_id", "")
                 if exp_id and _es is not None:
                     _es.update_curiosity_score(exp_id, score.total)
                 _tuner.on_curiosity_signal(score, outcome)
                 observer.on_curiosity_signal(score, outcome)
 
-                # Delta-driven skill evolution (断裂点4)
+                # Delta-driven skill evolution: high delta means prediction
+                # was inaccurate (failure); low delta means accurate (success)
                 delta = getattr(outcome, "delta", 0.0)
-                if delta > 0.4 and _evo_policy is not None and _skill_lib is not None:
+                evo_policy = _ctx._evolution_policy
+                skill_lib = _ctx.skill_lib
+                if evo_policy is not None and skill_lib is not None:
                     action_desc = ""
                     pred = getattr(outcome, "prediction", None)
                     if pred is not None:
                         action_desc = getattr(pred, "action_description", "")
-                    if action_desc:
+                    # Strip "skill:" / "bridge:" prefix for title lookup
+                    skill_title = action_desc.split(":", 1)[-1] if ":" in action_desc else action_desc
+                    if skill_title and (delta > 0.4 or delta < 0.15):
                         try:
-                            stored = _skill_lib.load_skill_by_title(action_desc)
+                            stored = skill_lib.load_skill_by_title(skill_title)
                             if stored:
-                                evo_outcome = _evo_policy.on_execution_result(
+                                evo_outcome = evo_policy.on_execution_result(
                                     stored.title,
                                     success=(delta < 0.2),
                                     duration_s=0.0,
                                     current_confidence=stored.confidence,
                                     current_version=stored.version,
                                 )
-                                _skill_lib.update_skill_confidence(
+                                skill_lib.update_skill_confidence(
                                     stored.title, evo_outcome.new_confidence
                                 )
                                 if evo_outcome.tier_changed:
@@ -1030,6 +1066,73 @@ class Context:
             self.copilot_evolution = None
             self.copilot_config = None
 
+        # ── Wire memory tools into TOOL_HANDLERS (late binding) ──
+        from leapflow.tools.registry_bootstrap import set_memory_manager
+        set_memory_manager(self.memory)
+
+        # ── Build CompressorConfig with LLM callbacks ──
+        from leapflow.engine.context_compressor import CompressorConfig
+
+        async def _summarize_via_llm(prompt: str) -> str:
+            from leapflow.llm.message_builder import build_user_message_text
+            resp = await self.llm.achat(
+                [build_user_message_text(prompt)],
+                stream=False, enable_thinking=False,
+            )
+            return (resp.content or "").strip()
+
+        compressor_config = CompressorConfig(
+            threshold=settings.compress_threshold,
+            keep_tail=settings.compress_keep_tail,
+            max_output_chars=settings.max_tool_output_chars,
+            summarize_fn=_summarize_via_llm if settings.has_llm_credentials else None,
+            token_count_fn=lambda text: len(text) // 4,
+        )
+
+        # ── Initialize DuckDBConversationStore ──
+        self._conversation_store = None
+        try:
+            from leapflow.storage.conversation_store import DuckDBConversationStore
+            conv_db_path = settings.duckdb_path.parent / "conversations.duckdb"
+            self._conversation_store = DuckDBConversationStore(conv_db_path)
+            logger.info("ConversationStore initialized: %s", conv_db_path)
+        except Exception:
+            logger.warning("ConversationStore initialization failed", exc_info=True)
+
+        # ── Initialize MCP Manager (if config exists) ──
+        self._mcp_manager = None
+        try:
+            mcp_config_path = settings.data_dir / "mcp_servers.json"
+            if mcp_config_path.exists():
+                import json as _json_mcp
+                from leapflow.platform.mcp_manager import McpManager, McpServerConfig
+                raw_configs = _json_mcp.loads(mcp_config_path.read_text())
+                server_configs = [
+                    McpServerConfig(
+                        name=name,
+                        command=cfg.get("command", ""),
+                        args=cfg.get("args", []),
+                        env=cfg.get("env", {}),
+                    )
+                    for name, cfg in raw_configs.items()
+                    if cfg.get("enabled", True) and cfg.get("command")
+                ]
+                if server_configs:
+                    mgr = McpManager()
+                    total_tools = 0
+                    for sc in server_configs:
+                        try:
+                            schemas = mgr.add_server(sc)
+                            total_tools += len(schemas)
+                        except Exception:
+                            logger.warning("MCP server '%s' failed to connect", sc.name)
+                    if total_tools > 0:
+                        self._mcp_manager = mgr
+                        logger.info("MCP Manager: %d servers, %d tools",
+                                    len(server_configs), total_tools)
+        except Exception:
+            logger.debug("MCP Manager initialization skipped", exc_info=True)
+
         self.engine = AgentEngine(
             settings, self.rpc, self.llm, self.wm, self.lt, self.imm,
             self.registry, classifier,
@@ -1050,6 +1153,14 @@ class Context:
             skill_index=skill_index,
         )
 
+        # ── Wire CompressorConfig into engine ──
+        from leapflow.engine.context_compressor import ContextCompressor
+        self.engine._compressor = ContextCompressor(compressor_config)
+
+        # ── Enable PrefixCacheOptimizer ──
+        from leapflow.engine.prompt_cache import PrefixCacheOptimizer
+        self.engine.set_cache_strategy(PrefixCacheOptimizer())
+
         # Pipeline Observer (A6: learning pipeline observability)
         from leapflow.engine.pipeline_observer import StructuredPipelineLogger
         self._pipeline_observer = StructuredPipelineLogger()
@@ -1069,21 +1180,51 @@ class Context:
                 logger.warning("ObservationDaemon auto-start failed", exc_info=True)
                 self._observation_daemon = None
 
-        # PatternMiner integration — 断裂点5: bridge EventBus → PatternMiner → ActiveLearning
+        # ColdStartManager: adaptive threshold management
+        from leapflow.learning.cold_start import ColdStartManager, ColdStartConfig
+        self._cold_start = ColdStartManager(ColdStartConfig(mode="prompt"))
+        initial_skills = len(self.skill_lib.load_all_active()) if self.skill_lib else 0
+        self._cold_start.update_stats(skills_count=initial_skills)
+
+        # LearningEffectivenessTracker: metrics observability
+        from leapflow.learning.effectiveness import LearningEffectivenessTracker
+        self._effectiveness_tracker = LearningEffectivenessTracker()
+
+        # PatternMiner → ActiveLearningObserver bridge (closed loop)
         if settings.observer_auto_start and settings.has_llm_credentials:
             try:
                 from leapflow.learning.pattern_miner import PatternMiner
+                active_obs = self.active_observer
+
+                def _on_miner_candidates(candidates: list) -> None:
+                    if active_obs is not None:
+                        active_obs.on_pattern_candidate(candidates)
+                    self._effectiveness_tracker.record_pattern_discovered()
+
+                base_freq = 5
+                adjusted_freq = self._cold_start.get_adjusted_min_frequency(base_freq)
+
                 self._pattern_miner = PatternMiner(
                     memory=self.imm,
                     llm=self.llm,
-                    min_frequency=5,
+                    min_frequency=adjusted_freq,
+                    on_candidates=_on_miner_candidates,
                 )
                 self.event_bus.register_consumer(self._pattern_miner)
-                logger.info("PatternMiner registered as EventBus consumer")
-            except ImportError:
-                logger.debug("PatternMiner not available (module not yet created)")
+                logger.info("PatternMiner registered (min_freq=%d, cold=%s)",
+                            adjusted_freq, self._cold_start.phase.value)
             except Exception:
                 logger.warning("PatternMiner initialization failed", exc_info=True)
+
+        # ImplicitFeedbackObserver: detect user struggle signals
+        if settings.observer_auto_start:
+            try:
+                from leapflow.perception.implicit_feedback import ImplicitFeedbackObserver
+                self._implicit_feedback = ImplicitFeedbackObserver(self.event_bus)
+                await self._implicit_feedback.start()
+                logger.info("ImplicitFeedbackObserver started")
+            except Exception:
+                logger.warning("ImplicitFeedbackObserver start failed", exc_info=True)
 
     def _build_insight_callback(self) -> Callable:
         """Build callback for replay insights — routes ALL insight types."""
@@ -1093,7 +1234,7 @@ class Context:
             metadata = getattr(insight, "metadata", None) or {}
             if isinstance(metadata, str):
                 return
-            insight_type = metadata.get("type", "unknown")
+            insight_type = getattr(insight, "insight_type", None) or metadata.get("type", "unknown")
 
             # Route 1: Causal rules → causal heuristic (existing)
             causal_rule = metadata.get("causal_rule")
@@ -1112,8 +1253,8 @@ class Context:
                     except Exception:
                         logger.debug("insight causal application failed", exc_info=True)
 
-            # Route 2: Skill performance insights → evolution policy
-            if insight_type in ("skill_regression", "skill_improvement", "execution_delta"):
+            # Route 2: Skill performance and corrective insights → evolution policy
+            if insight_type in ("edge_correction", "correction", "heuristic"):
                 skill_name = metadata.get("skill_name")
                 if skill_name and self._evolution_policy is not None:
                     delta = float(metadata.get("delta", 0.0))
@@ -1135,16 +1276,9 @@ class Context:
                         except Exception:
                             logger.debug("insight evolution update failed", exc_info=True)
 
-            # Route 3: Pattern discovery insights → log for observability
             if insight_type == "pattern_discovered":
                 pattern_desc = metadata.get("pattern", "")
-                logger.info("Insight: new pattern discovered \u2014 %s", pattern_desc)
-                # Route to ActiveLearningObserver if available
-                if self.active_observer is not None and hasattr(self.active_observer, "on_pattern_candidate"):
-                    try:
-                        self.active_observer.on_pattern_candidate(metadata)
-                    except Exception:
-                        logger.debug("pattern candidate routing failed", exc_info=True)
+                logger.info("Insight: new pattern discovered — %s", pattern_desc)
 
         return _on_insight
 
@@ -1177,8 +1311,7 @@ class Context:
                     grades = await self.trajectory_grader.grade_trajectory(
                         trajectory, goal=goal,
                     )
-                    # FIX A5-1: Feed grades to replay engine as priority weights
-                    if hasattr(self.replay_engine, 'set_replay_priorities') and grades:
+                    if grades and self.replay_engine is not None:
                         self.replay_engine.set_replay_priorities(grades)
                     observer.on_phase_success(
                         "trajectory_grading", time.perf_counter() - t0,
@@ -1218,9 +1351,8 @@ class Context:
                 curious_apps = self.active_observer.drain_high_curiosity_apps()
                 for app_ctx in curious_apps:
                     await self.replay_engine.replay_targeted(app_ctx)
-                # FIX A5-2: Feed curiosity signal to attention_tuner for next session
                 tuner = getattr(self, "attention_tuner", None)
-                if tuner is not None and curious_apps and hasattr(tuner, 'boost_curiosity_domains'):
+                if tuner is not None and curious_apps:
                     tuner.boost_curiosity_domains(curious_apps)
                 observer.on_phase_success(
                     "curiosity_replay", time.perf_counter() - t0,
@@ -1388,18 +1520,49 @@ class Context:
         )
 
     async def cleanup(self) -> None:
+        # Cancel engine if running
+        if self.engine is not None:
+            self.engine.cancel()
+
         if self._bg_connect_task and not self._bg_connect_task.done():
             self._bg_connect_task.cancel()
             try:
                 await self._bg_connect_task
             except asyncio.CancelledError:
                 pass
-        # Stop ObservationDaemon if running
+
+        # Close MCP manager
+        mcp = getattr(self, "_mcp_manager", None)
+        if mcp is not None:
+            try:
+                mcp.close()
+            except Exception:
+                logger.debug("MCP manager close failed", exc_info=True)
+
+        # Close conversation store
+        conv_store = getattr(self, "_conversation_store", None)
+        if conv_store is not None:
+            try:
+                conv_store.close()
+            except Exception:
+                logger.debug("ConversationStore close failed", exc_info=True)
+        # Stop ImplicitFeedbackObserver
+        implicit = getattr(self, "_implicit_feedback", None)
+        if implicit is not None:
+            try:
+                await implicit.stop()
+            except Exception:
+                logger.debug("ImplicitFeedbackObserver stop failed", exc_info=True)
+        # Stop ObservationDaemon
         if self._observation_daemon is not None:
             try:
                 await self._observation_daemon.stop()
             except Exception:
                 logger.warning("ObservationDaemon stop failed", exc_info=True)
+        # Emit final effectiveness metrics
+        tracker = getattr(self, "_effectiveness_tracker", None)
+        if tracker is not None:
+            tracker.maybe_emit()
         # OPD end-of-session learning pipeline
         if self.settings.replay_on_session_end:
             await self._on_session_end_learning()
@@ -1409,11 +1572,6 @@ class Context:
             await self.rpc.close()
         elif isinstance(self.rpc, CuaDriverClient):
             self.rpc.stop()
-        if self.skill_lib:
-            self.skill_lib.close()
-        if self.imitation:
-            self.imitation.store.close()
-        self.audit.close()
         if self.skill_lib:
             self.skill_lib.close()
         if self.imitation:

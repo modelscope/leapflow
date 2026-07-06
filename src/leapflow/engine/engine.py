@@ -59,7 +59,10 @@ logger = logging.getLogger(__name__)
 
 def _log_progress(msg: str) -> None:
     """Print a persistent progress line to stderr (visible to user during `leap run`)."""
-    sys.stderr.write(f"\033[2m\u2192 {msg}\033[0m\n")
+    if sys.stderr.isatty():
+        sys.stderr.write(f"\033[2m\u2192 {msg}\033[0m\n")
+    else:
+        sys.stderr.write(f"→ {msg}\n")
     sys.stderr.flush()
 
 
@@ -123,7 +126,10 @@ def _print_tool_result(tool_name: str, result: Any, *, enabled: bool = True) -> 
     # Truncate
     if len(preview) > 120:
         preview = preview[:117] + "..."
-    sys.stdout.write(f"\033[2m  \u21b3 {tool_name}: {preview}\033[0m\n")
+    if sys.stdout.isatty():
+        sys.stdout.write(f"\033[2m  \u21b3 {tool_name}: {preview}\033[0m\n")
+    else:
+        sys.stdout.write(f"  ↳ {tool_name}: {preview}\n")
     sys.stdout.flush()
 
 
@@ -234,6 +240,10 @@ class AgentEngine:
             concurrency_policy if concurrency_policy is not None else DefaultConcurrencyPolicy()
         )
 
+        # Cancellation: tracks active task for interrupt support
+        self._active_task: Optional[asyncio.Task] = None
+        self._cancel_requested = False
+
         # State-machine loop infrastructure (config-driven)
         self._budget_config = BudgetConfig(
             max_iterations=settings.react_max_iterations,
@@ -268,6 +278,21 @@ class AgentEngine:
     def set_sanitizer(self, sanitizer: MessageSanitizer | None) -> None:
         """Configure output message sanitizer."""
         self._sanitizer = sanitizer
+
+    def cancel(self) -> None:
+        """Request cancellation of the active run/run_stream call.
+
+        Thread-safe: can be called from signal handlers or other threads.
+        Cancels the active asyncio task if one is tracked.
+        """
+        self._cancel_requested = True
+        task = self._active_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancel_requested
 
     async def run(self, user_text: str, *, enable_thinking: bool = False) -> str:
         """Entrypoint: simplified routing with unified tool loop as default path."""
@@ -799,6 +824,7 @@ class AgentEngine:
         ]
 
         content = ""
+        consecutive_tool_failures = 0
         use_native_tools = self._settings.native_tool_calling_enabled
 
         # Prepare tools kwarg for native tool calling
@@ -806,8 +832,15 @@ class AgentEngine:
         if use_native_tools and TOOL_DEFINITIONS:
             tools_kwarg["tools"] = TOOL_DEFINITIONS
 
+        # Reset cancellation state for new run
+        self._cancel_requested = False
+
         # Loop: LLM response → parse → tool_call or final answer
         while not budget.exhausted:
+            if self._cancel_requested:
+                logger.info("unified_loop: cancelled by user")
+                break
+
             status = budget.consume()
             if status == BudgetStatus.EXHAUSTED:
                 break
@@ -826,8 +859,16 @@ class AgentEngine:
                 )
             except Exception as exc:
                 _clear_indicator()
-                category = self._error_classifier.classify(exc)
-                recovery = self._error_classifier.get_recovery(category)
+                classified = self._error_classifier.classify(exc)
+                recovery = self._error_classifier.get_recovery(classified)
+
+                # Context overflow: force-compress before retry
+                if classified in (ErrorCategory.CONTEXT_OVERFLOW,):
+                    messages = self._compressor.force_compress(messages)
+                    logger.info("unified_loop: force_compress on context overflow")
+                    if budget.remaining > 0:
+                        continue
+
                 if recovery.retry and budget.remaining > 0:
                     await asyncio.sleep(jittered_backoff(budget.used))
                     continue
@@ -861,8 +902,14 @@ class AgentEngine:
 
                 # Execute native tool calls (with concurrency policy)
                 await self._execute_tools_concurrent(
-                    native_calls, TOOL_HANDLERS, trace=trace, messages=messages
+                    native_calls, TOOL_HANDLERS, trace=trace, messages=messages,
                 )
+                # Check tool results for consecutive failures
+                consecutive_tool_failures = self._count_consecutive_tool_failures(messages)
+                if consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                    logger.warning("unified_loop: %d consecutive tool failures, stopping",
+                                   consecutive_tool_failures)
+                    break
 
                 self._wm.remember_chat(build_assistant_message(
                     content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
@@ -881,9 +928,7 @@ class AgentEngine:
             if tool_call is None:
                 # Pure text response — done (guard against empty content)
                 trace.record(ExecutionMode.COMPLETE)
-                if not content:
-                    return "I processed your request but have no additional output."
-                return content
+                break
 
             # Execute text-parsed tool
             messages.append(build_assistant_message(content))
@@ -897,6 +942,17 @@ class AgentEngine:
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
 
+            # Track consecutive failures for text-mode tools
+            is_error = isinstance(result, dict) and not result.get("ok", True)
+            if is_error:
+                consecutive_tool_failures += 1
+                if consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                    logger.warning("unified_loop: %d consecutive tool failures, stopping",
+                                   consecutive_tool_failures)
+                    break
+            else:
+                consecutive_tool_failures = 0
+
             result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
             messages.append(build_user_message_text(
                 f"Tool result ({tool_call['name']}):\n{result_text}"
@@ -907,7 +963,10 @@ class AgentEngine:
                     "SYSTEM: Approaching limit. Provide final answer now."
                 ))
 
-        # Budget exhausted
+        # Sync conversation to long-term memory (non-blocking)
+        if self._memory_manager and self._settings.memory_integration_enabled:
+            asyncio.create_task(self._sync_turn_safe(messages))
+
         return content if content else "I've reached my processing limit."
 
     async def _unified_tool_loop_stream(
@@ -987,6 +1046,7 @@ class AgentEngine:
         ]
 
         content = ""
+        consecutive_tool_failures = 0
         use_native_tools = self._settings.native_tool_calling_enabled
 
         tools_kwarg: Dict[str, Any] = {}
@@ -995,6 +1055,10 @@ class AgentEngine:
 
         # Loop: LLM -> parse -> tool_call or stream final answer
         while not budget.exhausted:
+            if self._cancel_requested:
+                logger.info("unified_loop_stream: cancelled by user")
+                break
+
             status = budget.consume()
             if status == BudgetStatus.EXHAUSTED:
                 break
@@ -1015,8 +1079,12 @@ class AgentEngine:
                     )
                 except Exception as exc:
                     _clear_indicator()
-                    category = self._error_classifier.classify(exc)
-                    recovery = self._error_classifier.get_recovery(category)
+                    classified = self._error_classifier.classify(exc)
+                    recovery = self._error_classifier.get_recovery(classified)
+                    if classified in (ErrorCategory.CONTEXT_OVERFLOW,):
+                        messages = self._compressor.force_compress(messages)
+                        if budget.remaining > 0:
+                            continue
                     if recovery.retry and budget.remaining > 0:
                         await asyncio.sleep(jittered_backoff(budget.used))
                         continue
@@ -1044,10 +1112,15 @@ class AgentEngine:
                     ]
                     messages.append(assistant_msg)
 
-                    # Execute native tool calls (with concurrency policy)
                     await self._execute_tools_concurrent(
                         native_calls, TOOL_HANDLERS, trace=trace, messages=messages
                     )
+
+                    consecutive_tool_failures = self._count_consecutive_tool_failures(messages)
+                    if consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                        logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
+                                       consecutive_tool_failures)
+                        break
 
                     self._wm.remember_chat(build_assistant_message(
                         content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
@@ -1133,6 +1206,17 @@ class AgentEngine:
                     action=tool_call,
                     observation=result if isinstance(result, dict) else {"result": str(result)},
                 )
+
+                is_error = isinstance(result, dict) and not result.get("ok", True)
+                if is_error:
+                    consecutive_tool_failures += 1
+                    if consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                        logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
+                                       consecutive_tool_failures)
+                        break
+                else:
+                    consecutive_tool_failures = 0
+
                 result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
                 messages.append(build_user_message_text(
                     f"Tool result ({tool_call['name']}):\n{result_text}"
@@ -1141,6 +1225,10 @@ class AgentEngine:
                     messages.append(build_user_message_text(
                         "SYSTEM: Approaching limit. Provide final answer now."
                     ))
+
+        # Sync conversation to long-term memory (non-blocking)
+        if self._memory_manager and self._settings.memory_integration_enabled:
+            asyncio.create_task(self._sync_turn_safe(messages))
 
         # Budget exhausted
         yield StreamEvent(type="final", content=content if content else "I've reached my processing limit.")
@@ -1275,32 +1363,64 @@ class AgentEngine:
         1. ToolBridge dispatch (gp_-prefixed) — local Python GP tools, always available
         2. ToolBridge dispatch (exact name) — may route to ExecutionPort or semantic tools
         3. TOOL_HANDLERS dict (static fallback when no bridge)
+
+        Security: untrusted tool results (MCP, web) are wrapped with delimiters.
+        Secrets in error messages are redacted before returning to LLM.
         """
         from leapflow.skills.tool_executor import ToolCall as TC
+        from leapflow.security.redact import redact_sensitive_text
+        from leapflow.security.threat_patterns import is_untrusted_source, wrap_untrusted_result
 
         name = tool_call.get("name", "")
         args = tool_call.get("arguments", {})
 
+        result: Dict[str, Any]
+
         # Route through ToolBridge when available (single source of truth)
         if self._tool_bridge is not None:
-            # Try gp_-prefixed first (local GP tools — always work, even offline)
             prefixed = f"gp_{name}"
             result = await self._tool_bridge.dispatch(TC(name=prefixed, params=args))
             if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
-                return result
-            # Try exact name (may route to ExecutionPort or semantic adapter tools)
+                return self._post_process_tool_result(name, result)
             result = await self._tool_bridge.dispatch(TC(name=name, params=args))
             if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
-                return result
+                return self._post_process_tool_result(name, result)
 
-        # Fallback: direct handler dispatch (e.g., when bridge not configured)
+        # Fallback: direct handler dispatch
         handler = handlers.get(name)
         if handler is None:
             return {"ok": False, "error": f"Unknown tool: {name}"}
         try:
-            return await handler(args)
+            result = await handler(args)
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            error_msg = redact_sensitive_text(str(e), force=True)
+            return {"ok": False, "error": error_msg}
+
+        return self._post_process_tool_result(name, result)
+
+    @staticmethod
+    def _post_process_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply security post-processing to tool results."""
+        from leapflow.security.redact import redact_sensitive_text
+        from leapflow.security.threat_patterns import is_untrusted_source, wrap_untrusted_result
+
+        if not isinstance(result, dict):
+            return result
+
+        # Redact secrets from error messages
+        error = result.get("error")
+        if isinstance(error, str):
+            result = {**result, "error": redact_sensitive_text(error, force=True)}
+
+        # Wrap untrusted tool output with delimiters
+        if is_untrusted_source(tool_name):
+            for key in ("result", "output", "content"):
+                val = result.get(key)
+                if isinstance(val, str) and len(val) >= 32:
+                    result = {**result, key: wrap_untrusted_result(val, source=tool_name)}
+                    break
+
+        return result
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -1386,11 +1506,40 @@ class AgentEngine:
         except Exception:
             logger.debug("memory.sync_turn failed", exc_info=True)
 
+    @staticmethod
+    def _count_consecutive_tool_failures(messages: List[Dict[str, Any]]) -> int:
+        """Count consecutive tool failures from the tail of messages.
+
+        Scans backwards through the most recent tool result messages.
+        A success anywhere resets the counter to 0.
+        """
+        count = 0
+        for msg in reversed(messages):
+            role = msg.get("role", "")
+            if role != "tool":
+                break
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict) and parsed.get("ok") is False:
+                    count += 1
+                    continue
+            except (json.JSONDecodeError, ValueError):
+                pass
+            # Non-JSON or ok!=False — treat as success, reset
+            return 0
+        return count
+
     async def _try_trigger_match(self, user_text: str) -> Optional[str]:
         """Check if a learned skill directly matches the user's request.
 
         Returns the skill output if a high-confidence match is found,
         or None to fall through to the ReAct/DAG path.
+
+        Enforces Progressive Trust: the ConfirmationHandler determines
+        whether the skill requires user confirmation before execution.
         """
         matches = self._registry.find_by_trigger(user_text, threshold=0.5)
         if not matches:
@@ -1402,9 +1551,21 @@ class AgentEngine:
         if best.metadata.confidence < 0.6:
             return None
 
+        from leapflow.engine.confirmation import ConfirmationHandler, ConfirmLevel
+
+        handler = ConfirmationHandler(skill_store=self._skill_library)
+        level = handler.determine_level(best)
+
+        if level in (ConfirmLevel.STEP, ConfirmLevel.CONFIRM):
+            logger.info(
+                "audit.trigger_match_deferred skill=%s tier=%s (requires confirmation)",
+                best.name, best.metadata.tier.name,
+            )
+            return None
+
         logger.info(
-            "audit.trigger_match skill=%s confidence=%.2f",
-            best.name, best.metadata.confidence,
+            "audit.trigger_match skill=%s confidence=%.2f level=%s",
+            best.name, best.metadata.confidence, level.value,
         )
         result = await self._registry.invoke(best.name, user_goal=user_text)
         if result.ok:

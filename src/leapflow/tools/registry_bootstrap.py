@@ -163,6 +163,37 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    # ── Memory tools (agent can actively search/add memory) ──
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": "Search agent memory for relevant past experiences, observations, and facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search keywords"},
+                    "limit": {"type": "integer", "description": "Max results (default: 10)"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_add",
+            "description": "Store a new observation or insight in memory for future reference.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "What to remember"},
+                    "kind": {"type": "string", "enum": ["observation", "insight", "fact"], "description": "Memory type (default: observation)"},
+                },
+                "required": ["content"],
+            },
+        },
+    },
 ] + HUB_TOOL_DEFINITIONS
 
 
@@ -281,10 +312,48 @@ TOOL_HANDLERS.update(HUB_TOOL_HANDLERS)
 for _td in TOOL_DEFINITIONS:
     _func_name = _td.get("function", {}).get("name", "")
     if _func_name and _func_name not in TOOL_HANDLERS:
-        # Find handler by matching the gp_-prefixed version
         _prefixed = f"gp_{_func_name}"
         if _prefixed in TOOL_HANDLERS:
             TOOL_HANDLERS[_func_name] = TOOL_HANDLERS[_prefixed]
+
+# ─────────────────────────────────────────────────────────────────────
+# Memory tool late-binding: handlers delegate to MemoryManager when
+# installed, fail gracefully when not. Avoids import-time dependency.
+# ─────────────────────────────────────────────────────────────────────
+
+_memory_manager_ref: Any = None
+
+
+def set_memory_manager(manager: Any) -> None:
+    """Install MemoryManager reference for memory tool dispatch."""
+    global _memory_manager_ref
+    _memory_manager_ref = manager
+
+
+async def _memory_search_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    if _memory_manager_ref is None:
+        return {"ok": False, "error": "Memory system not initialized"}
+    try:
+        result = await _memory_manager_ref.handle_tool_call("memory_search", params)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def _memory_add_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    if _memory_manager_ref is None:
+        return {"ok": False, "error": "Memory system not initialized"}
+    try:
+        result = await _memory_manager_ref.handle_tool_call("memory_add", params)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+TOOL_HANDLERS["memory_search"] = _memory_search_handler
+TOOL_HANDLERS["memory_add"] = _memory_add_handler
+TOOL_HANDLERS["gp_memory_search"] = _memory_search_handler
+TOOL_HANDLERS["gp_memory_add"] = _memory_add_handler
 
 
 def bootstrap_tools(bridge: Any) -> int:

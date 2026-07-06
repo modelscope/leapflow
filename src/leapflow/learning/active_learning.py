@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import uuid
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set
 
@@ -116,6 +117,63 @@ class ActiveLearningObserver:
         for candidate, episode in consolidated:
             self._process_candidate(candidate, episode)
         self._detect_repeated_patterns(episodes)
+
+    def on_pattern_candidate(
+        self, candidates: list,
+    ) -> None:
+        """Receive SkillCandidates from PatternMiner and process them.
+
+        Bridges the PatternMiner → ActiveLearning gap: converts mined
+        SkillCandidate objects into DistillationCandidate format and
+        runs through the standard similarity pipeline.
+        """
+        for candidate in candidates:
+            title = getattr(candidate, "title", "")
+            steps = getattr(candidate, "steps", [])
+            triggers = getattr(candidate, "trigger_phrases", [])
+            confidence = getattr(candidate, "confidence", 0.5)
+
+            if confidence < _MIN_ACTIVATION_CONFIDENCE or not title:
+                continue
+
+            dc = DistillationCandidate(
+                title=title,
+                trigger_phrases=list(triggers),
+                steps=list(steps),
+                parameters=[],
+                pre_conditions=[],
+                post_conditions=[],
+                source_trajectory_id="",
+                source_episode_id="",
+                confidence=confidence,
+            )
+
+            synthetic_episode = Episode(
+                trajectory_id="", start_idx=0, end_idx=0,
+                app_sequence=[], semantic_actions=[],
+                inferred_goal=title, confidence=confidence,
+            )
+
+            all_skills = self._store.load_all_active()
+            if not all_skills:
+                self._store.save_from_candidate(dc, [], [])
+                logger.info("pattern_miner.new_skill title=%s conf=%.2f", title, confidence)
+                continue
+
+            matches = self._scorer.find_similar(dc, all_skills, threshold=self._h_low)
+            if not matches:
+                self._store.save_from_candidate(dc, [], [])
+                logger.info("pattern_miner.new_skill title=%s conf=%.2f", title, confidence)
+            elif matches[0].overall_score >= self._h_high:
+                logger.debug(
+                    "pattern_miner.skip_existing title=%s match=%s score=%.2f",
+                    title, matches[0].stored_skill_title, matches[0].overall_score,
+                )
+            else:
+                suggestion = self._build_suggestion(dc, matches[0], synthetic_episode)
+                self._store.save_suggestion(suggestion)
+                self._notify(suggestion)
+                logger.info("pattern_miner.suggestion title=%s score=%.2f", title, matches[0].overall_score)
 
     def on_curiosity_signal(
         self, score: "CuriosityScore", outcome: "PredictionOutcome",
@@ -836,8 +894,8 @@ class ActiveLearningObserver:
 
         from leapflow.learning.doc_generator import DocGenContext
 
-        _DIM = "\033[2m"
-        _RESET = "\033[0m"
+        _DIM = "\033[2m" if sys.stdout.isatty() else ""
+        _RESET = "\033[0m" if sys.stdout.isatty() else ""
 
         print(f"{_DIM}  │   ├ Generating SKILL.md... [LLM]{_RESET}", flush=True)
 
@@ -1025,8 +1083,8 @@ class ActiveLearningObserver:
         self, candidate: DistillationCandidate, episode: Episode
     ) -> None:
         """Generate code and register skill in registry."""
-        _DIM = "\033[2m"
-        _RESET = "\033[0m"
+        _DIM = "\033[2m" if sys.stdout.isatty() else ""
+        _RESET = "\033[0m" if sys.stdout.isatty() else ""
 
         assert self._activator is not None
         try:

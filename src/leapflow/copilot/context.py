@@ -55,9 +55,16 @@ class ContextEncoder:
         Always appends to action_ring regardless of event type.
         """
         match event.event_type:
-            case "app.activated" | "app.focus":
+            case "app.focus_change":
                 self._state.delta_update("app_bundle", event.payload.get("bundle_id", ""))
-                self._state.delta_update("window_title", event.payload.get("title", ""))
+                self._state.delta_update(
+                    "window_title",
+                    event.payload.get("window_title", event.payload.get("app_name", "")),
+                )
+            case "context.change":
+                self._state.delta_update(
+                    "window_title", event.payload.get("window_title", ""),
+                )
             case "clipboard.change":
                 self._state.delta_update("clipboard_hash", hash(str(event.payload)))
             case "fs.change":

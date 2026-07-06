@@ -365,6 +365,25 @@ class ExperienceReplayEngine:
             ))
         return results
 
+    def set_replay_priorities(self, grades: list) -> None:
+        """Accept trajectory grades and mark high-value experiences for replay.
+
+        High-|advantage| experiences (informative learning signals) get their
+        replay count incremented, bringing them to the top of retrieval
+        queries that sort by replay_count descending.
+        """
+        prioritized = 0
+        for grade in grades:
+            exp_id = getattr(grade, "experience_id", None)
+            advantage = abs(getattr(grade, "advantage", 0.0))
+            if exp_id and advantage > 0.3:
+                try:
+                    self._store.increment_replay_count(exp_id)
+                    prioritized += 1
+                except Exception:
+                    logger.debug("replay.priority_update failed for %s", exp_id)
+        logger.debug("set_replay_priorities: prioritized %d/%d grades", prioritized, len(grades))
+
     def _notify_insights(self, insights: List[ReplayInsight]) -> None:
         """Notify downstream consumers of discovered insights."""
         if not insights or self._on_insight is None:

@@ -60,10 +60,16 @@ def ensure_default_env(data_dir: Path) -> bool:
 
     env_path.write_text(ENV_TEMPLATE, encoding="utf-8")
     # Inform the user (logging may not be configured yet at this point).
-    sys.stderr.write(
-        f"\033[2m→ Created default config: {env_path}\033[0m\n"
-        f"\033[2m  Edit LEAPFLOW_LLM_API_KEY to configure your LLM provider.\033[0m\n"
-    )
+    if sys.stderr.isatty():
+        sys.stderr.write(
+            f"\033[2m→ Created default config: {env_path}\033[0m\n"
+            f"\033[2m  Edit LEAPFLOW_LLM_API_KEY to configure your LLM provider.\033[0m\n"
+        )
+    else:
+        sys.stderr.write(
+            f"→ Created default config: {env_path}\n"
+            f"  Edit LEAPFLOW_LLM_API_KEY to configure your LLM provider.\n"
+        )
     sys.stderr.flush()
     return True
 
