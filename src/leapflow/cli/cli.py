@@ -140,18 +140,13 @@ def main(argv: list[str] | None = None) -> int:
     relearn_parser.add_argument("trajectory_id", help="Trajectory ID to re-process")
 
     # leap host
-    host_parser = subparsers.add_parser("host", help="Manage OS Host lifecycle")
+    host_parser = subparsers.add_parser("host", help="Manage cua-driver and ObservationDaemon")
     host_sub = host_parser.add_subparsers(dest="host_action")
-    host_sub.add_parser("start", help="Start the OS Host daemon")
-    host_sub.add_parser("stop", help="Gracefully stop the OS Host")
-    host_sub.add_parser("restart", help="Restart the OS Host")
-    host_sub.add_parser("status", help="Show host status and permissions")
-    logs_parser = host_sub.add_parser("logs", help="View host logs")
-    logs_parser.add_argument("--follow", "-f", action="store_true", help="Stream logs in real-time")
-    host_sub.add_parser("install", help="Build and deploy .app bundle")
-    host_sub.add_parser("setup", help="Install + register launchd + permission guidance")
-    host_sub.add_parser("uninstall", help="Stop, unregister, and remove bundle")
-    host_sub.add_parser("dev", help="Development mode (auto-rebuild on changes)")
+    host_sub.add_parser("start", help="Start ObservationDaemon (background observers)")
+    host_sub.add_parser("stop", help="Stop ObservationDaemon")
+    host_sub.add_parser("status", help="Show cua-driver and daemon status")
+    host_sub.add_parser("doctor", help="Run cua-driver connectivity health check")
+    host_sub.add_parser("install", help="Install cua-driver")
 
     # ── Pre-parse: detect if first non-flag arg is a known subcommand ──
     # If not, treat everything non-flag as a chat prompt.
