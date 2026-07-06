@@ -194,6 +194,26 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    # ── Subagent delegation ──
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_task",
+            "description": (
+                "Delegate a complex sub-task to an isolated subagent. "
+                "The subagent gets a fresh context and restricted tool access. "
+                "Use when a task is self-contained and can be solved independently."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "Clear description of the task to delegate"},
+                    "context": {"type": "string", "description": "Relevant context for the subagent (optional)"},
+                },
+                "required": ["goal"],
+            },
+        },
+    },
 ] + HUB_TOOL_DEFINITIONS
 
 
@@ -365,6 +385,55 @@ TOOL_HANDLERS["memory_search"] = _memory_search_handler
 TOOL_HANDLERS["memory_add"] = _memory_add_handler
 TOOL_HANDLERS["gp_memory_search"] = _memory_search_handler
 TOOL_HANDLERS["gp_memory_add"] = _memory_add_handler
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Subagent delegation (late-binding like memory tools)
+# ─────────────────────────────────────────────────────────────────────
+
+_subagent_manager_ref: Any = None
+
+
+def set_subagent_manager(manager: Any) -> None:
+    """Install SubagentManager reference for delegate_task dispatch."""
+    global _subagent_manager_ref
+    _subagent_manager_ref = manager
+
+
+async def _delegate_task_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    if _subagent_manager_ref is None:
+        return {"ok": False, "error": "Subagent system not configured"}
+    try:
+        from leapflow.engine.subagent import SubagentConfig
+        config = SubagentConfig(
+            goal=params.get("goal", ""),
+            context=params.get("context", ""),
+        )
+        result = await _subagent_manager_ref.delegate(config)
+        return {"ok": result.status == "completed", "summary": result.summary, "status": result.status}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+TOOL_HANDLERS["delegate_task"] = _delegate_task_handler
+TOOL_HANDLERS["gp_delegate_task"] = _delegate_task_handler
+
+
+# ─────────────────────────────────────────────────────────────────────
+# File write approval gate (Protocol-based, injectable)
+# ─────────────────────────────────────────────────────────────────────
+
+_file_write_gate: Any = None
+
+
+def set_file_write_gate(gate: Any) -> None:
+    """Install a file-write approval gate (independent from shell approval)."""
+    global _file_write_gate
+    _file_write_gate = gate
+
+
+def get_file_write_gate() -> Any:
+    return _file_write_gate
 
 
 def bootstrap_tools(bridge: Any) -> int:

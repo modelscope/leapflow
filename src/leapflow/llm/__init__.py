@@ -8,12 +8,28 @@ from leapflow.llm.message_builder import (
     build_user_message_text,
 )
 from leapflow.llm.openai_provider import OpenAIChat, OpenAIChatResponse
+from leapflow.llm.provider_chain import (
+    AuxiliaryClient,
+    CredentialPool,
+    FailoverChain,
+    ProviderConfig,
+    ProviderMetadata,
+    parse_credential_pools,
+    parse_provider_configs,
+)
 
 __all__ = [
     "LLMProvider",
     "LLMChatResponse",
     "OpenAIChat",
     "OpenAIChatResponse",
+    "FailoverChain",
+    "ProviderConfig",
+    "ProviderMetadata",
+    "CredentialPool",
+    "AuxiliaryClient",
+    "parse_provider_configs",
+    "parse_credential_pools",
     "build_assistant_message",
     "build_system_message",
     "build_user_message_text",

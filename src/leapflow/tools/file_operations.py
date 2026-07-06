@@ -179,6 +179,16 @@ async def file_write(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": f"Sensitive file write blocked by security policy: {target.name}"}
 
     try:
+        from leapflow.tools.registry_bootstrap import get_file_write_gate
+        gate = get_file_write_gate()
+        if gate is not None:
+            approved = await gate.check(str(target), content)
+            if not approved:
+                return {"ok": False, "error": f"File write denied by approval gate: {target.name}"}
+    except ImportError:
+        pass
+
+    try:
         from leapflow.security.threat_patterns import scan_for_threats, ThreatScope
         threats = scan_for_threats(content, scope=ThreatScope.ALL, max_results=3)
         high_threats = [t for t in threats if t.severity >= 0.8]

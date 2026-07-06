@@ -609,6 +609,55 @@ class ContextCompressor:
             return total
         return self._estimate_tokens(messages)
 
+    def preflight_check(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        context_length: int = 128_000,
+        huge_message_chars: int = 50_000,
+    ) -> List[Dict[str, Any]]:
+        """Preflight gate: detect and compress few-but-huge messages before LLM call.
+
+        Handles cases where message count is low but individual messages are enormous
+        (e.g., base64 images, massive file reads, large paste buffers). These won't
+        trigger the standard count-based stages but will overflow the context window.
+
+        Strategy: truncate any non-system message exceeding huge_message_chars,
+        preserving head + tail with a truncation notice.
+        """
+        modified = False
+        result = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                result.append(msg)
+                continue
+
+            content = msg.get("content", "")
+            if not isinstance(content, str) or len(content) <= huge_message_chars:
+                result.append(msg)
+                continue
+
+            head_size = huge_message_chars // 3
+            tail_size = huge_message_chars // 6
+            truncated_content = (
+                content[:head_size]
+                + f"\n\n[... {len(content) - head_size - tail_size:,} chars truncated ...]\n\n"
+                + content[-tail_size:]
+            )
+            new_msg = dict(msg, content=truncated_content)
+            result.append(new_msg)
+            modified = True
+            logger.info(
+                "preflight: truncated %s message from %d to %d chars",
+                msg.get("role", "?"), len(content), len(truncated_content),
+            )
+
+        estimated_tokens = self._count_tokens(result)
+        if estimated_tokens > context_length * 0.9:
+            result = self.force_compress(result)
+
+        return result
+
     @staticmethod
     def _estimate_tokens(messages: List[Dict[str, Any]]) -> int:
         """Rough token estimation (~4 chars per token)."""

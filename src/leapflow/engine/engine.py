@@ -261,6 +261,9 @@ class AgentEngine:
         self._active_task: Optional[asyncio.Task] = None
         self._cancel_requested = False
 
+        # Tool loop guardrails (injected by CLI)
+        self._guardrail: Optional[Any] = None
+
         # State-machine loop infrastructure (config-driven)
         self._budget_config = BudgetConfig(
             max_iterations=settings.react_max_iterations,
@@ -855,6 +858,7 @@ class AgentEngine:
 
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)
+            compressed = self._compressor.preflight_check(compressed)
             if self._cache_strategy:
                 compressed = self._cache_strategy.optimize(compressed)
 
@@ -869,7 +873,7 @@ class AgentEngine:
                 _clear_indicator()
                 classified = self._error_classifier.classify(exc)
                 rec = self._error_classifier.get_recovery(classified)
-                recovery.record_api_error()
+                recovery.record_api_error(classified.value if hasattr(classified, 'value') else str(classified))
 
                 if classified == ErrorCategory.CONTEXT_OVERFLOW and recovery.try_compress():
                     messages = self._compressor.force_compress(messages)
@@ -917,6 +921,20 @@ class AgentEngine:
                     logger.warning("unified_loop: %d consecutive tool failures, stopping", failures)
                     break
 
+                # Guardrail check after tool execution
+                if self._guardrail is not None:
+                    violation = self._guardrail.check(messages)
+                    if violation.violated:
+                        logger.warning("guardrail: %s", violation.reason)
+                        if violation.severity == "halt":
+                            messages.append(build_user_message_text(
+                                f"SYSTEM GUARDRAIL: {violation.reason}. {violation.suggestion}"
+                            ))
+                            break
+                        messages.append(build_user_message_text(
+                            f"SYSTEM WARNING: {violation.reason}. {violation.suggestion}"
+                        ))
+
                 self._wm.remember_chat(build_assistant_message(
                     content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
                 ))
@@ -956,6 +974,17 @@ class AgentEngine:
             else:
                 recovery.record_tool_success()
 
+            # Guardrail check for text-parsed tool path
+            if self._guardrail is not None:
+                violation = self._guardrail.check(messages)
+                if violation.violated:
+                    logger.warning("guardrail: %s", violation.reason)
+                    if violation.severity == "halt":
+                        break
+                    messages.append(build_user_message_text(
+                        f"SYSTEM WARNING: {violation.reason}. {violation.suggestion}"
+                    ))
+
             result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
             messages.append(build_user_message_text(
                 f"Tool result ({tool_call['name']}):\n{result_text}"
@@ -970,7 +999,64 @@ class AgentEngine:
         if self._memory_manager and self._settings.memory_integration_enabled:
             asyncio.create_task(self._sync_turn_safe(messages))
 
+        # Post-turn memory review: schedule background nudge for important observations
+        if self._evolution is not None and content:
+            asyncio.create_task(self._post_turn_review(messages, content))
+
+        # Between turns: try restoring primary provider
+        llm = self._llm
+        if hasattr(llm, 'try_restore_primary'):
+            llm.try_restore_primary()
+
         return content if content else "I've reached my processing limit."
+
+    async def _post_turn_review(
+        self, messages: List[Dict[str, Any]], final_content: str
+    ) -> None:
+        """Background post-turn review: detect memorable patterns and persist episodes.
+
+        Scans the turn's tool calls for interesting patterns (successes, failures)
+        and records them as skill episodes for evolution learning.
+        """
+        try:
+            tool_actions: List[Dict[str, Any]] = []
+            for msg in messages:
+                if msg.get("role") == "assistant":
+                    for tc in (msg.get("tool_calls") or []):
+                        fn = tc.get("function", {})
+                        tool_actions.append({
+                            "tool": fn.get("name", ""),
+                            "args_preview": fn.get("arguments", "")[:100],
+                        })
+
+            if not tool_actions:
+                return
+
+            has_success = any(
+                '"ok": true' in m.get("content", "") or '"ok":true' in m.get("content", "")
+                for m in messages if m.get("role") in ("tool", "user")
+            )
+            has_failure = any(
+                '"ok": false' in m.get("content", "") or '"ok":false' in m.get("content", "")
+                for m in messages if m.get("role") in ("tool", "user")
+            )
+
+            reward = 0.5
+            if has_success and not has_failure:
+                reward = 1.0
+            elif has_failure and not has_success:
+                reward = -0.5
+
+            skill_name = tool_actions[0]["tool"] if tool_actions else "unknown"
+            self._evolution.record_episode(
+                skill_name=f"turn_{skill_name}",
+                actions=tool_actions[:10],
+                outcome="completed" if has_success else "mixed",
+                reward=reward,
+                context={"final_content_preview": final_content[:200]},
+            )
+        except Exception:
+            logger.debug("post_turn_review failed", exc_info=True)
 
     async def _unified_tool_loop_stream(
         self, user_text: str, *, enable_thinking: bool = False
@@ -1056,6 +1142,7 @@ class AgentEngine:
 
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)
+            compressed = self._compressor.preflight_check(compressed)
             if self._cache_strategy:
                 compressed = self._cache_strategy.optimize(compressed)
 

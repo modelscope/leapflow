@@ -31,6 +31,13 @@ from leapflow.analysis.pipeline import ImitationPipeline
 from leapflow.storage.session_store import LearningSessionStore
 from leapflow.storage.trajectory_store import TrajectoryStore
 from leapflow.llm.openai_provider import OpenAIChat
+from leapflow.llm.provider_chain import (
+    AuxiliaryClient,
+    FailoverChain,
+    ProviderConfig,
+    parse_credential_pools,
+    parse_provider_configs,
+)
 from leapflow.memory import (
     MemoryManager, WorkingMemoryProvider, EpisodicMemoryProvider,
     SemanticMemoryProvider, EvolutionMemoryProvider, MemoryFragment,
@@ -368,12 +375,46 @@ class Context:
             )
             self.rpc.on_event(self.event_bus.handle_event)
 
-        self.llm = OpenAIChat(
-            api_key=settings.llm_api_key or "missing",
-            base_url=settings.llm_base_url,
-            model=settings.llm_model,
-            max_retries=settings.llm_max_retries,
+        # ── Multi-provider LLM chain (failover + credential rotation) ──
+        provider_configs = parse_provider_configs(
+            settings.llm_api_key or "missing",
+            settings.llm_base_url,
+            settings.llm_model,
+            fallback_json=settings.llm_fallback_providers,
+            primary_context_length=settings.llm_context_length,
         )
+        credential_pools = parse_credential_pools(provider_configs)
+        if len(provider_configs) > 1 or credential_pools:
+            self.llm_chain = FailoverChain(
+                provider_configs, credential_pools=credential_pools,
+            )
+            self.llm = self.llm_chain
+            logger.info(
+                "LLM chain: %d providers, %d credential pools",
+                len(provider_configs), len(credential_pools),
+            )
+        else:
+            self.llm_chain = None
+            self.llm = OpenAIChat(
+                api_key=settings.llm_api_key or "missing",
+                base_url=settings.llm_base_url,
+                model=settings.llm_model,
+                max_retries=settings.llm_max_retries,
+            )
+
+        # ── Auxiliary LLM for cheap operations ──
+        self.auxiliary: Optional[AuxiliaryClient] = None
+        if settings.llm_aux_model:
+            aux_llm = OpenAIChat(
+                api_key=settings.llm_aux_api_key or settings.llm_api_key or "missing",
+                base_url=settings.llm_aux_base_url or settings.llm_base_url,
+                model=settings.llm_aux_model,
+                max_retries=2,
+            )
+            self.auxiliary = AuxiliaryClient(aux_llm)
+            logger.info("Auxiliary LLM configured: %s", settings.llm_aux_model)
+        elif settings.has_llm_credentials:
+            self.auxiliary = AuxiliaryClient(self.llm)
 
         self.vlm: Optional[OpenAIChat] = None
         if settings.vlm_model and settings.vlm_model != settings.llm_model:
@@ -1108,11 +1149,13 @@ class Context:
             token_count_fn=lambda text: len(text) // 4,
         )
 
-        # ── Initialize DuckDBConversationStore ──
+        # ── Initialize DuckDBConversationStore (with self-repair) ──
         self._conversation_store = None
         try:
             from leapflow.storage.conversation_store import DuckDBConversationStore
+            from leapflow.storage.db_repair import check_and_repair
             conv_db_path = settings.duckdb_path.parent / "conversations.duckdb"
+            check_and_repair(conv_db_path)
             self._conversation_store = DuckDBConversationStore(conv_db_path)
             logger.info("ConversationStore initialized: %s", conv_db_path)
         except Exception:
@@ -1201,8 +1244,22 @@ class Context:
             skill_index=skill_index,
         )
 
-        # ── Wire CompressorConfig into engine ──
+        # ── Wire CompressorConfig with archive_fn into engine ──
         from leapflow.engine.context_compressor import ContextCompressor
+
+        async def _archive_to_semantic(messages: List[Dict[str, Any]]) -> None:
+            """Archive evicted messages to SemanticMemoryProvider."""
+            for msg in messages:
+                content = msg.get("content", "")
+                role = msg.get("role", "")
+                if content and isinstance(content, str) and len(content) > 20:
+                    self.lt.insert_raw(
+                        f"archived_{role}",
+                        content[:2000],
+                        metadata={"source": "compression_archive", "role": role},
+                    )
+
+        compressor_config.archive_fn = _archive_to_semantic
         self.engine._compressor = ContextCompressor(compressor_config)
 
         # ── Enable PrefixCacheOptimizer ──
@@ -1212,6 +1269,134 @@ class Context:
         # ── Wire ConversationStore into engine for session persistence ──
         if self._conversation_store:
             self.engine.set_conversation_store(self._conversation_store)
+
+        # ── Wire SubagentManager + delegate_task tool ──
+        try:
+            from leapflow.engine.subagent import DefaultSubagentExecutor, SubagentManager
+            from leapflow.tools.registry_bootstrap import (
+                TOOL_DEFINITIONS as _TD, TOOL_HANDLERS as _TH,
+                set_subagent_manager,
+            )
+            sub_executor = DefaultSubagentExecutor(
+                llm=self.llm,
+                tool_handlers=_TH,
+                tool_definitions=_TD,
+                settings=settings,
+            )
+            self._subagent_manager = SubagentManager(executor=sub_executor)
+            set_subagent_manager(self._subagent_manager)
+            logger.info("SubagentManager wired with delegate_task tool")
+        except Exception:
+            self._subagent_manager = None
+            logger.debug("SubagentManager setup skipped", exc_info=True)
+
+        # ── Wire EvolutionStore (DuckDB persistence for skill episodes) ──
+        self._evolution_store = None
+        try:
+            from leapflow.storage.evolution_store import DuckDBEvolutionStore
+            from leapflow.storage.db_repair import check_and_repair
+            evo_db_path = settings.duckdb_path.parent / "evolution.duckdb"
+            check_and_repair(evo_db_path)
+            self._evolution_store = DuckDBEvolutionStore(evo_db_path)
+            # Hydrate in-memory provider from persisted episodes
+            persisted = self._evolution_store.load_recent_episodes(
+                limit=settings.memory_evolution_max_episodes,
+            )
+            for ep in persisted:
+                self._evolution.record_episode(
+                    skill_name=ep["skill_name"],
+                    actions=ep["actions"],
+                    outcome=ep["outcome"],
+                    reward=ep["reward"],
+                    context=ep.get("context"),
+                )
+            if persisted:
+                logger.info("Evolution: hydrated %d episodes from DuckDB", len(persisted))
+        except Exception:
+            logger.debug("EvolutionStore initialization skipped", exc_info=True)
+
+        # ── Wire tool loop guardrails ──
+        try:
+            from leapflow.engine.tool_guardrails import CompositeGuardrail
+            self.engine._guardrail = CompositeGuardrail()
+            logger.debug("Tool loop guardrails enabled")
+        except Exception:
+            logger.debug("Tool guardrails setup skipped", exc_info=True)
+
+        # ── Wire Smart Approval (auxiliary LLM for command risk) ──
+        if self.auxiliary is not None:
+            try:
+                from leapflow.tools.shell_tools import CommandApprovalGate
+                aux = self.auxiliary
+
+                class _SmartApprovalGate:
+                    """LLM-assisted approval for dangerous commands.
+
+                    Low-risk commands (score < 0.3) are auto-approved.
+                    Medium-risk prompts the user. High-risk always prompts.
+                    """
+                    async def check(self, command: str) -> bool:
+                        try:
+                            risk = await aux.classify_risk(command)
+                        except Exception:
+                            risk = 0.5
+                        if risk < 0.3:
+                            logger.debug("smart_approval: auto-approved (risk=%.2f)", risk)
+                            return True
+                        return await _InteractiveApprovalGate().check(command)
+
+                from leapflow.tools.shell_tools import set_approval_gate
+                set_approval_gate(_SmartApprovalGate())
+                logger.debug("Smart approval gate enabled (auxiliary LLM)")
+            except Exception:
+                logger.debug("Smart approval setup skipped", exc_info=True)
+
+        # ── Wire File Write Approval Gate ──
+        try:
+            from leapflow.tools.registry_bootstrap import set_file_write_gate
+
+            class _FileWriteGate:
+                """Interactive approval for file writes to important paths."""
+                _APPROVE_EXTENSIONS = frozenset({
+                    ".tmp", ".log", ".txt", ".md", ".json", ".yaml", ".yml",
+                    ".csv", ".tsv",
+                })
+                async def check(self, path: str, content: str) -> bool:
+                    from pathlib import Path as _P
+                    p = _P(path)
+                    if p.suffix.lower() in self._APPROVE_EXTENSIONS:
+                        return True
+                    if len(content) < 500:
+                        return True
+                    if not sys.stdin.isatty():
+                        return True
+                    if sys.stderr.isatty():
+                        sys.stderr.write(f"\033[33m⚠ File write: {p.name} ({len(content)} chars)\033[0m\n")
+                    else:
+                        sys.stderr.write(f"WARNING: File write: {p.name} ({len(content)} chars)\n")
+                    sys.stderr.write("Approve? [Y/n]: ")
+                    sys.stderr.flush()
+                    try:
+                        answer = input().strip().lower()
+                        return answer in ("", "y", "yes")
+                    except (EOFError, KeyboardInterrupt):
+                        return False
+
+            set_file_write_gate(_FileWriteGate())
+            logger.debug("File write approval gate enabled")
+        except Exception:
+            logger.debug("File write gate setup skipped", exc_info=True)
+
+        # ── Token budget dynamic linking (tool result budget ∝ model context) ──
+        context_length = settings.llm_context_length
+        if hasattr(self, 'llm_chain') and self.llm_chain is not None:
+            context_length = self.llm_chain.context_length
+        dynamic_result_budget = min(settings.max_tool_result_chars, context_length // 20)
+        if dynamic_result_budget != settings.max_tool_result_chars:
+            logger.info(
+                "Dynamic tool result budget: %d (context=%d)",
+                dynamic_result_budget, context_length,
+            )
 
         # ── Register session_search tool ──
         if self._conversation_store:
@@ -1620,6 +1805,29 @@ class Context:
         )
 
     async def cleanup(self) -> None:
+        # Persist evolution episodes to DuckDB before shutdown
+        evo_store = getattr(self, "_evolution_store", None)
+        if evo_store is not None and self._evolution is not None:
+            try:
+                for eid, episode in self._evolution._episodes.items():
+                    evo_store.save_episode(
+                        episode_id=eid,
+                        skill_name=episode.skill_name,
+                        actions=episode.actions,
+                        outcome=episode.outcome,
+                        reward=episode.reward,
+                        context=episode.context,
+                        timestamp=episode.timestamp,
+                    )
+                logger.info("Evolution: persisted %d episodes to DuckDB", len(self._evolution._episodes))
+            except Exception:
+                logger.debug("Evolution persistence failed", exc_info=True)
+            finally:
+                try:
+                    evo_store.close()
+                except Exception:
+                    pass
+
         # Cancel engine if running
         if self.engine is not None:
             self.engine.cancel()

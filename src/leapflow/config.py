@@ -317,6 +317,14 @@ class Settings:
     # ── Session Persistence ──
     session_persistence_enabled: bool = True
 
+    # ── Multi-Provider LLM ──
+    llm_fallback_providers: str = ""  # JSON array of fallback provider configs
+    llm_aux_model: str = ""  # Auxiliary model for cheap operations (empty = reuse primary)
+    llm_aux_api_key: str = ""  # Aux API key (empty = reuse primary)
+    llm_aux_base_url: str = ""  # Aux base URL (empty = reuse primary)
+    llm_context_length: int = 128_000  # Primary provider's context window
+    llm_credential_cooldown_s: float = 60.0  # Per-key rate-limit cooldown
+
     # ── Signal Fusion (vision_only mode) ──
     # Default is the full 7-channel set; ``LEAPFLOW_SIGNAL_CHANNELS=none`` disables
     # signal collection entirely (V0 baseline).
@@ -712,6 +720,14 @@ def _build_settings_from_env() -> Settings:
     # Session Persistence
     session_persistence_enabled = _bool("LEAPFLOW_SESSION_PERSISTENCE_ENABLED", "true")
 
+    # Multi-Provider LLM
+    llm_fallback_providers = os.getenv("LEAPFLOW_LLM_FALLBACK_PROVIDERS", "").strip()
+    llm_aux_model = os.getenv("LEAPFLOW_LLM_AUX_MODEL", "").strip()
+    llm_aux_api_key = os.getenv("LEAPFLOW_LLM_AUX_API_KEY", "").strip()
+    llm_aux_base_url = os.getenv("LEAPFLOW_LLM_AUX_BASE_URL", "").strip()
+    llm_context_length = int(os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", "128000"))
+    llm_credential_cooldown_s = float(os.getenv("LEAPFLOW_LLM_CREDENTIAL_COOLDOWN_S", "60.0"))
+
     # Signal Fusion
     # Default = "all": collect every supported channel (V7 full fusion). Set
     # to "none" or empty list to disable; comma-separated list selects a
@@ -936,6 +952,13 @@ def _build_settings_from_env() -> Settings:
         max_consecutive_tool_failures=max_consecutive_tool_failures,
         # Session Persistence
         session_persistence_enabled=session_persistence_enabled,
+        # Multi-Provider LLM
+        llm_fallback_providers=llm_fallback_providers,
+        llm_aux_model=llm_aux_model,
+        llm_aux_api_key=llm_aux_api_key,
+        llm_aux_base_url=llm_aux_base_url,
+        llm_context_length=llm_context_length,
+        llm_credential_cooldown_s=llm_credential_cooldown_s,
         # Signal Fusion
         signal_channels=signal_channels,
         signal_reactive_capture=signal_reactive_capture,

@@ -5,12 +5,15 @@ Each recovery strategy can fire at most once per turn. Prevents:
 - Repeated native→text fallback after first attempt
 - OAuth refresh storms
 - Infinite grammar/format recovery
+- Provider failover loops
 
 Inspired by hermes TurnRetryState, adapted for leapflow's async-first design.
+Extended with provider-specific recovery strategies for multi-provider support.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -26,9 +29,14 @@ class TurnRecoveryState:
     _credential_rotated: bool = field(default=False, repr=False)
     _image_shrunk: bool = field(default=False, repr=False)
     _format_recovery: bool = field(default=False, repr=False)
+    _provider_failover: bool = field(default=False, repr=False)
+    _thinking_disabled: bool = field(default=False, repr=False)
+    _length_continuation: bool = field(default=False, repr=False)
+    _multimodal_strip: bool = field(default=False, repr=False)
 
     consecutive_api_errors: int = 0
     consecutive_tool_failures: int = 0
+    last_error_category: Optional[str] = field(default=None, repr=False)
 
     def try_compress(self) -> bool:
         """Attempt force-compress recovery. Returns True only on first call."""
@@ -65,13 +73,50 @@ class TurnRecoveryState:
         self._format_recovery = True
         return True
 
-    def record_api_error(self) -> int:
+    def try_provider_failover(self) -> bool:
+        """Attempt provider failover (switch to fallback provider). First call only."""
+        if self._provider_failover:
+            return False
+        self._provider_failover = True
+        return True
+
+    def try_disable_thinking(self) -> bool:
+        """Attempt disabling thinking/reasoning mode. First call only.
+
+        Some providers (e.g., Claude with extended thinking) may fail
+        when thinking is enabled with certain message shapes.
+        """
+        if self._thinking_disabled:
+            return False
+        self._thinking_disabled = True
+        return True
+
+    def try_length_continuation(self) -> bool:
+        """Attempt continuation for max_tokens truncation. First call only."""
+        if self._length_continuation:
+            return False
+        self._length_continuation = True
+        return True
+
+    def try_multimodal_strip(self) -> bool:
+        """Attempt stripping multimodal content (images) from messages. First call only.
+
+        Used when provider returns multimodal-related errors.
+        """
+        if self._multimodal_strip:
+            return False
+        self._multimodal_strip = True
+        return True
+
+    def record_api_error(self, category: Optional[str] = None) -> int:
         """Increment API error counter. Returns new count."""
         self.consecutive_api_errors += 1
+        self.last_error_category = category
         return self.consecutive_api_errors
 
     def record_api_success(self) -> None:
         self.consecutive_api_errors = 0
+        self.last_error_category = None
 
     def record_tool_failure(self) -> int:
         self.consecutive_tool_failures += 1
