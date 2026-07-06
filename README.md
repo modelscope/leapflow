@@ -28,7 +28,22 @@ Unlike instruction-driven agents (Computer-Use, RPA) that reason from scratch on
 
 ## Architecture Overview
 
-LeapFlow implements a layered cognitive pipeline:
+LeapFlow implements a **hybrid architecture** — a Python intelligence core paired with `cua-driver` as the native execution layer, communicating via MCP (Model Control Protocol):
+
+```
+LeapFlow Core (Python)
+├── Engine / OODA Loop + Learning + Copilot
+├── Platform Layer
+│   ├── CuaDriverClient (MCP stdio → cua-driver)   [Execution Layer]
+│   └── Observers (Python native)                    [Event Layer]
+└── EventBus → Signal Fusion → World Model
+
+cua-driver (Native)                                  [External Process]
+├── Screen capture, input injection, accessibility
+└── MCP protocol server (stdio transport)
+```
+
+The cognitive pipeline built on top:
 
 ```
 ┌───────────────────────────────────────────────────────────┐
@@ -41,24 +56,26 @@ LeapFlow implements a layered cognitive pipeline:
 │  Causal Engine     Rule · Heuristic · VLM verification    │
 ├───────────────────────────────────────────────────────────┤
 │  Perception        Multi-channel signal fusion (7 ch)     │
+├───────────────────────────────────────────────────────────┤
+│  cua-driver        Native execution (MCP protocol)        │
 └───────────────────────────────────────────────────────────┘
 ```
 
-**Perception** fuses raw signals into a causal timeline. The **Causal Engine** infers why things happened, not just what. The **World Model** builds an internal representation of the environment and learns from prediction errors. **Skill Synthesis** distills observations into parameterized, reusable skills with maturity tracking. The **Copilot** predicts your next workflow step and offers proactive suggestions — like GitHub Copilot, but for everything you do on your computer.
+**cua-driver** handles all native OS interactions — screen capture, accessibility tree queries, and input injection — via MCP stdio transport. **Perception** fuses raw signals into a causal timeline. The **Causal Engine** infers why things happened, not just what. The **World Model** builds an internal representation of the environment and learns from prediction errors. **Skill Synthesis** distills observations into parameterized, reusable skills with maturity tracking. The **Copilot** predicts your next workflow step and offers proactive suggestions — like GitHub Copilot, but for everything you do on your computer.
 
 ---
 
 ## Prerequisites
 
 | Component | Version | Purpose |
-|-----------|---------|---------|
+|-----------|---------|----------|
 | Python | ≥ 3.11 | Runtime (3.11–3.14 supported) |
 | [uv](https://github.com/astral-sh/uv) | latest | Fast package manager & virtualenv |
-| macOS | 14.0+ (Sonoma) | Required for native OS Host perception |
-| Xcode Command Line Tools | latest | Swift compiler for OS Host build |
+| macOS | 14.0+ (Sonoma) | Required for native perception |
+| [cua-driver](https://github.com/trycua/cua) | latest | Execution layer — screen capture, input injection, accessibility |
 | LLM API Key | — | DashScope, OpenAI, DeepSeek, or any OpenAI-compatible provider |
 
-> **Note:** You can run LeapFlow on any platform with `--mock-host` (no native perception), but full signal capture requires macOS with Accessibility permissions.
+> **Note:** You can run LeapFlow on any platform with `--mock-host` (no native perception), but full signal capture requires macOS with `cua-driver` installed and Accessibility permissions granted.
 
 ## Installation
 
@@ -96,21 +113,21 @@ LEAPFLOW_LLM_BASE_URL=https://api.openai.com/v1
 LEAPFLOW_LLM_MODEL=gpt-4o
 ```
 
-### 3. Build OS Host (Optional — macOS only)
+### 3. Install cua-driver (macOS only)
 
-The native OS Host captures screen recordings, accessibility trees, and input events. Skip this step if you just want to explore with `--mock-host`.
-
-```bash
-make swift-build              # Debug build
-```
-
-This compiles the Swift host binary to `os_host/darwin/.build/debug/OSHost`.
-
-For production deployment:
+`cua-driver` is the native execution layer that provides screen capture, accessibility tree access, and input injection via the MCP protocol. Skip this step if you just want to explore with `--mock-host`.
 
 ```bash
-make host-install             # Release build + .app bundle → ~/.leapflow/host/
+brew install trycua/tap/cua-driver
 ```
+
+Verify the driver is available:
+
+```bash
+uv run leap host doctor       # Checks cua-driver status and permissions
+```
+
+> **Tip:** macOS will prompt for Accessibility and Screen Recording permissions on first use. Grant both in System Settings → Privacy & Security.
 
 ### 4. Verify Installation
 
@@ -131,7 +148,7 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 | `LEAPFLOW_LLM_API_KEY` | **Yes** | — | Your LLM provider API key |
 | `LEAPFLOW_LLM_BASE_URL` | No | DashScope endpoint | OpenAI-compatible base URL |
 | `LEAPFLOW_LLM_MODEL` | No | `qwen3.7-plus` | Model identifier |
-| `LEAPFLOW_MOCK_HOST` | No | `0` | Set `1` to skip native Host |
+| `LEAPFLOW_MOCK_HOST` | No | `0` | Set `1` to skip cua-driver |
 | `LEAPFLOW_RECORDING_MODE` | No | `video` | `video` / `default` / `vision_only` |
 | `LEAPFLOW_LOG_LEVEL` | No | `INFO` | `DEBUG` / `INFO` / `WARNING` |
 | `LEAPFLOW_DUCKDB_PATH` | No | `~/.leapflow/memory.duckdb` | Persistent storage location |
@@ -148,8 +165,8 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 | `LEAPFLOW_LLM_MODEL` | `qwen3.7-plus` | Model identifier |
 | `LEAPFLOW_LLM_MAX_RETRIES` | `3` | Retry attempts on transient LLM errors |
 | **Bridge / Host** | | |
-| `LEAPFLOW_BRIDGE_SOCKET` | `/tmp/leapflow.sock` | Unix socket for Brain↔Host IPC |
-| `LEAPFLOW_MOCK_HOST` | `0` | `1` to skip native Host (in-process mock) |
+| `LEAPFLOW_BRIDGE_SOCKET` | `/tmp/leapflow.sock` | Unix socket for event push (observers) |
+| `LEAPFLOW_MOCK_HOST` | `0` | `1` to skip cua-driver (in-process mock) |
 | **Storage** | | |
 | `LEAPFLOW_DUCKDB_PATH` | `~/.leapflow/memory.duckdb` | Persistent DuckDB path |
 | `LEAPFLOW_DATA_DIR` | `~/.leapflow` | Root data directory |
@@ -311,7 +328,7 @@ Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` 
 | `run` | `leap run [prompt] [options]` | Execute a matched skill |
 | `skills` | `leap skills [action] [name]` | Manage the skill library |
 | `relearn` | `leap relearn <trajectory_id>` | Re-run learning pipeline on a saved trajectory |
-| `host` | `leap host <action>` | Manage native OS Host lifecycle |
+| `host` | `leap host <action>` | Manage cua-driver connection and diagnostics |
 
 **Global Flags:**
 
@@ -355,15 +372,8 @@ Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` 
 
 | Action | Description |
 |--------|-------------|
-| `start` | Start the OS Host daemon |
-| `stop` | Gracefully stop the OS Host |
-| `restart` | Restart the OS Host |
-| `status` | Show host status and macOS permissions |
-| `logs [-f]` | View host logs (`-f` to stream) |
-| `install` | Build and deploy `.app` bundle |
-| `setup` | Install + register LaunchAgent + permission guidance |
-| `uninstall` | Stop, unregister, and remove bundle |
-| `dev` | Development mode (auto-rebuild on source changes) |
+| `doctor` | Check cua-driver installation, version, and macOS permissions |
+| `status` | Show connection status to cua-driver |
 
 </details>
 
@@ -455,23 +465,22 @@ LEAPFLOW_VERBOSE_PROGRESS=true     # Show tool execution progress inline
 
 ---
 
-## OS Host Management
+## Host Management (cua-driver)
 
-For full perception (screen capture, accessibility tree, input events), you need the native OS Host running:
+For full perception (screen capture, accessibility tree, input events), you need `cua-driver` installed:
 
 ```bash
-# Development (foreground, debug build)
-make host                        # Terminal 1: builds + runs OS Host
-uv run leap                      # Terminal 2: interactive REPL
+# Check cua-driver and permissions
+uv run leap host doctor          # Verifies cua-driver binary, version, permissions
 
-# Production (daemon mode)
-uv run leap host setup           # Build, install, register as LaunchAgent
-uv run leap host start           # Start the daemon
-uv run leap host status          # Check if running
-uv run leap host stop            # Stop gracefully
+# Start with full perception
+uv run leap                      # Connects to cua-driver via MCP automatically
+
+# Without native perception
+uv run leap --mock-host          # Runs without cua-driver (for testing/exploration)
 ```
 
-> **Important:** macOS will prompt for Accessibility and Screen Recording permissions on first launch. Grant both in System Settings → Privacy & Security.
+> **Important:** macOS will prompt for Accessibility and Screen Recording permissions on first use. Grant both in System Settings → Privacy & Security.
 
 ---
 
@@ -481,9 +490,6 @@ uv run leap host stop            # Stop gracefully
 make setup            # Initialize environment
 make test             # Run tests (pytest)
 make lint             # Lint (ruff)
-make swift-build      # Build Swift Host (debug)
-make host-build       # Build Swift Host (release)
-make host-dev         # Auto-rebuild on source changes
 ```
 
 <details>
@@ -507,13 +513,12 @@ leapflow/
 │   ├── memory/             # Three-tier memory system
 │   ├── recording/          # Video recording orchestration
 │   ├── llm/                # LLM provider abstraction
-│   ├── platform/           # RPC bridge + platform layer
+│   ├── platform/           # MCP client + platform layer (cua-driver)
 │   ├── domain/             # Shared types & events
 │   ├── storage/            # DuckDB persistence
 │   ├── tools/              # Built-in tool registry
 │   ├── prompts/            # LLM prompt templates
 │   └── utils/              # Shared utilities
-├── os_host/darwin/         # Native macOS Host (Swift)
 ├── tests/                  # Pytest suite
 ├── docs/design/            # Design documents
 └── scripts/                # Setup & run scripts
@@ -586,8 +591,8 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | `analysis/` | Six-layer denoising pipeline for trajectory refinement |
 | `engine/` | Session orchestration and ReAct execution loop |
 | `memory/` | Three-tier event-driven memory (working → episodic → long-term) |
-| `platform/` | Platform adaptation layer and RPC bridge |
-| `os_host/` | Native host service — macOS (Swift), Linux & Windows (planned) |
+| `platform/` | Platform adaptation layer and MCP client (cua-driver communication) |
+| `hub/` | Multi-source skill hub (ModelScope, GitHub, local) |
 
 <details>
 <summary>Architecture — Detailed Module Map</summary>
@@ -605,13 +610,13 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | Engine | `src/leapflow/engine/` | session, react_loop, tools | Session orchestration, ReAct loop, tool dispatch, context compression |
 | Memory | `src/leapflow/memory/` | working, episodic, long_term | Three-tier event-driven memory with promotion/eviction |
 | LLM | `src/leapflow/llm/` | provider, message_builder | LLM abstraction (OpenAI-compatible), streaming, retry logic |
-| Platform | `src/leapflow/platform/` | rpc_client, bridge, adapter | RPC transport (msgpack over Unix socket), platform abstraction |
+| Platform | `src/leapflow/platform/` | mcp_client, bridge, adapter | MCP protocol client (stdio transport to cua-driver), platform abstraction |
 | Domain | `src/leapflow/domain/` | events, perception, types | Shared domain types, event definitions, perception models |
 | Recording | `src/leapflow/recording/` | recorder, video, segmenter | Video recording orchestration, segmentation, caching |
 | Tools | `src/leapflow/tools/` | registry, builtins | Built-in tool definitions for the ReAct loop |
 | CLI | `src/leapflow/cli/` | cli, commands/, banner | Argument parsing, subcommand dispatch, interactive REPL |
 | Storage | `src/leapflow/storage/` | duckdb, skill_library | DuckDB-backed persistent storage for skills, trajectories, audit |
-| OS Host (macOS) | `os_host/darwin/Sources/OSHost/` | Perception/, Execution/, Bridge/ | Native Swift host: screen capture, AX tree, input events, RPC server |
+| OS Host (macOS) | external: `cua-driver` | — | Native execution layer: screen capture, AX tree, input events (installed via Homebrew) |
 
 </details>
 
@@ -634,20 +639,18 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | `FeedbackSignal` | Structured user response (accept/ignore/correct/reject + latency) |
 | `FeedbackType` | Enum: `ACCEPT`, `IGNORE`, `CORRECT`, `EXPLICIT_REJECT` |
 
-**RPC Schema (Brain ↔ OS Host):**
+**MCP Protocol (LeapFlow → cua-driver):**
 
-Defined in `os_host/protocol/rpc_schema.yaml`. Transport: length-prefixed msgpack over Unix domain socket.
+Transport: stdio (JSON-RPC over stdin/stdout). The `CuaDriverClient` in `platform/` manages the connection lifecycle.
 
 | Method | Direction | Description |
 |--------|-----------|-------------|
-| `video.start` / `video.stop` | Brain → Host | Start/stop video recording |
-| `recording.start` / `recording.stop` | Brain → Host | Start/stop event-level recording |
-| `ax.tree` | Brain → Host | Snapshot current accessibility tree |
-| `ax.perform` | Brain → Host | Perform an action on a UI element |
-| `input.type_text` / `input.shortcut` | Brain → Host | Inject keyboard input |
-| `screen.capture_frame` | Brain → Host | Capture a single screen frame |
-| `system.manifest` | Brain → Host | Query platform capabilities |
-| `event.*` (6 types) | Host → Brain | Push real-time events (focus, clipboard, fs, UI action, etc.) |
+| `screen.capture` | LeapFlow → cua | Capture screen frame(s) |
+| `accessibility.tree` | LeapFlow → cua | Query accessibility tree |
+| `accessibility.perform` | LeapFlow → cua | Perform action on UI element |
+| `input.type` / `input.shortcut` | LeapFlow → cua | Inject keyboard input |
+| `input.click` / `input.scroll` | LeapFlow → cua | Inject mouse input |
+| `system.info` | LeapFlow → cua | Query platform capabilities |
 
 </details>
 
@@ -657,12 +660,11 @@ Defined in `os_host/protocol/rpc_schema.yaml`. Transport: length-prefixed msgpac
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `OS Host connection failed` | Host not running or socket mismatch | Run `make host` in another terminal, or use `--mock-host` |
+| `cua-driver not found` | Driver not installed | `brew install trycua/tap/cua-driver` |
+| `MCP connection failed` | cua-driver not responding | Run `leap host doctor` to diagnose; ensure driver is on PATH |
 | `LEAPFLOW_LLM_API_KEY is empty` | Missing API key | Set `LEAPFLOW_LLM_API_KEY` in `.env` |
-| `Accessibility permission denied` | macOS privacy gate | System Settings → Privacy & Security → Accessibility → enable LeapHost |
-| `Screen Recording blocked` | macOS privacy gate | System Settings → Privacy & Security → Screen Recording → enable LeapHost |
-| `swiftc: command not found` | Xcode CLT missing | `xcode-select --install` |
-| Host builds but crashes | SDK version mismatch | Ensure macOS 14+ and latest Xcode CLT |
+| `Accessibility permission denied` | macOS privacy gate | System Settings → Privacy & Security → Accessibility → enable cua-driver |
+| `Screen Recording blocked` | macOS privacy gate | System Settings → Privacy & Security → Screen Recording → enable cua-driver |
 
 ---
 

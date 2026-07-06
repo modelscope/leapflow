@@ -93,14 +93,6 @@ class Settings:
     # ── Data Root ──
     data_dir: Path = Path("~/.leapflow")
 
-    # ── OS Host ──
-    host_root: Path = Path("~/.leapflow/host")
-    host_socket: Path = Path("/tmp/leapflow.sock")
-    host_pid_file: Path = Path("~/.leapflow/var/host.pid")
-    host_log_file: Path = Path("~/.leapflow/var/host.log")
-    host_bundle_id: str = "com.leapflow.host"
-    host_auto_start: bool = True
-
     # Audit
     audit_log_path: Path = Path("~/.leapflow/audit.jsonl")
 
@@ -318,6 +310,10 @@ class Settings:
     # overrides live in ``leapflow.platform.client._RPC_TIMEOUT_MAP``.
     rpc_timeout_default: float = 30.0
 
+    # ── Cua Driver ──
+    use_cua_driver: bool = True
+    cua_driver_cmd: str = "cua-driver"
+
     # ── Workflow Copilot ──
     copilot_enabled: bool = True
     copilot_min_idle_ms: int = 500
@@ -397,25 +393,8 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     # Data Root – reuse the early-resolved path; derives all default host paths
     data_dir = _data_dir
 
-    # OS Host paths (default derived from data_dir)
-    host_root = _expand_path(
-        os.getenv("LEAPFLOW_HOST_ROOT", str(data_dir / "host")).strip()
-    )
-    host_socket_default = "/tmp/leapflow.sock"
-    host_socket = _expand_path(
-        os.getenv("LEAPFLOW_HOST_SOCKET", host_socket_default).strip()
-    )
-    host_pid_file = _expand_path(
-        os.getenv("LEAPFLOW_HOST_PID_FILE", str(data_dir / "var" / "host.pid")).strip()
-    )
-    host_log_file = _expand_path(
-        os.getenv("LEAPFLOW_HOST_LOG_FILE", str(data_dir / "var" / "host.log")).strip()
-    )
-    host_bundle_id = os.getenv("LEAPFLOW_HOST_BUNDLE_ID", "com.leapflow.host").strip()
-    host_auto_start = os.getenv("LEAPFLOW_HOST_AUTO_START", "1").strip() in ("1", "true", "True", "yes")
-
-    # bridge_socket: defaults to host_socket; LEAPFLOW_BRIDGE_SOCKET overrides for backward compatibility
-    bridge = os.getenv("LEAPFLOW_BRIDGE_SOCKET", str(host_socket)).strip()
+    # bridge_socket: LEAPFLOW_BRIDGE_SOCKET overrides default
+    bridge = os.getenv("LEAPFLOW_BRIDGE_SOCKET", "/tmp/leapflow.sock").strip()
     mock_host = os.getenv("LEAPFLOW_MOCK_HOST", "0").strip() in ("1", "true", "True", "yes")
     duckdb = os.getenv("LEAPFLOW_DUCKDB_PATH", "~/.leapflow/memory.duckdb").strip()
     log_level = os.getenv("LEAPFLOW_LOG_LEVEL", "INFO").strip()
@@ -642,6 +621,10 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     # RPC Transport
     rpc_timeout_default = float(os.getenv("LEAPFLOW_RPC_TIMEOUT_DEFAULT", "30.0"))
 
+    # Cua Driver
+    use_cua_driver = _bool("LEAPFLOW_USE_CUA_DRIVER", "true")
+    cua_driver_cmd = os.getenv("LEAPFLOW_CUA_DRIVER_CMD", "cua-driver").strip()
+
     # Workflow Copilot
     copilot_enabled = _bool("LEAPFLOW_COPILOT_ENABLED", "true")
     copilot_min_idle_ms = int(os.getenv("LEAPFLOW_COPILOT_MIN_IDLE_MS", "500"))
@@ -683,12 +666,6 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         memory_prefetch_timeout_s=memory_prefetch_timeout_s,
         memory_prefetch_limit=memory_prefetch_limit,
         data_dir=data_dir,
-        host_root=host_root,
-        host_socket=host_socket,
-        host_pid_file=host_pid_file,
-        host_log_file=host_log_file,
-        host_bundle_id=host_bundle_id,
-        host_auto_start=host_auto_start,
         audit_log_path=_expand_path(audit_log_path),
         skills_dir=_expand_path(skills_dir),
         skill_view_max_chars=skill_view_max_chars,
@@ -837,6 +814,9 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         signal_reactive_capture=signal_reactive_capture,
         # RPC Transport
         rpc_timeout_default=rpc_timeout_default,
+        # Cua Driver
+        use_cua_driver=use_cua_driver,
+        cua_driver_cmd=cua_driver_cmd,
         # Workflow Copilot
         copilot_enabled=copilot_enabled,
         copilot_min_idle_ms=copilot_min_idle_ms,

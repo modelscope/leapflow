@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from leapflow.platform.client import BridgeClient
+from leapflow.platform.cua_client import CuaDriverClient
 from leapflow.platform.event_bus import EventBus
 from leapflow.platform.mock import MockBridge
 from leapflow.config import Settings, load_config
@@ -293,10 +294,20 @@ class Context:
         self._evolution = evolution
 
         self.event_bus = EventBus(immediate=self.imm, working=self.wm)
-        self.rpc: BridgeClient | MockBridge
+        self.rpc: BridgeClient | CuaDriverClient | MockBridge
         if self.effective_mock:
             self.rpc = MockBridge()
             self.rpc.on_event(self.event_bus.handle_event)
+        elif settings.use_cua_driver:
+            from leapflow.platform.cua_client import cua_driver_available
+            if not cua_driver_available():
+                _emit_status(
+                    "WARNING: use_cua_driver=True but cua-driver not found on PATH"
+                )
+                _emit_status(
+                    "  Install with: leap host install  |  Diagnose with: leap host doctor"
+                )
+            self.rpc = CuaDriverClient()
         else:
             self.rpc = BridgeClient(
                 settings.bridge_socket,
@@ -387,76 +398,16 @@ class Context:
             self.rpc.on_reconnect(self._resubscribe_fs)
             await self.rpc.fire_reconnect_callbacks()
 
-    # ── Host Readiness ──────────────────────────────────────────────────────
-
-    def _build_host_manager(self) -> "HostManager":  # noqa: F821
-        """Construct a HostManager from current settings."""
-        from leapflow.host import HostManager
-        return HostManager(
-            host_root=self.settings.host_root,
-            host_socket=self.settings.host_socket,
-            pid_file=self.settings.host_pid_file,
-            log_file=self.settings.host_log_file,
-            bundle_id=self.settings.host_bundle_id,
-        )
+    # ── Host Readiness (legacy — OS Host removed, cua-driver pending) ────────
 
     async def _ensure_host_ready(self) -> HostReadiness:
-        """Structured OS Host health check with transparent status feedback.
+        """OS Host has been removed; always returns DEGRADED (offline mode).
 
-        Performs fast-path diagnosis, attempts auto-start when needed, and
-        reports state to the user in real-time. Never blocks longer than the
-        configured start timeout (default 5s).
-
-        Returns:
-            HostReadiness indicating whether the host is usable or degraded.
+        The legacy OS Host module is deprecated in favor of cua-driver.
+        Until cua-driver integration is complete, the system runs in offline mode.
         """
-        from leapflow.host import HostState
-
-        mgr = self._build_host_manager()
-        diag = mgr.diagnose()
-
-        # Fast path: already running
-        if diag.state == HostState.RUNNING:
-            pid_info = f" (PID {diag.pid})" if diag.pid else ""
-            _emit_status(f"OS Host: running{pid_info}")
-            return HostReadiness.RUNNING
-
-        # Binary not installed — guide user, degrade gracefully
-        if not diag.executable_found:
-            _emit_status("OS Host: not installed")
-            _emit_status("  Run 'leap host setup' to install and configure.")
-            return HostReadiness.DEGRADED
-
-        # Stale state detected — announce cleanup
-        if diag.state == HostState.STALE:
-            _emit_status("OS Host: cleaning stale state...")
-
-        # Attempt start
-        _emit_status("OS Host: starting...")
-        try:
-            status = await mgr.start(timeout=5.0)
-            pid_info = f" (PID {status.pid})" if status.pid else ""
-            _emit_status(f"OS Host: started{pid_info}")
-            return HostReadiness.STARTED
-        except FileNotFoundError:
-            _emit_status("OS Host: binary not found")
-            _emit_status("  Run 'leap host setup' to install and configure.")
-            return HostReadiness.DEGRADED
-        except TimeoutError:
-            _emit_status("OS Host: start timed out")
-            _emit_status("  Check 'leap host logs' for details.")
-            return HostReadiness.DEGRADED
-        except RuntimeError as exc:
-            _emit_status(f"OS Host: crashed on startup")
-            _emit_status(f"  {exc}")
-            return HostReadiness.DEGRADED
-        except OSError as exc:
-            _emit_status(f"OS Host: start failed ({exc})")
-            return HostReadiness.DEGRADED
-        except Exception as exc:
-            logger.debug("OS Host start unexpected error: %s", exc, exc_info=True)
-            _emit_status(f"OS Host: error ({type(exc).__name__})")
-            return HostReadiness.DEGRADED
+        _emit_status("OS Host: removed (cua-driver migration pending)")
+        return HostReadiness.DEGRADED
 
     async def initialize(self) -> None:
         """Async initialization: VSI handshake, pipeline assembly.
@@ -472,17 +423,14 @@ class Context:
         # Initialize all memory providers (opens DB, starts GC, etc.)
         await self.memory.initialize_all()
 
-        # Phase 1: OS Host readiness — diagnose, auto-start, report status
+        # Phase 1: Host readiness (OS Host removed; mock or offline)
         host_readiness: HostReadiness
         if self.effective_mock:
             # Mock mode: no host needed, bridge is in-process.
             host_readiness = HostReadiness.RUNNING
-        elif settings.host_auto_start:
-            host_readiness = await self._ensure_host_ready()
         else:
-            # Auto-start disabled: user manages host externally (e.g. launchd).
-            # Assume available; bridge connection will validate.
-            host_readiness = HostReadiness.RUNNING
+            # OS Host removed — run in offline/degraded mode until cua-driver ready
+            host_readiness = await self._ensure_host_ready()
 
         # Phase 2: Bridge connection
         vsi = VirtualSystemInterface(self.rpc)
@@ -504,6 +452,24 @@ class Context:
                     manifest = PlatformManifest.default_darwin()
                     vsi._manifest = manifest
                     self._bg_connect_task = asyncio.create_task(self._bg_connect())
+        elif isinstance(self.rpc, CuaDriverClient):
+            try:
+                self.rpc.start()
+                manifest = await vsi.handshake()
+                bridge_online = True
+            except RuntimeError as exc:
+                _emit_status(f"cua-driver connection failed: {exc}")
+                if "not found" in str(exc).lower():
+                    _emit_status(
+                        "  Install with: leap host install"
+                    )
+                else:
+                    _emit_status(
+                        "  Check permissions (macOS TCC) or run: leap host doctor"
+                    )
+                _emit_status("Running in degraded mode (no OS execution)")
+                manifest = PlatformManifest.default_darwin()
+                vsi._manifest = manifest
         else:
             manifest = await vsi.handshake()
             bridge_online = True
@@ -1205,6 +1171,8 @@ class Context:
         await self.memory.shutdown_all()
         if isinstance(self.rpc, BridgeClient):
             await self.rpc.close()
+        elif isinstance(self.rpc, CuaDriverClient):
+            self.rpc.stop()
         if self.skill_lib:
             self.skill_lib.close()
         if self.imitation:
