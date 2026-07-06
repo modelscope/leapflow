@@ -155,7 +155,7 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 | `LEAPFLOW_LLM_API_KEY` | **Yes** | — | Your LLM provider API key |
 | `LEAPFLOW_LLM_BASE_URL` | No | DashScope endpoint | OpenAI-compatible base URL |
 | `LEAPFLOW_LLM_MODEL` | No | `qwen3.7-plus` | Model identifier |
-| `LEAPFLOW_MOCK_HOST` | No | `0` | Set `1` to skip cua-driver |
+| `LEAPFLOW_MOCK_HOST` | No | `0` | Set `1` to use in-process mock (no execution backend) |
 | `LEAPFLOW_RECORDING_MODE` | No | `video` | `video` / `default` / `vision_only` |
 | `LEAPFLOW_LOG_LEVEL` | No | `INFO` | `DEBUG` / `INFO` / `WARNING` |
 | `LEAPFLOW_DUCKDB_PATH` | No | `~/.leapflow/memory.duckdb` | Persistent storage location |
@@ -173,7 +173,7 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 | `LEAPFLOW_LLM_MAX_RETRIES` | `3` | Retry attempts on transient LLM errors |
 | **Bridge / Host** | | |
 | `LEAPFLOW_BRIDGE_SOCKET` | `/tmp/leapflow.sock` | Unix socket for event push (observers) |
-| `LEAPFLOW_MOCK_HOST` | `0` | `1` to skip cua-driver (in-process mock) |
+| `LEAPFLOW_MOCK_HOST` | `0` | `1` to use in-process mock (no execution backend) |
 | **Storage** | | |
 | `LEAPFLOW_DUCKDB_PATH` | `~/.leapflow/memory.duckdb` | Persistent DuckDB path |
 | `LEAPFLOW_DATA_DIR` | `~/.leapflow` | Root data directory |
@@ -520,7 +520,7 @@ leapflow/
 │   ├── memory/             # Three-tier memory system
 │   ├── recording/          # Video recording orchestration
 │   ├── llm/                # LLM provider abstraction
-│   ├── platform/           # MCP client + platform layer (cua-driver)
+│   ├── platform/           # Platform adaptation layer (execution backend abstraction)
 │   ├── domain/             # Shared types & events
 │   ├── storage/            # DuckDB persistence
 │   ├── tools/              # Built-in tool registry
