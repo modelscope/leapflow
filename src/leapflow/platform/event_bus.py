@@ -5,9 +5,10 @@ Pipeline: OSHost push → EventBus → Normalizer → EpisodicMemory → (promot
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from leapflow.domain.events import SystemEvent
 from leapflow.memory.providers.episodic import EpisodicMemoryProvider
@@ -15,6 +16,9 @@ from leapflow.memory.providers.working import WorkingMemoryProvider
 from leapflow.platform.normalizer import EventNormalizer
 from leapflow.platform.protocol import EventTypes
 from leapflow.platform.reorder_buffer import EventReorderBuffer
+
+if TYPE_CHECKING:
+    from leapflow.learning.event_consumer import EventConsumer
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,8 @@ class EventBus:
         immediate: EpisodicMemoryProvider,
         working: WorkingMemoryProvider,
         normalizer: Optional[EventNormalizer] = None,
+        buffer_size: int = 50,
+        flush_interval_s: float = 60.0,
     ) -> None:
         self._immediate = immediate
         self._working = working
@@ -42,6 +48,12 @@ class EventBus:
         self._subscribers: List[EventCallback] = []
         self._recent_sources: Dict[str, float] = {}
         self._reorder_buffer: Optional[EventReorderBuffer] = None
+        # Consumer infrastructure
+        self._consumers: list["EventConsumer"] = []
+        self._event_buffer: list[SystemEvent] = []
+        self._buffer_size = buffer_size
+        self._flush_interval_s = flush_interval_s
+        self._last_flush_time = time.monotonic()
 
     def set_normalizer(self, normalizer: EventNormalizer) -> None:
         """Late-bind normalizer (set after VSI handshake resolves the manifest)."""
@@ -68,11 +80,59 @@ class EventBus:
         else:
             await self._process_event(event_type, payload)
 
+    def register_consumer(self, consumer: "EventConsumer") -> None:
+        """Register an event consumer for batch event delivery."""
+        if consumer not in self._consumers:
+            self._consumers.append(consumer)
+            logger.info("Registered event consumer: %s", consumer.consumer_id)
+
+    def unregister_consumer(self, consumer_id: str) -> None:
+        """Remove a consumer by ID."""
+        self._consumers = [
+            c for c in self._consumers if c.consumer_id != consumer_id
+        ]
+
+    async def flush_consumers(self) -> None:
+        """Force flush buffered events to all consumers."""
+        if not self._event_buffer or not self._consumers:
+            return
+        batch = self._event_buffer[:]
+        self._event_buffer.clear()
+        self._last_flush_time = time.monotonic()
+        for consumer in self._consumers:
+            if not consumer.enabled:
+                continue
+            try:
+                await consumer.on_events_batch(batch)
+            except Exception:
+                logger.warning(
+                    "Event consumer '%s' failed on batch of %d events",
+                    consumer.consumer_id,
+                    len(batch),
+                    exc_info=True,
+                )
+
+    def _buffer_event(self, event: SystemEvent) -> None:
+        """Add event to consumer buffer; schedule flush when threshold is met."""
+        self._event_buffer.append(event)
+        now = time.monotonic()
+        if (
+            len(self._event_buffer) >= self._buffer_size
+            or now - self._last_flush_time >= self._flush_interval_s
+        ):
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.flush_consumers())
+            except RuntimeError:
+                # No running loop — skip async flush (will flush on next opportunity)
+                pass
+
     async def _process_event(self, event_type: str, payload: Dict[str, Any]) -> None:
-        """Core processing: normalize → memory → subscribers."""
+        """Core processing: normalize → memory → subscribers → consumer buffer."""
         normalized = self._normalize(event_type, payload)
         self._ingest_to_memory(normalized)
         self._notify_subscribers(normalized)
+        self._buffer_event(normalized)
 
     def _normalize(self, event_type: str, payload: Dict[str, Any]) -> SystemEvent:
         if self._normalizer is not None:

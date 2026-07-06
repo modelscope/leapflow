@@ -6,9 +6,10 @@ import asyncio
 import logging
 import re
 import sys
+import time
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from leapflow.platform.client import BridgeClient
 from leapflow.platform.cua_client import CuaDriverClient
@@ -34,6 +35,7 @@ from leapflow.memory import (
     SemanticMemoryProvider, EvolutionMemoryProvider, MemoryFragment,
 )
 from leapflow.skills.activator import SkillActivator
+from leapflow.skills.evolution import EMAConfidencePolicy
 from leapflow.skills.index import SkillIndex
 from leapflow.skills.injector import SkillInjector
 from leapflow.skills.discovery import configure as configure_skill_discovery
@@ -355,6 +357,14 @@ class Context:
         self.snapshot_service: Optional[Any] = None
         self.trajectory_grader: Optional[Any] = None
         self.active_observer: Optional[Any] = None
+
+        # Daemon / Observer
+        self._observation_daemon: Optional[Any] = None
+        self._pipeline_observer: Optional[Any] = None
+
+        # Skill evolution & PatternMiner
+        self._evolution_policy: Optional[EMAConfidencePolicy] = None
+        self._pattern_miner: Optional[Any] = None
 
     async def _bg_connect(self) -> None:
         """Background bridge reconnection with post-connect initialization.
@@ -775,6 +785,9 @@ class Context:
             )
             _tuner = self.attention_tuner
 
+            _evo_policy = self._evolution_policy
+            _skill_lib = self.skill_lib
+
             def _on_prediction_outcome(outcome: Any) -> None:
                 score = self.curiosity.compute(outcome)
                 exp_id = getattr(outcome, "experience_id", "")
@@ -782,6 +795,36 @@ class Context:
                     _es.update_curiosity_score(exp_id, score.total)
                 _tuner.on_curiosity_signal(score, outcome)
                 observer.on_curiosity_signal(score, outcome)
+
+                # Delta-driven skill evolution (断裂点4)
+                delta = getattr(outcome, "delta", 0.0)
+                if delta > 0.4 and _evo_policy is not None and _skill_lib is not None:
+                    action_desc = ""
+                    pred = getattr(outcome, "prediction", None)
+                    if pred is not None:
+                        action_desc = getattr(pred, "action_description", "")
+                    if action_desc:
+                        try:
+                            stored = _skill_lib.load_skill_by_title(action_desc)
+                            if stored:
+                                evo_outcome = _evo_policy.on_execution_result(
+                                    stored.title,
+                                    success=(delta < 0.2),
+                                    duration_s=0.0,
+                                    current_confidence=stored.confidence,
+                                    current_version=stored.version,
+                                )
+                                _skill_lib.update_skill_confidence(
+                                    stored.title, evo_outcome.new_confidence
+                                )
+                                if evo_outcome.tier_changed:
+                                    logger.info(
+                                        "Delta-driven evolution: '%s' confidence \u2192 %.3f",
+                                        stored.title, evo_outcome.new_confidence,
+                                    )
+                        except Exception:
+                            logger.debug("delta-driven evolution update failed", exc_info=True)
+
             self.prediction_loop._on_outcome = _on_prediction_outcome
 
         n_doc_skills = 0
@@ -852,6 +895,7 @@ class Context:
                 config=learnability_config,
             )
 
+        self._evolution_policy = EMAConfidencePolicy()
         self.session = SessionController(
             self.imitation,
             self.registry,
@@ -864,6 +908,8 @@ class Context:
             active_learning_observer=observer,
             session_store=self.session_store,
             learnability_assessor=learnability_assessor,
+            evolution_policy=self._evolution_policy,
+            skill_store=self.skill_lib,
         )
 
         classifier: IntentClassifier = (
@@ -1004,90 +1050,213 @@ class Context:
             skill_index=skill_index,
         )
 
-    def _build_insight_callback(self) -> Any:
-        """Build a callback that routes replay insights to the causal heuristic engine."""
+        # Pipeline Observer (A6: learning pipeline observability)
+        from leapflow.engine.pipeline_observer import StructuredPipelineLogger
+        self._pipeline_observer = StructuredPipelineLogger()
+
+        # ObservationDaemon conditional auto-start (A4)
+        if settings.observer_auto_start and not self.effective_mock:
+            from leapflow.platform.observers import ObserverConfig
+            from leapflow.platform.observers.daemon import ObservationDaemon
+            observer_config = ObserverConfig(enabled=settings.observer_enabled_set)
+            self._observation_daemon = ObservationDaemon(
+                bus=self.event_bus, config=observer_config,
+            )
+            try:
+                await self._observation_daemon.start()
+                logger.info("ObservationDaemon auto-started: %s", self._observation_daemon.status)
+            except Exception:
+                logger.warning("ObservationDaemon auto-start failed", exc_info=True)
+                self._observation_daemon = None
+
+        # PatternMiner integration — 断裂点5: bridge EventBus → PatternMiner → ActiveLearning
+        if settings.observer_auto_start and settings.has_llm_credentials:
+            try:
+                from leapflow.learning.pattern_miner import PatternMiner
+                self._pattern_miner = PatternMiner(
+                    memory=self.imm,
+                    llm=self.llm,
+                    min_frequency=5,
+                )
+                self.event_bus.register_consumer(self._pattern_miner)
+                logger.info("PatternMiner registered as EventBus consumer")
+            except ImportError:
+                logger.debug("PatternMiner not available (module not yet created)")
+            except Exception:
+                logger.warning("PatternMiner initialization failed", exc_info=True)
+
+    def _build_insight_callback(self) -> Callable:
+        """Build callback for replay insights — routes ALL insight types."""
         ps = self.perception_session
-        if ps is None:
-            return None
 
         def _on_insight(insight: Any) -> None:
-            causal_rule = getattr(insight, "metadata", {}).get("causal_rule")
-            if not causal_rule or not isinstance(causal_rule, dict):
+            metadata = getattr(insight, "metadata", None) or {}
+            if isinstance(metadata, str):
                 return
-            parent = causal_rule.get("parent_channel", "")
-            child = causal_rule.get("child_channel", "")
-            confidence = float(causal_rule.get("confidence", 0.5))
-            if parent and child:
-                try:
-                    heuristic = ps.causal_pipeline.inference.heuristic
-                    heuristic.update_prior(parent, child, confidence)
-                    logger.debug(
-                        "insight applied: %s→%s confidence=%.2f",
-                        parent, child, confidence,
-                    )
-                except Exception:
-                    logger.debug("insight application failed", exc_info=True)
+            insight_type = metadata.get("type", "unknown")
+
+            # Route 1: Causal rules → causal heuristic (existing)
+            causal_rule = metadata.get("causal_rule")
+            if causal_rule and isinstance(causal_rule, dict) and ps is not None:
+                parent = causal_rule.get("parent_channel", "")
+                child = causal_rule.get("child_channel", "")
+                confidence = float(causal_rule.get("confidence", 0.5))
+                if parent and child:
+                    try:
+                        heuristic = ps.causal_pipeline.inference.heuristic
+                        heuristic.update_prior(parent, child, confidence)
+                        logger.debug(
+                            "insight applied: %s\u2192%s confidence=%.2f",
+                            parent, child, confidence,
+                        )
+                    except Exception:
+                        logger.debug("insight causal application failed", exc_info=True)
+
+            # Route 2: Skill performance insights → evolution policy
+            if insight_type in ("skill_regression", "skill_improvement", "execution_delta"):
+                skill_name = metadata.get("skill_name")
+                if skill_name and self._evolution_policy is not None:
+                    delta = float(metadata.get("delta", 0.0))
+                    if delta < -0.3:  # Significant regression
+                        try:
+                            outcome = self._evolution_policy.on_regression_detected(
+                                skill_name,
+                                current_confidence=float(metadata.get("confidence", 0.5)),
+                                current_version=int(metadata.get("version", 1)),
+                            )
+                            if self.skill_lib and outcome.tier_changed:
+                                self.skill_lib.update_skill_confidence(
+                                    skill_name, outcome.new_confidence
+                                )
+                                logger.info(
+                                    "Insight-driven regression: %s confidence \u2192 %.3f",
+                                    skill_name, outcome.new_confidence,
+                                )
+                        except Exception:
+                            logger.debug("insight evolution update failed", exc_info=True)
+
+            # Route 3: Pattern discovery insights → log for observability
+            if insight_type == "pattern_discovered":
+                pattern_desc = metadata.get("pattern", "")
+                logger.info("Insight: new pattern discovered \u2014 %s", pattern_desc)
+                # Route to ActiveLearningObserver if available
+                if self.active_observer is not None and hasattr(self.active_observer, "on_pattern_candidate"):
+                    try:
+                        self.active_observer.on_pattern_candidate(metadata)
+                    except Exception:
+                        logger.debug("pattern candidate routing failed", exc_info=True)
 
         return _on_insight
 
     async def _on_session_end_learning(self) -> None:
-        """End-of-session OPD learning pipeline (8 phases).
+        """End-of-session OPD learning pipeline (8 phases) with full observability.
 
         Executes in order:
-        1. Trajectory grading (teacher with full hindsight)
+        1. Trajectory grading (teacher with full hindsight) — grades consumed by replay_engine
         2. Off-policy experience replay (high-delta)
-        3. Curiosity-targeted replay (high-curiosity apps)
+        3. Curiosity-targeted replay (high-curiosity apps) — curiosity fed to attention_tuner
         4. Regression-gated self-distillation (causal rules)
         5. Attention statistics feedback (AttentionTuner)
         6. Long-term memory maintenance (prune old rows)
         7. Budget rebalancing from session outcomes
         8. VLM Tier 3 verification (if enabled)
         """
+        observer = self._pipeline_observer
+        pipeline_start = time.perf_counter()
+        phases_ok = 0
+        phases_failed = 0
         trajectory: list = []
 
-        # Phase 1: Trajectory grading
+        # Phase 1: Trajectory grading — FIX A5-1: grades now consumed by replay_engine
         if self.trajectory_grader is not None and self.prediction_loop is not None:
+            observer.on_phase_start("trajectory_grading")
+            t0 = time.perf_counter()
             try:
                 trajectory, goal = self.prediction_loop.flush_trajectory()
                 if trajectory:
                     grades = await self.trajectory_grader.grade_trajectory(
                         trajectory, goal=goal,
                     )
-                    logger.info("session_end: graded %d actions", len(grades))
-            except Exception:
-                logger.debug("session_end.trajectory_grading failed", exc_info=True)
+                    # FIX A5-1: Feed grades to replay engine as priority weights
+                    if hasattr(self.replay_engine, 'set_replay_priorities') and grades:
+                        self.replay_engine.set_replay_priorities(grades)
+                    observer.on_phase_success(
+                        "trajectory_grading", time.perf_counter() - t0,
+                        {"actions_graded": len(grades) if grades else 0},
+                    )
+                    phases_ok += 1
+                else:
+                    observer.on_phase_success(
+                        "trajectory_grading", time.perf_counter() - t0,
+                        {"actions_graded": 0, "note": "empty_trajectory"},
+                    )
+                    phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("trajectory_grading", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
         # Phase 2: Off-policy replay
         if self.replay_engine is not None:
+            observer.on_phase_start("off_policy_replay")
+            t0 = time.perf_counter()
             try:
                 insights = await self.replay_engine.replay_session()
-                if insights:
-                    logger.info("session_end: discovered %d insights", len(insights))
-            except Exception:
-                logger.debug("session_end.replay failed", exc_info=True)
+                observer.on_phase_success(
+                    "off_policy_replay", time.perf_counter() - t0,
+                    {"insights_discovered": len(insights) if insights else 0},
+                )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("off_policy_replay", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
-        # Phase 3: Targeted replay for high-curiosity domains
+        # Phase 3: Curiosity-targeted replay — FIX A5-2: feed curiosity to attention_tuner
         if self.replay_engine is not None and self.active_observer is not None:
+            observer.on_phase_start("curiosity_replay")
+            t0 = time.perf_counter()
             try:
                 curious_apps = self.active_observer.drain_high_curiosity_apps()
                 for app_ctx in curious_apps:
                     await self.replay_engine.replay_targeted(app_ctx)
-            except Exception:
-                logger.debug("session_end.curiosity_replay failed", exc_info=True)
+                # FIX A5-2: Feed curiosity signal to attention_tuner for next session
+                tuner = getattr(self, "attention_tuner", None)
+                if tuner is not None and curious_apps and hasattr(tuner, 'boost_curiosity_domains'):
+                    tuner.boost_curiosity_domains(curious_apps)
+                observer.on_phase_success(
+                    "curiosity_replay", time.perf_counter() - t0,
+                    {"curious_apps": len(curious_apps)},
+                )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("curiosity_replay", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
         # Phase 4: Regression-gated self-distillation
         if self.replay_engine is not None and trajectory:
+            observer.on_phase_start("regression_distillation")
+            t0 = time.perf_counter()
             try:
                 if self.replay_engine.detect_regression(trajectory):
-                    logger.warning("session_end: regression detected, triggering self-distillation")
                     distilled = await self.replay_engine.self_distill()
-                    logger.info("session_end: self-distilled %d rules", len(distilled))
-            except Exception:
-                logger.debug("session_end.distillation failed", exc_info=True)
+                    observer.on_phase_success(
+                        "regression_distillation", time.perf_counter() - t0,
+                        {"regression_detected": True, "rules_distilled": len(distilled)},
+                    )
+                else:
+                    observer.on_phase_success(
+                        "regression_distillation", time.perf_counter() - t0,
+                        {"regression_detected": False},
+                    )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("regression_distillation", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
-        # Phase 5: Feed per-app accuracy stats to AttentionTuner (contract mastered domains)
+        # Phase 5: Attention statistics feedback
         tuner = getattr(self, "attention_tuner", None)
         if tuner is not None and trajectory:
+            observer.on_phase_start("attention_feedback")
+            t0 = time.perf_counter()
             try:
                 from collections import defaultdict
                 app_sums: dict = defaultdict(lambda: [0.0, 0])
@@ -1100,23 +1269,65 @@ class Context:
                 app_deltas = {a: s[0] / s[1] for a, s in app_sums.items() if s[1] > 0}
                 if app_deltas:
                     tuner.on_session_stats(app_deltas)
-                    logger.debug("session_end: attention_tuner stats for %d apps", len(app_deltas))
-            except Exception:
-                logger.debug("session_end.attention_stats failed", exc_info=True)
+                observer.on_phase_success(
+                    "attention_feedback", time.perf_counter() - t0,
+                    {"apps_tracked": len(app_deltas)},
+                )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("attention_feedback", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
-        # Phase 6: Long-term memory maintenance (prune old, low-value rows)
+        # Phase 6: Long-term memory maintenance
+        observer.on_phase_start("memory_prune")
+        t0 = time.perf_counter()
         try:
-            pruned = self.lt.prune(
-                max_age_days=self.settings.memory_prune_age_days,
+            pruned = self.lt.prune(max_age_days=self.settings.memory_prune_age_days)
+            observer.on_phase_success(
+                "memory_prune", time.perf_counter() - t0,
+                {"rows_pruned": pruned or 0},
             )
-            if pruned:
-                logger.info("session_end: pruned %d old memory rows", pruned)
-        except Exception:
-            logger.debug("session_end.memory_prune failed", exc_info=True)
+            phases_ok += 1
+        except Exception as exc:
+            observer.on_phase_failure("memory_prune", exc, time.perf_counter() - t0)
+            phases_failed += 1
 
-        # Phase 7: Budget rebalancing from session outcomes
+        # Phase 6.5: Skill inactivity decay (C4 — after memory prune, before budget rebalance)
+        if self._evolution_policy is not None and self.skill_lib is not None:
+            observer.on_phase_start("skill_decay")
+            t0 = time.perf_counter()
+            try:
+                all_skills = self.skill_lib.load_all_active_parameterized()
+                decayed_count = 0
+                for skill in all_skills:
+                    last_used = skill.get("updated_at", 0.0)
+                    days_inactive = (time.time() - last_used) / 86400.0
+                    if days_inactive > 30:  # Only decay after 30 days of inactivity
+                        outcome = self._evolution_policy.decay_inactive(
+                            skill.get("name", ""),
+                            current_confidence=skill.get("confidence", 0.5),
+                            current_version=skill.get("version", 1),
+                            last_used_ts=last_used,
+                        )
+                        if outcome.tier_changed:
+                            self.skill_lib.update_skill_confidence(
+                                skill.get("name", ""), outcome.new_confidence
+                            )
+                            decayed_count += 1
+                observer.on_phase_success(
+                    "skill_decay", time.perf_counter() - t0,
+                    {"skills_decayed": decayed_count, "skills_checked": len(all_skills)},
+                )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("skill_decay", exc, time.perf_counter() - t0)
+                phases_failed += 1
+
+        # Phase 7: Budget rebalancing
         budget = getattr(self, "learning_budget", None)
         if budget is not None:
+            observer.on_phase_start("budget_rebalance")
+            t0 = time.perf_counter()
             try:
                 skills_discovered = 0
                 regressions_detected = 0
@@ -1136,26 +1347,45 @@ class Context:
                     regressions_detected=regressions_detected,
                     avg_prediction_delta=avg_delta,
                 )
-            except Exception:
-                logger.debug("session_end.budget_rebalance failed", exc_info=True)
+                observer.on_phase_success(
+                    "budget_rebalance", time.perf_counter() - t0,
+                    {"avg_delta": round(avg_delta, 4), "regressions": regressions_detected},
+                )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("budget_rebalance", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
-        # Phase 8: VLM Tier 3 verification (if enabled)
+        # Phase 8: VLM Tier 3 verification
         if self.settings.causal_tier3_enabled:
+            observer.on_phase_start("vlm_tier3")
+            t0 = time.perf_counter()
             try:
-                ps = getattr(self, "_perception_session", None)
+                ps = self.perception_session
                 if ps is not None:
                     pipeline = ps.causal_pipeline
                     graph = ps.causal_graph
 
                     async def _vlm_call(prompt: str) -> str:
-                        vlm = getattr(self, "vlm", None) or self.llm
-                        return await vlm.chat([{"role": "user", "content": prompt}])
+                        vlm = self.vlm or self.llm
+                        resp = await vlm.achat(
+                            [{"role": "user", "content": prompt}],
+                            stream=False,
+                            enable_thinking=False,
+                        )
+                        return (resp.content or "").strip()
 
-                    await pipeline.run_vlm_verification(
-                        graph, vlm_call=_vlm_call,
-                    )
-            except Exception:
-                logger.debug("session_end.vlm_tier3 failed", exc_info=True)
+                    await pipeline.run_vlm_verification(graph, vlm_call=_vlm_call)
+                observer.on_phase_success("vlm_tier3", time.perf_counter() - t0, {})
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("vlm_tier3", exc, time.perf_counter() - t0)
+                phases_failed += 1
+
+        # Pipeline complete
+        observer.on_pipeline_complete(
+            time.perf_counter() - pipeline_start, phases_ok, phases_failed,
+        )
 
     async def cleanup(self) -> None:
         if self._bg_connect_task and not self._bg_connect_task.done():
@@ -1164,6 +1394,12 @@ class Context:
                 await self._bg_connect_task
             except asyncio.CancelledError:
                 pass
+        # Stop ObservationDaemon if running
+        if self._observation_daemon is not None:
+            try:
+                await self._observation_daemon.stop()
+            except Exception:
+                logger.warning("ObservationDaemon stop failed", exc_info=True)
         # OPD end-of-session learning pipeline
         if self.settings.replay_on_session_end:
             await self._on_session_end_learning()
@@ -1173,6 +1409,11 @@ class Context:
             await self.rpc.close()
         elif isinstance(self.rpc, CuaDriverClient):
             self.rpc.stop()
+        if self.skill_lib:
+            self.skill_lib.close()
+        if self.imitation:
+            self.imitation.store.close()
+        self.audit.close()
         if self.skill_lib:
             self.skill_lib.close()
         if self.imitation:

@@ -11,6 +11,7 @@ from leapflow.cli.banner import BRIGHT_CYAN, DIM, RESET, VERSION
 from leapflow.cli.commands.run import _print_execution_result
 from leapflow.cli.helpers import require_initialized
 from leapflow.cli.tui import finish_input_frame, render_input_frame
+from leapflow.engine import StreamEvent
 
 if TYPE_CHECKING:
     from leapflow.cli.context import Context
@@ -435,8 +436,16 @@ async def cmd_interactive(ctx: "Context") -> int:
                         matched, io=io
                     )
                 else:
-                    async for chunk in ctx.engine.run_stream(trigger_or_name):
-                        print(chunk, end="", flush=True)
+                    _streamed = False
+                    async for event in ctx.engine.run_stream(trigger_or_name):
+                        if isinstance(event, StreamEvent):
+                            if event.type == "chunk":
+                                print(event.content, end="", flush=True)
+                                _streamed = True
+                            elif event.type == "final" and not _streamed:
+                                print(event.content, end="", flush=True)
+                        else:
+                            print(event, end="", flush=True)
                     print()
                     continue
 
@@ -489,8 +498,16 @@ async def cmd_interactive(ctx: "Context") -> int:
             result = await ctx.session.execute_skill(matched, io=io)
             _print_execution_result(result)
         else:
-            async for chunk in ctx.engine.run_stream(line):
-                print(chunk, end="", flush=True)
+            streamed = False
+            async for event in ctx.engine.run_stream(line):
+                if isinstance(event, StreamEvent):
+                    if event.type == "chunk":
+                        print(event.content, end="", flush=True)
+                        streamed = True
+                    elif event.type == "final" and not streamed:
+                        print(event.content, end="", flush=True)
+                else:
+                    print(event, end="", flush=True)
             print()
 
         # ── Copilot: Synthetic event injection after command processing ──

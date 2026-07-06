@@ -10,7 +10,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
 
 from leapflow.platform.protocol import HostRpc, Methods
 from leapflow.config import Settings
@@ -25,6 +25,13 @@ from leapflow.engine.error_classifier import (
 from leapflow.engine.execution_trace import ExecutionMode, ExecutionTrace
 from leapflow.engine.intent_classifier import Intent, IntentClassifier
 from leapflow.engine.message_healer import MessageHealer
+from leapflow.engine.message_sanitizer import MessageSanitizer
+from leapflow.engine.prompt_cache import CacheStrategy
+from leapflow.engine.tool_concurrency import (
+    DefaultConcurrencyPolicy,
+    ToolCall as ConcurrentToolCall,
+    ToolConcurrencyPolicy,
+)
 from leapflow.engine.shortcuts import ShortcutStore
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.scheduler import TaskScheduler
@@ -133,6 +140,19 @@ def _keywords_from_query(q: str) -> list[str]:
     return [t for t in toks if len(t) >= 2][:12]
 
 
+@dataclass(frozen=True, slots=True)
+class StreamEvent:
+    """Typed event emitted during streaming execution.
+
+    - chunk: intermediate token fragment, safe to display immediately.
+    - final: assembled complete response (full content).
+    - tool_call: internal tool invocation text, not intended for display.
+    """
+
+    type: Literal["chunk", "final", "tool_call"]
+    content: str
+
+
 @dataclass
 class _LoopContext:
     """Mutable state carried across state machine transitions."""
@@ -174,6 +194,7 @@ class AgentEngine:
         tool_bridge: Optional[Any] = None,
         skill_injector: Optional[Any] = None,
         skill_index: Optional[Any] = None,
+        concurrency_policy: Optional[ToolConcurrencyPolicy] = None,
     ) -> None:
         self._settings = settings
         self._rpc = rpc
@@ -208,6 +229,11 @@ class AgentEngine:
         # Skill discovery (SkillInjector for slash commands)
         self._skill_injector = skill_injector
 
+        # Tool concurrency policy (None = sequential fallback)
+        self._concurrency_policy: Optional[ToolConcurrencyPolicy] = (
+            concurrency_policy if concurrency_policy is not None else DefaultConcurrencyPolicy()
+        )
+
         # State-machine loop infrastructure (config-driven)
         self._budget_config = BudgetConfig(
             max_iterations=settings.react_max_iterations,
@@ -226,6 +252,22 @@ class AgentEngine:
             max_output_chars=settings.max_tool_output_chars,
         ))
         self._healer = MessageHealer()
+
+        # B2: Prompt cache optimization (None = disabled)
+        self._cache_strategy: CacheStrategy | None = None
+
+        # B4: Output sanitization (None = disabled)
+        self._sanitizer: MessageSanitizer | None = None
+
+    # ── Optional strategy setters (config-driven) ────────────────────────
+
+    def set_cache_strategy(self, strategy: CacheStrategy | None) -> None:
+        """Configure prompt cache optimization strategy."""
+        self._cache_strategy = strategy
+
+    def set_sanitizer(self, sanitizer: MessageSanitizer | None) -> None:
+        """Configure output message sanitizer."""
+        self._sanitizer = sanitizer
 
     async def run(self, user_text: str, *, enable_thinking: bool = False) -> str:
         """Entrypoint: simplified routing with unified tool loop as default path."""
@@ -259,8 +301,15 @@ class AgentEngine:
 
     async def run_stream(
         self, user_text: str, *, enable_thinking: bool = False
-    ) -> AsyncIterator[str]:
-        """Like run(), but yields text chunks for streamable responses."""
+    ) -> AsyncIterator[Union[str, StreamEvent]]:
+        """Like run(), but yields text chunks for streamable responses.
+
+        Yields:
+            str: legacy plain-text chunks (shortcuts, teach commands).
+            StreamEvent(type="chunk"): real-time token fragments.
+            StreamEvent(type="final"): complete assembled response.
+            StreamEvent(type="tool_call"): internal tool invocation (suppress display).
+        """
         logger.info("audit.user_input chars=%s", len(user_text))
 
         # 1. Shortcut match (zero cost)
@@ -763,9 +812,11 @@ class AgentEngine:
             if status == BudgetStatus.EXHAUSTED:
                 break
 
-            # Heal + compress
+            # Heal + compress + cache optimize
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)
+            if self._cache_strategy:
+                compressed = self._cache_strategy.optimize(compressed)
 
             _show_progress("thinking", f"round {budget.used}")
             try:
@@ -790,6 +841,8 @@ class AgentEngine:
             _clear_indicator()
 
             content = (resp.content or "").strip()
+            if self._sanitizer:
+                content = self._sanitizer.sanitize(content)
 
             # Check for native tool_calls first (more reliable)
             native_calls = getattr(resp, "tool_calls", None) or []
@@ -806,25 +859,10 @@ class AgentEngine:
                 ]
                 messages.append(assistant_msg)
 
-                # Execute each native tool call
-                for i, tc in enumerate(native_calls):
-                    _show_progress("executing", tc.name, step=i + 1, total=len(native_calls))
-                    tool_call_dict = {"name": tc.name, "arguments": tc.arguments}
-                    result = await self._execute_general_tool(tool_call_dict, TOOL_HANDLERS)
-                    _clear_indicator()
-                    _print_tool_result(tc.name, result, enabled=self._settings.verbose_progress)
-                    trace.record(
-                        ExecutionMode.ACTING,
-                        action=tool_call_dict,
-                        observation=result if isinstance(result, dict) else {"result": str(result)},
-                    )
-                    result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
-                    # Append tool result in OpenAI format
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result_text,
-                    })
+                # Execute native tool calls (with concurrency policy)
+                await self._execute_tools_concurrent(
+                    native_calls, TOOL_HANDLERS, trace=trace, messages=messages
+                )
 
                 self._wm.remember_chat(build_assistant_message(
                     content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
@@ -874,11 +912,12 @@ class AgentEngine:
 
     async def _unified_tool_loop_stream(
         self, user_text: str, *, enable_thinking: bool = False
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[Union[str, StreamEvent]]:
         """Streaming variant of _unified_tool_loop.
 
-        Yields text chunks for the final response. Shows transient progress
-        indicators on stderr for thinking and tool-execution phases.
+        Yields StreamEvent objects for real-time token streaming and final
+        responses. Shows transient progress indicators on stderr for thinking
+        and tool-execution phases.
         """
         # Reuse the same setup logic as _unified_tool_loop
         if user_text.startswith("/"):
@@ -962,6 +1001,8 @@ class AgentEngine:
 
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)
+            if self._cache_strategy:
+                compressed = self._cache_strategy.optimize(compressed)
 
             _show_progress("thinking", f"round {budget.used}")
 
@@ -988,6 +1029,8 @@ class AgentEngine:
                 _clear_indicator()
 
                 content = (resp.content or "").strip()
+                if self._sanitizer:
+                    content = self._sanitizer.sanitize(content)
                 native_calls = getattr(resp, "tool_calls", None) or []
                 if native_calls:
                     assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
@@ -1001,23 +1044,10 @@ class AgentEngine:
                     ]
                     messages.append(assistant_msg)
 
-                    for i, tc in enumerate(native_calls):
-                        _show_progress("executing", tc.name, step=i + 1, total=len(native_calls))
-                        tool_call_dict = {"name": tc.name, "arguments": tc.arguments}
-                        result = await self._execute_general_tool(tool_call_dict, TOOL_HANDLERS)
-                        _clear_indicator()
-                        _print_tool_result(tc.name, result, enabled=self._settings.verbose_progress)
-                        trace.record(
-                            ExecutionMode.ACTING,
-                            action=tool_call_dict,
-                            observation=result if isinstance(result, dict) else {"result": str(result)},
-                        )
-                        result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result_text,
-                        })
+                    # Execute native tool calls (with concurrency policy)
+                    await self._execute_tools_concurrent(
+                        native_calls, TOOL_HANDLERS, trace=trace, messages=messages
+                    )
 
                     self._wm.remember_chat(build_assistant_message(
                         content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
@@ -1032,22 +1062,23 @@ class AgentEngine:
                 self._wm.remember_chat(build_assistant_message(content))
                 trace.record(ExecutionMode.COMPLETE)
                 if not content:
-                    yield "I processed your request but have no additional output."
+                    yield StreamEvent(type="final", content="I processed your request but have no additional output.")
                 else:
-                    yield content
+                    yield StreamEvent(type="final", content=content)
                 return
 
             else:
                 # Non-native path: use streaming for real-time output when enabled
                 if self._settings.stream_output:
                     # Stream chunks and yield them in real-time to the caller
-                    chunks_collected: list[str] = []
+                    content_parts: list[str] = []
                     try:
                         _clear_indicator()
                         async for chunk in self._llm.achat_stream(
                             compressed, enable_thinking=enable_thinking,
                         ):
-                            chunks_collected.append(chunk)
+                            content_parts.append(chunk)
+                            yield StreamEvent(type="chunk", content=chunk)
                     except Exception as exc:
                         _clear_indicator()
                         category = self._error_classifier.classify(exc)
@@ -1057,7 +1088,9 @@ class AgentEngine:
                             continue
                         break
 
-                    content = "".join(chunks_collected).strip()
+                    content = "".join(content_parts).strip()
+                    if self._sanitizer:
+                        content = self._sanitizer.sanitize(content)
                 else:
                     # Buffered mode (stream_output=False): single request
                     try:
@@ -1074,17 +1107,19 @@ class AgentEngine:
                         break
                     _clear_indicator()
                     content = (resp.content or "").strip()
+                    if self._sanitizer:
+                        content = self._sanitizer.sanitize(content)
 
                 self._wm.remember_chat(build_assistant_message(content))
                 tool_call = self._parse_tool_call_from_content(content)
 
                 if tool_call is None:
-                    # Final answer — yield content
+                    # Final answer — yield completion event
                     trace.record(ExecutionMode.COMPLETE)
                     if not content:
-                        yield "I processed your request but have no additional output."
+                        yield StreamEvent(type="final", content="I processed your request but have no additional output.")
                     else:
-                        yield content
+                        yield StreamEvent(type="final", content=content)
                     return
 
                 # Execute text-parsed tool
@@ -1108,7 +1143,7 @@ class AgentEngine:
                     ))
 
         # Budget exhausted
-        yield content if content else "I've reached my processing limit."
+        yield StreamEvent(type="final", content=content if content else "I've reached my processing limit.")
 
 
     # ── Unified Loop Helpers ───────────────────────────────────────────────
@@ -1139,6 +1174,97 @@ class AgentEngine:
         if call:
             return {"name": call.name, "arguments": call.params}
         return None
+
+    async def _execute_tools_concurrent(
+        self,
+        native_calls: list,
+        handlers: Dict[str, Any],
+        *,
+        trace: ExecutionTrace,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        """Execute native tool calls respecting concurrency policy.
+
+        Concurrent group runs via asyncio.gather; sequential group runs one-by-one.
+        Results are appended to messages in OpenAI tool-result format.
+        """
+        tc_wrappers = [
+            ConcurrentToolCall(id=tc.id, name=tc.name, arguments=tc.arguments)
+            for tc in native_calls
+        ]
+
+        if not self._concurrency_policy or len(tc_wrappers) <= 1:
+            # Sequential fallback
+            for i, tc in enumerate(native_calls):
+                _show_progress("executing", tc.name, step=i + 1, total=len(native_calls))
+                tool_call_dict = {"name": tc.name, "arguments": tc.arguments}
+                result = await self._execute_general_tool(tool_call_dict, handlers)
+                _clear_indicator()
+                _print_tool_result(tc.name, result, enabled=self._settings.verbose_progress)
+                trace.record(
+                    ExecutionMode.ACTING,
+                    action=tool_call_dict,
+                    observation=result if isinstance(result, dict) else {"result": str(result)},
+                )
+                result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
+            return
+
+        concurrent, sequential = self._concurrency_policy.partition(tc_wrappers)
+        logger.info(
+            "tool_concurrency.execute concurrent=%d sequential=%d",
+            len(concurrent),
+            len(sequential),
+        )
+
+        # Execute concurrent group via asyncio.gather
+        if concurrent:
+            async def _run_one(ctc: ConcurrentToolCall) -> Dict[str, Any]:
+                tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+                return await self._execute_general_tool(tool_call_dict, handlers)
+
+            gather_results = await asyncio.gather(
+                *[_run_one(ctc) for ctc in concurrent],
+                return_exceptions=True,
+            )
+            for ctc, result in zip(concurrent, gather_results):
+                tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+                if isinstance(result, Exception):
+                    error_result: Dict[str, Any] = {
+                        "ok": False,
+                        "error": f"{type(result).__name__}: {result}",
+                    }
+                    _print_tool_result(ctc.name, error_result, enabled=self._settings.verbose_progress)
+                    trace.record(
+                        ExecutionMode.ACTING,
+                        action=tool_call_dict,
+                        observation=error_result,
+                    )
+                    result_text = json.dumps(error_result, default=str, ensure_ascii=False)[:3000]
+                else:
+                    _print_tool_result(ctc.name, result, enabled=self._settings.verbose_progress)
+                    trace.record(
+                        ExecutionMode.ACTING,
+                        action=tool_call_dict,
+                        observation=result if isinstance(result, dict) else {"result": str(result)},
+                    )
+                    result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
+                messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
+
+        # Execute sequential group one-by-one
+        for i, ctc in enumerate(sequential):
+            _show_progress("executing", ctc.name, step=i + 1, total=len(sequential))
+            tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+            result = await self._execute_general_tool(tool_call_dict, handlers)
+            _clear_indicator()
+            _print_tool_result(ctc.name, result, enabled=self._settings.verbose_progress)
+            trace.record(
+                ExecutionMode.ACTING,
+                action=tool_call_dict,
+                observation=result if isinstance(result, dict) else {"result": str(result)},
+            )
+            result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
+            messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
 
     async def _execute_general_tool(
         self, tool_call: Dict[str, Any], handlers: Dict[str, Any]

@@ -321,6 +321,7 @@ class Settings:
     copilot_cache_ttl_s: float = 30.0
     copilot_speculative_cache_size: int = 100
     copilot_action_ring_size: int = 10
+    notification_renderer: str = "auto"  # "os" | "stderr" | "log" | "auto" | "none"
 
     # ── Hub (cloud collaboration) ──
     hub_type: str = "modelscope"
@@ -330,6 +331,15 @@ class Settings:
     hub_sync_copilot: bool = True
     hub_repo_prefix: str = "leapflow-"
     hub_search_sources: str = "modelscope"  # comma-separated backend names for multi-source search
+
+    # ── Observer / Daemon ──
+    observer_auto_start: bool = False   # Auto-start ObservationDaemon on initialize
+    observer_enabled_set: Dict[str, bool] = field(default_factory=lambda: {
+        "fs_watcher": True,
+        "app_focus": True,
+        "clipboard": True,
+        "input_tap": False,
+    })
 
     # ── Scheduler ──
     scheduler_enabled: bool = True
@@ -632,6 +642,7 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     copilot_cache_ttl_s = float(os.getenv("LEAPFLOW_COPILOT_CACHE_TTL_S", "30.0"))
     copilot_speculative_cache_size = int(os.getenv("LEAPFLOW_COPILOT_SPECULATIVE_CACHE_SIZE", "100"))
     copilot_action_ring_size = int(os.getenv("LEAPFLOW_COPILOT_ACTION_RING_SIZE", "10"))
+    notification_renderer = os.getenv("LEAPFLOW_NOTIFICATION_RENDERER", "auto")
 
     # Hub (cloud collaboration)
     hub_type = os.getenv("LEAPFLOW_HUB_TYPE", "modelscope")
@@ -641,6 +652,19 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     hub_sync_copilot = _bool("LEAPFLOW_HUB_SYNC_COPILOT", "true")
     hub_repo_prefix = os.getenv("LEAPFLOW_HUB_REPO_PREFIX", "leapflow-")
     hub_search_sources = os.getenv("LEAPFLOW_HUB_SEARCH_SOURCES", "modelscope")
+
+    # Observer / Daemon
+    observer_auto_start = _bool("LEAPFLOW_OBSERVER_AUTO_START", "false")
+    _observer_enabled_raw = os.getenv("LEAPFLOW_OBSERVER_ENABLED_SET", "")
+    observer_enabled_set: Dict[str, bool] = {
+        "fs_watcher": True, "app_focus": True, "clipboard": True, "input_tap": False,
+    }
+    if _observer_enabled_raw:
+        import json as _json_obs
+        try:
+            observer_enabled_set = {str(k): bool(v) for k, v in _json_obs.loads(_observer_enabled_raw).items()}
+        except Exception:
+            logger.warning("Invalid LEAPFLOW_OBSERVER_ENABLED_SET: %s", _observer_enabled_raw)
 
     # Scheduler
     scheduler_enabled = _bool("LEAPFLOW_SCHEDULER_ENABLED", "true")
@@ -824,6 +848,7 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         copilot_cache_ttl_s=copilot_cache_ttl_s,
         copilot_speculative_cache_size=copilot_speculative_cache_size,
         copilot_action_ring_size=copilot_action_ring_size,
+        notification_renderer=notification_renderer,
         # Hub
         hub_type=hub_type,
         hub_default_owner=hub_default_owner,
@@ -832,6 +857,9 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         hub_sync_copilot=hub_sync_copilot,
         hub_repo_prefix=hub_repo_prefix,
         hub_search_sources=hub_search_sources,
+        # Observer / Daemon
+        observer_auto_start=observer_auto_start,
+        observer_enabled_set=observer_enabled_set,
         # Scheduler
         scheduler_enabled=scheduler_enabled,
         scheduler_tick_seconds=scheduler_tick_seconds,
