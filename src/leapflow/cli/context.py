@@ -61,6 +61,25 @@ from leapflow.platform.normalizer import EventNormalizer
 logger = logging.getLogger(__name__)
 
 
+class _InteractiveApprovalGate:
+    """CLI-mode interactive approval for dangerous shell commands."""
+
+    async def check(self, command: str) -> bool:
+        if not sys.stdin.isatty():
+            return False
+        try:
+            if sys.stderr.isatty():
+                sys.stderr.write(f"\033[33m⚠ Dangerous command: {command}\033[0m\n")
+            else:
+                sys.stderr.write(f"WARNING: Dangerous command: {command}\n")
+            sys.stderr.write("Approve? [y/N]: ")
+            sys.stderr.flush()
+            answer = input().strip().lower()
+            return answer in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+
 # ─── Host Readiness ────────────────────────────────────────────────────────
 
 
@@ -1156,25 +1175,6 @@ class Context:
         # ── Wire Approval Gate for shell dangerous commands ──
         try:
             from leapflow.tools.shell_tools import set_approval_gate
-            from leapflow.tools.shell_tools import CommandApprovalGate
-
-            class _InteractiveApprovalGate:
-                """CLI-mode interactive approval for dangerous commands."""
-                async def check(self, command: str) -> bool:
-                    import sys
-                    if not sys.stdin.isatty():
-                        return False
-                    try:
-                        if sys.stderr.isatty():
-                            sys.stderr.write(f"\033[33m⚠ Dangerous command: {command}\033[0m\n")
-                        else:
-                            sys.stderr.write(f"WARNING: Dangerous command: {command}\n")
-                        sys.stderr.write("Approve? [y/N]: ")
-                        sys.stderr.flush()
-                        answer = input().strip().lower()
-                        return answer in ("y", "yes")
-                    except (EOFError, KeyboardInterrupt):
-                        return False
 
             set_approval_gate(_InteractiveApprovalGate())
             logger.debug("Shell approval gate: interactive CLI mode")

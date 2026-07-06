@@ -463,17 +463,32 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     ensure_default_env(_data_dir)
 
     if env_file is None:
-        # Layer 2: YAML config overlay (deep-merge, dot.separated keys)
+        # Layer 2: YAML config overlay (deep-merge, dot.separated keys).
+        # Inject into os.environ only for the duration of this call so tests
+        # and repeated load_config() calls are not polluted.
         yaml_vars = _load_yaml_overlay(_data_dir)
+        injected_yaml_keys: list[str] = []
         for k, v in yaml_vars.items():
             if k not in os.environ:
                 os.environ[k] = v
+                injected_yaml_keys.append(k)
 
-        # Layer 3: global user .env — fills in any variables not already set.
-        _global_env = _data_dir / ".env"
-        if _global_env.exists():
-            load_dotenv(_global_env, override=False)
+        try:
+            # Layer 3: global user .env — fills in any variables not already set.
+            _global_env = _data_dir / ".env"
+            if _global_env.exists():
+                load_dotenv(_global_env, override=False)
 
+            return _build_settings_from_env()
+        finally:
+            for k in injected_yaml_keys:
+                os.environ.pop(k, None)
+
+    return _build_settings_from_env()
+
+
+def _build_settings_from_env() -> Settings:
+    """Build Settings from current os.environ (called by load_config)."""
     api_key = os.getenv("LEAPFLOW_LLM_API_KEY", "").strip()
     base_url = os.getenv(
         "LEAPFLOW_LLM_BASE_URL",
@@ -482,8 +497,7 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     model = os.getenv("LEAPFLOW_LLM_MODEL", "qwen-plus").strip()
     max_retries = int(os.getenv("LEAPFLOW_LLM_MAX_RETRIES", "3"))
 
-    # Data Root – reuse the early-resolved path; derives all default host paths
-    data_dir = _data_dir
+    data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
 
     # bridge_socket: LEAPFLOW_BRIDGE_SOCKET overrides default
     bridge = os.getenv("LEAPFLOW_BRIDGE_SOCKET", "/tmp/leapflow.sock").strip()

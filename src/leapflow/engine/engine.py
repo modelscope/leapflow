@@ -358,6 +358,7 @@ class AgentEngine:
             StreamEvent(type="tool_call"): internal tool invocation (suppress display).
         """
         logger.info("audit.user_input chars=%s", len(user_text))
+        self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
 
         # 1. Shortcut match (zero cost)
         if self._shortcuts:
@@ -1042,6 +1043,8 @@ class AgentEngine:
 
         session_id = self._ensure_session(user_text)
 
+        self._cancel_requested = False
+
         while not budget.exhausted:
             if self._cancel_requested:
                 logger.info("unified_loop_stream: cancelled by user")
@@ -1057,6 +1060,8 @@ class AgentEngine:
                 compressed = self._cache_strategy.optimize(compressed)
 
             yield StreamEvent(type="thinking", content=f"round {budget.used}")
+
+            content = ""
 
             if use_native_tools and tools_kwarg:
                 try:
@@ -1102,6 +1107,10 @@ class AgentEngine:
                         for tc in native_calls
                     ]
                     messages.append(assistant_msg)
+                    self._persist_message(
+                        session_id, "assistant", content,
+                        tool_calls=assistant_msg.get("tool_calls"),
+                    )
 
                     for tc in native_calls:
                         yield StreamEvent(type="tool_start", content=tc.name)
@@ -1126,15 +1135,6 @@ class AgentEngine:
                         ))
                     continue
 
-                self._wm.remember_chat(build_assistant_message(content))
-                self._persist_message(session_id, "assistant", content)
-                trace.record(ExecutionMode.COMPLETE)
-                if not content:
-                    yield StreamEvent(type="final", content="I processed your request but have no additional output.")
-                else:
-                    yield StreamEvent(type="final", content=content)
-                return
-
             else:
                 if self._settings.stream_output:
                     content_parts: list[str] = []
@@ -1158,6 +1158,7 @@ class AgentEngine:
                         if rec.retry and budget.remaining > 0:
                             await asyncio.sleep(jittered_backoff(budget.used))
                             continue
+                        yield StreamEvent(type="error", content=str(exc))
                         break
 
                     content = "".join(content_parts).strip()
@@ -1174,59 +1175,64 @@ class AgentEngine:
                         classified = self._error_classifier.classify(exc)
                         rec = self._error_classifier.get_recovery(classified)
                         turn_recovery.record_api_error()
+                        if classified == ErrorCategory.CONTEXT_OVERFLOW and turn_recovery.try_compress():
+                            messages = self._compressor.force_compress(messages)
+                            if budget.remaining > 0:
+                                continue
                         if rec.retry and budget.remaining > 0:
                             await asyncio.sleep(jittered_backoff(budget.used))
                             continue
+                        yield StreamEvent(type="error", content=str(exc))
                         break
                     _clear_indicator()
                     content = (resp.content or "").strip()
                     if self._sanitizer:
                         content = self._sanitizer.sanitize(content)
 
-                self._wm.remember_chat(build_assistant_message(content))
-                self._persist_message(session_id, "assistant", content)
-                tool_call = self._parse_tool_call_from_content(content)
+            self._wm.remember_chat(build_assistant_message(content))
+            self._persist_message(session_id, "assistant", content)
+            tool_call = self._parse_tool_call_from_content(content)
 
-                if tool_call is None:
-                    trace.record(ExecutionMode.COMPLETE)
-                    if not content:
-                        yield StreamEvent(type="final", content="I processed your request but have no additional output.")
-                    else:
-                        yield StreamEvent(type="final", content=content)
-                    return
-
-                messages.append(build_assistant_message(content))
-                yield StreamEvent(type="tool_start", content=tool_call['name'])
-                result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
-                _clear_indicator()
-                yield StreamEvent(type="tool_complete", content=tool_call['name'])
-                _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
-                trace.record(
-                    ExecutionMode.ACTING,
-                    action=tool_call,
-                    observation=result if isinstance(result, dict) else {"result": str(result)},
-                )
-
-                is_error = isinstance(result, dict) and not result.get("ok", True)
-                if is_error:
-                    turn_recovery.record_tool_failure()
-                    if turn_recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
-                        logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
-                                       turn_recovery.consecutive_tool_failures)
-                        break
+            if tool_call is None:
+                trace.record(ExecutionMode.COMPLETE)
+                if not content:
+                    yield StreamEvent(type="final", content="I processed your request but have no additional output.")
                 else:
-                    turn_recovery.record_tool_success()
+                    yield StreamEvent(type="final", content=content)
+                return
 
-                result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+            messages.append(build_assistant_message(content))
+            yield StreamEvent(type="tool_start", content=tool_call['name'])
+            result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
+            _clear_indicator()
+            yield StreamEvent(type="tool_complete", content=tool_call['name'])
+            _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
+            trace.record(
+                ExecutionMode.ACTING,
+                action=tool_call,
+                observation=result if isinstance(result, dict) else {"result": str(result)},
+            )
+
+            is_error = isinstance(result, dict) and not result.get("ok", True)
+            if is_error:
+                turn_recovery.record_tool_failure()
+                if turn_recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                    logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
+                                   turn_recovery.consecutive_tool_failures)
+                    break
+            else:
+                turn_recovery.record_tool_success()
+
+            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+            messages.append(build_user_message_text(
+                f"Tool result ({tool_call['name']}):\n{result_text}"
+            ))
+            self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
+
+            if status == BudgetStatus.SOFT_LIMIT:
                 messages.append(build_user_message_text(
-                    f"Tool result ({tool_call['name']}):\n{result_text}"
+                    "SYSTEM: Approaching limit. Provide final answer now."
                 ))
-                self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
-
-                if status == BudgetStatus.SOFT_LIMIT:
-                    messages.append(build_user_message_text(
-                        "SYSTEM: Approaching limit. Provide final answer now."
-                    ))
 
         if self._memory_manager and self._settings.memory_integration_enabled:
             asyncio.create_task(self._sync_turn_safe(messages))
@@ -1526,16 +1532,6 @@ class AgentEngine:
         except Exception:
             logger.debug("session.persist_message failed", exc_info=True)
 
-    def _freeze_memory_context(self, user_text: str) -> str:
-        """Freeze memory context at session start for prefix cache stability.
-
-        Once frozen, the same snapshot is reused for all turns in the session,
-        preventing prefix cache invalidation from mid-session memory writes.
-        """
-        if self._memory_context_snapshot is not None:
-            return self._memory_context_snapshot
-        return ""
-
     async def _prefetch_and_freeze_memory(self, user_text: str) -> str:
         """Prefetch memory context and freeze snapshot for session duration."""
         if self._memory_context_snapshot is not None:
@@ -1558,8 +1554,12 @@ class AgentEngine:
                 )
                 self._memory_context_snapshot = context
                 return context
+        except asyncio.TimeoutError:
+            logger.debug(
+                "memory.prefetch timed out (%.1fs)", self._settings.memory_prefetch_timeout_s,
+            )
         except Exception:
-            pass
+            logger.debug("memory.prefetch failed", exc_info=True)
         self._memory_context_snapshot = ""
         return ""
 

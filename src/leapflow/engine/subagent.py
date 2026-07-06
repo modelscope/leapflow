@@ -130,7 +130,7 @@ class SubagentManager:
             t0 = time.monotonic()
             try:
                 result = await self._executor.execute_subagent(config)
-                result = self._trim_summary(result)
+                result = self._trim_summary(result, config.summary_max_chars)
             except asyncio.CancelledError:
                 result = SubagentResult(
                     session_id=session_id,
@@ -173,11 +173,11 @@ class SubagentManager:
                 cancelled += 1
         return cancelled
 
-    def _trim_summary(self, result: SubagentResult) -> SubagentResult:
+    def _trim_summary(self, result: SubagentResult, max_chars: int = _SUMMARY_MAX_CHARS) -> SubagentResult:
         """Ensure summary fits within parent's budget."""
-        if len(result.summary) > _SUMMARY_MAX_CHARS:
-            trimmed = result.summary[:_SUMMARY_MAX_CHARS - 50]
-            trimmed += f"\n\n[... trimmed {len(result.summary) - _SUMMARY_MAX_CHARS + 50} chars]"
+        if len(result.summary) > max_chars:
+            trimmed = result.summary[:max_chars - 50]
+            trimmed += f"\n\n[... trimmed {len(result.summary) - max_chars + 50} chars]"
             return SubagentResult(
                 session_id=result.session_id,
                 goal=result.goal,
@@ -247,6 +247,11 @@ class DefaultSubagentExecutor:
 
         content = ""
         tool_call_count = 0
+        result_budget = (
+            self._settings.max_tool_result_chars
+            if self._settings is not None
+            else _SUMMARY_MAX_CHARS
+        )
 
         for _ in range(config.max_iterations):
             try:
@@ -289,7 +294,7 @@ class DefaultSubagentExecutor:
                         result_text = _json_sub.dumps(result, default=str, ensure_ascii=False)
                     except Exception as e:
                         result_text = _json_sub.dumps({"ok": False, "error": str(e)})
-                result_text = result_text[:config.summary_max_chars]
+                result_text = result_text[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
                 tool_call_count += 1
 
