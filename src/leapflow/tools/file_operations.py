@@ -135,10 +135,18 @@ async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
         truncated = len(lines) > max_lines
         content = "\n".join(lines[:max_lines])
 
-        # Redact secrets that might be embedded in file content
         try:
             from leapflow.security.redact import redact_sensitive_text
             content = redact_sensitive_text(content)
+        except ImportError:
+            pass
+
+        try:
+            from leapflow.security.threat_patterns import scan_for_threats, ThreatScope
+            threats = scan_for_threats(content, scope=ThreatScope.CONTEXT, max_results=3)
+            if threats:
+                threat_names = [t.pattern_name for t in threats]
+                logger.warning("file_read: threat patterns in %s: %s", target.name, threat_names)
         except ImportError:
             pass
 
@@ -166,6 +174,19 @@ async def file_write(params: Dict[str, Any]) -> Dict[str, Any]:
 
     if _is_write_blocked(target):
         return {"ok": False, "error": f"Write blocked by safety policy: {target}"}
+
+    if _is_sensitive_read(target):
+        return {"ok": False, "error": f"Sensitive file write blocked by security policy: {target.name}"}
+
+    try:
+        from leapflow.security.threat_patterns import scan_for_threats, ThreatScope
+        threats = scan_for_threats(content, scope=ThreatScope.ALL, max_results=3)
+        high_threats = [t for t in threats if t.severity >= 0.8]
+        if high_threats:
+            logger.warning("file_write: high-severity threats in content for %s: %s",
+                           target.name, [t.pattern_name for t in high_threats])
+    except ImportError:
+        pass
 
     try:
         target.parent.mkdir(parents=True, exist_ok=True)

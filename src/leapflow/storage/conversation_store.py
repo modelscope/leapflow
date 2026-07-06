@@ -434,6 +434,43 @@ class DuckDBConversationStore:
             [session_id, *message_ids],
         )
 
+    def end_session(self, session_id: str) -> None:
+        """Mark a session as inactive (completed/archived)."""
+        self._execute_write(
+            "UPDATE conversation_sessions SET is_active = FALSE, updated_at = ? WHERE session_id = ?",
+            [time.time(), session_id],
+        )
+
+    def fork_session(
+        self,
+        parent_session_id: str,
+        *,
+        title: str = "",
+        model: str = "",
+        carry_messages: int = 0,
+    ) -> ConversationSession:
+        """Fork a new child session from a parent (compression continuation).
+
+        Optionally copies the last N messages from parent to child for context.
+        """
+        child_id = str(uuid.uuid4())
+        child = self.create_session(
+            child_id,
+            title=title or f"Fork of {parent_session_id[:8]}",
+            parent_session_id=parent_session_id,
+            model=model,
+        )
+
+        if carry_messages > 0:
+            recent = self.get_messages(parent_session_id, limit=carry_messages)
+            for msg in recent:
+                self.append_message(
+                    child_id, msg.role, msg.content,
+                    tool_name=msg.tool_name, tool_call_id=msg.tool_call_id,
+                )
+
+        return child
+
     def close(self) -> None:
         """Close the database connection."""
         try:

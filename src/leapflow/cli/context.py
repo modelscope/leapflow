@@ -1099,13 +1099,15 @@ class Context:
         except Exception:
             logger.warning("ConversationStore initialization failed", exc_info=True)
 
-        # ── Initialize MCP Manager (if config exists) ──
+        # ── Initialize MCP Manager + register tools into agent surface ──
         self._mcp_manager = None
         try:
             mcp_config_path = settings.data_dir / "mcp_servers.json"
             if mcp_config_path.exists():
                 import json as _json_mcp
                 from leapflow.platform.mcp_manager import McpManager, McpServerConfig
+                from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
+
                 raw_configs = _json_mcp.loads(mcp_config_path.read_text())
                 server_configs = [
                     McpServerConfig(
@@ -1113,6 +1115,7 @@ class Context:
                         command=cfg.get("command", ""),
                         args=cfg.get("args", []),
                         env=cfg.get("env", {}),
+                        parallel_safe=cfg.get("parallel_safe", False),
                     )
                     for name, cfg in raw_configs.items()
                     if cfg.get("enabled", True) and cfg.get("command")
@@ -1126,12 +1129,57 @@ class Context:
                             total_tools += len(schemas)
                         except Exception:
                             logger.warning("MCP server '%s' failed to connect", sc.name)
+
                     if total_tools > 0:
                         self._mcp_manager = mgr
-                        logger.info("MCP Manager: %d servers, %d tools",
+
+                        from leapflow.security.threat_patterns import scan_mcp_description
+
+                        def _build_mcp_handler(manager, tool_name: str):
+                            async def _handler(params: dict) -> dict:
+                                return await manager.call_tool(tool_name, params)
+                            return _handler
+
+                        for schema in mgr.get_tool_schemas():
+                            threats = scan_mcp_description(schema.description)
+                            if threats:
+                                logger.warning("MCP tool '%s' description has threats: %s",
+                                               schema.name, [t.pattern_name for t in threats])
+                            TOOL_DEFINITIONS.append(schema.to_openai_function())
+                            TOOL_HANDLERS[schema.name] = _build_mcp_handler(mgr, schema.name)
+
+                        logger.info("MCP Manager: %d servers, %d tools registered to agent",
                                     len(server_configs), total_tools)
         except Exception:
             logger.debug("MCP Manager initialization skipped", exc_info=True)
+
+        # ── Wire Approval Gate for shell dangerous commands ──
+        try:
+            from leapflow.tools.shell_tools import set_approval_gate
+            from leapflow.tools.shell_tools import CommandApprovalGate
+
+            class _InteractiveApprovalGate:
+                """CLI-mode interactive approval for dangerous commands."""
+                async def check(self, command: str) -> bool:
+                    import sys
+                    if not sys.stdin.isatty():
+                        return False
+                    try:
+                        if sys.stderr.isatty():
+                            sys.stderr.write(f"\033[33m⚠ Dangerous command: {command}\033[0m\n")
+                        else:
+                            sys.stderr.write(f"WARNING: Dangerous command: {command}\n")
+                        sys.stderr.write("Approve? [y/N]: ")
+                        sys.stderr.flush()
+                        answer = input().strip().lower()
+                        return answer in ("y", "yes")
+                    except (EOFError, KeyboardInterrupt):
+                        return False
+
+            set_approval_gate(_InteractiveApprovalGate())
+            logger.debug("Shell approval gate: interactive CLI mode")
+        except Exception:
+            logger.debug("Shell approval gate setup skipped", exc_info=True)
 
         self.engine = AgentEngine(
             settings, self.rpc, self.llm, self.wm, self.lt, self.imm,
@@ -1160,6 +1208,58 @@ class Context:
         # ── Enable PrefixCacheOptimizer ──
         from leapflow.engine.prompt_cache import PrefixCacheOptimizer
         self.engine.set_cache_strategy(PrefixCacheOptimizer())
+
+        # ── Wire ConversationStore into engine for session persistence ──
+        if self._conversation_store:
+            self.engine.set_conversation_store(self._conversation_store)
+
+        # ── Register session_search tool ──
+        if self._conversation_store:
+            try:
+                from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
+                conv_store = self._conversation_store
+
+                TOOL_DEFINITIONS.append({
+                    "type": "function",
+                    "function": {
+                        "name": "session_search",
+                        "description": "Search past conversation sessions for relevant context.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Search keywords"},
+                                "limit": {"type": "integer", "description": "Max results (default: 5)"},
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                })
+
+                async def _session_search_handler(params: dict) -> dict:
+                    query = params.get("query", "")
+                    limit = int(params.get("limit", 5))
+                    if not query:
+                        return {"ok": False, "error": "Missing query parameter"}
+                    results = conv_store.search_messages(query, limit=limit)
+                    if not results:
+                        return {"ok": True, "result": "No matching sessions found."}
+                    items = [
+                        {
+                            "session": r.session_title or r.session_id[:8],
+                            "role": r.role,
+                            "content": r.content[:300],
+                            "score": round(r.score, 3),
+                        }
+                        for r in results
+                    ]
+                    import json as _json_ss
+                    return {"ok": True, "result": _json_ss.dumps(items, ensure_ascii=False)}
+
+                TOOL_HANDLERS["session_search"] = _session_search_handler
+                TOOL_HANDLERS["gp_session_search"] = _session_search_handler
+                logger.debug("session_search tool registered")
+            except Exception:
+                logger.debug("session_search tool registration failed", exc_info=True)
 
         # Pipeline Observer (A6: learning pipeline observability)
         from leapflow.engine.pipeline_observer import StructuredPipelineLogger

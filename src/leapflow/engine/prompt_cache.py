@@ -23,9 +23,10 @@ class PrefixCacheOptimizer:
 
     Strategy:
     1. Identify stable prefix: system prompt + tools schema + persona instructions
-    2. Ensure stable prefix is always at the start (never interleaved with dynamic content)
-    3. Mark cache boundary (for APIs that support explicit cache_control)
-    4. Dynamic section: conversation turns in chronological order
+    2. Identify frozen content: memory context snapshots (marked with _frozen_memory)
+    3. Ensure stable prefix is always at the start (never interleaved with dynamic content)
+    4. Mark cache boundary (for APIs that support explicit cache_control)
+    5. Dynamic section: conversation turns in chronological order
     """
 
     def __init__(
@@ -40,9 +41,8 @@ class PrefixCacheOptimizer:
     def optimize(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Reorganize messages for cache-friendliness.
 
-        Groups all system messages at the start as stable prefix,
+        Groups system messages and frozen memory blocks at the start as stable prefix,
         followed by dynamic conversation turns.
-        Optionally adds cache_control markers for Anthropic-style APIs.
         """
         if not messages:
             return messages
@@ -53,13 +53,15 @@ class PrefixCacheOptimizer:
         for msg in messages:
             if msg.get("role") in self._stable_roles:
                 stable.append(msg)
+            elif msg.get("_frozen_memory"):
+                stable.append(msg)
+            elif msg.get("_compressed_summary"):
+                stable.append(msg)
             else:
                 dynamic.append(msg)
 
-        # Add cache boundary marker to last stable message
         if self._cache_marker_enabled and stable:
             last_stable = {**stable[-1]}
-            # Anthropic-style cache_control
             last_stable.setdefault("cache_control", {"type": "ephemeral"})
             stable[-1] = last_stable
 

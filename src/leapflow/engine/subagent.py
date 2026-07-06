@@ -191,6 +191,118 @@ class SubagentManager:
         return result
 
 
+class DefaultSubagentExecutor:
+    """Concrete SubagentExecutor that runs a lightweight tool loop in isolation.
+
+    Creates a fresh message context with restricted tools and runs the
+    standard LLM→tool loop until goal completion or budget exhaustion.
+    """
+
+    def __init__(
+        self,
+        *,
+        llm: Any,
+        tool_handlers: Dict[str, Any],
+        tool_definitions: list,
+        settings: Any = None,
+    ) -> None:
+        self._llm = llm
+        self._tool_handlers = tool_handlers
+        self._tool_definitions = tool_definitions
+        self._settings = settings
+
+    async def execute_subagent(self, config: SubagentConfig) -> SubagentResult:
+        """Run isolated subagent with restricted tool access."""
+        session_id = f"sub_{uuid.uuid4().hex[:12]}"
+        t0 = time.monotonic()
+
+        available_tools = build_subagent_tool_filter(
+            list(self._tool_handlers.keys()), config,
+        )
+        filtered_handlers = {
+            name: self._tool_handlers[name]
+            for name in available_tools
+            if name in self._tool_handlers
+        }
+        filtered_definitions = [
+            td for td in self._tool_definitions
+            if td.get("function", {}).get("name", "") in available_tools
+        ]
+
+        system_prompt = (
+            f"You are a focused subagent. Complete this task:\n{config.goal}\n"
+        )
+        if config.context:
+            system_prompt += f"\nContext:\n{config.context}\n"
+        system_prompt += "\nProvide a clear, complete answer when done."
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": config.goal},
+        ]
+
+        tools_kwarg: dict[str, Any] = {}
+        if filtered_definitions:
+            tools_kwarg["tools"] = filtered_definitions
+
+        content = ""
+        tool_call_count = 0
+
+        for _ in range(config.max_iterations):
+            try:
+                resp = await self._llm.achat(
+                    messages, stream=False, enable_thinking=False,
+                    **tools_kwarg,
+                )
+            except Exception as exc:
+                return SubagentResult(
+                    session_id=session_id, goal=config.goal,
+                    summary=f"LLM error: {exc}",
+                    status="failed", elapsed_s=time.monotonic() - t0,
+                    tool_calls=tool_call_count, error=str(exc),
+                )
+
+            content = (resp.content or "").strip()
+            native_calls = getattr(resp, "tool_calls", None) or []
+
+            if not native_calls:
+                break
+
+            import json as _json_sub
+            assistant_msg: dict[str, Any] = {"role": "assistant", "content": content}
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.id, "type": "function",
+                    "function": {"name": tc.name, "arguments": _json_sub.dumps(tc.arguments, ensure_ascii=False)},
+                }
+                for tc in native_calls
+            ]
+            messages.append(assistant_msg)
+
+            for tc in native_calls:
+                handler = filtered_handlers.get(tc.name)
+                if handler is None:
+                    result_text = _json_sub.dumps({"ok": False, "error": f"Tool blocked: {tc.name}"})
+                else:
+                    try:
+                        result = await handler(tc.arguments)
+                        result_text = _json_sub.dumps(result, default=str, ensure_ascii=False)
+                    except Exception as e:
+                        result_text = _json_sub.dumps({"ok": False, "error": str(e)})
+                result_text = result_text[:config.summary_max_chars]
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
+                tool_call_count += 1
+
+        return SubagentResult(
+            session_id=session_id,
+            goal=config.goal,
+            summary=content[:config.summary_max_chars] or "(no output)",
+            status="completed",
+            elapsed_s=time.monotonic() - t0,
+            tool_calls=tool_call_count,
+        )
+
+
 def build_subagent_tool_filter(
     parent_tools: List[str],
     config: SubagentConfig,

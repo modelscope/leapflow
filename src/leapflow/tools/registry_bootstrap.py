@@ -343,6 +343,17 @@ async def _memory_search_handler(params: Dict[str, Any]) -> Dict[str, Any]:
 async def _memory_add_handler(params: Dict[str, Any]) -> Dict[str, Any]:
     if _memory_manager_ref is None:
         return {"ok": False, "error": "Memory system not initialized"}
+    content = params.get("content", "")
+    if content:
+        try:
+            from leapflow.security.threat_patterns import scan_for_threats, ThreatScope
+            threats = scan_for_threats(content, scope=ThreatScope.STRICT, max_results=3)
+            if any(t.severity >= 0.8 for t in threats):
+                import logging as _log
+                _log.getLogger(__name__).warning("memory_add: threat in content: %s",
+                                                  [t.pattern_name for t in threats])
+        except ImportError:
+            pass
     try:
         result = await _memory_manager_ref.handle_tool_call("memory_add", params)
         return {"ok": True, "result": result}

@@ -27,6 +27,7 @@ from leapflow.engine.intent_classifier import Intent, IntentClassifier
 from leapflow.engine.message_healer import MessageHealer
 from leapflow.engine.message_sanitizer import MessageSanitizer
 from leapflow.engine.prompt_cache import CacheStrategy
+from leapflow.engine.turn_recovery import TurnRecoveryState
 from leapflow.engine.tool_concurrency import (
     DefaultConcurrencyPolicy,
     ToolCall as ConcurrentToolCall,
@@ -150,13 +151,22 @@ def _keywords_from_query(q: str) -> list[str]:
 class StreamEvent:
     """Typed event emitted during streaming execution.
 
+    Event types (extensible via Literal union):
     - chunk: intermediate token fragment, safe to display immediately.
     - final: assembled complete response (full content).
-    - tool_call: internal tool invocation text, not intended for display.
+    - tool_start: tool execution beginning (content = tool name).
+    - tool_complete: tool execution finished (content = brief result).
+    - thinking: reasoning/thinking phase indicator.
+    - status: lifecycle status update.
+    - error: error notification.
     """
 
-    type: Literal["chunk", "final", "tool_call"]
+    type: Literal[
+        "chunk", "final", "tool_start", "tool_complete",
+        "thinking", "status", "error",
+    ]
     content: str
+    metadata: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -240,6 +250,13 @@ class AgentEngine:
             concurrency_policy if concurrency_policy is not None else DefaultConcurrencyPolicy()
         )
 
+        # Session persistence (injected by CLI)
+        self._conversation_store: Optional[Any] = None
+        self._current_session_id: Optional[str] = None
+
+        # Memory context snapshot (frozen at session start for prefix cache stability)
+        self._memory_context_snapshot: Optional[str] = None
+
         # Cancellation: tracks active task for interrupt support
         self._active_task: Optional[asyncio.Task] = None
         self._cancel_requested = False
@@ -279,6 +296,10 @@ class AgentEngine:
         """Configure output message sanitizer."""
         self._sanitizer = sanitizer
 
+    def set_conversation_store(self, store: Any) -> None:
+        """Inject conversation persistence store."""
+        self._conversation_store = store
+
     def cancel(self) -> None:
         """Request cancellation of the active run/run_stream call.
 
@@ -297,6 +318,7 @@ class AgentEngine:
     async def run(self, user_text: str, *, enable_thinking: bool = False) -> str:
         """Entrypoint: simplified routing with unified tool loop as default path."""
         logger.info("audit.user_input chars=%s", len(user_text))
+        self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
 
         # 1. Shortcut match (zero cost, exact keyword)
         if self._shortcuts:
@@ -769,24 +791,8 @@ class AgentEngine:
         # Build tool catalog text (for system prompt readability)
         tool_catalog = self._format_tool_catalog(TOOL_DEFINITIONS)
 
-        # Build memory context from long-term memory
-        memory_context = ""
-        if self._memory_manager and self._settings.memory_integration_enabled:
-            try:
-                entries = await asyncio.wait_for(
-                    self._memory_manager.prefetch(
-                        user_text, limit=self._settings.memory_prefetch_limit,
-                    ),
-                    timeout=self._settings.memory_prefetch_timeout_s,
-                )
-                if entries:
-                    memory_context = "## Recent Context\n" + "\n".join(
-                        f"- [{e.kind.value}] {e.content[:100]}" for e in entries
-                    )
-            except Exception:
-                pass
+        memory_context = await self._prefetch_and_freeze_memory(user_text)
 
-        # Build skill section (conditionally included)
         skill_section = ""
         if self._skill_index:
             entries = self._skill_index.get_entries()
@@ -824,18 +830,19 @@ class AgentEngine:
         ]
 
         content = ""
-        consecutive_tool_failures = 0
+        recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
+        result_budget = self._settings.max_tool_result_chars
 
-        # Prepare tools kwarg for native tool calling
         tools_kwarg: Dict[str, Any] = {}
         if use_native_tools and TOOL_DEFINITIONS:
             tools_kwarg["tools"] = TOOL_DEFINITIONS
 
-        # Reset cancellation state for new run
         self._cancel_requested = False
 
-        # Loop: LLM response → parse → tool_call or final answer
+        # Session persistence: create session for this turn
+        session_id = self._ensure_session(user_text)
+
         while not budget.exhausted:
             if self._cancel_requested:
                 logger.info("unified_loop: cancelled by user")
@@ -845,7 +852,6 @@ class AgentEngine:
             if status == BudgetStatus.EXHAUSTED:
                 break
 
-            # Heal + compress + cache optimize
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)
             if self._cache_strategy:
@@ -857,23 +863,24 @@ class AgentEngine:
                     compressed, stream=False, enable_thinking=enable_thinking,
                     **tools_kwarg,
                 )
+                recovery.record_api_success()
             except Exception as exc:
                 _clear_indicator()
                 classified = self._error_classifier.classify(exc)
-                recovery = self._error_classifier.get_recovery(classified)
+                rec = self._error_classifier.get_recovery(classified)
+                recovery.record_api_error()
 
-                # Context overflow: force-compress before retry
-                if classified in (ErrorCategory.CONTEXT_OVERFLOW,):
+                if classified == ErrorCategory.CONTEXT_OVERFLOW and recovery.try_compress():
                     messages = self._compressor.force_compress(messages)
                     logger.info("unified_loop: force_compress on context overflow")
                     if budget.remaining > 0:
                         continue
 
-                if recovery.retry and budget.remaining > 0:
+                if rec.retry and budget.remaining > 0:
                     await asyncio.sleep(jittered_backoff(budget.used))
                     continue
-                # If native tools caused the error, retry without them
-                if use_native_tools and tools_kwarg:
+
+                if use_native_tools and tools_kwarg and recovery.try_native_fallback():
                     logger.info("Native tool calling failed, falling back to text mode")
                     tools_kwarg = {}
                     use_native_tools = False
@@ -885,10 +892,8 @@ class AgentEngine:
             if self._sanitizer:
                 content = self._sanitizer.sanitize(content)
 
-            # Check for native tool_calls first (more reliable)
             native_calls = getattr(resp, "tool_calls", None) or []
             if native_calls:
-                # Build assistant message with tool_calls metadata
                 assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
                 assistant_msg["tool_calls"] = [
                     {
@@ -899,16 +904,16 @@ class AgentEngine:
                     for tc in native_calls
                 ]
                 messages.append(assistant_msg)
+                self._persist_message(session_id, "assistant", content, tool_calls=assistant_msg.get("tool_calls"))
 
-                # Execute native tool calls (with concurrency policy)
                 await self._execute_tools_concurrent(
                     native_calls, TOOL_HANDLERS, trace=trace, messages=messages,
                 )
-                # Check tool results for consecutive failures
-                consecutive_tool_failures = self._count_consecutive_tool_failures(messages)
-                if consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
-                    logger.warning("unified_loop: %d consecutive tool failures, stopping",
-                                   consecutive_tool_failures)
+
+                failures = self._count_consecutive_tool_failures(messages)
+                recovery.consecutive_tool_failures = failures
+                if failures >= self._settings.max_consecutive_tool_failures:
+                    logger.warning("unified_loop: %d consecutive tool failures, stopping", failures)
                     break
 
                 self._wm.remember_chat(build_assistant_message(
@@ -921,16 +926,14 @@ class AgentEngine:
                     ))
                 continue
 
-            # Fallback: text-based tool call parsing
             self._wm.remember_chat(build_assistant_message(content))
+            self._persist_message(session_id, "assistant", content)
             tool_call = self._parse_tool_call_from_content(content)
 
             if tool_call is None:
-                # Pure text response — done (guard against empty content)
                 trace.record(ExecutionMode.COMPLETE)
                 break
 
-            # Execute text-parsed tool
             messages.append(build_assistant_message(content))
             _show_progress("executing", tool_call['name'])
             result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
@@ -942,28 +945,27 @@ class AgentEngine:
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
 
-            # Track consecutive failures for text-mode tools
             is_error = isinstance(result, dict) and not result.get("ok", True)
             if is_error:
-                consecutive_tool_failures += 1
-                if consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                recovery.record_tool_failure()
+                if recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
                     logger.warning("unified_loop: %d consecutive tool failures, stopping",
-                                   consecutive_tool_failures)
+                                   recovery.consecutive_tool_failures)
                     break
             else:
-                consecutive_tool_failures = 0
+                recovery.record_tool_success()
 
-            result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
+            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
             messages.append(build_user_message_text(
                 f"Tool result ({tool_call['name']}):\n{result_text}"
             ))
+            self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
 
             if status == BudgetStatus.SOFT_LIMIT:
                 messages.append(build_user_message_text(
                     "SYSTEM: Approaching limit. Provide final answer now."
                 ))
 
-        # Sync conversation to long-term memory (non-blocking)
         if self._memory_manager and self._settings.memory_integration_enabled:
             asyncio.create_task(self._sync_turn_safe(messages))
 
@@ -995,24 +997,8 @@ class AgentEngine:
 
         tool_catalog = self._format_tool_catalog(TOOL_DEFINITIONS)
 
-        # Memory context prefetch
-        memory_context = ""
-        if self._memory_manager and self._settings.memory_integration_enabled:
-            try:
-                entries = await asyncio.wait_for(
-                    self._memory_manager.prefetch(
-                        user_text, limit=self._settings.memory_prefetch_limit,
-                    ),
-                    timeout=self._settings.memory_prefetch_timeout_s,
-                )
-                if entries:
-                    memory_context = "## Recent Context\n" + "\n".join(
-                        f"- [{e.kind.value}] {e.content[:100]}" for e in entries
-                    )
-            except Exception:
-                pass
+        memory_context = await self._prefetch_and_freeze_memory(user_text)
 
-        # Skill section
         skill_section = ""
         if self._skill_index:
             idx_entries = self._skill_index.get_entries()
@@ -1046,14 +1032,16 @@ class AgentEngine:
         ]
 
         content = ""
-        consecutive_tool_failures = 0
+        turn_recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
+        result_budget = self._settings.max_tool_result_chars
 
         tools_kwarg: Dict[str, Any] = {}
         if use_native_tools and TOOL_DEFINITIONS:
             tools_kwarg["tools"] = TOOL_DEFINITIONS
 
-        # Loop: LLM -> parse -> tool_call or stream final answer
+        session_id = self._ensure_session(user_text)
+
         while not budget.exhausted:
             if self._cancel_requested:
                 logger.info("unified_loop_stream: cancelled by user")
@@ -1068,31 +1056,34 @@ class AgentEngine:
             if self._cache_strategy:
                 compressed = self._cache_strategy.optimize(compressed)
 
-            _show_progress("thinking", f"round {budget.used}")
+            yield StreamEvent(type="thinking", content=f"round {budget.used}")
 
-            # When native tools are enabled we need stream=False for tool_calls
             if use_native_tools and tools_kwarg:
                 try:
                     resp = await self._llm.achat(
                         compressed, stream=False, enable_thinking=enable_thinking,
                         **tools_kwarg,
                     )
+                    turn_recovery.record_api_success()
                 except Exception as exc:
                     _clear_indicator()
                     classified = self._error_classifier.classify(exc)
-                    recovery = self._error_classifier.get_recovery(classified)
-                    if classified in (ErrorCategory.CONTEXT_OVERFLOW,):
+                    rec = self._error_classifier.get_recovery(classified)
+                    turn_recovery.record_api_error()
+
+                    if classified == ErrorCategory.CONTEXT_OVERFLOW and turn_recovery.try_compress():
                         messages = self._compressor.force_compress(messages)
                         if budget.remaining > 0:
                             continue
-                    if recovery.retry and budget.remaining > 0:
+                    if rec.retry and budget.remaining > 0:
                         await asyncio.sleep(jittered_backoff(budget.used))
                         continue
-                    if use_native_tools and tools_kwarg:
+                    if use_native_tools and tools_kwarg and turn_recovery.try_native_fallback():
                         logger.info("Native tool calling failed, falling back to text mode")
                         tools_kwarg = {}
                         use_native_tools = False
                         continue
+                    yield StreamEvent(type="error", content=str(exc))
                     break
                 _clear_indicator()
 
@@ -1112,14 +1103,18 @@ class AgentEngine:
                     ]
                     messages.append(assistant_msg)
 
+                    for tc in native_calls:
+                        yield StreamEvent(type="tool_start", content=tc.name)
                     await self._execute_tools_concurrent(
                         native_calls, TOOL_HANDLERS, trace=trace, messages=messages
                     )
+                    for tc in native_calls:
+                        yield StreamEvent(type="tool_complete", content=tc.name)
 
-                    consecutive_tool_failures = self._count_consecutive_tool_failures(messages)
-                    if consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
-                        logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
-                                       consecutive_tool_failures)
+                    failures = self._count_consecutive_tool_failures(messages)
+                    turn_recovery.consecutive_tool_failures = failures
+                    if failures >= self._settings.max_consecutive_tool_failures:
+                        logger.warning("unified_loop_stream: %d consecutive tool failures, stopping", failures)
                         break
 
                     self._wm.remember_chat(build_assistant_message(
@@ -1131,8 +1126,8 @@ class AgentEngine:
                         ))
                     continue
 
-                # No tool calls - final answer; yield content
                 self._wm.remember_chat(build_assistant_message(content))
+                self._persist_message(session_id, "assistant", content)
                 trace.record(ExecutionMode.COMPLETE)
                 if not content:
                     yield StreamEvent(type="final", content="I processed your request but have no additional output.")
@@ -1141,9 +1136,7 @@ class AgentEngine:
                 return
 
             else:
-                # Non-native path: use streaming for real-time output when enabled
                 if self._settings.stream_output:
-                    # Stream chunks and yield them in real-time to the caller
                     content_parts: list[str] = []
                     try:
                         _clear_indicator()
@@ -1152,11 +1145,17 @@ class AgentEngine:
                         ):
                             content_parts.append(chunk)
                             yield StreamEvent(type="chunk", content=chunk)
+                        turn_recovery.record_api_success()
                     except Exception as exc:
                         _clear_indicator()
-                        category = self._error_classifier.classify(exc)
-                        recovery = self._error_classifier.get_recovery(category)
-                        if recovery.retry and budget.remaining > 0:
+                        classified = self._error_classifier.classify(exc)
+                        rec = self._error_classifier.get_recovery(classified)
+                        turn_recovery.record_api_error()
+                        if classified == ErrorCategory.CONTEXT_OVERFLOW and turn_recovery.try_compress():
+                            messages = self._compressor.force_compress(messages)
+                            if budget.remaining > 0:
+                                continue
+                        if rec.retry and budget.remaining > 0:
                             await asyncio.sleep(jittered_backoff(budget.used))
                             continue
                         break
@@ -1165,16 +1164,17 @@ class AgentEngine:
                     if self._sanitizer:
                         content = self._sanitizer.sanitize(content)
                 else:
-                    # Buffered mode (stream_output=False): single request
                     try:
                         resp = await self._llm.achat(
                             compressed, stream=False, enable_thinking=enable_thinking,
                         )
+                        turn_recovery.record_api_success()
                     except Exception as exc:
                         _clear_indicator()
-                        category = self._error_classifier.classify(exc)
-                        recovery = self._error_classifier.get_recovery(category)
-                        if recovery.retry and budget.remaining > 0:
+                        classified = self._error_classifier.classify(exc)
+                        rec = self._error_classifier.get_recovery(classified)
+                        turn_recovery.record_api_error()
+                        if rec.retry and budget.remaining > 0:
                             await asyncio.sleep(jittered_backoff(budget.used))
                             continue
                         break
@@ -1184,10 +1184,10 @@ class AgentEngine:
                         content = self._sanitizer.sanitize(content)
 
                 self._wm.remember_chat(build_assistant_message(content))
+                self._persist_message(session_id, "assistant", content)
                 tool_call = self._parse_tool_call_from_content(content)
 
                 if tool_call is None:
-                    # Final answer — yield completion event
                     trace.record(ExecutionMode.COMPLETE)
                     if not content:
                         yield StreamEvent(type="final", content="I processed your request but have no additional output.")
@@ -1195,11 +1195,11 @@ class AgentEngine:
                         yield StreamEvent(type="final", content=content)
                     return
 
-                # Execute text-parsed tool
                 messages.append(build_assistant_message(content))
-                _show_progress("executing", tool_call['name'])
+                yield StreamEvent(type="tool_start", content=tool_call['name'])
                 result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
                 _clear_indicator()
+                yield StreamEvent(type="tool_complete", content=tool_call['name'])
                 _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
                 trace.record(
                     ExecutionMode.ACTING,
@@ -1209,28 +1209,28 @@ class AgentEngine:
 
                 is_error = isinstance(result, dict) and not result.get("ok", True)
                 if is_error:
-                    consecutive_tool_failures += 1
-                    if consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                    turn_recovery.record_tool_failure()
+                    if turn_recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
                         logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
-                                       consecutive_tool_failures)
+                                       turn_recovery.consecutive_tool_failures)
                         break
                 else:
-                    consecutive_tool_failures = 0
+                    turn_recovery.record_tool_success()
 
-                result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
+                result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
                 messages.append(build_user_message_text(
                     f"Tool result ({tool_call['name']}):\n{result_text}"
                 ))
+                self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
+
                 if status == BudgetStatus.SOFT_LIMIT:
                     messages.append(build_user_message_text(
                         "SYSTEM: Approaching limit. Provide final answer now."
                     ))
 
-        # Sync conversation to long-term memory (non-blocking)
         if self._memory_manager and self._settings.memory_integration_enabled:
             asyncio.create_task(self._sync_turn_safe(messages))
 
-        # Budget exhausted
         yield StreamEvent(type="final", content=content if content else "I've reached my processing limit.")
 
 
@@ -1276,13 +1276,13 @@ class AgentEngine:
         Concurrent group runs via asyncio.gather; sequential group runs one-by-one.
         Results are appended to messages in OpenAI tool-result format.
         """
+        result_budget = self._settings.max_tool_result_chars
         tc_wrappers = [
             ConcurrentToolCall(id=tc.id, name=tc.name, arguments=tc.arguments)
             for tc in native_calls
         ]
 
         if not self._concurrency_policy or len(tc_wrappers) <= 1:
-            # Sequential fallback
             for i, tc in enumerate(native_calls):
                 _show_progress("executing", tc.name, step=i + 1, total=len(native_calls))
                 tool_call_dict = {"name": tc.name, "arguments": tc.arguments}
@@ -1294,7 +1294,7 @@ class AgentEngine:
                     action=tool_call_dict,
                     observation=result if isinstance(result, dict) else {"result": str(result)},
                 )
-                result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
+                result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
             return
 
@@ -1328,7 +1328,7 @@ class AgentEngine:
                         action=tool_call_dict,
                         observation=error_result,
                     )
-                    result_text = json.dumps(error_result, default=str, ensure_ascii=False)[:3000]
+                    result_text = json.dumps(error_result, default=str, ensure_ascii=False)[:result_budget]
                 else:
                     _print_tool_result(ctc.name, result, enabled=self._settings.verbose_progress)
                     trace.record(
@@ -1336,10 +1336,9 @@ class AgentEngine:
                         action=tool_call_dict,
                         observation=result if isinstance(result, dict) else {"result": str(result)},
                     )
-                    result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
+                    result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
 
-        # Execute sequential group one-by-one
         for i, ctc in enumerate(sequential):
             _show_progress("executing", ctc.name, step=i + 1, total=len(sequential))
             tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
@@ -1351,7 +1350,7 @@ class AgentEngine:
                 action=tool_call_dict,
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
-            result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
+            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
             messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
 
     async def _execute_general_tool(
@@ -1491,6 +1490,78 @@ class AgentEngine:
                 logger.debug("evolution.record_episode outcome=%s actions=%d", outcome, len(actions))
         except Exception:
             pass  # never fail the main loop
+
+    def _ensure_session(self, user_text: str) -> Optional[str]:
+        """Create or reuse a conversation session. Returns session_id or None."""
+        if not self._conversation_store or not self._settings.session_persistence_enabled:
+            return None
+        try:
+            import uuid as _uuid
+            if self._current_session_id is None:
+                self._current_session_id = _uuid.uuid4().hex[:16]
+            title = user_text[:80].replace("\n", " ").strip()
+            self._conversation_store.create_session(
+                self._current_session_id, title=title,
+                model=self._settings.llm_model, source="cli",
+            )
+            self._persist_message(self._current_session_id, "user", user_text)
+            return self._current_session_id
+        except Exception:
+            logger.debug("session.ensure failed", exc_info=True)
+            return None
+
+    def _persist_message(
+        self, session_id: Optional[str], role: str, content: str,
+        *, tool_name: Optional[str] = None,
+        tool_calls: Optional[list] = None,
+    ) -> None:
+        """Persist a message to conversation store (fire-and-forget)."""
+        if not session_id or not self._conversation_store:
+            return
+        try:
+            self._conversation_store.append_message(
+                session_id, role, content[:8000],
+                tool_name=tool_name, tool_calls=tool_calls,
+            )
+        except Exception:
+            logger.debug("session.persist_message failed", exc_info=True)
+
+    def _freeze_memory_context(self, user_text: str) -> str:
+        """Freeze memory context at session start for prefix cache stability.
+
+        Once frozen, the same snapshot is reused for all turns in the session,
+        preventing prefix cache invalidation from mid-session memory writes.
+        """
+        if self._memory_context_snapshot is not None:
+            return self._memory_context_snapshot
+        return ""
+
+    async def _prefetch_and_freeze_memory(self, user_text: str) -> str:
+        """Prefetch memory context and freeze snapshot for session duration."""
+        if self._memory_context_snapshot is not None:
+            return self._memory_context_snapshot
+
+        if not self._memory_manager or not self._settings.memory_integration_enabled:
+            self._memory_context_snapshot = ""
+            return ""
+
+        try:
+            entries = await asyncio.wait_for(
+                self._memory_manager.prefetch(
+                    user_text, limit=self._settings.memory_prefetch_limit,
+                ),
+                timeout=self._settings.memory_prefetch_timeout_s,
+            )
+            if entries:
+                context = "## Recent Context\n" + "\n".join(
+                    f"- [{e.kind.value}] {e.content[:100]}" for e in entries
+                )
+                self._memory_context_snapshot = context
+                return context
+        except Exception:
+            pass
+        self._memory_context_snapshot = ""
+        return ""
 
     async def _sync_turn_safe(self, messages: List[Dict[str, Any]]) -> None:
         """Non-blocking wrapper for MemoryManager.sync_turn."""

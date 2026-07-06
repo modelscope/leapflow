@@ -1,13 +1,22 @@
-"""Configuration loading from environment variables."""
+"""Configuration loading from environment variables with optional YAML overlay.
+
+Loading priority (highest wins):
+    1. Real environment variables
+    2. CWD ``.env`` — project-specific overrides
+    3. ``<data_dir>/config.yaml`` — structured YAML config (deep-merged)
+    4. ``<data_dir>/.env`` — global user defaults
+    5. Hard-coded fallbacks
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 
 from dotenv import load_dotenv
 
@@ -298,11 +307,15 @@ class Settings:
     compress_threshold: int = 16
     compress_keep_tail: int = 4
     max_tool_output_chars: int = 2000
+    max_tool_result_chars: int = 3000  # Per-tool result truncation for LLM context
 
     # ── Error Recovery ──
     error_transient_max_retries: int = 3
     error_rate_limit_base_delay: float = 5.0
     max_consecutive_tool_failures: int = 3
+
+    # ── Session Persistence ──
+    session_persistence_enabled: bool = True
 
     # ── Signal Fusion (vision_only mode) ──
     # Default is the full 7-channel set; ``LEAPFLOW_SIGNAL_CHANNELS=none`` disables
@@ -358,6 +371,63 @@ class Settings:
         return bool(self.llm_api_key.strip())
 
 
+def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge overlay into base. Overlay values take precedence."""
+    result = dict(base)
+    for key, value in overlay.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _load_yaml_overlay(data_dir: Path) -> Dict[str, str]:
+    """Load config.yaml and flatten dot-separated keys to env var format.
+
+    Handles corrupt YAML by backing up and continuing with empty config.
+    Returns dict of LEAPFLOW_* env var names to string values.
+    """
+    yaml_path = data_dir / "config.yaml"
+    if not yaml_path.exists():
+        return {}
+
+    try:
+        import yaml
+    except ImportError:
+        return {}
+
+    try:
+        raw = yaml_path.read_text(encoding="utf-8")
+        parsed = yaml.safe_load(raw) or {}
+        if not isinstance(parsed, dict):
+            raise ValueError("config.yaml root must be a mapping")
+    except Exception as exc:
+        backup = yaml_path.with_suffix(f".yaml.corrupt.bak")
+        logger.warning("config.yaml parse error (%s), backing up to %s", exc, backup.name)
+        try:
+            shutil.copy2(yaml_path, backup)
+        except OSError:
+            pass
+        return {}
+
+    env_vars: Dict[str, str] = {}
+    _flatten_yaml(parsed, prefix="LEAPFLOW", env_vars=env_vars)
+    return env_vars
+
+
+def _flatten_yaml(
+    node: Any, *, prefix: str, env_vars: Dict[str, str]
+) -> None:
+    """Flatten nested YAML dict to LEAPFLOW_X_Y_Z = value strings."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            child_prefix = f"{prefix}_{key}".upper()
+            _flatten_yaml(value, prefix=child_prefix, env_vars=env_vars)
+    else:
+        env_vars[prefix] = str(node)
+
+
 def load_config(*, env_file: str | Path | None = None) -> Settings:
     """Load settings from `.env` and process environment.
 
@@ -393,7 +463,13 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     ensure_default_env(_data_dir)
 
     if env_file is None:
-        # Layer 2: global user .env — fills in any variables not already set.
+        # Layer 2: YAML config overlay (deep-merge, dot.separated keys)
+        yaml_vars = _load_yaml_overlay(_data_dir)
+        for k, v in yaml_vars.items():
+            if k not in os.environ:
+                os.environ[k] = v
+
+        # Layer 3: global user .env — fills in any variables not already set.
         _global_env = _data_dir / ".env"
         if _global_env.exists():
             load_dotenv(_global_env, override=False)
@@ -612,11 +688,15 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     compress_threshold = int(os.getenv("LEAPFLOW_COMPRESS_THRESHOLD", "16"))
     compress_keep_tail = int(os.getenv("LEAPFLOW_COMPRESS_KEEP_TAIL", "4"))
     max_tool_output_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_OUTPUT_CHARS", "2000"))
+    max_tool_result_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_RESULT_CHARS", "3000"))
 
     # Error Recovery
     error_transient_max_retries = int(os.getenv("LEAPFLOW_ERROR_TRANSIENT_MAX_RETRIES", "3"))
     error_rate_limit_base_delay = float(os.getenv("LEAPFLOW_ERROR_RATE_LIMIT_BASE_DELAY", "5.0"))
     max_consecutive_tool_failures = int(os.getenv("LEAPFLOW_MAX_CONSECUTIVE_TOOL_FAILURES", "3"))
+
+    # Session Persistence
+    session_persistence_enabled = _bool("LEAPFLOW_SESSION_PERSISTENCE_ENABLED", "true")
 
     # Signal Fusion
     # Default = "all": collect every supported channel (V7 full fusion). Set
@@ -835,10 +915,13 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         compress_threshold=compress_threshold,
         compress_keep_tail=compress_keep_tail,
         max_tool_output_chars=max_tool_output_chars,
+        max_tool_result_chars=max_tool_result_chars,
         # Error Recovery
         error_transient_max_retries=error_transient_max_retries,
         error_rate_limit_base_delay=error_rate_limit_base_delay,
         max_consecutive_tool_failures=max_consecutive_tool_failures,
+        # Session Persistence
+        session_persistence_enabled=session_persistence_enabled,
         # Signal Fusion
         signal_channels=signal_channels,
         signal_reactive_capture=signal_reactive_capture,
