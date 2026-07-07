@@ -1111,11 +1111,14 @@ class Context:
             copilot_idle = IdleDetector(copilot_config, on_idle=_copilot_on_idle)
 
             # Event subscriber — register to EventBus
+            warmup_raw = getattr(settings, "copilot_warmup_event_types", "")
+            warmup_types = frozenset(k.strip() for k in warmup_raw.split(",") if k.strip()) if warmup_raw else None
             copilot_subscriber = CopilotEventSubscriber(
                 copilot_encoder,
                 tracker=None,
                 working_memory=self.wm if hasattr(self, 'wm') else None,
                 pipeline=copilot_pipeline,
+                warmup_event_types=warmup_types,
             )
             self.event_bus.subscribe(copilot_subscriber.on_system_event)
 
@@ -1586,7 +1589,7 @@ class Context:
             if not state.get("transitions"):
                 return
             content = json.dumps(state, ensure_ascii=False)
-            self.lt.insert_raw(
+            self.lt.upsert_raw(
                 self._L1_MARKOV_KIND, content,
                 memory_id=self._L1_MARKOV_MEMORY_ID,
             )

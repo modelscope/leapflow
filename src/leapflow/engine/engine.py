@@ -394,39 +394,37 @@ class AgentEngine:
 
         return None
 
-    _LIVE_SIGNAL_KINDS = frozenset({
+    _DEFAULT_LIVE_SIGNAL_KINDS = frozenset({
         "app.focus_change", "fs.change", "context.change", "intent.signal",
     })
 
-    def _inject_live_signals(self, messages: list, since_ts: float) -> None:
-        """Inject high-priority WM events into the message context.
+    def _inject_live_signals(self, messages: list, watermark: list) -> None:
+        """Inject high-priority WM events arrived since ``watermark[0]``.
 
-        Checks for system events recorded since ``since_ts`` and appends
-        a summary system message if any match the signal whitelist.  This
-        bridges the EventBus signal stream into the LLM decision loop
-        without coupling the engine to the EventBus directly.
+        Uses a mutable watermark list (single-element) so the caller's
+        timestamp advances after each injection, preventing duplicate
+        signal messages across loop iterations.
         """
+        since_ts = watermark[0]
+        raw = getattr(self._settings, "live_signal_kinds", "")
+        signal_kinds = frozenset(k.strip() for k in raw.split(",") if k.strip()) if raw else self._DEFAULT_LIVE_SIGNAL_KINDS
         recent = self._wm.get_events_since(since_ts)
         relevant = [
             e for e in recent
-            if e.get("_event_kind") in self._LIVE_SIGNAL_KINDS
+            if e.get("_event_kind") in signal_kinds
         ]
         if not relevant:
             return
         lines = []
         for ev in relevant[-5:]:
-            content = ev.get("content", "")
-            if isinstance(content, str) and content.startswith("{"):
-                try:
-                    import ast
-                    parsed = ast.literal_eval(content)
-                    lines.append(parsed.get("text", str(parsed)[:120]))
-                except (ValueError, SyntaxError):
-                    lines.append(content[:120])
+            text = ev.get("_event_text", "")
+            if text:
+                lines.append(str(text)[:120])
             else:
-                lines.append(str(content)[:120])
+                lines.append(str(ev.get("content", ""))[:120])
         summary = "; ".join(lines)
         messages.append(build_system_message(f"[LIVE SIGNAL] {summary}"))
+        watermark[0] = time.time()
 
     @staticmethod
     def _strip_images_from_messages(messages: list) -> None:
@@ -486,7 +484,7 @@ class AgentEngine:
 
     def set_doc_store(self, doc_store: Any) -> None:
         """Inject SkillDocStore so SkillMerger can sync SKILL.md on approve."""
-        self._skill_merger._doc_store = doc_store
+        self._skill_merger.set_doc_store(doc_store)
 
     def set_event_bus(self, event_bus: Any) -> None:
         """Inject EventBus for emitting learning signals (episode events)."""
@@ -1066,7 +1064,7 @@ class AgentEngine:
             tools_kwarg["tools"] = TOOL_DEFINITIONS
 
         self._cancel_requested = False
-        _loop_start_ts = time.time()
+        _signal_watermark = [time.time()]
 
         session_id = self._ensure_session(user_text)
 
@@ -1079,7 +1077,7 @@ class AgentEngine:
             if status == BudgetStatus.EXHAUSTED:
                 break
 
-            self._inject_live_signals(messages, _loop_start_ts)
+            self._inject_live_signals(messages, _signal_watermark)
 
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)
@@ -1236,7 +1234,8 @@ class AgentEngine:
         """Background post-turn review: detect memorable patterns and persist episodes.
 
         Scans the turn's tool calls for interesting patterns (successes, failures)
-        and records them as skill episodes for evolution learning.
+        and records them as skill episodes for evolution learning. Delegates
+        persistence, world-model bridging, and event emission to focused helpers.
         """
         try:
             tool_actions: List[Dict[str, Any]] = []
@@ -1278,54 +1277,69 @@ class AgentEngine:
                 context=episode_context,
             )
 
-            # Incremental persistence: write to DuckDB immediately (not just on shutdown)
-            if self._evolution_store is not None and episode is not None:
-                try:
-                    self._evolution_store.save_episode(
-                        episode_id=episode.episode_id,
-                        skill_name=episode.skill_name,
-                        actions=episode.actions,
-                        outcome=episode.outcome,
-                        reward=episode.reward,
-                        context=episode.context,
-                        timestamp=episode.timestamp,
-                    )
-                except Exception:
-                    logger.debug("evolution_store.save_episode failed", exc_info=True)
-
-            # Bridge tool-loop outcomes to ExperienceStore for world-model trajectory
-            if self._experience_store is not None and episode is not None:
-                try:
-                    tool_names = ",".join(a.get("tool", "") for a in tool_actions[:3])
-                    self._experience_store.store(
-                        action_description=f"chat_tools:{tool_names}",
-                        app_context="",
-                        predicted_effect="",
-                        actual_effect=episode.outcome,
-                        delta=abs(reward),
-                        grade_label="helpful" if has_success and not has_failure else "mixed",
-                    )
-                except Exception:
-                    logger.debug("experience_store.store failed", exc_info=True)
-
-            # Emit high-value episodes to EventBus for active learning consumption
-            if episode is not None and self._event_bus is not None and abs(reward) >= 0.8:
-                try:
-                    import asyncio as _aio
-                    loop = _aio.get_running_loop()
-                    loop.create_task(self._event_bus.handle_event(
-                        "learning.episode_recorded",
-                        {
-                            "skill_name": episode.skill_name,
-                            "reward": episode.reward,
-                            "actions": [a.get("tool", "") for a in episode.actions[:5]],
-                            "outcome": episode.outcome,
-                        },
-                    ))
-                except RuntimeError:
-                    pass
+            self._persist_episode(episode)
+            self._bridge_to_experience_store(episode, tool_actions, reward, has_success, has_failure)
+            self._emit_episode_event(episode, reward)
         except Exception:
             logger.debug("post_turn_review failed", exc_info=True)
+
+    def _persist_episode(self, episode: Any) -> None:
+        """Incremental persistence: write episode to DuckDB immediately."""
+        if self._evolution_store is None or episode is None:
+            return
+        try:
+            self._evolution_store.save_episode(
+                episode_id=episode.episode_id,
+                skill_name=episode.skill_name,
+                actions=episode.actions,
+                outcome=episode.outcome,
+                reward=episode.reward,
+                context=episode.context,
+                timestamp=episode.timestamp,
+            )
+        except Exception:
+            logger.debug("evolution_store.save_episode failed", exc_info=True)
+
+    def _bridge_to_experience_store(
+        self, episode: Any, tool_actions: List[Dict[str, Any]],
+        reward: float, has_success: bool, has_failure: bool,
+    ) -> None:
+        """Bridge tool-loop outcomes to ExperienceStore for world-model trajectory."""
+        if self._experience_store is None or episode is None:
+            return
+        try:
+            tool_names = ",".join(a.get("tool", "") for a in tool_actions[:3])
+            self._experience_store.store(
+                action_description=f"chat_tools:{tool_names}",
+                app_context="",
+                predicted_effect="",
+                actual_effect=episode.outcome,
+                delta=abs(reward),
+                grade_label="helpful" if has_success and not has_failure else "mixed",
+            )
+        except Exception:
+            logger.debug("experience_store.store failed", exc_info=True)
+
+    def _emit_episode_event(self, episode: Any, reward: float) -> None:
+        """Emit high-value episodes to EventBus for active learning consumption."""
+        if episode is None or self._event_bus is None:
+            return
+        threshold = getattr(self._settings, "episode_emit_reward_threshold", 0.8)
+        if abs(reward) < threshold:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._event_bus.handle_event(
+                "learning.episode_recorded",
+                {
+                    "skill_name": episode.skill_name,
+                    "reward": episode.reward,
+                    "actions": [a.get("tool", "") for a in episode.actions[:5]],
+                    "outcome": episode.outcome,
+                },
+            ))
+        except RuntimeError:
+            pass
 
     async def _unified_tool_loop_stream(
         self, user_text: str, *, enable_thinking: bool = False
@@ -1400,7 +1414,7 @@ class AgentEngine:
         session_id = self._ensure_session(user_text)
 
         self._cancel_requested = False
-        _loop_start_ts = time.time()
+        _signal_watermark = [time.time()]
 
         while not budget.exhausted:
             if self._cancel_requested:
@@ -1411,7 +1425,7 @@ class AgentEngine:
             if status == BudgetStatus.EXHAUSTED:
                 break
 
-            self._inject_live_signals(messages, _loop_start_ts)
+            self._inject_live_signals(messages, _signal_watermark)
 
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)

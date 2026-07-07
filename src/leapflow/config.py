@@ -354,7 +354,11 @@ class Settings:
     copilot_cache_ttl_s: float = 30.0
     copilot_speculative_cache_size: int = 100
     copilot_action_ring_size: int = 10
+    copilot_warmup_event_types: str = "app.focus_change,context.change,ui.action"
     notification_renderer: str = "auto"  # "os" | "stderr" | "log" | "auto" | "none"
+
+    # ── Engine Live Signals ──
+    live_signal_kinds: str = "app.focus_change,fs.change,context.change,intent.signal"
 
     # ── Hub (cloud collaboration) ──
     hub_type: str = "modelscope"
@@ -770,7 +774,14 @@ def _build_settings_from_env() -> Settings:
     copilot_cache_ttl_s = float(os.getenv("LEAPFLOW_COPILOT_CACHE_TTL_S", "30.0"))
     copilot_speculative_cache_size = int(os.getenv("LEAPFLOW_COPILOT_SPECULATIVE_CACHE_SIZE", "100"))
     copilot_action_ring_size = int(os.getenv("LEAPFLOW_COPILOT_ACTION_RING_SIZE", "10"))
+    copilot_warmup_event_types = os.getenv(
+        "LEAPFLOW_COPILOT_WARMUP_EVENT_TYPES", "app.focus_change,context.change,ui.action",
+    )
     notification_renderer = os.getenv("LEAPFLOW_NOTIFICATION_RENDERER", "auto")
+
+    live_signal_kinds = os.getenv(
+        "LEAPFLOW_LIVE_SIGNAL_KINDS", "app.focus_change,fs.change,context.change,intent.signal",
+    )
 
     # Hub (cloud collaboration)
     hub_type = os.getenv("LEAPFLOW_HUB_TYPE", "modelscope")
@@ -991,7 +1002,9 @@ def _build_settings_from_env() -> Settings:
         copilot_cache_ttl_s=copilot_cache_ttl_s,
         copilot_speculative_cache_size=copilot_speculative_cache_size,
         copilot_action_ring_size=copilot_action_ring_size,
+        copilot_warmup_event_types=copilot_warmup_event_types,
         notification_renderer=notification_renderer,
+        live_signal_kinds=live_signal_kinds,
         # Hub
         hub_type=hub_type,
         hub_default_owner=hub_default_owner,

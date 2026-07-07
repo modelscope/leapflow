@@ -6,8 +6,11 @@ through configured Hub backends (ModelScope, HuggingFace, local, etc.).
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import TYPE_CHECKING, List
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from leapflow.cli.context import Context
@@ -399,6 +402,7 @@ def _install_via_doc_store(ctx: "Context", bundle: "SkillBundle", doc_store: obj
     try:
         doc_store.save(doc)  # type: ignore[union-attr]
     except Exception:
+        logger.warning("hub.install: doc_store.save failed for %s", m.name, exc_info=True)
         return False
 
     registry = getattr(ctx, "registry", None)
@@ -411,7 +415,7 @@ def _install_via_doc_store(ctx: "Context", bundle: "SkillBundle", doc_store: obj
             if skill is not None:
                 registry.register(skill)
         except Exception:
-            pass
+            logger.warning("hub.install: registry load failed for %s", m.name, exc_info=True)
 
     return True
 

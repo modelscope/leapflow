@@ -294,8 +294,36 @@ class SemanticMemoryProvider:
         mid = memory_id or str(uuid.uuid4())
         now = time.time()
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
-        # Infer domain from kind
         domain = SignalDomain.FILESYSTEM.value if "file" in kind else SignalDomain.SYSTEM.value
+        con.execute(
+            """
+            INSERT INTO leap_memory (id, kind, domain, content, path, metadata, created_at, accessed_at, access_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [mid, kind, domain, content, path, meta_json, now, now, 1],
+        )
+        return mid
+
+    def upsert_raw(
+        self,
+        kind: str,
+        content: str,
+        *,
+        path: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        memory_id: Optional[str] = None,
+    ) -> str:
+        """Insert or update a row by primary key.
+
+        Useful for singleton state blobs (e.g. Markov state) that must
+        be overwritten on each session rather than duplicated.
+        """
+        con = self._ensure_connection()
+        mid = memory_id or str(uuid.uuid4())
+        now = time.time()
+        meta_json = json.dumps(metadata or {}, ensure_ascii=False)
+        domain = SignalDomain.FILESYSTEM.value if "file" in kind else SignalDomain.SYSTEM.value
+        con.execute("DELETE FROM leap_memory WHERE id = ?", [mid])
         con.execute(
             """
             INSERT INTO leap_memory (id, kind, domain, content, path, metadata, created_at, accessed_at, access_count)

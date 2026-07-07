@@ -1157,6 +1157,10 @@ class SkillMerger:
         self._llm = llm
         self._execution = execution
 
+    def set_doc_store(self, doc_store: object) -> None:
+        """Late-bind the SkillDocStore (avoids circular init deps)."""
+        self._doc_store = doc_store
+
     def apply(
         self, suggestion: SkillUpdateSuggestion, store: SkillLibraryStore
     ) -> StoredSkill:
@@ -1211,29 +1215,28 @@ class SkillMerger:
         return merged
 
     def _sync_doc_store(self, merged: StoredSkill) -> None:
-        """Regenerate SKILL.md from the updated StoredSkill if it already exists."""
+        """Merge updated fields into the existing SKILL.md, preserving rich content."""
         if self._doc_store is None or not self._doc_store.exists(merged.title):
             return
         try:
-            from leapflow.learning.document import SkillDocument
-            doc = SkillDocument(
-                name=merged.title,
-                description=f"Learned skill (v{merged.version})",
-                goal=merged.title,
-                instructions=list(merged.steps),
-                preconditions=list(merged.pre_conditions),
-                postconditions=list(merged.post_conditions),
-                parameters=[
-                    {"name": p, "description": ""} if isinstance(p, str) else p
-                    for p in merged.parameters
-                ],
-                metadata={
-                    "version": merged.version,
-                    "confidence": merged.confidence,
-                    "source": "merged",
-                },
-            )
-            self._doc_store.save(doc)
+            existing_doc = self._doc_store.load(merged.title)
+            if existing_doc is None:
+                return
+            existing_doc.instructions = list(merged.steps)
+            existing_doc.preconditions = list(merged.pre_conditions)
+            existing_doc.postconditions = list(merged.post_conditions)
+            existing_doc.parameters = [
+                {"name": p, "description": ""} if isinstance(p, str) else p
+                for p in merged.parameters
+            ]
+            meta = existing_doc.metadata or {}
+            meta.update({
+                "version": merged.version,
+                "confidence": merged.confidence,
+                "source": "merged",
+            })
+            existing_doc.metadata = meta
+            self._doc_store.save(existing_doc)
             logger.info("skill_merger.doc_synced skill=%s", merged.title)
         except Exception:
             logger.warning("skill_merger.doc_sync_failed skill=%s", merged.title, exc_info=True)

@@ -170,6 +170,8 @@ class WorkingMemoryProvider:
         self._token_sum += w
         self._evict_if_needed()
 
+    _INTERNAL_KEYS = frozenset({"_event_ts", "_event_kind", "_event_text"})
+
     def remember_event(self, kind: str, text: str, metadata: Optional[Dict[str, object]] = None) -> None:
         """Store a compact system-side event as a synthetic system message."""
         ts = time.time()
@@ -179,7 +181,13 @@ class WorkingMemoryProvider:
             "text": text,
             "metadata": metadata or {},
         }
-        msg: Dict[str, object] = {"role": "system", "content": repr(payload), "_event_ts": ts, "_event_kind": kind}
+        msg: Dict[str, object] = {
+            "role": "system",
+            "content": repr(payload),
+            "_event_ts": ts,
+            "_event_kind": kind,
+            "_event_text": text,
+        }
         self.remember_chat(msg)
 
     def get_events_since(self, since_ts: float) -> List[Dict[str, object]]:
@@ -202,8 +210,18 @@ class WorkingMemoryProvider:
         return result
 
     def as_chat_messages(self) -> List[Dict[str, object]]:
-        """Return a list copy suitable for LLM APIs."""
-        return list(self._items)
+        """Return a list copy suitable for LLM APIs.
+
+        Internal metadata keys (_event_ts, etc.) are stripped so the
+        output is safe to pass directly to LLM chat endpoints.
+        """
+        out: List[Dict[str, object]] = []
+        for msg in self._items:
+            if any(k in msg for k in self._INTERNAL_KEYS):
+                out.append({k: v for k, v in msg.items() if k not in self._INTERNAL_KEYS})
+            else:
+                out.append(msg)
+        return out
 
     def clear(self) -> None:
         self._items.clear()

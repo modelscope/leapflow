@@ -105,7 +105,7 @@ class ContextEncoder:
         return f"{dt.strftime('%a').lower()}_{dt.hour:02d}"
 
 
-_WARMUP_EVENT_TYPES = frozenset({"app.focus_change", "context.change", "ui.action"})
+_DEFAULT_WARMUP_EVENT_TYPES = frozenset({"app.focus_change", "context.change", "ui.action"})
 
 
 class CopilotEventSubscriber:
@@ -123,6 +123,7 @@ class CopilotEventSubscriber:
 
     __slots__ = (
         "_encoder", "_tracker", "_working_memory", "_last_hint", "_pipeline",
+        "_warmup_event_types",
     )
 
     def __init__(
@@ -131,12 +132,14 @@ class CopilotEventSubscriber:
         tracker: Optional["CrossAppContextTracker"] = None,
         working_memory: Optional["WorkingMemoryProvider"] = None,
         pipeline: Optional[object] = None,
+        warmup_event_types: Optional[frozenset] = None,
     ) -> None:
         self._encoder = encoder
         self._tracker = tracker
         self._working_memory = working_memory
         self._last_hint: str = ""
         self._pipeline = pipeline
+        self._warmup_event_types = warmup_event_types or _DEFAULT_WARMUP_EVENT_TYPES
 
     def set_pipeline(self, pipeline: object) -> None:
         """Late-bind speculative pipeline (avoids circular init deps)."""
@@ -165,7 +168,7 @@ class CopilotEventSubscriber:
                 state.delta_update("conversation_hint", hint)
                 self._last_hint = hint
 
-        if self._pipeline is not None and event.event_type in _WARMUP_EVENT_TYPES:
+        if self._pipeline is not None and event.event_type in self._warmup_event_types:
             self._warmup_pipeline(event, state)
 
     def _warmup_pipeline(self, event: "SystemEvent", state: "ContextState") -> None:
