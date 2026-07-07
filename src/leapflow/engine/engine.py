@@ -1974,11 +1974,11 @@ class AgentEngine:
             import uuid as _uuid
             if self._current_session_id is None:
                 self._current_session_id = _uuid.uuid4().hex[:16]
-            title = user_text[:80].replace("\n", " ").strip()
-            self._conversation_store.create_session(
-                self._current_session_id, title=title,
-                model=self._settings.llm_model, source="cli",
-            )
+                title = user_text[:80].replace("\n", " ").strip()
+                self._conversation_store.create_session(
+                    self._current_session_id, title=title,
+                    model=self._settings.llm_model, source="cli",
+                )
             self._persist_message(self._current_session_id, "user", user_text)
             return self._current_session_id
         except Exception:
@@ -2048,16 +2048,22 @@ class AgentEngine:
 
     @staticmethod
     def _count_consecutive_tool_failures(messages: List[Dict[str, Any]]) -> int:
-        """Count consecutive tool failures from the tail of messages.
+        """Count consecutive tool failures within the current user turn.
 
-        Scans backwards through the most recent tool result messages.
-        A success anywhere resets the counter to 0.
+        Scans backwards from the tail, skipping interleaved assistant messages
+        (which separate tool results across loop iterations). A tool success
+        resets the counter to 0. Scanning stops at the current turn's ``user``
+        message so stale failures from previous turns are never counted.
         """
         count = 0
         for msg in reversed(messages):
             role = msg.get("role", "")
-            if role != "tool":
+            if role == "user":
+                # Reached the current turn boundary — stop scanning.
                 break
+            if role != "tool":
+                # Skip assistant messages interleaved between tool results.
+                continue
             content = msg.get("content", "")
             if not isinstance(content, str):
                 continue

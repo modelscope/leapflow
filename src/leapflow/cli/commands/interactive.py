@@ -7,6 +7,7 @@ bottom while Rich-formatted output scrolls above.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from typing import TYPE_CHECKING, Optional
@@ -442,7 +443,9 @@ async def _handle_teach(
                     console.system(
                         f"Uncertain (score: {report.score:.2f}) — {report.reason}"
                     )
-                    answer = input("  Learn this? [y/N]: ").strip().lower()
+                    answer = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: input("  Learn this? [y/N]: ").strip().lower()
+                    )
                     if answer not in ("y", "yes"):
                         ctx.session.reject_learning()
                         console.system("Skipped.")

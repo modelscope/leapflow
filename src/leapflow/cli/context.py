@@ -79,7 +79,9 @@ class _InteractiveApprovalGate:
                 sys.stderr.write(f"WARNING: Dangerous command: {command}\n")
             sys.stderr.write("Approve? [y/N]: ")
             sys.stderr.flush()
-            answer = input().strip().lower()
+            answer = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: input().strip().lower()
+            )
             return answer in ("y", "yes")
         except (EOFError, KeyboardInterrupt):
             return False
@@ -1299,7 +1301,9 @@ class Context:
                     sys.stderr.write("Approve? [Y/n]: ")
                     sys.stderr.flush()
                     try:
-                        answer = input().strip().lower()
+                        answer = await asyncio.get_running_loop().run_in_executor(
+                            None, lambda: input().strip().lower()
+                        )
                         return answer in ("", "y", "yes")
                     except (EOFError, KeyboardInterrupt):
                         return False
