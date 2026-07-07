@@ -295,6 +295,10 @@ class AgentEngine:
         # Model capability registry (injected by CLI)
         self._model_capabilities: Optional[Any] = None
 
+        # Session-level counters (survive per-turn tracker resets)
+        self._session_turn_count: int = 0
+        self._last_context_tokens: int = 0
+
         # State-machine loop infrastructure (config-driven)
         self._budget_config = BudgetConfig(
             max_iterations=settings.react_max_iterations,
@@ -538,8 +542,29 @@ class AgentEngine:
     def is_cancelled(self) -> bool:
         return self._cancel_requested
 
+    @property
+    def model_capabilities(self) -> Optional[Any]:
+        """Model capability registry (``ModelCapabilityRegistry``)."""
+        return self._model_capabilities
+
+    @property
+    def usage_tracker(self) -> "TurnUsageTracker":
+        """Current-turn usage accumulator."""
+        return self._usage_tracker
+
+    @property
+    def turn_count(self) -> int:
+        """Number of completed user turns in this session."""
+        return self._session_turn_count
+
+    @property
+    def context_token_count(self) -> int:
+        """Prompt tokens from the most recent API call (context utilization)."""
+        return self._last_context_tokens
+
     async def run(self, user_text: str, *, enable_thinking: bool = False) -> str:
         """Entrypoint: simplified routing with unified tool loop as default path."""
+        self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
         self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
 
@@ -580,6 +605,7 @@ class AgentEngine:
             StreamEvent(type="final"): complete assembled response.
             StreamEvent(type="tool_call"): internal tool invocation (suppress display).
         """
+        self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
         self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
 
@@ -1092,13 +1118,15 @@ class AgentEngine:
                     **tools_kwarg,
                 )
                 recovery.record_api_success()
+                usage = resp.usage or {}
                 self._usage_tracker.record_api_call(
-                    resp.usage or {},
+                    usage,
                     provider=getattr(self._llm, 'active_provider_name', ''),
                     model=resp.model or '',
                 )
-                if self._model_capabilities and resp.model and resp.usage:
-                    self._model_capabilities.update_from_usage(resp.model, resp.usage)
+                self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
+                if self._model_capabilities and resp.model and usage:
+                    self._model_capabilities.update_from_usage(resp.model, usage)
             except Exception as exc:
                 _clear_indicator()
                 classified = self._error_classifier.classify(exc)
@@ -1444,11 +1472,13 @@ class AgentEngine:
                         **tools_kwarg,
                     )
                     turn_recovery.record_api_success()
+                    usage = resp.usage or {}
                     self._usage_tracker.record_api_call(
-                        resp.usage or {},
+                        usage,
                         provider=getattr(self._llm, 'active_provider_name', ''),
                         model=resp.model or '',
                     )
+                    self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
                 except Exception as exc:
                     _clear_indicator()
                     classified = self._error_classifier.classify(exc)
@@ -1573,11 +1603,13 @@ class AgentEngine:
                             compressed, stream=False, enable_thinking=enable_thinking,
                         )
                         turn_recovery.record_api_success()
+                        usage = resp.usage or {}
                         self._usage_tracker.record_api_call(
-                            resp.usage or {},
+                            usage,
                             provider=getattr(self._llm, 'active_provider_name', ''),
                             model=resp.model or '',
                         )
+                        self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
                     except Exception as exc:
                         _clear_indicator()
                         classified = self._error_classifier.classify(exc)

@@ -95,19 +95,20 @@ async def cmd_interactive(ctx: "Context") -> int:
 
     def _update_status() -> None:
         ctx_used = 0
-        ctx_max = 0
+        ctx_max = ctx.settings.llm_context_length
         engine = ctx.engine
         if engine is not None:
             ctx_used = getattr(engine, "context_token_count", 0)
-            cap = getattr(engine, "model_capabilities", None)
-            if cap is not None:
-                ctx_max = getattr(cap, "context_length", 0)
+            cap_registry = getattr(engine, "model_capabilities", None)
+            if cap_registry is not None:
+                caps = cap_registry.resolve(ctx.settings.llm_model)
+                ctx_max = caps.context_length
         mode = _mode_name()
         status.update(
             mode=mode,
             skill_count=_skill_count(),
             platform_online=_platform_online(),
-            model_name=getattr(ctx.settings, "model", ""),
+            model_name=ctx.settings.llm_model,
             session_turns=getattr(engine, "turn_count", 0) if engine else 0,
             context_used=ctx_used,
             context_max=ctx_max,
@@ -122,12 +123,16 @@ async def cmd_interactive(ctx: "Context") -> int:
         if hasattr(ctx, "platform_tools")
         else 0
     )
-    cap = getattr(ctx.engine, "model_capabilities", None) if ctx.engine else None
-    ctx_len = getattr(cap, "context_length", 0) if cap else 0
+    cap_registry = getattr(ctx.engine, "model_capabilities", None) if ctx.engine else None
+    ctx_len = (
+        cap_registry.resolve(ctx.settings.llm_model).context_length
+        if cap_registry is not None
+        else ctx.settings.llm_context_length
+    )
 
     def _render_banner() -> None:
         display_rich_banner(
-            model=getattr(ctx.settings, "model", ""),
+            model=ctx.settings.llm_model,
             cwd=os.getcwd(),
             session_id=getattr(ctx.session, "session_id", ""),
             platform_online=_platform_online(),

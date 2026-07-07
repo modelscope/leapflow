@@ -201,7 +201,7 @@ class LeapApp:
         area = TextArea(
             height=Dimension(min=1, max=8, preferred=1),
             prompt=get_prompt,
-            style="class:input-area",
+            style=f"{self._theme.input_text} bold",
             multiline=True,
             wrap_lines=True,
             read_only=Condition(lambda: ref._agent_running),
@@ -280,7 +280,7 @@ class LeapApp:
     def _build_style(self) -> PTStyle:
         t = self._theme
         return PTStyle.from_dict({
-            "input-area": t.input_text,
+            "input-area": f"{t.input_text} bold",
             "prompt": t.prompt_char,
             "prompt.working": t.accent_dim,
             "prompt.recording": t.recording,

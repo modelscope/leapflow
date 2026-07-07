@@ -7,8 +7,7 @@ All display logic uses ``LeapConsole`` for consistent theming.
 from __future__ import annotations
 
 import os
-import time
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from leapflow.cli.context import Context
@@ -22,14 +21,16 @@ def handle_status(ctx: "Context", console: "LeapConsole", args: str) -> None:
 
     info = Text()
 
-    model = getattr(ctx.settings, "model", "unknown")
     info.append("Model:     ", style="dim")
-    info.append(f"{model}\n", style="bold")
+    info.append(f"{ctx.settings.llm_model}\n", style="bold")
 
     engine = ctx.engine
     if engine is not None:
-        cap = getattr(engine, "model_capabilities", None)
-        ctx_len = getattr(cap, "context_length", 0) if cap else 0
+        cap_registry = getattr(engine, "model_capabilities", None)
+        ctx_len = 0
+        if cap_registry is not None:
+            caps = cap_registry.resolve(ctx.settings.llm_model)
+            ctx_len = caps.context_length
         ctx_used = getattr(engine, "context_token_count", 0)
         turn_count = getattr(engine, "turn_count", 0)
 
@@ -115,27 +116,28 @@ def handle_usage(ctx: "Context", console: "LeapConsole", args: str) -> None:
         console.warning("No active engine — send a message first.")
         return
 
-    tracker = getattr(engine, "_turn_usage", None)
+    tracker = getattr(engine, "usage_tracker", None)
     if tracker is None:
         console.warning("Usage tracking not available.")
         return
 
     console.print()
 
-    total = getattr(tracker, "total_tokens", 0)
-    input_t = getattr(tracker, "total_input_tokens", 0)
-    output_t = getattr(tracker, "total_output_tokens", 0)
+    summary = tracker.summary()
     turn_count = getattr(engine, "turn_count", 0)
 
-    cap = getattr(engine, "model_capabilities", None)
-    ctx_len = getattr(cap, "context_length", 0) if cap else 0
+    cap_registry = getattr(engine, "model_capabilities", None)
+    ctx_len = 0
+    if cap_registry is not None:
+        caps = cap_registry.resolve(ctx.settings.llm_model)
+        ctx_len = caps.context_length
     ctx_used = getattr(engine, "context_token_count", 0)
 
     lines = [
-        f"  Model:           {getattr(ctx.settings, 'model', 'unknown')}",
-        f"  Input tokens:    {_compact_tokens(input_t):>8}  ({input_t:,})",
-        f"  Output tokens:   {_compact_tokens(output_t):>8}  ({output_t:,})",
-        f"  Total tokens:    {_compact_tokens(total):>8}  ({total:,})",
+        f"  Model:           {ctx.settings.llm_model}",
+        f"  Input tokens:    {_compact_tokens(summary.prompt_tokens):>8}  ({summary.prompt_tokens:,})",
+        f"  Output tokens:   {_compact_tokens(summary.completion_tokens):>8}  ({summary.completion_tokens:,})",
+        f"  Total tokens:    {_compact_tokens(summary.total_tokens):>8}  ({summary.total_tokens:,})",
         f"  Turns:           {turn_count}",
     ]
 
@@ -154,25 +156,20 @@ def handle_model(ctx: "Context", console: "LeapConsole", args: str) -> None:
     """Show or switch the active model."""
     model_arg = args.strip()
     if not model_arg:
-        model = getattr(ctx.settings, "model", "unknown")
-        console.system(f"Current model: {model}")
-        cap = None
+        console.system(f"Current model: {ctx.settings.llm_model}")
         engine = ctx.engine
         if engine is not None:
-            cap = getattr(engine, "model_capabilities", None)
-        if cap:
-            ctx_len = getattr(cap, "context_length", 0)
-            if ctx_len:
-                console.system(f"Context length: {ctx_len:,}")
+            cap_registry = getattr(engine, "model_capabilities", None)
+            if cap_registry is not None:
+                caps = cap_registry.resolve(ctx.settings.llm_model)
+                console.system(f"Context length: {caps.context_length:,}")
         return
 
-    if hasattr(ctx.settings, "model"):
-        old = ctx.settings.model
-        ctx.settings.model = model_arg
-        console.success(f"Model switched: {old} → {model_arg}")
-        console.system("Note: takes effect on next turn.")
-    else:
-        console.warning("Model switching not supported in current config.")
+    console.warning(
+        "Model switching requires restarting with LEAPFLOW_LLM_MODEL env var."
+    )
+    console.system(f"  Current: {ctx.settings.llm_model}")
+    console.system(f"  Example: LEAPFLOW_LLM_MODEL={model_arg} leap")
 
 
 def handle_clear(ctx: "Context", console: "LeapConsole", args: str) -> None:
