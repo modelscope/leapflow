@@ -501,6 +501,14 @@ class SkillLibraryStore:
         ).fetchone()
         return check is not None
 
+    def update_skill_confidence(self, name: str, confidence: float) -> None:
+        """Update confidence for a parameterized skill by name."""
+        self._con.execute(
+            "UPDATE leap_parameterized_skills "
+            "SET confidence = ?, updated_at = ? WHERE name = ?",
+            [confidence, time.time(), name],
+        )
+
     def update_parameterized_version(
         self, name: str, new_code: str
     ) -> int:

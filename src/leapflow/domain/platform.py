@@ -16,6 +16,33 @@ class PlatformID(Enum):
     LINUX_KDE = "linux_kde"
     UNKNOWN = "unknown"
 
+    @staticmethod
+    def resolve() -> "PlatformID":
+        """Detect the current platform variant from the running OS.
+
+        Darwin: uses ``platform.mac_ver()`` major version.
+        Linux: checks ``XDG_CURRENT_DESKTOP`` for GNOME/KDE.
+        Others: returns UNKNOWN.
+        """
+        import os as _os
+        import platform as _platform
+        import sys as _sys
+
+        if _sys.platform == "darwin":
+            try:
+                major = int(_platform.mac_ver()[0].split(".")[0])
+            except (ValueError, IndexError):
+                major = 15
+            return PlatformID.DARWIN_26 if major >= 26 else PlatformID.DARWIN_15
+
+        if _sys.platform.startswith("linux"):
+            desktop = _os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+            if "kde" in desktop:
+                return PlatformID.LINUX_KDE
+            return PlatformID.LINUX_GNOME
+
+        return PlatformID.UNKNOWN
+
 
 class Capability(Enum):
     """Atomic capability that a host may or may not support."""

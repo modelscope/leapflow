@@ -87,17 +87,19 @@ class EvolutionMemoryProvider:
         generalization_threshold: int = 3,
         novelty_threshold: float = 0.3,
         decay_lambda: float = _DEFAULT_DECAY_LAMBDA,
+        on_pattern_discovered: Optional[Any] = None,
+        persistent_store: Optional[Any] = None,
     ) -> None:
         self._max_episodes = max_episodes
         self._generalization_threshold = generalization_threshold
         self._novelty_threshold = novelty_threshold
         self._decay_lambda = decay_lambda
+        self._on_pattern_discovered = on_pattern_discovered
+        self._persistent_store = persistent_store
 
         self._entries: Dict[str, MemoryEntry] = {}
         self._episodes: Dict[str, SkillEpisode] = {}
-        # Skill-name index for fast lookup
         self._skill_index: Dict[str, List[str]] = {}
-        # Stats tracking
         self._stats = {"episodes": 0, "patterns": 0, "generalization_attempts": 0}
 
     # ── Protocol properties ───────────────────────────────────────────
@@ -257,15 +259,23 @@ class EvolutionMemoryProvider:
         reward: float,
         *,
         context: Optional[Dict[str, Any]] = None,
+        episode_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
     ) -> SkillEpisode:
         """Record a complete skill execution episode.
 
         Creates both a MemoryEntry (for protocol-based access) and a
         SkillEpisode (for structured experience queries).
         After recording, runs novelty check and generalization check.
+
+        Optional ``episode_id`` and ``timestamp`` support idempotent hydration
+        from persistent storage without generating duplicate entries.
         """
-        entry_id = uuid.uuid4().hex[:12]
-        now = time.time()
+        if episode_id and episode_id in self._episodes:
+            return self._episodes[episode_id]
+
+        entry_id = episode_id or uuid.uuid4().hex[:12]
+        now = timestamp if timestamp is not None else time.time()
 
         episode = SkillEpisode(
             episode_id=entry_id,
@@ -466,12 +476,39 @@ class EvolutionMemoryProvider:
             if eid in self._episodes and self._episodes[eid].reward > 0
         )
         if successful_count >= self._generalization_threshold:
-            # Check if we already have a pattern for this skill
             for entry in self._entries.values():
                 if (entry.kind == MemoryKind.SKILL_PATTERN and
                         entry.metadata.get("skill_name") == skill_name):
-                    return  # Already generalized
-            self.generalize(skill_name)
+                    return
+            pattern = self.generalize(skill_name)
+            if pattern is not None:
+                self._persist_pattern(pattern)
+                self._notify_pattern_discovered(pattern)
+
+    def _persist_pattern(self, pattern: MemoryEntry) -> None:
+        """Write pattern to DuckDB store if available."""
+        if self._persistent_store is None:
+            return
+        try:
+            content = json.loads(pattern.content) if isinstance(pattern.content, str) else {}
+            self._persistent_store.save_pattern(
+                pattern_id=pattern.entry_id,
+                skill_name=pattern.metadata.get("skill_name", ""),
+                pattern=content,
+                confidence=content.get("confidence", 0.0),
+                episode_count=content.get("sample_count", 0),
+            )
+        except Exception:
+            logger.debug("evolution.persist_pattern failed", exc_info=True)
+
+    def _notify_pattern_discovered(self, pattern: MemoryEntry) -> None:
+        """Invoke the pattern-discovered callback if registered."""
+        if self._on_pattern_discovered is None:
+            return
+        try:
+            self._on_pattern_discovered(pattern)
+        except Exception:
+            logger.debug("evolution.on_pattern_discovered callback failed", exc_info=True)
 
     def _evict_overflow(self) -> None:
         """Remove oldest entries when capacity exceeded."""

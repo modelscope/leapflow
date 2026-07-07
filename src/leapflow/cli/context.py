@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import sys
-from enum import Enum
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from leapflow.platform.client import BridgeClient
 from leapflow.platform.cua_client import CuaDriverClient
 from leapflow.platform.event_bus import EventBus
 from leapflow.platform.mock import MockBridge
@@ -29,11 +29,19 @@ from leapflow.analysis.pipeline import ImitationPipeline
 from leapflow.storage.session_store import LearningSessionStore
 from leapflow.storage.trajectory_store import TrajectoryStore
 from leapflow.llm.openai_provider import OpenAIChat
+from leapflow.llm.provider_chain import (
+    AuxiliaryClient,
+    FailoverChain,
+    ProviderConfig,
+    parse_credential_pools,
+    parse_provider_configs,
+)
 from leapflow.memory import (
     MemoryManager, WorkingMemoryProvider, EpisodicMemoryProvider,
     SemanticMemoryProvider, EvolutionMemoryProvider, MemoryFragment,
 )
 from leapflow.skills.activator import SkillActivator
+from leapflow.skills.evolution import EMAConfidencePolicy
 from leapflow.skills.index import SkillIndex
 from leapflow.skills.injector import SkillInjector
 from leapflow.skills.discovery import configure as configure_skill_discovery
@@ -58,28 +66,57 @@ from leapflow.platform.normalizer import EventNormalizer
 logger = logging.getLogger(__name__)
 
 
-# ─── Host Readiness ────────────────────────────────────────────────────────
+class _InteractiveApprovalGate:
+    """CLI-mode interactive approval for dangerous shell commands."""
+
+    async def check(self, command: str) -> bool:
+        if not sys.stdin.isatty():
+            return False
+        try:
+            if sys.stderr.isatty():
+                sys.stderr.write(f"\033[33m⚠ Dangerous command: {command}\033[0m\n")
+            else:
+                sys.stderr.write(f"WARNING: Dangerous command: {command}\n")
+            sys.stderr.write("Approve? [y/N]: ")
+            sys.stderr.flush()
+            answer = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: input().strip().lower()
+            )
+            return answer in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            return False
 
 
-class HostReadiness(str, Enum):
-    """Result of OS Host pre-flight check during initialization."""
-
-    RUNNING = "running"       # Host confirmed running, proceed normally
-    STARTED = "started"       # Host just started by this process
-    DEGRADED = "degraded"     # Host unavailable, running in offline mode
+def _default_recording_profile(settings: Settings) -> Optional["RecordingProfile"]:
+    """Build a RecordingProfile if the recording mode supports video."""
+    if not settings.recording_mode.uses_video:
+        return None
+    from leapflow.platform.observers import RecordingProfile
+    return RecordingProfile()
 
 
 def _emit_status(msg: str) -> None:
     """Write a dim status line to stderr (non-blocking, safe pre-logging)."""
-    sys.stderr.write(f"\033[2m\u2192 {msg}\033[0m\n")
+    if sys.stderr.isatty():
+        sys.stderr.write(f"\033[2m\u2192 {msg}\033[0m\n")
+    else:
+        sys.stderr.write(f"→ {msg}\n")
     sys.stderr.flush()
 
 
 def configure_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    log_level = getattr(logging, level.upper(), logging.INFO)
+
+    # Install RedactingFormatter to prevent secret leakage in logs
+    try:
+        from leapflow.security.redact import RedactingFormatter
+        formatter = RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    except ImportError:
+        formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    logging.basicConfig(level=log_level, handlers=[handler])
 
 
 def _build_visual_components(
@@ -117,15 +154,14 @@ def _build_visual_components(
 def _build_video_components(settings: Settings, rpc: Any, vlm: Any):
     """Build video-mode components when RecordingMode.VIDEO is active.
 
-    Returns (VideoRecorder, VideoAnalyzer, VideoSegmenter, SignalTimeline).
+    Returns (TrajectoryRecorder, VideoAnalyzer, VideoSegmenter, SignalTimeline).
     """
     from leapflow.perception.video.analyzer import VideoAnalyzer
     from leapflow.perception.video.cache_manager import VideoCacheManager
-    from leapflow.perception.video.recorder import VideoRecorder
+    from leapflow.perception.video.recorder import TrajectoryRecorder
     from leapflow.perception.video.segmenter import VideoSegmenter
     from leapflow.perception.video.timeline import SignalTimeline
 
-    # Clean up stale video cache before allocating new recording resources
     cache_manager = VideoCacheManager(
         settings.video_cache_dir,
         max_age_days=settings.video_cache_max_age_days,
@@ -133,7 +169,7 @@ def _build_video_components(settings: Settings, rpc: Any, vlm: Any):
     )
     cache_manager.cleanup()
 
-    recorder = VideoRecorder(
+    recorder = TrajectoryRecorder(
         rpc,
         settings.video_cache_dir,
         fps=settings.video_fps,
@@ -148,7 +184,7 @@ def _build_video_components(settings: Settings, rpc: Any, vlm: Any):
         max_l2_requests=settings.video_max_l2_requests,
         max_l3_requests=settings.video_max_l3_requests,
         l2_time_window_s=settings.video_l2_time_window_s,
-        frame_extractor=recorder,  # VideoRecorder implements FrameExtractor Protocol
+        frame_extractor=recorder,
         url_scheme=settings.video_vlm_url_scheme,
         vlm_max_retries=settings.video_vlm_max_retries,
         vlm_retry_backoff_s=settings.video_vlm_retry_backoff_s,
@@ -293,34 +329,87 @@ class Context:
         self.imm = episodic
         self._evolution = evolution
 
-        self.event_bus = EventBus(immediate=self.imm, working=self.wm)
-        self.rpc: BridgeClient | CuaDriverClient | MockBridge
+        from leapflow.privacy.policy import PrivacyManager, PrivacyPolicy, DataRetentionConfig
+
+        _exclude_paths_raw = os.environ.get("LEAPFLOW_PRIVACY_EXCLUDE_PATHS", "")
+        _exclude_paths = frozenset(
+            p.strip() for p in _exclude_paths_raw.split(",") if p.strip()
+        ) if _exclude_paths_raw else frozenset()
+
+        privacy_policy = PrivacyPolicy(
+            exclude_apps=frozenset(settings.privacy_sensitive_apps),
+            exclude_paths=_exclude_paths,
+            retention=DataRetentionConfig(
+                episodic_ttl_s=settings.memory_episodic_ttl_s,
+            ),
+        )
+        self.privacy_manager = PrivacyManager(privacy_policy)
+
+        self.event_bus = EventBus(
+            immediate=self.imm,
+            working=self.wm,
+            privacy_filter=self.privacy_manager,
+        )
+        self.rpc: CuaDriverClient | MockBridge
         if self.effective_mock:
             self.rpc = MockBridge()
             self.rpc.on_event(self.event_bus.handle_event)
-        elif settings.use_cua_driver:
+        else:
             from leapflow.platform.cua_client import cua_driver_available
             if not cua_driver_available():
                 _emit_status(
-                    "WARNING: use_cua_driver=True but cua-driver not found on PATH"
+                    "WARNING: cua-driver not found on PATH"
                 )
                 _emit_status(
                     "  Install with: leap host install  |  Diagnose with: leap host doctor"
                 )
             self.rpc = CuaDriverClient()
-        else:
-            self.rpc = BridgeClient(
-                settings.bridge_socket,
-                default_timeout=settings.rpc_timeout_default,
-            )
-            self.rpc.on_event(self.event_bus.handle_event)
 
-        self.llm = OpenAIChat(
-            api_key=settings.llm_api_key or "missing",
-            base_url=settings.llm_base_url,
-            model=settings.llm_model,
-            max_retries=settings.llm_max_retries,
+        # ── Multi-provider LLM chain (failover + credential rotation) ──
+        provider_configs = parse_provider_configs(
+            settings.llm_api_key or "missing",
+            settings.llm_base_url,
+            settings.llm_model,
+            fallback_json=settings.llm_fallback_providers,
+            primary_context_length=settings.llm_context_length,
         )
+        credential_pools = parse_credential_pools(
+            provider_configs,
+            cooldown_s=settings.llm_credential_cooldown_s,
+        )
+        if len(provider_configs) > 1 or credential_pools:
+            self.llm_chain = FailoverChain(
+                provider_configs, credential_pools=credential_pools,
+                circuit_failure_threshold=settings.circuit_breaker_threshold,
+                circuit_cooldown_s=settings.circuit_breaker_cooldown_s,
+            )
+            self.llm = self.llm_chain
+            logger.info(
+                "LLM chain: %d providers, %d credential pools",
+                len(provider_configs), len(credential_pools),
+            )
+        else:
+            self.llm_chain = None
+            self.llm = OpenAIChat(
+                api_key=settings.llm_api_key or "missing",
+                base_url=settings.llm_base_url,
+                model=settings.llm_model,
+                max_retries=settings.llm_max_retries,
+            )
+
+        # ── Auxiliary LLM for cheap operations ──
+        self.auxiliary: Optional[AuxiliaryClient] = None
+        if settings.llm_aux_model:
+            aux_llm = OpenAIChat(
+                api_key=settings.llm_aux_api_key or settings.llm_api_key or "missing",
+                base_url=settings.llm_aux_base_url or settings.llm_base_url,
+                model=settings.llm_aux_model,
+                max_retries=2,
+            )
+            self.auxiliary = AuxiliaryClient(aux_llm)
+            logger.info("Auxiliary LLM configured: %s", settings.llm_aux_model)
+        elif settings.has_llm_credentials:
+            self.auxiliary = AuxiliaryClient(self.llm)
 
         self.vlm: Optional[OpenAIChat] = None
         if settings.vlm_model and settings.vlm_model != settings.llm_model:
@@ -344,7 +433,6 @@ class Context:
         self.session_store: Optional[LearningSessionStore] = None
         self.engine: Optional[AgentEngine] = None
         self.intent_classifier: Optional[IntentClassifier] = None
-        self._bg_connect_task: Optional[asyncio.Task] = None
 
         # World Model components (wired during initialize)
         self.learning_budget: Optional[Any] = None
@@ -356,103 +444,30 @@ class Context:
         self.trajectory_grader: Optional[Any] = None
         self.active_observer: Optional[Any] = None
 
-    async def _bg_connect(self) -> None:
-        """Background bridge reconnection with post-connect initialization.
-    
-        After connecting, sends fs.subscribe and fires reconnect callbacks
-        so the system transitions from offline/mock state to live.
-    
-        Uses longer retry window (up to ~90s) with increasing delays to
-        handle slow host startup and transient unavailability.
-        """
-        _BG_MAX_ATTEMPTS = 12
-        _BG_DELAYS = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 8.0, 10.0, 10.0, 15.0, 15.0]
-        for attempt in range(_BG_MAX_ATTEMPTS):
-            delay = _BG_DELAYS[attempt] if attempt < len(_BG_DELAYS) else 15.0
-            await asyncio.sleep(delay)
-            ok = await self.rpc.try_connect()
-            if ok:
-                _emit_status("Bridge connected")
-                await self._post_connect_setup()
-                return
-        _emit_status("Bridge unavailable, running offline")
+        # Daemon / Observer
+        self._observation_daemon: Optional[Any] = None
+        self._pipeline_observer: Optional[Any] = None
 
-    async def _resubscribe_fs(self) -> None:
-        """Re-subscribe to FS events after reconnect."""
-        home = str(Path.home())
-        cwd = str(Path.cwd())
-        for watch_path in dict.fromkeys([home, cwd]):
-            try:
-                await self.rpc.call("fs.subscribe", {"path": watch_path})
-                logger.info("Re-subscribed to FS events: %s", watch_path)
-            except Exception as exc:
-                logger.warning("fs.subscribe failed for %s: %s", watch_path, exc)
-
-    async def _post_connect_setup(self) -> None:
-        """Post-connect initialization: register fs callback + fire all reconnect callbacks.
-
-        Registering _resubscribe_fs before firing ensures it runs as part of
-        fire_reconnect_callbacks, avoiding a duplicate call.
-        """
-        if isinstance(self.rpc, BridgeClient):
-            self.rpc.on_reconnect(self._resubscribe_fs)
-            await self.rpc.fire_reconnect_callbacks()
-
-    # ── Host Readiness (legacy — OS Host removed, cua-driver pending) ────────
-
-    async def _ensure_host_ready(self) -> HostReadiness:
-        """OS Host has been removed; always returns DEGRADED (offline mode).
-
-        The legacy OS Host module is deprecated in favor of cua-driver.
-        Until cua-driver integration is complete, the system runs in offline mode.
-        """
-        _emit_status("OS Host: removed (cua-driver migration pending)")
-        return HostReadiness.DEGRADED
+        # Skill evolution & PatternMiner
+        self._evolution_policy: Optional[EMAConfidencePolicy] = None
+        self._pattern_miner: Optional[Any] = None
 
     async def initialize(self) -> None:
         """Async initialization: VSI handshake, pipeline assembly.
 
         Phases:
             1. Memory providers initialization
-            2. OS Host readiness check (diagnose → auto-start → feedback)
-            3. Bridge connection (non-blocking, background fallback)
-            4. Platform adapter registration
+            2. CuaDriver connection / mock setup
+            3. Platform adapter registration
         """
         settings = self.settings
 
-        # Initialize all memory providers (opens DB, starts GC, etc.)
         await self.memory.initialize_all()
 
-        # Phase 1: Host readiness (OS Host removed; mock or offline)
-        host_readiness: HostReadiness
-        if self.effective_mock:
-            # Mock mode: no host needed, bridge is in-process.
-            host_readiness = HostReadiness.RUNNING
-        else:
-            # OS Host removed — run in offline/degraded mode until cua-driver ready
-            host_readiness = await self._ensure_host_ready()
-
-        # Phase 2: Bridge connection
         vsi = VirtualSystemInterface(self.rpc)
         bridge_online = False
 
-        if isinstance(self.rpc, BridgeClient):
-            # Skip connection attempt when host is known-degraded
-            if host_readiness == HostReadiness.DEGRADED:
-                _emit_status("Running in offline mode")
-                manifest = PlatformManifest.default_darwin()
-                vsi._manifest = manifest
-                self._bg_connect_task = asyncio.create_task(self._bg_connect())
-            else:
-                bridge_online = await self.rpc.try_connect()
-                if bridge_online:
-                    manifest = await vsi.handshake()
-                else:
-                    _emit_status("Bridge not available, connecting in background...")
-                    manifest = PlatformManifest.default_darwin()
-                    vsi._manifest = manifest
-                    self._bg_connect_task = asyncio.create_task(self._bg_connect())
-        elif isinstance(self.rpc, CuaDriverClient):
+        if isinstance(self.rpc, CuaDriverClient):
             try:
                 self.rpc.start()
                 manifest = await vsi.handshake()
@@ -494,8 +509,6 @@ class Context:
                         await self.event_bus.handle_event("event.fs_change", dict(evt))
                 except Exception as exc:
                     logger.warning("Failed to subscribe FS events for %s: %s", watch_path, exc)
-            if isinstance(self.rpc, BridgeClient):
-                self.rpc.on_reconnect(self._resubscribe_fs)
         else:
             from leapflow.platform.adapters.mock import MockExecutionAdapter, MockPerceptionAdapter
             perception = MockPerceptionAdapter()
@@ -590,6 +603,8 @@ class Context:
             video_analyzer=video_analyzer,
             video_segmenter=video_segmenter,
             signal_timeline=signal_timeline,
+            observation_daemon=self._observation_daemon,
+            recording_profile=_default_recording_profile(settings),
         )
         self.event_bus.subscribe(self.imitation.recorder.on_event)
 
@@ -775,13 +790,50 @@ class Context:
             )
             _tuner = self.attention_tuner
 
+            _ctx = self
+
             def _on_prediction_outcome(outcome: Any) -> None:
-                score = self.curiosity.compute(outcome)
+                score = _ctx.curiosity.compute(outcome)
                 exp_id = getattr(outcome, "experience_id", "")
                 if exp_id and _es is not None:
                     _es.update_curiosity_score(exp_id, score.total)
                 _tuner.on_curiosity_signal(score, outcome)
                 observer.on_curiosity_signal(score, outcome)
+
+                # Delta-driven skill evolution: high delta means prediction
+                # was inaccurate (failure); low delta means accurate (success)
+                delta = getattr(outcome, "delta", 0.0)
+                evo_policy = _ctx._evolution_policy
+                skill_lib = _ctx.skill_lib
+                if evo_policy is not None and skill_lib is not None:
+                    action_desc = ""
+                    pred = getattr(outcome, "prediction", None)
+                    if pred is not None:
+                        action_desc = getattr(pred, "action_description", "")
+                    # Strip "skill:" / "bridge:" prefix for title lookup
+                    skill_title = action_desc.split(":", 1)[-1] if ":" in action_desc else action_desc
+                    if skill_title and (delta > 0.4 or delta < 0.15):
+                        try:
+                            stored = skill_lib.load_skill_by_title(skill_title)
+                            if stored:
+                                evo_outcome = evo_policy.on_execution_result(
+                                    stored.title,
+                                    success=(delta < 0.2),
+                                    duration_s=0.0,
+                                    current_confidence=stored.confidence,
+                                    current_version=stored.version,
+                                )
+                                skill_lib.update_skill_confidence(
+                                    stored.title, evo_outcome.new_confidence
+                                )
+                                if evo_outcome.tier_changed:
+                                    logger.info(
+                                        "Delta-driven evolution: '%s' confidence \u2192 %.3f",
+                                        stored.title, evo_outcome.new_confidence,
+                                    )
+                        except Exception:
+                            logger.debug("delta-driven evolution update failed", exc_info=True)
+
             self.prediction_loop._on_outcome = _on_prediction_outcome
 
         n_doc_skills = 0
@@ -852,6 +904,7 @@ class Context:
                 config=learnability_config,
             )
 
+        self._evolution_policy = EMAConfidencePolicy()
         self.session = SessionController(
             self.imitation,
             self.registry,
@@ -864,6 +917,8 @@ class Context:
             active_learning_observer=observer,
             session_store=self.session_store,
             learnability_assessor=learnability_assessor,
+            evolution_policy=self._evolution_policy,
+            skill_store=self.skill_lib,
         )
 
         classifier: IntentClassifier = (
@@ -911,9 +966,13 @@ class Context:
                 from leapflow.copilot.adapters import SemanticHashAdapter
                 l0_store = SemanticHashAdapter(self.lt)
 
+            l1_markov = L1MarkovPredictor()
+            self._l1_markov = l1_markov
+            self._hydrate_l1_markov(l1_markov)
+
             predictors = [
                 L0HashPredictor(l0_store),
-                L1MarkovPredictor(),
+                l1_markov,
             ]
             # L2/L3: wire Memory adapters when ExperienceStore is available
             if hasattr(self, 'experience_store') and self.experience_store is not None:
@@ -960,10 +1019,14 @@ class Context:
             copilot_idle = IdleDetector(copilot_config, on_idle=_copilot_on_idle)
 
             # Event subscriber — register to EventBus
+            warmup_raw = getattr(settings, "copilot_warmup_event_types", "")
+            warmup_types = frozenset(k.strip() for k in warmup_raw.split(",") if k.strip()) if warmup_raw else None
             copilot_subscriber = CopilotEventSubscriber(
                 copilot_encoder,
-                tracker=None,  # CrossAppContextTracker if available
+                tracker=None,
                 working_memory=self.wm if hasattr(self, 'wm') else None,
+                pipeline=copilot_pipeline,
+                warmup_event_types=warmup_types,
             )
             self.event_bus.subscribe(copilot_subscriber.on_system_event)
 
@@ -983,6 +1046,104 @@ class Context:
             self.copilot_feedback = None
             self.copilot_evolution = None
             self.copilot_config = None
+
+        # ── Wire memory tools into TOOL_HANDLERS (late binding) ──
+        from leapflow.tools.registry_bootstrap import set_memory_manager
+        set_memory_manager(self.memory)
+
+        # ── Build CompressorConfig with LLM callbacks ──
+        from leapflow.engine.context_compressor import CompressorConfig
+
+        async def _summarize_via_llm(prompt: str) -> str:
+            from leapflow.llm.message_builder import build_user_message_text
+            resp = await self.llm.achat(
+                [build_user_message_text(prompt)],
+                stream=False, enable_thinking=False,
+            )
+            return (resp.content or "").strip()
+
+        compressor_config = CompressorConfig(
+            threshold=settings.compress_threshold,
+            keep_tail=settings.compress_keep_tail,
+            max_output_chars=settings.max_tool_output_chars,
+            summarize_fn=_summarize_via_llm if settings.has_llm_credentials else None,
+            token_count_fn=lambda text: len(text) // 4,
+        )
+
+        # ── Initialize DuckDBConversationStore (with self-repair) ──
+        self._conversation_store = None
+        try:
+            from leapflow.storage.conversation_store import DuckDBConversationStore
+            from leapflow.storage.db_repair import check_and_repair
+            conv_db_path = settings.duckdb_path.parent / "conversations.duckdb"
+            check_and_repair(conv_db_path)
+            self._conversation_store = DuckDBConversationStore(conv_db_path)
+            logger.info("ConversationStore initialized: %s", conv_db_path)
+        except Exception:
+            logger.warning("ConversationStore initialization failed", exc_info=True)
+
+        # ── Initialize MCP Manager + register tools into agent surface ──
+        self._mcp_manager = None
+        try:
+            mcp_config_path = settings.data_dir / "mcp_servers.json"
+            if mcp_config_path.exists():
+                import json as _json_mcp
+                from leapflow.platform.mcp_manager import McpManager, McpServerConfig
+                from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
+
+                raw_configs = _json_mcp.loads(mcp_config_path.read_text())
+                server_configs = [
+                    McpServerConfig(
+                        name=name,
+                        command=cfg.get("command", ""),
+                        args=cfg.get("args", []),
+                        env=cfg.get("env", {}),
+                        parallel_safe=cfg.get("parallel_safe", False),
+                    )
+                    for name, cfg in raw_configs.items()
+                    if cfg.get("enabled", True) and cfg.get("command")
+                ]
+                if server_configs:
+                    mgr = McpManager()
+                    total_tools = 0
+                    for sc in server_configs:
+                        try:
+                            schemas = mgr.add_server(sc)
+                            total_tools += len(schemas)
+                        except Exception:
+                            logger.warning("MCP server '%s' failed to connect", sc.name)
+
+                    if total_tools > 0:
+                        self._mcp_manager = mgr
+
+                        from leapflow.security.threat_patterns import scan_mcp_description
+
+                        def _build_mcp_handler(manager, tool_name: str):
+                            async def _handler(params: dict) -> dict:
+                                return await manager.call_tool(tool_name, params)
+                            return _handler
+
+                        for schema in mgr.get_tool_schemas():
+                            threats = scan_mcp_description(schema.description)
+                            if threats:
+                                logger.warning("MCP tool '%s' description has threats: %s",
+                                               schema.name, [t.pattern_name for t in threats])
+                            TOOL_DEFINITIONS.append(schema.to_openai_function())
+                            TOOL_HANDLERS[schema.name] = _build_mcp_handler(mgr, schema.name)
+
+                        logger.info("MCP Manager: %d servers, %d tools registered to agent",
+                                    len(server_configs), total_tools)
+        except Exception:
+            logger.debug("MCP Manager initialization skipped", exc_info=True)
+
+        # ── Wire Approval Gate for shell dangerous commands ──
+        try:
+            from leapflow.tools.shell_tools import set_approval_gate
+
+            set_approval_gate(_InteractiveApprovalGate())
+            logger.debug("Shell approval gate: interactive CLI mode")
+        except Exception:
+            logger.debug("Shell approval gate setup skipped", exc_info=True)
 
         self.engine = AgentEngine(
             settings, self.rpc, self.llm, self.wm, self.lt, self.imm,
@@ -1004,90 +1165,511 @@ class Context:
             skill_index=skill_index,
         )
 
-    def _build_insight_callback(self) -> Any:
-        """Build a callback that routes replay insights to the causal heuristic engine."""
+        # ── Wire CompressorConfig with archive_fn into engine ──
+        from leapflow.engine.context_compressor import ContextCompressor
+
+        async def _archive_to_semantic(messages: List[Dict[str, Any]]) -> None:
+            """Archive evicted messages to SemanticMemoryProvider."""
+            for msg in messages:
+                content = msg.get("content", "")
+                role = msg.get("role", "")
+                if content and isinstance(content, str) and len(content) > 20:
+                    self.lt.insert_raw(
+                        f"archived_{role}",
+                        content[:2000],
+                        metadata={"source": "compression_archive", "role": role},
+                    )
+
+        compressor_config.archive_fn = _archive_to_semantic
+        self.engine._compressor = ContextCompressor(compressor_config)
+
+        # ── Enable PrefixCacheOptimizer ──
+        from leapflow.engine.prompt_cache import PrefixCacheOptimizer
+        self.engine.set_cache_strategy(PrefixCacheOptimizer())
+
+        # ── Wire ConversationStore into engine for session persistence ──
+        if self._conversation_store:
+            self.engine.set_conversation_store(self._conversation_store)
+
+        # ── Wire SubagentManager + delegate_task tool ──
+        try:
+            from leapflow.engine.subagent import DefaultSubagentExecutor, SubagentManager
+            from leapflow.tools.registry_bootstrap import (
+                TOOL_DEFINITIONS as _TD, TOOL_HANDLERS as _TH,
+                set_subagent_manager,
+            )
+            sub_executor = DefaultSubagentExecutor(
+                llm=self.llm,
+                tool_handlers=_TH,
+                tool_definitions=_TD,
+                settings=settings,
+            )
+            self._subagent_manager = SubagentManager(executor=sub_executor)
+            set_subagent_manager(self._subagent_manager)
+            logger.info("SubagentManager wired with delegate_task tool")
+        except Exception:
+            self._subagent_manager = None
+            logger.debug("SubagentManager setup skipped", exc_info=True)
+
+        # ── Wire EvolutionStore (DuckDB persistence for skill episodes) ──
+        self._evolution_store = None
+        try:
+            from leapflow.storage.evolution_store import DuckDBEvolutionStore
+            from leapflow.storage.db_repair import check_and_repair
+            evo_db_path = settings.duckdb_path.parent / "evolution.duckdb"
+            check_and_repair(evo_db_path)
+            self._evolution_store = DuckDBEvolutionStore(evo_db_path)
+            # Hydrate in-memory provider from persisted episodes
+            persisted = self._evolution_store.load_recent_episodes(
+                limit=settings.memory_evolution_max_episodes,
+            )
+            for ep in persisted:
+                self._evolution.record_episode(
+                    skill_name=ep["skill_name"],
+                    actions=ep["actions"],
+                    outcome=ep["outcome"],
+                    reward=ep["reward"],
+                    context=ep.get("context"),
+                    episode_id=ep["episode_id"],
+                    timestamp=ep.get("timestamp"),
+                )
+            if persisted:
+                logger.info("Evolution: hydrated %d episodes from DuckDB", len(persisted))
+            self._evolution._persistent_store = self._evolution_store
+        except Exception:
+            logger.debug("EvolutionStore initialization skipped", exc_info=True)
+
+        # ── Wire tool loop guardrails ──
+        try:
+            from leapflow.engine.tool_guardrails import CompositeGuardrail
+            self.engine._guardrail = CompositeGuardrail()
+            logger.debug("Tool loop guardrails enabled")
+        except Exception:
+            logger.debug("Tool guardrails setup skipped", exc_info=True)
+
+        # ── Wire Smart Approval (auxiliary LLM for command risk) ──
+        if self.auxiliary is not None:
+            try:
+                from leapflow.tools.shell_tools import CommandApprovalGate
+                aux = self.auxiliary
+
+                class _SmartApprovalGate:
+                    """LLM-assisted approval for dangerous commands.
+
+                    Low-risk commands (score < 0.3) are auto-approved.
+                    Medium-risk prompts the user. High-risk always prompts.
+                    """
+                    async def check(self, command: str) -> bool:
+                        try:
+                            risk = await aux.classify_risk(command)
+                        except Exception:
+                            risk = 0.5
+                        if risk < 0.3:
+                            logger.debug("smart_approval: auto-approved (risk=%.2f)", risk)
+                            return True
+                        return await _InteractiveApprovalGate().check(command)
+
+                from leapflow.tools.shell_tools import set_approval_gate
+                set_approval_gate(_SmartApprovalGate())
+                logger.debug("Smart approval gate enabled (auxiliary LLM)")
+            except Exception:
+                logger.debug("Smart approval setup skipped", exc_info=True)
+
+        # ── Wire File Write Approval Gate ──
+        try:
+            from leapflow.tools.registry_bootstrap import set_file_write_gate
+
+            class _FileWriteGate:
+                """Interactive approval for file writes to important paths."""
+                _APPROVE_EXTENSIONS = frozenset({
+                    ".tmp", ".log", ".txt", ".md", ".json", ".yaml", ".yml",
+                    ".csv", ".tsv",
+                })
+                async def check(self, path: str, content: str) -> bool:
+                    from pathlib import Path as _P
+                    p = _P(path)
+                    if p.suffix.lower() in self._APPROVE_EXTENSIONS:
+                        return True
+                    if len(content) < 500:
+                        return True
+                    if not sys.stdin.isatty():
+                        return True
+                    if sys.stderr.isatty():
+                        sys.stderr.write(f"\033[33m⚠ File write: {p.name} ({len(content)} chars)\033[0m\n")
+                    else:
+                        sys.stderr.write(f"WARNING: File write: {p.name} ({len(content)} chars)\n")
+                    sys.stderr.write("Approve? [Y/n]: ")
+                    sys.stderr.flush()
+                    try:
+                        answer = await asyncio.get_running_loop().run_in_executor(
+                            None, lambda: input().strip().lower()
+                        )
+                        return answer in ("", "y", "yes")
+                    except (EOFError, KeyboardInterrupt):
+                        return False
+
+            set_file_write_gate(_FileWriteGate())
+            logger.debug("File write approval gate enabled")
+        except Exception:
+            logger.debug("File write gate setup skipped", exc_info=True)
+
+        # ── Token budget dynamic linking (tool result budget ∝ model context) ──
+        context_length = settings.llm_context_length
+        if hasattr(self, 'llm_chain') and self.llm_chain is not None:
+            context_length = self.llm_chain.context_length
+        dynamic_result_budget = min(settings.max_tool_result_chars, context_length // 20)
+        if dynamic_result_budget != settings.max_tool_result_chars:
+            logger.info(
+                "Dynamic tool result budget: %d (context=%d)",
+                dynamic_result_budget, context_length,
+            )
+        if self.engine is not None:
+            self.engine.set_tool_result_budget(dynamic_result_budget)
+
+        # ── Wire new engine capabilities ──
+        if self.engine is not None:
+            self.engine.set_stale_stream_timeout(settings.stale_stream_timeout_s)
+            self.engine.set_default_tool_timeout(settings.default_tool_timeout_s)
+
+            if self._evolution_store is not None:
+                self.engine.set_evolution_store(self._evolution_store)
+
+            try:
+                from leapflow.llm.model_capabilities import ModelCapabilityRegistry
+                cap_registry = ModelCapabilityRegistry()
+                if hasattr(self, 'llm_chain') and self.llm_chain is not None:
+                    from leapflow.llm.model_capabilities import ModelCapabilities
+                    cap_registry.register(
+                        settings.llm_model,
+                        ModelCapabilities(
+                            context_length=self.llm_chain.context_length,
+                            supports_tools=settings.native_tool_calling_enabled,
+                        ),
+                    )
+                self.engine.set_model_capabilities(cap_registry)
+                logger.debug("Model capability registry wired")
+            except Exception:
+                logger.debug("ModelCapabilityRegistry setup skipped", exc_info=True)
+
+            if hasattr(self, "doc_store") and self.doc_store is not None:
+                self.engine.set_doc_store(self.doc_store)
+
+            self.engine.set_event_bus(self.event_bus)
+
+            if hasattr(self, "experience_store") and self.experience_store is not None:
+                self.engine.set_experience_store(self.experience_store)
+
+        # ── Register session_search tool ──
+        if self._conversation_store:
+            try:
+                from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
+                conv_store = self._conversation_store
+
+                TOOL_DEFINITIONS.append({
+                    "type": "function",
+                    "function": {
+                        "name": "session_search",
+                        "description": "Search past conversation sessions for relevant context.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Search keywords"},
+                                "limit": {"type": "integer", "description": "Max results (default: 5)"},
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                })
+
+                async def _session_search_handler(params: dict) -> dict:
+                    query = params.get("query", "")
+                    limit = int(params.get("limit", 5))
+                    if not query:
+                        return {"ok": False, "error": "Missing query parameter"}
+                    results = conv_store.search_messages(query, limit=limit)
+                    if not results:
+                        return {"ok": True, "result": "No matching sessions found."}
+                    items = [
+                        {
+                            "session": r.session_title or r.session_id[:8],
+                            "role": r.role,
+                            "content": r.content[:300],
+                            "score": round(r.score, 3),
+                        }
+                        for r in results
+                    ]
+                    import json as _json_ss
+                    return {"ok": True, "result": _json_ss.dumps(items, ensure_ascii=False)}
+
+                TOOL_HANDLERS["session_search"] = _session_search_handler
+                TOOL_HANDLERS["gp_session_search"] = _session_search_handler
+                logger.debug("session_search tool registered")
+            except Exception:
+                logger.debug("session_search tool registration failed", exc_info=True)
+
+        # Pipeline Observer (A6: learning pipeline observability)
+        from leapflow.engine.pipeline_observer import StructuredPipelineLogger
+        self._pipeline_observer = StructuredPipelineLogger()
+
+        # ObservationDaemon conditional auto-start (A4)
+        if settings.observer_auto_start and not self.effective_mock:
+            from leapflow.platform.observers import ObserverConfig
+            from leapflow.platform.observers.daemon import ObservationDaemon
+            observer_config = ObserverConfig(enabled=settings.observer_enabled_set)
+            self._observation_daemon = ObservationDaemon(
+                bus=self.event_bus, config=observer_config,
+            )
+            try:
+                await self._observation_daemon.start()
+                logger.info("ObservationDaemon auto-started: %s", self._observation_daemon.status)
+            except Exception:
+                logger.warning("ObservationDaemon auto-start failed", exc_info=True)
+                self._observation_daemon = None
+
+        # ColdStartManager: adaptive threshold management
+        from leapflow.learning.cold_start import ColdStartManager, ColdStartConfig
+        self._cold_start = ColdStartManager(ColdStartConfig(mode="prompt"))
+        initial_skills = len(self.skill_lib.load_all_active()) if self.skill_lib else 0
+        self._cold_start.update_stats(skills_count=initial_skills)
+
+        # LearningEffectivenessTracker: metrics observability
+        from leapflow.learning.effectiveness import LearningEffectivenessTracker
+        self._effectiveness_tracker = LearningEffectivenessTracker()
+
+        # PatternMiner → ActiveLearningObserver bridge (closed loop)
+        if settings.observer_auto_start and settings.has_llm_credentials:
+            try:
+                from leapflow.learning.pattern_miner import PatternMiner
+                active_obs = self.active_observer
+
+                def _on_miner_candidates(candidates: list) -> None:
+                    if active_obs is not None:
+                        active_obs.on_pattern_candidate(candidates)
+                    self._effectiveness_tracker.record_pattern_discovered()
+
+                base_freq = 5
+                adjusted_freq = self._cold_start.get_adjusted_min_frequency(base_freq)
+
+                self._pattern_miner = PatternMiner(
+                    memory=self.imm,
+                    llm=self.llm,
+                    min_frequency=adjusted_freq,
+                    on_candidates=_on_miner_candidates,
+                )
+                self.event_bus.register_consumer(self._pattern_miner)
+                logger.info("PatternMiner registered (min_freq=%d, cold=%s)",
+                            adjusted_freq, self._cold_start.phase.value)
+            except Exception:
+                logger.warning("PatternMiner initialization failed", exc_info=True)
+
+        # ImplicitFeedbackObserver: detect user struggle signals
+        if settings.observer_auto_start:
+            try:
+                from leapflow.perception.implicit_feedback import ImplicitFeedbackObserver
+                self._implicit_feedback = ImplicitFeedbackObserver(self.event_bus)
+                await self._implicit_feedback.start()
+                logger.info("ImplicitFeedbackObserver started")
+            except Exception:
+                logger.warning("ImplicitFeedbackObserver start failed", exc_info=True)
+
+    _L1_MARKOV_MEMORY_ID = "copilot_l1_markov_state"
+    _L1_MARKOV_KIND = "copilot_state"
+
+    def _hydrate_l1_markov(self, l1: Any) -> None:
+        """Restore L1 Markov transition matrix from semantic memory."""
+        try:
+            hits = self.lt.search_keywords(
+                [self._L1_MARKOV_MEMORY_ID], kinds=[self._L1_MARKOV_KIND], limit=1,
+            )
+            if hits:
+                import json
+                state = json.loads(hits[0].content)
+                l1.import_state(state)
+        except Exception:
+            logger.debug("L1 Markov hydration skipped", exc_info=True)
+
+    def _persist_l1_markov(self) -> None:
+        """Save L1 Markov transition matrix to semantic memory for next session."""
+        l1 = getattr(self, "_l1_markov", None)
+        if l1 is None:
+            return
+        try:
+            import json
+            state = l1.export_state()
+            if not state.get("transitions"):
+                return
+            content = json.dumps(state, ensure_ascii=False)
+            self.lt.upsert_raw(
+                self._L1_MARKOV_KIND, content,
+                memory_id=self._L1_MARKOV_MEMORY_ID,
+            )
+            logger.info("L1 Markov: persisted %d transition keys", len(state.get("transitions", {})))
+        except Exception:
+            logger.debug("L1 Markov persistence failed", exc_info=True)
+
+    def _build_insight_callback(self) -> Callable:
+        """Build callback for replay insights — routes ALL insight types."""
         ps = self.perception_session
-        if ps is None:
-            return None
 
         def _on_insight(insight: Any) -> None:
-            causal_rule = getattr(insight, "metadata", {}).get("causal_rule")
-            if not causal_rule or not isinstance(causal_rule, dict):
+            metadata = getattr(insight, "metadata", None) or {}
+            if isinstance(metadata, str):
                 return
-            parent = causal_rule.get("parent_channel", "")
-            child = causal_rule.get("child_channel", "")
-            confidence = float(causal_rule.get("confidence", 0.5))
-            if parent and child:
-                try:
-                    heuristic = ps.causal_pipeline.inference.heuristic
-                    heuristic.update_prior(parent, child, confidence)
-                    logger.debug(
-                        "insight applied: %s→%s confidence=%.2f",
-                        parent, child, confidence,
-                    )
-                except Exception:
-                    logger.debug("insight application failed", exc_info=True)
+            insight_type = getattr(insight, "insight_type", None) or metadata.get("type", "unknown")
+
+            # Route 1: Causal rules → causal heuristic (existing)
+            causal_rule = metadata.get("causal_rule")
+            if causal_rule and isinstance(causal_rule, dict) and ps is not None:
+                parent = causal_rule.get("parent_channel", "")
+                child = causal_rule.get("child_channel", "")
+                confidence = float(causal_rule.get("confidence", 0.5))
+                if parent and child:
+                    try:
+                        heuristic = ps.causal_pipeline.inference.heuristic
+                        heuristic.update_prior(parent, child, confidence)
+                        logger.debug(
+                            "insight applied: %s\u2192%s confidence=%.2f",
+                            parent, child, confidence,
+                        )
+                    except Exception:
+                        logger.debug("insight causal application failed", exc_info=True)
+
+            # Route 2: Skill performance and corrective insights → evolution policy
+            if insight_type in ("edge_correction", "correction", "heuristic"):
+                skill_name = metadata.get("skill_name")
+                if skill_name and self._evolution_policy is not None:
+                    delta = float(metadata.get("delta", 0.0))
+                    if delta < -0.3:  # Significant regression
+                        try:
+                            outcome = self._evolution_policy.on_regression_detected(
+                                skill_name,
+                                current_confidence=float(metadata.get("confidence", 0.5)),
+                                current_version=int(metadata.get("version", 1)),
+                            )
+                            if self.skill_lib and outcome.tier_changed:
+                                self.skill_lib.update_skill_confidence(
+                                    skill_name, outcome.new_confidence
+                                )
+                                logger.info(
+                                    "Insight-driven regression: %s confidence \u2192 %.3f",
+                                    skill_name, outcome.new_confidence,
+                                )
+                        except Exception:
+                            logger.debug("insight evolution update failed", exc_info=True)
+
+            if insight_type == "pattern_discovered":
+                pattern_desc = metadata.get("pattern", "")
+                logger.info("Insight: new pattern discovered — %s", pattern_desc)
 
         return _on_insight
 
     async def _on_session_end_learning(self) -> None:
-        """End-of-session OPD learning pipeline (8 phases).
+        """End-of-session OPD learning pipeline (8 phases) with full observability.
 
         Executes in order:
-        1. Trajectory grading (teacher with full hindsight)
+        1. Trajectory grading (teacher with full hindsight) — grades consumed by replay_engine
         2. Off-policy experience replay (high-delta)
-        3. Curiosity-targeted replay (high-curiosity apps)
+        3. Curiosity-targeted replay (high-curiosity apps) — curiosity fed to attention_tuner
         4. Regression-gated self-distillation (causal rules)
         5. Attention statistics feedback (AttentionTuner)
         6. Long-term memory maintenance (prune old rows)
         7. Budget rebalancing from session outcomes
         8. VLM Tier 3 verification (if enabled)
         """
+        observer = self._pipeline_observer
+        pipeline_start = time.perf_counter()
+        phases_ok = 0
+        phases_failed = 0
         trajectory: list = []
 
-        # Phase 1: Trajectory grading
+        # Phase 1: Trajectory grading — FIX A5-1: grades now consumed by replay_engine
         if self.trajectory_grader is not None and self.prediction_loop is not None:
+            observer.on_phase_start("trajectory_grading")
+            t0 = time.perf_counter()
             try:
                 trajectory, goal = self.prediction_loop.flush_trajectory()
                 if trajectory:
                     grades = await self.trajectory_grader.grade_trajectory(
                         trajectory, goal=goal,
                     )
-                    logger.info("session_end: graded %d actions", len(grades))
-            except Exception:
-                logger.debug("session_end.trajectory_grading failed", exc_info=True)
+                    if grades and self.replay_engine is not None:
+                        self.replay_engine.set_replay_priorities(grades)
+                    observer.on_phase_success(
+                        "trajectory_grading", time.perf_counter() - t0,
+                        {"actions_graded": len(grades) if grades else 0},
+                    )
+                    phases_ok += 1
+                else:
+                    observer.on_phase_success(
+                        "trajectory_grading", time.perf_counter() - t0,
+                        {"actions_graded": 0, "note": "empty_trajectory"},
+                    )
+                    phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("trajectory_grading", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
         # Phase 2: Off-policy replay
         if self.replay_engine is not None:
+            observer.on_phase_start("off_policy_replay")
+            t0 = time.perf_counter()
             try:
                 insights = await self.replay_engine.replay_session()
-                if insights:
-                    logger.info("session_end: discovered %d insights", len(insights))
-            except Exception:
-                logger.debug("session_end.replay failed", exc_info=True)
+                observer.on_phase_success(
+                    "off_policy_replay", time.perf_counter() - t0,
+                    {"insights_discovered": len(insights) if insights else 0},
+                )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("off_policy_replay", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
-        # Phase 3: Targeted replay for high-curiosity domains
+        # Phase 3: Curiosity-targeted replay — FIX A5-2: feed curiosity to attention_tuner
         if self.replay_engine is not None and self.active_observer is not None:
+            observer.on_phase_start("curiosity_replay")
+            t0 = time.perf_counter()
             try:
                 curious_apps = self.active_observer.drain_high_curiosity_apps()
                 for app_ctx in curious_apps:
                     await self.replay_engine.replay_targeted(app_ctx)
-            except Exception:
-                logger.debug("session_end.curiosity_replay failed", exc_info=True)
+                tuner = getattr(self, "attention_tuner", None)
+                if tuner is not None and curious_apps:
+                    tuner.boost_curiosity_domains(curious_apps)
+                observer.on_phase_success(
+                    "curiosity_replay", time.perf_counter() - t0,
+                    {"curious_apps": len(curious_apps)},
+                )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("curiosity_replay", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
         # Phase 4: Regression-gated self-distillation
         if self.replay_engine is not None and trajectory:
+            observer.on_phase_start("regression_distillation")
+            t0 = time.perf_counter()
             try:
                 if self.replay_engine.detect_regression(trajectory):
-                    logger.warning("session_end: regression detected, triggering self-distillation")
                     distilled = await self.replay_engine.self_distill()
-                    logger.info("session_end: self-distilled %d rules", len(distilled))
-            except Exception:
-                logger.debug("session_end.distillation failed", exc_info=True)
+                    observer.on_phase_success(
+                        "regression_distillation", time.perf_counter() - t0,
+                        {"regression_detected": True, "rules_distilled": len(distilled)},
+                    )
+                else:
+                    observer.on_phase_success(
+                        "regression_distillation", time.perf_counter() - t0,
+                        {"regression_detected": False},
+                    )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("regression_distillation", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
-        # Phase 5: Feed per-app accuracy stats to AttentionTuner (contract mastered domains)
+        # Phase 5: Attention statistics feedback
         tuner = getattr(self, "attention_tuner", None)
         if tuner is not None and trajectory:
+            observer.on_phase_start("attention_feedback")
+            t0 = time.perf_counter()
             try:
                 from collections import defaultdict
                 app_sums: dict = defaultdict(lambda: [0.0, 0])
@@ -1100,23 +1682,65 @@ class Context:
                 app_deltas = {a: s[0] / s[1] for a, s in app_sums.items() if s[1] > 0}
                 if app_deltas:
                     tuner.on_session_stats(app_deltas)
-                    logger.debug("session_end: attention_tuner stats for %d apps", len(app_deltas))
-            except Exception:
-                logger.debug("session_end.attention_stats failed", exc_info=True)
+                observer.on_phase_success(
+                    "attention_feedback", time.perf_counter() - t0,
+                    {"apps_tracked": len(app_deltas)},
+                )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("attention_feedback", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
-        # Phase 6: Long-term memory maintenance (prune old, low-value rows)
+        # Phase 6: Long-term memory maintenance
+        observer.on_phase_start("memory_prune")
+        t0 = time.perf_counter()
         try:
-            pruned = self.lt.prune(
-                max_age_days=self.settings.memory_prune_age_days,
+            pruned = self.lt.prune(max_age_days=self.settings.memory_prune_age_days)
+            observer.on_phase_success(
+                "memory_prune", time.perf_counter() - t0,
+                {"rows_pruned": pruned or 0},
             )
-            if pruned:
-                logger.info("session_end: pruned %d old memory rows", pruned)
-        except Exception:
-            logger.debug("session_end.memory_prune failed", exc_info=True)
+            phases_ok += 1
+        except Exception as exc:
+            observer.on_phase_failure("memory_prune", exc, time.perf_counter() - t0)
+            phases_failed += 1
 
-        # Phase 7: Budget rebalancing from session outcomes
+        # Phase 6.5: Skill inactivity decay (C4 — after memory prune, before budget rebalance)
+        if self._evolution_policy is not None and self.skill_lib is not None:
+            observer.on_phase_start("skill_decay")
+            t0 = time.perf_counter()
+            try:
+                all_skills = self.skill_lib.load_all_active_parameterized()
+                decayed_count = 0
+                for skill in all_skills:
+                    last_used = skill.get("updated_at", 0.0)
+                    days_inactive = (time.time() - last_used) / 86400.0
+                    if days_inactive > 30:  # Only decay after 30 days of inactivity
+                        outcome = self._evolution_policy.decay_inactive(
+                            skill.get("name", ""),
+                            current_confidence=skill.get("confidence", 0.5),
+                            current_version=skill.get("version", 1),
+                            last_used_ts=last_used,
+                        )
+                        if outcome.tier_changed:
+                            self.skill_lib.update_skill_confidence(
+                                skill.get("name", ""), outcome.new_confidence
+                            )
+                            decayed_count += 1
+                observer.on_phase_success(
+                    "skill_decay", time.perf_counter() - t0,
+                    {"skills_decayed": decayed_count, "skills_checked": len(all_skills)},
+                )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("skill_decay", exc, time.perf_counter() - t0)
+                phases_failed += 1
+
+        # Phase 7: Budget rebalancing
         budget = getattr(self, "learning_budget", None)
         if budget is not None:
+            observer.on_phase_start("budget_rebalance")
+            t0 = time.perf_counter()
             try:
                 skills_discovered = 0
                 regressions_detected = 0
@@ -1136,42 +1760,119 @@ class Context:
                     regressions_detected=regressions_detected,
                     avg_prediction_delta=avg_delta,
                 )
-            except Exception:
-                logger.debug("session_end.budget_rebalance failed", exc_info=True)
+                observer.on_phase_success(
+                    "budget_rebalance", time.perf_counter() - t0,
+                    {"avg_delta": round(avg_delta, 4), "regressions": regressions_detected},
+                )
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("budget_rebalance", exc, time.perf_counter() - t0)
+                phases_failed += 1
 
-        # Phase 8: VLM Tier 3 verification (if enabled)
+        # Phase 8: VLM Tier 3 verification
         if self.settings.causal_tier3_enabled:
+            observer.on_phase_start("vlm_tier3")
+            t0 = time.perf_counter()
             try:
-                ps = getattr(self, "_perception_session", None)
+                ps = self.perception_session
                 if ps is not None:
                     pipeline = ps.causal_pipeline
                     graph = ps.causal_graph
 
                     async def _vlm_call(prompt: str) -> str:
-                        vlm = getattr(self, "vlm", None) or self.llm
-                        return await vlm.chat([{"role": "user", "content": prompt}])
+                        vlm = self.vlm or self.llm
+                        resp = await vlm.achat(
+                            [{"role": "user", "content": prompt}],
+                            stream=False,
+                            enable_thinking=False,
+                        )
+                        return (resp.content or "").strip()
 
-                    await pipeline.run_vlm_verification(
-                        graph, vlm_call=_vlm_call,
-                    )
-            except Exception:
-                logger.debug("session_end.vlm_tier3 failed", exc_info=True)
+                    await pipeline.run_vlm_verification(graph, vlm_call=_vlm_call)
+                observer.on_phase_success("vlm_tier3", time.perf_counter() - t0, {})
+                phases_ok += 1
+            except Exception as exc:
+                observer.on_phase_failure("vlm_tier3", exc, time.perf_counter() - t0)
+                phases_failed += 1
+
+        # Pipeline complete
+        observer.on_pipeline_complete(
+            time.perf_counter() - pipeline_start, phases_ok, phases_failed,
+        )
 
     async def cleanup(self) -> None:
-        if self._bg_connect_task and not self._bg_connect_task.done():
-            self._bg_connect_task.cancel()
+        # Persist evolution episodes to DuckDB before shutdown
+        evo_store = getattr(self, "_evolution_store", None)
+        if evo_store is not None and self._evolution is not None:
             try:
-                await self._bg_connect_task
-            except asyncio.CancelledError:
-                pass
+                for eid, episode in self._evolution._episodes.items():
+                    evo_store.save_episode(
+                        episode_id=eid,
+                        skill_name=episode.skill_name,
+                        actions=episode.actions,
+                        outcome=episode.outcome,
+                        reward=episode.reward,
+                        context=episode.context,
+                        timestamp=episode.timestamp,
+                    )
+                logger.info("Evolution: persisted %d episodes to DuckDB", len(self._evolution._episodes))
+            except Exception:
+                logger.debug("Evolution persistence failed", exc_info=True)
+            finally:
+                try:
+                    evo_store.close()
+                except Exception:
+                    pass
+
+        # Cancel engine if running
+        if self.engine is not None:
+            self.engine.cancel()
+
+        # Close MCP manager
+        mcp = getattr(self, "_mcp_manager", None)
+        if mcp is not None:
+            try:
+                mcp.close()
+            except Exception:
+                logger.debug("MCP manager close failed", exc_info=True)
+
+        # Close conversation store
+        conv_store = getattr(self, "_conversation_store", None)
+        if conv_store is not None:
+            try:
+                conv_store.close()
+            except Exception:
+                logger.debug("ConversationStore close failed", exc_info=True)
+        # Stop ImplicitFeedbackObserver
+        implicit = getattr(self, "_implicit_feedback", None)
+        if implicit is not None:
+            try:
+                await implicit.stop()
+            except Exception:
+                logger.debug("ImplicitFeedbackObserver stop failed", exc_info=True)
+        # Stop ObservationDaemon
+        if self._observation_daemon is not None:
+            try:
+                await self._observation_daemon.stop()
+            except Exception:
+                logger.warning("ObservationDaemon stop failed", exc_info=True)
+        # Emit final effectiveness metrics
+        tracker = getattr(self, "_effectiveness_tracker", None)
+        if tracker is not None:
+            tracker.maybe_emit()
+        # Persist L1 Markov state before shutdown
+        self._persist_l1_markov()
+        # Flush EventBus tail events before learning pipeline
+        try:
+            await self.event_bus.shutdown()
+        except Exception:
+            logger.debug("EventBus shutdown failed", exc_info=True)
         # OPD end-of-session learning pipeline
         if self.settings.replay_on_session_end:
             await self._on_session_end_learning()
         # Shutdown all memory providers (stops GC, closes DB)
         await self.memory.shutdown_all()
-        if isinstance(self.rpc, BridgeClient):
-            await self.rpc.close()
-        elif isinstance(self.rpc, CuaDriverClient):
+        if isinstance(self.rpc, CuaDriverClient):
             self.rpc.stop()
         if self.skill_lib:
             self.skill_lib.close()

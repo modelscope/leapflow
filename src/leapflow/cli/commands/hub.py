@@ -6,11 +6,15 @@ through configured Hub backends (ModelScope, HuggingFace, local, etc.).
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import TYPE_CHECKING, List
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from leapflow.cli.context import Context
+    from leapflow.hub.protocol import SkillBundle
 
 
 # ─── Human-in-the-loop Confirmation ─────────────────────────────────────────
@@ -350,17 +354,70 @@ async def _hub_pull(ctx: "Context", args: List[str]) -> int:
             print("  Cancelled.")
             return 0
 
-    # Step 5: Import locally
-    serializer = SkillSerializer()
-    skill_data = serializer.import_skill(bundle)
+    # Step 5: Import locally via SkillDocStore (canonical skill format)
+    installed = False
+    doc_store = getattr(ctx, "doc_store", None)
+    if doc_store is not None:
+        installed = _install_via_doc_store(ctx, bundle, doc_store)
+    elif ctx.skill_lib:
+        serializer = SkillSerializer()
+        skill_data = serializer.import_skill(bundle)
+        try:
+            ctx.skill_lib.save_skill_from_dict(skill_data)
+            installed = True
+        except (AttributeError, TypeError):
+            pass
 
-    if ctx.skill_lib:
-        ctx.skill_lib.save_from_hub(skill_data)
+    if installed:
         print(f"\n  Installed '{bundle.manifest.name}' successfully.")
     else:
-        print("  Warning: Skill library not available. Bundle downloaded but not installed.")
+        print("  Warning: Skill store not available. Bundle downloaded but not installed.")
 
     return 0
+
+
+def _install_via_doc_store(ctx: "Context", bundle: "SkillBundle", doc_store: object) -> bool:
+    """Install a hub bundle as SKILL.md and register in the runtime registry."""
+    from leapflow.learning.document import SkillDocument
+
+    m = bundle.manifest
+    doc = SkillDocument(
+        name=m.name,
+        description=m.description or f"Imported from hub ({m.hub_type or 'unknown'})",
+        goal=m.name,
+        instructions=[],
+        preconditions=[],
+        metadata={
+            "version": m.version,
+            "source": "hub",
+            "hub_type": m.hub_type,
+            "repo_id": m.repo_id,
+            "author": m.author,
+        },
+    )
+
+    if bundle.readme:
+        doc.instructions = [line for line in bundle.readme.splitlines() if line.strip()]
+
+    try:
+        doc_store.save(doc)  # type: ignore[union-attr]
+    except Exception:
+        logger.warning("hub.install: doc_store.save failed for %s", m.name, exc_info=True)
+        return False
+
+    registry = getattr(ctx, "registry", None)
+    llm_chain = getattr(ctx, "llm_chain", None)
+    if registry is not None and llm_chain is not None:
+        try:
+            skill = doc_store.load_as_skill(  # type: ignore[union-attr]
+                m.name, llm_chain, execution=getattr(ctx, "execution_adapter", None),
+            )
+            if skill is not None:
+                registry.register(skill)
+        except Exception:
+            logger.warning("hub.install: registry load failed for %s", m.name, exc_info=True)
+
+    return True
 
 
 # ─── Sync ────────────────────────────────────────────────────────────────────

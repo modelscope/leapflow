@@ -163,6 +163,57 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    # ── Memory tools (agent can actively search/add memory) ──
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": "Search agent memory for relevant past experiences, observations, and facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search keywords"},
+                    "limit": {"type": "integer", "description": "Max results (default: 10)"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_add",
+            "description": "Store a new observation or insight in memory for future reference.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "What to remember"},
+                    "kind": {"type": "string", "enum": ["observation", "insight", "fact"], "description": "Memory type (default: observation)"},
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    # ── Subagent delegation ──
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_task",
+            "description": (
+                "Delegate a complex sub-task to an isolated subagent. "
+                "The subagent gets a fresh context and restricted tool access. "
+                "Use when a task is self-contained and can be solved independently."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "Clear description of the task to delegate"},
+                    "context": {"type": "string", "description": "Relevant context for the subagent (optional)"},
+                },
+                "required": ["goal"],
+            },
+        },
+    },
 ] + HUB_TOOL_DEFINITIONS
 
 
@@ -281,10 +332,108 @@ TOOL_HANDLERS.update(HUB_TOOL_HANDLERS)
 for _td in TOOL_DEFINITIONS:
     _func_name = _td.get("function", {}).get("name", "")
     if _func_name and _func_name not in TOOL_HANDLERS:
-        # Find handler by matching the gp_-prefixed version
         _prefixed = f"gp_{_func_name}"
         if _prefixed in TOOL_HANDLERS:
             TOOL_HANDLERS[_func_name] = TOOL_HANDLERS[_prefixed]
+
+# ─────────────────────────────────────────────────────────────────────
+# Memory tool late-binding: handlers delegate to MemoryManager when
+# installed, fail gracefully when not. Avoids import-time dependency.
+# ─────────────────────────────────────────────────────────────────────
+
+_memory_manager_ref: Any = None
+
+
+def set_memory_manager(manager: Any) -> None:
+    """Install MemoryManager reference for memory tool dispatch."""
+    global _memory_manager_ref
+    _memory_manager_ref = manager
+
+
+async def _memory_search_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    if _memory_manager_ref is None:
+        return {"ok": False, "error": "Memory system not initialized"}
+    try:
+        result = await _memory_manager_ref.handle_tool_call("memory_search", params)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def _memory_add_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    if _memory_manager_ref is None:
+        return {"ok": False, "error": "Memory system not initialized"}
+    content = params.get("content", "")
+    if content:
+        try:
+            from leapflow.security.threat_patterns import scan_for_threats, ThreatScope
+            threats = scan_for_threats(content, scope=ThreatScope.STRICT, max_results=3)
+            if any(t.severity >= 0.8 for t in threats):
+                import logging as _log
+                _log.getLogger(__name__).warning("memory_add: threat in content: %s",
+                                                  [t.pattern_name for t in threats])
+        except ImportError:
+            pass
+    try:
+        result = await _memory_manager_ref.handle_tool_call("memory_add", params)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+TOOL_HANDLERS["memory_search"] = _memory_search_handler
+TOOL_HANDLERS["memory_add"] = _memory_add_handler
+TOOL_HANDLERS["gp_memory_search"] = _memory_search_handler
+TOOL_HANDLERS["gp_memory_add"] = _memory_add_handler
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Subagent delegation (late-binding like memory tools)
+# ─────────────────────────────────────────────────────────────────────
+
+_subagent_manager_ref: Any = None
+
+
+def set_subagent_manager(manager: Any) -> None:
+    """Install SubagentManager reference for delegate_task dispatch."""
+    global _subagent_manager_ref
+    _subagent_manager_ref = manager
+
+
+async def _delegate_task_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    if _subagent_manager_ref is None:
+        return {"ok": False, "error": "Subagent system not configured"}
+    try:
+        from leapflow.engine.subagent import SubagentConfig
+        config = SubagentConfig(
+            goal=params.get("goal", ""),
+            context=params.get("context", ""),
+        )
+        result = await _subagent_manager_ref.delegate(config)
+        return {"ok": result.status == "completed", "summary": result.summary, "status": result.status}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+TOOL_HANDLERS["delegate_task"] = _delegate_task_handler
+TOOL_HANDLERS["gp_delegate_task"] = _delegate_task_handler
+
+
+# ─────────────────────────────────────────────────────────────────────
+# File write approval gate (Protocol-based, injectable)
+# ─────────────────────────────────────────────────────────────────────
+
+_file_write_gate: Any = None
+
+
+def set_file_write_gate(gate: Any) -> None:
+    """Install a file-write approval gate (independent from shell approval)."""
+    global _file_write_gate
+    _file_write_gate = gate
+
+
+def get_file_write_gate() -> Any:
+    return _file_write_gate
 
 
 def bootstrap_tools(bridge: Any) -> int:

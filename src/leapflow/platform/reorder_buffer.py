@@ -1,7 +1,7 @@
 """Async event reorder buffer for correcting cross-source arrival inversions.
 
-Events produced on different os_host threads (CGEvent tap, NSWorkspace notification,
-FSEvents callback) may arrive at the Python side out of causal order. This buffer
+Events produced by different observer threads (CGEvent tap, app focus,
+FS watcher) may arrive at the Python side out of causal order.  This buffer
 holds incoming events for a brief settle window, then flushes them sorted by their
 monotonic origin timestamp — ensuring downstream consumers see events in true
 temporal order regardless of dispatch latency differences.

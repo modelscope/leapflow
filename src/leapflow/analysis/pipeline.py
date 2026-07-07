@@ -18,21 +18,23 @@ from leapflow.analysis.abstractor import ActionAbstractor
 from leapflow.recording.recorder import DemonstrationRecorder
 from leapflow.analysis.segmenter import SegmentDetector
 from leapflow.storage.trajectory_store import TrajectoryStore
-from leapflow.domain.trajectory import Episode, RecordingMode, RecordingState, Trajectory
+from leapflow.domain.trajectory import Episode, RecordingMode, Trajectory
 from leapflow.domain.skill_types import DistillationCandidate
 from leapflow.learning.distiller import LLMSkillDistiller, SkillDistiller
 from leapflow.platform.client import fire_and_forget
-from leapflow.platform.protocol import HostRpc, Methods
+from leapflow.platform.protocol import HostRpc
 
 if TYPE_CHECKING:
     from leapflow.analysis.intent_inferrer import IntentInferrer
     from leapflow.perception.session import PerceptionSession
     from leapflow.perception.types import VideoAction
     from leapflow.perception.video.analyzer import VideoAnalyzer
-    from leapflow.perception.video.recorder import VideoRecorder
+    from leapflow.perception.video.recorder import TrajectoryRecorder
     from leapflow.perception.video.segmenter import VideoSegmenter
     from leapflow.perception.video.timeline import SignalTimeline
     from leapflow.platform.event_bus import EventBus
+    from leapflow.platform.observers import RecordingProfile
+    from leapflow.platform.observers.daemon import ObservationDaemon
     from leapflow.learning.codegen import CodeGenContext, GeneratedSkill, SkillCodeGenerator
 
 CandidatesCallback = Callable[[List[DistillationCandidate], List[Episode]], None]
@@ -86,10 +88,12 @@ class ImitationPipeline:
         clipboard_max_length: int = 1024,
         recording_mode: RecordingMode = RecordingMode.DEFAULT,
         mhms_fusion_enabled: bool = False,
-        video_recorder: "Optional[VideoRecorder]" = None,
+        video_recorder: "Optional[TrajectoryRecorder]" = None,
         video_analyzer: "Optional[VideoAnalyzer]" = None,
         video_segmenter: "Optional[VideoSegmenter]" = None,
         signal_timeline: "Optional[SignalTimeline]" = None,
+        observation_daemon: "Optional[ObservationDaemon]" = None,
+        recording_profile: "Optional[RecordingProfile]" = None,
     ) -> None:
         self._store = store
         self._segmenter = segmenter or SegmentDetector()
@@ -123,12 +127,11 @@ class ImitationPipeline:
         self._video_analyzer = video_analyzer
         self._video_segmenter = video_segmenter
         self._signal_timeline = signal_timeline
+        self._observation_daemon = observation_daemon
+        self._recording_profile = recording_profile
         self._extracted_video_actions: List[Any] = []
         self._video_available: bool = False
         self._current_goal = ""
-
-        if rpc and hasattr(rpc, "on_reconnect"):
-            rpc.on_reconnect(self._on_bridge_reconnect)
 
     @property
     def recorder(self) -> DemonstrationRecorder:
@@ -181,7 +184,7 @@ class ImitationPipeline:
         tid = self._recorder.start(user_id=user_id)
         if goal:
             self._recorder.attention_context.seed_from_goal(goal)
-        await self._notify_host_recording_start()
+        await self._apply_recording_profile()
 
         if self._recording_mode.uses_video and self._video_recorder:
             from leapflow.config import get_settings
@@ -236,7 +239,7 @@ class ImitationPipeline:
         await asyncio.sleep(0.2)
         self._report_stop("save")
         traj = self._recorder.stop()
-        await self._notify_host_recording_stop()
+        await self._reset_recording_profile()
 
         if self._recording_mode.uses_video:
             await self._stop_video_recording(discard=discard)
@@ -246,14 +249,20 @@ class ImitationPipeline:
         return traj
 
     async def _stop_video_recording(self, *, discard: bool) -> None:
-        """Finalize video recording and run multi-scale analysis."""
+        """Finalize trajectory/video recording and run multi-scale analysis."""
         if not self._video_available:
             return
         if not self._video_recorder or not self._video_recorder.active:
             return
 
+        trajectory_actions = self._video_recorder.load_trajectory_actions()
+        if trajectory_actions:
+            logger.info(
+                "video_analysis: loaded %d trajectory actions", len(trajectory_actions),
+            )
+
         self._report_stop("video_stop")
-        logger.info("video_analysis: stopping video recorder")
+        logger.info("video_analysis: stopping trajectory recorder")
         segments = await self._video_recorder.stop()
         if discard or not segments:
             return
@@ -261,9 +270,6 @@ class ImitationPipeline:
         logger.info("video_analysis: segmenting %d video segments", len(segments))
         if self._video_analyzer and self._video_segmenter and self._signal_timeline:
             self._report_stop("video_segment")
-            # Yield to the event loop so any pending EventBus callbacks
-            # (e.g. late-arriving signals routed to SignalTimeline) are
-            # processed before we compress the timeline.
             await asyncio.sleep(0)
             markers = self._signal_timeline.compress()
             analysis_segs = self._video_segmenter.segment(segments, markers)
@@ -275,6 +281,7 @@ class ImitationPipeline:
                         analysis_segs, self._signal_timeline,
                         goal=self._current_goal,
                         progress=lambda msg: self._report_stop(msg),
+                        trajectory_actions=trajectory_actions,
                     )
                     self._extracted_video_actions = actions
                     logger.info("video_analysis: extracted %d video actions", len(actions))
@@ -320,37 +327,23 @@ class ImitationPipeline:
         if self._video_recorder and self._video_recorder.paused:
             fire_and_forget(self._video_recorder.resume())
 
-    async def _notify_host_recording_start(self) -> None:
-        """RPC to switch host into high-fidelity perception mode."""
-        if self._rpc is None:
+    async def _apply_recording_profile(self) -> None:
+        """Switch observation daemon to high-fidelity recording mode."""
+        if self._observation_daemon is None or self._recording_profile is None:
             return
         try:
-            await self._rpc.call(Methods.RECORDING_START)
+            await self._observation_daemon.apply_profile(self._recording_profile)
         except Exception as e:
-            logger.warning("recording.start RPC failed: %s", e)
+            logger.warning("apply_recording_profile failed: %s", e)
 
-    async def _notify_host_recording_stop(self) -> None:
-        """RPC to restore host to idle perception mode."""
-        if self._rpc is None:
+    async def _reset_recording_profile(self) -> None:
+        """Restore observation daemon to idle-mode parameters."""
+        if self._observation_daemon is None:
             return
         try:
-            result = await self._rpc.call(Methods.RECORDING_STOP)
-            event_count = 0
-            if isinstance(result, dict):
-                event_count = result.get("event_count", 0)
-            logger.info("Host recording stopped: event_count=%d", event_count)
+            await self._observation_daemon.reset_profile()
         except Exception as e:
-            logger.warning("recording.stop RPC failed: %s", e)
-
-    async def _on_bridge_reconnect(self) -> None:
-        """Re-establish recording state after bridge reconnection."""
-        if self._recorder.state != RecordingState.RECORDING:
-            return
-        try:
-            await self._rpc.call(Methods.RECORDING_START)
-            logger.info("Re-sent recording.start after bridge reconnect")
-        except Exception as e:
-            logger.warning("Failed to re-send recording.start: %s", e)
+            logger.warning("reset_recording_profile failed: %s", e)
 
     # ── Video enrichment ──
 

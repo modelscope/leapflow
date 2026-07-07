@@ -1,13 +1,22 @@
-"""Configuration loading from environment variables."""
+"""Configuration loading from environment variables with optional YAML overlay.
+
+Loading priority (highest wins):
+    1. Real environment variables
+    2. CWD ``.env`` — project-specific overrides
+    3. ``<data_dir>/config.yaml`` — structured YAML config (deep-merged)
+    4. ``<data_dir>/.env`` — global user defaults
+    5. Hard-coded fallbacks
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 
 from dotenv import load_dotenv
 
@@ -60,10 +69,16 @@ def ensure_default_env(data_dir: Path) -> bool:
 
     env_path.write_text(ENV_TEMPLATE, encoding="utf-8")
     # Inform the user (logging may not be configured yet at this point).
-    sys.stderr.write(
-        f"\033[2m→ Created default config: {env_path}\033[0m\n"
-        f"\033[2m  Edit LEAPFLOW_LLM_API_KEY to configure your LLM provider.\033[0m\n"
-    )
+    if sys.stderr.isatty():
+        sys.stderr.write(
+            f"\033[2m→ Created default config: {env_path}\033[0m\n"
+            f"\033[2m  Edit LEAPFLOW_LLM_API_KEY to configure your LLM provider.\033[0m\n"
+        )
+    else:
+        sys.stderr.write(
+            f"→ Created default config: {env_path}\n"
+            f"  Edit LEAPFLOW_LLM_API_KEY to configure your LLM provider.\n"
+        )
     sys.stderr.flush()
     return True
 
@@ -76,7 +91,6 @@ class Settings:
     llm_base_url: str
     llm_model: str
     llm_max_retries: int
-    bridge_socket: Path
     mock_host: bool
     duckdb_path: Path
     log_level: str
@@ -292,11 +306,29 @@ class Settings:
     compress_threshold: int = 16
     compress_keep_tail: int = 4
     max_tool_output_chars: int = 2000
+    max_tool_result_chars: int = 3000  # Per-tool result truncation for LLM context
 
     # ── Error Recovery ──
     error_transient_max_retries: int = 3
     error_rate_limit_base_delay: float = 5.0
     max_consecutive_tool_failures: int = 3
+
+    # ── Session Persistence ──
+    session_persistence_enabled: bool = True
+
+    # ── Multi-Provider LLM ──
+    llm_fallback_providers: str = ""  # JSON array of fallback provider configs
+    llm_aux_model: str = ""  # Auxiliary model for cheap operations (empty = reuse primary)
+    llm_aux_api_key: str = ""  # Aux API key (empty = reuse primary)
+    llm_aux_base_url: str = ""  # Aux base URL (empty = reuse primary)
+    llm_context_length: int = 128_000  # Primary provider's context window
+    llm_credential_cooldown_s: float = 60.0  # Per-key rate-limit cooldown
+
+    # ── Stream & Tool Robustness ──
+    stale_stream_timeout_s: float = 180.0  # Idle timeout for streaming responses
+    default_tool_timeout_s: float = 120.0  # Default per-tool execution timeout
+    circuit_breaker_threshold: int = 5  # Consecutive failures before circuit opens
+    circuit_breaker_cooldown_s: float = 60.0  # Circuit breaker cooldown period
 
     # ── Signal Fusion (vision_only mode) ──
     # Default is the full 7-channel set; ``LEAPFLOW_SIGNAL_CHANNELS=none`` disables
@@ -305,9 +337,8 @@ class Settings:
     signal_reactive_capture: bool = False
 
     # ── RPC Transport ──
-    # Default fallback timeout (seconds) used by BridgeClient when no
-    # method-specific entry in the timeout map matches. Method-specific
-    # overrides live in ``leapflow.platform.client._RPC_TIMEOUT_MAP``.
+    # Default fallback timeout (seconds) used by CuaDriverClient when no
+    # method-specific timeout applies.
     rpc_timeout_default: float = 30.0
 
     # ── Cua Driver ──
@@ -321,6 +352,11 @@ class Settings:
     copilot_cache_ttl_s: float = 30.0
     copilot_speculative_cache_size: int = 100
     copilot_action_ring_size: int = 10
+    copilot_warmup_event_types: str = "app.focus_change,context.change,ui.action"
+    notification_renderer: str = "auto"  # "os" | "stderr" | "log" | "auto" | "none"
+
+    # ── Engine Live Signals ──
+    live_signal_kinds: str = "app.focus_change,fs.change,context.change,intent.signal"
 
     # ── Hub (cloud collaboration) ──
     hub_type: str = "modelscope"
@@ -331,6 +367,15 @@ class Settings:
     hub_repo_prefix: str = "leapflow-"
     hub_search_sources: str = "modelscope"  # comma-separated backend names for multi-source search
 
+    # ── Observer / Daemon ──
+    observer_auto_start: bool = False   # Auto-start ObservationDaemon on initialize
+    observer_enabled_set: Dict[str, bool] = field(default_factory=lambda: {
+        "fs_watcher": True,
+        "app_focus": True,
+        "clipboard": True,
+        "input_tap": False,
+    })
+
     # ── Scheduler ──
     scheduler_enabled: bool = True
     scheduler_tick_seconds: int = 60
@@ -340,6 +385,63 @@ class Settings:
     @property
     def has_llm_credentials(self) -> bool:
         return bool(self.llm_api_key.strip())
+
+
+def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively merge overlay into base. Overlay values take precedence."""
+    result = dict(base)
+    for key, value in overlay.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _load_yaml_overlay(data_dir: Path) -> Dict[str, str]:
+    """Load config.yaml and flatten dot-separated keys to env var format.
+
+    Handles corrupt YAML by backing up and continuing with empty config.
+    Returns dict of LEAPFLOW_* env var names to string values.
+    """
+    yaml_path = data_dir / "config.yaml"
+    if not yaml_path.exists():
+        return {}
+
+    try:
+        import yaml
+    except ImportError:
+        return {}
+
+    try:
+        raw = yaml_path.read_text(encoding="utf-8")
+        parsed = yaml.safe_load(raw) or {}
+        if not isinstance(parsed, dict):
+            raise ValueError("config.yaml root must be a mapping")
+    except Exception as exc:
+        backup = yaml_path.with_suffix(f".yaml.corrupt.bak")
+        logger.warning("config.yaml parse error (%s), backing up to %s", exc, backup.name)
+        try:
+            shutil.copy2(yaml_path, backup)
+        except OSError:
+            pass
+        return {}
+
+    env_vars: Dict[str, str] = {}
+    _flatten_yaml(parsed, prefix="LEAPFLOW", env_vars=env_vars)
+    return env_vars
+
+
+def _flatten_yaml(
+    node: Any, *, prefix: str, env_vars: Dict[str, str]
+) -> None:
+    """Flatten nested YAML dict to LEAPFLOW_X_Y_Z = value strings."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            child_prefix = f"{prefix}_{key}".upper()
+            _flatten_yaml(value, prefix=child_prefix, env_vars=env_vars)
+    else:
+        env_vars[prefix] = str(node)
 
 
 def load_config(*, env_file: str | Path | None = None) -> Settings:
@@ -377,11 +479,32 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     ensure_default_env(_data_dir)
 
     if env_file is None:
-        # Layer 2: global user .env — fills in any variables not already set.
-        _global_env = _data_dir / ".env"
-        if _global_env.exists():
-            load_dotenv(_global_env, override=False)
+        # Layer 2: YAML config overlay (deep-merge, dot.separated keys).
+        # Inject into os.environ only for the duration of this call so tests
+        # and repeated load_config() calls are not polluted.
+        yaml_vars = _load_yaml_overlay(_data_dir)
+        injected_yaml_keys: list[str] = []
+        for k, v in yaml_vars.items():
+            if k not in os.environ:
+                os.environ[k] = v
+                injected_yaml_keys.append(k)
 
+        try:
+            # Layer 3: global user .env — fills in any variables not already set.
+            _global_env = _data_dir / ".env"
+            if _global_env.exists():
+                load_dotenv(_global_env, override=False)
+
+            return _build_settings_from_env()
+        finally:
+            for k in injected_yaml_keys:
+                os.environ.pop(k, None)
+
+    return _build_settings_from_env()
+
+
+def _build_settings_from_env() -> Settings:
+    """Build Settings from current os.environ (called by load_config)."""
     api_key = os.getenv("LEAPFLOW_LLM_API_KEY", "").strip()
     base_url = os.getenv(
         "LEAPFLOW_LLM_BASE_URL",
@@ -390,11 +513,8 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     model = os.getenv("LEAPFLOW_LLM_MODEL", "qwen-plus").strip()
     max_retries = int(os.getenv("LEAPFLOW_LLM_MAX_RETRIES", "3"))
 
-    # Data Root – reuse the early-resolved path; derives all default host paths
-    data_dir = _data_dir
+    data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
 
-    # bridge_socket: LEAPFLOW_BRIDGE_SOCKET overrides default
-    bridge = os.getenv("LEAPFLOW_BRIDGE_SOCKET", "/tmp/leapflow.sock").strip()
     mock_host = os.getenv("LEAPFLOW_MOCK_HOST", "0").strip() in ("1", "true", "True", "yes")
     duckdb = os.getenv("LEAPFLOW_DUCKDB_PATH", "~/.leapflow/memory.duckdb").strip()
     log_level = os.getenv("LEAPFLOW_LOG_LEVEL", "INFO").strip()
@@ -596,11 +716,29 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     compress_threshold = int(os.getenv("LEAPFLOW_COMPRESS_THRESHOLD", "16"))
     compress_keep_tail = int(os.getenv("LEAPFLOW_COMPRESS_KEEP_TAIL", "4"))
     max_tool_output_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_OUTPUT_CHARS", "2000"))
+    max_tool_result_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_RESULT_CHARS", "3000"))
 
     # Error Recovery
     error_transient_max_retries = int(os.getenv("LEAPFLOW_ERROR_TRANSIENT_MAX_RETRIES", "3"))
     error_rate_limit_base_delay = float(os.getenv("LEAPFLOW_ERROR_RATE_LIMIT_BASE_DELAY", "5.0"))
     max_consecutive_tool_failures = int(os.getenv("LEAPFLOW_MAX_CONSECUTIVE_TOOL_FAILURES", "3"))
+
+    # Session Persistence
+    session_persistence_enabled = _bool("LEAPFLOW_SESSION_PERSISTENCE_ENABLED", "true")
+
+    # Multi-Provider LLM
+    llm_fallback_providers = os.getenv("LEAPFLOW_LLM_FALLBACK_PROVIDERS", "").strip()
+    llm_aux_model = os.getenv("LEAPFLOW_LLM_AUX_MODEL", "").strip()
+    llm_aux_api_key = os.getenv("LEAPFLOW_LLM_AUX_API_KEY", "").strip()
+    llm_aux_base_url = os.getenv("LEAPFLOW_LLM_AUX_BASE_URL", "").strip()
+    llm_context_length = int(os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", "128000"))
+    llm_credential_cooldown_s = float(os.getenv("LEAPFLOW_LLM_CREDENTIAL_COOLDOWN_S", "60.0"))
+
+    # Stream & Tool Robustness
+    stale_stream_timeout_s = float(os.getenv("LEAPFLOW_STALE_STREAM_TIMEOUT_S", "180.0"))
+    default_tool_timeout_s = float(os.getenv("LEAPFLOW_DEFAULT_TOOL_TIMEOUT_S", "120.0"))
+    circuit_breaker_threshold = int(os.getenv("LEAPFLOW_CIRCUIT_BREAKER_THRESHOLD", "5"))
+    circuit_breaker_cooldown_s = float(os.getenv("LEAPFLOW_CIRCUIT_BREAKER_COOLDOWN_S", "60.0"))
 
     # Signal Fusion
     # Default = "all": collect every supported channel (V7 full fusion). Set
@@ -632,6 +770,14 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     copilot_cache_ttl_s = float(os.getenv("LEAPFLOW_COPILOT_CACHE_TTL_S", "30.0"))
     copilot_speculative_cache_size = int(os.getenv("LEAPFLOW_COPILOT_SPECULATIVE_CACHE_SIZE", "100"))
     copilot_action_ring_size = int(os.getenv("LEAPFLOW_COPILOT_ACTION_RING_SIZE", "10"))
+    copilot_warmup_event_types = os.getenv(
+        "LEAPFLOW_COPILOT_WARMUP_EVENT_TYPES", "app.focus_change,context.change,ui.action",
+    )
+    notification_renderer = os.getenv("LEAPFLOW_NOTIFICATION_RENDERER", "auto")
+
+    live_signal_kinds = os.getenv(
+        "LEAPFLOW_LIVE_SIGNAL_KINDS", "app.focus_change,fs.change,context.change,intent.signal",
+    )
 
     # Hub (cloud collaboration)
     hub_type = os.getenv("LEAPFLOW_HUB_TYPE", "modelscope")
@@ -641,6 +787,19 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     hub_sync_copilot = _bool("LEAPFLOW_HUB_SYNC_COPILOT", "true")
     hub_repo_prefix = os.getenv("LEAPFLOW_HUB_REPO_PREFIX", "leapflow-")
     hub_search_sources = os.getenv("LEAPFLOW_HUB_SEARCH_SOURCES", "modelscope")
+
+    # Observer / Daemon
+    observer_auto_start = _bool("LEAPFLOW_OBSERVER_AUTO_START", "false")
+    _observer_enabled_raw = os.getenv("LEAPFLOW_OBSERVER_ENABLED_SET", "")
+    observer_enabled_set: Dict[str, bool] = {
+        "fs_watcher": True, "app_focus": True, "clipboard": True, "input_tap": False,
+    }
+    if _observer_enabled_raw:
+        import json as _json_obs
+        try:
+            observer_enabled_set = {str(k): bool(v) for k, v in _json_obs.loads(_observer_enabled_raw).items()}
+        except Exception:
+            logger.warning("Invalid LEAPFLOW_OBSERVER_ENABLED_SET: %s", _observer_enabled_raw)
 
     # Scheduler
     scheduler_enabled = _bool("LEAPFLOW_SCHEDULER_ENABLED", "true")
@@ -653,7 +812,6 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         llm_base_url=base_url.rstrip("/"),
         llm_model=model,
         llm_max_retries=max(1, max_retries),
-        bridge_socket=_expand_path(bridge),
         mock_host=mock_host,
         duckdb_path=_expand_path(duckdb),
         log_level=log_level,
@@ -805,10 +963,25 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         compress_threshold=compress_threshold,
         compress_keep_tail=compress_keep_tail,
         max_tool_output_chars=max_tool_output_chars,
+        max_tool_result_chars=max_tool_result_chars,
         # Error Recovery
         error_transient_max_retries=error_transient_max_retries,
         error_rate_limit_base_delay=error_rate_limit_base_delay,
         max_consecutive_tool_failures=max_consecutive_tool_failures,
+        # Session Persistence
+        session_persistence_enabled=session_persistence_enabled,
+        # Multi-Provider LLM
+        llm_fallback_providers=llm_fallback_providers,
+        llm_aux_model=llm_aux_model,
+        llm_aux_api_key=llm_aux_api_key,
+        llm_aux_base_url=llm_aux_base_url,
+        llm_context_length=llm_context_length,
+        llm_credential_cooldown_s=llm_credential_cooldown_s,
+        # Stream & Tool Robustness
+        stale_stream_timeout_s=stale_stream_timeout_s,
+        default_tool_timeout_s=default_tool_timeout_s,
+        circuit_breaker_threshold=circuit_breaker_threshold,
+        circuit_breaker_cooldown_s=circuit_breaker_cooldown_s,
         # Signal Fusion
         signal_channels=signal_channels,
         signal_reactive_capture=signal_reactive_capture,
@@ -824,6 +997,9 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         copilot_cache_ttl_s=copilot_cache_ttl_s,
         copilot_speculative_cache_size=copilot_speculative_cache_size,
         copilot_action_ring_size=copilot_action_ring_size,
+        copilot_warmup_event_types=copilot_warmup_event_types,
+        notification_renderer=notification_renderer,
+        live_signal_kinds=live_signal_kinds,
         # Hub
         hub_type=hub_type,
         hub_default_owner=hub_default_owner,
@@ -832,6 +1008,9 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         hub_sync_copilot=hub_sync_copilot,
         hub_repo_prefix=hub_repo_prefix,
         hub_search_sources=hub_search_sources,
+        # Observer / Daemon
+        observer_auto_start=observer_auto_start,
+        observer_enabled_set=observer_enabled_set,
         # Scheduler
         scheduler_enabled=scheduler_enabled,
         scheduler_tick_seconds=scheduler_tick_seconds,
@@ -843,7 +1022,62 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         logger.warning("LEAPFLOW_LLM_API_KEY is empty; LLM calls will fail until configured.")
 
     settings.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for warning in validate_settings(settings):
+        logger.warning("config: %s", warning)
+
     return settings
+
+
+def validate_settings(settings: Settings) -> list[str]:
+    """Post-load validation with actionable error messages.
+
+    Returns a list of warning strings (empty = no issues).
+    Does not raise — all issues are advisory.
+    """
+    warnings: list[str] = []
+
+    if settings.llm_context_length < 1024:
+        warnings.append(
+            f"llm_context_length={settings.llm_context_length} is suspiciously low; "
+            "expected at least 1024. Check LEAPFLOW_LLM_CONTEXT_LENGTH."
+        )
+
+    if settings.stale_stream_timeout_s < 10.0:
+        warnings.append(
+            f"stale_stream_timeout_s={settings.stale_stream_timeout_s} is very short; "
+            "may cause premature stream cancellations."
+        )
+
+    if settings.default_tool_timeout_s < 5.0:
+        warnings.append(
+            f"default_tool_timeout_s={settings.default_tool_timeout_s} is very short; "
+            "tools may timeout before completing."
+        )
+
+    if settings.react_soft_limit >= settings.react_max_iterations:
+        warnings.append(
+            f"react_soft_limit ({settings.react_soft_limit}) >= react_max_iterations "
+            f"({settings.react_max_iterations}); soft limit will never trigger."
+        )
+
+    if settings.llm_aux_model and not settings.llm_aux_api_key and not settings.llm_api_key:
+        warnings.append(
+            "llm_aux_model is set but no API key available (neither aux nor primary). "
+            "Auxiliary LLM calls will fail."
+        )
+
+    if settings.llm_fallback_providers:
+        import json as _json
+        try:
+            _json.loads(settings.llm_fallback_providers)
+        except _json.JSONDecodeError as e:
+            warnings.append(
+                f"LEAPFLOW_LLM_FALLBACK_PROVIDERS is not valid JSON: {e}. "
+                "Fallback providers will be ignored."
+            )
+
+    return warnings
 
 
 # ── Global settings accessor (lazy singleton) ──

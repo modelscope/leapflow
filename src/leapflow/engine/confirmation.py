@@ -7,8 +7,9 @@ NOTIFY → AUTO as they mature through successful executions.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
 from leapflow.skills.registry import Skill
@@ -54,8 +55,14 @@ class IOProvider(Protocol):
 class ConfirmationHandler:
     """Determines and manages confirmation levels for skill execution."""
 
-    def __init__(self, *, skill_store: Optional["SkillLibraryStore"] = None) -> None:
+    def __init__(
+        self,
+        *,
+        skill_store: Optional["SkillLibraryStore"] = None,
+        risk_detector: Optional["DangerousOperationDetector"] = None,
+    ) -> None:
         self._skill_store = skill_store
+        self._risk_detector = risk_detector or DangerousOperationDetector()
         self._step_callback: Optional[StepCallback] = None
 
     def set_on_step(self, callback: Optional[StepCallback]) -> None:
@@ -70,6 +77,7 @@ class ConfirmationHandler:
         skill: Skill,
         *,
         override: Optional[ConfirmLevel] = None,
+        action_params: Optional[Dict[str, Any]] = None,
     ) -> ConfirmLevel:
         if override is not None:
             return override
@@ -81,6 +89,15 @@ class ConfirmationHandler:
 
         if tier <= SkillTier.DRAFT:
             return ConfirmLevel.STEP
+
+        # Risk detector: elevate confirmation for dangerous operations
+        if self._risk_detector and action_params:
+            for trigger in skill.triggers:
+                assessment = self._risk_detector.assess_risk(trigger, action_params)
+                if assessment.requires_double_confirmation:
+                    return ConfirmLevel.STEP
+                if assessment.requires_confirmation:
+                    return ConfirmLevel.CONFIRM
 
         if self._has_destructive_ops(skill):
             return ConfirmLevel.CONFIRM
@@ -217,4 +234,87 @@ class ConfirmationHandler:
             return "skip"
         if r in ("stop", "中止", "停"):
             return "stop"
-        return "yes"
+        return "no"
+
+
+@dataclass(frozen=True)
+class RiskAssessment:
+    """Result of dangerous operation detection."""
+    action: str
+    severity: float  # 0.0-1.0
+    risks: List[str] = field(default_factory=list)
+    requires_confirmation: bool = False
+    requires_double_confirmation: bool = False
+
+
+class DangerousOperationDetector:
+    """Detects high-risk operations that require elevated confirmation.
+    
+    Identifies:
+    - Batch operations exceeding threshold
+    - Irreversible operations (delete, format, overwrite)
+    - Operations touching sensitive paths
+    - Operations with broad scope (wildcards, recursive)
+    """
+
+    def __init__(
+        self,
+        *,
+        batch_threshold: int = 10,
+        sensitive_paths: frozenset[str] = frozenset({
+            "/etc", "/usr", "/System", "/bin", "/sbin",
+            "~/.ssh", "~/.config", "~/.gnupg",
+        }),
+        irreversible_actions: frozenset[str] = frozenset({
+            "file.delete", "batch_delete", "shell.exec",
+            "file.overwrite", "disk.format", "git.force_push",
+        }),
+    ) -> None:
+        self._batch_threshold = batch_threshold
+        self._sensitive_paths = sensitive_paths
+        self._irreversible_actions = irreversible_actions
+
+    def assess_risk(self, action: str, params: Dict[str, Any]) -> RiskAssessment:
+        """Assess the risk level of an operation."""
+        risks: List[str] = []
+        severity = 0.0
+        
+        # Check irreversible
+        if action in self._irreversible_actions:
+            risks.append("irreversible_operation")
+            severity = max(severity, 0.8)
+        
+        # Check batch size
+        batch_size = params.get("batch_size", params.get("count", 1))
+        if isinstance(batch_size, int) and batch_size > self._batch_threshold:
+            risks.append(f"batch_operation ({batch_size} items)")
+            severity = max(severity, 0.6)
+        
+        # Check sensitive paths
+        target_path = params.get("path", params.get("target", ""))
+        if isinstance(target_path, str) and target_path:
+            for sensitive in self._sensitive_paths:
+                expanded = sensitive.replace("~", str(Path.home())) if "~" in sensitive else sensitive
+                if expanded == "/":
+                    # Root "/" only matches exact target "/"
+                    if target_path == "/":
+                        risks.append(f"sensitive_path ({sensitive})")
+                        severity = max(severity, 0.9)
+                        break
+                elif target_path.startswith(expanded):
+                    risks.append(f"sensitive_path ({sensitive})")
+                    severity = max(severity, 0.9)
+                    break
+        
+        # Check wildcards / recursive
+        if any(params.get(k) for k in ("recursive", "wildcard", "glob")):
+            risks.append("broad_scope (recursive/wildcard)")
+            severity = max(severity, 0.5)
+        
+        return RiskAssessment(
+            action=action,
+            severity=severity,
+            risks=risks,
+            requires_confirmation=severity >= 0.5,
+            requires_double_confirmation=severity >= 0.8,
+        )

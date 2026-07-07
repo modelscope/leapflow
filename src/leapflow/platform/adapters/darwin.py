@@ -1,4 +1,4 @@
-"""macOS adapter — maps VSI ports to HostRpc calls targeting the Swift OSHost."""
+"""macOS adapter — maps VSI ports to HostRpc calls targeting CuaDriver."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from leapflow.platform.protocol import HostRpc, Methods
 
 
 class DarwinPerceptionAdapter:
-    """PerceptionPort implementation backed by macOS OSHost RPC."""
+    """PerceptionPort implementation backed by CuaDriver RPC."""
 
     def __init__(self, rpc: HostRpc, manifest: PlatformManifest) -> None:
         self._rpc = rpc
@@ -65,7 +65,7 @@ class DarwinPerceptionAdapter:
 
 
 class DarwinExecutionAdapter:
-    """ExecutionPort implementation backed by macOS OSHost RPC.
+    """ExecutionPort implementation backed by CuaDriver RPC.
 
     Features a bounded undo stack supporting multi-step rollback and
     pre-delete backup for file recovery.

@@ -171,8 +171,7 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 | `LEAPFLOW_LLM_BASE_URL` | DashScope endpoint | OpenAI-compatible base URL |
 | `LEAPFLOW_LLM_MODEL` | `qwen3.7-plus` | Model identifier |
 | `LEAPFLOW_LLM_MAX_RETRIES` | `3` | Retry attempts on transient LLM errors |
-| **Bridge / Host** | | |
-| `LEAPFLOW_BRIDGE_SOCKET` | `/tmp/leapflow.sock` | Unix socket for event push (observers) |
+| **Platform** | | |
 | `LEAPFLOW_MOCK_HOST` | `0` | `1` to use in-process mock (no execution backend) |
 | **Storage** | | |
 | `LEAPFLOW_DUCKDB_PATH` | `~/.leapflow/memory.duckdb` | Persistent DuckDB path |
@@ -247,7 +246,7 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 uv run leap --mock-host
 ```
 
-> You'll see the LeapFlow banner and a `>` prompt — you're in the interactive REPL.
+> You'll see the LeapFlow banner, session info (model, platform, cwd), and a `❯` prompt — you're in the rich interactive TUI.
 
 ### Step 2: Have a Conversation
 
@@ -386,6 +385,49 @@ Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` 
 
 ---
 
+## Terminal UI
+
+LeapFlow provides a rich interactive terminal experience built on [Rich](https://github.com/Textualize/rich) (output rendering) and [prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit) (input handling). The TUI activates automatically when you launch `leap` in a terminal.
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Markdown rendering** | LLM responses rendered as styled markdown with syntax-highlighted code blocks |
+| **Streaming display** | Real-time token streaming with live markdown updates via `rich.Live` |
+| **Tool activity** | Tool calls shown with elapsed timers; completed tools persist in scrollback |
+| **Thinking display** | LLM reasoning/thinking rendered in a dimmed panel |
+| **Persistent history** | Input history saved to `~/.leapflow/history` (Up/Down to navigate) |
+| **Command completion** | Tab-completion for all REPL commands |
+| **Multiline editing** | Alt+Enter inserts a newline for multi-line prompts |
+| **Status bar** | Live bottom toolbar: mode, skills, platform, model, context usage %, turn elapsed |
+| **Adaptive theming** | Automatic light/dark detection via `COLORFGBG` / `LEAPFLOW_TUI_THEME` |
+| **Session info** | Startup display showing model, platform status, cwd, and skill count |
+| **Mode indicators** | Prompt character changes with session mode (idle ❯ / recording ● / paused ⏸) |
+
+### Theme Configuration
+
+The TUI auto-detects your terminal background. Override with:
+
+```bash
+LEAPFLOW_TUI_THEME=light   # or: dark (default)
+```
+
+### Architecture
+
+```
+tui_app/
+├── theme.py      # Color palette + light/dark detection
+├── console.py    # Rich console wrapper (markdown, panels, tools, errors)
+├── input.py      # prompt_toolkit session (history, completion, keybindings)
+├── stream.py     # Live streaming renderer (markdown + tool timers)
+└── status.py     # Bottom toolbar (mode, context %, model, elapsed)
+```
+
+All output flows through `LeapConsole`, ensuring consistent theming. All input flows through `LeapInput`, providing history persistence and command completion. The `StreamRenderer` handles live-updating displays during LLM streaming with zero flicker.
+
+---
+
 ## Workflow Copilot (Preview)
 
 LeapFlow includes a **Workflow Copilot** that predicts your next action and offers proactive suggestions — like GitHub Copilot, but for any workflow on your computer.
@@ -518,9 +560,9 @@ leapflow/
 │   ├── skills/             # Skill library + execution
 │   ├── analysis/           # Trajectory denoising
 │   ├── memory/             # Three-tier memory system
-│   ├── recording/          # Video recording orchestration
+│   ├── recording/          # Trajectory recording orchestration
 │   ├── llm/                # LLM provider abstraction
-│   ├── platform/           # Platform adaptation layer (execution backend abstraction)
+│   ├── platform/           # Platform adaptation (CuaDriver client, observers, event bus)
 │   ├── domain/             # Shared types & events
 │   ├── storage/            # DuckDB persistence
 │   ├── tools/              # Built-in tool registry
@@ -588,7 +630,7 @@ uv run pytest -k "test_world_model" -q            # By keyword
 
 | Module | Role |
 |--------|------|
-| `perception/` | Multi-channel signal capture and fusion (video, AX tree, clipboard, keyboard, file system, etc.) |
+| `perception/` | Multi-channel signal capture and fusion (trajectory, AX tree, clipboard, keyboard, file system, etc.) |
 | `signal_fusion/` | Cross-modal temporal alignment and surprise detection |
 | `causal/` | Three-tier causal inference engine (rule → heuristic → VLM) |
 | `world_model/` | Predictive coding loop, experience store, curiosity-driven learning |
@@ -617,9 +659,9 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | Engine | `src/leapflow/engine/` | session, react_loop, tools | Session orchestration, ReAct loop, tool dispatch, context compression |
 | Memory | `src/leapflow/memory/` | working, episodic, long_term | Three-tier event-driven memory with promotion/eviction |
 | LLM | `src/leapflow/llm/` | provider, message_builder | LLM abstraction (OpenAI-compatible), streaming, retry logic |
-| Platform | `src/leapflow/platform/` | mcp_client, bridge, adapter | Platform adaptation layer — protocol client, event normalization, capability negotiation |
+| Platform | `src/leapflow/platform/` | cua_client, adapter, observers | Platform adaptation layer — CuaDriver MCP client, event normalization, observation daemon |
 | Domain | `src/leapflow/domain/` | events, perception, types | Shared domain types, event definitions, perception models |
-| Recording | `src/leapflow/recording/` | recorder, video, segmenter | Video recording orchestration, segmentation, caching |
+| Recording | `src/leapflow/recording/` | recorder, video, segmenter | Trajectory recording orchestration, segmentation, caching |
 | Tools | `src/leapflow/tools/` | registry, builtins | Built-in tool definitions for the ReAct loop |
 | CLI | `src/leapflow/cli/` | cli, commands/, banner | Argument parsing, subcommand dispatch, interactive REPL |
 | Storage | `src/leapflow/storage/` | duckdb, skill_library | DuckDB-backed persistent storage for skills, trajectories, audit |

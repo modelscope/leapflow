@@ -59,6 +59,10 @@ def _child_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(base if base is not None else os.environ)
     if _telemetry_disabled():
         env[_CUA_TELEMETRY_ENV_VAR] = "0"
+    # Suppress async update banner on stderr — it writes directly to the
+    # inherited FD (bypassing patch_stdout) and corrupts prompt_toolkit TUI.
+    if env.get("CUA_DRIVER_RS_UPDATE_CHECK", "").lower() not in ("1", "true", "yes"):
+        env["CUA_DRIVER_RS_UPDATE_CHECK"] = "0"
     return env
 
 
@@ -233,13 +237,16 @@ class _McpSession:
                 env=_child_env(),
             )
 
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    await self._discover_capabilities(session)
-                    self._session = session
-                    self._ready_event.set()
-                    await self._shutdown_event.wait()
+            # Route subprocess stderr away from the terminal — cua-driver logs
+            # and update notices must not corrupt prompt_toolkit rendering.
+            with open(os.devnull, "w", encoding="utf-8") as _devnull:
+                async with stdio_client(params, errlog=_devnull) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        await self._discover_capabilities(session)
+                        self._session = session
+                        self._ready_event.set()
+                        await self._shutdown_event.wait()
         except BaseException as e:
             self._setup_error = e
             self._ready_event.set()
@@ -609,7 +616,15 @@ class CuaDriverClient(HostRpc):
         """Gracefully shut down."""
         self._closed = True
         self._stop_keepalive()
-        self._session.stop()
+        # Suppress expected "Process group termination failed" from the MCP
+        # library during controlled shutdown — the fallback terminate works fine.
+        _mcp_logger = logging.getLogger("mcp.os.posix.utilities")
+        _prev_level = _mcp_logger.level
+        _mcp_logger.setLevel(logging.CRITICAL)
+        try:
+            self._session.stop()
+        finally:
+            _mcp_logger.setLevel(_prev_level)
         self._bridge.stop()
         logger.info("CuaDriverClient stopped")
 
@@ -713,8 +728,9 @@ class CuaDriverClient(HostRpc):
         """Translate a LeapFlow Methods constant to (cua_tool_name, args)."""
         if method == Methods.AX_TREE:
             args: Dict[str, Any] = {}
-            if "app" in params:
-                args["app"] = params["app"]
+            app = params.get("app") or params.get("bundle_id")
+            if app:
+                args["app"] = app
             if "window_id" in params:
                 args["window_id"] = params["window_id"]
             return "get_window_state", args
@@ -730,12 +746,12 @@ class CuaDriverClient(HostRpc):
             return "scroll", args
 
         elif method == Methods.APP_LAUNCH:
-            args = {"app_name": params.get("app_name", params.get("name", ""))}
-            return "launch_app", args
+            app = params.get("app_name") or params.get("name") or params.get("bundle_id", "")
+            return "launch_app", {"app_name": app}
 
         elif method == Methods.APP_ACTIVATE:
-            args = {"app_name": params.get("app_name", params.get("name", ""))}
-            return "launch_app", args
+            app = params.get("app_name") or params.get("name") or params.get("bundle_id", "")
+            return "launch_app", {"app_name": app}
 
         elif method == Methods.APP_LIST:
             return "list_apps", {}
@@ -751,23 +767,28 @@ class CuaDriverClient(HostRpc):
             return "hotkey", args
 
         elif method == Methods.SCREEN_CAPTURE_FRAME:
-            # Prefer screenshot tool if available, else get_window_state
+            app = params.get("app") or params.get("bundle_id")
             if self._session.has_tool("screenshot"):
                 args = {}
-                if "app" in params:
-                    args["app"] = params["app"]
+                if app:
+                    args["app"] = app
                 return "screenshot", args
             else:
                 args = {}
-                if "app" in params:
-                    args["app"] = params["app"]
+                if app:
+                    args["app"] = app
                 return "get_window_state", args
 
         elif method == Methods.RECORDING_START:
-            return "start_recording", params
+            args: Dict[str, Any] = {}
+            if "output_dir" in params:
+                args["output_dir"] = params["output_dir"]
+            if "record_video" in params:
+                args["record_video"] = params["record_video"]
+            return "start_recording", args
 
         elif method == Methods.RECORDING_STOP:
-            return "stop_recording", params
+            return "stop_recording", {}
 
         elif method == Methods.PING:
             return "list_apps", {}

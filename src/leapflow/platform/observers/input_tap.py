@@ -55,6 +55,10 @@ class InputTapObserver:
     def running(self) -> bool:
         return self._running
 
+    def set_throttle_ms(self, ms: int) -> None:
+        """Hot-reconfigure throttle window (e.g. for recording mode)."""
+        self._throttle_ms = max(0, ms)
+
     async def start(self) -> None:
         """Start capturing input. Idempotent."""
         if self._running:

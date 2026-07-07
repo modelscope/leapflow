@@ -10,7 +10,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
 
 from leapflow.platform.protocol import HostRpc, Methods
 from leapflow.config import Settings
@@ -25,6 +25,16 @@ from leapflow.engine.error_classifier import (
 from leapflow.engine.execution_trace import ExecutionMode, ExecutionTrace
 from leapflow.engine.intent_classifier import Intent, IntentClassifier
 from leapflow.engine.message_healer import MessageHealer
+from leapflow.engine.message_sanitizer import MessageSanitizer
+from leapflow.engine.prompt_cache import CacheStrategy
+from leapflow.engine.stale_stream import StaleStreamError, stale_guarded_stream, build_continuation_prompt
+from leapflow.engine.turn_recovery import TurnRecoveryState
+from leapflow.engine.turn_usage import TurnUsageTracker
+from leapflow.engine.tool_concurrency import (
+    DefaultConcurrencyPolicy,
+    ToolCall as ConcurrentToolCall,
+    ToolConcurrencyPolicy,
+)
 from leapflow.engine.shortcuts import ShortcutStore
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.scheduler import TaskScheduler
@@ -52,7 +62,10 @@ logger = logging.getLogger(__name__)
 
 def _log_progress(msg: str) -> None:
     """Print a persistent progress line to stderr (visible to user during `leap run`)."""
-    sys.stderr.write(f"\033[2m\u2192 {msg}\033[0m\n")
+    if sys.stderr.isatty():
+        sys.stderr.write(f"\033[2m\u2192 {msg}\033[0m\n")
+    else:
+        sys.stderr.write(f"→ {msg}\n")
     sys.stderr.flush()
 
 
@@ -116,7 +129,10 @@ def _print_tool_result(tool_name: str, result: Any, *, enabled: bool = True) -> 
     # Truncate
     if len(preview) > 120:
         preview = preview[:117] + "..."
-    sys.stdout.write(f"\033[2m  \u21b3 {tool_name}: {preview}\033[0m\n")
+    if sys.stdout.isatty():
+        sys.stdout.write(f"\033[2m  \u21b3 {tool_name}: {preview}\033[0m\n")
+    else:
+        sys.stdout.write(f"  ↳ {tool_name}: {preview}\n")
     sys.stdout.flush()
 
 
@@ -131,6 +147,28 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
 def _keywords_from_query(q: str) -> list[str]:
     toks = re.findall(r"[\w\-./]+|[\u4e00-\u9fff]+", q)
     return [t for t in toks if len(t) >= 2][:12]
+
+
+@dataclass(frozen=True, slots=True)
+class StreamEvent:
+    """Typed event emitted during streaming execution.
+
+    Event types (extensible via Literal union):
+    - chunk: intermediate token fragment, safe to display immediately.
+    - final: assembled complete response (full content).
+    - tool_start: tool execution beginning (content = tool name).
+    - tool_complete: tool execution finished (content = brief result).
+    - thinking: reasoning/thinking phase indicator.
+    - status: lifecycle status update.
+    - error: error notification.
+    """
+
+    type: Literal[
+        "chunk", "final", "tool_start", "tool_complete",
+        "thinking", "status", "error",
+    ]
+    content: str
+    metadata: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -174,6 +212,7 @@ class AgentEngine:
         tool_bridge: Optional[Any] = None,
         skill_injector: Optional[Any] = None,
         skill_index: Optional[Any] = None,
+        concurrency_policy: Optional[ToolConcurrencyPolicy] = None,
     ) -> None:
         self._settings = settings
         self._rpc = rpc
@@ -187,7 +226,11 @@ class AgentEngine:
         self._shortcuts = shortcuts
         self._imitation = imitation
         self._skill_library = skill_library
-        self._skill_merger = SkillMerger()
+        self._skill_merger = SkillMerger(
+            registry=registry,
+            llm=llm,
+            execution=execution,
+        )
         self._graph_planner = graph_planner
         self._scheduler = scheduler
         self._perception = perception
@@ -208,6 +251,54 @@ class AgentEngine:
         # Skill discovery (SkillInjector for slash commands)
         self._skill_injector = skill_injector
 
+        # Tool concurrency policy (None = sequential fallback)
+        self._concurrency_policy: Optional[ToolConcurrencyPolicy] = (
+            concurrency_policy if concurrency_policy is not None else DefaultConcurrencyPolicy()
+        )
+
+        # Session persistence (injected by CLI)
+        self._conversation_store: Optional[Any] = None
+        self._current_session_id: Optional[str] = None
+
+        # Memory context snapshot (frozen at session start for prefix cache stability)
+        self._memory_context_snapshot: Optional[str] = None
+
+        # Cancellation: tracks active task for interrupt support
+        self._active_task: Optional[asyncio.Task] = None
+        self._cancel_requested = False
+
+        # Tool loop guardrails (injected by CLI)
+        self._guardrail: Optional[Any] = None
+
+        # Optional override for dynamic tool result budget (set by CLI wiring)
+        self._tool_result_budget: Optional[int] = None
+
+        # Per-turn usage tracking
+        self._usage_tracker = TurnUsageTracker()
+
+        # Per-tool timeout (seconds); can be overridden via set_tool_timeouts
+        self._default_tool_timeout_s: float = 120.0
+        self._tool_timeouts: Dict[str, float] = {}
+
+        # Stale stream timeout
+        self._stale_stream_timeout_s: float = 180.0
+
+        # Evolution store for incremental persistence (injected by CLI)
+        self._evolution_store: Optional[Any] = None
+
+        # EventBus for learning signal emission (injected by CLI)
+        self._event_bus: Optional[Any] = None
+
+        # ExperienceStore bridge for world-model trajectory data (injected by CLI)
+        self._experience_store: Optional[Any] = None
+
+        # Model capability registry (injected by CLI)
+        self._model_capabilities: Optional[Any] = None
+
+        # Session-level counters (survive per-turn tracker resets)
+        self._session_turn_count: int = 0
+        self._last_context_tokens: int = 0
+
         # State-machine loop infrastructure (config-driven)
         self._budget_config = BudgetConfig(
             max_iterations=settings.react_max_iterations,
@@ -227,9 +318,255 @@ class AgentEngine:
         ))
         self._healer = MessageHealer()
 
+        # B2: Prompt cache optimization (None = disabled)
+        self._cache_strategy: CacheStrategy | None = None
+
+        # B4: Output sanitization (None = disabled)
+        self._sanitizer: MessageSanitizer | None = None
+
+    # ── Optional strategy setters (config-driven) ────────────────────────
+
+    def set_cache_strategy(self, strategy: CacheStrategy | None) -> None:
+        """Configure prompt cache optimization strategy."""
+        self._cache_strategy = strategy
+
+    def set_sanitizer(self, sanitizer: MessageSanitizer | None) -> None:
+        """Configure output message sanitizer."""
+        self._sanitizer = sanitizer
+
+    def set_tool_result_budget(self, budget: int) -> None:
+        """Override per-tool result truncation budget (e.g. linked to model context)."""
+        self._tool_result_budget = max(1, budget)
+
+    def _effective_tool_result_budget(self) -> int:
+        return self._tool_result_budget or self._settings.max_tool_result_chars
+
+    async def _handle_api_error(
+        self,
+        classified: ErrorCategory,
+        rec: Any,
+        recovery: TurnRecoveryState,
+        messages: list,
+        budget: Any,
+        *,
+        use_native_tools: bool = False,
+        tools_kwarg: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Unified API error recovery dispatcher. Returns 'continue' to retry, else None.
+
+        Wires ALL TurnRecoveryState one-shot guards to their matching ErrorCategory:
+        - CONTEXT_OVERFLOW → try_compress
+        - IMAGE_TOO_LARGE → try_multimodal_strip
+        - should_fallback → try_provider_failover
+        - should_rotate_credential → try_credential_rotate
+        - FORMAT_ERROR with thinking → try_disable_thinking
+        """
+        if classified == ErrorCategory.CONTEXT_OVERFLOW and recovery.try_compress():
+            messages[:] = self._compressor.force_compress(messages)
+            logger.info("recovery: force_compress on context overflow")
+            if budget.remaining > 0:
+                return "continue"
+
+        if classified == ErrorCategory.IMAGE_TOO_LARGE and recovery.try_multimodal_strip():
+            self._strip_images_from_messages(messages)
+            logger.info("recovery: stripped images from messages")
+            if budget.remaining > 0:
+                return "continue"
+
+        if rec.should_fallback and recovery.try_provider_failover():
+            llm = self._llm
+            if hasattr(llm, '_failover'):
+                llm._failover("recovery: provider failover")
+            logger.info("recovery: provider failover triggered")
+            if budget.remaining > 0:
+                return "continue"
+
+        if rec.should_rotate_credential and recovery.try_credential_rotate():
+            logger.info("recovery: credential rotation requested")
+            if budget.remaining > 0:
+                return "continue"
+
+        if classified == ErrorCategory.FORMAT_ERROR and recovery.try_disable_thinking():
+            logger.info("recovery: disabled thinking mode")
+            if budget.remaining > 0:
+                return "continue"
+
+        if rec.retry and budget.remaining > 0:
+            if rec.backoff:
+                await asyncio.sleep(jittered_backoff(budget.used, base=rec.base_delay))
+            return "continue"
+
+        return None
+
+    _DEFAULT_LIVE_SIGNAL_KINDS = frozenset({
+        "app.focus_change", "fs.change", "context.change", "intent.signal",
+    })
+
+    def _inject_live_signals(self, messages: list, watermark: list) -> None:
+        """Inject high-priority WM events arrived since ``watermark[0]``.
+
+        Uses a mutable watermark list (single-element) so the caller's
+        timestamp advances after each injection, preventing duplicate
+        signal messages across loop iterations.
+        """
+        since_ts = watermark[0]
+        raw = getattr(self._settings, "live_signal_kinds", "")
+        signal_kinds = frozenset(k.strip() for k in raw.split(",") if k.strip()) if raw else self._DEFAULT_LIVE_SIGNAL_KINDS
+        recent = self._wm.get_events_since(since_ts)
+        relevant = [
+            e for e in recent
+            if e.get("_event_kind") in signal_kinds
+        ]
+        if not relevant:
+            return
+        lines = []
+        for ev in relevant[-5:]:
+            text = ev.get("_event_text", "")
+            if text:
+                lines.append(str(text)[:120])
+            else:
+                lines.append(str(ev.get("content", ""))[:120])
+        summary = "; ".join(lines)
+        messages.append(build_system_message(f"[LIVE SIGNAL] {summary}"))
+        watermark[0] = time.time()
+
+    @staticmethod
+    def _strip_images_from_messages(messages: list) -> None:
+        """Remove image content parts from messages in-place (multimodal strip)."""
+        for i, msg in enumerate(messages):
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_parts = [
+                    p for p in content
+                    if isinstance(p, dict) and p.get("type") != "image_url"
+                    and p.get("type") != "input_image" and p.get("type") != "image"
+                ]
+                if len(text_parts) < len(content):
+                    if text_parts:
+                        messages[i] = {**msg, "content": text_parts}
+                    else:
+                        messages[i] = {**msg, "content": "[images removed to reduce context]"}
+
+    def _check_guardrail(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Run guardrail check. Returns 'halt' if loop should stop, else None."""
+        if self._guardrail is None:
+            return None
+        violation = self._guardrail.check(messages)
+        if not violation.violated:
+            return None
+        logger.warning("guardrail: %s", violation.reason)
+        if violation.severity == "halt":
+            messages.append(build_user_message_text(
+                f"SYSTEM GUARDRAIL: {violation.reason}. {violation.suggestion}"
+            ))
+            return "halt"
+        messages.append(build_user_message_text(
+            f"SYSTEM WARNING: {violation.reason}. {violation.suggestion}"
+        ))
+        return None
+
+    def set_tool_timeouts(self, timeouts: Dict[str, float]) -> None:
+        """Set per-tool execution timeout overrides (seconds)."""
+        self._tool_timeouts = dict(timeouts)
+
+    def set_default_tool_timeout(self, timeout_s: float) -> None:
+        self._default_tool_timeout_s = max(5.0, timeout_s)
+
+    def set_stale_stream_timeout(self, timeout_s: float) -> None:
+        self._stale_stream_timeout_s = max(30.0, timeout_s)
+
+    def set_evolution_store(self, store: Any) -> None:
+        """Inject evolution store for incremental episode persistence."""
+        self._evolution_store = store
+
+    def set_model_capabilities(self, registry: Any) -> None:
+        """Inject model capability registry."""
+        self._model_capabilities = registry
+
+    def set_doc_store(self, doc_store: Any) -> None:
+        """Inject SkillDocStore so SkillMerger can sync SKILL.md on approve."""
+        self._skill_merger.set_doc_store(doc_store)
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Inject EventBus for emitting learning signals (episode events)."""
+        self._event_bus = event_bus
+
+    def set_experience_store(self, store: Any) -> None:
+        """Inject ExperienceStore for world-model trajectory bridge."""
+        self._experience_store = store
+
+    def set_conversation_store(self, store: Any) -> None:
+        """Inject conversation persistence store."""
+        self._conversation_store = store
+
+    def load_session(self, session_id: str) -> bool:
+        """Resume a previous session by loading messages from DuckDB.
+
+        Returns True if the session was found and messages loaded.
+        """
+        if not self._conversation_store:
+            return False
+        try:
+            messages = self._conversation_store.get_messages(session_id, limit=500)
+            if not messages:
+                return False
+            self._current_session_id = session_id
+            for msg in messages:
+                role = msg.role
+                content = msg.content
+                if role == "user":
+                    self._wm.remember_chat(build_user_message_text(content))
+                elif role == "assistant":
+                    self._wm.remember_chat(build_assistant_message(content))
+            logger.info("session.resume loaded %d messages from %s", len(messages), session_id)
+            return True
+        except Exception:
+            logger.debug("session.resume failed", exc_info=True)
+            return False
+
+    def cancel(self) -> None:
+        """Request cancellation of the active run/run_stream call.
+
+        Thread-safe: can be called from signal handlers or other threads.
+        Cancels the active asyncio task if one is tracked.
+        """
+        self._cancel_requested = True
+        task = self._active_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancel_requested
+
+    @property
+    def model_capabilities(self) -> Optional[Any]:
+        """Model capability registry (``ModelCapabilityRegistry``)."""
+        return self._model_capabilities
+
+    @property
+    def usage_tracker(self) -> "TurnUsageTracker":
+        """Current-turn usage accumulator."""
+        return self._usage_tracker
+
+    @property
+    def turn_count(self) -> int:
+        """Number of completed user turns in this session."""
+        return self._session_turn_count
+
+    @property
+    def context_token_count(self) -> int:
+        """Prompt tokens from the most recent API call (context utilization)."""
+        return self._last_context_tokens
+
     async def run(self, user_text: str, *, enable_thinking: bool = False) -> str:
         """Entrypoint: simplified routing with unified tool loop as default path."""
+        self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
+        self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
 
         # 1. Shortcut match (zero cost, exact keyword)
         if self._shortcuts:
@@ -259,9 +596,18 @@ class AgentEngine:
 
     async def run_stream(
         self, user_text: str, *, enable_thinking: bool = False
-    ) -> AsyncIterator[str]:
-        """Like run(), but yields text chunks for streamable responses."""
+    ) -> AsyncIterator[Union[str, StreamEvent]]:
+        """Like run(), but yields text chunks for streamable responses.
+
+        Yields:
+            str: legacy plain-text chunks (shortcuts, teach commands).
+            StreamEvent(type="chunk"): real-time token fragments.
+            StreamEvent(type="final"): complete assembled response.
+            StreamEvent(type="tool_call"): internal tool invocation (suppress display).
+        """
+        self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
+        self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
 
         # 1. Shortcut match (zero cost)
         if self._shortcuts:
@@ -695,24 +1041,8 @@ class AgentEngine:
         # Build tool catalog text (for system prompt readability)
         tool_catalog = self._format_tool_catalog(TOOL_DEFINITIONS)
 
-        # Build memory context from long-term memory
-        memory_context = ""
-        if self._memory_manager and self._settings.memory_integration_enabled:
-            try:
-                entries = await asyncio.wait_for(
-                    self._memory_manager.prefetch(
-                        user_text, limit=self._settings.memory_prefetch_limit,
-                    ),
-                    timeout=self._settings.memory_prefetch_timeout_s,
-                )
-                if entries:
-                    memory_context = "## Recent Context\n" + "\n".join(
-                        f"- [{e.kind.value}] {e.content[:100]}" for e in entries
-                    )
-            except Exception:
-                pass
+        memory_context = await self._prefetch_and_freeze_memory(user_text)
 
-        # Build skill section (conditionally included)
         skill_section = ""
         if self._skill_index:
             entries = self._skill_index.get_entries()
@@ -750,22 +1080,36 @@ class AgentEngine:
         ]
 
         content = ""
+        recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
+        result_budget = self._effective_tool_result_budget()
+        self._usage_tracker.reset()
 
-        # Prepare tools kwarg for native tool calling
         tools_kwarg: Dict[str, Any] = {}
         if use_native_tools and TOOL_DEFINITIONS:
             tools_kwarg["tools"] = TOOL_DEFINITIONS
 
-        # Loop: LLM response → parse → tool_call or final answer
+        self._cancel_requested = False
+        _signal_watermark = [time.time()]
+
+        session_id = self._ensure_session(user_text)
+
         while not budget.exhausted:
+            if self._cancel_requested:
+                logger.info("unified_loop: cancelled by user")
+                break
+
             status = budget.consume()
             if status == BudgetStatus.EXHAUSTED:
                 break
 
-            # Heal + compress
+            self._inject_live_signals(messages, _signal_watermark)
+
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)
+            compressed = self._compressor.preflight_check(compressed)
+            if self._cache_strategy:
+                compressed = self._cache_strategy.optimize(compressed)
 
             _show_progress("thinking", f"round {budget.used}")
             try:
@@ -773,15 +1117,31 @@ class AgentEngine:
                     compressed, stream=False, enable_thinking=enable_thinking,
                     **tools_kwarg,
                 )
+                recovery.record_api_success()
+                usage = resp.usage or {}
+                self._usage_tracker.record_api_call(
+                    usage,
+                    provider=getattr(self._llm, 'active_provider_name', ''),
+                    model=resp.model or '',
+                )
+                self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
+                if self._model_capabilities and resp.model and usage:
+                    self._model_capabilities.update_from_usage(resp.model, usage)
             except Exception as exc:
                 _clear_indicator()
-                category = self._error_classifier.classify(exc)
-                recovery = self._error_classifier.get_recovery(category)
-                if recovery.retry and budget.remaining > 0:
-                    await asyncio.sleep(jittered_backoff(budget.used))
+                classified = self._error_classifier.classify(exc)
+                rec = self._error_classifier.get_recovery(classified)
+                category_str = classified.value if hasattr(classified, 'value') else str(classified)
+                recovery.record_api_error(category_str)
+
+                if await self._handle_api_error(
+                    classified, rec, recovery, messages, budget,
+                    use_native_tools=use_native_tools, tools_kwarg=tools_kwarg,
+                ) == "continue":
+                    if classified == ErrorCategory.CONTEXT_OVERFLOW:
+                        self._usage_tracker.mark_compression()
                     continue
-                # If native tools caused the error, retry without them
-                if use_native_tools and tools_kwarg:
+                if classified in (ErrorCategory.FORMAT_ERROR,) and tools_kwarg and recovery.try_native_fallback():
                     logger.info("Native tool calling failed, falling back to text mode")
                     tools_kwarg = {}
                     use_native_tools = False
@@ -790,11 +1150,19 @@ class AgentEngine:
             _clear_indicator()
 
             content = (resp.content or "").strip()
+            if self._sanitizer:
+                content = self._sanitizer.sanitize(content)
 
-            # Check for native tool_calls first (more reliable)
+            # Length continuation: if LLM hit max_tokens, attempt continuation
+            finish = getattr(resp, 'finish_reason', None)
+            if finish in ("length", "max_tokens") and recovery.try_length_continuation():
+                logger.info("unified_loop: length continuation (finish_reason=%s)", finish)
+                messages.append(build_assistant_message(content))
+                messages.append(build_user_message_text(build_continuation_prompt(content)))
+                continue
+
             native_calls = getattr(resp, "tool_calls", None) or []
             if native_calls:
-                # Build assistant message with tool_calls metadata
                 assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
                 assistant_msg["tool_calls"] = [
                     {
@@ -805,26 +1173,21 @@ class AgentEngine:
                     for tc in native_calls
                 ]
                 messages.append(assistant_msg)
+                self._persist_message(session_id, "assistant", content, tool_calls=assistant_msg.get("tool_calls"))
 
-                # Execute each native tool call
-                for i, tc in enumerate(native_calls):
-                    _show_progress("executing", tc.name, step=i + 1, total=len(native_calls))
-                    tool_call_dict = {"name": tc.name, "arguments": tc.arguments}
-                    result = await self._execute_general_tool(tool_call_dict, TOOL_HANDLERS)
-                    _clear_indicator()
-                    _print_tool_result(tc.name, result, enabled=self._settings.verbose_progress)
-                    trace.record(
-                        ExecutionMode.ACTING,
-                        action=tool_call_dict,
-                        observation=result if isinstance(result, dict) else {"result": str(result)},
-                    )
-                    result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
-                    # Append tool result in OpenAI format
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result_text,
-                    })
+                await self._execute_tools_concurrent(
+                    native_calls, TOOL_HANDLERS, trace=trace, messages=messages,
+                )
+
+                failures = self._count_consecutive_tool_failures(messages)
+                recovery.consecutive_tool_failures = failures
+                if failures >= self._settings.max_consecutive_tool_failures:
+                    logger.warning("unified_loop: %d consecutive tool failures, stopping", failures)
+                    break
+
+                # Guardrail check after tool execution
+                if self._check_guardrail(messages) == "halt":
+                    break
 
                 self._wm.remember_chat(build_assistant_message(
                     content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
@@ -836,18 +1199,14 @@ class AgentEngine:
                     ))
                 continue
 
-            # Fallback: text-based tool call parsing
             self._wm.remember_chat(build_assistant_message(content))
+            self._persist_message(session_id, "assistant", content)
             tool_call = self._parse_tool_call_from_content(content)
 
             if tool_call is None:
-                # Pure text response — done (guard against empty content)
                 trace.record(ExecutionMode.COMPLETE)
-                if not content:
-                    return "I processed your request but have no additional output."
-                return content
+                break
 
-            # Execute text-parsed tool
             messages.append(build_assistant_message(content))
             _show_progress("executing", tool_call['name'])
             result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
@@ -859,26 +1218,165 @@ class AgentEngine:
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
 
-            result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
+            is_error = isinstance(result, dict) and not result.get("ok", True)
+            if is_error:
+                recovery.record_tool_failure()
+                if recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                    logger.warning("unified_loop: %d consecutive tool failures, stopping",
+                                   recovery.consecutive_tool_failures)
+                    break
+            else:
+                recovery.record_tool_success()
+
+            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
             messages.append(build_user_message_text(
                 f"Tool result ({tool_call['name']}):\n{result_text}"
             ))
+            self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
+
+            if self._check_guardrail(messages) == "halt":
+                break
 
             if status == BudgetStatus.SOFT_LIMIT:
                 messages.append(build_user_message_text(
                     "SYSTEM: Approaching limit. Provide final answer now."
                 ))
 
-        # Budget exhausted
+        if self._memory_manager and self._settings.memory_integration_enabled:
+            asyncio.create_task(self._sync_turn_safe(messages))
+
+        if self._evolution is not None and content:
+            asyncio.create_task(self._post_turn_review(messages, content))
+
+        llm = self._llm
+        if hasattr(llm, 'try_restore_primary'):
+            llm.try_restore_primary()
+
+        logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
+
         return content if content else "I've reached my processing limit."
+
+    async def _post_turn_review(
+        self, messages: List[Dict[str, Any]], final_content: str
+    ) -> None:
+        """Background post-turn review: detect memorable patterns and persist episodes.
+
+        Scans the turn's tool calls for interesting patterns (successes, failures)
+        and records them as skill episodes for evolution learning. Delegates
+        persistence, world-model bridging, and event emission to focused helpers.
+        """
+        try:
+            tool_actions: List[Dict[str, Any]] = []
+            for msg in messages:
+                if msg.get("role") == "assistant":
+                    for tc in (msg.get("tool_calls") or []):
+                        fn = tc.get("function", {})
+                        tool_actions.append({
+                            "tool": fn.get("name", ""),
+                            "args_preview": fn.get("arguments", "")[:100],
+                        })
+
+            if not tool_actions:
+                return
+
+            has_success = any(
+                '"ok": true' in m.get("content", "") or '"ok":true' in m.get("content", "")
+                for m in messages if m.get("role") in ("tool", "user")
+            )
+            has_failure = any(
+                '"ok": false' in m.get("content", "") or '"ok":false' in m.get("content", "")
+                for m in messages if m.get("role") in ("tool", "user")
+            )
+
+            reward = 0.5
+            if has_success and not has_failure:
+                reward = 1.0
+            elif has_failure and not has_success:
+                reward = -0.5
+
+            skill_name = tool_actions[0]["tool"] if tool_actions else "unknown"
+            episode_context = {"final_content_preview": final_content[:200]}
+            episode_context.update(self._usage_tracker.to_learning_signal())
+            episode = self._evolution.record_episode(
+                skill_name=f"turn_{skill_name}",
+                actions=tool_actions[:10],
+                outcome="completed" if has_success else "mixed",
+                reward=reward,
+                context=episode_context,
+            )
+
+            self._persist_episode(episode)
+            self._bridge_to_experience_store(episode, tool_actions, reward, has_success, has_failure)
+            self._emit_episode_event(episode, reward)
+        except Exception:
+            logger.debug("post_turn_review failed", exc_info=True)
+
+    def _persist_episode(self, episode: Any) -> None:
+        """Incremental persistence: write episode to DuckDB immediately."""
+        if self._evolution_store is None or episode is None:
+            return
+        try:
+            self._evolution_store.save_episode(
+                episode_id=episode.episode_id,
+                skill_name=episode.skill_name,
+                actions=episode.actions,
+                outcome=episode.outcome,
+                reward=episode.reward,
+                context=episode.context,
+                timestamp=episode.timestamp,
+            )
+        except Exception:
+            logger.debug("evolution_store.save_episode failed", exc_info=True)
+
+    def _bridge_to_experience_store(
+        self, episode: Any, tool_actions: List[Dict[str, Any]],
+        reward: float, has_success: bool, has_failure: bool,
+    ) -> None:
+        """Bridge tool-loop outcomes to ExperienceStore for world-model trajectory."""
+        if self._experience_store is None or episode is None:
+            return
+        try:
+            tool_names = ",".join(a.get("tool", "") for a in tool_actions[:3])
+            self._experience_store.store(
+                action_description=f"chat_tools:{tool_names}",
+                app_context="",
+                predicted_effect="",
+                actual_effect=episode.outcome,
+                delta=abs(reward),
+                grade_label="helpful" if has_success and not has_failure else "mixed",
+            )
+        except Exception:
+            logger.debug("experience_store.store failed", exc_info=True)
+
+    def _emit_episode_event(self, episode: Any, reward: float) -> None:
+        """Emit high-value episodes to EventBus for active learning consumption."""
+        if episode is None or self._event_bus is None:
+            return
+        threshold = getattr(self._settings, "episode_emit_reward_threshold", 0.8)
+        if abs(reward) < threshold:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._event_bus.handle_event(
+                "learning.episode_recorded",
+                {
+                    "skill_name": episode.skill_name,
+                    "reward": episode.reward,
+                    "actions": [a.get("tool", "") for a in episode.actions[:5]],
+                    "outcome": episode.outcome,
+                },
+            ))
+        except RuntimeError:
+            pass
 
     async def _unified_tool_loop_stream(
         self, user_text: str, *, enable_thinking: bool = False
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[Union[str, StreamEvent]]:
         """Streaming variant of _unified_tool_loop.
 
-        Yields text chunks for the final response. Shows transient progress
-        indicators on stderr for thinking and tool-execution phases.
+        Yields StreamEvent objects for real-time token streaming and final
+        responses. Shows transient progress indicators on stderr for thinking
+        and tool-execution phases.
         """
         # Reuse the same setup logic as _unified_tool_loop
         if user_text.startswith("/"):
@@ -897,24 +1395,8 @@ class AgentEngine:
 
         tool_catalog = self._format_tool_catalog(TOOL_DEFINITIONS)
 
-        # Memory context prefetch
-        memory_context = ""
-        if self._memory_manager and self._settings.memory_integration_enabled:
-            try:
-                entries = await asyncio.wait_for(
-                    self._memory_manager.prefetch(
-                        user_text, limit=self._settings.memory_prefetch_limit,
-                    ),
-                    timeout=self._settings.memory_prefetch_timeout_s,
-                )
-                if entries:
-                    memory_context = "## Recent Context\n" + "\n".join(
-                        f"- [{e.kind.value}] {e.content[:100]}" for e in entries
-                    )
-            except Exception:
-                pass
+        memory_context = await self._prefetch_and_freeze_memory(user_text)
 
-        # Skill section
         skill_section = ""
         if self._skill_index:
             idx_entries = self._skill_index.get_entries()
@@ -948,46 +1430,87 @@ class AgentEngine:
         ]
 
         content = ""
+        turn_recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
+        result_budget = self._effective_tool_result_budget()
+        self._usage_tracker.reset()
 
         tools_kwarg: Dict[str, Any] = {}
         if use_native_tools and TOOL_DEFINITIONS:
             tools_kwarg["tools"] = TOOL_DEFINITIONS
 
-        # Loop: LLM -> parse -> tool_call or stream final answer
+        session_id = self._ensure_session(user_text)
+
+        self._cancel_requested = False
+        _signal_watermark = [time.time()]
+
         while not budget.exhausted:
+            if self._cancel_requested:
+                logger.info("unified_loop_stream: cancelled by user")
+                break
+
             status = budget.consume()
             if status == BudgetStatus.EXHAUSTED:
                 break
 
+            self._inject_live_signals(messages, _signal_watermark)
+
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)
+            compressed = self._compressor.preflight_check(compressed)
+            if self._cache_strategy:
+                compressed = self._cache_strategy.optimize(compressed)
 
-            _show_progress("thinking", f"round {budget.used}")
+            yield StreamEvent(type="thinking", content=f"round {budget.used}")
 
-            # When native tools are enabled we need stream=False for tool_calls
+            content = ""
+
             if use_native_tools and tools_kwarg:
                 try:
                     resp = await self._llm.achat(
                         compressed, stream=False, enable_thinking=enable_thinking,
                         **tools_kwarg,
                     )
+                    turn_recovery.record_api_success()
+                    usage = resp.usage or {}
+                    self._usage_tracker.record_api_call(
+                        usage,
+                        provider=getattr(self._llm, 'active_provider_name', ''),
+                        model=resp.model or '',
+                    )
+                    self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
                 except Exception as exc:
                     _clear_indicator()
-                    category = self._error_classifier.classify(exc)
-                    recovery = self._error_classifier.get_recovery(category)
-                    if recovery.retry and budget.remaining > 0:
-                        await asyncio.sleep(jittered_backoff(budget.used))
+                    classified = self._error_classifier.classify(exc)
+                    rec = self._error_classifier.get_recovery(classified)
+                    turn_recovery.record_api_error()
+
+                    if await self._handle_api_error(
+                        classified, rec, turn_recovery, messages, budget,
+                        use_native_tools=use_native_tools, tools_kwarg=tools_kwarg,
+                    ) == "continue":
                         continue
-                    if use_native_tools and tools_kwarg:
+                    if tools_kwarg and turn_recovery.try_native_fallback():
                         logger.info("Native tool calling failed, falling back to text mode")
                         tools_kwarg = {}
                         use_native_tools = False
                         continue
+                    yield StreamEvent(type="error", content=str(exc))
                     break
                 _clear_indicator()
 
                 content = (resp.content or "").strip()
+                if self._sanitizer:
+                    content = self._sanitizer.sanitize(content)
+
+                # Length continuation for native tool path
+                finish = getattr(resp, 'finish_reason', None)
+                if finish in ("length", "max_tokens") and turn_recovery.try_length_continuation():
+                    logger.info("unified_loop_stream: length continuation")
+                    messages.append(build_assistant_message(content))
+                    messages.append(build_user_message_text(build_continuation_prompt(content)))
+                    continue
+
                 native_calls = getattr(resp, "tool_calls", None) or []
                 if native_calls:
                     assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
@@ -1000,24 +1523,27 @@ class AgentEngine:
                         for tc in native_calls
                     ]
                     messages.append(assistant_msg)
+                    self._persist_message(
+                        session_id, "assistant", content,
+                        tool_calls=assistant_msg.get("tool_calls"),
+                    )
 
-                    for i, tc in enumerate(native_calls):
-                        _show_progress("executing", tc.name, step=i + 1, total=len(native_calls))
-                        tool_call_dict = {"name": tc.name, "arguments": tc.arguments}
-                        result = await self._execute_general_tool(tool_call_dict, TOOL_HANDLERS)
-                        _clear_indicator()
-                        _print_tool_result(tc.name, result, enabled=self._settings.verbose_progress)
-                        trace.record(
-                            ExecutionMode.ACTING,
-                            action=tool_call_dict,
-                            observation=result if isinstance(result, dict) else {"result": str(result)},
-                        )
-                        result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result_text,
-                        })
+                    for tc in native_calls:
+                        yield StreamEvent(type="tool_start", content=tc.name)
+                    await self._execute_tools_concurrent(
+                        native_calls, TOOL_HANDLERS, trace=trace, messages=messages
+                    )
+                    for tc in native_calls:
+                        yield StreamEvent(type="tool_complete", content=tc.name)
+
+                    failures = self._count_consecutive_tool_failures(messages)
+                    turn_recovery.consecutive_tool_failures = failures
+                    if failures >= self._settings.max_consecutive_tool_failures:
+                        logger.warning("unified_loop_stream: %d consecutive tool failures, stopping", failures)
+                        break
+
+                    if self._check_guardrail(messages) == "halt":
+                        break
 
                     self._wm.remember_chat(build_assistant_message(
                         content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
@@ -1028,87 +1554,146 @@ class AgentEngine:
                         ))
                     continue
 
-                # No tool calls - final answer; yield content
-                self._wm.remember_chat(build_assistant_message(content))
-                trace.record(ExecutionMode.COMPLETE)
-                if not content:
-                    yield "I processed your request but have no additional output."
-                else:
-                    yield content
-                return
-
             else:
-                # Non-native path: use streaming for real-time output when enabled
                 if self._settings.stream_output:
-                    # Stream chunks and yield them in real-time to the caller
-                    chunks_collected: list[str] = []
+                    content_parts: list[str] = []
                     try:
                         _clear_indicator()
-                        async for chunk in self._llm.achat_stream(
+                        raw_stream = self._llm.achat_stream(
                             compressed, enable_thinking=enable_thinking,
-                        ):
-                            chunks_collected.append(chunk)
+                        )
+                        guarded = stale_guarded_stream(
+                            raw_stream, timeout_s=self._stale_stream_timeout_s,
+                        )
+                        async for chunk in guarded:
+                            content_parts.append(chunk)
+                            yield StreamEvent(type="chunk", content=chunk)
+                        turn_recovery.record_api_success()
+                    except StaleStreamError as stale_exc:
+                        _clear_indicator()
+                        partial = stale_exc.partial_text or "".join(content_parts)
+                        if partial.strip() and turn_recovery.try_length_continuation():
+                            logger.warning("stale_stream: recovering with %d chars partial", len(partial))
+                            content = partial.strip()
+                            messages.append(build_assistant_message(content))
+                            messages.append(build_user_message_text(
+                                build_continuation_prompt(content)
+                            ))
+                            continue
+                        yield StreamEvent(type="error", content=str(stale_exc))
+                        break
                     except Exception as exc:
                         _clear_indicator()
-                        category = self._error_classifier.classify(exc)
-                        recovery = self._error_classifier.get_recovery(category)
-                        if recovery.retry and budget.remaining > 0:
-                            await asyncio.sleep(jittered_backoff(budget.used))
+                        classified = self._error_classifier.classify(exc)
+                        rec = self._error_classifier.get_recovery(classified)
+                        turn_recovery.record_api_error()
+                        if await self._handle_api_error(
+                            classified, rec, turn_recovery, messages, budget,
+                        ) == "continue":
                             continue
+                        yield StreamEvent(type="error", content=str(exc))
                         break
 
-                    content = "".join(chunks_collected).strip()
+                    content = "".join(content_parts).strip()
+                    if self._sanitizer:
+                        content = self._sanitizer.sanitize(content)
                 else:
-                    # Buffered mode (stream_output=False): single request
                     try:
                         resp = await self._llm.achat(
                             compressed, stream=False, enable_thinking=enable_thinking,
                         )
+                        turn_recovery.record_api_success()
+                        usage = resp.usage or {}
+                        self._usage_tracker.record_api_call(
+                            usage,
+                            provider=getattr(self._llm, 'active_provider_name', ''),
+                            model=resp.model or '',
+                        )
+                        self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
                     except Exception as exc:
                         _clear_indicator()
-                        category = self._error_classifier.classify(exc)
-                        recovery = self._error_classifier.get_recovery(category)
-                        if recovery.retry and budget.remaining > 0:
-                            await asyncio.sleep(jittered_backoff(budget.used))
+                        classified = self._error_classifier.classify(exc)
+                        rec = self._error_classifier.get_recovery(classified)
+                        turn_recovery.record_api_error()
+                        if await self._handle_api_error(
+                            classified, rec, turn_recovery, messages, budget,
+                        ) == "continue":
                             continue
+                        yield StreamEvent(type="error", content=str(exc))
                         break
                     _clear_indicator()
                     content = (resp.content or "").strip()
+                    if self._sanitizer:
+                        content = self._sanitizer.sanitize(content)
 
-                self._wm.remember_chat(build_assistant_message(content))
-                tool_call = self._parse_tool_call_from_content(content)
+                    # Length continuation for non-stream path
+                    finish = getattr(resp, 'finish_reason', None)
+                    if finish in ("length", "max_tokens") and turn_recovery.try_length_continuation():
+                        messages.append(build_assistant_message(content))
+                        messages.append(build_user_message_text(build_continuation_prompt(content)))
+                        continue
 
-                if tool_call is None:
-                    # Final answer — yield content
-                    trace.record(ExecutionMode.COMPLETE)
-                    if not content:
-                        yield "I processed your request but have no additional output."
-                    else:
-                        yield content
-                    return
+            self._wm.remember_chat(build_assistant_message(content))
+            self._persist_message(session_id, "assistant", content)
+            tool_call = self._parse_tool_call_from_content(content)
 
-                # Execute text-parsed tool
-                messages.append(build_assistant_message(content))
-                _show_progress("executing", tool_call['name'])
-                result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
-                _clear_indicator()
-                _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
-                trace.record(
-                    ExecutionMode.ACTING,
-                    action=tool_call,
-                    observation=result if isinstance(result, dict) else {"result": str(result)},
-                )
-                result_text = json.dumps(result, default=str, ensure_ascii=False)[:3000]
+            if tool_call is None:
+                trace.record(ExecutionMode.COMPLETE)
+                if not content:
+                    yield StreamEvent(type="final", content="I processed your request but have no additional output.")
+                else:
+                    yield StreamEvent(type="final", content=content)
+                return
+
+            messages.append(build_assistant_message(content))
+            yield StreamEvent(type="tool_start", content=tool_call['name'])
+            result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
+            _clear_indicator()
+            yield StreamEvent(type="tool_complete", content=tool_call['name'])
+            _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
+            trace.record(
+                ExecutionMode.ACTING,
+                action=tool_call,
+                observation=result if isinstance(result, dict) else {"result": str(result)},
+            )
+
+            is_error = isinstance(result, dict) and not result.get("ok", True)
+            if is_error:
+                turn_recovery.record_tool_failure()
+                if turn_recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                    logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
+                                   turn_recovery.consecutive_tool_failures)
+                    break
+            else:
+                turn_recovery.record_tool_success()
+
+            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+            messages.append(build_user_message_text(
+                f"Tool result ({tool_call['name']}):\n{result_text}"
+            ))
+            self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
+
+            if self._check_guardrail(messages) == "halt":
+                break
+
+            if status == BudgetStatus.SOFT_LIMIT:
                 messages.append(build_user_message_text(
-                    f"Tool result ({tool_call['name']}):\n{result_text}"
+                    "SYSTEM: Approaching limit. Provide final answer now."
                 ))
-                if status == BudgetStatus.SOFT_LIMIT:
-                    messages.append(build_user_message_text(
-                        "SYSTEM: Approaching limit. Provide final answer now."
-                    ))
 
-        # Budget exhausted
-        yield content if content else "I've reached my processing limit."
+        if self._memory_manager and self._settings.memory_integration_enabled:
+            asyncio.create_task(self._sync_turn_safe(messages))
+
+        if self._evolution is not None and content:
+            asyncio.create_task(self._post_turn_review(messages, content))
+
+        llm = self._llm
+        if hasattr(llm, 'try_restore_primary'):
+            llm.try_restore_primary()
+
+        logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
+
+        yield StreamEvent(type="final", content=content if content else "I've reached my processing limit.")
 
 
     # ── Unified Loop Helpers ───────────────────────────────────────────────
@@ -1140,6 +1725,96 @@ class AgentEngine:
             return {"name": call.name, "arguments": call.params}
         return None
 
+    async def _execute_tools_concurrent(
+        self,
+        native_calls: list,
+        handlers: Dict[str, Any],
+        *,
+        trace: ExecutionTrace,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        """Execute native tool calls respecting concurrency policy.
+
+        Concurrent group runs via asyncio.gather; sequential group runs one-by-one.
+        Results are appended to messages in OpenAI tool-result format.
+        """
+        result_budget = self._effective_tool_result_budget()
+        tc_wrappers = [
+            ConcurrentToolCall(id=tc.id, name=tc.name, arguments=tc.arguments)
+            for tc in native_calls
+        ]
+
+        if not self._concurrency_policy or len(tc_wrappers) <= 1:
+            for i, tc in enumerate(native_calls):
+                _show_progress("executing", tc.name, step=i + 1, total=len(native_calls))
+                tool_call_dict = {"name": tc.name, "arguments": tc.arguments}
+                result = await self._execute_general_tool(tool_call_dict, handlers)
+                _clear_indicator()
+                _print_tool_result(tc.name, result, enabled=self._settings.verbose_progress)
+                trace.record(
+                    ExecutionMode.ACTING,
+                    action=tool_call_dict,
+                    observation=result if isinstance(result, dict) else {"result": str(result)},
+                )
+                result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
+            return
+
+        concurrent, sequential = self._concurrency_policy.partition(tc_wrappers)
+        logger.info(
+            "tool_concurrency.execute concurrent=%d sequential=%d",
+            len(concurrent),
+            len(sequential),
+        )
+
+        # Execute concurrent group via asyncio.gather
+        if concurrent:
+            async def _run_one(ctc: ConcurrentToolCall) -> Dict[str, Any]:
+                tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+                return await self._execute_general_tool(tool_call_dict, handlers)
+
+            gather_results = await asyncio.gather(
+                *[_run_one(ctc) for ctc in concurrent],
+                return_exceptions=True,
+            )
+            for ctc, result in zip(concurrent, gather_results):
+                tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+                if isinstance(result, Exception):
+                    error_result: Dict[str, Any] = {
+                        "ok": False,
+                        "error": f"{type(result).__name__}: {result}",
+                    }
+                    _print_tool_result(ctc.name, error_result, enabled=self._settings.verbose_progress)
+                    trace.record(
+                        ExecutionMode.ACTING,
+                        action=tool_call_dict,
+                        observation=error_result,
+                    )
+                    result_text = json.dumps(error_result, default=str, ensure_ascii=False)[:result_budget]
+                else:
+                    _print_tool_result(ctc.name, result, enabled=self._settings.verbose_progress)
+                    trace.record(
+                        ExecutionMode.ACTING,
+                        action=tool_call_dict,
+                        observation=result if isinstance(result, dict) else {"result": str(result)},
+                    )
+                    result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+                messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
+
+        for i, ctc in enumerate(sequential):
+            _show_progress("executing", ctc.name, step=i + 1, total=len(sequential))
+            tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+            result = await self._execute_general_tool(tool_call_dict, handlers)
+            _clear_indicator()
+            _print_tool_result(ctc.name, result, enabled=self._settings.verbose_progress)
+            trace.record(
+                ExecutionMode.ACTING,
+                action=tool_call_dict,
+                observation=result if isinstance(result, dict) else {"result": str(result)},
+            )
+            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+            messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
+
     async def _execute_general_tool(
         self, tool_call: Dict[str, Any], handlers: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -1149,32 +1824,77 @@ class AgentEngine:
         1. ToolBridge dispatch (gp_-prefixed) — local Python GP tools, always available
         2. ToolBridge dispatch (exact name) — may route to ExecutionPort or semantic tools
         3. TOOL_HANDLERS dict (static fallback when no bridge)
+
+        Security: untrusted tool results (MCP, web) are wrapped with delimiters.
+        Secrets in error messages are redacted before returning to LLM.
         """
         from leapflow.skills.tool_executor import ToolCall as TC
+        from leapflow.security.redact import redact_sensitive_text
+        from leapflow.security.threat_patterns import is_untrusted_source, wrap_untrusted_result
 
         name = tool_call.get("name", "")
         args = tool_call.get("arguments", {})
 
+        result: Dict[str, Any]
+
         # Route through ToolBridge when available (single source of truth)
         if self._tool_bridge is not None:
-            # Try gp_-prefixed first (local GP tools — always work, even offline)
             prefixed = f"gp_{name}"
             result = await self._tool_bridge.dispatch(TC(name=prefixed, params=args))
             if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
-                return result
-            # Try exact name (may route to ExecutionPort or semantic adapter tools)
+                return self._post_process_tool_result(name, result)
             result = await self._tool_bridge.dispatch(TC(name=name, params=args))
             if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
-                return result
+                return self._post_process_tool_result(name, result)
 
-        # Fallback: direct handler dispatch (e.g., when bridge not configured)
+        # Fallback: direct handler dispatch
         handler = handlers.get(name)
         if handler is None:
             return {"ok": False, "error": f"Unknown tool: {name}"}
+
+        timeout = self._tool_timeouts.get(name, self._default_tool_timeout_s)
+        t0 = time.perf_counter()
         try:
-            return await handler(args)
+            result = await asyncio.wait_for(handler(args), timeout=timeout)
+        except asyncio.TimeoutError:
+            duration = (time.perf_counter() - t0) * 1000
+            self._usage_tracker.record_tool_call(name, False, duration)
+            return {"ok": False, "error": f"Tool '{name}' timed out after {timeout:.0f}s"}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            duration = (time.perf_counter() - t0) * 1000
+            self._usage_tracker.record_tool_call(name, False, duration)
+            error_msg = redact_sensitive_text(str(e), force=True)
+            return {"ok": False, "error": error_msg}
+
+        duration = (time.perf_counter() - t0) * 1000
+        is_ok = not (isinstance(result, dict) and not result.get("ok", True))
+        self._usage_tracker.record_tool_call(name, is_ok, duration)
+
+        return self._post_process_tool_result(name, result)
+
+    @staticmethod
+    def _post_process_tool_result(tool_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply security post-processing to tool results."""
+        from leapflow.security.redact import redact_sensitive_text
+        from leapflow.security.threat_patterns import is_untrusted_source, wrap_untrusted_result
+
+        if not isinstance(result, dict):
+            return result
+
+        # Redact secrets from error messages
+        error = result.get("error")
+        if isinstance(error, str):
+            result = {**result, "error": redact_sensitive_text(error, force=True)}
+
+        # Wrap untrusted tool output with delimiters
+        if is_untrusted_source(tool_name):
+            for key in ("result", "output", "content"):
+                val = result.get(key)
+                if isinstance(val, str) and len(val) >= 32:
+                    result = {**result, key: wrap_untrusted_result(val, source=tool_name)}
+                    break
+
+        return result
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -1246,6 +1966,72 @@ class AgentEngine:
         except Exception:
             pass  # never fail the main loop
 
+    def _ensure_session(self, user_text: str) -> Optional[str]:
+        """Create or reuse a conversation session. Returns session_id or None."""
+        if not self._conversation_store or not self._settings.session_persistence_enabled:
+            return None
+        try:
+            import uuid as _uuid
+            if self._current_session_id is None:
+                self._current_session_id = _uuid.uuid4().hex[:16]
+                title = user_text[:80].replace("\n", " ").strip()
+                self._conversation_store.create_session(
+                    self._current_session_id, title=title,
+                    model=self._settings.llm_model, source="cli",
+                )
+            self._persist_message(self._current_session_id, "user", user_text)
+            return self._current_session_id
+        except Exception:
+            logger.debug("session.ensure failed", exc_info=True)
+            return None
+
+    def _persist_message(
+        self, session_id: Optional[str], role: str, content: str,
+        *, tool_name: Optional[str] = None,
+        tool_calls: Optional[list] = None,
+    ) -> None:
+        """Persist a message to conversation store (fire-and-forget)."""
+        if not session_id or not self._conversation_store:
+            return
+        try:
+            self._conversation_store.append_message(
+                session_id, role, content[:8000],
+                tool_name=tool_name, tool_calls=tool_calls,
+            )
+        except Exception:
+            logger.debug("session.persist_message failed", exc_info=True)
+
+    async def _prefetch_and_freeze_memory(self, user_text: str) -> str:
+        """Prefetch memory context and freeze snapshot for session duration."""
+        if self._memory_context_snapshot is not None:
+            return self._memory_context_snapshot
+
+        if not self._memory_manager or not self._settings.memory_integration_enabled:
+            self._memory_context_snapshot = ""
+            return ""
+
+        try:
+            entries = await asyncio.wait_for(
+                self._memory_manager.prefetch(
+                    user_text, limit=self._settings.memory_prefetch_limit,
+                ),
+                timeout=self._settings.memory_prefetch_timeout_s,
+            )
+            if entries:
+                context = "## Recent Context\n" + "\n".join(
+                    f"- [{e.kind.value}] {e.content[:100]}" for e in entries
+                )
+                self._memory_context_snapshot = context
+                return context
+        except asyncio.TimeoutError:
+            logger.debug(
+                "memory.prefetch timed out (%.1fs)", self._settings.memory_prefetch_timeout_s,
+            )
+        except Exception:
+            logger.debug("memory.prefetch failed", exc_info=True)
+        self._memory_context_snapshot = ""
+        return ""
+
     async def _sync_turn_safe(self, messages: List[Dict[str, Any]]) -> None:
         """Non-blocking wrapper for MemoryManager.sync_turn."""
         try:
@@ -1260,11 +2046,46 @@ class AgentEngine:
         except Exception:
             logger.debug("memory.sync_turn failed", exc_info=True)
 
+    @staticmethod
+    def _count_consecutive_tool_failures(messages: List[Dict[str, Any]]) -> int:
+        """Count consecutive tool failures within the current user turn.
+
+        Scans backwards from the tail, skipping interleaved assistant messages
+        (which separate tool results across loop iterations). A tool success
+        resets the counter to 0. Scanning stops at the current turn's ``user``
+        message so stale failures from previous turns are never counted.
+        """
+        count = 0
+        for msg in reversed(messages):
+            role = msg.get("role", "")
+            if role == "user":
+                # Reached the current turn boundary — stop scanning.
+                break
+            if role != "tool":
+                # Skip assistant messages interleaved between tool results.
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict) and parsed.get("ok") is False:
+                    count += 1
+                    continue
+            except (json.JSONDecodeError, ValueError):
+                pass
+            # Non-JSON or ok!=False — treat as success, reset
+            return 0
+        return count
+
     async def _try_trigger_match(self, user_text: str) -> Optional[str]:
         """Check if a learned skill directly matches the user's request.
 
         Returns the skill output if a high-confidence match is found,
         or None to fall through to the ReAct/DAG path.
+
+        Enforces Progressive Trust: the ConfirmationHandler determines
+        whether the skill requires user confirmation before execution.
         """
         matches = self._registry.find_by_trigger(user_text, threshold=0.5)
         if not matches:
@@ -1276,9 +2097,21 @@ class AgentEngine:
         if best.metadata.confidence < 0.6:
             return None
 
+        from leapflow.engine.confirmation import ConfirmationHandler, ConfirmLevel
+
+        handler = ConfirmationHandler(skill_store=self._skill_library)
+        level = handler.determine_level(best)
+
+        if level in (ConfirmLevel.STEP, ConfirmLevel.CONFIRM):
+            logger.info(
+                "audit.trigger_match_deferred skill=%s tier=%s (requires confirmation)",
+                best.name, best.metadata.tier.name,
+            )
+            return None
+
         logger.info(
-            "audit.trigger_match skill=%s confidence=%.2f",
-            best.name, best.metadata.confidence,
+            "audit.trigger_match skill=%s confidence=%.2f level=%s",
+            best.name, best.metadata.confidence, level.value,
         )
         result = await self._registry.invoke(best.name, user_goal=user_text)
         if result.ok:

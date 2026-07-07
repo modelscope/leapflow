@@ -77,6 +77,19 @@ class AttentionTuner:
             ):
                 self._promote_perception_depth(app_id)
 
+    def boost_curiosity_domains(self, app_ids: "set[str]") -> None:
+        """Expand attention scope for apps that triggered high curiosity.
+
+        Called at session end with the accumulated set of apps from
+        ``ActiveLearningObserver.drain_high_curiosity_apps()``. Ensures
+        these apps will be observed in the next session.
+        """
+        for app_id in app_ids:
+            if app_id and app_id != "unknown":
+                self._context.expand_app_scope(app_id)
+                self._curiosity_hits[app_id] += 1
+                logger.debug("attention_tuner.boost_domain app=%s", app_id)
+
     def on_session_stats(self, app_deltas: Dict[str, float]) -> None:
         """Contract perception depth for apps with low average delta (mastered)."""
         if self._perceptual_filter is None:

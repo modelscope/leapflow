@@ -56,8 +56,8 @@ def status_bar(mode: str, skill_count: int, bridge_online: bool) -> str:
         "executing": "▶ running",
     }
     mode_str = mode_indicators.get(mode, "⏵ idle")
-    bridge_str = "online" if bridge_online else "offline"
-    return f"{DIM}  {mode_str} │ skills: {skill_count} │ bridge: {bridge_str}{RESET}"
+    conn_str = "online" if bridge_online else "offline"
+    return f"{DIM}  {mode_str} │ skills: {skill_count} │ platform: {conn_str}{RESET}"
 
 
 def render_input_frame(mode: str, skill_count: int, bridge_online: bool) -> str:

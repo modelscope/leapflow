@@ -1,5 +1,13 @@
 """Shared domain model — zero-dependency data types used across all layers."""
 
+from leapflow.domain.event_types import (
+    CLIEventType,
+    ImplicitFeedbackType,
+    LearningEventType,
+    NormalizedEventType,
+    UIActionSubType,
+    UNDO_SHORTCUTS,
+)
 from leapflow.domain.events import SystemEvent, UINode
 from leapflow.domain.platform import (
     Capability,
@@ -25,6 +33,12 @@ from leapflow.domain.trajectory import (
 
 __all__ = [
     "ActionType",
+    "CLIEventType",
+    "ImplicitFeedbackType",
+    "LearningEventType",
+    "NormalizedEventType",
+    "UIActionSubType",
+    "UNDO_SHORTCUTS",
     "Capability",
     "DEFAULT_DARWIN_CAPABILITIES",
     "DistillationCandidate",

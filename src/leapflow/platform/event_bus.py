@@ -1,13 +1,14 @@
-"""Event bus: handles server-pushed events and routes them to memory/skills.
+"""Event bus: handles platform events and routes them to memory/skills.
 
-Pipeline: OSHost push → EventBus → Normalizer → EpisodicMemory → (promotion) → SemanticMemory
+Pipeline: CuaDriver/Observer → EventBus → Normalizer → EpisodicMemory → (promotion) → SemanticMemory
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from leapflow.domain.events import SystemEvent
 from leapflow.memory.providers.episodic import EpisodicMemoryProvider
@@ -15,6 +16,10 @@ from leapflow.memory.providers.working import WorkingMemoryProvider
 from leapflow.platform.normalizer import EventNormalizer
 from leapflow.platform.protocol import EventTypes
 from leapflow.platform.reorder_buffer import EventReorderBuffer
+
+if TYPE_CHECKING:
+    from leapflow.learning.event_consumer import EventConsumer
+    from leapflow.privacy.policy import EventPrivacyFilter
 
 logger = logging.getLogger(__name__)
 
@@ -35,17 +40,30 @@ class EventBus:
         immediate: EpisodicMemoryProvider,
         working: WorkingMemoryProvider,
         normalizer: Optional[EventNormalizer] = None,
+        buffer_size: int = 50,
+        flush_interval_s: float = 60.0,
+        privacy_filter: Optional["EventPrivacyFilter"] = None,
     ) -> None:
         self._immediate = immediate
         self._working = working
         self._normalizer = normalizer
+        self._privacy_filter = privacy_filter
         self._subscribers: List[EventCallback] = []
         self._recent_sources: Dict[str, float] = {}
         self._reorder_buffer: Optional[EventReorderBuffer] = None
+        self._consumers: list["EventConsumer"] = []
+        self._event_buffer: list[SystemEvent] = []
+        self._buffer_size = buffer_size
+        self._flush_interval_s = flush_interval_s
+        self._last_flush_time = time.monotonic()
 
     def set_normalizer(self, normalizer: EventNormalizer) -> None:
         """Late-bind normalizer (set after VSI handshake resolves the manifest)."""
         self._normalizer = normalizer
+
+    def set_privacy_filter(self, privacy_filter: "EventPrivacyFilter") -> None:
+        """Late-bind privacy filter for event ingestion control."""
+        self._privacy_filter = privacy_filter
 
     def subscribe(self, callback: EventCallback) -> None:
         """Register a callback that receives every normalized SystemEvent."""
@@ -68,11 +86,84 @@ class EventBus:
         else:
             await self._process_event(event_type, payload)
 
+    def register_consumer(self, consumer: "EventConsumer") -> None:
+        """Register an event consumer for batch event delivery."""
+        if consumer not in self._consumers:
+            self._consumers.append(consumer)
+            logger.info("Registered event consumer: %s", consumer.consumer_id)
+
+    def unregister_consumer(self, consumer_id: str) -> None:
+        """Remove a consumer by ID."""
+        self._consumers = [
+            c for c in self._consumers if c.consumer_id != consumer_id
+        ]
+
+    async def flush_consumers(self) -> None:
+        """Force flush buffered events to all consumers."""
+        if not self._event_buffer or not self._consumers:
+            return
+        batch = self._event_buffer[:]
+        self._event_buffer.clear()
+        self._last_flush_time = time.monotonic()
+        for consumer in self._consumers:
+            if not consumer.enabled:
+                continue
+            try:
+                await consumer.on_events_batch(batch)
+            except Exception:
+                logger.warning(
+                    "Event consumer '%s' failed on batch of %d events",
+                    consumer.consumer_id,
+                    len(batch),
+                    exc_info=True,
+                )
+
+    async def shutdown(self) -> None:
+        """Flush remaining events and release resources.
+
+        Call this during application cleanup to ensure tail events
+        (e.g. PatternMiner batches) are not lost.
+        """
+        if self._reorder_buffer is not None:
+            try:
+                await self._reorder_buffer.drain()
+            except Exception:
+                logger.debug("EventBus reorder drain failed on shutdown", exc_info=True)
+            self._reorder_buffer = None
+        await self.flush_consumers()
+        self._subscribers.clear()
+        self._consumers.clear()
+        logger.debug("EventBus shutdown complete")
+
+    def _buffer_event(self, event: SystemEvent) -> None:
+        """Add event to consumer buffer; schedule flush when threshold is met."""
+        self._event_buffer.append(event)
+        now = time.monotonic()
+        if (
+            len(self._event_buffer) >= self._buffer_size
+            or now - self._last_flush_time >= self._flush_interval_s
+        ):
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.flush_consumers())
+            except RuntimeError:
+                # No running loop — skip async flush (will flush on next opportunity)
+                pass
+
     async def _process_event(self, event_type: str, payload: Dict[str, Any]) -> None:
-        """Core processing: normalize → memory → subscribers."""
+        """Core processing: normalize → privacy gate → memory → subscribers → consumers."""
         normalized = self._normalize(event_type, payload)
+
+        # Privacy gate: block excluded apps/paths from the entire pipeline
+        if self._privacy_filter is not None:
+            if not self._privacy_filter.should_ingest(
+                normalized.event_type, normalized.source, normalized.payload,
+            ):
+                return
+
         self._ingest_to_memory(normalized)
         self._notify_subscribers(normalized)
+        self._buffer_event(normalized)
 
     def _normalize(self, event_type: str, payload: Dict[str, Any]) -> SystemEvent:
         if self._normalizer is not None:
@@ -81,10 +172,6 @@ class EventBus:
 
     def _ingest_to_memory(self, event: SystemEvent) -> None:
         dedup_key = f"{event.event_type}:{event.source}"
-        # Use monotonic clock for dedup window: immune to wall-clock jumps
-        # (NTP, manual time changes). SystemEvent.timestamp keeps wall-clock
-        # semantics for downstream consumers — only the dedup bookkeeping
-        # uses monotonic time.
         now = time.monotonic()
         last_seen = self._recent_sources.get(dedup_key, 0.0)
         if now - last_seen < _DEDUP_WINDOW_S:
@@ -95,14 +182,20 @@ class EventBus:
             self._recent_sources = {
                 k: v for k, v in self._recent_sources.items() if v > cutoff
             }
+
+        # Redact sensitive content before persisting
+        payload = event.payload
+        if self._privacy_filter is not None:
+            payload = self._privacy_filter.redact_payload(event.event_type, payload)
+
         content = _event_to_content(event)
         self._immediate.ingest(
             event.event_type,
             content,
             path=event.source if event.event_type == "fs.change" else None,
-            metadata=event.payload,
+            metadata=payload,
         )
-        self._working.remember_event(event.event_type, content, event.payload)
+        self._working.remember_event(event.event_type, content, payload)
 
     def _notify_subscribers(self, event: SystemEvent) -> None:
         for cb in self._subscribers:

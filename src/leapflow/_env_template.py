@@ -23,12 +23,10 @@ LEAPFLOW_LLM_MODEL=qwen3.7-plus
 LEAPFLOW_LLM_MAX_RETRIES=3
 
 # ═══════════════════════════════════════════════════════════════════════
-# Bridge / Host — communication between Python Brain and platform Host
+# Platform — CuaDriver communication
 # ═══════════════════════════════════════════════════════════════════════
-# LEAPFLOW_BRIDGE_SOCKET defaults to /tmp/leapflow.sock (matches OS Host).
-# Uncomment only if you need a non-standard socket location.
-# LEAPFLOW_BRIDGE_SOCKET=/tmp/leapflow.sock
-# Set to 1 to run Brain standalone with an in-process mock Host (no Swift).
+# CuaDriver is the sole platform backend.
+# Set to 1 to run with an in-process mock (no platform driver required).
 LEAPFLOW_MOCK_HOST=0
 
 # ═══════════════════════════════════════════════════════════════════════

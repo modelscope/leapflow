@@ -1,6 +1,6 @@
 """Runtime environment capability detection and caching.
 
-Probes the os_host connection, platform manifest, and permission state
+Probes the platform connection, platform manifest, and permission state
 to inform precondition checks and execution routing. Results are cached
 with a configurable TTL to avoid redundant RPC calls.
 """

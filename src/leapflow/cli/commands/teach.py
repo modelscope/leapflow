@@ -174,12 +174,12 @@ async def cmd_teach(ctx: "Context", goal: str, timeout: Optional[float], field_a
     # Check Bridge connection before starting recording
     if not ctx.effective_mock and hasattr(ctx.rpc, 'connected') and not ctx.rpc.connected:
         sys.stderr.write(
-            "\033[33m⚠ Warning: OS Host bridge not connected. "
+            "\033[33m⚠ Warning: Platform driver not connected. "
             "Recording may not capture real events.\033[0m\n"
         )
         sys.stderr.write(
-            "\033[2m  Check: is OS Host running? "
-            "Try 'leap host dev' in another terminal.\033[0m\n"
+            "\033[2m  Check: is cua-driver available? "
+            "Try 'leap host doctor' for diagnostics.\033[0m\n"
         )
         sys.stderr.flush()
 
@@ -365,7 +365,7 @@ async def cmd_teach(ctx: "Context", goal: str, timeout: Optional[float], field_a
         print()
         print("[ NO STEPS RECORDED ]")
         if ctx.perception_session and hasattr(ctx.perception_session, 'capture_stats') and ctx.perception_session.capture_stats and ctx.perception_session.capture_stats.get("fail", 0) > 0:
-            print("  Visual capture failed — check bridge connection and screen recording permission.")
+            print("  Visual capture failed — check platform driver and screen recording permission.")
         else:
             print("  No actions were observed. Try again and perform the task before stopping.")
         return 0

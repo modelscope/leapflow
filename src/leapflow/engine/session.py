@@ -20,6 +20,7 @@ from leapflow.analysis.pipeline import ImitationPipeline
 from leapflow.storage.session_store import LearningSessionStore
 from leapflow.domain.trajectory import Episode, Trajectory
 from leapflow.learning.distiller import DistillationCandidate
+from leapflow.skills.evolution import SkillEvolutionPolicy
 from leapflow.skills.registry import Skill, SkillRegistry, TriggerMatch
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,8 @@ class SessionController:
         active_learning_observer: Optional[Any] = None,
         session_store: Optional[LearningSessionStore] = None,
         learnability_assessor: Optional[Any] = None,
+        evolution_policy: Optional[SkillEvolutionPolicy] = None,
+        skill_store: Optional[Any] = None,
     ) -> None:
         self._pipeline = pipeline
         self._registry = registry
@@ -115,6 +118,8 @@ class SessionController:
         self._observer = active_learning_observer
         self._session_store = session_store
         self._learnability_assessor = learnability_assessor
+        self._evolution_policy = evolution_policy
+        self._skill_store = skill_store
 
         self._mode = SessionMode.IDLE
         self._session: Optional[LearningSession] = None
@@ -685,7 +690,10 @@ class SessionController:
                 )
 
         self._audit_log("skill.execute", skill=skill_name, level=level.value)
-        sys.stderr.write(f"\033[2m→ Running skill '{skill_name}' (confirm={level.value})\033[0m\n")
+        if sys.stderr.isatty():
+            sys.stderr.write(f"\033[2m→ Running skill '{skill_name}' (confirm={level.value})\033[0m\n")
+        else:
+            sys.stderr.write(f"→ Running skill '{skill_name}' (confirm={level.value})\n")
         sys.stderr.flush()
 
         invoke_kwargs = dict(params or {})
@@ -728,10 +736,15 @@ class SessionController:
         if not exec_result.ok:
             self._record_skill_failure(skill, exec_result)
 
+        self._apply_evolution_policy(skill_name, exec_result)
+
         status = "✓" if exec_result.ok else "✗"
-        sys.stderr.write(
-            f"\033[2m→ {status} Skill '{skill_name}' finished in {elapsed:.1f}s\033[0m\n"
-        )
+        if sys.stderr.isatty():
+            sys.stderr.write(
+                f"\033[2m→ {status} Skill '{skill_name}' finished in {elapsed:.1f}s\033[0m\n"
+            )
+        else:
+            sys.stderr.write(f"→ {status} Skill '{skill_name}' finished in {elapsed:.1f}s\n")
         sys.stderr.flush()
         return exec_result
 
@@ -749,6 +762,40 @@ class SessionController:
             )
         except Exception:
             logger.debug("record_skill_failure failed", exc_info=True)
+
+    def _apply_evolution_policy(
+        self, skill_name: str, result: ExecutionResult,
+    ) -> None:
+        """Apply evolution policy to update skill confidence/version after execution."""
+        if self._evolution_policy is None or self._skill_store is None:
+            return
+        try:
+            stored = self._skill_store.load_parameterized_skill(skill_name)
+            if stored is None:
+                return
+            outcome = self._evolution_policy.on_execution_result(
+                skill_name,
+                success=result.ok,
+                duration_s=result.duration_s,
+                current_confidence=stored.get("confidence", 0.3),
+                current_version=stored.get("version", 1),
+                source=stored.get("source", ""),
+            )
+            self._skill_store.update_skill_confidence(
+                skill_name, outcome.new_confidence
+            )
+            if outcome.version_bump:
+                self._skill_store.update_parameterized_version(
+                    skill_name, stored.get("code", "") or ""
+                )
+            if outcome.tier_changed:
+                logger.info(
+                    "Skill '%s' tier changed: %s -> %s (confidence=%.3f)",
+                    skill_name, outcome.tier_before.name, outcome.tier_after.name,
+                    outcome.new_confidence,
+                )
+        except Exception:
+            logger.warning("skill_evolution update failed for '%s'", skill_name, exc_info=True)
 
     async def execute_skill_sequence(
         self,

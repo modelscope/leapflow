@@ -42,7 +42,7 @@ async def run(
     *,
     user_goal: str,
 ) -> str:
-    """List PDFs, ask the LLM for category→folder mapping, apply moves via OSHost."""
+    """List PDFs, ask the LLM for category→folder mapping, apply moves via platform."""
     path_hint = _extract_path_hint(user_goal) or _default_downloads()
 
     _log_progress(f"Listing files in {path_hint}")

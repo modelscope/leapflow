@@ -50,6 +50,10 @@ class FileSystemObserver:
     def running(self) -> bool:
         return self._running
 
+    def set_debounce_ms(self, ms: int) -> None:
+        """Hot-reconfigure debounce window (e.g. for recording mode)."""
+        self._debounce_ms = max(0, ms)
+
     async def start(self) -> None:
         """Start watching configured paths. Idempotent."""
         if self._running:

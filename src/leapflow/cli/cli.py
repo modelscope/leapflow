@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument(
         "--mock-host",
         action="store_true",
-        help="Force in-process mock OSHost (overrides LEAPFLOW_MOCK_HOST).",
+        help="Force in-process mock platform (overrides LEAPFLOW_MOCK_HOST).",
     )
 
     parser = argparse.ArgumentParser(
@@ -184,12 +184,7 @@ def main(argv: list[str] | None = None) -> int:
             args.command = "chat"
             args.prompt = " ".join(prompt_words)
         else:
-            # leap → banner + interactive REPL
-            from leapflow.cli.banner import display_welcome
-            try:
-                display_welcome()
-            except KeyboardInterrupt:
-                return 130
+            # leap → interactive REPL (Rich banner rendered inside cmd_interactive)
             args.command = "interactive"
 
     # Host command does not need Context initialization

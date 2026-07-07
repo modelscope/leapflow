@@ -8,7 +8,7 @@ are selected transparently based on sys.platform.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Protocol, runtime_checkable
+from typing import Dict, List, Optional, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -59,6 +59,23 @@ class ObserverConfig:
     input_throttle_ms: int = 50
 
 
+@dataclass(frozen=True)
+class RecordingProfile:
+    """Observation parameter overrides during active recording.
+
+    Applied via ``ObservationDaemon.apply_profile()`` to tighten
+    observer parameters for high-fidelity signal capture.  The daemon
+    restores original values when ``reset_profile()`` is called.
+
+    Config-driven: observer parameters are adjusted in-process
+    without cross-process RPC.
+    """
+
+    fs_debounce_ms: int = 100
+    input_throttle_ms: int = 20
+    enable_input_tap: bool = True
+
+
 from leapflow.platform.observers.fs_watcher import FileSystemObserver  # noqa: E402
 from leapflow.platform.observers.app_focus import AppFocusObserver  # noqa: E402
 from leapflow.platform.observers.clipboard import ClipboardObserver  # noqa: E402
@@ -68,6 +85,7 @@ from leapflow.platform.observers.daemon import ObservationDaemon  # noqa: E402
 __all__ = [
     "Observer",
     "ObserverConfig",
+    "RecordingProfile",
     "FileSystemObserver",
     "AppFocusObserver",
     "ClipboardObserver",

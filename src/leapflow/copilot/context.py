@@ -55,9 +55,16 @@ class ContextEncoder:
         Always appends to action_ring regardless of event type.
         """
         match event.event_type:
-            case "app.activated" | "app.focus":
+            case "app.focus_change":
                 self._state.delta_update("app_bundle", event.payload.get("bundle_id", ""))
-                self._state.delta_update("window_title", event.payload.get("title", ""))
+                self._state.delta_update(
+                    "window_title",
+                    event.payload.get("window_title", event.payload.get("app_name", "")),
+                )
+            case "context.change":
+                self._state.delta_update(
+                    "window_title", event.payload.get("window_title", ""),
+                )
             case "clipboard.change":
                 self._state.delta_update("clipboard_hash", hash(str(event.payload)))
             case "fs.change":
@@ -98,12 +105,15 @@ class ContextEncoder:
         return f"{dt.strftime('%a').lower()}_{dt.hour:02d}"
 
 
+_DEFAULT_WARMUP_EVENT_TYPES = frozenset({"app.focus_change", "context.change", "ui.action"})
+
+
 class CopilotEventSubscriber:
     """Bridge between EventBus and the Copilot ContextEncoder.
 
     Subscribes to the platform EventBus, forwards events to the encoder,
-    and optionally enriches context with CrossAppContextTracker hypotheses
-    and WorkingMemory conversation hints.
+    and optionally enriches context with CrossAppContextTracker hypotheses,
+    WorkingMemory conversation hints, and speculative pipeline warmup.
 
     Usage::
 
@@ -111,18 +121,29 @@ class CopilotEventSubscriber:
         event_bus.subscribe(subscriber.on_system_event)
     """
 
-    __slots__ = ("_encoder", "_tracker", "_working_memory", "_last_hint")
+    __slots__ = (
+        "_encoder", "_tracker", "_working_memory", "_last_hint", "_pipeline",
+        "_warmup_event_types",
+    )
 
     def __init__(
         self,
         encoder: ContextEncoder,
         tracker: Optional["CrossAppContextTracker"] = None,
         working_memory: Optional["WorkingMemoryProvider"] = None,
+        pipeline: Optional[object] = None,
+        warmup_event_types: Optional[frozenset] = None,
     ) -> None:
         self._encoder = encoder
         self._tracker = tracker
         self._working_memory = working_memory
         self._last_hint: str = ""
+        self._pipeline = pipeline
+        self._warmup_event_types = warmup_event_types or _DEFAULT_WARMUP_EVENT_TYPES
+
+    def set_pipeline(self, pipeline: object) -> None:
+        """Late-bind speculative pipeline (avoids circular init deps)."""
+        self._pipeline = pipeline
 
     def on_system_event(self, event: "SystemEvent") -> None:
         """EventBus callback — matches the standard EventCallback signature.
@@ -131,6 +152,7 @@ class CopilotEventSubscriber:
         When CrossAppContextTracker has an active hypothesis, injects a
         workflow_hint field into the context for downstream predictors.
         When WorkingMemory is available, injects a conversation_hint.
+        For high-information events, warms the speculative pipeline cache.
         """
         state = self._encoder.on_event(event)
 
@@ -146,10 +168,28 @@ class CopilotEventSubscriber:
                 state.delta_update("conversation_hint", hint)
                 self._last_hint = hint
 
+        if self._pipeline is not None and event.event_type in self._warmup_event_types:
+            self._warmup_pipeline(event, state)
+
+    def _warmup_pipeline(self, event: "SystemEvent", state: "ContextState") -> None:
+        """Trigger speculative cache warmup for high-information OS events."""
+        import asyncio
+        on_observed = getattr(self._pipeline, "on_action_observed", None)
+        if on_observed is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            ctx_snapshot = self._encoder.snapshot()
+            loop.create_task(on_observed(
+                action_id=f"{event.event_type}:{event.source}",
+                context=ctx_snapshot,
+            ))
+        except RuntimeError:
+            pass
+
     def _extract_conversation_hint(self) -> str:
         """Extract latest user intent from WorkingMemory (lightweight, <0.1ms)."""
         messages = self._working_memory.as_chat_messages()  # type: ignore[union-attr]
-        # Scan backwards for the most recent user message
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 content = str(msg.get("content", ""))
