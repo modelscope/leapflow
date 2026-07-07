@@ -28,6 +28,8 @@ dependencies = [
     "mcp>=1.26.0",
     "watchdog>=3.0",
     "gnureadline>=8.0; sys_platform == 'darwin'",
+    "rich>=13.0",
+    "prompt_toolkit>=3.0.40",
 ]
 
 [project.optional-dependencies]

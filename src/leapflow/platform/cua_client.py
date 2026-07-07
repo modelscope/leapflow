@@ -609,7 +609,15 @@ class CuaDriverClient(HostRpc):
         """Gracefully shut down."""
         self._closed = True
         self._stop_keepalive()
-        self._session.stop()
+        # Suppress expected "Process group termination failed" from the MCP
+        # library during controlled shutdown — the fallback terminate works fine.
+        _mcp_logger = logging.getLogger("mcp.os.posix.utilities")
+        _prev_level = _mcp_logger.level
+        _mcp_logger.setLevel(logging.CRITICAL)
+        try:
+            self._session.stop()
+        finally:
+            _mcp_logger.setLevel(_prev_level)
         self._bridge.stop()
         logger.info("CuaDriverClient stopped")
 

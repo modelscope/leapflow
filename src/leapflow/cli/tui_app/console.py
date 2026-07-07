@@ -1,0 +1,172 @@
+"""Rich console wrapper — the single output surface for the TUI.
+
+Centralizes all visual output: markdown rendering, code highlighting,
+tool status, error panels, and system messages.  Components call
+methods on ``LeapConsole`` instead of printing directly.
+"""
+
+from __future__ import annotations
+
+import sys
+from typing import Optional
+
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.syntax import Syntax
+from rich.text import Text
+from rich.theme import Theme as RichTheme
+
+from leapflow.cli.tui_app.theme import Theme
+
+
+def _build_rich_theme(theme: Theme) -> RichTheme:
+    """Map LeapFlow theme to a Rich style dict."""
+    return RichTheme({
+        "leap.accent": theme.accent,
+        "leap.dim": theme.text_dim,
+        "leap.muted": theme.text_muted,
+        "leap.success": theme.success,
+        "leap.warning": theme.warning,
+        "leap.error": theme.error,
+        "leap.info": theme.info,
+        "leap.border": theme.border,
+        "leap.recording": theme.recording,
+        "leap.executing": theme.executing,
+        "leap.panel_title": theme.panel_title,
+        "rule.line": theme.border,
+    })
+
+
+class LeapConsole:
+    """Unified output surface wrapping ``rich.Console``.
+
+    All TUI output flows through this class, ensuring consistent
+    theming and preventing raw print() calls from breaking layout.
+    """
+
+    def __init__(self, theme: Theme) -> None:
+        self._theme = theme
+        self._console = Console(
+            theme=_build_rich_theme(theme),
+            highlight=False,
+            soft_wrap=True,
+        )
+
+    @property
+    def theme(self) -> Theme:
+        return self._theme
+
+    @property
+    def width(self) -> int:
+        return self._console.width
+
+    @property
+    def is_tty(self) -> bool:
+        return self._console.is_terminal
+
+    def print(self, *args, **kwargs) -> None:
+        """Pass-through to rich.Console.print."""
+        self._console.print(*args, **kwargs)
+
+    def markdown(self, text: str, *, code_theme: str = "monokai") -> None:
+        """Render markdown content with syntax-highlighted code blocks."""
+        if not text.strip():
+            return
+        md = Markdown(
+            text,
+            code_theme=code_theme if self._theme.name == "dark" else "default",
+        )
+        self._console.print(md)
+
+    def code(self, source: str, language: str = "python", *, title: str = "") -> None:
+        """Render a standalone code block with syntax highlighting."""
+        syntax = Syntax(
+            source.rstrip(),
+            language,
+            theme="monokai" if self._theme.name == "dark" else "default",
+            line_numbers=len(source.splitlines()) > 5,
+            padding=(0, 1),
+        )
+        if title:
+            self._console.print(Panel(syntax, title=title, border_style="leap.border"))
+        else:
+            self._console.print(syntax)
+
+    def system(self, message: str, *, style: str = "leap.dim") -> None:
+        """Print a system/info message in muted style."""
+        self._console.print(f"  {message}", style=style)
+
+    def success(self, message: str) -> None:
+        self._console.print(f"  ✓ {message}", style="leap.success")
+
+    def warning(self, message: str) -> None:
+        self._console.print(f"  ⚠ {message}", style="leap.warning")
+
+    def error(self, message: str) -> None:
+        self._console.print(f"  ✗ {message}", style="leap.error")
+
+    def error_panel(self, title: str, body: str) -> None:
+        """Render a prominent error panel."""
+        self._console.print(Panel(
+            Text(body),
+            title=title,
+            border_style="leap.error",
+            padding=(0, 1),
+        ))
+
+    def rule(self, title: str = "", *, style: Optional[str] = None) -> None:
+        """Print a horizontal rule, optionally titled."""
+        self._console.print(Rule(
+            title=title,
+            style=style or "leap.border",
+        ))
+
+    def tool_start(self, name: str, args_summary: str = "") -> None:
+        """Announce a tool call starting."""
+        label = Text()
+        label.append("  ⚡ ", style="leap.accent")
+        label.append(name, style="bold")
+        if args_summary:
+            label.append(f" {args_summary}", style="leap.dim")
+        self._console.print(label)
+
+    def tool_result(self, name: str, output: str, *, is_error: bool = False) -> None:
+        """Display a tool call result, truncated if very long."""
+        max_lines = 20
+        lines = output.splitlines()
+        truncated = len(lines) > max_lines
+        display = "\n".join(lines[:max_lines])
+        if truncated:
+            display += f"\n  … ({len(lines) - max_lines} more lines)"
+
+        style = "leap.error" if is_error else "leap.border"
+        self._console.print(Panel(
+            Syntax(display, "text", theme="monokai" if self._theme.name == "dark" else "default")
+            if not is_error else Text(display),
+            title=f"{'✗' if is_error else '↳'} {name}",
+            border_style=style,
+            padding=(0, 1),
+        ))
+
+    def thinking(self, text: str) -> None:
+        """Display LLM thinking/reasoning content."""
+        if not text.strip():
+            return
+        content = Text(text.strip(), style="leap.muted")
+        self._console.print(Panel(
+            content,
+            title="💭 thinking",
+            title_align="left",
+            border_style="leap.border",
+            padding=(0, 1),
+        ))
+
+    def newline(self) -> None:
+        self._console.print()
+
+    def flush(self) -> None:
+        """Ensure all buffered output is written."""
+        if hasattr(sys.stdout, "flush"):
+            sys.stdout.flush()
