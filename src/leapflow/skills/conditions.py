@@ -35,7 +35,7 @@ class ConditionChecker:
     """Evaluates skill preconditions and postconditions against runtime state.
 
     Condition DSL (strings in skill.preconditions / skill.postconditions):
-    - "connected"              → os_host connection is live
+    - "connected"              → platform connection is live
     - "capability:<cap>"       → PlatformManifest has capability
     - "file_exists:<param>"    → named param resolves to existing path
     - "app_running:<bundle>"   → application is active

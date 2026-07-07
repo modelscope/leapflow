@@ -32,12 +32,12 @@ logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class FrameExtractor(Protocol):
-    """帧提取能力的抽象接口。"""
+    """Protocol for frame extraction from video files."""
 
     async def extract(
         self, video_path: str, timestamp_s: float, *, max_size: int = 1024,
     ) -> Optional[bytes]:
-        """从视频中提取指定时间戳的帧，返回图片字节数据。"""
+        """Extract a frame at *timestamp_s* and return JPEG bytes (or None)."""
         ...
 
 
@@ -118,22 +118,28 @@ class VideoAnalyzer:
         *,
         goal: str = "",
         progress: Optional[Callable] = None,
+        trajectory_actions: Optional[List[Dict[str, Any]]] = None,
     ) -> List[VideoAction]:
-        """Run L1→L2→L3 analysis and return time-sorted actions."""
+        """Run L1→L2→L3 analysis and return time-sorted actions.
+
+        When *trajectory_actions* (from CuaDriver trajectory recording) is
+        provided, structured action-state pairs are injected into L1 context,
+        producing higher-quality analysis than VLM video interpretation alone.
+        """
         all_actions: List[VideoAction] = []
+        traj_context = _format_trajectory_context(trajectory_actions) if trajectory_actions else ""
 
         for idx, seg in enumerate(segments):
             if progress:
                 progress(f"Analyzing segment {idx + 1}/{len(segments)}")
 
-            l1 = await self._analyze_macro(seg, timeline, goal=goal)
+            l1 = await self._analyze_macro(seg, timeline, goal=goal, trajectory_context=traj_context)
             all_actions.extend(l1.actions)
 
             if self._l2_enabled and l1.detail_requests:
                 l2_actions = await self._analyze_moments(seg, l1, timeline)
                 all_actions = _merge_refined(all_actions, l2_actions)
 
-            # L3: 帧提取精确分析（仅当启用且有提取器时）
             if self._l3_enabled and self._frame_extractor and l1.frame_requests:
                 l3_actions = await self._analyze_details(seg, l1, timeline)
                 all_actions = _merge_refined(all_actions, l3_actions)
@@ -144,7 +150,12 @@ class VideoAnalyzer:
     # ── L1: Macro ──
     
     async def _analyze_macro(
-        self, seg: AnalysisSegment, timeline: TimelineReader, *, goal: str,
+        self,
+        seg: AnalysisSegment,
+        timeline: TimelineReader,
+        *,
+        goal: str,
+        trajectory_context: str = "",
     ) -> MacroAnalysisResult:
         top_apps = ", ".join(
             sorted(seg.app_summary, key=seg.app_summary.get, reverse=True)[:5]
@@ -156,14 +167,21 @@ class VideoAnalyzer:
             end_time=seg.segment.start_time + seg.end_offset,
         )
 
+        effective_timeline = tl_text
+        if trajectory_context:
+            effective_timeline = (
+                f"{tl_text}\n\n## Structured Trajectory Actions\n{trajectory_context}"
+                if tl_text else trajectory_context
+            )
+
         messages = self._prompts.build_l1_messages(
             video_path=str(seg.segment.file_path),
             duration=seg.duration,
             top_apps=top_apps,
-            timeline_text=tl_text,
-            goal=goal or "not specified \u2014 infer from observations",
+            timeline_text=effective_timeline,
+            goal=goal or "not specified — infer from observations",
         )
-    
+
         text = await self._call_vlm_with_retry(messages)
         if text is None:
             logger.warning("video_analyzer.l1_failed segment=%s (all retries exhausted)", seg.segment.segment_id)
@@ -439,3 +457,33 @@ def _merge_refined(base: List[VideoAction], refined: List[VideoAction]) -> List[
 
 def _overlaps(a: VideoAction, b: VideoAction) -> bool:
     return a.start_time < b.end_time and b.start_time < a.end_time
+
+
+def _format_trajectory_context(actions: List[Dict[str, Any]], *, max_actions: int = 50) -> str:
+    """Format CuaDriver trajectory actions as supplemental LLM context.
+
+    Produces a compact, structured summary that the VLM can use alongside
+    (or instead of) video data for grounded action understanding.
+    """
+    if not actions:
+        return ""
+    lines: List[str] = []
+    for i, act in enumerate(actions[:max_actions]):
+        tool = act.get("tool", act.get("action", "unknown"))
+        args_summary = ""
+        for key in ("coordinate", "text", "keys", "url", "direction"):
+            val = act.get(key)
+            if val is not None:
+                args_summary += f" {key}={val}"
+        has_screenshot = bool(act.get("_screenshot_path"))
+        has_ax = bool(act.get("_app_state_path"))
+        extras = []
+        if has_screenshot:
+            extras.append("screenshot")
+        if has_ax:
+            extras.append("AX-tree")
+        extra_str = f" [{', '.join(extras)}]" if extras else ""
+        lines.append(f"  {i + 1}. {tool}{args_summary}{extra_str}")
+    if len(actions) > max_actions:
+        lines.append(f"  ... ({len(actions) - max_actions} more actions)")
+    return "\n".join(lines)

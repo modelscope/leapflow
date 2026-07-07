@@ -1,4 +1,4 @@
-"""Video-first perception: recording, segmentation, and multi-scale VLM analysis."""
+"""Trajectory-first perception: recording, segmentation, and multi-scale VLM analysis."""
 
 from leapflow.perception.video.analyzer import VideoAnalyzer
 from leapflow.perception.video.cache_manager import VideoCacheManager
@@ -8,7 +8,7 @@ from leapflow.perception.video.prompts import (
     DefaultAnalysisPrompts,
     VLMMessageBuilder,
 )
-from leapflow.perception.video.recorder import VideoRecorder
+from leapflow.perception.video.recorder import TrajectoryRecorder, VideoRecorder
 from leapflow.perception.video.segmenter import VideoSegmenter
 from leapflow.perception.video.timeline import SignalTimeline, TimelineReader, TimelineWriter
 
@@ -19,6 +19,7 @@ __all__ = [
     "SignalTimeline",
     "TimelineReader",
     "TimelineWriter",
+    "TrajectoryRecorder",
     "VLMMessageBuilder",
     "VideoAnalyzer",
     "VideoCacheManager",

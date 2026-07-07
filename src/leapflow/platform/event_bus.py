@@ -1,6 +1,6 @@
-"""Event bus: handles server-pushed events and routes them to memory/skills.
+"""Event bus: handles platform events and routes them to memory/skills.
 
-Pipeline: OSHost push → EventBus → Normalizer → EpisodicMemory → (promotion) → SemanticMemory
+Pipeline: CuaDriver/Observer → EventBus → Normalizer → EpisodicMemory → (promotion) → SemanticMemory
 """
 
 from __future__ import annotations

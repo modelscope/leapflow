@@ -535,7 +535,7 @@ class DemonstrationRecorder:
         and cached. The event payload may also carry inline tree data from
         the host.
         """
-        # Prefer inline tree from event payload (pushed by OSHost)
+        # Prefer inline tree from event payload (pushed by platform)
         if "ax_tree" in event.payload:
             return dict(event.payload["ax_tree"])
         return self._last_ax_tree

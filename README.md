@@ -171,8 +171,7 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 | `LEAPFLOW_LLM_BASE_URL` | DashScope endpoint | OpenAI-compatible base URL |
 | `LEAPFLOW_LLM_MODEL` | `qwen3.7-plus` | Model identifier |
 | `LEAPFLOW_LLM_MAX_RETRIES` | `3` | Retry attempts on transient LLM errors |
-| **Bridge / Host** | | |
-| `LEAPFLOW_BRIDGE_SOCKET` | `/tmp/leapflow.sock` | Unix socket for event push (observers) |
+| **Platform** | | |
 | `LEAPFLOW_MOCK_HOST` | `0` | `1` to use in-process mock (no execution backend) |
 | **Storage** | | |
 | `LEAPFLOW_DUCKDB_PATH` | `~/.leapflow/memory.duckdb` | Persistent DuckDB path |
@@ -518,9 +517,9 @@ leapflow/
 │   ├── skills/             # Skill library + execution
 │   ├── analysis/           # Trajectory denoising
 │   ├── memory/             # Three-tier memory system
-│   ├── recording/          # Video recording orchestration
+│   ├── recording/          # Trajectory recording orchestration
 │   ├── llm/                # LLM provider abstraction
-│   ├── platform/           # Platform adaptation layer (execution backend abstraction)
+│   ├── platform/           # Platform adaptation (CuaDriver client, observers, event bus)
 │   ├── domain/             # Shared types & events
 │   ├── storage/            # DuckDB persistence
 │   ├── tools/              # Built-in tool registry
@@ -588,7 +587,7 @@ uv run pytest -k "test_world_model" -q            # By keyword
 
 | Module | Role |
 |--------|------|
-| `perception/` | Multi-channel signal capture and fusion (video, AX tree, clipboard, keyboard, file system, etc.) |
+| `perception/` | Multi-channel signal capture and fusion (trajectory, AX tree, clipboard, keyboard, file system, etc.) |
 | `signal_fusion/` | Cross-modal temporal alignment and surprise detection |
 | `causal/` | Three-tier causal inference engine (rule → heuristic → VLM) |
 | `world_model/` | Predictive coding loop, experience store, curiosity-driven learning |
@@ -617,9 +616,9 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | Engine | `src/leapflow/engine/` | session, react_loop, tools | Session orchestration, ReAct loop, tool dispatch, context compression |
 | Memory | `src/leapflow/memory/` | working, episodic, long_term | Three-tier event-driven memory with promotion/eviction |
 | LLM | `src/leapflow/llm/` | provider, message_builder | LLM abstraction (OpenAI-compatible), streaming, retry logic |
-| Platform | `src/leapflow/platform/` | mcp_client, bridge, adapter | Platform adaptation layer — protocol client, event normalization, capability negotiation |
+| Platform | `src/leapflow/platform/` | cua_client, adapter, observers | Platform adaptation layer — CuaDriver MCP client, event normalization, observation daemon |
 | Domain | `src/leapflow/domain/` | events, perception, types | Shared domain types, event definitions, perception models |
-| Recording | `src/leapflow/recording/` | recorder, video, segmenter | Video recording orchestration, segmentation, caching |
+| Recording | `src/leapflow/recording/` | recorder, video, segmenter | Trajectory recording orchestration, segmentation, caching |
 | Tools | `src/leapflow/tools/` | registry, builtins | Built-in tool definitions for the ReAct loop |
 | CLI | `src/leapflow/cli/` | cli, commands/, banner | Argument parsing, subcommand dispatch, interactive REPL |
 | Storage | `src/leapflow/storage/` | duckdb, skill_library | DuckDB-backed persistent storage for skills, trajectories, audit |

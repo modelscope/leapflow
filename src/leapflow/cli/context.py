@@ -8,11 +8,9 @@ import os
 import re
 import sys
 import time
-from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from leapflow.platform.client import BridgeClient
 from leapflow.platform.cua_client import CuaDriverClient
 from leapflow.platform.event_bus import EventBus
 from leapflow.platform.mock import MockBridge
@@ -87,15 +85,12 @@ class _InteractiveApprovalGate:
             return False
 
 
-# ─── Host Readiness ────────────────────────────────────────────────────────
-
-
-class HostReadiness(str, Enum):
-    """Result of OS Host pre-flight check during initialization."""
-
-    RUNNING = "running"       # Host confirmed running, proceed normally
-    STARTED = "started"       # Host just started by this process
-    DEGRADED = "degraded"     # Host unavailable, running in offline mode
+def _default_recording_profile(settings: Settings) -> Optional["RecordingProfile"]:
+    """Build a RecordingProfile if the recording mode supports video."""
+    if not settings.recording_mode.uses_video:
+        return None
+    from leapflow.platform.observers import RecordingProfile
+    return RecordingProfile()
 
 
 def _emit_status(msg: str) -> None:
@@ -157,15 +152,14 @@ def _build_visual_components(
 def _build_video_components(settings: Settings, rpc: Any, vlm: Any):
     """Build video-mode components when RecordingMode.VIDEO is active.
 
-    Returns (VideoRecorder, VideoAnalyzer, VideoSegmenter, SignalTimeline).
+    Returns (TrajectoryRecorder, VideoAnalyzer, VideoSegmenter, SignalTimeline).
     """
     from leapflow.perception.video.analyzer import VideoAnalyzer
     from leapflow.perception.video.cache_manager import VideoCacheManager
-    from leapflow.perception.video.recorder import VideoRecorder
+    from leapflow.perception.video.recorder import TrajectoryRecorder
     from leapflow.perception.video.segmenter import VideoSegmenter
     from leapflow.perception.video.timeline import SignalTimeline
 
-    # Clean up stale video cache before allocating new recording resources
     cache_manager = VideoCacheManager(
         settings.video_cache_dir,
         max_age_days=settings.video_cache_max_age_days,
@@ -173,7 +167,7 @@ def _build_video_components(settings: Settings, rpc: Any, vlm: Any):
     )
     cache_manager.cleanup()
 
-    recorder = VideoRecorder(
+    recorder = TrajectoryRecorder(
         rpc,
         settings.video_cache_dir,
         fps=settings.video_fps,
@@ -188,7 +182,7 @@ def _build_video_components(settings: Settings, rpc: Any, vlm: Any):
         max_l2_requests=settings.video_max_l2_requests,
         max_l3_requests=settings.video_max_l3_requests,
         l2_time_window_s=settings.video_l2_time_window_s,
-        frame_extractor=recorder,  # VideoRecorder implements FrameExtractor Protocol
+        frame_extractor=recorder,
         url_scheme=settings.video_vlm_url_scheme,
         vlm_max_retries=settings.video_vlm_max_retries,
         vlm_retry_backoff_s=settings.video_vlm_retry_backoff_s,
@@ -354,26 +348,20 @@ class Context:
             working=self.wm,
             privacy_filter=self.privacy_manager,
         )
-        self.rpc: BridgeClient | CuaDriverClient | MockBridge
+        self.rpc: CuaDriverClient | MockBridge
         if self.effective_mock:
             self.rpc = MockBridge()
             self.rpc.on_event(self.event_bus.handle_event)
-        elif settings.use_cua_driver:
+        else:
             from leapflow.platform.cua_client import cua_driver_available
             if not cua_driver_available():
                 _emit_status(
-                    "WARNING: use_cua_driver=True but cua-driver not found on PATH"
+                    "WARNING: cua-driver not found on PATH"
                 )
                 _emit_status(
                     "  Install with: leap host install  |  Diagnose with: leap host doctor"
                 )
             self.rpc = CuaDriverClient()
-        else:
-            self.rpc = BridgeClient(
-                settings.bridge_socket,
-                default_timeout=settings.rpc_timeout_default,
-            )
-            self.rpc.on_event(self.event_bus.handle_event)
 
         # ── Multi-provider LLM chain (failover + credential rotation) ──
         provider_configs = parse_provider_configs(
@@ -443,7 +431,6 @@ class Context:
         self.session_store: Optional[LearningSessionStore] = None
         self.engine: Optional[AgentEngine] = None
         self.intent_classifier: Optional[IntentClassifier] = None
-        self._bg_connect_task: Optional[asyncio.Task] = None
 
         # World Model components (wired during initialize)
         self.learning_budget: Optional[Any] = None
@@ -463,103 +450,22 @@ class Context:
         self._evolution_policy: Optional[EMAConfidencePolicy] = None
         self._pattern_miner: Optional[Any] = None
 
-    async def _bg_connect(self) -> None:
-        """Background bridge reconnection with post-connect initialization.
-    
-        After connecting, sends fs.subscribe and fires reconnect callbacks
-        so the system transitions from offline/mock state to live.
-    
-        Uses longer retry window (up to ~90s) with increasing delays to
-        handle slow host startup and transient unavailability.
-        """
-        _BG_MAX_ATTEMPTS = 12
-        _BG_DELAYS = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 8.0, 8.0, 10.0, 10.0, 15.0, 15.0]
-        for attempt in range(_BG_MAX_ATTEMPTS):
-            delay = _BG_DELAYS[attempt] if attempt < len(_BG_DELAYS) else 15.0
-            await asyncio.sleep(delay)
-            ok = await self.rpc.try_connect()
-            if ok:
-                _emit_status("Bridge connected")
-                await self._post_connect_setup()
-                return
-        _emit_status("Bridge unavailable, running offline")
-
-    async def _resubscribe_fs(self) -> None:
-        """Re-subscribe to FS events after reconnect."""
-        home = str(Path.home())
-        cwd = str(Path.cwd())
-        for watch_path in dict.fromkeys([home, cwd]):
-            try:
-                await self.rpc.call("fs.subscribe", {"path": watch_path})
-                logger.info("Re-subscribed to FS events: %s", watch_path)
-            except Exception as exc:
-                logger.warning("fs.subscribe failed for %s: %s", watch_path, exc)
-
-    async def _post_connect_setup(self) -> None:
-        """Post-connect initialization: register fs callback + fire all reconnect callbacks.
-
-        Registering _resubscribe_fs before firing ensures it runs as part of
-        fire_reconnect_callbacks, avoiding a duplicate call.
-        """
-        if isinstance(self.rpc, BridgeClient):
-            self.rpc.on_reconnect(self._resubscribe_fs)
-            await self.rpc.fire_reconnect_callbacks()
-
-    # ── Host Readiness (legacy — OS Host removed, cua-driver pending) ────────
-
-    async def _ensure_host_ready(self) -> HostReadiness:
-        """OS Host has been removed; always returns DEGRADED (offline mode).
-
-        The legacy OS Host module is deprecated in favor of cua-driver.
-        Until cua-driver integration is complete, the system runs in offline mode.
-        """
-        _emit_status("OS Host: removed (cua-driver migration pending)")
-        return HostReadiness.DEGRADED
-
     async def initialize(self) -> None:
         """Async initialization: VSI handshake, pipeline assembly.
 
         Phases:
             1. Memory providers initialization
-            2. OS Host readiness check (diagnose → auto-start → feedback)
-            3. Bridge connection (non-blocking, background fallback)
-            4. Platform adapter registration
+            2. CuaDriver connection / mock setup
+            3. Platform adapter registration
         """
         settings = self.settings
 
-        # Initialize all memory providers (opens DB, starts GC, etc.)
         await self.memory.initialize_all()
 
-        # Phase 1: Host readiness (OS Host removed; mock or offline)
-        host_readiness: HostReadiness
-        if self.effective_mock:
-            # Mock mode: no host needed, bridge is in-process.
-            host_readiness = HostReadiness.RUNNING
-        else:
-            # OS Host removed — run in offline/degraded mode until cua-driver ready
-            host_readiness = await self._ensure_host_ready()
-
-        # Phase 2: Bridge connection
         vsi = VirtualSystemInterface(self.rpc)
         bridge_online = False
 
-        if isinstance(self.rpc, BridgeClient):
-            # Skip connection attempt when host is known-degraded
-            if host_readiness == HostReadiness.DEGRADED:
-                _emit_status("Running in offline mode")
-                manifest = PlatformManifest.default_darwin()
-                vsi._manifest = manifest
-                self._bg_connect_task = asyncio.create_task(self._bg_connect())
-            else:
-                bridge_online = await self.rpc.try_connect()
-                if bridge_online:
-                    manifest = await vsi.handshake()
-                else:
-                    _emit_status("Bridge not available, connecting in background...")
-                    manifest = PlatformManifest.default_darwin()
-                    vsi._manifest = manifest
-                    self._bg_connect_task = asyncio.create_task(self._bg_connect())
-        elif isinstance(self.rpc, CuaDriverClient):
+        if isinstance(self.rpc, CuaDriverClient):
             try:
                 self.rpc.start()
                 manifest = await vsi.handshake()
@@ -601,8 +507,6 @@ class Context:
                         await self.event_bus.handle_event("event.fs_change", dict(evt))
                 except Exception as exc:
                     logger.warning("Failed to subscribe FS events for %s: %s", watch_path, exc)
-            if isinstance(self.rpc, BridgeClient):
-                self.rpc.on_reconnect(self._resubscribe_fs)
         else:
             from leapflow.platform.adapters.mock import MockExecutionAdapter, MockPerceptionAdapter
             perception = MockPerceptionAdapter()
@@ -697,6 +601,8 @@ class Context:
             video_analyzer=video_analyzer,
             video_segmenter=video_segmenter,
             signal_timeline=signal_timeline,
+            observation_daemon=self._observation_daemon,
+            recording_profile=_default_recording_profile(settings),
         )
         self.event_bus.subscribe(self.imitation.recorder.on_event)
 
@@ -1918,13 +1824,6 @@ class Context:
         if self.engine is not None:
             self.engine.cancel()
 
-        if self._bg_connect_task and not self._bg_connect_task.done():
-            self._bg_connect_task.cancel()
-            try:
-                await self._bg_connect_task
-            except asyncio.CancelledError:
-                pass
-
         # Close MCP manager
         mcp = getattr(self, "_mcp_manager", None)
         if mcp is not None:
@@ -1969,9 +1868,7 @@ class Context:
             await self._on_session_end_learning()
         # Shutdown all memory providers (stops GC, closes DB)
         await self.memory.shutdown_all()
-        if isinstance(self.rpc, BridgeClient):
-            await self.rpc.close()
-        elif isinstance(self.rpc, CuaDriverClient):
+        if isinstance(self.rpc, CuaDriverClient):
             self.rpc.stop()
         if self.skill_lib:
             self.skill_lib.close()

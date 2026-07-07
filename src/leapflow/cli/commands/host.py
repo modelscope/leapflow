@@ -1,4 +1,4 @@
-"""OS Host lifecycle management commands — cua-driver + ObservationDaemon.
+"""Platform driver lifecycle management commands — cua-driver + ObservationDaemon.
 
 Manages the cua-driver execution layer and ObservationDaemon background
 observers for passive signal collection.

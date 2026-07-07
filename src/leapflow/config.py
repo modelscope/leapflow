@@ -91,7 +91,6 @@ class Settings:
     llm_base_url: str
     llm_model: str
     llm_max_retries: int
-    bridge_socket: Path
     mock_host: bool
     duckdb_path: Path
     log_level: str
@@ -338,9 +337,8 @@ class Settings:
     signal_reactive_capture: bool = False
 
     # ── RPC Transport ──
-    # Default fallback timeout (seconds) used by BridgeClient when no
-    # method-specific entry in the timeout map matches. Method-specific
-    # overrides live in ``leapflow.platform.client._RPC_TIMEOUT_MAP``.
+    # Default fallback timeout (seconds) used by CuaDriverClient when no
+    # method-specific timeout applies.
     rpc_timeout_default: float = 30.0
 
     # ── Cua Driver ──
@@ -517,8 +515,6 @@ def _build_settings_from_env() -> Settings:
 
     data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
 
-    # bridge_socket: LEAPFLOW_BRIDGE_SOCKET overrides default
-    bridge = os.getenv("LEAPFLOW_BRIDGE_SOCKET", "/tmp/leapflow.sock").strip()
     mock_host = os.getenv("LEAPFLOW_MOCK_HOST", "0").strip() in ("1", "true", "True", "yes")
     duckdb = os.getenv("LEAPFLOW_DUCKDB_PATH", "~/.leapflow/memory.duckdb").strip()
     log_level = os.getenv("LEAPFLOW_LOG_LEVEL", "INFO").strip()
@@ -816,7 +812,6 @@ def _build_settings_from_env() -> Settings:
         llm_base_url=base_url.rstrip("/"),
         llm_model=model,
         llm_max_retries=max(1, max_retries),
-        bridge_socket=_expand_path(bridge),
         mock_host=mock_host,
         duckdb_path=_expand_path(duckdb),
         log_level=log_level,

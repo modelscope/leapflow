@@ -250,7 +250,6 @@ def make_settings(tmp_dir: str) -> Settings:
         llm_base_url="https://example.invalid/v1",
         llm_model="test-model",
         llm_max_retries=1,
-        bridge_socket=Path(tmp_dir) / "sock",
         mock_host=True,
         duckdb_path=Path(tmp_dir) / "mem.duckdb",
         log_level="WARNING",

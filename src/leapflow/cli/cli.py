@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument(
         "--mock-host",
         action="store_true",
-        help="Force in-process mock OSHost (overrides LEAPFLOW_MOCK_HOST).",
+        help="Force in-process mock platform (overrides LEAPFLOW_MOCK_HOST).",
     )
 
     parser = argparse.ArgumentParser(

@@ -713,8 +713,9 @@ class CuaDriverClient(HostRpc):
         """Translate a LeapFlow Methods constant to (cua_tool_name, args)."""
         if method == Methods.AX_TREE:
             args: Dict[str, Any] = {}
-            if "app" in params:
-                args["app"] = params["app"]
+            app = params.get("app") or params.get("bundle_id")
+            if app:
+                args["app"] = app
             if "window_id" in params:
                 args["window_id"] = params["window_id"]
             return "get_window_state", args
@@ -730,12 +731,12 @@ class CuaDriverClient(HostRpc):
             return "scroll", args
 
         elif method == Methods.APP_LAUNCH:
-            args = {"app_name": params.get("app_name", params.get("name", ""))}
-            return "launch_app", args
+            app = params.get("app_name") or params.get("name") or params.get("bundle_id", "")
+            return "launch_app", {"app_name": app}
 
         elif method == Methods.APP_ACTIVATE:
-            args = {"app_name": params.get("app_name", params.get("name", ""))}
-            return "launch_app", args
+            app = params.get("app_name") or params.get("name") or params.get("bundle_id", "")
+            return "launch_app", {"app_name": app}
 
         elif method == Methods.APP_LIST:
             return "list_apps", {}
@@ -751,23 +752,28 @@ class CuaDriverClient(HostRpc):
             return "hotkey", args
 
         elif method == Methods.SCREEN_CAPTURE_FRAME:
-            # Prefer screenshot tool if available, else get_window_state
+            app = params.get("app") or params.get("bundle_id")
             if self._session.has_tool("screenshot"):
                 args = {}
-                if "app" in params:
-                    args["app"] = params["app"]
+                if app:
+                    args["app"] = app
                 return "screenshot", args
             else:
                 args = {}
-                if "app" in params:
-                    args["app"] = params["app"]
+                if app:
+                    args["app"] = app
                 return "get_window_state", args
 
         elif method == Methods.RECORDING_START:
-            return "start_recording", params
+            args: Dict[str, Any] = {}
+            if "output_dir" in params:
+                args["output_dir"] = params["output_dir"]
+            if "record_video" in params:
+                args["record_video"] = params["record_video"]
+            return "start_recording", args
 
         elif method == Methods.RECORDING_STOP:
-            return "stop_recording", params
+            return "stop_recording", {}
 
         elif method == Methods.PING:
             return "list_apps", {}

@@ -47,7 +47,7 @@ class VirtualSystemInterface:
         """Perform capability handshake with the host process.
 
         Falls back to a default Darwin manifest if the host does not support
-        the system.manifest RPC (backward compatibility with older OSHost).
+        the system.manifest RPC.
 
         When the underlying transport is CuaDriverClient, capabilities are
         derived from the tools/list discovery (no system.manifest RPC needed).

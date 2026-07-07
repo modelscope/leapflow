@@ -1,4 +1,4 @@
-"""In-process mock OSHost with event simulation for demos without Swift."""
+"""In-process mock platform backend with event simulation for testing."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from leapflow.platform.protocol import EventHandler, EventTypes, HostRpc, Method
 
 
 class MockBridge(HostRpc):
-    """Deterministic stub that mimics OSHost RPC and can simulate pushed events."""
+    """Deterministic stub that mimics platform RPC and can simulate pushed events."""
 
     def __init__(self) -> None:
         self._vfs: Dict[str, Dict[str, Any]] = {}
@@ -35,7 +35,7 @@ class MockBridge(HostRpc):
             }
 
     def on_event(self, handler: EventHandler) -> None:
-        """Register an event handler (mirrors BridgeClient interface)."""
+        """Register an event handler (mirrors HostRpc interface)."""
         self._event_handlers.append(handler)
 
     async def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
