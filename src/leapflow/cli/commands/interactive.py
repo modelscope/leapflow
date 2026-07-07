@@ -156,195 +156,191 @@ async def cmd_interactive(ctx: "Context") -> int:
         status.mark_turn_end()
         console.print()
 
-    # ── Main loop ──
-    while True:
-        _learning = ctx.session and ctx.session.mode == SessionMode.LEARNING
-        if _learning:
-            ctx.imitation.end_control_input()
+    # ── Main loop (patch_stdout pins the prompt to bottom) ──
+    with leap_input.stdout_proxy():
+        while True:
+            _learning = ctx.session and ctx.session.mode == SessionMode.LEARNING
+            if _learning:
+                ctx.imitation.end_control_input()
 
-        _update_status()
+            _update_status()
 
-        # Show ghost hint from Copilot
-        global _last_hint
-        if (
-            not _learning
-            and ctx.copilot_pipeline is not None
-            and ctx.copilot_config is not None
-        ):
-            best = ctx.copilot_pipeline.get_best(
-                min_confidence=ctx.copilot_config.min_confidence_display
-            )
-            if best is not None:
-                _render_ghost_hint(console, best)
-                _last_hint = best
-                if ctx.copilot_feedback is not None and ctx.copilot_encoder is not None:
-                    ctx.copilot_feedback.track_shown(
-                        best, ctx.copilot_encoder.current_state
-                    )
+            # Show ghost hint from Copilot
+            global _last_hint
+            if (
+                not _learning
+                and ctx.copilot_pipeline is not None
+                and ctx.copilot_config is not None
+            ):
+                best = ctx.copilot_pipeline.get_best(
+                    min_confidence=ctx.copilot_config.min_confidence_display
+                )
+                if best is not None:
+                    _render_ghost_hint(console, best)
+                    _last_hint = best
+                    if ctx.copilot_feedback is not None and ctx.copilot_encoder is not None:
+                        ctx.copilot_feedback.track_shown(
+                            best, ctx.copilot_encoder.current_state
+                        )
+                else:
+                    _last_hint = None
             else:
                 _last_hint = None
-        else:
-            _last_hint = None
 
-        try:
-            line = await leap_input.prompt(
-                _mode_name(),
-                bottom_toolbar=status,
-            )
-        except (EOFError, KeyboardInterrupt):
-            console.print()
-            console.system("Bye!")
-            break
-
-        if not line:
-            continue
-
-        # Copilot idle timestamp
-        if ctx.copilot_idle is not None:
-            ctx.copilot_idle.on_event_timestamp(time.time())
-
-        # Copilot feedback
-        if ctx.copilot_feedback is not None and _last_hint is not None:
-            if _is_hint_accepted(line, _last_hint):
-                signal = ctx.copilot_feedback.on_accept()
-            elif ctx.copilot_encoder is not None:
-                signal = ctx.copilot_feedback.on_next_action(
-                    line, ctx.copilot_encoder.current_state
+            try:
+                line = await leap_input.prompt(
+                    _mode_name(),
+                    bottom_toolbar=status,
                 )
-            else:
-                signal = None
-            if signal and ctx.copilot_evolution:
-                await ctx.copilot_evolution.process_feedback(signal)
-            _last_hint = None
-
-        if _learning:
-            ctx.imitation.mark_control_input()
-
-        # Normalize: strip leading "/" for slash commands
-        cmd_text = line.lstrip("/") if line.startswith("/") else line
-
-        # ── Registry-based dispatch ──
-        cmd_def = resolve_command(cmd_text)
-        if cmd_def is not None:
-            canonical = cmd_def.name
-            # Extract args after the command name
-            cmd_args = cmd_text[len(canonical):].strip()
-
-            # Session commands
-            if canonical == "exit":
-                if ctx.session and ctx.session.mode == SessionMode.LEARNING:
-                    try:
-                        await ctx.session.exit_learning()
-                        console.system("Learning stopped.")
-                    except Exception:
-                        pass
-                elif _learning:
-                    ctx.imitation.end_control_input()
+            except (EOFError, KeyboardInterrupt):
+                console.print()
                 console.system("Bye!")
                 break
 
-            elif canonical == "help":
-                _show_help(console)
+            if not line:
                 continue
 
-            elif canonical == "status":
-                handle_status(ctx, console, cmd_args)
-                continue
+            # Copilot idle timestamp
+            if ctx.copilot_idle is not None:
+                ctx.copilot_idle.on_event_timestamp(time.time())
 
-            elif canonical == "clear":
-                handle_clear(ctx, console, cmd_args)
-                display_rich_banner(
-                    model=getattr(ctx.settings, "model", ""),
-                    cwd=os.getcwd(),
-                    session_id=getattr(ctx.session, "session_id", ""),
-                    platform_online=_platform_online(),
-                    tool_defs=TOOL_DEFINITIONS,
-                    skills=ctx.registry.list_all() if ctx.registry else [],
-                    context_length=ctx_len,
-                    mcp_tools=mcp_count,
-                )
-                continue
-
-            elif canonical == "tools":
-                handle_tools(ctx, console, cmd_args)
-                continue
-
-            elif canonical == "usage":
-                handle_usage(ctx, console, cmd_args)
-                continue
-
-            elif canonical == "model":
-                handle_model(ctx, console, cmd_args)
-                continue
-
-            # Teaching commands
-            elif canonical.startswith("teach") or canonical in ("annotate", "skip"):
-                if await _handle_teach(ctx, console, cmd_text, _learning):
-                    continue
-
-            # Skills commands
-            elif canonical.startswith("skills"):
-                if _handle_skills(ctx, console, cmd_text):
-                    continue
-
-            # Hub commands
-            elif canonical.startswith("hub"):
-                from leapflow.cli.commands.hub import cmd_hub
-                hub_args = cmd_text.split()[1:] if len(cmd_text.split()) > 1 else []
-                await cmd_hub(ctx, hub_args)
-                continue
-
-            # Run command
-            elif canonical == "run":
-                trigger_or_name = cmd_args
-                if trigger_or_name.startswith("--skill "):
-                    skill_name = trigger_or_name[len("--skill "):]
-                    result = await ctx.session.execute_skill(skill_name, io=io)
+            # Copilot feedback
+            if ctx.copilot_feedback is not None and _last_hint is not None:
+                if _is_hint_accepted(line, _last_hint):
+                    signal = ctx.copilot_feedback.on_accept()
+                elif ctx.copilot_encoder is not None:
+                    signal = ctx.copilot_feedback.on_next_action(
+                        line, ctx.copilot_encoder.current_state
+                    )
                 else:
-                    matched = ctx.session.find_skill(trigger_or_name)
-                    if matched:
-                        result = await ctx.session.execute_skill(matched, io=io)
-                    else:
-                        await _stream_response(trigger_or_name)
-                        await _inject_copilot_event(ctx, line, _mode_name)
-                        continue
-                _print_execution_result(result)
-                continue
+                    signal = None
+                if signal and ctx.copilot_evolution:
+                    await ctx.copilot_evolution.process_feedback(signal)
+                _last_hint = None
 
-            # Shortcut commands
-            elif canonical.startswith("shortcut"):
-                if _handle_shortcuts(ctx, console, cmd_text):
+            if _learning:
+                ctx.imitation.mark_control_input()
+
+            # Input separator (Hermes-style rule above user input echo)
+            console.rule()
+
+            # Normalize: strip leading "/" for slash commands
+            cmd_text = line.lstrip("/") if line.startswith("/") else line
+
+            # ── Registry-based dispatch ──
+            cmd_def = resolve_command(cmd_text)
+            if cmd_def is not None:
+                canonical = cmd_def.name
+                cmd_args = cmd_text[len(canonical):].strip()
+
+                if canonical == "exit":
+                    if ctx.session and ctx.session.mode == SessionMode.LEARNING:
+                        try:
+                            await ctx.session.exit_learning()
+                            console.system("Learning stopped.")
+                        except Exception:
+                            pass
+                    elif _learning:
+                        ctx.imitation.end_control_input()
+                    console.system("Bye!")
+                    break
+
+                elif canonical == "help":
+                    _show_help(console)
                     continue
 
-            # Scheduler commands
-            elif canonical == "arm":
-                from leapflow.cli.commands.scheduler import cmd_arm
-                await cmd_arm(ctx, cmd_text.split()[1:] if len(cmd_text.split()) > 1 else [])
+                elif canonical == "status":
+                    handle_status(ctx, console, cmd_args)
+                    continue
+
+                elif canonical == "clear":
+                    handle_clear(ctx, console, cmd_args)
+                    display_rich_banner(
+                        model=getattr(ctx.settings, "model", ""),
+                        cwd=os.getcwd(),
+                        session_id=getattr(ctx.session, "session_id", ""),
+                        platform_online=_platform_online(),
+                        tool_defs=TOOL_DEFINITIONS,
+                        skills=ctx.registry.list_all() if ctx.registry else [],
+                        context_length=ctx_len,
+                        mcp_tools=mcp_count,
+                    )
+                    continue
+
+                elif canonical == "tools":
+                    handle_tools(ctx, console, cmd_args)
+                    continue
+
+                elif canonical == "usage":
+                    handle_usage(ctx, console, cmd_args)
+                    continue
+
+                elif canonical == "model":
+                    handle_model(ctx, console, cmd_args)
+                    continue
+
+                elif canonical.startswith("teach") or canonical in ("annotate", "skip"):
+                    if await _handle_teach(ctx, console, cmd_text, _learning):
+                        continue
+
+                elif canonical.startswith("skills"):
+                    if _handle_skills(ctx, console, cmd_text):
+                        continue
+
+                elif canonical.startswith("hub"):
+                    from leapflow.cli.commands.hub import cmd_hub
+                    hub_args = cmd_text.split()[1:] if len(cmd_text.split()) > 1 else []
+                    await cmd_hub(ctx, hub_args)
+                    continue
+
+                elif canonical == "run":
+                    trigger_or_name = cmd_args
+                    if trigger_or_name.startswith("--skill "):
+                        skill_name = trigger_or_name[len("--skill "):]
+                        result = await ctx.session.execute_skill(skill_name, io=io)
+                    else:
+                        matched = ctx.session.find_skill(trigger_or_name)
+                        if matched:
+                            result = await ctx.session.execute_skill(matched, io=io)
+                        else:
+                            await _stream_response(trigger_or_name)
+                            await _inject_copilot_event(ctx, line, _mode_name)
+                            continue
+                    _print_execution_result(result)
+                    continue
+
+                elif canonical.startswith("shortcut"):
+                    if _handle_shortcuts(ctx, console, cmd_text):
+                        continue
+
+                elif canonical == "arm":
+                    from leapflow.cli.commands.scheduler import cmd_arm
+                    await cmd_arm(ctx, cmd_text.split()[1:] if len(cmd_text.split()) > 1 else [])
+                    continue
+
+                elif canonical == "tasks":
+                    from leapflow.cli.commands.scheduler import cmd_tasks
+                    await cmd_tasks(ctx, cmd_text.split()[1:] if len(cmd_text.split()) > 1 else [])
+                    continue
+
+            if _learning:
+                ctx.imitation.end_control_input()
+
+            # ── Default: Natural language ──
+            if ctx.session and ctx.session.mode == SessionMode.LEARNING:
+                ctx.session.annotate(line)
+                console.system("(Noted as annotation during learning)")
+                await _inject_copilot_event(ctx, line, _mode_name)
                 continue
 
-            elif canonical == "tasks":
-                from leapflow.cli.commands.scheduler import cmd_tasks
-                await cmd_tasks(ctx, cmd_text.split()[1:] if len(cmd_text.split()) > 1 else [])
-                continue
+            matched = ctx.session.find_skill(line) if ctx.session else None
+            if matched:
+                result = await ctx.session.execute_skill(matched, io=io)
+                _print_execution_result(result)
+            else:
+                await _stream_response(line)
 
-        if _learning:
-            ctx.imitation.end_control_input()
-
-        # ── Default: Natural language ──
-        if ctx.session and ctx.session.mode == SessionMode.LEARNING:
-            ctx.session.annotate(line)
-            console.system("(Noted as annotation during learning)")
             await _inject_copilot_event(ctx, line, _mode_name)
-            continue
-
-        matched = ctx.session.find_skill(line) if ctx.session else None
-        if matched:
-            result = await ctx.session.execute_skill(matched, io=io)
-            _print_execution_result(result)
-        else:
-            await _stream_response(line)
-
-        await _inject_copilot_event(ctx, line, _mode_name)
 
     return 0
 

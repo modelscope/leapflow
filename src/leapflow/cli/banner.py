@@ -110,15 +110,21 @@ def display_rich_banner(
 
     if model:
         model_short = model.split("/")[-1] if "/" in model else model
-        ctx_str = f"  [dim {_DIM_GOLD}]({context_length // 1000}K ctx)[/]" if context_length else ""
-        left_lines.append(f"[bold {_AMBER}]{model_short}[/]{ctx_str}")
+        if context_length >= 1_000_000:
+            ctx_label = f"{context_length / 1_000_000:.1f}M"
+        elif context_length >= 1_000:
+            ctx_label = f"{context_length // 1000}K"
+        else:
+            ctx_label = str(context_length)
+        ctx_str = f"  [dim {_DIM_GOLD}]({ctx_label} ctx)[/]" if context_length else ""
+        left_lines.append(f"[bold {_AMBER}]{model_short}[/]{ctx_str} [dim {_DIM_GOLD}]·[/] [dim {_DIM_GOLD}]ModelScope[/]")
 
     if cwd:
         short_cwd = cwd.replace(os.path.expanduser("~"), "~")
         left_lines.append(f"[{_WARM_GRAY}]{short_cwd}[/]")
 
     if session_id:
-        left_lines.append(f"[{_WARM_GRAY}]session: {session_id[:12]}[/]")
+        left_lines.append(f"[{_WARM_GRAY}]Session: {session_id[:16]}[/]")
 
     left_lines.append("")
     left_content = "\n".join(left_lines)

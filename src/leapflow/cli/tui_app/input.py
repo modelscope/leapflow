@@ -22,6 +22,7 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 
 from leapflow.cli.tui_app.theme import Theme
@@ -131,6 +132,15 @@ class LeapInput:
             mouse_support=False,
             multiline=False,
         )
+
+    def stdout_proxy(self):
+        """Return a ``patch_stdout`` context manager.
+
+        While active, all ``print()`` / ``sys.stdout.write()`` output is
+        rendered above the prompt, keeping the input line pinned to the
+        bottom of the terminal — matching Hermes-agent's fixed-input UX.
+        """
+        return patch_stdout(raw=True)
 
     async def prompt(
         self,
