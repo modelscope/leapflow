@@ -172,14 +172,34 @@ class WorkingMemoryProvider:
 
     def remember_event(self, kind: str, text: str, metadata: Optional[Dict[str, object]] = None) -> None:
         """Store a compact system-side event as a synthetic system message."""
+        ts = time.time()
         payload: Dict[str, object] = {
-            "ts": time.time(),
+            "ts": ts,
             "kind": kind,
             "text": text,
             "metadata": metadata or {},
         }
-        msg: Dict[str, object] = {"role": "system", "content": repr(payload)}
+        msg: Dict[str, object] = {"role": "system", "content": repr(payload), "_event_ts": ts, "_event_kind": kind}
         self.remember_chat(msg)
+
+    def get_events_since(self, since_ts: float) -> List[Dict[str, object]]:
+        """Return system event messages recorded after ``since_ts``.
+
+        Scans the item ring from newest to oldest and stops once messages
+        are older than the threshold, keeping the scan O(recent) rather
+        than O(total).
+        """
+        result: List[Dict[str, object]] = []
+        for msg in reversed(self._items):
+            ts = msg.get("_event_ts")
+            if ts is None:
+                continue
+            if isinstance(ts, (int, float)) and ts > since_ts:
+                result.append(msg)
+            elif isinstance(ts, (int, float)):
+                break
+        result.reverse()
+        return result
 
     def as_chat_messages(self) -> List[Dict[str, object]]:
         """Return a list copy suitable for LLM APIs."""

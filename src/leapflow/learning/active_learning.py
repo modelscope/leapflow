@@ -1137,7 +1137,25 @@ class ActiveLearningObserver:
 
 
 class SkillMerger:
-    """Merges an approved suggestion into the existing skill."""
+    """Merges an approved suggestion into the existing skill.
+
+    Optionally propagates changes to SKILL.md (via doc_store) and
+    refreshes the runtime registry, keeping all three skill
+    representations (StoredSkill, SKILL.md, Registry) in sync.
+    """
+
+    def __init__(
+        self,
+        *,
+        doc_store: Optional["SkillDocStore"] = None,
+        registry: Optional["SkillRegistry"] = None,
+        llm: Optional[object] = None,
+        execution: Optional[object] = None,
+    ) -> None:
+        self._doc_store = doc_store
+        self._registry = registry
+        self._llm = llm
+        self._execution = execution
 
     def apply(
         self, suggestion: SkillUpdateSuggestion, store: SkillLibraryStore
@@ -1181,12 +1199,58 @@ class SkillMerger:
         )
         store.save_skill(merged)
         store.resolve_suggestion(suggestion.suggestion_id, "approved")
+
+        self._sync_doc_store(merged)
+        self._sync_registry(merged)
+
         logger.info(
             "skill_merger.applied skill=%s v%d",
             merged.skill_id,
             merged.version,
         )
         return merged
+
+    def _sync_doc_store(self, merged: StoredSkill) -> None:
+        """Regenerate SKILL.md from the updated StoredSkill if it already exists."""
+        if self._doc_store is None or not self._doc_store.exists(merged.title):
+            return
+        try:
+            from leapflow.learning.document import SkillDocument
+            doc = SkillDocument(
+                name=merged.title,
+                description=f"Learned skill (v{merged.version})",
+                goal=merged.title,
+                instructions=list(merged.steps),
+                preconditions=list(merged.pre_conditions),
+                postconditions=list(merged.post_conditions),
+                parameters=[
+                    {"name": p, "description": ""} if isinstance(p, str) else p
+                    for p in merged.parameters
+                ],
+                metadata={
+                    "version": merged.version,
+                    "confidence": merged.confidence,
+                    "source": "merged",
+                },
+            )
+            self._doc_store.save(doc)
+            logger.info("skill_merger.doc_synced skill=%s", merged.title)
+        except Exception:
+            logger.warning("skill_merger.doc_sync_failed skill=%s", merged.title, exc_info=True)
+
+    def _sync_registry(self, merged: StoredSkill) -> None:
+        """Reload the skill in the runtime registry from the updated SKILL.md."""
+        if self._registry is None or self._doc_store is None or self._llm is None:
+            return
+        try:
+            skill = self._doc_store.load_as_skill(
+                merged.title, self._llm, execution=self._execution,
+            )
+            if skill is not None:
+                self._registry.register(skill)
+                logger.info("skill_merger.registry_synced skill=%s", merged.title)
+        except Exception:
+            logger.warning("skill_merger.registry_sync_failed skill=%s", merged.title, exc_info=True)
 
 
 # ── Merge helpers ──

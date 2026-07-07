@@ -226,7 +226,11 @@ class AgentEngine:
         self._shortcuts = shortcuts
         self._imitation = imitation
         self._skill_library = skill_library
-        self._skill_merger = SkillMerger()
+        self._skill_merger = SkillMerger(
+            registry=registry,
+            llm=llm,
+            execution=execution,
+        )
         self._graph_planner = graph_planner
         self._scheduler = scheduler
         self._perception = perception
@@ -281,6 +285,12 @@ class AgentEngine:
 
         # Evolution store for incremental persistence (injected by CLI)
         self._evolution_store: Optional[Any] = None
+
+        # EventBus for learning signal emission (injected by CLI)
+        self._event_bus: Optional[Any] = None
+
+        # ExperienceStore bridge for world-model trajectory data (injected by CLI)
+        self._experience_store: Optional[Any] = None
 
         # Model capability registry (injected by CLI)
         self._model_capabilities: Optional[Any] = None
@@ -384,6 +394,40 @@ class AgentEngine:
 
         return None
 
+    _LIVE_SIGNAL_KINDS = frozenset({
+        "app.focus_change", "fs.change", "context.change", "intent.signal",
+    })
+
+    def _inject_live_signals(self, messages: list, since_ts: float) -> None:
+        """Inject high-priority WM events into the message context.
+
+        Checks for system events recorded since ``since_ts`` and appends
+        a summary system message if any match the signal whitelist.  This
+        bridges the EventBus signal stream into the LLM decision loop
+        without coupling the engine to the EventBus directly.
+        """
+        recent = self._wm.get_events_since(since_ts)
+        relevant = [
+            e for e in recent
+            if e.get("_event_kind") in self._LIVE_SIGNAL_KINDS
+        ]
+        if not relevant:
+            return
+        lines = []
+        for ev in relevant[-5:]:
+            content = ev.get("content", "")
+            if isinstance(content, str) and content.startswith("{"):
+                try:
+                    import ast
+                    parsed = ast.literal_eval(content)
+                    lines.append(parsed.get("text", str(parsed)[:120]))
+                except (ValueError, SyntaxError):
+                    lines.append(content[:120])
+            else:
+                lines.append(str(content)[:120])
+        summary = "; ".join(lines)
+        messages.append(build_system_message(f"[LIVE SIGNAL] {summary}"))
+
     @staticmethod
     def _strip_images_from_messages(messages: list) -> None:
         """Remove image content parts from messages in-place (multimodal strip)."""
@@ -439,6 +483,18 @@ class AgentEngine:
     def set_model_capabilities(self, registry: Any) -> None:
         """Inject model capability registry."""
         self._model_capabilities = registry
+
+    def set_doc_store(self, doc_store: Any) -> None:
+        """Inject SkillDocStore so SkillMerger can sync SKILL.md on approve."""
+        self._skill_merger._doc_store = doc_store
+
+    def set_event_bus(self, event_bus: Any) -> None:
+        """Inject EventBus for emitting learning signals (episode events)."""
+        self._event_bus = event_bus
+
+    def set_experience_store(self, store: Any) -> None:
+        """Inject ExperienceStore for world-model trajectory bridge."""
+        self._experience_store = store
 
     def set_conversation_store(self, store: Any) -> None:
         """Inject conversation persistence store."""
@@ -1010,6 +1066,7 @@ class AgentEngine:
             tools_kwarg["tools"] = TOOL_DEFINITIONS
 
         self._cancel_requested = False
+        _loop_start_ts = time.time()
 
         session_id = self._ensure_session(user_text)
 
@@ -1021,6 +1078,8 @@ class AgentEngine:
             status = budget.consume()
             if status == BudgetStatus.EXHAUSTED:
                 break
+
+            self._inject_live_signals(messages, _loop_start_ts)
 
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)
@@ -1209,28 +1268,62 @@ class AgentEngine:
                 reward = -0.5
 
             skill_name = tool_actions[0]["tool"] if tool_actions else "unknown"
+            episode_context = {"final_content_preview": final_content[:200]}
+            episode_context.update(self._usage_tracker.to_learning_signal())
             episode = self._evolution.record_episode(
                 skill_name=f"turn_{skill_name}",
                 actions=tool_actions[:10],
                 outcome="completed" if has_success else "mixed",
                 reward=reward,
-                context={"final_content_preview": final_content[:200]},
+                context=episode_context,
             )
 
             # Incremental persistence: write to DuckDB immediately (not just on shutdown)
             if self._evolution_store is not None and episode is not None:
                 try:
-                    self._evolution_store.save_episode({
-                        "episode_id": episode.episode_id,
-                        "skill_name": episode.skill_name,
-                        "actions": episode.actions,
-                        "outcome": episode.outcome,
-                        "reward": episode.reward,
-                        "context": episode.context,
-                        "timestamp": episode.timestamp,
-                    })
+                    self._evolution_store.save_episode(
+                        episode_id=episode.episode_id,
+                        skill_name=episode.skill_name,
+                        actions=episode.actions,
+                        outcome=episode.outcome,
+                        reward=episode.reward,
+                        context=episode.context,
+                        timestamp=episode.timestamp,
+                    )
                 except Exception:
                     logger.debug("evolution_store.save_episode failed", exc_info=True)
+
+            # Bridge tool-loop outcomes to ExperienceStore for world-model trajectory
+            if self._experience_store is not None and episode is not None:
+                try:
+                    tool_names = ",".join(a.get("tool", "") for a in tool_actions[:3])
+                    self._experience_store.store(
+                        action_description=f"chat_tools:{tool_names}",
+                        app_context="",
+                        predicted_effect="",
+                        actual_effect=episode.outcome,
+                        delta=abs(reward),
+                        grade_label="helpful" if has_success and not has_failure else "mixed",
+                    )
+                except Exception:
+                    logger.debug("experience_store.store failed", exc_info=True)
+
+            # Emit high-value episodes to EventBus for active learning consumption
+            if episode is not None and self._event_bus is not None and abs(reward) >= 0.8:
+                try:
+                    import asyncio as _aio
+                    loop = _aio.get_running_loop()
+                    loop.create_task(self._event_bus.handle_event(
+                        "learning.episode_recorded",
+                        {
+                            "skill_name": episode.skill_name,
+                            "reward": episode.reward,
+                            "actions": [a.get("tool", "") for a in episode.actions[:5]],
+                            "outcome": episode.outcome,
+                        },
+                    ))
+                except RuntimeError:
+                    pass
         except Exception:
             logger.debug("post_turn_review failed", exc_info=True)
 
@@ -1307,6 +1400,7 @@ class AgentEngine:
         session_id = self._ensure_session(user_text)
 
         self._cancel_requested = False
+        _loop_start_ts = time.time()
 
         while not budget.exhausted:
             if self._cancel_requested:
@@ -1316,6 +1410,8 @@ class AgentEngine:
             status = budget.consume()
             if status == BudgetStatus.EXHAUSTED:
                 break
+
+            self._inject_live_signals(messages, _loop_start_ts)
 
             healed = self._healer.heal(messages)
             compressed = self._compressor.compress(healed)

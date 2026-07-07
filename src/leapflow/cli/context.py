@@ -1058,9 +1058,13 @@ class Context:
                 from leapflow.copilot.adapters import SemanticHashAdapter
                 l0_store = SemanticHashAdapter(self.lt)
 
+            l1_markov = L1MarkovPredictor()
+            self._l1_markov = l1_markov
+            self._hydrate_l1_markov(l1_markov)
+
             predictors = [
                 L0HashPredictor(l0_store),
-                L1MarkovPredictor(),
+                l1_markov,
             ]
             # L2/L3: wire Memory adapters when ExperienceStore is available
             if hasattr(self, 'experience_store') and self.experience_store is not None:
@@ -1109,8 +1113,9 @@ class Context:
             # Event subscriber — register to EventBus
             copilot_subscriber = CopilotEventSubscriber(
                 copilot_encoder,
-                tracker=None,  # CrossAppContextTracker if available
+                tracker=None,
                 working_memory=self.wm if hasattr(self, 'wm') else None,
+                pipeline=copilot_pipeline,
             )
             self.event_bus.subscribe(copilot_subscriber.on_system_event)
 
@@ -1319,6 +1324,7 @@ class Context:
                 )
             if persisted:
                 logger.info("Evolution: hydrated %d episodes from DuckDB", len(persisted))
+            self._evolution._persistent_store = self._evolution_store
         except Exception:
             logger.debug("EvolutionStore initialization skipped", exc_info=True)
 
@@ -1432,6 +1438,14 @@ class Context:
             except Exception:
                 logger.debug("ModelCapabilityRegistry setup skipped", exc_info=True)
 
+            if hasattr(self, "doc_store") and self.doc_store is not None:
+                self.engine.set_doc_store(self.doc_store)
+
+            self.engine.set_event_bus(self.event_bus)
+
+            if hasattr(self, "experience_store") and self.experience_store is not None:
+                self.engine.set_experience_store(self.experience_store)
+
         # ── Register session_search tool ──
         if self._conversation_store:
             try:
@@ -1544,6 +1558,41 @@ class Context:
                 logger.info("ImplicitFeedbackObserver started")
             except Exception:
                 logger.warning("ImplicitFeedbackObserver start failed", exc_info=True)
+
+    _L1_MARKOV_MEMORY_ID = "copilot_l1_markov_state"
+    _L1_MARKOV_KIND = "copilot_state"
+
+    def _hydrate_l1_markov(self, l1: Any) -> None:
+        """Restore L1 Markov transition matrix from semantic memory."""
+        try:
+            hits = self.lt.search_keywords(
+                [self._L1_MARKOV_MEMORY_ID], kinds=[self._L1_MARKOV_KIND], limit=1,
+            )
+            if hits:
+                import json
+                state = json.loads(hits[0].content)
+                l1.import_state(state)
+        except Exception:
+            logger.debug("L1 Markov hydration skipped", exc_info=True)
+
+    def _persist_l1_markov(self) -> None:
+        """Save L1 Markov transition matrix to semantic memory for next session."""
+        l1 = getattr(self, "_l1_markov", None)
+        if l1 is None:
+            return
+        try:
+            import json
+            state = l1.export_state()
+            if not state.get("transitions"):
+                return
+            content = json.dumps(state, ensure_ascii=False)
+            self.lt.insert_raw(
+                self._L1_MARKOV_KIND, content,
+                memory_id=self._L1_MARKOV_MEMORY_ID,
+            )
+            logger.info("L1 Markov: persisted %d transition keys", len(state.get("transitions", {})))
+        except Exception:
+            logger.debug("L1 Markov persistence failed", exc_info=True)
 
     def _build_insight_callback(self) -> Callable:
         """Build callback for replay insights — routes ALL insight types."""
@@ -1905,6 +1954,13 @@ class Context:
         tracker = getattr(self, "_effectiveness_tracker", None)
         if tracker is not None:
             tracker.maybe_emit()
+        # Persist L1 Markov state before shutdown
+        self._persist_l1_markov()
+        # Flush EventBus tail events before learning pipeline
+        try:
+            await self.event_bus.shutdown()
+        except Exception:
+            logger.debug("EventBus shutdown failed", exc_info=True)
         # OPD end-of-session learning pipeline
         if self.settings.replay_on_session_end:
             await self._on_session_end_learning()

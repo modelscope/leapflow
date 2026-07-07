@@ -117,6 +117,23 @@ class TurnUsageTracker:
         self._tool_records.clear()
         self._compression_applied = False
 
+    def to_learning_signal(self) -> Dict[str, Any]:
+        """Structured signal for evolution episode context.
+
+        Returns a lightweight dict describing runtime difficulty: retries,
+        failovers, compressions, tool failure rates, and latency. The
+        evolution pipeline can use these to identify "hard" action patterns
+        and allocate attention/replay accordingly.
+        """
+        s = self.summary()
+        return {
+            "api_retries": max(0, s.api_calls - 1),
+            "compression_applied": s.compression_applied,
+            "tool_failure_rate": round(s.tool_failures / max(s.tool_calls, 1), 3),
+            "total_latency_ms": s.latency_ms,
+            "total_tokens": s.total_tokens,
+        }
+
     def format_log_line(self) -> str:
         """One-line summary for structured logging."""
         s = self.summary()

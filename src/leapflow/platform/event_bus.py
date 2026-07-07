@@ -118,6 +118,23 @@ class EventBus:
                     exc_info=True,
                 )
 
+    async def shutdown(self) -> None:
+        """Flush remaining events and release resources.
+
+        Call this during application cleanup to ensure tail events
+        (e.g. PatternMiner batches) are not lost.
+        """
+        if self._reorder_buffer is not None:
+            try:
+                await self._reorder_buffer.drain()
+            except Exception:
+                logger.debug("EventBus reorder drain failed on shutdown", exc_info=True)
+            self._reorder_buffer = None
+        await self.flush_consumers()
+        self._subscribers.clear()
+        self._consumers.clear()
+        logger.debug("EventBus shutdown complete")
+
     def _buffer_event(self, event: SystemEvent) -> None:
         """Add event to consumer buffer; schedule flush when threshold is met."""
         self._event_buffer.append(event)
