@@ -19,7 +19,7 @@ async def cmd_chat(ctx: "Context", prompt: str, thinking: bool) -> int:
     theme = detect_theme()
     console = LeapConsole(theme)
 
-    renderer = StreamRenderer(console.raw, theme)
+    renderer = StreamRenderer(console)
     renderer.start()
 
     try:
@@ -37,14 +37,6 @@ async def cmd_chat(ctx: "Context", prompt: str, thinking: bool) -> int:
             elif event.type == "final" and not renderer.text:
                 renderer.feed(event.content)
     finally:
-        elapsed = renderer.elapsed
-        tool_count = len(renderer._tool_history)
         renderer.finish()
-
-    final_text = renderer.text.strip()
-    if final_text:
-        console.markdown(final_text)
-    console.response_label(elapsed, tool_count=tool_count)
-    console.print()
 
     return 0

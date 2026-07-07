@@ -102,8 +102,9 @@ async def cmd_interactive(ctx: "Context") -> int:
             cap = getattr(engine, "model_capabilities", None)
             if cap is not None:
                 ctx_max = getattr(cap, "context_length", 0)
+        mode = _mode_name()
         status.update(
-            mode=_mode_name(),
+            mode=mode,
             skill_count=_skill_count(),
             platform_online=_platform_online(),
             model_name=getattr(ctx.settings, "model", ""),
@@ -111,6 +112,7 @@ async def cmd_interactive(ctx: "Context") -> int:
             context_used=ctx_used,
             context_max=ctx_max,
         )
+        app.prompt_mode = mode
 
     # ── Banner ───────────────────────────────────────────────────────
 
@@ -585,7 +587,7 @@ def _handle_skills(ctx: "Context", console, line: str) -> bool:
                     f"{m.confidence:.0%}",
                     s.description[:40],
                 )
-            console._console.print(table)
+            console.print(table)
         return True
 
     if line.startswith("skills show "):
@@ -605,7 +607,7 @@ def _handle_skills(ctx: "Context", console, line: str) -> bool:
             info.append(f"Confidence:  {m.confidence:.0%}\n")
             if skill.triggers:
                 info.append(f"Triggers:    {', '.join(skill.triggers)}")
-            console._console.print(
+            console.print(
                 Panel(info, title=skill.name, border_style="cyan")
             )
         return True

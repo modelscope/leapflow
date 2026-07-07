@@ -70,7 +70,7 @@ class LeapConsole:
 
     @property
     def raw(self) -> Console:
-        """Direct access to the underlying Rich Console (for StreamRenderer)."""
+        """Direct access to the underlying Rich Console."""
         return self._console
 
     def print(self, *args, **kwargs) -> None:

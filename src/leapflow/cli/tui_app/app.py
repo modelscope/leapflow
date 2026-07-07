@@ -89,6 +89,7 @@ class LeapApp:
 
         self._should_exit = False
         self._agent_running = False
+        self._prompt_mode = "idle"
         self._spinner_text = ""
         self._tool_start_time: float = 0.0
         self._pending_input: asyncio.Queue[str] = asyncio.Queue()
@@ -111,6 +112,15 @@ class LeapApp:
     @agent_running.setter
     def agent_running(self, value: bool) -> None:
         self._agent_running = value
+        self._invalidate()
+
+    @property
+    def prompt_mode(self) -> str:
+        return self._prompt_mode
+
+    @prompt_mode.setter
+    def prompt_mode(self, value: str) -> None:
+        self._prompt_mode = value
         self._invalidate()
 
     @property
@@ -291,7 +301,18 @@ class LeapApp:
     def _prompt_fragments(self) -> list[tuple[str, str]]:
         if self._agent_running:
             return [("class:prompt.working", "⚕ ")]
-        return [("class:prompt", "❯ ")]
+        _mode_prompts = {
+            "learning": [
+                ("class:prompt.recording", "● rec "),
+                ("class:prompt", "❯ "),
+            ],
+            "paused": [
+                ("class:prompt.paused", "⏸ "),
+                ("class:prompt", "❯ "),
+            ],
+            "executing": [("class:prompt.executing", "▶ ")],
+        }
+        return _mode_prompts.get(self._prompt_mode, [("class:prompt", "❯ ")])
 
     def _spinner_fragments(self) -> list[tuple[str, str]]:
         if not self._spinner_text:
