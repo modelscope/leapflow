@@ -214,18 +214,17 @@ class FailoverChain(LLMProvider):
                 if self._observer:
                     try:
                         self._observer.on_failover(old_name, new_name, reason)
-                    except Exception:
-                        pass
+                    except Exception as observer_exc:
+                        logger.debug("llm_failover observer error: %s", observer_exc)
                 return True
         return False
 
     def try_restore_primary(self) -> None:
         """Between turns, attempt to restore primary provider."""
-        if self._active_idx != 0 and 0 not in self._failed_indices:
-            return
         if self._active_idx == 0:
             return
-        self._failed_indices.discard(0)
+        if 0 in self._failed_indices:
+            return
         old = self._configs[self._active_idx].name
         self._active_idx = 0
         self._providers.pop(0, None)
@@ -282,11 +281,38 @@ class FailoverChain(LLMProvider):
         enable_thinking: bool = False,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        provider = self._get_or_create(self._active_idx)
-        async for chunk in provider.achat_stream(
-            messages, enable_thinking=enable_thinking, **kwargs
-        ):
-            yield chunk
+        last_exc: Optional[BaseException] = None
+
+        for _attempt in range(len(self._configs)):
+            provider = self._get_or_create(self._active_idx)
+            config = self._configs[self._active_idx]
+            pool = self._pools.get(config.name)
+
+            try:
+                async for chunk in provider.achat_stream(
+                    messages, enable_thinking=enable_thinking, **kwargs
+                ):
+                    yield chunk
+                return
+            except Exception as exc:
+                last_exc = exc
+
+                if self._is_rate_limit(exc) and pool and pool.size > 1:
+                    current_key = pool.get_key()
+                    pool.mark_rate_limited(current_key)
+                    self._providers.pop(self._active_idx, None)
+                    logger.info("llm_chain: rotated credential for %s (stream)", config.name)
+                    continue
+
+                if self._should_failover(exc):
+                    if not self._failover(str(exc)[:100]):
+                        break
+                    continue
+
+                raise
+
+        assert last_exc is not None
+        raise last_exc
 
 
 class AuxiliaryClient:
@@ -411,13 +437,17 @@ def parse_provider_configs(
     return configs
 
 
-def parse_credential_pools(configs: List[ProviderConfig]) -> Dict[str, CredentialPool]:
+def parse_credential_pools(
+    configs: List[ProviderConfig],
+    *,
+    cooldown_s: float = 60.0,
+) -> Dict[str, CredentialPool]:
     """Build credential pools for providers that have comma-separated api_keys."""
     pools: Dict[str, CredentialPool] = {}
     for config in configs:
         if "," in config.api_key:
             keys = [k.strip() for k in config.api_key.split(",") if k.strip()]
             if len(keys) > 1:
-                pools[config.name] = CredentialPool(keys)
+                pools[config.name] = CredentialPool(keys, cooldown_s=cooldown_s)
                 logger.info("credential_pool: %s has %d keys", config.name, len(keys))
     return pools

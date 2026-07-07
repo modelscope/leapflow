@@ -383,7 +383,10 @@ class Context:
             fallback_json=settings.llm_fallback_providers,
             primary_context_length=settings.llm_context_length,
         )
-        credential_pools = parse_credential_pools(provider_configs)
+        credential_pools = parse_credential_pools(
+            provider_configs,
+            cooldown_s=settings.llm_credential_cooldown_s,
+        )
         if len(provider_configs) > 1 or credential_pools:
             self.llm_chain = FailoverChain(
                 provider_configs, credential_pools=credential_pools,
@@ -1309,6 +1312,8 @@ class Context:
                     outcome=ep["outcome"],
                     reward=ep["reward"],
                     context=ep.get("context"),
+                    episode_id=ep["episode_id"],
+                    timestamp=ep.get("timestamp"),
                 )
             if persisted:
                 logger.info("Evolution: hydrated %d episodes from DuckDB", len(persisted))
@@ -1397,6 +1402,8 @@ class Context:
                 "Dynamic tool result budget: %d (context=%d)",
                 dynamic_result_budget, context_length,
             )
+        if self.engine is not None:
+            self.engine.set_tool_result_budget(dynamic_result_budget)
 
         # ── Register session_search tool ──
         if self._conversation_store:

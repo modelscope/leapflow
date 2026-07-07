@@ -96,7 +96,7 @@ class StagnationGuard:
     def check(self, history: List[Dict[str, Any]]) -> GuardrailViolation:
         tool_results = [
             m for m in history[-self._window * 3:]
-            if m.get("role") in ("tool", "user") and "Tool result" in m.get("content", "")
+            if m.get("role") in ("tool", "user")
         ]
         if len(tool_results) < self._window:
             return GuardrailViolation(violated=False)
@@ -104,7 +104,9 @@ class StagnationGuard:
         successes = 0
         for msg in tool_results[-self._window:]:
             content = msg.get("content", "")
-            if '"ok": true' in content or '"ok":true' in content:
+            if not isinstance(content, str):
+                continue
+            if self._is_success_result(content):
                 successes += 1
 
         rate = successes / self._window
@@ -117,6 +119,19 @@ class StagnationGuard:
             )
 
         return GuardrailViolation(violated=False)
+
+    @staticmethod
+    def _is_success_result(content: str) -> bool:
+        """Detect tool success from native tool JSON or text-mode tool results."""
+        if '"ok": true' in content or '"ok":true' in content:
+            return True
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict) and parsed.get("ok") is True:
+                return True
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return False
 
     def reset(self) -> None:
         pass

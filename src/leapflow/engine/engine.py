@@ -264,6 +264,9 @@ class AgentEngine:
         # Tool loop guardrails (injected by CLI)
         self._guardrail: Optional[Any] = None
 
+        # Optional override for dynamic tool result budget (set by CLI wiring)
+        self._tool_result_budget: Optional[int] = None
+
         # State-machine loop infrastructure (config-driven)
         self._budget_config = BudgetConfig(
             max_iterations=settings.react_max_iterations,
@@ -298,6 +301,34 @@ class AgentEngine:
     def set_sanitizer(self, sanitizer: MessageSanitizer | None) -> None:
         """Configure output message sanitizer."""
         self._sanitizer = sanitizer
+
+    def set_tool_result_budget(self, budget: int) -> None:
+        """Override per-tool result truncation budget (e.g. linked to model context)."""
+        self._tool_result_budget = max(1, budget)
+
+    def _effective_tool_result_budget(self) -> int:
+        return self._tool_result_budget or self._settings.max_tool_result_chars
+
+    def _check_guardrail(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Run guardrail check. Returns 'halt' if loop should stop, else None."""
+        if self._guardrail is None:
+            return None
+        violation = self._guardrail.check(messages)
+        if not violation.violated:
+            return None
+        logger.warning("guardrail: %s", violation.reason)
+        if violation.severity == "halt":
+            messages.append(build_user_message_text(
+                f"SYSTEM GUARDRAIL: {violation.reason}. {violation.suggestion}"
+            ))
+            return "halt"
+        messages.append(build_user_message_text(
+            f"SYSTEM WARNING: {violation.reason}. {violation.suggestion}"
+        ))
+        return None
 
     def set_conversation_store(self, store: Any) -> None:
         """Inject conversation persistence store."""
@@ -836,7 +867,7 @@ class AgentEngine:
         content = ""
         recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
-        result_budget = self._settings.max_tool_result_chars
+        result_budget = self._effective_tool_result_budget()
 
         tools_kwarg: Dict[str, Any] = {}
         if use_native_tools and TOOL_DEFINITIONS:
@@ -922,18 +953,8 @@ class AgentEngine:
                     break
 
                 # Guardrail check after tool execution
-                if self._guardrail is not None:
-                    violation = self._guardrail.check(messages)
-                    if violation.violated:
-                        logger.warning("guardrail: %s", violation.reason)
-                        if violation.severity == "halt":
-                            messages.append(build_user_message_text(
-                                f"SYSTEM GUARDRAIL: {violation.reason}. {violation.suggestion}"
-                            ))
-                            break
-                        messages.append(build_user_message_text(
-                            f"SYSTEM WARNING: {violation.reason}. {violation.suggestion}"
-                        ))
+                if self._check_guardrail(messages) == "halt":
+                    break
 
                 self._wm.remember_chat(build_assistant_message(
                     content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
@@ -974,22 +995,14 @@ class AgentEngine:
             else:
                 recovery.record_tool_success()
 
-            # Guardrail check for text-parsed tool path
-            if self._guardrail is not None:
-                violation = self._guardrail.check(messages)
-                if violation.violated:
-                    logger.warning("guardrail: %s", violation.reason)
-                    if violation.severity == "halt":
-                        break
-                    messages.append(build_user_message_text(
-                        f"SYSTEM WARNING: {violation.reason}. {violation.suggestion}"
-                    ))
-
             result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
             messages.append(build_user_message_text(
                 f"Tool result ({tool_call['name']}):\n{result_text}"
             ))
             self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
+
+            if self._check_guardrail(messages) == "halt":
+                break
 
             if status == BudgetStatus.SOFT_LIMIT:
                 messages.append(build_user_message_text(
@@ -1121,7 +1134,7 @@ class AgentEngine:
         content = ""
         turn_recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
-        result_budget = self._settings.max_tool_result_chars
+        result_budget = self._effective_tool_result_budget()
 
         tools_kwarg: Dict[str, Any] = {}
         if use_native_tools and TOOL_DEFINITIONS:
@@ -1211,6 +1224,9 @@ class AgentEngine:
                     turn_recovery.consecutive_tool_failures = failures
                     if failures >= self._settings.max_consecutive_tool_failures:
                         logger.warning("unified_loop_stream: %d consecutive tool failures, stopping", failures)
+                        break
+
+                    if self._check_guardrail(messages) == "halt":
                         break
 
                     self._wm.remember_chat(build_assistant_message(
@@ -1316,6 +1332,9 @@ class AgentEngine:
             ))
             self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
 
+            if self._check_guardrail(messages) == "halt":
+                break
+
             if status == BudgetStatus.SOFT_LIMIT:
                 messages.append(build_user_message_text(
                     "SYSTEM: Approaching limit. Provide final answer now."
@@ -1323,6 +1342,13 @@ class AgentEngine:
 
         if self._memory_manager and self._settings.memory_integration_enabled:
             asyncio.create_task(self._sync_turn_safe(messages))
+
+        if self._evolution is not None and content:
+            asyncio.create_task(self._post_turn_review(messages, content))
+
+        llm = self._llm
+        if hasattr(llm, 'try_restore_primary'):
+            llm.try_restore_primary()
 
         yield StreamEvent(type="final", content=content if content else "I've reached my processing limit.")
 
@@ -1369,7 +1395,7 @@ class AgentEngine:
         Concurrent group runs via asyncio.gather; sequential group runs one-by-one.
         Results are appended to messages in OpenAI tool-result format.
         """
-        result_budget = self._settings.max_tool_result_chars
+        result_budget = self._effective_tool_result_budget()
         tc_wrappers = [
             ConcurrentToolCall(id=tc.id, name=tc.name, arguments=tc.arguments)
             for tc in native_calls

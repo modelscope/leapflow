@@ -486,6 +486,16 @@ class ArchiveStage:
         if not archived:
             return messages
 
+        if self._archive_fn is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(self._archive_fn(archived))
+                else:
+                    loop.run_until_complete(self._archive_fn(archived))
+            except Exception as exc:
+                logger.warning("ArchiveStage: archive_fn failed (%s)", exc)
+
         # Archive notification (actual archiving is async, handled externally)
         archive_notice = {
             "role": "system",

@@ -257,15 +257,23 @@ class EvolutionMemoryProvider:
         reward: float,
         *,
         context: Optional[Dict[str, Any]] = None,
+        episode_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
     ) -> SkillEpisode:
         """Record a complete skill execution episode.
 
         Creates both a MemoryEntry (for protocol-based access) and a
         SkillEpisode (for structured experience queries).
         After recording, runs novelty check and generalization check.
+
+        Optional ``episode_id`` and ``timestamp`` support idempotent hydration
+        from persistent storage without generating duplicate entries.
         """
-        entry_id = uuid.uuid4().hex[:12]
-        now = time.time()
+        if episode_id and episode_id in self._episodes:
+            return self._episodes[episode_id]
+
+        entry_id = episode_id or uuid.uuid4().hex[:12]
+        now = timestamp if timestamp is not None else time.time()
 
         episode = SkillEpisode(
             episode_id=entry_id,
