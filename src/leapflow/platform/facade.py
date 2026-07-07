@@ -133,7 +133,6 @@ _CUA_TOOL_TO_CAPABILITIES: dict[str, list[str]] = {
 def _manifest_from_cua_tools(rpc: "CuaDriverClient") -> PlatformManifest:
     """Build a PlatformManifest from CuaDriverClient's discovered tools."""
     import platform as _platform
-    import sys as _sys
 
     from leapflow.platform.cua_client import CuaDriverClient
 
@@ -150,15 +149,7 @@ def _manifest_from_cua_tools(rpc: "CuaDriverClient") -> PlatformManifest:
         cap for s in caps_strs if (cap := capability_from_str(s)) is not None
     )
 
-    # Determine platform
-    if _sys.platform == "darwin":
-        pid = PlatformID.DARWIN
-    elif _sys.platform == "win32":
-        pid = PlatformID.WINDOWS
-    elif _sys.platform.startswith("linux"):
-        pid = PlatformID.LINUX
-    else:
-        pid = PlatformID.UNKNOWN
+    pid = PlatformID.resolve()
 
     return PlatformManifest(
         platform_id=pid,
