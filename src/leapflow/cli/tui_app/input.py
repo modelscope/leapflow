@@ -33,7 +33,10 @@ _HISTORY_FILE = "history"
 
 
 class _SlashCompleter(Completer):
-    """Complete slash-style commands from a static command list."""
+    """Complete slash-style commands from a static command list.
+
+    Matches both ``/help`` and bare ``help`` input styles.
+    """
 
     def __init__(self, commands: Sequence[tuple[str, str]]) -> None:
         self._commands = commands
@@ -42,9 +45,16 @@ class _SlashCompleter(Completer):
         text = document.text_before_cursor.lstrip()
         if not text:
             return
+        has_slash = text.startswith("/")
+        query = text.lstrip("/")
+        if not query:
+            for cmd, desc in self._commands:
+                yield Completion(f"/{cmd}", start_position=-len(text), display_meta=desc)
+            return
         for cmd, desc in self._commands:
-            if cmd.startswith(text) and cmd != text:
-                yield Completion(cmd, start_position=-len(text), display_meta=desc)
+            if cmd.startswith(query) and cmd != query:
+                completion = f"/{cmd}" if has_slash else cmd
+                yield Completion(completion, start_position=-len(text), display_meta=desc)
 
 
 def _build_style(theme: Theme) -> Style:

@@ -28,9 +28,14 @@ async def cmd_interactive(ctx: "Context") -> int:
     # ── TUI setup ──
     from leapflow.cli.tui_app import detect_theme, LeapConsole, LeapInput, StreamRenderer
     from leapflow.cli.tui_app.status import StatusBar
-    from leapflow.cli.banner import display_welcome
+    from leapflow.cli.banner import display_rich_banner
+    from leapflow.cli.commands.registry import completion_entries, resolve_command
+    from leapflow.cli.commands.slash_handlers import (
+        handle_status, handle_tools, handle_usage, handle_model, handle_clear,
+    )
     from leapflow.utils.terminal_io import TerminalIOProvider
     from leapflow.engine.session import SessionMode
+    from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
 
     theme = detect_theme()
     console = LeapConsole(theme)
@@ -40,6 +45,7 @@ async def cmd_interactive(ctx: "Context") -> int:
     leap_input = LeapInput(
         theme,
         data_dir=ctx.settings.data_dir if hasattr(ctx.settings, "data_dir") else None,
+        commands=completion_entries(),
     )
 
     # ── Callbacks ──
@@ -62,16 +68,22 @@ async def cmd_interactive(ctx: "Context") -> int:
         ctx.session.set_on_learn_complete(_on_complete)
     ctx.session.set_on_execute_step(_on_step)
 
-    # ── Banner + session info ──
-    display_welcome()
-    console.session_info(
+    # ── Banner ──
+    all_skills = ctx.registry.list_all() if ctx.registry else []
+    mcp_count = len(getattr(ctx, "platform_tools", [])) if hasattr(ctx, "platform_tools") else 0
+    cap = getattr(ctx.engine, "model_capabilities", None) if ctx.engine else None
+    ctx_len = getattr(cap, "context_length", 0) if cap else 0
+
+    display_rich_banner(
         model=getattr(ctx.settings, "model", ""),
-        platform="connected" if (hasattr(ctx.rpc, "connected") and ctx.rpc.connected) else "mock",
         cwd=os.getcwd(),
-        skill_count=_skill_count(),
         session_id=getattr(ctx.session, "session_id", ""),
+        platform_online=_platform_online(),
+        tool_defs=TOOL_DEFINITIONS,
+        skills=all_skills,
+        context_length=ctx_len,
+        mcp_tools=mcp_count,
     )
-    console.rule()
     console.print()
 
     # ── Helpers ──
@@ -208,73 +220,115 @@ async def cmd_interactive(ctx: "Context") -> int:
         if _learning:
             ctx.imitation.mark_control_input()
 
-        # ── Exit ──
-        if line in ("exit", "quit", "q", "退出"):
-            if ctx.session and ctx.session.mode == SessionMode.LEARNING:
-                try:
-                    await ctx.session.exit_learning()
-                    console.system("Learning stopped.")
-                except Exception:
-                    pass
-            elif _learning:
-                ctx.imitation.end_control_input()
-            console.system("Bye!")
-            break
+        # Normalize: strip leading "/" for slash commands
+        cmd_text = line.lstrip("/") if line.startswith("/") else line
 
-        # ── Help ──
-        if line in ("help", "帮助", "?"):
-            _show_help(console)
-            continue
+        # ── Registry-based dispatch ──
+        cmd_def = resolve_command(cmd_text)
+        if cmd_def is not None:
+            canonical = cmd_def.name
+            # Extract args after the command name
+            cmd_args = cmd_text[len(canonical):].strip()
 
-        # ── Teach commands ──
-        if await _handle_teach(ctx, console, line, _learning):
-            continue
+            # Session commands
+            if canonical == "exit":
+                if ctx.session and ctx.session.mode == SessionMode.LEARNING:
+                    try:
+                        await ctx.session.exit_learning()
+                        console.system("Learning stopped.")
+                    except Exception:
+                        pass
+                elif _learning:
+                    ctx.imitation.end_control_input()
+                console.system("Bye!")
+                break
+
+            elif canonical == "help":
+                _show_help(console)
+                continue
+
+            elif canonical == "status":
+                handle_status(ctx, console, cmd_args)
+                continue
+
+            elif canonical == "clear":
+                handle_clear(ctx, console, cmd_args)
+                display_rich_banner(
+                    model=getattr(ctx.settings, "model", ""),
+                    cwd=os.getcwd(),
+                    session_id=getattr(ctx.session, "session_id", ""),
+                    platform_online=_platform_online(),
+                    tool_defs=TOOL_DEFINITIONS,
+                    skills=ctx.registry.list_all() if ctx.registry else [],
+                    context_length=ctx_len,
+                    mcp_tools=mcp_count,
+                )
+                continue
+
+            elif canonical == "tools":
+                handle_tools(ctx, console, cmd_args)
+                continue
+
+            elif canonical == "usage":
+                handle_usage(ctx, console, cmd_args)
+                continue
+
+            elif canonical == "model":
+                handle_model(ctx, console, cmd_args)
+                continue
+
+            # Teaching commands
+            elif canonical.startswith("teach") or canonical in ("annotate", "skip"):
+                if await _handle_teach(ctx, console, cmd_text, _learning):
+                    continue
+
+            # Skills commands
+            elif canonical.startswith("skills"):
+                if _handle_skills(ctx, console, cmd_text):
+                    continue
+
+            # Hub commands
+            elif canonical.startswith("hub"):
+                from leapflow.cli.commands.hub import cmd_hub
+                hub_args = cmd_text.split()[1:] if len(cmd_text.split()) > 1 else []
+                await cmd_hub(ctx, hub_args)
+                continue
+
+            # Run command
+            elif canonical == "run":
+                trigger_or_name = cmd_args
+                if trigger_or_name.startswith("--skill "):
+                    skill_name = trigger_or_name[len("--skill "):]
+                    result = await ctx.session.execute_skill(skill_name, io=io)
+                else:
+                    matched = ctx.session.find_skill(trigger_or_name)
+                    if matched:
+                        result = await ctx.session.execute_skill(matched, io=io)
+                    else:
+                        await _stream_response(trigger_or_name)
+                        await _inject_copilot_event(ctx, line, _mode_name)
+                        continue
+                _print_execution_result(result)
+                continue
+
+            # Shortcut commands
+            elif canonical.startswith("shortcut"):
+                if _handle_shortcuts(ctx, console, cmd_text):
+                    continue
+
+            # Scheduler commands
+            elif canonical == "arm":
+                from leapflow.cli.commands.scheduler import cmd_arm
+                await cmd_arm(ctx, cmd_text.split()[1:] if len(cmd_text.split()) > 1 else [])
+                continue
+
+            elif canonical == "tasks":
+                from leapflow.cli.commands.scheduler import cmd_tasks
+                await cmd_tasks(ctx, cmd_text.split()[1:] if len(cmd_text.split()) > 1 else [])
+                continue
 
         if _learning:
             ctx.imitation.end_control_input()
-
-        # ── Skills commands ──
-        if _handle_skills(ctx, console, line):
-            continue
-
-        # ── Hub commands ──
-        if line.startswith("hub"):
-            from leapflow.cli.commands.hub import cmd_hub
-            hub_args = line.split()[1:] if len(line.split()) > 1 else []
-            await cmd_hub(ctx, hub_args)
-            continue
-
-        # ── Scheduler commands ──
-        if line.startswith("arm"):
-            from leapflow.cli.commands.scheduler import cmd_arm
-            await cmd_arm(ctx, line.split()[1:] if len(line.split()) > 1 else [])
-            continue
-
-        if line.startswith("tasks"):
-            from leapflow.cli.commands.scheduler import cmd_tasks
-            await cmd_tasks(ctx, line.split()[1:] if len(line.split()) > 1 else [])
-            continue
-
-        # ── Run command ──
-        if line.startswith("run "):
-            trigger_or_name = line[4:].strip()
-            if trigger_or_name.startswith("--skill "):
-                skill_name = trigger_or_name[len("--skill "):]
-                result = await ctx.session.execute_skill(skill_name, io=io)
-            else:
-                matched = ctx.session.find_skill(trigger_or_name)
-                if matched:
-                    result = await ctx.session.execute_skill(matched, io=io)
-                else:
-                    await _stream_response(trigger_or_name)
-                    await _inject_copilot_event(ctx, line, _mode_name)
-                    continue
-            _print_execution_result(result)
-            continue
-
-        # ── Shortcut commands ──
-        if _handle_shortcuts(ctx, console, line):
-            continue
 
         # ── Default: Natural language ──
         if ctx.session and ctx.session.mode == SessionMode.LEARNING:
@@ -566,41 +620,27 @@ def _handle_shortcuts(ctx: "Context", console, line: str) -> bool:
 
 
 def _show_help(console) -> None:
-    """Display help with rich formatting."""
-    from rich.table import Table
+    """Display categorized help using the command registry."""
+    from leapflow.cli.commands.registry import commands_by_category
 
-    table = Table(
-        title="Commands",
-        show_header=True,
-        header_style="bold",
-        border_style="dim",
-        title_style="bold cyan",
-        padding=(0, 1),
-    )
-    table.add_column("Command", style="cyan", no_wrap=True)
-    table.add_column("Description")
+    categories = commands_by_category()
 
-    commands = [
-        ("teach start [goal]", "Start teaching mode"),
-        ("teach stop / stop", "Stop and distill skill"),
-        ("teach pause / resume", "Pause/resume recording"),
-        ("teach discard", "Discard recording"),
-        ("annotate <text>", "Add annotation during teaching"),
-        ("skip [n]", "Mark last n steps as noise"),
-        ("run <trigger>", "Execute a skill by trigger"),
-        ("run --skill <name>", "Execute by exact name"),
-        ("skills", "List all skills"),
-        ("skills show <name>", "Show skill details"),
-        ("hub push/pull/search", "Hub operations"),
-        ("shortcut list/add/remove", "Manage quick-reply shortcuts"),
-        ("<text>", "Chat / natural language"),
-        ("exit", "Quit"),
-    ]
-    for cmd, desc in commands:
-        table.add_row(cmd, desc)
-
-    console._console.print(table)
     console.print()
+    for category, cmds in categories.items():
+        console.print(f"  [bold]── {category} ──[/]")
+        for cmd in cmds:
+            name = f"/{cmd.name}"
+            if cmd.args_hint:
+                name = f"{name} {cmd.args_hint}"
+            aliases = ""
+            if cmd.aliases:
+                visible = [a for a in cmd.aliases if not a.startswith("教") and a != "?" and a not in ("teach",)]
+                if visible:
+                    aliases = f" [dim]({', '.join(visible)})[/]"
+            console.print(f"    [cyan]{name:<28}[/] {cmd.description}{aliases}")
+        console.print()
+
+    console.system("Type your message to chat · Alt+Enter for multiline · Tab for completion")
 
 
 # ── Copilot helpers ───────────────────────────────────────────────────────────
