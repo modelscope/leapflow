@@ -471,6 +471,78 @@ class DuckDBConversationStore:
 
         return child
 
+    def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Export a session with all its messages as a portable dict.
+
+        Returns None if session not found. Suitable for JSON serialization.
+        """
+        session = self.get_session(session_id)
+        if session is None:
+            return None
+
+        messages = self.get_messages(session_id, limit=10_000, active_only=False)
+        return {
+            "session_id": session.session_id,
+            "title": session.title,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+            "parent_session_id": session.parent_session_id,
+            "model": session.model,
+            "source": session.source,
+            "cwd": session.cwd,
+            "metadata": session.metadata,
+            "messages": [
+                {
+                    "message_id": m.message_id,
+                    "role": m.role,
+                    "content": m.content,
+                    "created_at": m.created_at,
+                    "tool_name": m.tool_name,
+                    "tool_call_id": m.tool_call_id,
+                    "tool_calls_json": m.tool_calls_json,
+                    "token_count": m.token_count,
+                }
+                for m in messages
+            ],
+        }
+
+    def import_session(self, data: Dict[str, Any]) -> ConversationSession:
+        """Import a session from a portable dict (e.g. from export_session).
+
+        Creates the session and all its messages. Skips messages that already
+        exist (idempotent on message_id).
+        """
+        sid = data["session_id"]
+        session = self.create_session(
+            sid,
+            title=data.get("title", ""),
+            parent_session_id=data.get("parent_session_id"),
+            model=data.get("model", ""),
+            source=data.get("source", "imported"),
+            cwd=data.get("cwd", ""),
+            metadata=data.get("metadata"),
+        )
+
+        for msg in data.get("messages", []):
+            tc_json = msg.get("tool_calls_json")
+            tc_list = None
+            if tc_json:
+                try:
+                    tc_list = json.loads(tc_json)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            self.append_message(
+                sid,
+                msg["role"],
+                msg.get("content", ""),
+                tool_name=msg.get("tool_name"),
+                tool_call_id=msg.get("tool_call_id"),
+                tool_calls=tc_list,
+                token_count=msg.get("token_count", 0),
+            )
+
+        return session
+
     def close(self) -> None:
         """Close the database connection."""
         try:

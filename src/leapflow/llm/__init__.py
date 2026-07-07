@@ -17,6 +17,10 @@ from leapflow.llm.provider_chain import (
     parse_credential_pools,
     parse_provider_configs,
 )
+from leapflow.llm.model_capabilities import (
+    ModelCapabilities,
+    ModelCapabilityRegistry,
+)
 
 __all__ = [
     "LLMProvider",
@@ -28,6 +32,8 @@ __all__ = [
     "ProviderMetadata",
     "CredentialPool",
     "AuxiliaryClient",
+    "ModelCapabilities",
+    "ModelCapabilityRegistry",
     "parse_provider_configs",
     "parse_credential_pools",
     "build_assistant_message",

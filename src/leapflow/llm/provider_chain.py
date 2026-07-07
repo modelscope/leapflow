@@ -130,15 +130,62 @@ def _build_provider(config: ProviderConfig, pool: Optional[CredentialPool] = Non
     )
 
 
+class _CircuitState:
+    """Per-provider circuit breaker state.
+
+    States:
+    - CLOSED: normal operation, requests flow through
+    - OPEN: failures exceeded threshold, requests rejected for cooldown_s
+    - HALF_OPEN: cooldown expired, next request is a probe
+    """
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+    def __init__(self, *, failure_threshold: int = 5, cooldown_s: float = 60.0) -> None:
+        self._failure_threshold = failure_threshold
+        self._cooldown_s = cooldown_s
+        self._consecutive_failures = 0
+        self._state = self.CLOSED
+        self._opened_at = 0.0
+
+    @property
+    def is_available(self) -> bool:
+        if self._state == self.CLOSED:
+            return True
+        if self._state == self.OPEN:
+            if time.monotonic() - self._opened_at >= self._cooldown_s:
+                self._state = self.HALF_OPEN
+                return True
+            return False
+        return True  # HALF_OPEN allows one probe
+
+    def record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._state = self.CLOSED
+
+    def record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._failure_threshold:
+            self._state = self.OPEN
+            self._opened_at = time.monotonic()
+            logger.info(
+                "circuit_breaker: opened after %d failures (cooldown %.0fs)",
+                self._consecutive_failures, self._cooldown_s,
+            )
+
+
 class FailoverChain(LLMProvider):
-    """Ordered provider chain with automatic failover.
+    """Ordered provider chain with automatic failover and circuit breaker.
 
     Behavior:
     1. Primary provider receives all requests.
     2. On unrecoverable error (billing, auth, persistent 500), failover to next.
     3. Between turns, attempt to restore primary (avoid permanent degradation).
     4. Credential pool rotates keys within a single provider on rate-limit.
-    5. Observer notified on every failover event.
+    5. Circuit breaker per provider: opens after N consecutive failures.
+    6. Observer notified on every failover event.
 
     Implements LLMProvider so engine code needs zero changes.
     """
@@ -154,6 +201,8 @@ class FailoverChain(LLMProvider):
         *,
         credential_pools: Optional[Dict[str, CredentialPool]] = None,
         observer: Optional[FailoverObserver] = None,
+        circuit_failure_threshold: int = 5,
+        circuit_cooldown_s: float = 60.0,
     ) -> None:
         if not providers:
             raise ValueError("FailoverChain requires at least one provider")
@@ -163,6 +212,13 @@ class FailoverChain(LLMProvider):
         self._active_idx = 0
         self._providers: Dict[int, LLMProvider] = {}
         self._failed_indices: set[int] = set()
+        self._circuits: Dict[int, _CircuitState] = {
+            i: _CircuitState(
+                failure_threshold=circuit_failure_threshold,
+                cooldown_s=circuit_cooldown_s,
+            )
+            for i in range(len(self._configs))
+        }
 
     @property
     def active_provider_name(self) -> str:
@@ -253,8 +309,10 @@ class FailoverChain(LLMProvider):
                     enable_thinking=enable_thinking,
                     on_chunk=on_chunk, **kwargs,
                 )
+                self._circuits[self._active_idx].record_success()
                 return resp
             except Exception as exc:
+                self._circuits[self._active_idx].record_failure()
                 last_exc = exc
 
                 if self._is_rate_limit(exc) and pool and pool.size > 1:
@@ -293,8 +351,10 @@ class FailoverChain(LLMProvider):
                     messages, enable_thinking=enable_thinking, **kwargs
                 ):
                     yield chunk
+                self._circuits[self._active_idx].record_success()
                 return
             except Exception as exc:
+                self._circuits[self._active_idx].record_failure()
                 last_exc = exc
 
                 if self._is_rate_limit(exc) and pool and pool.size > 1:

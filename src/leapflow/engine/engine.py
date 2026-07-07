@@ -27,7 +27,9 @@ from leapflow.engine.intent_classifier import Intent, IntentClassifier
 from leapflow.engine.message_healer import MessageHealer
 from leapflow.engine.message_sanitizer import MessageSanitizer
 from leapflow.engine.prompt_cache import CacheStrategy
+from leapflow.engine.stale_stream import StaleStreamError, stale_guarded_stream, build_continuation_prompt
 from leapflow.engine.turn_recovery import TurnRecoveryState
+from leapflow.engine.turn_usage import TurnUsageTracker
 from leapflow.engine.tool_concurrency import (
     DefaultConcurrencyPolicy,
     ToolCall as ConcurrentToolCall,
@@ -267,6 +269,22 @@ class AgentEngine:
         # Optional override for dynamic tool result budget (set by CLI wiring)
         self._tool_result_budget: Optional[int] = None
 
+        # Per-turn usage tracking
+        self._usage_tracker = TurnUsageTracker()
+
+        # Per-tool timeout (seconds); can be overridden via set_tool_timeouts
+        self._default_tool_timeout_s: float = 120.0
+        self._tool_timeouts: Dict[str, float] = {}
+
+        # Stale stream timeout
+        self._stale_stream_timeout_s: float = 180.0
+
+        # Evolution store for incremental persistence (injected by CLI)
+        self._evolution_store: Optional[Any] = None
+
+        # Model capability registry (injected by CLI)
+        self._model_capabilities: Optional[Any] = None
+
         # State-machine loop infrastructure (config-driven)
         self._budget_config = BudgetConfig(
             max_iterations=settings.react_max_iterations,
@@ -309,6 +327,80 @@ class AgentEngine:
     def _effective_tool_result_budget(self) -> int:
         return self._tool_result_budget or self._settings.max_tool_result_chars
 
+    async def _handle_api_error(
+        self,
+        classified: ErrorCategory,
+        rec: Any,
+        recovery: TurnRecoveryState,
+        messages: list,
+        budget: Any,
+        *,
+        use_native_tools: bool = False,
+        tools_kwarg: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Unified API error recovery dispatcher. Returns 'continue' to retry, else None.
+
+        Wires ALL TurnRecoveryState one-shot guards to their matching ErrorCategory:
+        - CONTEXT_OVERFLOW → try_compress
+        - IMAGE_TOO_LARGE → try_multimodal_strip
+        - should_fallback → try_provider_failover
+        - should_rotate_credential → try_credential_rotate
+        - FORMAT_ERROR with thinking → try_disable_thinking
+        """
+        if classified == ErrorCategory.CONTEXT_OVERFLOW and recovery.try_compress():
+            messages[:] = self._compressor.force_compress(messages)
+            logger.info("recovery: force_compress on context overflow")
+            if budget.remaining > 0:
+                return "continue"
+
+        if classified == ErrorCategory.IMAGE_TOO_LARGE and recovery.try_multimodal_strip():
+            self._strip_images_from_messages(messages)
+            logger.info("recovery: stripped images from messages")
+            if budget.remaining > 0:
+                return "continue"
+
+        if rec.should_fallback and recovery.try_provider_failover():
+            llm = self._llm
+            if hasattr(llm, '_failover'):
+                llm._failover("recovery: provider failover")
+            logger.info("recovery: provider failover triggered")
+            if budget.remaining > 0:
+                return "continue"
+
+        if rec.should_rotate_credential and recovery.try_credential_rotate():
+            logger.info("recovery: credential rotation requested")
+            if budget.remaining > 0:
+                return "continue"
+
+        if classified == ErrorCategory.FORMAT_ERROR and recovery.try_disable_thinking():
+            logger.info("recovery: disabled thinking mode")
+            if budget.remaining > 0:
+                return "continue"
+
+        if rec.retry and budget.remaining > 0:
+            if rec.backoff:
+                await asyncio.sleep(jittered_backoff(budget.used, base=rec.base_delay))
+            return "continue"
+
+        return None
+
+    @staticmethod
+    def _strip_images_from_messages(messages: list) -> None:
+        """Remove image content parts from messages in-place (multimodal strip)."""
+        for i, msg in enumerate(messages):
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_parts = [
+                    p for p in content
+                    if isinstance(p, dict) and p.get("type") != "image_url"
+                    and p.get("type") != "input_image" and p.get("type") != "image"
+                ]
+                if len(text_parts) < len(content):
+                    if text_parts:
+                        messages[i] = {**msg, "content": text_parts}
+                    else:
+                        messages[i] = {**msg, "content": "[images removed to reduce context]"}
+
     def _check_guardrail(
         self,
         messages: List[Dict[str, Any]],
@@ -330,9 +422,52 @@ class AgentEngine:
         ))
         return None
 
+    def set_tool_timeouts(self, timeouts: Dict[str, float]) -> None:
+        """Set per-tool execution timeout overrides (seconds)."""
+        self._tool_timeouts = dict(timeouts)
+
+    def set_default_tool_timeout(self, timeout_s: float) -> None:
+        self._default_tool_timeout_s = max(5.0, timeout_s)
+
+    def set_stale_stream_timeout(self, timeout_s: float) -> None:
+        self._stale_stream_timeout_s = max(30.0, timeout_s)
+
+    def set_evolution_store(self, store: Any) -> None:
+        """Inject evolution store for incremental episode persistence."""
+        self._evolution_store = store
+
+    def set_model_capabilities(self, registry: Any) -> None:
+        """Inject model capability registry."""
+        self._model_capabilities = registry
+
     def set_conversation_store(self, store: Any) -> None:
         """Inject conversation persistence store."""
         self._conversation_store = store
+
+    def load_session(self, session_id: str) -> bool:
+        """Resume a previous session by loading messages from DuckDB.
+
+        Returns True if the session was found and messages loaded.
+        """
+        if not self._conversation_store:
+            return False
+        try:
+            messages = self._conversation_store.get_messages(session_id, limit=500)
+            if not messages:
+                return False
+            self._current_session_id = session_id
+            for msg in messages:
+                role = msg.role
+                content = msg.content
+                if role == "user":
+                    self._wm.remember_chat(build_user_message_text(content))
+                elif role == "assistant":
+                    self._wm.remember_chat(build_assistant_message(content))
+            logger.info("session.resume loaded %d messages from %s", len(messages), session_id)
+            return True
+        except Exception:
+            logger.debug("session.resume failed", exc_info=True)
+            return False
 
     def cancel(self) -> None:
         """Request cancellation of the active run/run_stream call.
@@ -868,6 +1003,7 @@ class AgentEngine:
         recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
         result_budget = self._effective_tool_result_budget()
+        self._usage_tracker.reset()
 
         tools_kwarg: Dict[str, Any] = {}
         if use_native_tools and TOOL_DEFINITIONS:
@@ -875,7 +1011,6 @@ class AgentEngine:
 
         self._cancel_requested = False
 
-        # Session persistence: create session for this turn
         session_id = self._ensure_session(user_text)
 
         while not budget.exhausted:
@@ -900,23 +1035,28 @@ class AgentEngine:
                     **tools_kwarg,
                 )
                 recovery.record_api_success()
+                self._usage_tracker.record_api_call(
+                    resp.usage or {},
+                    provider=getattr(self._llm, 'active_provider_name', ''),
+                    model=resp.model or '',
+                )
+                if self._model_capabilities and resp.model and resp.usage:
+                    self._model_capabilities.update_from_usage(resp.model, resp.usage)
             except Exception as exc:
                 _clear_indicator()
                 classified = self._error_classifier.classify(exc)
                 rec = self._error_classifier.get_recovery(classified)
-                recovery.record_api_error(classified.value if hasattr(classified, 'value') else str(classified))
+                category_str = classified.value if hasattr(classified, 'value') else str(classified)
+                recovery.record_api_error(category_str)
 
-                if classified == ErrorCategory.CONTEXT_OVERFLOW and recovery.try_compress():
-                    messages = self._compressor.force_compress(messages)
-                    logger.info("unified_loop: force_compress on context overflow")
-                    if budget.remaining > 0:
-                        continue
-
-                if rec.retry and budget.remaining > 0:
-                    await asyncio.sleep(jittered_backoff(budget.used))
+                if await self._handle_api_error(
+                    classified, rec, recovery, messages, budget,
+                    use_native_tools=use_native_tools, tools_kwarg=tools_kwarg,
+                ) == "continue":
+                    if classified == ErrorCategory.CONTEXT_OVERFLOW:
+                        self._usage_tracker.mark_compression()
                     continue
-
-                if use_native_tools and tools_kwarg and recovery.try_native_fallback():
+                if classified in (ErrorCategory.FORMAT_ERROR,) and tools_kwarg and recovery.try_native_fallback():
                     logger.info("Native tool calling failed, falling back to text mode")
                     tools_kwarg = {}
                     use_native_tools = False
@@ -927,6 +1067,14 @@ class AgentEngine:
             content = (resp.content or "").strip()
             if self._sanitizer:
                 content = self._sanitizer.sanitize(content)
+
+            # Length continuation: if LLM hit max_tokens, attempt continuation
+            finish = getattr(resp, 'finish_reason', None)
+            if finish in ("length", "max_tokens") and recovery.try_length_continuation():
+                logger.info("unified_loop: length continuation (finish_reason=%s)", finish)
+                messages.append(build_assistant_message(content))
+                messages.append(build_user_message_text(build_continuation_prompt(content)))
+                continue
 
             native_calls = getattr(resp, "tool_calls", None) or []
             if native_calls:
@@ -1012,14 +1160,14 @@ class AgentEngine:
         if self._memory_manager and self._settings.memory_integration_enabled:
             asyncio.create_task(self._sync_turn_safe(messages))
 
-        # Post-turn memory review: schedule background nudge for important observations
         if self._evolution is not None and content:
             asyncio.create_task(self._post_turn_review(messages, content))
 
-        # Between turns: try restoring primary provider
         llm = self._llm
         if hasattr(llm, 'try_restore_primary'):
             llm.try_restore_primary()
+
+        logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
         return content if content else "I've reached my processing limit."
 
@@ -1061,13 +1209,28 @@ class AgentEngine:
                 reward = -0.5
 
             skill_name = tool_actions[0]["tool"] if tool_actions else "unknown"
-            self._evolution.record_episode(
+            episode = self._evolution.record_episode(
                 skill_name=f"turn_{skill_name}",
                 actions=tool_actions[:10],
                 outcome="completed" if has_success else "mixed",
                 reward=reward,
                 context={"final_content_preview": final_content[:200]},
             )
+
+            # Incremental persistence: write to DuckDB immediately (not just on shutdown)
+            if self._evolution_store is not None and episode is not None:
+                try:
+                    self._evolution_store.save_episode({
+                        "episode_id": episode.episode_id,
+                        "skill_name": episode.skill_name,
+                        "actions": episode.actions,
+                        "outcome": episode.outcome,
+                        "reward": episode.reward,
+                        "context": episode.context,
+                        "timestamp": episode.timestamp,
+                    })
+                except Exception:
+                    logger.debug("evolution_store.save_episode failed", exc_info=True)
         except Exception:
             logger.debug("post_turn_review failed", exc_info=True)
 
@@ -1135,6 +1298,7 @@ class AgentEngine:
         turn_recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
         result_budget = self._effective_tool_result_budget()
+        self._usage_tracker.reset()
 
         tools_kwarg: Dict[str, Any] = {}
         if use_native_tools and TOOL_DEFINITIONS:
@@ -1170,20 +1334,23 @@ class AgentEngine:
                         **tools_kwarg,
                     )
                     turn_recovery.record_api_success()
+                    self._usage_tracker.record_api_call(
+                        resp.usage or {},
+                        provider=getattr(self._llm, 'active_provider_name', ''),
+                        model=resp.model or '',
+                    )
                 except Exception as exc:
                     _clear_indicator()
                     classified = self._error_classifier.classify(exc)
                     rec = self._error_classifier.get_recovery(classified)
                     turn_recovery.record_api_error()
 
-                    if classified == ErrorCategory.CONTEXT_OVERFLOW and turn_recovery.try_compress():
-                        messages = self._compressor.force_compress(messages)
-                        if budget.remaining > 0:
-                            continue
-                    if rec.retry and budget.remaining > 0:
-                        await asyncio.sleep(jittered_backoff(budget.used))
+                    if await self._handle_api_error(
+                        classified, rec, turn_recovery, messages, budget,
+                        use_native_tools=use_native_tools, tools_kwarg=tools_kwarg,
+                    ) == "continue":
                         continue
-                    if use_native_tools and tools_kwarg and turn_recovery.try_native_fallback():
+                    if tools_kwarg and turn_recovery.try_native_fallback():
                         logger.info("Native tool calling failed, falling back to text mode")
                         tools_kwarg = {}
                         use_native_tools = False
@@ -1195,6 +1362,15 @@ class AgentEngine:
                 content = (resp.content or "").strip()
                 if self._sanitizer:
                     content = self._sanitizer.sanitize(content)
+
+                # Length continuation for native tool path
+                finish = getattr(resp, 'finish_reason', None)
+                if finish in ("length", "max_tokens") and turn_recovery.try_length_continuation():
+                    logger.info("unified_loop_stream: length continuation")
+                    messages.append(build_assistant_message(content))
+                    messages.append(build_user_message_text(build_continuation_prompt(content)))
+                    continue
+
                 native_calls = getattr(resp, "tool_calls", None) or []
                 if native_calls:
                     assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
@@ -1243,23 +1419,37 @@ class AgentEngine:
                     content_parts: list[str] = []
                     try:
                         _clear_indicator()
-                        async for chunk in self._llm.achat_stream(
+                        raw_stream = self._llm.achat_stream(
                             compressed, enable_thinking=enable_thinking,
-                        ):
+                        )
+                        guarded = stale_guarded_stream(
+                            raw_stream, timeout_s=self._stale_stream_timeout_s,
+                        )
+                        async for chunk in guarded:
                             content_parts.append(chunk)
                             yield StreamEvent(type="chunk", content=chunk)
                         turn_recovery.record_api_success()
+                    except StaleStreamError as stale_exc:
+                        _clear_indicator()
+                        partial = stale_exc.partial_text or "".join(content_parts)
+                        if partial.strip() and turn_recovery.try_length_continuation():
+                            logger.warning("stale_stream: recovering with %d chars partial", len(partial))
+                            content = partial.strip()
+                            messages.append(build_assistant_message(content))
+                            messages.append(build_user_message_text(
+                                build_continuation_prompt(content)
+                            ))
+                            continue
+                        yield StreamEvent(type="error", content=str(stale_exc))
+                        break
                     except Exception as exc:
                         _clear_indicator()
                         classified = self._error_classifier.classify(exc)
                         rec = self._error_classifier.get_recovery(classified)
                         turn_recovery.record_api_error()
-                        if classified == ErrorCategory.CONTEXT_OVERFLOW and turn_recovery.try_compress():
-                            messages = self._compressor.force_compress(messages)
-                            if budget.remaining > 0:
-                                continue
-                        if rec.retry and budget.remaining > 0:
-                            await asyncio.sleep(jittered_backoff(budget.used))
+                        if await self._handle_api_error(
+                            classified, rec, turn_recovery, messages, budget,
+                        ) == "continue":
                             continue
                         yield StreamEvent(type="error", content=str(exc))
                         break
@@ -1273,17 +1463,19 @@ class AgentEngine:
                             compressed, stream=False, enable_thinking=enable_thinking,
                         )
                         turn_recovery.record_api_success()
+                        self._usage_tracker.record_api_call(
+                            resp.usage or {},
+                            provider=getattr(self._llm, 'active_provider_name', ''),
+                            model=resp.model or '',
+                        )
                     except Exception as exc:
                         _clear_indicator()
                         classified = self._error_classifier.classify(exc)
                         rec = self._error_classifier.get_recovery(classified)
                         turn_recovery.record_api_error()
-                        if classified == ErrorCategory.CONTEXT_OVERFLOW and turn_recovery.try_compress():
-                            messages = self._compressor.force_compress(messages)
-                            if budget.remaining > 0:
-                                continue
-                        if rec.retry and budget.remaining > 0:
-                            await asyncio.sleep(jittered_backoff(budget.used))
+                        if await self._handle_api_error(
+                            classified, rec, turn_recovery, messages, budget,
+                        ) == "continue":
                             continue
                         yield StreamEvent(type="error", content=str(exc))
                         break
@@ -1291,6 +1483,13 @@ class AgentEngine:
                     content = (resp.content or "").strip()
                     if self._sanitizer:
                         content = self._sanitizer.sanitize(content)
+
+                    # Length continuation for non-stream path
+                    finish = getattr(resp, 'finish_reason', None)
+                    if finish in ("length", "max_tokens") and turn_recovery.try_length_continuation():
+                        messages.append(build_assistant_message(content))
+                        messages.append(build_user_message_text(build_continuation_prompt(content)))
+                        continue
 
             self._wm.remember_chat(build_assistant_message(content))
             self._persist_message(session_id, "assistant", content)
@@ -1349,6 +1548,8 @@ class AgentEngine:
         llm = self._llm
         if hasattr(llm, 'try_restore_primary'):
             llm.try_restore_primary()
+
+        logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
         yield StreamEvent(type="final", content=content if content else "I've reached my processing limit.")
 
@@ -1508,11 +1709,24 @@ class AgentEngine:
         handler = handlers.get(name)
         if handler is None:
             return {"ok": False, "error": f"Unknown tool: {name}"}
+
+        timeout = self._tool_timeouts.get(name, self._default_tool_timeout_s)
+        t0 = time.perf_counter()
         try:
-            result = await handler(args)
+            result = await asyncio.wait_for(handler(args), timeout=timeout)
+        except asyncio.TimeoutError:
+            duration = (time.perf_counter() - t0) * 1000
+            self._usage_tracker.record_tool_call(name, False, duration)
+            return {"ok": False, "error": f"Tool '{name}' timed out after {timeout:.0f}s"}
         except Exception as e:
+            duration = (time.perf_counter() - t0) * 1000
+            self._usage_tracker.record_tool_call(name, False, duration)
             error_msg = redact_sensitive_text(str(e), force=True)
             return {"ok": False, "error": error_msg}
+
+        duration = (time.perf_counter() - t0) * 1000
+        is_ok = not (isinstance(result, dict) and not result.get("ok", True))
+        self._usage_tracker.record_tool_call(name, is_ok, duration)
 
         return self._post_process_tool_result(name, result)
 

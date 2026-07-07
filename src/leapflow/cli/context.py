@@ -390,6 +390,8 @@ class Context:
         if len(provider_configs) > 1 or credential_pools:
             self.llm_chain = FailoverChain(
                 provider_configs, credential_pools=credential_pools,
+                circuit_failure_threshold=settings.circuit_breaker_threshold,
+                circuit_cooldown_s=settings.circuit_breaker_cooldown_s,
             )
             self.llm = self.llm_chain
             logger.info(
@@ -1404,6 +1406,31 @@ class Context:
             )
         if self.engine is not None:
             self.engine.set_tool_result_budget(dynamic_result_budget)
+
+        # ── Wire new engine capabilities ──
+        if self.engine is not None:
+            self.engine.set_stale_stream_timeout(settings.stale_stream_timeout_s)
+            self.engine.set_default_tool_timeout(settings.default_tool_timeout_s)
+
+            if self._evolution_store is not None:
+                self.engine.set_evolution_store(self._evolution_store)
+
+            try:
+                from leapflow.llm.model_capabilities import ModelCapabilityRegistry
+                cap_registry = ModelCapabilityRegistry()
+                if hasattr(self, 'llm_chain') and self.llm_chain is not None:
+                    from leapflow.llm.model_capabilities import ModelCapabilities
+                    cap_registry.register(
+                        settings.llm_model,
+                        ModelCapabilities(
+                            context_length=self.llm_chain.context_length,
+                            supports_tools=settings.native_tool_calling_enabled,
+                        ),
+                    )
+                self.engine.set_model_capabilities(cap_registry)
+                logger.debug("Model capability registry wired")
+            except Exception:
+                logger.debug("ModelCapabilityRegistry setup skipped", exc_info=True)
 
         # ── Register session_search tool ──
         if self._conversation_store:

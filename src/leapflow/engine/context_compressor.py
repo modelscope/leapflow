@@ -670,10 +670,33 @@ class ContextCompressor:
 
     @staticmethod
     def _estimate_tokens(messages: List[Dict[str, Any]]) -> int:
-        """Rough token estimation (~4 chars per token)."""
-        total_chars = sum(len(str(msg.get("content", ""))) for msg in messages)
+        """Token estimation: ~4 chars/token for text, ~1600 tokens per image part.
+
+        Multimodal-aware: detects image_url and input_image content parts
+        and adds a flat token estimate per image (inspired by hermes
+        _IMAGE_TOKEN_ESTIMATE = 1600).
+        """
+        _IMAGE_TOKEN_ESTIMATE = 1600
+        total_chars = 0
+        image_count = 0
+
         for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = part.get("type", "")
+                    if part_type == "text":
+                        total_chars += len(part.get("text", ""))
+                    elif part_type in ("image_url", "input_image", "image"):
+                        image_count += 1
+
             for tc in msg.get("tool_calls", []):
                 args = tc.get("function", {}).get("arguments", "")
-                total_chars += len(str(args))
-        return total_chars // 4
+                if isinstance(args, str):
+                    total_chars += len(args)
+
+        return (total_chars // 4) + (image_count * _IMAGE_TOKEN_ESTIMATE)

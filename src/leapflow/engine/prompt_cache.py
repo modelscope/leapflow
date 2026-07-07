@@ -80,6 +80,57 @@ class PrefixCacheOptimizer:
         return stable_chars / max(total_chars, 1)
 
 
+class AnthropicCacheStrategy:
+    """Anthropic-optimized caching: system + last N messages with cache_control.
+
+    Places cache breakpoints on:
+    1. System message (stable prefix — highest reuse)
+    2. Last *breakpoints* non-system messages (conversation tail)
+
+    This mirrors hermes prompt_caching.py ``system_and_3`` strategy,
+    adapted for LeapFlow's async-first architecture.
+    """
+
+    def __init__(
+        self,
+        *,
+        breakpoints: int = 3,
+        cache_ttl: str = "5m",
+    ) -> None:
+        self._breakpoints = breakpoints
+        self._marker = {"type": "ephemeral"}
+
+    def optimize(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not messages:
+            return messages
+
+        import copy
+        result = copy.deepcopy(messages)
+
+        for msg in result:
+            if msg.get("role") == "system":
+                self._apply_marker(msg)
+
+        non_system = [m for m in result if m.get("role") != "system"]
+        for msg in non_system[-self._breakpoints:]:
+            self._apply_marker(msg)
+
+        return result
+
+    def _apply_marker(self, msg: Dict[str, Any]) -> None:
+        """Attach cache_control marker to a message."""
+        content = msg.get("content")
+        if content is None or content == "":
+            msg["cache_control"] = self._marker
+        elif isinstance(content, str):
+            msg["content"] = [
+                {"type": "text", "text": content, "cache_control": self._marker}
+            ]
+        elif isinstance(content, list) and content:
+            last = {**content[-1], "cache_control": self._marker}
+            msg["content"] = content[:-1] + [last]
+
+
 class NoCacheStrategy:
     """No-op cache strategy — passes messages through unchanged."""
 

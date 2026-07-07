@@ -325,6 +325,12 @@ class Settings:
     llm_context_length: int = 128_000  # Primary provider's context window
     llm_credential_cooldown_s: float = 60.0  # Per-key rate-limit cooldown
 
+    # ── Stream & Tool Robustness ──
+    stale_stream_timeout_s: float = 180.0  # Idle timeout for streaming responses
+    default_tool_timeout_s: float = 120.0  # Default per-tool execution timeout
+    circuit_breaker_threshold: int = 5  # Consecutive failures before circuit opens
+    circuit_breaker_cooldown_s: float = 60.0  # Circuit breaker cooldown period
+
     # ── Signal Fusion (vision_only mode) ──
     # Default is the full 7-channel set; ``LEAPFLOW_SIGNAL_CHANNELS=none`` disables
     # signal collection entirely (V0 baseline).
@@ -728,6 +734,12 @@ def _build_settings_from_env() -> Settings:
     llm_context_length = int(os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", "128000"))
     llm_credential_cooldown_s = float(os.getenv("LEAPFLOW_LLM_CREDENTIAL_COOLDOWN_S", "60.0"))
 
+    # Stream & Tool Robustness
+    stale_stream_timeout_s = float(os.getenv("LEAPFLOW_STALE_STREAM_TIMEOUT_S", "180.0"))
+    default_tool_timeout_s = float(os.getenv("LEAPFLOW_DEFAULT_TOOL_TIMEOUT_S", "120.0"))
+    circuit_breaker_threshold = int(os.getenv("LEAPFLOW_CIRCUIT_BREAKER_THRESHOLD", "5"))
+    circuit_breaker_cooldown_s = float(os.getenv("LEAPFLOW_CIRCUIT_BREAKER_COOLDOWN_S", "60.0"))
+
     # Signal Fusion
     # Default = "all": collect every supported channel (V7 full fusion). Set
     # to "none" or empty list to disable; comma-separated list selects a
@@ -959,6 +971,11 @@ def _build_settings_from_env() -> Settings:
         llm_aux_base_url=llm_aux_base_url,
         llm_context_length=llm_context_length,
         llm_credential_cooldown_s=llm_credential_cooldown_s,
+        # Stream & Tool Robustness
+        stale_stream_timeout_s=stale_stream_timeout_s,
+        default_tool_timeout_s=default_tool_timeout_s,
+        circuit_breaker_threshold=circuit_breaker_threshold,
+        circuit_breaker_cooldown_s=circuit_breaker_cooldown_s,
         # Signal Fusion
         signal_channels=signal_channels,
         signal_reactive_capture=signal_reactive_capture,
@@ -997,7 +1014,62 @@ def _build_settings_from_env() -> Settings:
         logger.warning("LEAPFLOW_LLM_API_KEY is empty; LLM calls will fail until configured.")
 
     settings.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for warning in validate_settings(settings):
+        logger.warning("config: %s", warning)
+
     return settings
+
+
+def validate_settings(settings: Settings) -> list[str]:
+    """Post-load validation with actionable error messages.
+
+    Returns a list of warning strings (empty = no issues).
+    Does not raise — all issues are advisory.
+    """
+    warnings: list[str] = []
+
+    if settings.llm_context_length < 1024:
+        warnings.append(
+            f"llm_context_length={settings.llm_context_length} is suspiciously low; "
+            "expected at least 1024. Check LEAPFLOW_LLM_CONTEXT_LENGTH."
+        )
+
+    if settings.stale_stream_timeout_s < 10.0:
+        warnings.append(
+            f"stale_stream_timeout_s={settings.stale_stream_timeout_s} is very short; "
+            "may cause premature stream cancellations."
+        )
+
+    if settings.default_tool_timeout_s < 5.0:
+        warnings.append(
+            f"default_tool_timeout_s={settings.default_tool_timeout_s} is very short; "
+            "tools may timeout before completing."
+        )
+
+    if settings.react_soft_limit >= settings.react_max_iterations:
+        warnings.append(
+            f"react_soft_limit ({settings.react_soft_limit}) >= react_max_iterations "
+            f"({settings.react_max_iterations}); soft limit will never trigger."
+        )
+
+    if settings.llm_aux_model and not settings.llm_aux_api_key and not settings.llm_api_key:
+        warnings.append(
+            "llm_aux_model is set but no API key available (neither aux nor primary). "
+            "Auxiliary LLM calls will fail."
+        )
+
+    if settings.llm_fallback_providers:
+        import json as _json
+        try:
+            _json.loads(settings.llm_fallback_providers)
+        except _json.JSONDecodeError as e:
+            warnings.append(
+                f"LEAPFLOW_LLM_FALLBACK_PROVIDERS is not valid JSON: {e}. "
+                "Fallback providers will be ignored."
+            )
+
+    return warnings
 
 
 # ── Global settings accessor (lazy singleton) ──
