@@ -52,6 +52,17 @@ class Theme:
     # Prompt
     prompt_char: str
 
+    # Input line
+    input_text: str          # Default input text color (adaptive white)
+
+    # Bottom toolbar (status bar)
+    toolbar_bg: str
+    toolbar_fg: str
+
+    # Prompt modes
+    prompt_paused: str       # paused mode color
+    auto_suggest: str        # autosuggestion ghost text color
+
 
 _DARK = Theme(
     name="dark",
@@ -69,28 +80,38 @@ _DARK = Theme(
     panel_title="bold #FFD700",
     recording="bold #FF6B6B",
     executing="bold #87D687",
-    code_bg="grey11",
+    code_bg="#1c1c1c",
     prompt_char="bold #FFD700",
+    input_text="#FFFFFF",
+    toolbar_bg="#2a2418",
+    toolbar_fg="#B8860B",
+    prompt_paused="bold #FFD700",
+    auto_suggest="#8B8682",
 )
 
 _LIGHT = Theme(
     name="light",
     accent="#996600",
     accent_dim="#B8860B",
-    success="dark_green",
+    success="#007700",
     warning="#996600",
-    error="red3",
-    info="blue3",
+    error="#cc0000",
+    info="#0055cc",
     text="black",
     text_dim="#8B6914",
-    text_muted="grey50",
+    text_muted="#808080",
     border="#CD7F32",
-    border_dim="grey50",
+    border_dim="#808080",
     panel_title="bold #996600",
-    recording="bold red3",
-    executing="bold dark_green",
-    code_bg="grey93",
+    recording="bold #cc0000",
+    executing="bold #007700",
+    code_bg="#ededed",
     prompt_char="bold #996600",
+    input_text="#1A1A1A",
+    toolbar_bg="#f0e8d8",
+    toolbar_fg="#8B6914",
+    prompt_paused="bold #996600",
+    auto_suggest="#808080",
 )
 
 

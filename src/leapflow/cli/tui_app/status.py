@@ -1,10 +1,12 @@
-"""Status bar for the prompt_toolkit bottom toolbar.
+"""Status bar for the Application layout.
 
-Hermes-style layout:
-``⚡ model │ 38.3K/1M │ [░░░░░░░░░░] 4% │ 2m │ ⏲ 6s │ ✓ 2m``
+Hermes-style single-line status rendered via ``FormattedTextControl``::
 
-Segments: model, context tokens, progress bar, session duration,
-last-turn elapsed, session up-time checkmark.
+    ⚡ qwen3-plus │ 38.3K/1M │ [████░░░░░░] 38% │ 12m │ ⏲ 2.1s │ ✓ 12m
+
+All style strings use ``class:status-bar*`` Application style classes
+defined in ``app.py``.  The ``StatusBar`` is callable — pass it directly
+as the ``text`` argument to ``FormattedTextControl``.
 """
 
 from __future__ import annotations
@@ -12,11 +14,11 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from prompt_toolkit.formatted_text import FormattedText
+from leapflow.cli.tui_app.theme import Theme, detect_theme
 
 
 def _compact_tokens(n: int) -> str:
-    """Format token count as compact string: 12.4K, 1.2M, etc."""
+    """Format token count: ``12.4K``, ``128K``, ``1.2M``."""
     if n < 0:
         return "?"
     if n < 1_000:
@@ -29,7 +31,7 @@ def _compact_tokens(n: int) -> str:
 
 
 def _format_duration(seconds: float) -> str:
-    """Format seconds as compact duration: 42s, 2m, 1h23m."""
+    """Format seconds as compact duration: ``42s``, ``2m``, ``1h23m``."""
     if seconds < 60:
         return f"{int(seconds)}s"
     minutes = int(seconds // 60)
@@ -41,18 +43,20 @@ def _format_duration(seconds: float) -> str:
 
 
 def _progress_bar(pct: int, width: int = 10) -> str:
-    """Build a Unicode progress bar: [████░░░░░░]."""
+    """Unicode progress bar: ``████░░░░░░``."""
     filled = int(pct / 100 * width)
     return "█" * filled + "░" * (width - filled)
 
 
 class StatusBar:
-    """Builds bottom-toolbar content for the prompt.
+    """Produces status-bar fragments for ``FormattedTextControl``.
 
-    Updated by the interactive loop before each prompt cycle.
+    Updated by the interactive loop; called by the Application on
+    every redraw cycle to get fresh fragments.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, theme: Optional[Theme] = None) -> None:
+        self._theme = theme or detect_theme()
         self.mode: str = "idle"
         self.skill_count: int = 0
         self.platform_online: bool = False
@@ -65,76 +69,71 @@ class StatusBar:
         self._session_start: float = time.monotonic()
 
     def mark_turn_start(self) -> None:
-        """Record the start of a new turn for elapsed tracking."""
+        """Record start of a new agent turn."""
         self._turn_start = time.monotonic()
 
     def mark_turn_end(self) -> None:
-        """Record the end of a turn."""
+        """Record end of the agent turn."""
         if self._turn_start > 0:
             self.last_turn_elapsed = time.monotonic() - self._turn_start
             self._turn_start = 0.0
 
-    def __call__(self) -> FormattedText:
-        """Called by prompt_toolkit to render the bottom toolbar."""
+    def __call__(self) -> list[tuple[str, str]]:
+        """Called by FormattedTextControl on every Application redraw."""
         parts: list[tuple[str, str]] = []
 
-        # Mode indicator (compact)
-        mode_map = {
-            "idle": ("class:bottom-toolbar.text", " ⚡ "),
-            "learning": ("#FF6B6B bold", " ● "),
-            "paused": ("#FFD700 bold", " ⏸ "),
-            "executing": ("#87D687 bold", " ▶ "),
+        _modes = {
+            "idle":      ("class:status-bar",     " ⚡ "),
+            "learning":  ("class:status-bar.bad",  " ● "),
+            "paused":    ("class:status-bar.warn", " ⏸ "),
+            "executing": ("class:status-bar.good", " ▶ "),
         }
-        style, icon = mode_map.get(self.mode, mode_map["idle"])
+        style, icon = _modes.get(self.mode, _modes["idle"])
         parts.append((style, icon))
 
-        # Model name
         if self.model_name:
-            display_model = self.model_name
-            if len(display_model) > 20:
-                display_model = display_model[:18] + "…"
-            parts.append(("class:bottom-toolbar.text", f"{display_model} "))
-            parts.append(("class:bottom-toolbar.text", "│ "))
+            display = self.model_name
+            if len(display) > 20:
+                display = display[:18] + "…"
+            parts.append(("class:status-bar.strong", f"{display} "))
+            parts.append(("class:status-bar.dim", "│ "))
 
-        # Context tokens + progress bar
         if self.context_max > 0:
             used = _compact_tokens(self.context_used)
             total = _compact_tokens(self.context_max)
-            pct = int(self.context_used * 100 / self.context_max) if self.context_max else 0
+            pct = (
+                min(int(self.context_used * 100 / self.context_max), 100)
+                if self.context_max
+                else 0
+            )
+            parts.append(("class:status-bar", f"{used}/{total} "))
+            parts.append(("class:status-bar.dim", "│ "))
 
-            parts.append(("class:bottom-toolbar.text", f"{used}/{total} "))
-            parts.append(("class:bottom-toolbar.text", "│ "))
-
-            # Color-coded progress bar
+            bar_cls = "class:status-bar"
             if pct >= 90:
-                bar_style = "#FF6B6B"
+                bar_cls = "class:status-bar.bad"
             elif pct >= 75:
-                bar_style = "#FFD700"
-            else:
-                bar_style = "class:bottom-toolbar.text"
+                bar_cls = "class:status-bar.warn"
             bar = _progress_bar(pct)
-            parts.append((bar_style, f"[{bar}] "))
-            parts.append(("class:bottom-toolbar.text", f"{pct}% "))
-            parts.append(("class:bottom-toolbar.text", "│ "))
+            parts.append((bar_cls, f"[{bar}] "))
+            parts.append(("class:status-bar", f"{pct}% "))
+            parts.append(("class:status-bar.dim", "│ "))
 
-        # Session duration
-        session_elapsed = time.monotonic() - self._session_start
-        parts.append(("class:bottom-toolbar.text", f"{_format_duration(session_elapsed)} "))
+        elapsed = time.monotonic() - self._session_start
+        parts.append(("class:status-bar", f"{_format_duration(elapsed)} "))
 
-        # Last turn elapsed
         if self.last_turn_elapsed > 0:
-            parts.append(("class:bottom-toolbar.text", "│ "))
+            parts.append(("class:status-bar.dim", "│ "))
             if self.last_turn_elapsed < 1.0:
-                elapsed_str = f"{self.last_turn_elapsed * 1000:.0f}ms"
+                e_str = f"{self.last_turn_elapsed * 1000:.0f}ms"
             else:
-                elapsed_str = f"{self.last_turn_elapsed:.1f}s"
-            parts.append(("class:bottom-toolbar.text", f"⏲ {elapsed_str} "))
+                e_str = f"{self.last_turn_elapsed:.1f}s"
+            parts.append(("class:status-bar", f"⏲ {e_str} "))
 
-        # Session uptime checkmark
-        parts.append(("class:bottom-toolbar.text", "│ "))
-        parts.append(("#87D687", f"✓ {_format_duration(session_elapsed)} "))
+        parts.append(("class:status-bar.dim", "│ "))
+        parts.append(("class:status-bar.good", f"✓ {_format_duration(elapsed)} "))
 
-        return FormattedText(parts)
+        return parts
 
     def update(
         self,

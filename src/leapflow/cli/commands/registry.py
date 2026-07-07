@@ -1,7 +1,7 @@
 """Slash-command registry and dispatch.
 
 Single source of truth for all REPL commands.  The registry drives:
-- Tab completion (via ``LeapInput``)
+- Tab completion (via ``LeapApp``)
 - ``/help`` categorized display
 - Dispatch in the interactive loop
 - Command alias resolution
@@ -108,7 +108,7 @@ def commands_by_category() -> Dict[str, List[CommandDef]]:
 
 
 def completion_entries() -> List[Tuple[str, str]]:
-    """Build the completion list for LeapInput."""
+    """Build the completion list for LeapApp's TextArea completer."""
     entries: List[Tuple[str, str]] = []
     for cmd in COMMAND_REGISTRY:
         full = f"/{cmd.name}" if cmd.args_hint else f"/{cmd.name}"
