@@ -1,20 +1,22 @@
 """Rich console wrapper — the single output surface for the TUI.
 
 Centralizes all visual output: markdown rendering, code highlighting,
-tool status, error panels, and system messages.  Components call
-methods on ``LeapConsole`` instead of printing directly.
+tool status, error panels, session info, and system messages.
+Components call methods on ``LeapConsole`` instead of printing directly.
 """
 
 from __future__ import annotations
 
+import os
 import sys
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme as RichTheme
 
@@ -65,6 +67,11 @@ class LeapConsole:
     @property
     def is_tty(self) -> bool:
         return self._console.is_terminal
+
+    @property
+    def raw(self) -> Console:
+        """Direct access to the underlying Rich Console (for StreamRenderer)."""
+        return self._console
 
     def print(self, *args, **kwargs) -> None:
         """Pass-through to rich.Console.print."""
@@ -162,6 +169,51 @@ class LeapConsole:
             border_style="leap.border",
             padding=(0, 1),
         ))
+
+    def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        """Print the response attribution line with elapsed time."""
+        from leapflow.cli.tui_app.stream import _format_elapsed
+
+        label = Text()
+        label.append("  ─ ", style="leap.border")
+        label.append("LEAP", style="leap.accent")
+        elapsed_str = _format_elapsed(elapsed_s)
+        label.append(f"  {elapsed_str}", style="leap.dim")
+        if tool_count > 0:
+            label.append(f"  {tool_count} tool{'s' if tool_count != 1 else ''}", style="leap.dim")
+        self._console.print(label)
+
+    def session_info(
+        self,
+        *,
+        model: str = "",
+        platform: str = "",
+        cwd: str = "",
+        skill_count: int = 0,
+        session_id: str = "",
+    ) -> None:
+        """Display compact session information after the banner."""
+        info_parts: list[str] = []
+        if model:
+            info_parts.append(f"model: {model}")
+        if platform:
+            info_parts.append(f"platform: {platform}")
+        if cwd:
+            short_cwd = cwd.replace(os.path.expanduser("~"), "~")
+            info_parts.append(f"cwd: {short_cwd}")
+        if skill_count > 0:
+            info_parts.append(f"skills: {skill_count}")
+
+        if info_parts:
+            self._console.print(
+                f"  {' │ '.join(info_parts)}",
+                style="leap.dim",
+            )
+        if session_id:
+            self._console.print(
+                f"  session: {session_id[:12]}",
+                style="leap.muted",
+            )
 
     def newline(self) -> None:
         self._console.print()

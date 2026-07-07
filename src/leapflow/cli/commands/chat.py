@@ -14,14 +14,12 @@ if TYPE_CHECKING:
 async def cmd_chat(ctx: "Context", prompt: str, thinking: bool) -> int:
     require_initialized(ctx)
 
-    from leapflow.cli.tui_app import detect_theme, StreamRenderer
-    from rich.console import Console
-    from rich.markdown import Markdown
+    from leapflow.cli.tui_app import detect_theme, LeapConsole, StreamRenderer
 
     theme = detect_theme()
-    console = Console(highlight=False)
+    console = LeapConsole(theme)
 
-    renderer = StreamRenderer(console, theme)
+    renderer = StreamRenderer(console.raw, theme)
     renderer.start()
 
     try:
@@ -39,12 +37,14 @@ async def cmd_chat(ctx: "Context", prompt: str, thinking: bool) -> int:
             elif event.type == "final" and not renderer.text:
                 renderer.feed(event.content)
     finally:
+        elapsed = renderer.elapsed
+        tool_count = len(renderer._tool_history)
         renderer.finish()
 
     final_text = renderer.text.strip()
     if final_text:
-        code_theme = "monokai" if theme.name == "dark" else "default"
-        console.print(Markdown(final_text, code_theme=code_theme))
+        console.markdown(final_text)
+    console.response_label(elapsed, tool_count=tool_count)
     console.print()
 
     return 0

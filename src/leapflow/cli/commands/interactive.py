@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from typing import TYPE_CHECKING, Optional
@@ -61,8 +62,15 @@ async def cmd_interactive(ctx: "Context") -> int:
         ctx.session.set_on_learn_complete(_on_complete)
     ctx.session.set_on_execute_step(_on_step)
 
-    # ── Banner ──
+    # ── Banner + session info ──
     display_welcome()
+    console.session_info(
+        model=getattr(ctx.settings, "model", ""),
+        platform="connected" if (hasattr(ctx.rpc, "connected") and ctx.rpc.connected) else "mock",
+        cwd=os.getcwd(),
+        skill_count=_skill_count(),
+        session_id=getattr(ctx.session, "session_id", ""),
+    )
     console.rule()
     console.print()
 
@@ -85,17 +93,28 @@ async def cmd_interactive(ctx: "Context") -> int:
         return hasattr(ctx.rpc, "connected") and ctx.rpc.connected
 
     def _update_status() -> None:
+        ctx_used = 0
+        ctx_max = 0
+        engine = ctx.engine
+        if engine is not None:
+            ctx_used = getattr(engine, "context_token_count", 0)
+            cap = getattr(engine, "model_capabilities", None)
+            if cap is not None:
+                ctx_max = getattr(cap, "context_length", 0)
         status.update(
             mode=_mode_name(),
             skill_count=_skill_count(),
             platform_online=_platform_online(),
             model_name=getattr(ctx.settings, "model", ""),
-            session_turns=getattr(ctx.engine, "turn_count", 0),
+            session_turns=getattr(engine, "turn_count", 0) if engine else 0,
+            context_used=ctx_used,
+            context_max=ctx_max,
         )
 
     async def _stream_response(prompt_text: str) -> None:
         """Stream LLM response with rich rendering."""
-        renderer = StreamRenderer(console._console, theme)
+        status.mark_turn_start()
+        renderer = StreamRenderer(console.raw, theme)
         renderer.start()
         try:
             async for event in ctx.engine.run_stream(prompt_text):
@@ -114,11 +133,15 @@ async def cmd_interactive(ctx: "Context") -> int:
                 else:
                     renderer.feed(str(event))
         finally:
+            elapsed = renderer.elapsed
+            tool_count = len(renderer._tool_history)
             renderer.finish()
 
         final_text = renderer.text.strip()
         if final_text:
             console.markdown(final_text)
+        console.response_label(elapsed, tool_count=tool_count)
+        status.mark_turn_end()
         console.print()
 
     # ── Main loop ──
