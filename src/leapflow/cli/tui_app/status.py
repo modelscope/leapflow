@@ -59,9 +59,9 @@ class StatusBar:
 
         mode_styles = {
             "idle": ("class:bottom-toolbar.text", " ⏵ idle "),
-            "learning": ("ansired bold", " ● recording "),
-            "paused": ("ansiyellow bold", " ⏸ paused "),
-            "executing": ("ansigreen bold", " ▶ running "),
+            "learning": ("#FF6B6B bold", " ● recording "),
+            "paused": ("#FFD700 bold", " ⏸ paused "),
+            "executing": ("#87D687 bold", " ▶ running "),
         }
         style, label = mode_styles.get(self.mode, mode_styles["idle"])
         parts.append((style, label))
@@ -70,7 +70,7 @@ class StatusBar:
         parts.append(("class:bottom-toolbar.text", f" skills:{self.skill_count} "))
         parts.append(("class:bottom-toolbar.text", "│"))
 
-        conn_style = "ansigreen" if self.platform_online else "class:bottom-toolbar.text"
+        conn_style = "#87D687" if self.platform_online else "class:bottom-toolbar.text"
         conn_label = " ● " if self.platform_online else " ○ "
         parts.append((conn_style, conn_label))
         parts.append(("class:bottom-toolbar.text", "│"))
@@ -88,9 +88,9 @@ class StatusBar:
             pct = int(self.context_used * 100 / self.context_max) if self.context_max else 0
 
             if pct >= 90:
-                ctx_style = "ansired bold"
+                ctx_style = "#FF6B6B bold"
             elif pct >= 75:
-                ctx_style = "ansiyellow"
+                ctx_style = "#FFD700"
             else:
                 ctx_style = "class:bottom-toolbar.text"
 

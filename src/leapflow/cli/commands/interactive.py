@@ -68,6 +68,24 @@ async def cmd_interactive(ctx: "Context") -> int:
         ctx.session.set_on_learn_complete(_on_complete)
     ctx.session.set_on_execute_step(_on_step)
 
+    # ── Helpers (defined before banner so they're available) ──
+    def _mode_name() -> str:
+        if ctx.session and ctx.session.mode == SessionMode.LEARNING:
+            if ctx.imitation and ctx.imitation.recorder.state.name == "PAUSED":
+                return "paused"
+            return "learning"
+        elif ctx.session and ctx.session.mode == SessionMode.EXECUTING:
+            return "executing"
+        return "idle"
+
+    def _skill_count() -> int:
+        index_count = len(ctx.skill_index.get_entries()) if hasattr(ctx, "skill_index") and ctx.skill_index else 0
+        registry_count = len(ctx.registry.list_all()) if ctx.registry else 0
+        return index_count + registry_count
+
+    def _platform_online() -> bool:
+        return hasattr(ctx.rpc, "connected") and ctx.rpc.connected
+
     # ── Banner ──
     all_skills = ctx.registry.list_all() if ctx.registry else []
     mcp_count = len(getattr(ctx, "platform_tools", [])) if hasattr(ctx, "platform_tools") else 0
@@ -85,24 +103,6 @@ async def cmd_interactive(ctx: "Context") -> int:
         mcp_tools=mcp_count,
     )
     console.print()
-
-    # ── Helpers ──
-    def _mode_name() -> str:
-        if ctx.session and ctx.session.mode == SessionMode.LEARNING:
-            if ctx.imitation and ctx.imitation.recorder.state.name == "PAUSED":
-                return "paused"
-            return "learning"
-        elif ctx.session and ctx.session.mode == SessionMode.EXECUTING:
-            return "executing"
-        return "idle"
-
-    def _skill_count() -> int:
-        index_count = len(ctx.skill_index.get_entries()) if hasattr(ctx, "skill_index") and ctx.skill_index else 0
-        registry_count = len(ctx.registry.list_all()) if ctx.registry else 0
-        return index_count + registry_count
-
-    def _platform_online() -> bool:
-        return hasattr(ctx.rpc, "connected") and ctx.rpc.connected
 
     def _update_status() -> None:
         ctx_used = 0

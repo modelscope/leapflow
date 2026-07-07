@@ -61,13 +61,14 @@ def _build_style(theme: Theme) -> Style:
     """Build prompt_toolkit style from LeapFlow theme."""
     is_light = theme.name == "light"
     return Style.from_dict({
-        "prompt": "bold ansibrightcyan" if not is_light else "bold ansicyan",
-        "prompt.mode": "bold ansired" if not is_light else "bold ansired",
-        "prompt.mode.paused": "bold ansiyellow",
-        "prompt.mode.executing": "bold ansigreen",
-        "": "" if not is_light else "ansiblack",
-        "bottom-toolbar": "bg:ansibrightblack" if not is_light else "bg:ansigray ansiblack",
-        "bottom-toolbar.text": "" if not is_light else "ansiblack",
+        "prompt": "bold #FFD700" if not is_light else "bold #996600",
+        "prompt.mode": "bold #FF6B6B" if not is_light else "bold ansired",
+        "prompt.mode.paused": "bold #FFD700",
+        "prompt.mode.executing": "bold #87D687" if not is_light else "bold ansigreen",
+        "": "#FFF8DC" if not is_light else "ansiblack",
+        "bottom-toolbar": "bg:#2a2418 #B8860B" if not is_light else "bg:#f0e8d8 #8B6914",
+        "bottom-toolbar.text": "#B8860B" if not is_light else "#8B6914",
+        "auto-suggest": "#8B8682",
     })
 
 
@@ -161,18 +162,20 @@ class LeapInput:
         """Build mode-aware prompt with theme colors."""
         if mode == "learning":
             return FormattedText([
-                ("class:prompt.mode", " ● rec "),
+                ("class:prompt.mode", "● rec "),
+                ("class:prompt", "❯ "),
             ])
         elif mode == "paused":
             return FormattedText([
-                ("class:prompt.mode.paused", " ⏸ "),
+                ("class:prompt.mode.paused", "⏸  "),
+                ("class:prompt", "❯ "),
             ])
         elif mode == "executing":
             return FormattedText([
-                ("class:prompt.mode.executing", " ▶ "),
+                ("class:prompt.mode.executing", "▶ "),
             ])
         return FormattedText([
-            ("class:prompt", " ❯ "),
+            ("class:prompt", "❯ "),
         ])
 
 

@@ -1,13 +1,10 @@
 """LeapFlow welcome banner.
 
 Two display modes:
-1. **Rich panel** (interactive REPL): two-column layout with tools, skills,
-   session info — high information density.
-2. **Animated ASCII** (``leap`` without subcommand): progressive fade-in of
-   the LEAP logo with typewriter tagline.
-
-The Rich banner is used by ``cmd_interactive``; the animated version by the
-bare ``leap`` entrypoint.
+1. **Rich panel** (interactive REPL via ``cmd_interactive``): full-width
+   two-column layout with tools, skills, session info — warm gold palette.
+2. **Animated ASCII** (``leap`` without subcommand — now only used for
+   non-interactive contexts like ``leap --help`` preamble).
 """
 
 from __future__ import annotations
@@ -20,22 +17,9 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from leapflow.version import __version__
 
-# ── ANSI escape codes (animated banner only) ─────────────────────────
-RESET = "\033[0m"
-DIM = "\033[2m"
-BOLD = "\033[1m"
-CYAN = "\033[36m"
-BRIGHT_CYAN = "\033[1;36m"
-BRIGHT_ORANGE = "\033[1;38;5;208m"
-DIM_WHITE = "\033[2;37m"
-CURSOR_HIDE = "\033[?25l"
-CURSOR_SHOW = "\033[?25h"
-
 VERSION = __version__
-INDENT = "    "
-W = 50
 
-# ── Rich banner (interactive mode) ───────────────────────────────────
+# ── Tool category mapping ────────────────────────────────────────────
 
 _TOOL_CATEGORIES: Dict[str, str] = {
     "file_list": "file",
@@ -82,6 +66,17 @@ def _categorize_skills(
     return dict(sorted(groups.items()))
 
 
+# ── Rich banner (interactive REPL) ───────────────────────────────────
+
+# Warm gold/amber/bronze palette (inspired by Hermes, adapted for LeapFlow)
+_GOLD = "#FFD700"
+_AMBER = "#FFBF00"
+_BRONZE = "#CD7F32"
+_CREAM = "#FFF8DC"
+_DIM_GOLD = "#B8860B"
+_WARM_GRAY = "#8B8682"
+
+
 def display_rich_banner(
     *,
     model: str = "",
@@ -93,7 +88,7 @@ def display_rich_banner(
     context_length: int = 0,
     mcp_tools: int = 0,
 ) -> None:
-    """Print the information-dense Rich banner panel."""
+    """Print the full-width Rich banner panel with tools/skills catalog."""
     try:
         from rich.console import Console
         from rich.panel import Panel
@@ -106,59 +101,55 @@ def display_rich_banner(
     console = Console(highlight=False, soft_wrap=True)
     term_width = shutil.get_terminal_size().columns
 
-    # ── Colors ──
-    accent = "cyan"
-    dim = "bright_black"
-    text_color = ""
-
-    # ── Left column: logo + metadata ──
+    # ── Left column: branding + session metadata ──
     left_lines: list[str] = []
     left_lines.append("")
-    left_lines.append(f"[bold {accent}]L . E . A . P[/]")
-    left_lines.append(f"[dim]Learning and Evolving from Actual Practice[/]")
+    left_lines.append(f"[bold {_GOLD}]L[/] [dim {_DIM_GOLD}].[/] [bold {_GOLD}]E[/] [dim {_DIM_GOLD}].[/] [bold {_GOLD}]A[/] [dim {_DIM_GOLD}].[/] [bold {_GOLD}]P[/]")
+    left_lines.append(f"[{_CREAM}]Learning and Evolving from Actual Practice[/]")
     left_lines.append("")
+
     if model:
         model_short = model.split("/")[-1] if "/" in model else model
-        ctx_str = f"  ({context_length // 1000}K ctx)" if context_length else ""
-        left_lines.append(f"[{accent}]{model_short}[/][dim]{ctx_str}[/]")
+        ctx_str = f"  [dim {_DIM_GOLD}]({context_length // 1000}K ctx)[/]" if context_length else ""
+        left_lines.append(f"[bold {_AMBER}]{model_short}[/]{ctx_str}")
+
     if cwd:
         short_cwd = cwd.replace(os.path.expanduser("~"), "~")
-        left_lines.append(f"[{dim}]{short_cwd}[/]")
-    if session_id:
-        left_lines.append(f"[{dim}]session: {session_id[:12]}[/]")
-    left_lines.append("")
+        left_lines.append(f"[{_WARM_GRAY}]{short_cwd}[/]")
 
+    if session_id:
+        left_lines.append(f"[{_WARM_GRAY}]session: {session_id[:12]}[/]")
+
+    left_lines.append("")
     left_content = "\n".join(left_lines)
 
-    # ── Right column: tools + skills ──
+    # ── Right column: tools + skills catalog ──
     right_lines: list[str] = []
 
-    # Tools
     if tool_defs:
         tool_groups = _categorize_tools(tool_defs)
-        right_lines.append(f"[bold {accent}]Available Tools[/]")
+        right_lines.append(f"[bold {_AMBER}]Available Tools[/]")
         for cat, names in tool_groups.items():
             names_str = ", ".join(sorted(names))
-            if len(names_str) > 50:
-                names_str = names_str[:47] + "…"
-            right_lines.append(f"[{dim}]{cat}:[/] {names_str}")
+            if len(names_str) > 52:
+                names_str = names_str[:49] + "…"
+            right_lines.append(f"[{_DIM_GOLD}]{cat}:[/] [{_CREAM}]{names_str}[/]")
 
         if mcp_tools > 0:
-            right_lines.append(f"[{dim}]mcp:[/] {mcp_tools} platform tools")
+            right_lines.append(f"[{_DIM_GOLD}]mcp:[/] [{_CREAM}]{mcp_tools} platform tools[/]")
 
-    # Skills
     if skills:
         right_lines.append("")
-        right_lines.append(f"[bold {accent}]Available Skills[/]")
+        right_lines.append(f"[bold {_AMBER}]Available Skills[/]")
         skill_groups = _categorize_skills(skills)
         for cat, names in skill_groups.items():
             names_str = ", ".join(sorted(names))
-            if len(names_str) > 50:
-                names_str = names_str[:47] + "…"
-            right_lines.append(f"[{dim}]{cat}:[/] {names_str}")
+            if len(names_str) > 52:
+                names_str = names_str[:49] + "…"
+            right_lines.append(f"[{_DIM_GOLD}]{cat}:[/] [{_CREAM}]{names_str}[/]")
 
-    if not right_lines:
-        right_lines.append(f"[{dim}]No tools or skills loaded[/]")
+    if not tool_defs and not skills:
+        right_lines.append(f"[{_WARM_GRAY}]No tools or skills loaded[/]")
 
     # Summary line
     tool_count = len(tool_defs) if tool_defs else 0
@@ -172,39 +163,64 @@ def display_rich_banner(
         summary_parts.append(f"{mcp_tools} mcp")
     summary_parts.append("/help for commands")
     right_lines.append("")
-    right_lines.append(f"[{dim}]{' · '.join(summary_parts)}[/]")
+    right_lines.append(f"[{_WARM_GRAY}]{' · '.join(summary_parts)}[/]")
 
     right_content = "\n".join(right_lines)
 
-    # ── Assembly ──
-    layout = Table.grid(padding=(0, 3))
-    layout.add_column("left", justify="center", min_width=min(40, term_width // 3))
-    layout.add_column("right", justify="left")
-    layout.add_row(left_content, right_content)
-
-    # Compact mode for narrow terminals
-    if term_width < 80:
+    # ── Assembly — full-width panel ──
+    if term_width < 70:
+        # Narrow: single-column compact
+        combined = left_content + "\n" + right_content
+        version_label = f"LeapFlow v{VERSION}"
+        conn = "[green]●[/]" if platform_online else f"[{_WARM_GRAY}]○[/]"
         panel = Panel(
-            Text.from_markup(f"[bold {accent}]L.E.A.P[/]  [dim]v{VERSION}[/]"),
-            border_style=dim,
-            padding=(0, 1),
+            combined,
+            title=f"[bold {_GOLD}]{version_label}[/]  {conn}",
+            border_style=_BRONZE,
+            padding=(0, 2),
+            expand=True,
         )
     else:
+        layout = Table.grid(padding=(0, 3))
+        left_min = max(38, term_width // 3)
+        layout.add_column("left", justify="center", min_width=left_min)
+        layout.add_column("right", justify="left", ratio=1)
+        layout.add_row(left_content, right_content)
+
         version_label = f"LeapFlow v{VERSION}"
-        conn_indicator = "[green]●[/]" if platform_online else f"[{dim}]○[/]"
-        title = f"[bold {accent}]{version_label}[/]  {conn_indicator}"
+        conn = "[green]●[/]" if platform_online else f"[{_WARM_GRAY}]○[/]"
         panel = Panel(
             layout,
-            title=title,
-            border_style=dim,
-            padding=(0, 1),
+            title=f"[bold {_GOLD}]{version_label}[/]  {conn}",
+            border_style=_BRONZE,
+            padding=(0, 2),
+            expand=True,
         )
 
     console.print()
     console.print(panel)
 
+    # Welcome line
+    console.print(
+        f"\n[{_CREAM}]Type your message or [bold {_AMBER}]/help[/bold {_AMBER}] for commands.[/]\n",
+    )
 
-# ── Animated ASCII banner (bare `leap` command) ──────────────────────
+
+# ── Animated ASCII banner (non-interactive contexts) ─────────────────
+
+RESET = "\033[0m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+CYAN = "\033[36m"
+BRIGHT_CYAN = "\033[1;36m"
+BRIGHT_ORANGE = "\033[1;38;5;208m"
+DIM_WHITE = "\033[2;37m"
+CURSOR_HIDE = "\033[?25l"
+CURSOR_SHOW = "\033[?25h"
+
+INDENT = "    "
+W = 50
+
 
 def _tty() -> bool:
     return sys.stdout.isatty()
@@ -358,7 +374,7 @@ def _print_static() -> None:
 
 
 def display_welcome() -> None:
-    """Render the animated LEAP welcome banner (bare ``leap`` entrypoint).
+    """Render the animated LEAP welcome banner (non-interactive contexts).
 
     For the Rich interactive banner, use ``display_rich_banner()``.
     """

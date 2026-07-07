@@ -3,6 +3,9 @@
 Detects terminal background color via environment heuristics and provides
 a coherent color palette for the entire TUI.  All colors are centralized
 here — components never hardcode ANSI sequences.
+
+The dark theme uses a warm gold/amber palette inspired by premium
+terminal tools.  The light theme uses dark counterparts for readability.
 """
 
 from __future__ import annotations
@@ -52,42 +55,42 @@ class Theme:
 
 _DARK = Theme(
     name="dark",
-    accent="cyan",
-    accent_dim="dim cyan",
-    success="green",
-    warning="yellow",
-    error="red",
-    info="blue",
-    text="white",
-    text_dim="dim white",
-    text_muted="bright_black",
-    border="bright_black",
-    border_dim="dim",
-    panel_title="bold cyan",
-    recording="bold red",
-    executing="bold green",
+    accent="#FFBF00",
+    accent_dim="#B8860B",
+    success="#87D687",
+    warning="#FFD700",
+    error="#FF6B6B",
+    info="#87CEEB",
+    text="#FFF8DC",
+    text_dim="#B8860B",
+    text_muted="#8B8682",
+    border="#CD7F32",
+    border_dim="#8B6914",
+    panel_title="bold #FFD700",
+    recording="bold #FF6B6B",
+    executing="bold #87D687",
     code_bg="grey11",
-    prompt_char="bold cyan",
+    prompt_char="bold #FFD700",
 )
 
 _LIGHT = Theme(
     name="light",
-    accent="dark_cyan",
-    accent_dim="dim dark_cyan",
+    accent="#996600",
+    accent_dim="#B8860B",
     success="dark_green",
-    warning="dark_orange3",
+    warning="#996600",
     error="red3",
     info="blue3",
     text="black",
-    text_dim="dim",
+    text_dim="#8B6914",
     text_muted="grey50",
-    border="grey70",
-    border_dim="dim grey50",
-    panel_title="bold dark_cyan",
+    border="#CD7F32",
+    border_dim="grey50",
+    panel_title="bold #996600",
     recording="bold red3",
     executing="bold dark_green",
     code_bg="grey93",
-    prompt_char="bold dark_cyan",
+    prompt_char="bold #996600",
 )
 
 
