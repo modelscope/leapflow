@@ -86,23 +86,23 @@ async def cmd_interactive(ctx: "Context") -> int:
     def _platform_online() -> bool:
         return hasattr(ctx.rpc, "connected") and ctx.rpc.connected
 
-    # ── Banner ──
+    # ── Banner data (rendered inside patch_stdout below) ──
     all_skills = ctx.registry.list_all() if ctx.registry else []
     mcp_count = len(getattr(ctx, "platform_tools", [])) if hasattr(ctx, "platform_tools") else 0
     cap = getattr(ctx.engine, "model_capabilities", None) if ctx.engine else None
     ctx_len = getattr(cap, "context_length", 0) if cap else 0
 
-    display_rich_banner(
-        model=getattr(ctx.settings, "model", ""),
-        cwd=os.getcwd(),
-        session_id=getattr(ctx.session, "session_id", ""),
-        platform_online=_platform_online(),
-        tool_defs=TOOL_DEFINITIONS,
-        skills=all_skills,
-        context_length=ctx_len,
-        mcp_tools=mcp_count,
-    )
-    console.print()
+    def _render_banner() -> None:
+        display_rich_banner(
+            model=getattr(ctx.settings, "model", ""),
+            cwd=os.getcwd(),
+            session_id=getattr(ctx.session, "session_id", ""),
+            platform_online=_platform_online(),
+            tool_defs=TOOL_DEFINITIONS,
+            skills=all_skills,
+            context_length=ctx_len,
+            mcp_tools=mcp_count,
+        )
 
     def _update_status() -> None:
         ctx_used = 0
@@ -158,6 +158,8 @@ async def cmd_interactive(ctx: "Context") -> int:
 
     # ── Main loop (patch_stdout pins the prompt to bottom) ──
     with leap_input.stdout_proxy():
+        _render_banner()
+
         while True:
             _learning = ctx.session and ctx.session.mode == SessionMode.LEARNING
             if _learning:
@@ -255,16 +257,7 @@ async def cmd_interactive(ctx: "Context") -> int:
 
                 elif canonical == "clear":
                     handle_clear(ctx, console, cmd_args)
-                    display_rich_banner(
-                        model=getattr(ctx.settings, "model", ""),
-                        cwd=os.getcwd(),
-                        session_id=getattr(ctx.session, "session_id", ""),
-                        platform_online=_platform_online(),
-                        tool_defs=TOOL_DEFINITIONS,
-                        skills=ctx.registry.list_all() if ctx.registry else [],
-                        context_length=ctx_len,
-                        mcp_tools=mcp_count,
-                    )
+                    _render_banner()
                     continue
 
                 elif canonical == "tools":

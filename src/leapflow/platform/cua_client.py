@@ -59,6 +59,10 @@ def _child_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(base if base is not None else os.environ)
     if _telemetry_disabled():
         env[_CUA_TELEMETRY_ENV_VAR] = "0"
+    # Suppress async update banner on stderr — it writes directly to the
+    # inherited FD (bypassing patch_stdout) and corrupts prompt_toolkit TUI.
+    if env.get("CUA_DRIVER_RS_UPDATE_CHECK", "").lower() not in ("1", "true", "yes"):
+        env["CUA_DRIVER_RS_UPDATE_CHECK"] = "0"
     return env
 
 
@@ -233,13 +237,16 @@ class _McpSession:
                 env=_child_env(),
             )
 
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    await self._discover_capabilities(session)
-                    self._session = session
-                    self._ready_event.set()
-                    await self._shutdown_event.wait()
+            # Route subprocess stderr away from the terminal — cua-driver logs
+            # and update notices must not corrupt prompt_toolkit rendering.
+            with open(os.devnull, "w", encoding="utf-8") as _devnull:
+                async with stdio_client(params, errlog=_devnull) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        await self._discover_capabilities(session)
+                        self._session = session
+                        self._ready_event.set()
+                        await self._shutdown_event.wait()
         except BaseException as e:
             self._setup_error = e
             self._ready_event.set()

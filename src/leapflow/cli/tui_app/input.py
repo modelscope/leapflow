@@ -77,9 +77,14 @@ def _build_keybindings() -> KeyBindings:
     """Configure key bindings for multiline editing and navigation."""
     kb = KeyBindings()
 
+    @kb.add(Keys.Enter)
+    def _submit(event):
+        """Enter: submit input (single-line mode)."""
+        event.current_buffer.validate_and_handle()
+
     @kb.add(Keys.Escape, Keys.Enter)
     def _multiline_alt_enter(event):
-        """Alt+Enter: insert newline (multiline mode)."""
+        """Alt+Enter: insert newline for multi-line prompts."""
         event.current_buffer.insert_text("\n")
 
     @kb.add(Keys.ControlD)

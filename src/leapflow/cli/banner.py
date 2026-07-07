@@ -87,6 +87,7 @@ def display_rich_banner(
     skills: Optional[Sequence[Any]] = None,
     context_length: int = 0,
     mcp_tools: int = 0,
+    show_welcome: bool = True,
 ) -> None:
     """Print the full-width Rich banner panel with tools/skills catalog."""
     try:
@@ -104,8 +105,16 @@ def display_rich_banner(
     # ── Left column: branding + session metadata ──
     left_lines: list[str] = []
     left_lines.append("")
-    left_lines.append(f"[bold {_GOLD}]L[/] [dim {_DIM_GOLD}].[/] [bold {_GOLD}]E[/] [dim {_DIM_GOLD}].[/] [bold {_GOLD}]A[/] [dim {_DIM_GOLD}].[/] [bold {_GOLD}]P[/]")
+    left_lines.append(
+        f"[bold {_GOLD}]L[/] [dim {_DIM_GOLD}].[/] "
+        f"[bold {_GOLD}]E[/] [dim {_DIM_GOLD}].[/] "
+        f"[bold {_GOLD}]A[/] [dim {_DIM_GOLD}].[/] "
+        f"[bold {_GOLD}]P[/]"
+    )
     left_lines.append(f"[{_CREAM}]Learning and Evolving from Actual Practice[/]")
+    left_lines.append(f"[bold {_AMBER}]ModelScope[/]")
+    if session_id:
+        left_lines.append(f"[{_WARM_GRAY}]Session: {session_id}[/]")
     left_lines.append("")
 
     if model:
@@ -117,14 +126,11 @@ def display_rich_banner(
         else:
             ctx_label = str(context_length)
         ctx_str = f"  [dim {_DIM_GOLD}]({ctx_label} ctx)[/]" if context_length else ""
-        left_lines.append(f"[bold {_AMBER}]{model_short}[/]{ctx_str} [dim {_DIM_GOLD}]·[/] [dim {_DIM_GOLD}]ModelScope[/]")
+        left_lines.append(f"[bold {_AMBER}]{model_short}[/]{ctx_str}")
 
     if cwd:
         short_cwd = cwd.replace(os.path.expanduser("~"), "~")
         left_lines.append(f"[{_WARM_GRAY}]{short_cwd}[/]")
-
-    if session_id:
-        left_lines.append(f"[{_WARM_GRAY}]Session: {session_id[:16]}[/]")
 
     left_lines.append("")
     left_content = "\n".join(left_lines)
@@ -206,10 +212,11 @@ def display_rich_banner(
     console.print()
     console.print(panel)
 
-    # Welcome line
-    console.print(
-        f"\n[{_CREAM}]Type your message or [bold {_AMBER}]/help[/bold {_AMBER}] for commands.[/]\n",
-    )
+    if show_welcome:
+        console.print(
+            f"\n[{_CREAM}]Welcome to LeapFlow! "
+            f"Type your message or [bold {_AMBER}]/help[/bold {_AMBER}] for commands.[/]\n",
+        )
 
 
 # ── Animated ASCII banner (non-interactive contexts) ─────────────────
