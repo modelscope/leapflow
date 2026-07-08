@@ -288,7 +288,7 @@ def test_skill_library_crud(skill_library) -> None:
 
 
 def test_memory_tiers_integration(tmp_db) -> None:
-    lt = SemanticMemoryProvider(db_path=tmp_db)
+    lt = SemanticMemoryProvider(source=tmp_db)
     lt._ensure_connection()
     try:
 

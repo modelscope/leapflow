@@ -14,25 +14,29 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import time
-import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+
+from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
+from leapflow.storage.write_buffer import execute_with_retry
 
 logger = logging.getLogger(__name__)
 
-_WRITE_RETRIES = 10
-_WRITE_JITTER_MS = (15, 120)
-
 
 class DuckDBEvolutionStore:
-    """Persistent backing store for skill episodes."""
+    """Persistent backing store for skill episodes.
 
-    def __init__(self, db_path: Path | str) -> None:
-        import duckdb
-        self._db_path = str(db_path)
-        self._conn = duckdb.connect(self._db_path)
+    Accepts ``ConnectionHolder`` (shared) or legacy ``Path``.
+    """
+
+    def __init__(self, source: Union[ConnectionHolder, Path, str]) -> None:
+        self._owns_holder = isinstance(source, (str, Path))
+        if self._owns_holder:
+            source = LocalConnectionHolder(Path(source))
+        self._holder = source
+        self._conn = self._holder.connection
+        self._db_path = str(self._holder.db_path)
         self._initialize_schema()
 
     def _initialize_schema(self) -> None:
@@ -63,19 +67,7 @@ class DuckDBEvolutionStore:
         """)
 
     def _execute_write(self, sql: str, params: Any = None) -> None:
-        for attempt in range(_WRITE_RETRIES):
-            try:
-                if params:
-                    self._conn.execute(sql, params)
-                else:
-                    self._conn.execute(sql)
-                return
-            except Exception as e:
-                if "locked" in str(e).lower() and attempt < _WRITE_RETRIES - 1:
-                    jitter = random.uniform(*_WRITE_JITTER_MS) / 1000
-                    time.sleep(jitter)
-                    continue
-                raise
+        execute_with_retry(self._conn, sql, params)
 
     def save_episode(
         self,
@@ -195,7 +187,8 @@ class DuckDBEvolutionStore:
             return False
 
     def close(self) -> None:
-        try:
-            self._conn.close()
-        except Exception:
-            pass
+        if self._owns_holder:
+            try:
+                self._holder.close()
+            except Exception:
+                pass

@@ -70,7 +70,7 @@ async def test_simple_query_returns_answer() -> None:
         rpc = MockBridge()
         llm = StubLLM([answer])
         wm = WorkingMemoryProvider(max_tokens=1024)
-        lt = SemanticMemoryProvider(db_path=settings.duckdb_path)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
         imm = EpisodicMemoryProvider()
         imm.ingest("event.fs_change", "File modified: /tmp/README.md", path="/tmp/README.md")
         try:
@@ -102,7 +102,7 @@ async def test_react_loop_tool_then_answer() -> None:
             ]
         )
         wm = WorkingMemoryProvider(max_tokens=1024)
-        lt = SemanticMemoryProvider(db_path=settings.duckdb_path)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
         imm = EpisodicMemoryProvider()
         try:
             reg = build_default_registry(rpc, llm, wm, lt)
@@ -125,7 +125,7 @@ async def test_dag_execution_end_to_end() -> None:
         rpc = MockBridge()
         llm = StubLLM([])
         wm = WorkingMemoryProvider(max_tokens=1024)
-        lt = SemanticMemoryProvider(db_path=settings.duckdb_path)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
         imm = EpisodicMemoryProvider()
 
         planned = TaskGraph(goal="organize downloads")
@@ -176,7 +176,7 @@ async def test_engine_remembers_context() -> None:
             ]
         )
         wm = WorkingMemoryProvider(max_tokens=1024)
-        lt = SemanticMemoryProvider(db_path=settings.duckdb_path)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
         imm = EpisodicMemoryProvider()
         try:
             reg = build_default_registry(rpc, llm, wm, lt)
@@ -207,7 +207,7 @@ async def test_immediate_memory_integration() -> None:
         rpc = MockBridge()
         llm = StubLLM(["You recently modified /tmp/README.md"])
         wm = WorkingMemoryProvider(max_tokens=1024)
-        lt = SemanticMemoryProvider(db_path=settings.duckdb_path)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
         imm = EpisodicMemoryProvider()
         imm.ingest("event.fs_change", "File modified: /tmp/README.md", path="/tmp/README.md")
         try:

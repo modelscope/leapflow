@@ -38,7 +38,8 @@ from leapflow.llm.provider_chain import (
 )
 from leapflow.memory import (
     MemoryManager, WorkingMemoryProvider, EpisodicMemoryProvider,
-    SemanticMemoryProvider, EvolutionMemoryProvider, MemoryFragment,
+    SemanticMemoryProvider, EvolutionMemoryProvider, NarrativeProvider,
+    MemoryFragment,
 )
 from leapflow.skills.activator import SkillActivator
 from leapflow.skills.evolution import EMAConfidencePolicy
@@ -50,6 +51,8 @@ from leapflow.learning.codegen import CompositeSkillCodeGenerator, LLMSkillCodeG
 from leapflow.learning.distiller import LLMSkillDistiller, SkillDistiller
 from leapflow.learning.doc_generator import CompositeSkillDocGenerator, LLMSkillDocGenerator
 from leapflow.storage.skill_docs import SkillDocStore
+from leapflow.storage.duckdb_connect import DatabaseLockedError
+from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
 from leapflow.learning.feedback import FeedbackEvaluator
 from leapflow.storage.skill_library import SkillLibraryStore
 from leapflow.skills.registry import SkillRegistry
@@ -307,19 +310,24 @@ class Context:
         self.settings = settings
         self.effective_mock = bool(mock_host or settings.mock_host)
 
-        # Memory subsystem — provider-based architecture
+        # Memory subsystem — provider-based architecture (dual-layer)
         working = WorkingMemoryProvider(max_tokens=settings.memory_working_max_tokens)
-        semantic = SemanticMemoryProvider(db_path=settings.duckdb_path)
+        semantic = SemanticMemoryProvider(source=self._db_holder)
         episodic = EpisodicMemoryProvider(
             ttl=settings.memory_episodic_ttl_s,
             max_entries=settings.memory_episodic_max_entries,
             on_promote=_build_promotion_callback(semantic),
         )
         evolution = EvolutionMemoryProvider(max_episodes=settings.memory_evolution_max_episodes)
+        narrative = NarrativeProvider(
+            memory_dir=settings.profile_dir / "memory",
+            workspace_path=str(Path.cwd()),
+        )
 
         self.memory = MemoryManager()
         self.memory.add_provider(working)
         self.memory.add_provider(episodic)
+        self.memory.add_provider(narrative)
         self.memory.add_provider(semantic)
         self.memory.add_provider(evolution)
 
@@ -525,8 +533,21 @@ class Context:
         if settings.has_llm_credentials:
             codegen = CompositeSkillCodeGenerator(LLMSkillCodeGenerator(self.llm))
 
-        traj_db_path = settings.duckdb_path.parent / "trajectories.duckdb"
-        traj_store = TrajectoryStore(traj_db_path)
+        try:
+            self._db_holder = LocalConnectionHolder(settings.duckdb_path)
+            _ = self._db_holder.connection  # eagerly open to detect lock
+        except DatabaseLockedError as exc:
+            logger.error("Database locked: %s", exc)
+            raise SystemExit(
+                f"\n{exc}\n\nHint: close the other instance or wait for it to finish."
+            ) from exc
+
+        try:
+            traj_store = TrajectoryStore(self._db_holder)
+        except Exception as exc:
+            logger.error("TrajectoryStore init failed: %s", exc)
+            self._db_holder.close()
+            raise SystemExit(f"\nFailed to initialize trajectory store: {exc}") from exc
         distiller: SkillDistiller
         if settings.has_llm_credentials:
             distiller = LLMSkillDistiller(self.llm)
@@ -629,8 +650,7 @@ class Context:
                 "(video mode active but timeline unavailable)"
             )
 
-        skill_lib_path = settings.duckdb_path.parent / "skill_library.duckdb"
-        self.skill_lib = SkillLibraryStore(skill_lib_path, audit_logger=self.audit)
+        self.skill_lib = SkillLibraryStore(self._db_holder, audit_logger=self.audit)
         scorer = HeuristicSimilarityScorer()
         llm_scorer = LLMSimilarityScorer(self.llm) if settings.has_llm_credentials else None
         feedback_evaluator = FeedbackEvaluator(
@@ -879,7 +899,7 @@ class Context:
         from leapflow.engine.confirmation import ConfirmationHandler
         confirmation = ConfirmationHandler(skill_store=self.skill_lib)
 
-        self.session_store = LearningSessionStore(traj_db_path)
+        self.session_store = LearningSessionStore(self._db_holder)
 
         # Learnability assessor
         learnability_assessor = None
@@ -912,7 +932,7 @@ class Context:
             auto_learn=settings.learn_auto_distill,
             confirmation=confirmation,
             audit=self.audit,
-            storage_path=str(skill_lib_path),
+            storage_path=str(settings.duckdb_path),
             audit_log_path=str(settings.audit_log_path),
             active_learning_observer=observer,
             session_store=self.session_store,
@@ -1070,15 +1090,12 @@ class Context:
             token_count_fn=lambda text: len(text) // 4,
         )
 
-        # ── Initialize DuckDBConversationStore (with self-repair) ──
+        # ── Initialize DuckDBConversationStore ──
         self._conversation_store = None
         try:
             from leapflow.storage.conversation_store import DuckDBConversationStore
-            from leapflow.storage.db_repair import check_and_repair
-            conv_db_path = settings.duckdb_path.parent / "conversations.duckdb"
-            check_and_repair(conv_db_path)
-            self._conversation_store = DuckDBConversationStore(conv_db_path)
-            logger.info("ConversationStore initialized: %s", conv_db_path)
+            self._conversation_store = DuckDBConversationStore(self._db_holder)
+            logger.info("ConversationStore initialized")
         except Exception:
             logger.warning("ConversationStore initialization failed", exc_info=True)
 
@@ -1215,10 +1232,7 @@ class Context:
         self._evolution_store = None
         try:
             from leapflow.storage.evolution_store import DuckDBEvolutionStore
-            from leapflow.storage.db_repair import check_and_repair
-            evo_db_path = settings.duckdb_path.parent / "evolution.duckdb"
-            check_and_repair(evo_db_path)
-            self._evolution_store = DuckDBEvolutionStore(evo_db_path)
+            self._evolution_store = DuckDBEvolutionStore(self._db_holder)
             # Hydrate in-memory provider from persisted episodes
             persisted = self._evolution_store.load_recent_episodes(
                 limit=settings.memory_evolution_max_episodes,
@@ -1876,6 +1890,12 @@ class Context:
             self.rpc.stop()
         if self.skill_lib:
             self.skill_lib.close()
+        if self.session_store:
+            self.session_store.close()
         if self.imitation:
             self.imitation.store.close()
+        # Close the shared DuckDB connection last (after all stores are done)
+        db_holder = getattr(self, "_db_holder", None)
+        if db_holder is not None:
+            db_holder.close()
         self.audit.close()

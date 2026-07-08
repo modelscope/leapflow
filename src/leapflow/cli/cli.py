@@ -148,9 +148,15 @@ def main(argv: list[str] | None = None) -> int:
     host_sub.add_parser("doctor", help="Run cua-driver connectivity health check")
     host_sub.add_parser("install", help="Install cua-driver")
 
+    # leap daemon
+    daemon_parser = subparsers.add_parser("daemon", help="Manage leapd daemon")
+    daemon_sub = daemon_parser.add_subparsers(dest="daemon_action")
+    daemon_sub.add_parser("status", help="Show daemon status")
+    daemon_sub.add_parser("stop", help="Stop running daemon")
+
     # ── Pre-parse: detect if first non-flag arg is a known subcommand ──
     # If not, treat everything non-flag as a chat prompt.
-    known_commands = {"teach", "run", "skills", "relearn", "host"}
+    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon"}
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
 
     # Find first non-flag argument
@@ -194,6 +200,11 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             sys.stderr.write("\n\033[2m→ Interrupted\033[0m\n")
             return 130
+
+    # Daemon command does not need Context initialization
+    if args.command == "daemon":
+        from leapflow.cli.commands.daemon import cmd_daemon
+        return cmd_daemon(args)
 
     try:
         return asyncio.run(_async_main(args))

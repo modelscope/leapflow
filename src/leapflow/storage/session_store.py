@@ -10,24 +10,31 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-import duckdb
+from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
+from leapflow.storage.write_buffer import execute_with_retry
 
 logger = logging.getLogger(__name__)
 
 
 class LearningSessionStore:
-    """DuckDB-backed CRUD for learning session metadata."""
+    """DuckDB-backed CRUD for learning session metadata.
 
-    def __init__(self, db_path: Path) -> None:
-        self._path = db_path
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._con = duckdb.connect(str(self._path))
+    Accepts ``ConnectionHolder`` (shared) or legacy ``Path``.
+    """
+
+    def __init__(self, source: Union[ConnectionHolder, Path]) -> None:
+        self._owns_holder = isinstance(source, Path)
+        if self._owns_holder:
+            source = LocalConnectionHolder(source)
+        self._holder = source
+        self._con = self._holder.connection
         self._init_schema()
 
     def close(self) -> None:
-        self._con.close()
+        if self._owns_holder:
+            self._holder.close()
 
     def _init_schema(self) -> None:
         self._con.execute("""
@@ -66,7 +73,8 @@ class LearningSessionStore:
     ) -> None:
         """Persist or update a learning session record."""
         now = time.time()
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "INSERT OR REPLACE INTO leap_learning_session "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
@@ -109,7 +117,8 @@ class LearningSessionStore:
 
     def mark_completed(self, session_id: str, end_time: Optional[float] = None) -> None:
         """Mark a session as completed (learning triggered)."""
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "UPDATE leap_learning_session SET status = 'completed', end_time = ? "
             "WHERE session_id = ?",
             [end_time or time.time(), session_id],
@@ -117,7 +126,8 @@ class LearningSessionStore:
 
     def mark_abandoned(self, session_id: str) -> None:
         """Mark a session as abandoned (quit without learning)."""
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "UPDATE leap_learning_session SET status = 'abandoned', end_time = ? "
             "WHERE session_id = ?",
             [time.time(), session_id],

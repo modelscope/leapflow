@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import duckdb
 
@@ -25,6 +25,8 @@ from leapflow.domain.skill_types import (
     DistillationCandidate,
     RecoveryEvent,
 )
+from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
+from leapflow.storage.write_buffer import execute_with_retry
 
 if TYPE_CHECKING:
     from leapflow.skills.registry import Skill
@@ -95,17 +97,28 @@ class SkillUpdateSuggestion:
 
 
 class SkillLibraryStore:
-    """DuckDB-backed CRUD for the skill library and suggestion queue."""
+    """DuckDB-backed CRUD for the skill library and suggestion queue.
 
-    def __init__(self, db_path: Path, *, audit_logger: Optional[Any] = None) -> None:
-        self._path = db_path
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._con = duckdb.connect(str(self._path))
+    Accepts ``ConnectionHolder`` (shared) or legacy ``Path``.
+    """
+
+    def __init__(
+        self,
+        source: Union[ConnectionHolder, Path],
+        *,
+        audit_logger: Optional[Any] = None,
+    ) -> None:
+        self._owns_holder = isinstance(source, Path)
+        if self._owns_holder:
+            source = LocalConnectionHolder(source)
+        self._holder = source
+        self._con = self._holder.connection
         self._audit_logger = audit_logger
         self._init_schema()
 
     def close(self) -> None:
-        self._con.close()
+        if self._owns_holder:
+            self._holder.close()
 
     # ── Schema ──
 
@@ -205,7 +218,8 @@ class SkillLibraryStore:
 
     def save_skill(self, skill: StoredSkill) -> None:
         now = time.time()
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "INSERT OR REPLACE INTO leap_skill_library VALUES "
             "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
@@ -286,7 +300,8 @@ class SkillLibraryStore:
     # ── Suggestion CRUD ──
 
     def save_suggestion(self, s: SkillUpdateSuggestion) -> None:
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "INSERT OR REPLACE INTO leap_skill_suggestion VALUES "
             "(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
@@ -357,7 +372,8 @@ class SkillLibraryStore:
         return int(result[0]) if result else 0
 
     def resolve_suggestion(self, suggestion_id: str, status: str) -> None:
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "UPDATE leap_skill_suggestion SET status = ?, resolved_at = ? WHERE id = ?",
             [status, time.time(), suggestion_id],
         )
@@ -365,7 +381,8 @@ class SkillLibraryStore:
     # ── Execution log CRUD ──
 
     def save_execution(self, execution: SkillExecution) -> None:
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "INSERT OR REPLACE INTO leap_skill_execution VALUES "
             "(?,?,?,?,?,?,?,?,?)",
             [
@@ -446,7 +463,8 @@ class SkillLibraryStore:
               "default": p.default, "description": p.description}
              for p in skill.parameters]
         )
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "INSERT OR REPLACE INTO leap_parameterized_skills VALUES "
             "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
@@ -489,12 +507,12 @@ class SkillLibraryStore:
 
     def deactivate_parameterized(self, name: str) -> bool:
         """Soft-delete a parameterized skill. Returns True if it existed."""
-        result = self._con.execute(
+        execute_with_retry(
+            self._con,
             "UPDATE leap_parameterized_skills SET is_active = FALSE, updated_at = ? "
             "WHERE name = ? AND is_active = TRUE",
             [time.time(), name],
         )
-        result.fetchone()  # DuckDB returns None on success
         # Check if row existed
         check = self._con.execute(
             "SELECT 1 FROM leap_parameterized_skills WHERE name = ?", [name]
@@ -503,7 +521,8 @@ class SkillLibraryStore:
 
     def update_skill_confidence(self, name: str, confidence: float) -> None:
         """Update confidence for a parameterized skill by name."""
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "UPDATE leap_parameterized_skills "
             "SET confidence = ?, updated_at = ? WHERE name = ?",
             [confidence, time.time(), name],
@@ -520,7 +539,8 @@ class SkillLibraryStore:
         if row is None:
             raise KeyError(f"Parameterized skill '{name}' not found")
         new_version = row[0] + 1
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "UPDATE leap_parameterized_skills "
             "SET version = ?, code = ?, updated_at = ? WHERE name = ?",
             [new_version, new_code, time.time(), name],

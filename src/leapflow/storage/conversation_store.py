@@ -16,12 +16,11 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Union, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +84,6 @@ class ConversationStore(Protocol):
     def close(self) -> None: ...
 
 
-_WRITE_RETRIES = 15
-_WRITE_JITTER_MIN_MS = 20
-_WRITE_JITTER_MAX_MS = 150
-
-
 class DuckDBConversationStore:
     """DuckDB-backed conversation store with FTS and write-retry.
 
@@ -97,12 +91,18 @@ class DuckDBConversationStore:
     - conversation_sessions: metadata, lineage (parent_session_id), model config
     - conversation_messages: full transcript with soft-delete (active) and compaction flag
     - FTS index on messages for keyword search
+
+    Accepts ``ConnectionHolder`` (shared) or legacy ``Path``.
     """
 
-    def __init__(self, db_path: Path | str) -> None:
-        import duckdb
-        self._db_path = str(db_path)
-        self._conn = duckdb.connect(self._db_path)
+    def __init__(self, source: "Union[ConnectionHolder, Path, str]") -> None:
+        from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
+        self._owns_holder = isinstance(source, (str, Path))
+        if self._owns_holder:
+            source = LocalConnectionHolder(Path(source))
+        self._holder = source
+        self._conn = self._holder.connection
+        self._db_path = str(self._holder.db_path)
         self._write_count = 0
         self._initialize_schema()
 
@@ -175,20 +175,9 @@ class DuckDBConversationStore:
 
     def _execute_write(self, sql: str, params: Any = None) -> None:
         """Execute a write with jitter retry for concurrent access."""
-        for attempt in range(_WRITE_RETRIES):
-            try:
-                if params:
-                    self._conn.execute(sql, params)
-                else:
-                    self._conn.execute(sql)
-                self._write_count += 1
-                return
-            except Exception as e:
-                if "locked" in str(e).lower() and attempt < _WRITE_RETRIES - 1:
-                    jitter = random.uniform(_WRITE_JITTER_MIN_MS, _WRITE_JITTER_MAX_MS) / 1000
-                    time.sleep(jitter)
-                    continue
-                raise
+        from leapflow.storage.write_buffer import execute_with_retry
+        execute_with_retry(self._conn, sql, params)
+        self._write_count += 1
 
     def create_session(
         self,
@@ -544,11 +533,12 @@ class DuckDBConversationStore:
         return session
 
     def close(self) -> None:
-        """Close the database connection."""
-        try:
-            self._conn.close()
-        except Exception:
-            pass
+        """Close the database connection if owned by this store."""
+        if self._owns_holder:
+            try:
+                self._holder.close()
+            except Exception:
+                pass
 
     def _row_to_session(self, row: tuple) -> ConversationSession:
         meta = {}

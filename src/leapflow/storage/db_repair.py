@@ -44,6 +44,10 @@ def check_and_repair(
         conn.close()
         return True
     except Exception as exc:
+        from leapflow.storage.duckdb_connect import is_lock_error
+        if is_lock_error(exc):
+            logger.info("db_repair: %s is locked (not corrupt), skipping repair", db_path.name)
+            return True
         logger.warning("db_repair: integrity check failed for %s: %s", db_path.name, exc)
 
     logger.warning("db_repair: database corrupt, backing up: %s", db_path.name)
@@ -103,12 +107,9 @@ def _cleanup_old_backups(
 def safe_connect(db_path: Path | str, *, read_only: bool = False):
     """Connect to DuckDB with pre-flight health check and auto-repair.
 
-    Returns a duckdb.Connection. On corruption, backs up and recreates.
+    .. deprecated::
+        Use ``leapflow.storage.duckdb_connect.connect()`` instead,
+        which provides lock-aware retry in addition to corruption repair.
     """
-    import duckdb
-
-    db_path = Path(db_path)
-    if db_path.exists():
-        check_and_repair(db_path)
-
-    return duckdb.connect(str(db_path), read_only=read_only)
+    from leapflow.storage.duckdb_connect import connect as lock_aware_connect
+    return lock_aware_connect(db_path, read_only=read_only)

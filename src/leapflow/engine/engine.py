@@ -2002,7 +2002,11 @@ class AgentEngine:
             logger.debug("session.persist_message failed", exc_info=True)
 
     async def _prefetch_and_freeze_memory(self, user_text: str) -> str:
-        """Prefetch memory context and freeze snapshot for session duration."""
+        """Prefetch memory context and freeze snapshot for session duration.
+
+        Combines narrative memory (always-on MEMORY.md) with signal-based
+        prefetch results into a unified context block.
+        """
         if self._memory_context_snapshot is not None:
             return self._memory_context_snapshot
 
@@ -2010,6 +2014,19 @@ class AgentEngine:
             self._memory_context_snapshot = ""
             return ""
 
+        parts: list[str] = []
+
+        # Layer 1: Narrative memory (MEMORY.md — always loaded, no timeout)
+        narrative = self._memory_manager.get_provider("narrative")
+        if narrative is not None and hasattr(narrative, "context_block"):
+            try:
+                block = narrative.context_block()
+                if block:
+                    parts.append(block)
+            except Exception:
+                logger.debug("narrative.context_block failed", exc_info=True)
+
+        # Layer 2: Signal-based prefetch (DuckDB — timeout-bounded)
         try:
             entries = await asyncio.wait_for(
                 self._memory_manager.prefetch(
@@ -2018,19 +2035,18 @@ class AgentEngine:
                 timeout=self._settings.memory_prefetch_timeout_s,
             )
             if entries:
-                context = "## Recent Context\n" + "\n".join(
+                parts.append("## Recent Context\n" + "\n".join(
                     f"- [{e.kind.value}] {e.content[:100]}" for e in entries
-                )
-                self._memory_context_snapshot = context
-                return context
+                ))
         except asyncio.TimeoutError:
             logger.debug(
                 "memory.prefetch timed out (%.1fs)", self._settings.memory_prefetch_timeout_s,
             )
         except Exception:
             logger.debug("memory.prefetch failed", exc_info=True)
-        self._memory_context_snapshot = ""
-        return ""
+
+        self._memory_context_snapshot = "\n\n".join(parts)
+        return self._memory_context_snapshot
 
     async def _sync_turn_safe(self, messages: List[Dict[str, Any]]) -> None:
         """Non-blocking wrapper for MemoryManager.sync_turn."""
