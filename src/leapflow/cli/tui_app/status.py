@@ -19,13 +19,17 @@ from leapflow.cli.tui_app.theme import ResolvedTheme, Theme, detect_theme
 
 
 def _compact_tokens(n: int) -> str:
-    """Format token count: ``0.2K``, ``12K``, ``1.2M``."""
+    """Format token count with adaptive precision.
+
+    < 1K   → ``0.1K``, ``0.9K``  (1 decimal)
+    1–10K  → ``1.2K``, ``9.8K``  (1 decimal)
+    10–999K → ``12K``, ``256K``   (integer K)
+    ≥ 1M   → ``1.2M``            (1 decimal)
+    """
     if n < 0:
         return "?"
     if n == 0:
         return "0"
-    if n < 100:
-        return str(n)
     if n < 10_000:
         return f"{n / 1000:.1f}K"
     if n < 1_000_000:

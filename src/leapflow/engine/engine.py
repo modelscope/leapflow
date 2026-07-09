@@ -1203,7 +1203,9 @@ class AgentEngine:
                     provider=getattr(self._llm, 'active_provider_name', ''),
                     model=resp.model or '',
                 )
-                self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
+                provider_prompt = usage.get("prompt_tokens", 0)
+                if provider_prompt > 0:
+                    self._last_context_tokens = provider_prompt
                 if self._model_capabilities and resp.model and usage:
                     self._model_capabilities.update_from_usage(resp.model, usage)
             except Exception as exc:
@@ -1561,7 +1563,9 @@ class AgentEngine:
                         provider=getattr(self._llm, 'active_provider_name', ''),
                         model=resp.model or '',
                     )
-                    self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
+                    provider_prompt = usage.get("prompt_tokens", 0)
+                    if provider_prompt > 0:
+                        self._last_context_tokens = provider_prompt
                 except Exception as exc:
                     _clear_indicator()
                     classified = self._error_classifier.classify(exc)
@@ -1694,7 +1698,9 @@ class AgentEngine:
                             provider=getattr(self._llm, 'active_provider_name', ''),
                             model=resp.model or '',
                         )
-                        self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
+                        provider_prompt = usage.get("prompt_tokens", 0)
+                        if provider_prompt > 0:
+                            self._last_context_tokens = provider_prompt
                     except Exception as exc:
                         _clear_indicator()
                         classified = self._error_classifier.classify(exc)

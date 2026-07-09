@@ -249,6 +249,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
             app.spinner_text = ""
             app.agent_running = False
             status.mark_turn_end()
+            _update_status()
 
     # ── Input handler (business logic) ───────────────────────────────
 
