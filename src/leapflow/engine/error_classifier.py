@@ -106,6 +106,49 @@ def build_recovery_map(
 
 RECOVERY_MAP: Dict[ErrorCategory, RecoveryStrategy] = build_recovery_map()
 
+# User-facing, actionable messages per error category. Surfaced by the agent
+# loop so a failed turn explains *why* it failed and how to fix it, instead of
+# a generic "I've reached my processing limit." fallback.
+_FRIENDLY_MESSAGES: Dict[ErrorCategory, str] = {
+    ErrorCategory.AUTH_ERROR: (
+        "LLM authentication failed \u2014 the API key is missing or invalid. "
+        "Set a valid LEAPFLOW_LLM_API_KEY in ~/.leapflow/.env "
+        "(and verify LEAPFLOW_LLM_BASE_URL / LEAPFLOW_LLM_MODEL)."
+    ),
+    ErrorCategory.AUTH_PERMANENT: (
+        "LLM authentication failed \u2014 the API key is missing or invalid. "
+        "Set a valid LEAPFLOW_LLM_API_KEY in ~/.leapflow/.env "
+        "(and verify LEAPFLOW_LLM_BASE_URL / LEAPFLOW_LLM_MODEL)."
+    ),
+    ErrorCategory.BILLING: (
+        "LLM request rejected due to billing/quota limits \u2014 "
+        "check your provider account balance or quota."
+    ),
+    ErrorCategory.MODEL_NOT_FOUND: (
+        "The configured LLM model was not found \u2014 check LEAPFLOW_LLM_MODEL."
+    ),
+    ErrorCategory.RATE_LIMITED: (
+        "LLM rate limit reached \u2014 please wait a moment and try again."
+    ),
+    ErrorCategory.OVERLOADED: (
+        "The LLM provider is overloaded \u2014 please retry shortly."
+    ),
+    ErrorCategory.CONTEXT_OVERFLOW: (
+        "The conversation exceeded the model's context window \u2014 "
+        "start a new session or shorten the input."
+    ),
+    ErrorCategory.PAYLOAD_TOO_LARGE: (
+        "The request payload was too large for the provider."
+    ),
+    ErrorCategory.CONTENT_BLOCKED: (
+        "The request was blocked by the provider's content policy."
+    ),
+    ErrorCategory.SSL_ERROR: (
+        "TLS/SSL error connecting to the LLM provider \u2014 "
+        "check your network, proxy, or certificates."
+    ),
+}
+
 _AUTH_KEYWORDS = ("api_key", "api key", "unauthorized", "forbidden", "401", "403")
 _BILLING_KEYWORDS = ("insufficient_quota", "billing", "payment", "quota exceeded", "402")
 _RATE_LIMIT_KEYWORDS = ("rate", "429", "too many", "throttl")
@@ -175,6 +218,21 @@ class ErrorClassifier:
 
     def get_recovery(self, category: ErrorCategory) -> RecoveryStrategy:
         return self._map.get(category, RecoveryStrategy())
+
+    @staticmethod
+    def friendly_message(category: ErrorCategory, detail: str = "") -> str:
+        """Return a clear, actionable user-facing message for an error category.
+
+        Lets the agent loop surface *why* a turn failed (with remediation
+        guidance) instead of a generic fallback message.
+        """
+        base = _FRIENDLY_MESSAGES.get(category)
+        if base:
+            return base
+        detail = (detail or "").strip()
+        if detail:
+            return f"LLM request failed ({category.value}): {detail[:200]}"
+        return f"LLM request failed ({category.value})."
 
     @staticmethod
     def _extract_status_code(exc: Exception) -> Optional[int]:

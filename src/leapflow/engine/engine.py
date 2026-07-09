@@ -592,6 +592,10 @@ class AgentEngine:
 
         # 4. Everything else → unified tool loop (LLM decides tools vs direct response)
         logger.debug("route.unified user_text_len=%d", len(user_text))
+        if not self._settings.has_llm_credentials:
+            msg = self._error_classifier.friendly_message(ErrorCategory.AUTH_PERMANENT)
+            self._wm.remember_chat(build_assistant_message(msg))
+            return msg
         return await self._unified_tool_loop(user_text, enable_thinking=enable_thinking)
 
     async def run_stream(
@@ -638,6 +642,11 @@ class AgentEngine:
 
         # 4. Everything else → unified tool loop (streaming)
         logger.debug("route.unified user_text_len=%d", len(user_text))
+        if not self._settings.has_llm_credentials:
+            msg = self._error_classifier.friendly_message(ErrorCategory.AUTH_PERMANENT)
+            self._wm.remember_chat(build_assistant_message(msg))
+            yield StreamEvent(type="final", content=msg)
+            return
         async for chunk in self._unified_tool_loop_stream(user_text, enable_thinking=enable_thinking):
             yield chunk
 
@@ -1080,6 +1089,7 @@ class AgentEngine:
         ]
 
         content = ""
+        fatal_error: Optional[str] = None
         recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
         result_budget = self._effective_tool_result_budget()
@@ -1146,6 +1156,8 @@ class AgentEngine:
                     tools_kwarg = {}
                     use_native_tools = False
                     continue
+                fatal_error = self._error_classifier.friendly_message(classified, str(exc))
+                logger.error("unified_loop: unrecoverable %s: %s", category_str, exc)
                 break
             _clear_indicator()
 
@@ -1254,7 +1266,7 @@ class AgentEngine:
 
         logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
-        return content if content else "I've reached my processing limit."
+        return content if content else (fatal_error or "I've reached my processing limit.")
 
     async def _post_turn_review(
         self, messages: List[Dict[str, Any]], final_content: str
@@ -1430,6 +1442,7 @@ class AgentEngine:
         ]
 
         content = ""
+        fatal_error: Optional[str] = None
         turn_recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
         result_budget = self._effective_tool_result_budget()
@@ -1591,7 +1604,9 @@ class AgentEngine:
                             classified, rec, turn_recovery, messages, budget,
                         ) == "continue":
                             continue
-                        yield StreamEvent(type="error", content=str(exc))
+                        fatal_error = self._error_classifier.friendly_message(classified, str(exc))
+                        logger.error("unified_loop_stream: unrecoverable %s: %s", classified.value, exc)
+                        yield StreamEvent(type="error", content=fatal_error)
                         break
 
                     content = "".join(content_parts).strip()
@@ -1619,7 +1634,9 @@ class AgentEngine:
                             classified, rec, turn_recovery, messages, budget,
                         ) == "continue":
                             continue
-                        yield StreamEvent(type="error", content=str(exc))
+                        fatal_error = self._error_classifier.friendly_message(classified, str(exc))
+                        logger.error("unified_loop_stream: unrecoverable %s: %s", classified.value, exc)
+                        yield StreamEvent(type="error", content=fatal_error)
                         break
                     _clear_indicator()
                     content = (resp.content or "").strip()
@@ -1693,7 +1710,7 @@ class AgentEngine:
 
         logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
-        yield StreamEvent(type="final", content=content if content else "I've reached my processing limit.")
+        yield StreamEvent(type="final", content=content if content else (fatal_error or "I've reached my processing limit."))
 
 
     # ── Unified Loop Helpers ───────────────────────────────────────────────

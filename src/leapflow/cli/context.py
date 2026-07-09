@@ -310,6 +310,12 @@ class Context:
         self.settings = settings
         self.effective_mock = bool(mock_host or settings.mock_host)
 
+        # Shared DuckDB connection holder — single leap.duckdb for all stores (P1).
+        # Created here (lazy, not yet opened) so __init__-time providers such as
+        # SemanticMemoryProvider can bind to it. Eager open + lock detection
+        # happens later in initialize().
+        self._db_holder = LocalConnectionHolder(settings.duckdb_path)
+
         # Memory subsystem — provider-based architecture (dual-layer)
         working = WorkingMemoryProvider(max_tokens=settings.memory_working_max_tokens)
         semantic = SemanticMemoryProvider(source=self._db_holder)
@@ -534,7 +540,8 @@ class Context:
             codegen = CompositeSkillCodeGenerator(LLMSkillCodeGenerator(self.llm))
 
         try:
-            self._db_holder = LocalConnectionHolder(settings.duckdb_path)
+            # Holder was created in __init__ (lazy); eagerly open now to detect
+            # a cross-instance lock as early as possible.
             _ = self._db_holder.connection  # eagerly open to detect lock
         except DatabaseLockedError as exc:
             logger.error("Database locked: %s", exc)
