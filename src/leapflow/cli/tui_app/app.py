@@ -201,7 +201,7 @@ class LeapApp:
         area = TextArea(
             height=Dimension(min=1, max=8, preferred=1),
             prompt=get_prompt,
-            style=f"{self._theme.input_text} bold",
+            style="class:input-area",
             multiline=True,
             wrap_lines=True,
             read_only=Condition(lambda: ref._agent_running),
@@ -279,8 +279,11 @@ class LeapApp:
 
     def _build_style(self) -> PTStyle:
         t = self._theme
+        input_style = f"bg:{t.input_bg} {t.input_text} bold"
+        disabled_style = f"bg:{t.input_bg} {t.input_disabled_text}"
         return PTStyle.from_dict({
-            "input-area": f"{t.input_text} bold",
+            "input-area": input_style,
+            "input-area.disabled": disabled_style,
             "prompt": t.prompt_char,
             "prompt.working": t.accent_dim,
             "prompt.recording": t.recording,
@@ -294,6 +297,8 @@ class LeapApp:
             "status-bar.bad": f"bg:{t.toolbar_bg} {t.error}",
             "hint": t.text_dim,
             "auto-suggest": t.auto_suggest,
+            "placeholder": t.input_placeholder,
+            "selection": f"bg:{t.input_selection_bg} {t.input_selection_fg}",
         })
 
     # ── Fragment providers ───────────────────────────────────────────

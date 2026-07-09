@@ -38,7 +38,7 @@ async def _async_main(args: argparse.Namespace) -> int:
 
         if cmd == "interactive":
             from leapflow.cli.commands.interactive import cmd_interactive
-            return await cmd_interactive(ctx)
+            return await cmd_interactive(ctx, resume_id=getattr(args, "resume", None))
         elif cmd == "chat":
             from leapflow.cli.commands.chat import cmd_chat
             return await cmd_chat(ctx, args.prompt, getattr(args, "thinking", False))
@@ -101,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     parser.add_argument("--thinking", action="store_true", help="Enable LLM reasoning mode")
+    parser.add_argument("--resume", metavar="ID", help="Resume a previous chat session")
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -159,19 +160,41 @@ def main(argv: list[str] | None = None) -> int:
     known_commands = {"teach", "run", "skills", "relearn", "host", "daemon"}
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
 
-    # Find first non-flag argument
+    # Find first non-flag argument, skipping values owned by global options.
+    value_options = {"--resume"}
     prompt_words: list[str] = []
     first_pos = None
+    skip_next = False
     for i, tok in enumerate(effective_argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in value_options:
+            skip_next = True
+            continue
         if tok.startswith("-"):
             continue
         first_pos = i
         break
 
     if first_pos is not None and effective_argv[first_pos] not in known_commands:
-        # Collect all non-flag tokens as prompt, remove them from argv for argparse
-        flags = [t for t in effective_argv if t.startswith("-")]
-        prompt_words = [t for t in effective_argv if not t.startswith("-")]
+        # Collect all non-option prompt tokens while preserving global option values.
+        flags: list[str] = []
+        prompt_words = []
+        skip_next = False
+        for tok in effective_argv:
+            if skip_next:
+                flags.append(tok)
+                skip_next = False
+                continue
+            if tok in value_options:
+                flags.append(tok)
+                skip_next = True
+                continue
+            if tok.startswith("-"):
+                flags.append(tok)
+            else:
+                prompt_words.append(tok)
         effective_argv = flags
 
     args = parser.parse_args(effective_argv)

@@ -9,21 +9,20 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Optional, Sequence, Tuple
+from typing import Optional
 
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
-from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme as RichTheme
 
-from leapflow.cli.tui_app.theme import Theme
+from leapflow.cli.tui_app.theme import ResolvedTheme, Theme
 
 
-def _build_rich_theme(theme: Theme) -> RichTheme:
+def _build_rich_theme(theme: Theme | ResolvedTheme) -> RichTheme:
     """Map LeapFlow theme to a Rich style dict."""
     return RichTheme({
         "leap.accent": theme.accent,
@@ -48,7 +47,7 @@ class LeapConsole:
     theming and preventing raw print() calls from breaking layout.
     """
 
-    def __init__(self, theme: Theme) -> None:
+    def __init__(self, theme: Theme | ResolvedTheme) -> None:
         self._theme = theme
         self._console = Console(
             theme=_build_rich_theme(theme),
@@ -57,7 +56,7 @@ class LeapConsole:
         )
 
     @property
-    def theme(self) -> Theme:
+    def theme(self) -> Theme | ResolvedTheme:
         return self._theme
 
     @property

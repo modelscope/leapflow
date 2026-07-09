@@ -13,11 +13,11 @@ import os
 import time
 from typing import TYPE_CHECKING, Optional
 
-logger = logging.getLogger(__name__)
-
-from leapflow.cli.helpers import require_initialized
 from leapflow.cli.commands.run import _print_execution_result
+from leapflow.cli.helpers import require_initialized
 from leapflow.engine import StreamEvent
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from leapflow.cli.context import Context
@@ -29,11 +29,19 @@ _CLI_EVENT_SOURCE = "interactive_repl"
 _last_hint: Optional["PredictionCandidate"] = None
 
 
-async def cmd_interactive(ctx: "Context") -> int:
+async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) -> int:
     """Persistent REPL session with hybrid TUI (Application + Rich)."""
     require_initialized(ctx)
 
-    from leapflow.cli.tui_app import detect_theme, LeapConsole, StreamRenderer, LeapApp
+    from leapflow.cli.tui_app import (
+        LeapApp,
+        LeapConsole,
+        SessionExitStats,
+        StreamRenderer,
+        build_exit_summary_lines,
+        detect_theme,
+        summarize_messages,
+    )
     from leapflow.cli.tui_app.status import StatusBar
     from leapflow.cli.banner import display_rich_banner
     from leapflow.cli.commands.registry import completion_entries, resolve_command
@@ -53,6 +61,8 @@ async def cmd_interactive(ctx: "Context") -> int:
     console = LeapConsole(theme)
     status = StatusBar(theme)
     io = TerminalIOProvider()
+    exit_stats = SessionExitStats()
+    active_resume_id = ""
 
     # ── Session callbacks ────────────────────────────────────────────
 
@@ -160,9 +170,53 @@ async def cmd_interactive(ctx: "Context") -> int:
             gateway_connected=_gateway_connected_names(),
         )
 
+    def _active_chat_session_id() -> str:
+        engine = getattr(ctx, "engine", None)
+        current = getattr(engine, "_current_session_id", "") if engine else ""
+        return str(current or active_resume_id or "")
+
+    def _stored_message_counts(session_id: str) -> tuple[int, int, int] | None:
+        if not session_id:
+            return None
+        store = getattr(ctx, "_conversation_store", None)
+        if store is None:
+            engine = getattr(ctx, "engine", None)
+            store = getattr(engine, "_conversation_store", None) if engine else None
+        if store is None:
+            return None
+        try:
+            messages = store.get_messages(session_id, limit=10_000)
+        except Exception:
+            logger.debug("session summary message lookup failed", exc_info=True)
+            return None
+        return summarize_messages(messages)
+
+    def _print_exit_summary() -> None:
+        session_id = _active_chat_session_id()
+        counts = _stored_message_counts(session_id)
+        if counts is None:
+            message_count = exit_stats.message_count
+            user_messages = exit_stats.user_messages
+            tool_calls = exit_stats.tool_calls
+        else:
+            message_count, user_messages, stored_tool_calls = counts
+            tool_calls = max(stored_tool_calls, exit_stats.tool_calls)
+        if not session_id and message_count == 0:
+            return
+        console.newline()
+        for line in build_exit_summary_lines(
+            session_id=session_id,
+            duration_s=exit_stats.duration_s,
+            message_count=message_count,
+            user_messages=user_messages,
+            tool_calls=tool_calls,
+        ):
+            console.print(line)
+
     # ── Stream response ──────────────────────────────────────────────
 
     async def _stream_response(prompt_text: str) -> None:
+        exit_stats.record_user_message()
         status.mark_turn_start()
         app.agent_running = True
         app.spinner_text = "Thinking…"
@@ -188,6 +242,9 @@ async def cmd_interactive(ctx: "Context") -> int:
                     renderer.feed(str(event))
         finally:
             renderer.finish()
+            if renderer.has_output:
+                exit_stats.record_assistant_message()
+            exit_stats.record_tool_calls(renderer.tool_count)
             app.spinner_text = ""
             app.agent_running = False
             status.mark_turn_end()
@@ -242,7 +299,6 @@ async def cmd_interactive(ctx: "Context") -> int:
                         pass
                 elif _learning:
                     ctx.imitation.end_control_input()
-                console.system("Bye!")
                 app.exit()
                 return
 
@@ -407,9 +463,21 @@ async def cmd_interactive(ctx: "Context") -> int:
         except Exception:
             logger.debug("Gateway auto-connect failed", exc_info=True)
 
+    if resume_id and ctx.engine is not None:
+        if ctx.engine.load_session(resume_id):
+            active_resume_id = resume_id
+            console.success(f"Resumed session {resume_id}")
+        else:
+            console.warning(f"Session '{resume_id}' not found; starting a new session.")
+
     _render_banner()
     _update_status()
-    return await app.run()
+    exit_code = 0
+    try:
+        exit_code = await app.run()
+    finally:
+        _print_exit_summary()
+    return exit_code
 
 
 # ── Command handlers ─────────────────────────────────────────────────

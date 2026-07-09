@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from leapflow.cli.tui_app.theme import Theme, detect_theme
+from leapflow.cli.tui_app.theme import ResolvedTheme, Theme, detect_theme
 
 
 def _compact_tokens(n: int) -> str:
@@ -55,7 +55,7 @@ class StatusBar:
     every redraw cycle to get fresh fragments.
     """
 
-    def __init__(self, theme: Optional[Theme] = None) -> None:
+    def __init__(self, theme: Optional[Theme | ResolvedTheme] = None) -> None:
         self._theme = theme or detect_theme()
         self.mode: str = "idle"
         self.skill_count: int = 0
