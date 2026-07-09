@@ -116,10 +116,6 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         engine = ctx.engine
         if engine is not None:
             ctx_used = getattr(engine, "context_token_count", 0)
-            cap_registry = getattr(engine, "model_capabilities", None)
-            if cap_registry is not None:
-                caps = cap_registry.resolve(ctx.settings.llm_model)
-                ctx_max = caps.context_length
         mode = _mode_name()
         status.update(
             mode=mode,
@@ -140,12 +136,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         if hasattr(ctx, "platform_tools")
         else 0
     )
-    cap_registry = getattr(ctx.engine, "model_capabilities", None) if ctx.engine else None
-    ctx_len = (
-        cap_registry.resolve(ctx.settings.llm_model).context_length
-        if cap_registry is not None
-        else ctx.settings.llm_context_length
-    )
+    ctx_len = ctx.settings.llm_context_length
 
     def _gateway_connected_names() -> list[str]:
         gw = getattr(ctx, "gateway_server", None)
@@ -525,28 +516,44 @@ async def cmd_interactive_daemon(
     exit_stats = SessionExitStats()
     active_session_id = str(resume_id or "")
     turn_count = 0
+    runtime_model_name = str(getattr(settings, "llm_model", ""))
+    runtime_context_length = int(getattr(settings, "llm_context_length", 0) or 0)
+
+    def _apply_daemon_runtime_metadata(metadata: dict[str, Any]) -> None:
+        nonlocal active_session_id, runtime_model_name, runtime_context_length
+        if metadata.get("session_id"):
+            active_session_id = str(metadata["session_id"])
+        if metadata.get("model"):
+            runtime_model_name = str(metadata["model"])
+        if metadata.get("llm_model"):
+            runtime_model_name = str(metadata["llm_model"])
+        if metadata.get("llm_context_length") is not None:
+            try:
+                runtime_context_length = max(1, int(metadata["llm_context_length"]))
+            except (TypeError, ValueError):
+                pass
 
     def _update_status() -> None:
         status.update(
             mode="daemon",
             skill_count=0,
             platform_online=True,
-            model_name=getattr(settings, "llm_model", ""),
+            model_name=runtime_model_name,
             session_turns=turn_count,
             context_used=0,
-            context_max=getattr(settings, "llm_context_length", 0),
+            context_max=runtime_context_length,
         )
         app.prompt_mode = "daemon"
 
     def _render_banner() -> None:
         display_rich_banner(
-            model=getattr(settings, "llm_model", ""),
+            model=runtime_model_name,
             cwd=os.getcwd(),
             session_id=active_session_id,
             platform_online=True,
             tool_defs=TOOL_DEFINITIONS,
             skills=[],
-            context_length=getattr(settings, "llm_context_length", 0),
+            context_length=runtime_context_length,
             mcp_tools=0,
             gateway_connected=[],
             theme=theme,
@@ -559,6 +566,8 @@ async def cmd_interactive_daemon(
         except Exception as exc:
             console.warning(f"Daemon status unavailable: {exc}")
             return
+        _apply_daemon_runtime_metadata(daemon_status)
+        _update_status()
         console.system(
             "leapd "
             f"pid={daemon_status.get('pid')} "
@@ -575,9 +584,12 @@ async def cmd_interactive_daemon(
         project_env_path = daemon_status.get("project_env_path")
         if project_env_path:
             console.system(f"Project override: {project_env_path}")
+        context_length = daemon_status.get("llm_context_length")
+        if context_length:
+            console.system(f"Context budget: {int(context_length):,} tokens")
 
     async def _stream_response(prompt_text: str) -> None:
-        nonlocal active_session_id, turn_count
+        nonlocal active_session_id, turn_count, runtime_model_name, runtime_context_length
         exit_stats.record_user_message()
         status.mark_turn_start()
         app.agent_running = True
@@ -588,8 +600,7 @@ async def cmd_interactive_daemon(
         try:
             async for event in client.engine_chat(prompt_text):
                 metadata = event.metadata or {}
-                if metadata.get("session_id"):
-                    active_session_id = str(metadata["session_id"])
+                _apply_daemon_runtime_metadata(metadata)
                 if event.type == "chunk":
                     renderer.feed(event.content)
                 elif event.type == "thinking":
@@ -680,6 +691,11 @@ async def cmd_interactive_daemon(
         else:
             console.warning(f"Session '{resume_id}' not found; starting a new session.")
             active_session_id = ""
+
+    try:
+        _apply_daemon_runtime_metadata(await client.status())
+    except Exception as exc:
+        console.warning(f"Daemon status unavailable: {exc}")
 
     _render_banner()
     _update_status()

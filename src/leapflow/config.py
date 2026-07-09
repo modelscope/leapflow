@@ -25,6 +25,8 @@ from leapflow.domain.trajectory import RecordingMode
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_LLM_CONTEXT_LENGTH = 256_000
+
 ALL_SIGNAL_CHANNELS = frozenset({
     "click", "app_switch", "clipboard", "clipboard_content",
     "keyboard", "scroll", "drag",
@@ -339,7 +341,7 @@ class Settings:
     llm_aux_model: str = ""  # Auxiliary model for cheap operations (empty = reuse primary)
     llm_aux_api_key: str = ""  # Aux API key (empty = reuse primary)
     llm_aux_base_url: str = ""  # Aux base URL (empty = reuse primary)
-    llm_context_length: int = 128_000  # Primary provider's context window
+    llm_context_length: int = DEFAULT_LLM_CONTEXT_LENGTH  # Primary provider's runtime context budget
     llm_credential_cooldown_s: float = 60.0  # Per-key rate-limit cooldown
 
     # ── Stream & Tool Robustness ──
@@ -762,7 +764,7 @@ def _build_settings_from_env() -> Settings:
     llm_aux_model = os.getenv("LEAPFLOW_LLM_AUX_MODEL", "").strip()
     llm_aux_api_key = os.getenv("LEAPFLOW_LLM_AUX_API_KEY", "").strip()
     llm_aux_base_url = os.getenv("LEAPFLOW_LLM_AUX_BASE_URL", "").strip()
-    llm_context_length = int(os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", "128000"))
+    llm_context_length = int(os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", str(DEFAULT_LLM_CONTEXT_LENGTH)))
     llm_credential_cooldown_s = float(os.getenv("LEAPFLOW_LLM_CREDENTIAL_COOLDOWN_S", "60.0"))
 
     # Stream & Tool Robustness

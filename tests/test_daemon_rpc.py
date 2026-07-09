@@ -159,6 +159,7 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
     env_path.write_text("LEAPFLOW_LLM_API_KEY=\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LEAPFLOW_LLM_CONTEXT_LENGTH", raising=False)
 
     settings = make_settings(str(tmp_path))
     settings = settings.__class__(
@@ -166,6 +167,7 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
             **settings.__dict__,
             "data_dir": data_dir,
             "llm_api_key": "",
+            "llm_context_length": 128_000,
             "vlm_api_key": "",
             "visual_track_enabled": False,
         }
@@ -174,17 +176,28 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
     await service.start()
     stream = None
     try:
-        env_path.write_text("LEAPFLOW_LLM_API_KEY=sk-daemon-hot-reload\n", encoding="utf-8")
+        env_path.write_text(
+            "LEAPFLOW_LLM_API_KEY=sk-daemon-hot-reload\n"
+            "LEAPFLOW_LLM_CONTEXT_LENGTH=700000\n",
+            encoding="utf-8",
+        )
         stream = service.engine_chat("hello")
         first = await anext(stream)
 
         assert first.event_type == "status"
         assert "Configuration reloaded" in first.content
+        assert first.metadata == {
+            "llm_model": service.context.settings.llm_model,
+            "llm_context_length": 700_000,
+        }
         assert service.context.settings.llm_api_key == "sk-daemon-hot-reload"
+        assert service.context.settings.llm_context_length == 700_000
         assert service.context.engine._settings.llm_api_key == "sk-daemon-hot-reload"
+        assert service.context.engine._settings.llm_context_length == 700_000
         status = await service.status()
         assert status["config_path"] == str(data_dir / ".env")
         assert status["project_env_path"] == str(tmp_path / ".env")
+        assert status["llm_context_length"] == 700_000
     finally:
         if stream is not None:
             await stream.aclose()

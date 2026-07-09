@@ -155,6 +155,7 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 | `LEAPFLOW_LLM_API_KEY` | **Yes** | — | Your LLM provider API key |
 | `LEAPFLOW_LLM_BASE_URL` | No | DashScope endpoint | OpenAI-compatible base URL |
 | `LEAPFLOW_LLM_MODEL` | No | `qwen3.7-plus` | Model identifier |
+| `LEAPFLOW_LLM_CONTEXT_LENGTH` | No | `256000` | Runtime context budget shown in the TUI status bar |
 | `LEAPFLOW_MOCK_HOST` | No | `0` | Set `1` to use in-process mock (no execution backend) |
 | `LEAPFLOW_RECORDING_MODE` | No | `video` | `video` / `default` / `vision_only` |
 | `LEAPFLOW_LOG_LEVEL` | No | `INFO` | `DEBUG` / `INFO` / `WARNING` |
@@ -171,6 +172,7 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 | `LEAPFLOW_LLM_BASE_URL` | DashScope endpoint | OpenAI-compatible base URL |
 | `LEAPFLOW_LLM_MODEL` | `qwen3.7-plus` | Model identifier |
 | `LEAPFLOW_LLM_MAX_RETRIES` | `3` | Retry attempts on transient LLM errors |
+| `LEAPFLOW_LLM_CONTEXT_LENGTH` | `256000` | Runtime context budget in tokens; explicit config wins over static model hints |
 | **Platform** | | |
 | `LEAPFLOW_MOCK_HOST` | `0` | `1` to use in-process mock (no execution backend) |
 | **Storage** | | |
@@ -240,13 +242,13 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 
 ## Quick Start — First Experience
 
-### Step 1: Launch Interactive Mode
+### Step 1: Launch the Interactive TUI
 
 ```bash
-uv run leap --mock-host
+uv run leap
 ```
 
-> You'll see the LeapFlow banner, session info (model, platform, cwd), and a `❯` prompt — you're in the rich interactive TUI.
+> You'll see the LeapFlow banner, session info (model, context budget, platform, cwd), and a `❯` prompt — you're in the rich interactive TUI. If you do not have a native execution backend available yet, use `uv run leap --mock-host` for a safe first run.
 
 ### Step 2: Have a Conversation
 
@@ -289,16 +291,35 @@ uv run leap skills show "skill-name" # Inspect a specific skill
 
 ---
 
-## Usage Patterns
+## Recommended Entry Point — Interactive TUI
 
-### Interactive Mode — Conversational Agent
+LeapFlow is designed to be used primarily through the **interactive terminal UI**. Start here for day-to-day work: chat, inspect status, trigger tools, resume sessions, and progressively teach or execute workflows from one conversational surface.
 
 ```bash
-uv run leap                          # Enter REPL
-uv run leap "summarize this PDF"     # Single-turn (answer + exit)
+uv run leap                         # Recommended: launch the interactive TUI
+uv run leap --mock-host             # Safe first run without native OS backend
+uv run leap "summarize this repo"   # Single-turn prompt, then exit
 ```
 
-The REPL supports multi-turn conversation with tool use, memory, and real-time streaming.
+Why we recommend the TUI first:
+
+- **One surface for the whole loop**: conversation, tool execution, skill learning, status, and session continuity.
+- **Real-time transparency**: streaming output, tool progress, daemon status, model name, and context budget are visible while work is running.
+- **Lower setup friction**: first-run config is generated automatically, and API key/context changes are hot-reloaded in active sessions.
+- **Best default mental model**: use `leap` like an always-available agent console; reach for subcommands only when scripting or automating.
+
+### TUI Status Bar
+
+The bottom toolbar shows the active model and context usage, for example:
+
+```text
+qwen3.7-plus │ 0/256K │ [░░░░░░░░░░] 0%
+```
+
+The max value comes from `LEAPFLOW_LLM_CONTEXT_LENGTH` — LeapFlow's runtime context budget. Configure it in `~/.leapflow/.env`, project `./.env`, `~/.leapflow/config.yaml`, or real environment variables. Explicit config always wins over static model capability hints.
+
+<details>
+<summary>More commands — teaching, execution, skills, host, daemon</summary>
 
 ### Teach Mode — Learn from Demonstration
 
@@ -323,18 +344,18 @@ uv run leap run --auto "routine task"    # Skip confirmations
 
 Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` as confidence grows.
 
-<details>
-<summary>CLI Command Reference</summary>
+### Command Reference
 
 | Command | Syntax | Description |
 |---------|--------|-------------|
-| _(default)_ | `leap` | Launch interactive REPL with multi-turn conversation |
+| _(default)_ | `leap` | Launch the interactive TUI with multi-turn conversation |
 | _(prompt)_ | `leap "question"` | Single-turn chat (answer + exit) |
 | `teach` | `leap teach [goal] [options]` | Record a demonstration and distill into a skill |
 | `run` | `leap run [prompt] [options]` | Execute a matched skill |
 | `skills` | `leap skills [action] [name]` | Manage the skill library |
 | `relearn` | `leap relearn <trajectory_id>` | Re-run learning pipeline on a saved trajectory |
 | `host` | `leap host <action>` | Manage execution backend connection and diagnostics |
+| `daemon` | `leap daemon <action>` | Manage the persistent leapd runtime |
 
 **Global Flags:**
 
@@ -400,10 +421,12 @@ LeapFlow provides a rich interactive terminal experience built on [Rich](https:/
 | **Persistent history** | Input history saved to `~/.leapflow/history` (Up/Down to navigate) |
 | **Command completion** | Tab-completion for all REPL commands |
 | **Multiline editing** | Alt+Enter inserts a newline for multi-line prompts |
-| **Status bar** | Live bottom toolbar: mode, skills, platform, model, context usage %, turn elapsed |
+| **Status bar** | Live bottom toolbar: mode, skills, platform, model, context usage, turn elapsed |
 | **Adaptive theming** | Automatic light/dark detection via `COLORFGBG` / `LEAPFLOW_TUI_THEME` |
 | **Session info** | Startup display showing model, platform status, cwd, and skill count |
 | **Mode indicators** | Prompt character changes with session mode (idle ❯ / recording ● / paused ⏸) |
+
+The context maximum shown in the status bar is the active runtime budget from `LEAPFLOW_LLM_CONTEXT_LENGTH`. In daemon mode, the TUI synchronizes this value from the daemon runtime so multiple terminal clients show the same budget.
 
 ### Theme Configuration
 

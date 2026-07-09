@@ -21,6 +21,8 @@ LEAPFLOW_LLM_API_KEY=
 LEAPFLOW_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LEAPFLOW_LLM_MODEL=qwen3.7-plus
 LEAPFLOW_LLM_MAX_RETRIES=3
+# Runtime context budget in tokens. Set to the usable limit for your provider/model.
+LEAPFLOW_LLM_CONTEXT_LENGTH=256000
 
 # ═══════════════════════════════════════════════════════════════════════
 # Platform — CuaDriver communication

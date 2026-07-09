@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -67,17 +68,31 @@ async def test_context_initialize_degrades_when_primary_db_is_locked(
 
 
 def test_visual_track_defaults_off_without_env(monkeypatch, tmp_path) -> None:
-    from leapflow.config import _build_settings_from_env
+    from leapflow.config import DEFAULT_LLM_CONTEXT_LENGTH, _build_settings_from_env
 
     monkeypatch.delenv("LEAPFLOW_VISUAL_TRACK_ENABLED", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
     monkeypatch.delenv("LEAPFLOW_VLM_API_KEY", raising=False)
+    monkeypatch.delenv("LEAPFLOW_LLM_CONTEXT_LENGTH", raising=False)
     monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path))
 
     settings = _build_settings_from_env()
 
     assert settings.visual_track_enabled is False
     assert settings.has_vlm_credentials is False
+    assert settings.llm_context_length == DEFAULT_LLM_CONTEXT_LENGTH
+
+
+def test_context_length_is_exposed_in_env_templates() -> None:
+    from leapflow.config import DEFAULT_LLM_CONTEXT_LENGTH
+    from leapflow._env_template import ENV_TEMPLATE
+
+    expected = f"LEAPFLOW_LLM_CONTEXT_LENGTH={DEFAULT_LLM_CONTEXT_LENGTH}"
+    example = (Path(__file__).parents[1] / ".env.example").read_text(encoding="utf-8")
+
+    assert expected in ENV_TEMPLATE
+    assert expected in example
+    assert "Runtime context budget" in ENV_TEMPLATE
 
 
 def test_build_visual_components_degrades_without_credentials(
@@ -172,13 +187,15 @@ async def test_context_hot_reloads_llm_credentials_from_env_file(
     env_path.write_text(
         "LEAPFLOW_LLM_API_KEY=\n"
         "LEAPFLOW_LLM_BASE_URL=https://old.example.invalid/v1\n"
-        "LEAPFLOW_LLM_MODEL=old-model\n",
+        "LEAPFLOW_LLM_MODEL=old-model\n"
+        "LEAPFLOW_LLM_CONTEXT_LENGTH=128000\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_MODEL", raising=False)
+    monkeypatch.delenv("LEAPFLOW_LLM_CONTEXT_LENGTH", raising=False)
 
     settings = replace(
         make_settings(str(tmp_path)),
@@ -186,6 +203,7 @@ async def test_context_hot_reloads_llm_credentials_from_env_file(
         llm_api_key="",
         llm_base_url="https://old.example.invalid/v1",
         llm_model="old-model",
+        llm_context_length=128_000,
         vlm_api_key="",
         visual_track_enabled=False,
     )
@@ -200,7 +218,8 @@ async def test_context_hot_reloads_llm_credentials_from_env_file(
         env_path.write_text(
             "LEAPFLOW_LLM_API_KEY=sk-hot-reload\n"
             "LEAPFLOW_LLM_BASE_URL=https://new.example.invalid/v1\n"
-            "LEAPFLOW_LLM_MODEL=new-model\n",
+            "LEAPFLOW_LLM_MODEL=new-model\n"
+            "LEAPFLOW_LLM_CONTEXT_LENGTH=512000\n",
             encoding="utf-8",
         )
 
@@ -208,7 +227,10 @@ async def test_context_hot_reloads_llm_credentials_from_env_file(
         assert ctx.settings.llm_api_key == "sk-hot-reload"
         assert ctx.settings.llm_base_url == "https://new.example.invalid/v1"
         assert ctx.settings.llm_model == "new-model"
+        assert ctx.settings.llm_context_length == 512_000
         assert ctx.engine._settings.llm_api_key == "sk-hot-reload"
+        assert ctx.engine._settings.llm_context_length == 512_000
+        assert ctx.engine.model_capabilities.resolve("new-model").context_length == 512_000
         assert ctx.engine._settings.has_llm_credentials is True
         assert ctx.intent_classifier.__class__.__name__ == "LLMIntentClassifier"
     finally:
@@ -229,6 +251,7 @@ async def test_context_hot_reloads_llm_credentials_from_config_yaml(
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_MODEL", raising=False)
+    monkeypatch.delenv("LEAPFLOW_LLM_CONTEXT_LENGTH", raising=False)
 
     settings = replace(
         make_settings(str(tmp_path)),
@@ -236,6 +259,7 @@ async def test_context_hot_reloads_llm_credentials_from_config_yaml(
         llm_api_key="",
         llm_base_url="https://old.example.invalid/v1",
         llm_model="old-model",
+        llm_context_length=128_000,
         vlm_api_key="",
         visual_track_enabled=False,
     )
@@ -248,7 +272,8 @@ async def test_context_hot_reloads_llm_credentials_from_config_yaml(
             "llm:\n"
             "  api_key: sk-yaml-hot-reload\n"
             "  base_url: https://yaml.example.invalid/v1\n"
-            "  model: yaml-model\n",
+            "  model: yaml-model\n"
+            "  context_length: 640000\n",
             encoding="utf-8",
         )
 
@@ -256,7 +281,33 @@ async def test_context_hot_reloads_llm_credentials_from_config_yaml(
         assert ctx.settings.llm_api_key == "sk-yaml-hot-reload"
         assert ctx.settings.llm_base_url == "https://yaml.example.invalid/v1"
         assert ctx.settings.llm_model == "yaml-model"
+        assert ctx.settings.llm_context_length == 640_000
         assert ctx.engine._settings.llm_api_key == "sk-yaml-hot-reload"
+        assert ctx.engine.model_capabilities.resolve("yaml-model").context_length == 640_000
+    finally:
+        await ctx.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_known_model_table_does_not_override_explicit_context_length(
+    tmp_path,
+) -> None:
+    from leapflow.cli.context import Context
+
+    settings = replace(
+        make_settings(str(tmp_path)),
+        llm_model="qwen3.7-plus",
+        llm_context_length=300_000,
+        visual_track_enabled=False,
+    )
+
+    ctx = Context(settings, mock_host=True)
+    await ctx.initialize()
+    try:
+        assert ctx.engine is not None
+        caps = ctx.engine.model_capabilities.resolve("qwen3.7-plus")
+        assert caps.context_length == 300_000
+        assert caps.supports_thinking is True
     finally:
         await ctx.cleanup()
 
@@ -279,6 +330,7 @@ async def test_daemon_fallback_initializes_local_interactive_with_real_config(
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
     monkeypatch.delenv("LEAPFLOW_VLM_API_KEY", raising=False)
     monkeypatch.delenv("LEAPFLOW_VISUAL_TRACK_ENABLED", raising=False)
+    monkeypatch.delenv("LEAPFLOW_LLM_CONTEXT_LENGTH", raising=False)
 
     async def fake_ensure_daemon_client(*args, **kwargs):
         raise daemon_client.DaemonUnavailableError("daemon unavailable")
@@ -333,6 +385,7 @@ def test_leap_no_daemon_initializes_and_runs_interactive(monkeypatch, tmp_path) 
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
     monkeypatch.delenv("LEAPFLOW_VLM_API_KEY", raising=False)
     monkeypatch.delenv("LEAPFLOW_VISUAL_TRACK_ENABLED", raising=False)
+    monkeypatch.delenv("LEAPFLOW_LLM_CONTEXT_LENGTH", raising=False)
 
     async def fake_interactive(ctx, *, resume_id=None) -> int:
         require_initialized(ctx)

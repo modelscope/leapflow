@@ -84,6 +84,10 @@ class RuntimeLeapService:
                 request_id="",
                 content="Configuration reloaded — LLM settings updated in leapd.",
                 event_type="status",
+                metadata={
+                    "llm_model": getattr(ctx.settings, "llm_model", ""),
+                    "llm_context_length": getattr(ctx.settings, "llm_context_length", 0),
+                },
             )
         engine = getattr(ctx, "engine", None)
         if engine is None:
@@ -128,6 +132,7 @@ class RuntimeLeapService:
             "uptime_s": max(0.0, time.time() - self._started_at),
             "active_clients": max(0, self._client_count()),
             "model": getattr(settings, "llm_model", ""),
+            "llm_context_length": getattr(settings, "llm_context_length", 0),
             "session_id": str(getattr(engine, "_current_session_id", "") or ""),
         }
 

@@ -556,6 +556,49 @@ class Context:
                 model=settings.vlm_model,
             )
 
+    def _effective_llm_context_length(self, settings: Settings) -> int:
+        """Return the configured runtime context budget for the active provider."""
+        if self.llm_chain is not None:
+            return max(1, int(self.llm_chain.context_length))
+        return max(1, int(settings.llm_context_length))
+
+    def _build_model_capability_registry(self, settings: Settings) -> Any:
+        """Build model capabilities where explicit runtime config wins over static hints."""
+        from leapflow.llm.model_capabilities import ModelCapabilities, ModelCapabilityRegistry
+
+        cap_registry = ModelCapabilityRegistry()
+        base_caps = cap_registry.resolve(settings.llm_model)
+        cap_registry.register(
+            settings.llm_model,
+            ModelCapabilities(
+                context_length=self._effective_llm_context_length(settings),
+                max_output_tokens=base_caps.max_output_tokens,
+                supports_tools=settings.native_tool_calling_enabled,
+                supports_vision=base_caps.supports_vision,
+                supports_thinking=base_caps.supports_thinking,
+                supports_streaming_tools=base_caps.supports_streaming_tools,
+                tokens_per_image=base_caps.tokens_per_image,
+            ),
+        )
+        return cap_registry
+
+    def _sync_engine_runtime_budget(self, settings: Settings) -> None:
+        """Sync engine-visible budgets and model capability metadata from settings."""
+        if self.engine is None:
+            return
+
+        context_length = self._effective_llm_context_length(settings)
+        dynamic_result_budget = min(settings.max_tool_result_chars, context_length // 20)
+        if dynamic_result_budget != settings.max_tool_result_chars:
+            logger.info(
+                "Dynamic tool result budget: %d (context=%d)",
+                dynamic_result_budget,
+                context_length,
+            )
+        self.engine.set_tool_result_budget(dynamic_result_budget)
+        self.engine.set_model_capabilities(self._build_model_capability_registry(settings))
+        logger.debug("Model capability registry wired")
+
     @staticmethod
     def _runtime_config_signature(settings: Settings) -> tuple:
         """Return a stable signature for user-editable runtime config files."""
@@ -615,12 +658,22 @@ class Context:
         except ValueError:
             max_retries = self.settings.llm_max_retries
 
+        context_length_raw = _value(
+            "LEAPFLOW_LLM_CONTEXT_LENGTH",
+            str(self.settings.llm_context_length),
+        )
+        try:
+            llm_context_length = max(1, int(context_length_raw))
+        except ValueError:
+            llm_context_length = self.settings.llm_context_length
+
         return replace(
             self.settings,
             llm_api_key=_value("LEAPFLOW_LLM_API_KEY", self.settings.llm_api_key),
             llm_base_url=_value("LEAPFLOW_LLM_BASE_URL", self.settings.llm_base_url).rstrip("/"),
             llm_model=_value("LEAPFLOW_LLM_MODEL", self.settings.llm_model),
             llm_max_retries=max_retries,
+            llm_context_length=llm_context_length,
             vlm_api_key=_value("LEAPFLOW_VLM_API_KEY", self.settings.vlm_api_key),
             vlm_base_url=_value("LEAPFLOW_VLM_BASE_URL", self.settings.vlm_base_url).rstrip("/"),
             vlm_model=_value("LEAPFLOW_VLM_MODEL", self.settings.vlm_model),
@@ -647,6 +700,7 @@ class Context:
             or previous.llm_base_url != updated.llm_base_url
             or previous.llm_model != updated.llm_model
             or previous.llm_max_retries != updated.llm_max_retries
+            or previous.llm_context_length != updated.llm_context_length
             or previous.vlm_api_key != updated.vlm_api_key
             or previous.vlm_base_url != updated.vlm_base_url
             or previous.vlm_model != updated.vlm_model
@@ -675,6 +729,7 @@ class Context:
                 vlm=self.vlm,
                 classifier=classifier,
             )
+            self._sync_engine_runtime_budget(updated)
         logger.info("Runtime LLM configuration reloaded")
         return True
 
@@ -1637,43 +1692,14 @@ class Context:
         except Exception:
             logger.debug("File write gate setup skipped", exc_info=True)
 
-        # ── Token budget dynamic linking (tool result budget ∝ model context) ──
-        context_length = settings.llm_context_length
-        if hasattr(self, 'llm_chain') and self.llm_chain is not None:
-            context_length = self.llm_chain.context_length
-        dynamic_result_budget = min(settings.max_tool_result_chars, context_length // 20)
-        if dynamic_result_budget != settings.max_tool_result_chars:
-            logger.info(
-                "Dynamic tool result budget: %d (context=%d)",
-                dynamic_result_budget, context_length,
-            )
+        # ── Token budget and model capability metadata ─────────────────────
         if self.engine is not None:
-            self.engine.set_tool_result_budget(dynamic_result_budget)
-
-        # ── Wire new engine capabilities ──
-        if self.engine is not None:
+            self._sync_engine_runtime_budget(settings)
             self.engine.set_stale_stream_timeout(settings.stale_stream_timeout_s)
             self.engine.set_default_tool_timeout(settings.default_tool_timeout_s)
 
             if self._evolution_store is not None:
                 self.engine.set_evolution_store(self._evolution_store)
-
-            try:
-                from leapflow.llm.model_capabilities import ModelCapabilityRegistry
-                cap_registry = ModelCapabilityRegistry()
-                if hasattr(self, 'llm_chain') and self.llm_chain is not None:
-                    from leapflow.llm.model_capabilities import ModelCapabilities
-                    cap_registry.register(
-                        settings.llm_model,
-                        ModelCapabilities(
-                            context_length=self.llm_chain.context_length,
-                            supports_tools=settings.native_tool_calling_enabled,
-                        ),
-                    )
-                self.engine.set_model_capabilities(cap_registry)
-                logger.debug("Model capability registry wired")
-            except Exception:
-                logger.debug("ModelCapabilityRegistry setup skipped", exc_info=True)
 
             if hasattr(self, "doc_store") and self.doc_store is not None:
                 self.engine.set_doc_store(self.doc_store)
