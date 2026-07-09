@@ -19,7 +19,11 @@ from rich.syntax import Syntax
 from rich.text import Text
 from rich.theme import Theme as RichTheme
 
+from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
 from leapflow.cli.tui_app.theme import ResolvedTheme, Theme
+
+_COMMAND_CARD_MIN_SUMMARY = 32
+_COMMAND_CARD_PADDING = 24
 
 
 def _build_rich_theme(theme: Theme | ResolvedTheme) -> RichTheme:
@@ -75,6 +79,39 @@ class LeapConsole:
     def print(self, *args, **kwargs) -> None:
         """Pass-through to rich.Console.print."""
         self._console.print(*args, **kwargs)
+
+    def command_card(self, command: TuiCommand) -> None:
+        """Render a compact lifecycle card for a queued or running command."""
+        border_styles = {
+            TuiCommandStatus.QUEUED: "leap.border",
+            TuiCommandStatus.RUNNING: "leap.accent",
+            TuiCommandStatus.DONE: "leap.success",
+            TuiCommandStatus.FAILED: "leap.error",
+        }
+        title_styles = {
+            TuiCommandStatus.QUEUED: "leap.muted",
+            TuiCommandStatus.RUNNING: "leap.accent",
+            TuiCommandStatus.DONE: "leap.success",
+            TuiCommandStatus.FAILED: "leap.error",
+        }
+        summary_limit = max(_COMMAND_CARD_MIN_SUMMARY, self.width - _COMMAND_CARD_PADDING)
+        body = Text(command.summary(limit=summary_limit), style="leap.muted")
+        if command.error:
+            body.append("\n")
+            body.append(command.error, style="leap.error")
+        if command.elapsed_s > 0:
+            body.append("\n")
+            body.append(f"elapsed: {command.elapsed_s:.1f}s", style="leap.dim")
+        title = Text()
+        title.append(command.label, style="bold")
+        title.append(f" {command.status.value}", style=title_styles[command.status])
+        self._console.print(Panel(
+            body,
+            title=title,
+            title_align="left",
+            border_style=border_styles[command.status],
+            padding=(0, 1),
+        ))
 
     def markdown(self, text: str, *, code_theme: str = "monokai") -> None:
         """Render markdown content with syntax-highlighted code blocks."""

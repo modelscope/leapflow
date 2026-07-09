@@ -5,6 +5,7 @@ and ``rich`` (Markdown rendering, panels, syntax highlighting, theming).
 """
 
 from leapflow.cli.tui_app.app import LeapApp
+from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
 from leapflow.cli.tui_app.console import LeapConsole
 from leapflow.cli.tui_app.session_summary import (
     SessionExitStats,
@@ -26,6 +27,8 @@ from leapflow.cli.tui_app.theme import (
 
 __all__ = [
     "LeapApp",
+    "TuiCommand",
+    "TuiCommandStatus",
     "LeapConsole",
     "SessionExitStats",
     "StreamRenderer",

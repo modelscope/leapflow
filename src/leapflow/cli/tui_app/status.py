@@ -72,6 +72,8 @@ class StatusBar:
         self.session_turns: int = 0
         self.context_used: int = 0
         self.context_max: int = 0
+        self.running_tasks: int = 0
+        self.queued_tasks: int = 0
         self.last_turn_elapsed: float = 0.0
         self._turn_start: float = 0.0
         self._session_start: float = time.monotonic()
@@ -102,6 +104,14 @@ class StatusBar:
         }
         style, icon = _modes.get(self.mode, _modes["idle"])
         parts.append((style, icon))
+
+        if self.running_tasks or self.queued_tasks:
+            if narrow:
+                task_text = f"r{self.running_tasks} q{self.queued_tasks} "
+            else:
+                task_text = f"running:{self.running_tasks} queued:{self.queued_tasks} "
+            parts.append(("class:status-bar.strong", task_text))
+            parts.append(("class:status-bar.dim", "│ "))
 
         if self.model_name and not narrow:
             model_limit = 12 if compact else 20
@@ -159,6 +169,8 @@ class StatusBar:
         session_turns: Optional[int] = None,
         context_used: Optional[int] = None,
         context_max: Optional[int] = None,
+        running_tasks: Optional[int] = None,
+        queued_tasks: Optional[int] = None,
     ) -> None:
         """Selectively update status fields."""
         if mode is not None:
@@ -175,3 +187,12 @@ class StatusBar:
             self.context_used = context_used
         if context_max is not None:
             self.context_max = context_max
+        if running_tasks is not None:
+            self.running_tasks = running_tasks
+        if queued_tasks is not None:
+            self.queued_tasks = queued_tasks
+
+    def update_task_counts(self, *, running: int, queued: int) -> None:
+        """Update task counters shown in the status bar."""
+        self.running_tasks = max(0, running)
+        self.queued_tasks = max(0, queued)

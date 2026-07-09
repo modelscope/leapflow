@@ -37,7 +37,6 @@ from typing import (
 
 from prompt_toolkit import Application
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
@@ -48,6 +47,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.widgets import TextArea
 
+from leapflow.cli.tui_app.command import TuiCommand
 from leapflow.cli.tui_app.input import build_completer
 from leapflow.cli.tui_app.status import StatusBar
 from leapflow.cli.tui_app.theme import Theme
@@ -92,7 +92,9 @@ class LeapApp:
         self._prompt_mode = "idle"
         self._spinner_text = ""
         self._tool_start_time: float = 0.0
-        self._pending_input: asyncio.Queue[str] = asyncio.Queue()
+        self._next_command_id = 1
+        self._active_command: Optional[TuiCommand] = None
+        self._pending_input: asyncio.Queue[TuiCommand] = asyncio.Queue()
 
         data_dir = data_dir or Path(
             os.environ.get("LEAPFLOW_DATA_DIR", "~/.leapflow")
@@ -133,6 +135,20 @@ class LeapApp:
         self._tool_start_time = time.monotonic() if value else 0.0
         self._invalidate()
 
+    def submit_text(self, text: str) -> TuiCommand:
+        """Submit user text into the serial TUI command queue."""
+        normalized = text.strip()
+        if not normalized:
+            raise ValueError("Cannot submit an empty TUI command")
+        command = TuiCommand.create(command_id=self._next_command_id, text=normalized)
+        self._next_command_id += 1
+        self._pending_input.put_nowait(command)
+        self._sync_task_counts()
+        if self._active_command is not None or self._pending_input.qsize() > 1:
+            self._console.command_card(command)
+        self._invalidate()
+        return command
+
     # ── Lifecycle ────────────────────────────────────────────────────
 
     async def run(self) -> int:
@@ -164,7 +180,7 @@ class LeapApp:
         """Drain pending_input and dispatch to on_input handler."""
         while not self._should_exit:
             try:
-                text = await asyncio.wait_for(
+                command = await asyncio.wait_for(
                     self._pending_input.get(), timeout=0.1
                 )
             except asyncio.TimeoutError:
@@ -172,19 +188,33 @@ class LeapApp:
             except asyncio.CancelledError:
                 return
 
-            if not text:
+            if not command.text.strip():
+                self._sync_task_counts()
                 continue
 
+            self._active_command = command.mark_running()
+            self._agent_running = True
+            self._sync_task_counts()
+            self._console.command_card(self._active_command)
             try:
                 if self._on_input is not None:
-                    result = self._on_input(text)
+                    result = self._on_input(command.text)
                     if asyncio.iscoroutine(result):
                         await result
+                if self._active_command is not None:
+                    finished = self._active_command.mark_done()
+                    self._console.command_card(finished)
             except Exception as exc:
+                if self._active_command is not None:
+                    failed = self._active_command.mark_failed(f"{type(exc).__name__}: {exc}")
+                    self._console.command_card(failed)
                 self._console.error(f"{exc}")
-                self._agent_running = False
                 self._spinner_text = ""
                 self._tool_start_time = 0.0
+            finally:
+                self._active_command = None
+                self._agent_running = False
+                self._sync_task_counts()
                 self._invalidate()
 
     # ── Layout construction ──────────────────────────────────────────
@@ -205,7 +235,6 @@ class LeapApp:
             multiline=True,
             wrap_lines=True,
             dont_extend_height=True,
-            read_only=Condition(lambda: ref._agent_running),
             history=FileHistory(str(self._history_path)),
             completer=completer,
             complete_while_typing=True,
@@ -258,7 +287,7 @@ class LeapApp:
             text = event.app.current_buffer.text.strip()
             if not text:
                 return
-            ref._pending_input.put_nowait(text)
+            ref.submit_text(text)
             event.app.current_buffer.reset(append_to_history=True)
 
         @kb.add(Keys.Escape, Keys.Enter)
@@ -272,9 +301,17 @@ class LeapApp:
 
         @kb.add(Keys.ControlC)
         def _(event):
-            if not ref._agent_running:
-                ref._should_exit = True
-                event.app.exit()
+            if event.current_buffer.text:
+                event.current_buffer.reset()
+                return
+            if ref._agent_running:
+                ref._console.system(
+                    "Task is running. Keep typing to queue the next instruction; "
+                    "use /exit after it finishes to leave."
+                )
+                return
+            ref._should_exit = True
+            event.app.exit()
 
         return kb
 
@@ -337,6 +374,12 @@ class LeapApp:
         return 1 if self._spinner_text else 0
 
     # ── Internal ─────────────────────────────────────────────────────
+
+    def _sync_task_counts(self) -> None:
+        self._status.update_task_counts(
+            running=1 if self._active_command is not None else 0,
+            queued=self._pending_input.qsize(),
+        )
 
     def _invalidate(self) -> None:
         if self._app.is_running:
