@@ -146,6 +146,52 @@ async def test_daemon_client_surfaces_stream_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_service_hot_reloads_config_before_daemon_chat(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from conftest import make_settings
+    from leapflow.daemon.service import RuntimeLeapService
+
+    data_dir = tmp_path / "leap-home"
+    data_dir.mkdir()
+    env_path = data_dir / ".env"
+    env_path.write_text("LEAPFLOW_LLM_API_KEY=\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
+
+    settings = make_settings(str(tmp_path))
+    settings = settings.__class__(
+        **{
+            **settings.__dict__,
+            "data_dir": data_dir,
+            "llm_api_key": "",
+            "vlm_api_key": "",
+            "visual_track_enabled": False,
+        }
+    )
+    service = RuntimeLeapService(settings, mock_host=True)
+    await service.start()
+    stream = None
+    try:
+        env_path.write_text("LEAPFLOW_LLM_API_KEY=sk-daemon-hot-reload\n", encoding="utf-8")
+        stream = service.engine_chat("hello")
+        first = await anext(stream)
+
+        assert first.event_type == "status"
+        assert "Configuration reloaded" in first.content
+        assert service.context.settings.llm_api_key == "sk-daemon-hot-reload"
+        assert service.context.engine._settings.llm_api_key == "sk-daemon-hot-reload"
+        status = await service.status()
+        assert status["config_path"] == str(data_dir / ".env")
+        assert status["project_env_path"] == str(tmp_path / ".env")
+    finally:
+        if stream is not None:
+            await stream.aclose()
+        await service.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_ensure_daemon_client_does_not_spawn_when_daemon_unhealthy(
     tmp_path,
     monkeypatch,

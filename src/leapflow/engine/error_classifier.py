@@ -111,14 +111,16 @@ RECOVERY_MAP: Dict[ErrorCategory, RecoveryStrategy] = build_recovery_map()
 # a generic "I've reached my processing limit." fallback.
 _FRIENDLY_MESSAGES: Dict[ErrorCategory, str] = {
     ErrorCategory.AUTH_ERROR: (
-        "LLM authentication failed \u2014 the API key is missing or invalid. "
+        "LLM authentication failed — the API key is missing or invalid. "
         "Set a valid LEAPFLOW_LLM_API_KEY in ~/.leapflow/.env "
-        "(and verify LEAPFLOW_LLM_BASE_URL / LEAPFLOW_LLM_MODEL)."
+        "or in a project-specific ./.env file, then retry. "
+        "Also verify LEAPFLOW_LLM_BASE_URL / LEAPFLOW_LLM_MODEL."
     ),
     ErrorCategory.AUTH_PERMANENT: (
-        "LLM authentication failed \u2014 the API key is missing or invalid. "
+        "LLM authentication failed — the API key is missing or invalid. "
         "Set a valid LEAPFLOW_LLM_API_KEY in ~/.leapflow/.env "
-        "(and verify LEAPFLOW_LLM_BASE_URL / LEAPFLOW_LLM_MODEL)."
+        "or in a project-specific ./.env file, then retry. "
+        "Also verify LEAPFLOW_LLM_BASE_URL / LEAPFLOW_LLM_MODEL."
     ),
     ErrorCategory.BILLING: (
         "LLM request rejected due to billing/quota limits \u2014 "
@@ -186,7 +188,6 @@ class ErrorClassifier:
 
     def classify_detailed(self, exc: Exception) -> ClassifiedError:
         """Classify with full context for advanced recovery logic."""
-        msg = str(exc).lower()
         status = self._extract_status_code(exc)
         category = self.classify(exc)
         recovery = self.get_recovery(category)

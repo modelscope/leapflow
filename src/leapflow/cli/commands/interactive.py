@@ -569,6 +569,12 @@ async def cmd_interactive_daemon(
         db_path = daemon_status.get("db_path")
         if db_path:
             console.system(f"DB: {db_path}")
+        config_path = daemon_status.get("config_path")
+        if config_path:
+            console.system(f"Config: {config_path}")
+        project_env_path = daemon_status.get("project_env_path")
+        if project_env_path:
+            console.system(f"Project override: {project_env_path}")
 
     async def _stream_response(prompt_text: str) -> None:
         nonlocal active_session_id, turn_count
@@ -598,6 +604,8 @@ async def cmd_interactive_daemon(
                         renderer.feed(event.content)
                 elif event.type == "error":
                     renderer.feed(event.content)
+                elif event.type == "status":
+                    console.system(event.content)
         finally:
             renderer.finish()
             if renderer.has_output:

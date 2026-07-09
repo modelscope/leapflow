@@ -216,6 +216,52 @@ async def test_context_hot_reloads_llm_credentials_from_env_file(
 
 
 @pytest.mark.asyncio
+async def test_context_hot_reloads_llm_credentials_from_config_yaml(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from leapflow.cli.context import Context
+
+    data_dir = tmp_path / "leap-home"
+    data_dir.mkdir()
+    (data_dir / ".env").write_text("LEAPFLOW_LLM_API_KEY=\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LEAPFLOW_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LEAPFLOW_LLM_MODEL", raising=False)
+
+    settings = replace(
+        make_settings(str(tmp_path)),
+        data_dir=data_dir,
+        llm_api_key="",
+        llm_base_url="https://old.example.invalid/v1",
+        llm_model="old-model",
+        vlm_api_key="",
+        visual_track_enabled=False,
+    )
+
+    ctx = Context(settings, mock_host=True)
+    await ctx.initialize()
+    try:
+        assert ctx.settings.has_llm_credentials is False
+        (data_dir / "config.yaml").write_text(
+            "llm:\n"
+            "  api_key: sk-yaml-hot-reload\n"
+            "  base_url: https://yaml.example.invalid/v1\n"
+            "  model: yaml-model\n",
+            encoding="utf-8",
+        )
+
+        assert ctx.reload_runtime_config_if_changed() is True
+        assert ctx.settings.llm_api_key == "sk-yaml-hot-reload"
+        assert ctx.settings.llm_base_url == "https://yaml.example.invalid/v1"
+        assert ctx.settings.llm_model == "yaml-model"
+        assert ctx.engine._settings.llm_api_key == "sk-yaml-hot-reload"
+    finally:
+        await ctx.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_daemon_fallback_initializes_local_interactive_with_real_config(
     monkeypatch,
     tmp_path,

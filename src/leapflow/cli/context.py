@@ -17,7 +17,7 @@ from dotenv import dotenv_values
 from leapflow.platform.cua_client import CuaDriverClient
 from leapflow.platform.event_bus import EventBus
 from leapflow.platform.mock import MockBridge
-from leapflow.config import Settings
+from leapflow.config import Settings, _load_yaml_overlay
 from leapflow.engine.engine import AgentEngine, build_default_registry
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.intent_classifier import (
@@ -584,13 +584,21 @@ class Context:
     def _load_runtime_settings_from_files(self) -> Settings:
         """Reload hot-swappable LLM/VLM settings directly from config files."""
         values: dict[str, str] = {}
-        for path in (self.settings.data_dir / ".env", Path.cwd() / ".env"):
-            if path.exists():
-                values.update({
-                    key: value
-                    for key, value in dotenv_values(path).items()
-                    if value is not None
-                })
+        data_env = self.settings.data_dir / ".env"
+        cwd_env = Path.cwd() / ".env"
+        if data_env.exists():
+            values.update({
+                key: value
+                for key, value in dotenv_values(data_env).items()
+                if value is not None
+            })
+        values.update(_load_yaml_overlay(self.settings.data_dir))
+        if cwd_env.exists():
+            values.update({
+                key: value
+                for key, value in dotenv_values(cwd_env).items()
+                if value is not None
+            })
 
         def _value(key: str, current: str) -> str:
             env_value = os.environ.get(key, "").strip()

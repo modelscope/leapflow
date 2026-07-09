@@ -87,12 +87,14 @@ def ensure_default_env(data_dir: Path) -> bool:
     if sys.stderr.isatty():
         sys.stderr.write(
             f"\033[2m→ Created default config: {env_path}\033[0m\n"
-            f"\033[2m  Edit LEAPFLOW_LLM_API_KEY to configure your LLM provider.\033[0m\n"
+            f"\033[2m  Edit LEAPFLOW_LLM_API_KEY in this file to configure your LLM provider.\033[0m\n"
+            f"\033[2m  Optional project override: ./.env in your working directory.\033[0m\n"
         )
     else:
         sys.stderr.write(
             f"→ Created default config: {env_path}\n"
-            f"  Edit LEAPFLOW_LLM_API_KEY to configure your LLM provider.\n"
+            f"  Edit LEAPFLOW_LLM_API_KEY in this file to configure your LLM provider.\n"
+            f"  Optional project override: ./.env in your working directory.\n"
         )
     sys.stderr.flush()
     return True

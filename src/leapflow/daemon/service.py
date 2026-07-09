@@ -78,6 +78,13 @@ class RuntimeLeapService:
 
     async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
         ctx = self.context
+        if ctx.reload_runtime_config_if_changed():
+            self._settings = ctx.settings
+            yield StreamChunk(
+                request_id="",
+                content="Configuration reloaded — LLM settings updated in leapd.",
+                event_type="status",
+            )
         engine = getattr(ctx, "engine", None)
         if engine is None:
             raise RuntimeError("leapd engine is not initialized")
@@ -105,17 +112,22 @@ class RuntimeLeapService:
 
     async def status(self) -> dict[str, Any]:
         ctx = self._ctx
+        settings = getattr(ctx, "settings", self._settings) if ctx is not None else self._settings
         engine = getattr(ctx, "engine", None) if ctx is not None else None
         db_holder = getattr(ctx, "_db_holder", None) if ctx is not None else None
+        config_path = os.path.join(str(getattr(settings, "data_dir", "")), ".env")
+        project_env_path = os.path.join(os.getcwd(), ".env")
         return {
             "pid": os.getpid(),
-            "profile": getattr(self._settings, "profile", "default"),
-            "profile_dir": str(getattr(self._settings, "profile_dir", "")),
-            "db_path": str(getattr(db_holder, "db_path", self._settings.duckdb_path)),
+            "profile": getattr(settings, "profile", "default"),
+            "profile_dir": str(getattr(settings, "profile_dir", "")),
+            "config_path": config_path,
+            "project_env_path": project_env_path,
+            "db_path": str(getattr(db_holder, "db_path", settings.duckdb_path)),
             "volatile": bool(getattr(ctx, "storage_volatile", False)) if ctx is not None else False,
             "uptime_s": max(0.0, time.time() - self._started_at),
             "active_clients": max(0, self._client_count()),
-            "model": getattr(self._settings, "llm_model", ""),
+            "model": getattr(settings, "llm_model", ""),
             "session_id": str(getattr(engine, "_current_session_id", "") or ""),
         }
 

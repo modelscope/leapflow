@@ -52,6 +52,14 @@ def handle_status(ctx: "Context", console: "LeapConsole", args: str) -> None:
     info.append("CWD:       ", style="dim")
     info.append(f"{cwd}\n")
 
+    config_path = ctx.settings.data_dir / ".env"
+    info.append("Config:    ", style="dim")
+    info.append(f"{str(config_path).replace(os.path.expanduser('~'), '~')}\n")
+
+    project_env = os.path.join(os.getcwd(), ".env")
+    info.append("Override:  ", style="dim")
+    info.append(f"{project_env.replace(os.path.expanduser('~'), '~')}\n")
+
     session_id = getattr(ctx.session, "session_id", "")
     if session_id:
         info.append("Session:   ", style="dim")
