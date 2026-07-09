@@ -120,6 +120,53 @@ def test_failed_command_error_is_single_line_and_truncated() -> None:
     assert len(failed.error) == 240
     assert failed.error.endswith("…")
 
+
+class _FakeBuffer:
+    def __init__(self) -> None:
+        self.text = ""
+
+    def insert_text(self, text: str) -> None:
+        self.text += text
+
+
+def test_large_paste_is_compacted_but_submits_full_text() -> None:
+    app, _console, _status = _make_app()
+    buffer = _FakeBuffer()
+    pasted = "line\n" * 2_000
+
+    app._insert_paste_text(buffer, pasted)
+
+    assert pasted not in buffer.text
+    assert "pasted block #1" in buffer.text
+    assert "full text will be submitted" in buffer.text
+    command = app.submit_text(f"Please summarize:\n{buffer.text}")
+
+    assert command.text == f"Please summarize:\n{pasted}".strip()
+    assert app._paste_blocks == {}
+
+
+def test_small_paste_stays_inline() -> None:
+    app, _console, _status = _make_app()
+    buffer = _FakeBuffer()
+    pasted = "short pasted text"
+
+    app._insert_paste_text(buffer, pasted)
+
+    assert buffer.text == pasted
+    assert app._paste_blocks == {}
+
+
+def test_submit_clears_stale_compacted_paste_when_marker_removed() -> None:
+    app, _console, _status = _make_app()
+    buffer = _FakeBuffer()
+    app._insert_paste_text(buffer, "line\n" * 2_000)
+
+    command = app.submit_text("marker was deleted by user")
+
+    assert command.text == "marker was deleted by user"
+    assert app._paste_blocks == {}
+
+
 @pytest.mark.asyncio
 async def test_process_loop_runs_submitted_commands_serially() -> None:
     processed: list[str] = []

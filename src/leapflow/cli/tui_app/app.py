@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -57,8 +58,19 @@ if TYPE_CHECKING:
 
 _HISTORY_FILENAME = "history"
 _REFRESH_INTERVAL_S = 0.5
+_LARGE_PASTE_CHAR_THRESHOLD = 4_000
+_LARGE_PASTE_LINE_THRESHOLD = 24
+_PASTE_PREVIEW_LIMIT = 80
 
 InputHandler = Callable[[str], Union[Awaitable[None], None]]
+
+
+@dataclass(frozen=True)
+class _PasteBlock:
+    """Full pasted content stored outside the prompt buffer."""
+
+    marker: str
+    text: str
 
 
 class LeapApp:
@@ -93,6 +105,8 @@ class LeapApp:
         self._spinner_text = ""
         self._tool_start_time: float = 0.0
         self._next_command_id = 1
+        self._next_paste_id = 1
+        self._paste_blocks: dict[str, _PasteBlock] = {}
         self._active_command: Optional[TuiCommand] = None
         self._pending_input: asyncio.Queue[TuiCommand] = asyncio.Queue()
 
@@ -137,7 +151,7 @@ class LeapApp:
 
     def submit_text(self, text: str) -> TuiCommand:
         """Submit user text into the serial TUI command queue."""
-        normalized = text.strip()
+        normalized = self._resolve_paste_blocks(text).strip()
         if not normalized:
             raise ValueError("Cannot submit an empty TUI command")
         command = TuiCommand.create(command_id=self._next_command_id, text=normalized)
@@ -148,6 +162,54 @@ class LeapApp:
             self._console.command_card(command)
         self._invalidate()
         return command
+
+    def _should_compact_paste(self, text: str) -> bool:
+        """Return True when rendering pasted text directly would hurt TUI responsiveness."""
+        if len(text) >= _LARGE_PASTE_CHAR_THRESHOLD:
+            return True
+        return text.count("\n") + 1 >= _LARGE_PASTE_LINE_THRESHOLD
+
+    def _compact_tokens(self, text: str) -> str:
+        size = len(text)
+        if size < 1_000:
+            return f"{size} chars"
+        if size < 1_000_000:
+            return f"{size / 1000:.1f}K chars"
+        return f"{size / 1_000_000:.1f}M chars"
+
+    def _paste_marker(self, text: str) -> str:
+        paste_id = self._next_paste_id
+        self._next_paste_id += 1
+        line_count = text.count("\n") + 1
+        first_line = " ".join(text.strip().split())[:_PASTE_PREVIEW_LIMIT]
+        preview = f": {first_line}" if first_line else ""
+        marker = (
+            f"⟪pasted block #{paste_id}: {self._compact_tokens(text)}, "
+            f"{line_count} lines{preview} — full text will be submitted⟫"
+        )
+        self._paste_blocks[marker] = _PasteBlock(marker=marker, text=text)
+        return marker
+
+    def _resolve_paste_blocks(self, text: str) -> str:
+        """Replace compact paste markers with the original full pasted content."""
+        if not self._paste_blocks:
+            return text
+        resolved = text
+        for marker, block in self._paste_blocks.items():
+            if marker in resolved:
+                resolved = resolved.replace(marker, block.text)
+        self._paste_blocks.clear()
+        return resolved
+
+    def _insert_paste_text(self, buffer: Any, text: str) -> None:
+        """Insert pasted text, compacting large blocks to keep terminal rendering smooth."""
+        if not text:
+            return
+        if self._should_compact_paste(text):
+            buffer.insert_text(self._paste_marker(text))
+            self._invalidate()
+            return
+        buffer.insert_text(text)
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
@@ -287,12 +349,17 @@ class LeapApp:
             text = event.app.current_buffer.text.strip()
             if not text:
                 return
+            has_compacted_paste = bool(ref._paste_blocks)
             ref.submit_text(text)
-            event.app.current_buffer.reset(append_to_history=True)
+            event.app.current_buffer.reset(append_to_history=not has_compacted_paste)
 
         @kb.add(Keys.Escape, Keys.Enter)
         def _(event):
             event.current_buffer.insert_text("\n")
+
+        @kb.add(Keys.BracketedPaste)
+        def _(event):
+            ref._insert_paste_text(event.current_buffer, event.data)
 
         @kb.add(Keys.ControlD)
         def _(event):
@@ -303,6 +370,7 @@ class LeapApp:
         def _(event):
             if event.current_buffer.text:
                 event.current_buffer.reset()
+                ref._paste_blocks.clear()
                 return
             if ref._agent_running:
                 ref._console.system(
