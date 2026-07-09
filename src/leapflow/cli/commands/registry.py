@@ -66,6 +66,9 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("shortcut add", "Add a quick-reply shortcut", "Shortcuts", args_hint="<pattern> = <reply>"),
     CommandDef("shortcut remove", "Remove a shortcut", "Shortcuts", args_hint="<pattern>"),
 
+    # Gateway
+    CommandDef("gateway", "Show connected platforms and gateway status", "Gateway"),
+
     # Scheduler
     CommandDef("arm", "Schedule a skill for timed execution", "Scheduler", args_hint="<skill> <cron>"),
     CommandDef("tasks", "List scheduled tasks", "Scheduler"),

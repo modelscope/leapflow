@@ -1,0 +1,43 @@
+platform_id: api_server
+display_name: "API Server (OpenAI Compatible)"
+description: HTTP API server exposing OpenAI-compatible chat completions endpoint
+category: api
+
+credentials:
+  - key: api_key
+    label: API Key
+    required: true
+    secret: true
+    help_zh: "用于认证 API 请求的密钥（至少 16 字符，自行设定）"
+    help_en: "API key for authenticating requests (at least 16 chars, you define it)"
+
+options:
+  - key: host
+    label: 绑定地址
+    type: string
+    default: "127.0.0.1"
+    help_zh: "HTTP 服务绑定地址（默认仅本机访问）"
+    help_en: "HTTP server bind address (default: localhost only)"
+  - key: port
+    label: 端口
+    type: string
+    default: "8080"
+    help_zh: "HTTP 服务端口"
+    help_en: "HTTP server port"
+
+setup_guide:
+  summary_zh: |
+    API Server 提供 OpenAI 兼容的 HTTP API，可供外部应用调用。
+    你需要设定一个 API Key 用于认证（至少 16 字符）。
+  summary_en: |
+    API Server exposes an OpenAI-compatible HTTP API for external applications.
+    You need to set an API key for authentication (at least 16 characters).
+
+validation:
+  method: ""
+  timeout_s: 5
+
+adapter:
+  module: leapflow.gateway.adapters.api_server
+  class: APIServerAdapter
+  dependencies: [aiohttp]

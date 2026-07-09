@@ -428,6 +428,96 @@ All output flows through `LeapConsole`, ensuring consistent theming. All input f
 
 ---
 
+## External Platform Integration (Gateway)
+
+LeapFlow can connect to external messaging platforms — **Feishu (Lark)**, **DingTalk**, **Telegram**, and more — turning any IM channel into a natural-language interface to the agent. Platforms are integrated through a declarative **manifest** system and configured via a conversational setup flow, with no source-code changes required.
+
+### Design Highlights
+
+| Aspect | Approach |
+|--------|----------|
+| **Config-as-Conversation** | Say *"connect to Feishu"* in the REPL. The agent walks you through credential setup in 1–2 turns — no config files to edit by hand. |
+| **Declarative Manifests** | Each platform is defined by a YAML manifest (credentials, setup guide, adapter module). Add a new platform by dropping a `.yaml` file. |
+| **Credential Security** | Secrets are encrypted at rest (Fernet AES-128-CBC), never appear in LLM context or logs, and can be overridden via environment variables (`LEAPFLOW_<PLATFORM>_<KEY>`). |
+| **Lazy Loading** | Platform SDK dependencies are imported only when a platform is first connected, keeping CLI startup instant. |
+| **Adapter Protocol** | Platform adapters implement a simple Python `Protocol` — `connect()`, `disconnect()`, `send()`, `on_message` callback — extensible via `PlatformAdapterMixin` for graceful degradation. |
+
+### Quick Start
+
+```
+❯ connect to Telegram
+# Agent shows setup steps, asks for Bot Token
+❯ <paste your bot token>
+# Agent validates, encrypts, connects — done.
+```
+
+Or use the `/gateway` slash command to check connection status:
+
+```
+❯ /gateway
+┌── Gateway ─────────────────────┐
+│ Connected                      │
+│   ● Telegram (5m 32s)          │
+│ Available                      │
+│   飞书, DingTalk, Webhook      │
+│                                │
+│ Say "connect to <platform>"    │
+│ to set up a new integration.   │
+└────────────────────────────────┘
+```
+
+### Adding a Custom Platform
+
+1. Create a YAML manifest in `~/.leapflow/profiles/<profile>/gateway/manifests/`:
+
+```yaml
+platform_id: my_platform
+display_name: My Platform
+category: im
+
+credentials:
+  - key: api_key
+    label: API Key
+    required: true
+    secret: true
+
+setup_guide:
+  summary_en: "Provide your API key to connect."
+
+adapter:
+  module: my_package.adapter
+  class: MyAdapter
+  dependencies: [my-sdk]
+```
+
+2. Implement the adapter:
+
+```python
+from leapflow.gateway.protocol import PlatformAdapter
+
+class MyAdapter:
+    def __init__(self, api_key: str, **kwargs): ...
+    async def connect(self, *, is_reconnect: bool = False) -> None: ...
+    async def send(self, target, content) -> SendResult: ...
+    async def disconnect(self) -> None: ...
+```
+
+3. Say *"connect to my_platform"* in the REPL — the agent handles the rest.
+
+### Environment Variable Overrides
+
+For deployment environments (CI/CD, containers), set credentials as environment variables instead of interactive configuration:
+
+```bash
+export LEAPFLOW_TELEGRAM_BOT_TOKEN=your_token_here
+export LEAPFLOW_FEISHU_APP_ID=cli_xxx
+export LEAPFLOW_FEISHU_APP_SECRET=xxx
+```
+
+Environment variables take precedence over values stored in `gateway.yaml`.
+
+---
+
 ## Workflow Copilot (Preview)
 
 LeapFlow includes a **Workflow Copilot** that predicts your next action and offers proactive suggestions — like GitHub Copilot, but for any workflow on your computer.
@@ -641,6 +731,7 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | `engine/` | Session orchestration and ReAct execution loop |
 | `memory/` | Three-tier event-driven memory (working → episodic → long-term) |
 | `platform/` | Platform adaptation layer — protocol abstraction for pluggable execution backends |
+| `gateway/` | External platform integration — declarative manifests, credential vault, adapter lifecycle |
 | `hub/` | Multi-source skill hub (ModelScope, GitHub, local) |
 
 <details>
@@ -665,6 +756,7 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | Tools | `src/leapflow/tools/` | registry, builtins | Built-in tool definitions for the ReAct loop |
 | CLI | `src/leapflow/cli/` | cli, commands/, banner | Argument parsing, subcommand dispatch, interactive REPL |
 | Storage | `src/leapflow/storage/` | duckdb, skill_library | DuckDB-backed persistent storage for skills, trajectories, audit |
+| Gateway | `src/leapflow/gateway/` | server, manifest, protocol, credential_vault | External platform integration — manifest discovery, adapter lifecycle, credential encryption |
 | Execution Backend | external (pluggable) | — | OS interaction: screen capture, AX tree, input injection (default: `cua-driver` via MCP) |
 
 </details>
@@ -678,6 +770,7 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | `PredictorLayer` | `copilot/types.py` | Prediction algorithm interface (predict, on_feedback, priority, timeout) |
 | `SignalChannel` | `copilot/types.py` | Dynamically registerable signal source (start, stop, subscribe) |
 | `HintRenderer` | `copilot/types.py` | Ghost-hint display abstraction (show, dismiss, is_visible) |
+| `PlatformAdapter` | `gateway/protocol.py` | External platform adapter contract (connect, disconnect, send, on_message) |
 
 **Core Data Types:**
 

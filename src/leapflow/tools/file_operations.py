@@ -34,12 +34,14 @@ _SENSITIVE_READ_PATTERNS: FrozenSet[str] = frozenset({
     "token.json", "secrets.yaml", "secrets.yml",
     ".kube/config",
     "id_rsa", "id_ed25519",
+    "gateway.yaml", ".credential_key",
 })
 
 _SENSITIVE_EXACT_NAMES: FrozenSet[str] = frozenset({
     ".env", ".env.local", ".env.production", ".env.staging",
     "credentials.json", "service_account.json", "token.json",
     "secrets.yaml", "secrets.yml", ".netrc", ".npmrc", ".pypirc",
+    "gateway.yaml", ".credential_key",
 })
 
 # Binary extensions that should not be read as text

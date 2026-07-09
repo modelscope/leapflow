@@ -38,6 +38,7 @@ _TOOL_CATEGORIES: Dict[str, str] = {
     "hub_push": "hub",
     "hub_pull": "hub",
     "hub_search": "hub",
+    "gateway_connect": "gateway",
 }
 
 
@@ -87,6 +88,7 @@ def display_rich_banner(
     skills: Optional[Sequence[Any]] = None,
     context_length: int = 0,
     mcp_tools: int = 0,
+    gateway_connected: Sequence[str] = (),
     show_welcome: bool = True,
 ) -> None:
     """Print the full-width Rich banner panel with tools/skills catalog."""
@@ -160,6 +162,14 @@ def display_rich_banner(
                 names_str = names_str[:49] + "…"
             right_lines.append(f"[{_DIM_GOLD}]{cat}:[/] [{_CREAM}]{names_str}[/]")
 
+    if gateway_connected:
+        right_lines.append("")
+        right_lines.append(f"[bold {_AMBER}]Gateway[/]")
+        names_str = ", ".join(gateway_connected)
+        if len(names_str) > 52:
+            names_str = names_str[:49] + "…"
+        right_lines.append(f"[green]●[/] [{_CREAM}]{names_str}[/]")
+
     if not tool_defs and not skills:
         right_lines.append(f"[{_WARM_GRAY}]No tools or skills loaded[/]")
 
@@ -173,6 +183,8 @@ def display_rich_banner(
         summary_parts.append(f"{skill_count} skills")
     if mcp_tools:
         summary_parts.append(f"{mcp_tools} mcp")
+    if gateway_connected:
+        summary_parts.append(f"{len(gateway_connected)} gateway")
     summary_parts.append("/help for commands")
     right_lines.append("")
     right_lines.append(f"[{_WARM_GRAY}]{' · '.join(summary_parts)}[/]")

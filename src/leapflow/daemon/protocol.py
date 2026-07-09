@@ -174,6 +174,25 @@ class LeapService(Protocol):
         """Graceful shutdown."""
         ...
 
+    # ── Gateway ──────────────────────────────────────────────────────
+
+    async def gateway_connect(
+        self,
+        platform: str,
+        credentials: Dict[str, str],
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Connect a platform via the gateway."""
+        ...
+
+    async def gateway_disconnect(self, platform: str) -> Dict[str, Any]:
+        """Disconnect a platform."""
+        ...
+
+    async def gateway_status(self) -> List[Dict[str, Any]]:
+        """Return status of all gateway platforms."""
+        ...
+
 
 # ══════════════════════════════════════════════════════════════════════
 # Method registry — maps JSON-RPC method names to LeapService methods
@@ -191,4 +210,7 @@ METHOD_REGISTRY: Dict[str, str] = {
     "scheduler.arm": "scheduler_arm",
     "daemon.status": "status",
     "daemon.shutdown": "shutdown",
+    "gateway.connect": "gateway_connect",
+    "gateway.disconnect": "gateway_disconnect",
+    "gateway.status": "gateway_status",
 }

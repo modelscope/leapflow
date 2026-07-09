@@ -1,0 +1,52 @@
+platform_id: telegram
+display_name: Telegram
+description: Telegram Messenger
+category: social
+
+credentials:
+  - key: bot_token
+    label: Bot Token
+    required: true
+    secret: true
+    help_zh: "在 Telegram 中搜索 @BotFather → 发送 /newbot → 按提示创建 → 复制 token"
+    help_en: "Search @BotFather in Telegram → /newbot → Follow prompts → Copy token"
+
+options:
+  - key: transport
+    label: 传输模式
+    type: choice
+    choices: [polling, webhook]
+    default: polling
+    help_zh: "polling 无需公网 IP（推荐），webhook 需要公网 HTTPS 地址"
+    help_en: "polling needs no public IP (recommended), webhook requires public HTTPS URL"
+  - key: webhook_url
+    label: Webhook URL
+    type: string
+    required: false
+    advanced: true
+    depends_on:
+      transport: webhook
+    help_zh: "Webhook 模式下的公网回调地址"
+    help_en: "Public callback URL for webhook mode"
+
+setup_guide:
+  summary_zh: |
+    接入 Telegram 只需一个 Bot Token。
+    在 Telegram 中搜索 @BotFather，发送 /newbot 创建机器人并复制 token。
+  summary_en: |
+    To connect Telegram, you only need a Bot Token.
+    Search @BotFather in Telegram, send /newbot, and copy the token.
+  steps_zh:
+    - "在 Telegram 中搜索 @BotFather 并开始对话"
+    - "发送 /newbot，按提示输入机器人名称和用户名"
+    - "复制返回的 Bot Token（格式如 123456:ABC-DEF...）"
+  console_url: "https://t.me/BotFather"
+
+validation:
+  method: telegram_getme
+  timeout_s: 10
+
+adapter:
+  module: leapflow.gateway.adapters.telegram
+  class: TelegramAdapter
+  dependencies: [aiohttp]

@@ -1078,6 +1078,17 @@ class Context:
         from leapflow.tools.registry_bootstrap import set_memory_manager
         set_memory_manager(self.memory)
 
+        # ── Gateway server (late-bound tool wiring) ──
+        from leapflow.gateway.server import GatewayServer
+        from leapflow.tools.registry_bootstrap import set_gateway_server
+
+        self.gateway_server = GatewayServer(
+            settings.profile_dir,
+            extra_manifest_dirs=[settings.profile_dir / "gateway" / "manifests"],
+        )
+        self.gateway_server.discover_manifests()
+        set_gateway_server(self.gateway_server)
+
         # ── Build CompressorConfig with LLM callbacks ──
         from leapflow.engine.context_compressor import CompressorConfig
 
@@ -1844,6 +1855,14 @@ class Context:
                     evo_store.close()
                 except Exception:
                     pass
+
+        # Stop gateway server
+        gw = getattr(self, "gateway_server", None)
+        if gw is not None:
+            try:
+                await gw.stop()
+            except Exception:
+                logger.debug("GatewayServer stop failed", exc_info=True)
 
         # Cancel engine if running
         if self.engine is not None:

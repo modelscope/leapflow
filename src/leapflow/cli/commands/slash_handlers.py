@@ -67,6 +67,20 @@ def handle_status(ctx: "Context", console: "LeapConsole", args: str) -> None:
     info.append("Mode:      ", style="dim")
     info.append(f"{mode}\n")
 
+    gw = getattr(ctx, "gateway_server", None)
+    if gw is not None:
+        statuses = gw.platform_status()
+        connected = [s for s in statuses if s.connected]
+        info.append("Gateway:   ", style="dim")
+        if connected:
+            names = []
+            for s in connected:
+                m = gw.manifests.get(s.platform_id)
+                names.append(m.display_name if m else s.platform_id)
+            info.append(f"{', '.join(names)}\n", style="green")
+        else:
+            info.append("no connections\n", style="dim")
+
     console.print(Panel(
         info,
         title="[bold cyan]LeapFlow Status[/]",
@@ -170,6 +184,67 @@ def handle_model(ctx: "Context", console: "LeapConsole", args: str) -> None:
     )
     console.system(f"  Current: {ctx.settings.llm_model}")
     console.system(f"  Example: LEAPFLOW_LLM_MODEL={model_arg} leap")
+
+
+def handle_gateway(ctx: "Context", console: "LeapConsole", args: str) -> None:
+    """Display gateway status: connected platforms, available integrations."""
+    from rich.panel import Panel
+    from rich.text import Text
+
+    gw = getattr(ctx, "gateway_server", None)
+    if gw is None:
+        console.warning("Gateway not initialised.")
+        return
+
+    statuses = gw.platform_status()
+    if not statuses:
+        console.system("No platform manifests discovered.")
+        return
+
+    info = Text()
+    connected = [s for s in statuses if s.connected]
+    configured = [s for s in statuses if not s.connected and s.error == "configured but not connected"]
+    available = [s for s in statuses if not s.connected and not s.error]
+
+    import time
+
+    if connected:
+        info.append("Connected\n", style="bold green")
+        for s in connected:
+            m = gw.manifests.get(s.platform_id)
+            name = m.display_name if m else s.platform_id
+            uptime = ""
+            if s.connected_since > 0:
+                secs = int(time.time() - s.connected_since)
+                if secs < 60:
+                    uptime = f" ({secs}s)"
+                elif secs < 3600:
+                    uptime = f" ({secs // 60}m)"
+                else:
+                    uptime = f" ({secs // 3600}h {(secs % 3600) // 60}m)"
+            info.append(f"  ● {name}{uptime}\n", style="green")
+
+    if configured:
+        info.append("Configured (not connected)\n", style="bold yellow")
+        for s in configured:
+            m = gw.manifests.get(s.platform_id)
+            name = m.display_name if m else s.platform_id
+            info.append(f"  ○ {name}\n", style="yellow")
+
+    if available:
+        info.append("Available\n", style="bold dim")
+        names = [gw.manifests[s.platform_id].display_name for s in available if s.platform_id in gw.manifests]
+        info.append(f"  {', '.join(names)}\n", style="dim")
+
+    info.append("\n", style="dim")
+    info.append('Say "connect to <platform>" to set up a new integration.', style="dim italic")
+
+    console.print(Panel(
+        info,
+        title="[bold cyan]Gateway[/]",
+        border_style="bright_black",
+        padding=(0, 2),
+    ))
 
 
 def handle_clear(ctx: "Context", console: "LeapConsole", args: str) -> None:

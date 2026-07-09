@@ -1,0 +1,50 @@
+platform_id: feishu
+display_name: "飞书 (Feishu/Lark)"
+description: "飞书企业即时通讯平台"
+category: im
+
+credentials:
+  - key: app_id
+    label: App ID
+    required: true
+    secret: false
+    help_zh: "登录 open.feishu.cn → 创建企业自建应用 → 凭证与基础信息 → 复制 App ID"
+    help_en: "Login open.feishu.cn → Create App → Credentials → Copy App ID"
+  - key: app_secret
+    label: App Secret
+    required: true
+    secret: true
+    help_zh: "同页面 → 复制 App Secret"
+    help_en: "Same page → Copy App Secret"
+
+options:
+  - key: connection_mode
+    label: 连接模式
+    type: choice
+    choices: [websocket, webhook]
+    default: websocket
+    help_zh: "WebSocket 无需公网 IP（推荐），Webhook 需要公网回调地址"
+    help_en: "WebSocket needs no public IP (recommended), Webhook requires public callback URL"
+
+setup_guide:
+  summary_zh: |
+    接入飞书需要在飞书开放平台创建一个企业自建应用并开启机器人能力。
+    完成后请提供 App ID 和 App Secret。
+  summary_en: |
+    To connect Feishu, create an enterprise app on open.feishu.cn
+    with bot capability enabled. Then provide your App ID and App Secret.
+  steps_zh:
+    - "打开 https://open.feishu.cn/app → 点击「创建企业自建应用」"
+    - "在「应用能力」中启用「机器人」"
+    - "在「凭证与基础信息」页面复制 App ID 和 App Secret"
+    - "在「权限管理」中添加：im:message、im:message.group_at_msg"
+  console_url: "https://open.feishu.cn/app"
+
+validation:
+  method: feishu_token_check
+  timeout_s: 10
+
+adapter:
+  module: leapflow.gateway.adapters.feishu
+  class: FeishuAdapter
+  dependencies: [lark-oapi]

@@ -40,6 +40,7 @@ async def cmd_interactive(ctx: "Context") -> int:
         handle_usage,
         handle_model,
         handle_clear,
+        handle_gateway,
     )
     from leapflow.utils.terminal_io import TerminalIOProvider
     from leapflow.engine.session import SessionMode
@@ -131,6 +132,18 @@ async def cmd_interactive(ctx: "Context") -> int:
         else ctx.settings.llm_context_length
     )
 
+    def _gateway_connected_names() -> list[str]:
+        gw = getattr(ctx, "gateway_server", None)
+        if gw is None:
+            return []
+        return [
+            (gw.manifests[s.platform_id].display_name
+             if s.platform_id in gw.manifests
+             else s.platform_id)
+            for s in gw.platform_status()
+            if s.connected
+        ]
+
     def _render_banner() -> None:
         display_rich_banner(
             model=ctx.settings.llm_model,
@@ -141,6 +154,7 @@ async def cmd_interactive(ctx: "Context") -> int:
             skills=all_skills,
             context_length=ctx_len,
             mcp_tools=mcp_count,
+            gateway_connected=_gateway_connected_names(),
         )
 
     # ── Stream response ──────────────────────────────────────────────
@@ -244,6 +258,10 @@ async def cmd_interactive(ctx: "Context") -> int:
 
             if canonical == "tools":
                 handle_tools(ctx, console, cmd_args)
+                return
+
+            if canonical == "gateway":
+                handle_gateway(ctx, console, cmd_args)
                 return
 
             if canonical == "usage":

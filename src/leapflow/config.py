@@ -50,6 +50,8 @@ _PROFILE_SUBDIRS = [
     "cache/frames",
     "cache/video",
     "run",
+    "gateway",
+    "gateway/manifests",
 ]
 
 
