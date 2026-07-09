@@ -245,10 +245,10 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 ### Step 1: Launch the Interactive TUI
 
 ```bash
-uv run leap
+leap
 ```
 
-> You'll see the LeapFlow banner, session info (model, context budget, platform, cwd), and a `❯` prompt — you're in the rich interactive TUI. If you do not have a native execution backend available yet, use `uv run leap --mock-host` for a safe first run.
+> You'll see the LeapFlow banner, session info (model, context budget, platform, cwd), and a `❯` prompt — you're in the rich interactive TUI. If you do not have a native execution backend available yet, use `leap --mock-host` for a safe first run.
 
 ### Step 2: Have a Conversation
 
@@ -296,9 +296,9 @@ uv run leap skills show "skill-name" # Inspect a specific skill
 LeapFlow is designed to be used primarily through the **interactive terminal UI**. Start here for day-to-day work: chat, inspect status, trigger tools, resume sessions, and progressively teach or execute workflows from one conversational surface.
 
 ```bash
-uv run leap                         # Recommended: launch the interactive TUI
-uv run leap --mock-host             # Safe first run without native OS backend
-uv run leap "summarize this repo"   # Single-turn prompt, then exit
+leap                         # Recommended: launch the interactive TUI
+leap --mock-host             # Safe first run without native OS backend
+leap "summarize this repo"   # Single-turn prompt, then exit
 ```
 
 Why we recommend the TUI first:
