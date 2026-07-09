@@ -8,6 +8,7 @@ Public API:
 - ``ManifestLoader`` for declarative platform discovery
 - ``CredentialVault`` for at-rest credential encryption
 - ``SessionKey`` / ``build_session_key`` for structured session routing
+- ``GatewayRouter`` for per-session LLM processing of inbound messages
 """
 from leapflow.gateway.config_store import GatewayConfig, GatewayConfigStore
 from leapflow.gateway.credential_vault import CredentialVault
@@ -28,6 +29,7 @@ from leapflow.gateway.protocol import (
     SendResult,
     SendTarget,
 )
+from leapflow.gateway.router import GatewayRouter
 from leapflow.gateway.server import GatewayServer
 from leapflow.gateway.session_router import SessionKey, build_session_key
 from leapflow.gateway.validators import register_validator, validate_credentials
@@ -49,6 +51,7 @@ __all__ = [
     "GatewaySessionCreated",
     "GatewaySessionEnded",
     # Core components
+    "GatewayRouter",
     "GatewayServer",
     "ManifestLoader",
     "PlatformManifest",

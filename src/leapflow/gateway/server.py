@@ -32,8 +32,12 @@ from leapflow.gateway.events import (
 from leapflow.gateway.manifest import ManifestLoader, PlatformManifest
 from leapflow.gateway.protocol import (
     InboundMessage,
+    MessageSource,
+    OutboundContent,
     PlatformAdapter,
     PlatformStatus,
+    SendResult,
+    SendTarget,
 )
 from leapflow.gateway.session_router import SessionKey, build_session_key
 from leapflow.gateway.validators import validate_credentials
@@ -225,6 +229,33 @@ class GatewayServer:
         for pid in list(self._adapters):
             await self.disconnect_platform(pid)
         self._started = False
+
+    # ── Reply delivery ────────────────────────────────────────
+
+    async def send_reply(
+        self,
+        source: MessageSource,
+        text: str,
+    ) -> Optional["SendResult"]:
+        """Send a reply back to the originating conversation.
+
+        Public API for ``GatewayRouter`` and any other component that
+        needs to deliver outbound messages.  Returns ``None`` if no
+        adapter is connected for the platform.
+        """
+        adapter = self._adapters.get(source.platform)
+        if adapter is None:
+            logger.warning(
+                "No adapter for %s, cannot send reply", source.platform,
+            )
+            return None
+        target = SendTarget(
+            platform=source.platform,
+            chat_id=source.chat_id,
+            thread_id=source.thread_id,
+        )
+        content = OutboundContent(text=text)
+        return await adapter.send(target, content)
 
     # ── Message routing ──────────────────────────────────────
 

@@ -1080,14 +1080,68 @@ class Context:
 
         # ── Gateway server (late-bound tool wiring) ──
         from leapflow.gateway.server import GatewayServer
+        from leapflow.gateway.router import GatewayRouter
+        from leapflow.gateway.events import (
+            GatewayMessageReceived,
+            GatewaySessionCreated,
+            GatewaySessionEnded,
+        )
         from leapflow.tools.registry_bootstrap import set_gateway_server
+
+        async def _on_gateway_event(event: object) -> None:
+            """Bridge gateway events to episodic memory and logging."""
+            if isinstance(event, GatewayMessageReceived):
+                logger.info(
+                    "gateway.inbound platform=%s session=%s len=%d",
+                    event.source.platform,
+                    event.session_key,
+                    len(event.text),
+                )
+                if self.imm is not None:
+                    self.imm.ingest(
+                        "gateway.message",
+                        f"[{event.source.platform}:{event.source.user_name or event.source.user_id}] "
+                        f"{event.text[:500]}",
+                        metadata={
+                            "platform": event.source.platform,
+                            "session": event.session_key,
+                        },
+                    )
+            elif isinstance(event, GatewaySessionCreated):
+                logger.info("gateway.session_created key=%s", event.session_key)
+            elif isinstance(event, GatewaySessionEnded):
+                logger.info(
+                    "gateway.session_ended key=%s reason=%s",
+                    event.session_key,
+                    event.reason,
+                )
+                router = getattr(self, "_gateway_router", None)
+                if router is not None:
+                    router.clear_session(event.session_key)
 
         self.gateway_server = GatewayServer(
             settings.profile_dir,
             extra_manifest_dirs=[settings.profile_dir / "gateway" / "manifests"],
+            on_event=_on_gateway_event,
         )
         self.gateway_server.discover_manifests()
         set_gateway_server(self.gateway_server)
+
+        async def _gateway_send(source: Any, text: str) -> None:
+            await self.gateway_server.send_reply(source, text)
+
+        self._gateway_router = GatewayRouter(
+            llm=self.llm,
+            system_prompt=(
+                "You are LeapFlow, a helpful AI assistant responding "
+                "through an external messaging platform.  Be concise "
+                "and conversational."
+            ),
+            send_fn=_gateway_send,
+        )
+        self.gateway_server.set_message_handler(
+            self._gateway_router.handle_message,
+        )
 
         # ── Build CompressorConfig with LLM callbacks ──
         from leapflow.engine.context_compressor import CompressorConfig

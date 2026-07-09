@@ -441,6 +441,31 @@ LeapFlow can connect to external messaging platforms — **Feishu (Lark)**, **Di
 | **Credential Security** | Secrets are encrypted at rest (Fernet AES-128-CBC), never appear in LLM context or logs, and can be overridden via environment variables (`LEAPFLOW_<PLATFORM>_<KEY>`). |
 | **Lazy Loading** | Platform SDK dependencies are imported only when a platform is first connected, keeping CLI startup instant. |
 | **Adapter Protocol** | Platform adapters implement a simple Python `Protocol` — `connect()`, `disconnect()`, `send()`, `on_message` callback — extensible via `PlatformAdapterMixin` for graceful degradation. |
+| **Auto-Reconnect** | Previously configured platforms are automatically reconnected on startup. Connection state persists across sessions via `gateway.yaml`. |
+| **Independent Sessions** | Each external chat gets its own conversation history, isolated from the CLI session and other chats. Messages are routed through a per-session LLM processing loop. |
+| **Event-Driven** | Inbound messages are logged to episodic memory and emitted as typed events (`GatewayMessageReceived`, `GatewaySessionCreated`, `GatewaySessionEnded`) for downstream subscribers. |
+
+### Architecture
+
+```
+External Platform (Feishu, Telegram, ...)
+        │
+        ▼
+  ┌─────────────┐    ┌──────────────┐    ┌─────────────┐
+  │  Platform    │───▶│  Gateway     │───▶│  Gateway    │───▶ LLM
+  │  Adapter     │    │  Server      │    │  Router     │◀─── reply
+  │  (Protocol)  │◀───│  (lifecycle) │◀───│  (per-      │
+  └─────────────┘    │              │    │   session)  │
+    send reply       │  on_event ──▶│    └─────────────┘
+                     └──────┬───────┘
+                            │
+                   ┌────────▼────────┐
+                   │ Episodic Memory │
+                   │ (event logging) │
+                   └─────────────────┘
+```
+
+`Context` is the sole integration point — gateway modules have no dependency on engine or CLI.
 
 ### Quick Start
 

@@ -8,9 +8,12 @@ bottom while Rich-formatted output scrolls above.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from typing import TYPE_CHECKING, Optional
+
+logger = logging.getLogger(__name__)
 
 from leapflow.cli.helpers import require_initialized
 from leapflow.cli.commands.run import _print_execution_result
@@ -393,6 +396,16 @@ async def cmd_interactive(ctx: "Context") -> int:
         ),
         on_input=handle_input,
     )
+
+    # Auto-connect previously configured gateway platforms
+    gw = getattr(ctx, "gateway_server", None)
+    if gw is not None:
+        try:
+            gw_count = await gw.start()
+            if gw_count > 0:
+                console.system(f"  Gateway: {gw_count} platform(s) reconnected")
+        except Exception:
+            logger.debug("Gateway auto-connect failed", exc_info=True)
 
     _render_banner()
     _update_status()
