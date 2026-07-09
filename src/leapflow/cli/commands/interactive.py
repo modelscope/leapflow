@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
+import sys
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -28,6 +30,49 @@ _CLI_INTERACTION_EVENT = "cli.interaction"
 _CLI_EVENT_SOURCE = "interactive_repl"
 
 _last_hint: Optional["PredictionCandidate"] = None
+
+
+async def _prompt_stop_daemon_on_exit(
+    client: "DaemonClient",
+    settings: Any,
+    console: Any,
+) -> None:
+    """Ask whether to stop leapd after a daemon-backed TUI exits."""
+    try:
+        daemon_status = await client.status()
+    except Exception:
+        daemon_status = {}
+    pid = daemon_status.get("pid") or "unknown"
+    console.system(
+        "leapd runs in the background; stop/restart it after reinstalling LeapFlow "
+        "to load new code."
+    )
+    stop = await _ask_yes_no_default_yes(f"Stop leapd now (pid={pid})? [Y/n]: ")
+    if not stop:
+        console.system("leapd kept running. Use `leap daemon restart` when needed.")
+        return
+
+    from leapflow.daemon.lifecycle import send_signal
+
+    run_dir = settings.profile_dir / "run"
+    if send_signal(run_dir, signal.SIGTERM):
+        console.system(f"Sent SIGTERM to leapd (pid={pid}).")
+    else:
+        console.warning("Could not stop leapd; run `leap daemon stop` manually.")
+
+
+async def _ask_yes_no_default_yes(prompt: str) -> bool:
+    """Return True by default, including non-interactive or interrupted prompts."""
+    if not sys.stdin.isatty():
+        return True
+    try:
+        answer = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: input(prompt).strip().lower(),
+        )
+    except (EOFError, KeyboardInterrupt):
+        return True
+    return answer not in {"n", "no"}
 
 
 async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) -> int:
@@ -520,9 +565,13 @@ async def cmd_interactive_daemon(
     runtime_model_name = str(getattr(settings, "llm_model", ""))
     runtime_context_length = int(getattr(settings, "llm_context_length", 0) or 0)
     runtime_context_used = 0
+    runtime_daemon_pid = ""
 
     def _apply_daemon_runtime_metadata(metadata: dict[str, Any]) -> None:
-        nonlocal active_session_id, runtime_model_name, runtime_context_length, runtime_context_used
+        nonlocal active_session_id, runtime_model_name, runtime_context_length
+        nonlocal runtime_context_used, runtime_daemon_pid
+        if metadata.get("pid"):
+            runtime_daemon_pid = str(metadata["pid"])
         if metadata.get("session_id"):
             active_session_id = str(metadata["session_id"])
         if metadata.get("model"):
@@ -565,7 +614,9 @@ async def cmd_interactive_daemon(
             gateway_connected=[],
             theme=theme,
         )
-        console.system("Daemon mode: chat/session persistence is shared across terminals.")
+        daemon_suffix = f" pid={runtime_daemon_pid}" if runtime_daemon_pid else ""
+        console.system(f"Daemon mode{daemon_suffix}: shared runtime across terminals.")
+        console.system("After reinstalling LeapFlow, use `leap daemon restart` to load new code.")
 
     async def _print_daemon_status() -> None:
         try:
@@ -591,6 +642,15 @@ async def cmd_interactive_daemon(
         project_env_path = daemon_status.get("project_env_path")
         if project_env_path:
             console.system(f"Project override: {project_env_path}")
+        runtime_version = daemon_status.get("runtime_version")
+        if runtime_version:
+            console.system(f"Runtime version: {runtime_version}")
+        runtime_source = daemon_status.get("runtime_source")
+        if runtime_source:
+            console.system(f"Runtime source: {runtime_source}")
+        runtime_executable = daemon_status.get("runtime_executable")
+        if runtime_executable:
+            console.system(f"Python: {runtime_executable}")
         context_length = daemon_status.get("llm_context_length")
         if context_length:
             console.system(f"Context budget: {int(context_length):,} tokens")
@@ -715,6 +775,7 @@ async def cmd_interactive_daemon(
         exit_code = await app.run()
     finally:
         _print_exit_summary()
+        await _prompt_stop_daemon_on_exit(client, settings, console)
     return exit_code
 
 

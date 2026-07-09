@@ -199,6 +199,10 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
         assert status["config_path"] == str(data_dir / ".env")
         assert status["project_env_path"] == str(tmp_path / ".env")
         assert status["llm_context_length"] == 700_000
+        assert status["context_used"] == 0
+        assert status["runtime_source"].endswith("leapflow/__init__.py")
+        assert status["runtime_executable"]
+        assert status["runtime_version"]
     finally:
         if stream is not None:
             await stream.aclose()
@@ -281,6 +285,49 @@ async def test_ensure_daemon_client_does_not_spawn_when_daemon_unhealthy(
 
     with pytest.raises(DaemonUnavailableError, match="running but unhealthy"):
         await ensure_daemon_client(settings)
+
+
+def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
+    from leapflow.cli.commands.daemon import _print_runtime_status
+
+    _print_runtime_status({
+        "profile": "default",
+        "active_clients": 1,
+        "volatile": False,
+        "model": "qwen3.7-plus",
+        "context_used": 256,
+        "llm_context_length": 256_000,
+        "session_id": "sess-1",
+        "runtime_version": "0.0.test",
+        "runtime_source": "/repo/src/leapflow/__init__.py",
+        "runtime_executable": "/venv/bin/python",
+        "config_path": "/home/.leapflow/.env",
+        "project_env_path": "/repo/.env",
+        "db_path": "/home/.leapflow/db/leap.duckdb",
+    })
+
+    output = capsys.readouterr().out
+    assert "runtime: profile=default clients=1 volatile=False" in output
+    assert "model: qwen3.7-plus context=256/256000" in output
+    assert "version: 0.0.test" in output
+    assert "source: /repo/src/leapflow/__init__.py" in output
+    assert "python: /venv/bin/python" in output
+
+
+def test_daemon_restart_stops_waits_and_starts(monkeypatch, tmp_path) -> None:
+    from leapflow.cli.commands import daemon as daemon_module
+
+    calls: list[str] = []
+
+    class Settings:
+        profile_dir = tmp_path
+
+    monkeypatch.setattr(daemon_module, "_stop", lambda run_dir: calls.append("stop") or 0)
+    monkeypatch.setattr(daemon_module, "_wait_stopped", lambda run_dir: calls.append("wait") or True)
+    monkeypatch.setattr(daemon_module, "_start", lambda settings, mock_host: calls.append("start") or 0)
+
+    assert daemon_module._restart(Settings(), mock_host=True) == 0
+    assert calls == ["stop", "wait", "start"]
 
 
 def test_stream_chunk_notification_preserves_event_shape() -> None:

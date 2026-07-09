@@ -211,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
     daemon_sub.add_parser("status", help="Show daemon status")
     daemon_sub.add_parser("start", help="Start daemon for the active profile")
     daemon_sub.add_parser("stop", help="Stop running daemon")
+    daemon_sub.add_parser("restart", help="Restart daemon for the active profile")
     serve_parser = daemon_sub.add_parser("serve", help=argparse.SUPPRESS)
     serve_parser.add_argument("--internal", action="store_true", help=argparse.SUPPRESS)
 

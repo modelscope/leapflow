@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -139,7 +140,24 @@ class RuntimeLeapService:
             "llm_context_length": getattr(settings, "llm_context_length", 0),
             "context_used": getattr(engine, "context_token_count", 0) if engine is not None else 0,
             "session_id": str(getattr(engine, "_current_session_id", "") or ""),
+            "runtime_source": self._runtime_source(),
+            "runtime_executable": sys.executable,
+            "runtime_version": self._runtime_version(),
         }
+
+    @staticmethod
+    def _runtime_source() -> str:
+        import leapflow
+
+        return str(getattr(leapflow, "__file__", ""))
+
+    @staticmethod
+    def _runtime_version() -> str:
+        try:
+            from leapflow.version import __version__
+        except ImportError:
+            return "unknown"
+        return str(__version__)
 
     async def shutdown(self) -> None:
         if self._ctx is None:

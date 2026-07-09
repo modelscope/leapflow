@@ -1,14 +1,16 @@
 """CLI commands for leapd daemon management.
 
-``leap daemon status`` — show whether leapd is running
-``leap daemon start``  — start leapd for the active profile
-``leap daemon stop``   — send SIGTERM to a running leapd
+``leap daemon status``  — show whether leapd is running
+``leap daemon start``   — start leapd for the active profile
+``leap daemon stop``    — send SIGTERM to a running leapd
+``leap daemon restart`` — restart leapd so code/config changes take effect
 """
 from __future__ import annotations
 
 import asyncio
 import signal
 import sys
+import time
 from argparse import Namespace
 from pathlib import Path
 
@@ -28,6 +30,8 @@ def cmd_daemon(args: Namespace) -> int:
         return _start(settings, getattr(args, "mock_host", False))
     if action == "stop":
         return _stop(run_dir)
+    if action == "restart":
+        return _restart(settings, getattr(args, "mock_host", False))
     if action == "serve":
         if not getattr(args, "internal", False):
             sys.stderr.write("'leap daemon serve' is an internal command. Use 'leap daemon start'.\n")
@@ -45,7 +49,48 @@ def _status(run_dir: Path) -> int:
     print(info.format_status())
     if info.sock_path is not None:
         print(f"socket: {info.sock_path}")
+    if info.is_healthy and info.sock_path is not None:
+        try:
+            details = asyncio.run(_runtime_status(info.sock_path))
+        except Exception as exc:
+            sys.stderr.write(f"Could not fetch daemon runtime details: {exc}\n")
+        else:
+            _print_runtime_status(details)
     return 0 if info.is_healthy else 1
+
+
+async def _runtime_status(sock_path: Path) -> dict:
+    from leapflow.daemon.client import DaemonClient
+
+    return await DaemonClient(sock_path).status()
+
+
+def _print_runtime_status(status: dict) -> None:
+    print(
+        "runtime: "
+        f"profile={status.get('profile')} "
+        f"clients={status.get('active_clients')} "
+        f"volatile={status.get('volatile')}"
+    )
+    print(
+        "model: "
+        f"{status.get('model')} "
+        f"context={status.get('context_used', 0)}/{status.get('llm_context_length', 0)}"
+    )
+    if status.get("session_id"):
+        print(f"session: {status['session_id']}")
+    if status.get("runtime_version"):
+        print(f"version: {status['runtime_version']}")
+    if status.get("runtime_source"):
+        print(f"source: {status['runtime_source']}")
+    if status.get("runtime_executable"):
+        print(f"python: {status['runtime_executable']}")
+    if status.get("config_path"):
+        print(f"config: {status['config_path']}")
+    if status.get("project_env_path"):
+        print(f"project_env: {status['project_env_path']}")
+    if status.get("db_path"):
+        print(f"db: {status['db_path']}")
 
 
 def _start(settings: object, mock_host: bool) -> int:
@@ -90,6 +135,29 @@ def _stop(run_dir: Path) -> int:
 
     sys.stderr.write("Failed to stop leapd.\n")
     return 1
+
+
+def _restart(settings: object, mock_host: bool) -> int:
+    run_dir = settings.profile_dir / "run"
+    print("Restarting leapd...")
+    stop_code = _stop(run_dir)
+    if stop_code != 0:
+        return stop_code
+    if not _wait_stopped(run_dir):
+        sys.stderr.write("Timed out waiting for leapd to stop.\n")
+        return 1
+    return _start(settings, mock_host)
+
+
+def _wait_stopped(run_dir: Path, *, timeout_s: float = 10.0) -> bool:
+    from leapflow.daemon.lifecycle import DaemonInfo
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not DaemonInfo.discover(run_dir).is_running:
+            return True
+        time.sleep(0.1)
+    return not DaemonInfo.discover(run_dir).is_running
 
 
 async def _serve(settings: object, mock_host: bool) -> int:

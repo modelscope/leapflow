@@ -357,6 +357,15 @@ Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` 
 | `host` | `leap host <action>` | Manage execution backend connection and diagnostics |
 | `daemon` | `leap daemon <action>` | Manage the persistent leapd runtime |
 
+**`leap daemon` actions:**
+
+| Action | Description |
+|--------|-------------|
+| `status` | Show leapd PID, socket, runtime source, Python executable, model, context usage, config paths, and DB path |
+| `start` | Start leapd for the active profile, or connect to the healthy running daemon |
+| `stop` | Stop the running leapd process for the active profile |
+| `restart` | Stop then start leapd so code/config changes take effect after reinstalling or upgrading LeapFlow |
+
 **Global Flags:**
 
 | Flag | Effect |
@@ -427,6 +436,24 @@ LeapFlow provides a rich interactive terminal experience built on [Rich](https:/
 | **Mode indicators** | Prompt character changes with session mode (idle ❯ / recording ● / paused ⏸) |
 
 The context maximum shown in the status bar is the active runtime budget from `LEAPFLOW_LLM_CONTEXT_LENGTH`. In daemon mode, the TUI synchronizes this value from the daemon runtime so multiple terminal clients show the same budget.
+
+### Daemon-backed TUI Lifecycle
+
+By default, `leap` uses `leapd`, a per-profile background runtime shared across terminal clients. Exiting the TUI closes the current client; before returning, LeapFlow asks whether to stop `leapd` and defaults to stopping it. Keep it running when you want another terminal to reuse the same runtime.
+
+After reinstalling or upgrading LeapFlow, restart the daemon so the background process loads the new code:
+
+```bash
+leap daemon restart
+```
+
+Use diagnostics when the TUI appears stale:
+
+```bash
+leap daemon status
+```
+
+`status` prints the daemon PID, socket, runtime source path, Python executable, model, context usage, config paths, and DB path.
 
 ### Theme Configuration
 

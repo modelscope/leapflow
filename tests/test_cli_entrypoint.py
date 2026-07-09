@@ -417,6 +417,101 @@ def test_leap_no_daemon_initializes_and_runs_interactive(monkeypatch, tmp_path) 
     assert (data_dir / ".env").exists()
 
 
+def test_leap_daemon_restart_routes_to_daemon_command(monkeypatch) -> None:
+    from leapflow.cli import cli
+    import leapflow.cli.commands.daemon as daemon_module
+
+    captured = {}
+
+    def fake_cmd_daemon(args):
+        captured["action"] = args.daemon_action
+        return 0
+
+    monkeypatch.setattr(daemon_module, "cmd_daemon", fake_cmd_daemon)
+
+    assert cli.main(["daemon", "restart"]) == 0
+    assert captured == {"action": "restart"}
+
+
+@pytest.mark.asyncio
+async def test_daemon_tui_exit_prompt_stops_by_default(monkeypatch, tmp_path) -> None:
+    from leapflow.cli.commands import interactive as interactive_module
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    class Client:
+        async def status(self):
+            return {"pid": 1234}
+
+    class Console:
+        def __init__(self) -> None:
+            self.systems: list[str] = []
+            self.warnings: list[str] = []
+
+        def system(self, message: str) -> None:
+            self.systems.append(message)
+
+        def warning(self, message: str) -> None:
+            self.warnings.append(message)
+
+    class Settings:
+        profile_dir = tmp_path
+
+    async def yes(prompt: str) -> bool:
+        return True
+
+    def record_signal(run_dir, sig):
+        calls.append((run_dir, sig))
+        return True
+
+    calls = []
+    monkeypatch.setattr(interactive_module, "_ask_yes_no_default_yes", yes)
+    monkeypatch.setattr(lifecycle_module, "send_signal", record_signal)
+    console = Console()
+
+    await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
+
+    assert calls
+    assert "Sent SIGTERM" in console.systems[-1]
+
+
+@pytest.mark.asyncio
+async def test_daemon_tui_exit_prompt_can_keep_daemon(monkeypatch, tmp_path) -> None:
+    from leapflow.cli.commands import interactive as interactive_module
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    class Client:
+        async def status(self):
+            return {"pid": 1234}
+
+    class Console:
+        def __init__(self) -> None:
+            self.systems: list[str] = []
+            self.warnings: list[str] = []
+
+        def system(self, message: str) -> None:
+            self.systems.append(message)
+
+        def warning(self, message: str) -> None:
+            self.warnings.append(message)
+
+    class Settings:
+        profile_dir = tmp_path
+
+    def fail_send_signal(*args, **kwargs):
+        raise AssertionError("daemon should be kept running")
+
+    async def no(prompt: str) -> bool:
+        return False
+
+    monkeypatch.setattr(interactive_module, "_ask_yes_no_default_yes", no)
+    monkeypatch.setattr(lifecycle_module, "send_signal", fail_send_signal)
+    console = Console()
+
+    await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
+
+    assert any("kept running" in message for message in console.systems)
+
+
 def test_leap_prompt_uses_daemon_chat_route(monkeypatch) -> None:
     from leapflow.cli import cli
 
