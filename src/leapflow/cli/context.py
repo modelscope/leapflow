@@ -69,25 +69,83 @@ from leapflow.platform.normalizer import EventNormalizer
 logger = logging.getLogger(__name__)
 
 
-class _InteractiveApprovalGate:
-    """CLI-mode interactive approval for dangerous shell commands."""
+class _TUIApprovalGate:
+    """Rich-styled approval gate for the interactive TUI.
+
+    Displays a styled panel with the action details and accepts:
+    - ``y``/``yes`` → allow this one time
+    - ``a``/``always`` → allow and skip future prompts for this category
+    - ``n``/``no``/Enter → deny
+
+    Implements both ``ApprovalGate`` (unified) and ``CommandApprovalGate``
+    (backward-compatible with ``shell_tools.py``).
+    """
+
+    _CATEGORY_LABELS = {
+        "shell_dangerous": ("Shell Command", "yellow"),
+        "file_write": ("File Write", "yellow"),
+        "gateway_send": ("External Message", "cyan"),
+    }
+
+    async def request_approval(
+        self, request: "ApprovalRequest",
+    ) -> "ApprovalDecision":
+        from leapflow.security.approval import ApprovalDecision
+
+        if not sys.stdin.isatty():
+            return ApprovalDecision.DENY
+
+        label, color = self._CATEGORY_LABELS.get(
+            request.category, ("Action", "yellow"),
+        )
+
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            from rich.text import Text
+
+            console = Console(stderr=True, highlight=False)
+            body = Text()
+            body.append(f"  {request.detail}\n\n", style="bold")
+            body.append("  [y]es  — allow once\n", style="dim")
+            body.append("  [a]lways — allow for this session\n", style="dim")
+            body.append("  [n]o / Enter — deny\n", style="dim")
+            console.print(Panel(
+                body,
+                title=f"[bold {color}]⚠ {label} Approval[/]",
+                border_style=color,
+                padding=(0, 1),
+            ))
+            sys.stderr.write("  → ")
+            sys.stderr.flush()
+        except ImportError:
+            sys.stderr.write(f"⚠ {label}: {request.detail}\n")
+            sys.stderr.write("Approve? [y/a(lways)/N]: ")
+            sys.stderr.flush()
+
+        try:
+            answer = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: input().strip().lower(),
+            )
+        except (EOFError, KeyboardInterrupt):
+            return ApprovalDecision.DENY
+
+        if answer in ("a", "always"):
+            return ApprovalDecision.ALLOW_SESSION
+        if answer in ("y", "yes"):
+            return ApprovalDecision.ALLOW
+        return ApprovalDecision.DENY
 
     async def check(self, command: str) -> bool:
-        if not sys.stdin.isatty():
-            return False
-        try:
-            if sys.stderr.isatty():
-                sys.stderr.write(f"\033[33m⚠ Dangerous command: {command}\033[0m\n")
-            else:
-                sys.stderr.write(f"WARNING: Dangerous command: {command}\n")
-            sys.stderr.write("Approve? [y/N]: ")
-            sys.stderr.flush()
-            answer = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: input().strip().lower()
-            )
-            return answer in ("y", "yes")
-        except (EOFError, KeyboardInterrupt):
-            return False
+        """``CommandApprovalGate`` compatibility — shell_tools calls this."""
+        from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+
+        decision = await self.request_approval(ApprovalRequest(
+            category="shell_dangerous",
+            detail=command,
+            risk_hint=0.7,
+        ))
+        return decision in (ApprovalDecision.ALLOW, ApprovalDecision.ALLOW_SESSION)
 
 
 def _default_recording_profile(settings: Settings) -> Optional["RecordingProfile"]:
@@ -1087,6 +1145,7 @@ class Context:
             GatewaySessionEnded,
         )
         from leapflow.tools.registry_bootstrap import set_gateway_server
+        from leapflow.tools.gateway_tool import set_gateway_approval_gate
 
         async def _on_gateway_event(event: object) -> None:
             """Bridge gateway events to episodic memory and logging."""
@@ -1126,6 +1185,7 @@ class Context:
         )
         self.gateway_server.discover_manifests()
         set_gateway_server(self.gateway_server)
+        set_gateway_approval_gate(self._approval_gate)
 
         async def _gateway_send(source: Any, text: str) -> None:
             await self.gateway_server.send_reply(source, text)
@@ -1229,12 +1289,16 @@ class Context:
         except Exception:
             logger.debug("MCP Manager initialization skipped", exc_info=True)
 
-        # ── Wire Approval Gate for shell dangerous commands ──
+        # ── Unified approval gate (shell, file, gateway) ──
+        from leapflow.security.approval import SessionAwareGate
+
+        self._tui_approval = _TUIApprovalGate()
+        self._approval_gate = SessionAwareGate(self._tui_approval)
+
         try:
             from leapflow.tools.shell_tools import set_approval_gate
-
-            set_approval_gate(_InteractiveApprovalGate())
-            logger.debug("Shell approval gate: interactive CLI mode")
+            set_approval_gate(self._approval_gate)
+            logger.debug("Shell approval gate: unified TUI mode")
         except Exception:
             logger.debug("Shell approval gate setup skipped", exc_info=True)
 
@@ -1340,15 +1404,18 @@ class Context:
         # ── Wire Smart Approval (auxiliary LLM for command risk) ──
         if self.auxiliary is not None:
             try:
-                from leapflow.tools.shell_tools import CommandApprovalGate
                 aux = self.auxiliary
 
                 class _SmartApprovalGate:
-                    """LLM-assisted approval for dangerous commands.
+                    """LLM-assisted approval that auto-approves low-risk commands.
 
-                    Low-risk commands (score < 0.3) are auto-approved.
-                    Medium-risk prompts the user. High-risk always prompts.
+                    Uses the auxiliary LLM to score risk (0.0–1.0).
+                    Low-risk (< 0.3) auto-approved; others prompt via TUI gate.
+                    Wraps the unified approval gate — session memory still works.
                     """
+                    def __init__(self, delegate: Any) -> None:
+                        self._delegate = delegate
+
                     async def check(self, command: str) -> bool:
                         try:
                             risk = await aux.classify_risk(command)
@@ -1357,10 +1424,10 @@ class Context:
                         if risk < 0.3:
                             logger.debug("smart_approval: auto-approved (risk=%.2f)", risk)
                             return True
-                        return await _InteractiveApprovalGate().check(command)
+                        return await self._delegate.check(command)
 
                 from leapflow.tools.shell_tools import set_approval_gate
-                set_approval_gate(_SmartApprovalGate())
+                set_approval_gate(_SmartApprovalGate(self._approval_gate))
                 logger.debug("Smart approval gate enabled (auxiliary LLM)")
             except Exception:
                 logger.debug("Smart approval setup skipped", exc_info=True)
@@ -1368,38 +1435,41 @@ class Context:
         # ── Wire File Write Approval Gate ──
         try:
             from leapflow.tools.registry_bootstrap import set_file_write_gate
+            from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+
+            _SAFE_EXTENSIONS = frozenset({
+                ".tmp", ".log", ".txt", ".md", ".json", ".yaml", ".yml",
+                ".csv", ".tsv",
+            })
+            approval_gate = self._approval_gate
 
             class _FileWriteGate:
-                """Interactive approval for file writes to important paths."""
-                _APPROVE_EXTENSIONS = frozenset({
-                    ".tmp", ".log", ".txt", ".md", ".json", ".yaml", ".yml",
-                    ".csv", ".tsv",
-                })
+                """File write approval via the unified gate.
+
+                Auto-approves safe extensions and small writes; delegates
+                everything else to the session-aware approval gate.
+                """
                 async def check(self, path: str, content: str) -> bool:
                     from pathlib import Path as _P
                     p = _P(path)
-                    if p.suffix.lower() in self._APPROVE_EXTENSIONS:
+                    if p.suffix.lower() in _SAFE_EXTENSIONS:
                         return True
                     if len(content) < 500:
                         return True
-                    if not sys.stdin.isatty():
-                        return True
-                    if sys.stderr.isatty():
-                        sys.stderr.write(f"\033[33m⚠ File write: {p.name} ({len(content)} chars)\033[0m\n")
-                    else:
-                        sys.stderr.write(f"WARNING: File write: {p.name} ({len(content)} chars)\n")
-                    sys.stderr.write("Approve? [Y/n]: ")
-                    sys.stderr.flush()
-                    try:
-                        answer = await asyncio.get_running_loop().run_in_executor(
-                            None, lambda: input().strip().lower()
-                        )
-                        return answer in ("", "y", "yes")
-                    except (EOFError, KeyboardInterrupt):
-                        return False
+                    decision = await approval_gate.request_approval(
+                        ApprovalRequest(
+                            category="file_write",
+                            detail=f"{p.name} ({len(content)} chars)",
+                            risk_hint=0.4,
+                        ),
+                    )
+                    return decision in (
+                        ApprovalDecision.ALLOW,
+                        ApprovalDecision.ALLOW_SESSION,
+                    )
 
             set_file_write_gate(_FileWriteGate())
-            logger.debug("File write approval gate enabled")
+            logger.debug("File write approval gate: unified")
         except Exception:
             logger.debug("File write gate setup skipped", exc_info=True)
 

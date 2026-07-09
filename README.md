@@ -548,6 +548,54 @@ Environment variables take precedence over values stored in `gateway.yaml`.
 
 ---
 
+## Safety & Approval
+
+LeapFlow enforces a **layered safety architecture** that balances autonomy with human oversight. The goal is minimal interruption — the agent asks for permission only when an action carries real consequences.
+
+### Multi-Layer Defense
+
+```
+               ┌───────────────────────────────┐
+               │    Hardline Block (always)     │  rm -rf /, mkfs, fork bomb
+               ├───────────────────────────────┤
+               │    Dangerous Detection         │  sudo, chmod, kill -9 ...
+               │    → Approval Gate (prompt)    │  [y]es / [a]lways / [n]o
+               ├───────────────────────────────┤
+               │    Safe Path / Size Bypass     │  .md, .json, < 500 chars
+               ├───────────────────────────────┤
+               │    Output Redaction            │  Secrets stripped from results
+               ├───────────────────────────────┤
+               │    Untrusted Result Wrapping   │  MCP/web tool output delimited
+               └───────────────────────────────┘
+```
+
+### Approval System
+
+| Feature | Behavior |
+|---------|----------|
+| **Unified Gate** | A single `ApprovalGate` protocol handles shell commands, file writes, and outbound messages — swappable for TUI, Web UI, or CI modes. |
+| **Session Memory** | Choose **[a]lways** once and the same category won't prompt again for the rest of the session. |
+| **Per-Category Scoping** | Shell commands, file writes, and each gateway platform are tracked independently. |
+| **Smart Approval** | When an auxiliary LLM is configured, low-risk commands (risk < 0.3) are auto-approved; medium/high-risk still prompt. |
+| **Fail-Closed** | In non-interactive environments (pipes, CI), all dangerous actions are denied by default. |
+| **Rich TUI Display** | Approval prompts render as styled panels in the terminal — not raw text — with full action detail. |
+| **Gateway Send** | First outbound message to each platform requires explicit approval; subsequent sends are auto-approved for the session. |
+| **Audit Trail** | Every approval decision (allow/deny/session) is logged with timestamp and category. |
+
+### What Gets Approved
+
+| Action | Default | Approval Needed? |
+|--------|---------|-----------------|
+| Safe shell commands (`ls`, `cat`, `git status`) | Auto-execute | No |
+| Dangerous shell (`sudo`, `rm -r`, `kill -9`) | Prompt | Yes (once per session) |
+| Destructive shell (`rm -rf /`, `mkfs`) | Always blocked | Cannot override |
+| File write (`.md`, `.json`, small files) | Auto-approve | No |
+| File write (large, non-safe extensions) | Prompt | Yes (once per session) |
+| Gateway send (first message to platform) | Prompt | Yes (once per platform per session) |
+| Gateway inbound (external messages) | Restricted tools | Only safe read-only tools |
+
+---
+
 ## Workflow Copilot (Preview)
 
 LeapFlow includes a **Workflow Copilot** that predicts your next action and offers proactive suggestions — like GitHub Copilot, but for any workflow on your computer.

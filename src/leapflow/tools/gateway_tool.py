@@ -16,12 +16,19 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 _gateway_server_ref: Any = None
+_approval_gate: Any = None
 
 
 def set_gateway_server(server: Any) -> None:
     """Install ``GatewayServer`` reference for tool dispatch (late-bound)."""
     global _gateway_server_ref
     _gateway_server_ref = server
+
+
+def set_gateway_approval_gate(gate: Any) -> None:
+    """Install approval gate for outbound messaging (late-bound)."""
+    global _approval_gate
+    _approval_gate = gate
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -258,6 +265,8 @@ async def gateway_send_handler(params: Dict[str, Any]) -> Dict[str, Any]:
 
     Enables the agent to proactively message any connected platform
     conversation (e.g. post to a Feishu group, reply in a Telegram chat).
+
+    First use per platform requires user approval (session-scoped).
     """
     if _gateway_server_ref is None:
         return {"ok": False, "error": "Gateway not initialised"}
@@ -272,6 +281,22 @@ async def gateway_send_handler(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "chat_id is required"}
     if not text:
         return {"ok": False, "error": "text is required"}
+
+    if _approval_gate is not None:
+        try:
+            from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+
+            preview = text[:80] + ("…" if len(text) > 80 else "")
+            decision = await _approval_gate.request_approval(ApprovalRequest(
+                category=f"gateway_send:{platform}",
+                detail=f"Send to {platform}/{chat_id}: {preview}",
+                risk_hint=0.5,
+                metadata={"platform": platform, "chat_id": chat_id},
+            ))
+            if decision == ApprovalDecision.DENY:
+                return {"ok": False, "error": "Outbound message denied by approval gate"}
+        except Exception:
+            logger.debug("gateway_send approval check failed", exc_info=True)
 
     return await _gateway_server_ref.send_message(
         platform,
