@@ -518,9 +518,10 @@ async def cmd_interactive_daemon(
     turn_count = 0
     runtime_model_name = str(getattr(settings, "llm_model", ""))
     runtime_context_length = int(getattr(settings, "llm_context_length", 0) or 0)
+    runtime_context_used = 0
 
     def _apply_daemon_runtime_metadata(metadata: dict[str, Any]) -> None:
-        nonlocal active_session_id, runtime_model_name, runtime_context_length
+        nonlocal active_session_id, runtime_model_name, runtime_context_length, runtime_context_used
         if metadata.get("session_id"):
             active_session_id = str(metadata["session_id"])
         if metadata.get("model"):
@@ -532,6 +533,11 @@ async def cmd_interactive_daemon(
                 runtime_context_length = max(1, int(metadata["llm_context_length"]))
             except (TypeError, ValueError):
                 pass
+        if metadata.get("context_used") is not None:
+            try:
+                runtime_context_used = max(0, int(metadata["context_used"]))
+            except (TypeError, ValueError):
+                pass
 
     def _update_status() -> None:
         status.update(
@@ -540,7 +546,7 @@ async def cmd_interactive_daemon(
             platform_online=True,
             model_name=runtime_model_name,
             session_turns=turn_count,
-            context_used=0,
+            context_used=runtime_context_used,
             context_max=runtime_context_length,
         )
         app.prompt_mode = "daemon"
@@ -587,9 +593,13 @@ async def cmd_interactive_daemon(
         context_length = daemon_status.get("llm_context_length")
         if context_length:
             console.system(f"Context budget: {int(context_length):,} tokens")
+        context_used = daemon_status.get("context_used")
+        if context_used is not None:
+            console.system(f"Context used: {int(context_used):,} tokens")
 
     async def _stream_response(prompt_text: str) -> None:
-        nonlocal active_session_id, turn_count, runtime_model_name, runtime_context_length
+        nonlocal active_session_id, turn_count, runtime_model_name
+        nonlocal runtime_context_length, runtime_context_used
         exit_stats.record_user_message()
         status.mark_turn_start()
         app.agent_running = True

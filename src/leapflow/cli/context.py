@@ -1380,8 +1380,9 @@ class Context:
                     event.session_key,
                     len(event.text),
                 )
-                if self.imm is not None:
-                    self.imm.ingest(
+                episodic = self.memory.get_provider("episodic")
+                if episodic is not None and hasattr(episodic, "ingest"):
+                    episodic.ingest(
                         "gateway.message",
                         f"[{event.source.platform}:{event.source.user_name or event.source.user_id}] "
                         f"{event.text[:500]}",

@@ -29,10 +29,9 @@ import hashlib
 import logging
 import os
 import re
-import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from leapflow.memory.protocol import (
     MemoryEntry,
@@ -70,12 +69,20 @@ def _workspace_hash(workspace_path: str) -> str:
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    """Write with advisory file lock for multi-process safety."""
+    """Write text atomically under a dedicated advisory lock."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        _write_text_unlocked(path, content)
+
+
+def _write_text_unlocked(path: Path, content: str) -> None:
+    """Replace a file atomically. Caller must hold the file lock."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
@@ -83,6 +90,19 @@ def _atomic_write(path: Path, content: str) -> None:
     except OSError:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _locked_update(path: Path, update: Callable[[str], str]) -> str:
+    """Run read-modify-write under one lock and return the final content."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    with open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        current = _read_text(path) or _MEMORY_HEADER
+        updated = update(current)
+        if updated != current:
+            _write_text_unlocked(path, updated)
+        return updated
 
 
 def _read_text(path: Path) -> str:
@@ -154,29 +174,25 @@ class NarrativeProvider:
             else self._global_dir
         )
         index_path = target_dir / "MEMORY.md"
-        content = _read_text(index_path) or _MEMORY_HEADER
 
         section_header = f"## {section_name}"
         bullet = f"- {entry.content.strip()}"
 
-        if section_header in content:
-            # Avoid duplicates
-            if bullet in content:
-                return entry.entry_id
-            # Append to existing section (before next ## or EOF)
-            parts = content.split(section_header, 1)
-            after = parts[1]
-            next_section = after.find("\n## ")
-            if next_section == -1:
-                content = parts[0] + section_header + after.rstrip() + "\n" + bullet + "\n"
-            else:
+        def _append_if_missing(content: str) -> str:
+            if section_header in content:
+                if bullet in content:
+                    return content
+                parts = content.split(section_header, 1)
+                after = parts[1]
+                next_section = after.find("\n## ")
+                if next_section == -1:
+                    return parts[0] + section_header + after.rstrip() + "\n" + bullet + "\n"
                 before_next = after[:next_section].rstrip()
                 rest = after[next_section:]
-                content = parts[0] + section_header + before_next + "\n" + bullet + "\n" + rest
-        else:
-            content = content.rstrip() + "\n\n" + section_header + "\n" + bullet + "\n"
+                return parts[0] + section_header + before_next + "\n" + bullet + "\n" + rest
+            return content.rstrip() + "\n\n" + section_header + "\n" + bullet + "\n"
 
-        _atomic_write(index_path, content)
+        _locked_update(index_path, _append_if_missing)
         logger.debug("narrative: inserted %s into %s/%s", entry.entry_id, scope, section_name)
 
         # Long entries also get a topic file for detail

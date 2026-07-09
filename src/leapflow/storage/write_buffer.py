@@ -125,8 +125,15 @@ class WriteBuffer:
                 execute_with_retry(self._conn, sql, params)
                 flushed += 1
             except Exception as exc:
-                logger.warning("write_buffer: flush failed for %s: %s", tag, exc)
-                remaining.append((tag, sql, params))
+                if is_lock_error(exc):
+                    logger.warning("write_buffer: transient flush failed for %s: %s", tag, exc)
+                    remaining.append((tag, sql, params))
+                    continue
+                logger.error(
+                    "write_buffer: dropping permanent failed op %s: %s",
+                    tag,
+                    exc,
+                )
 
         self._buffer = remaining
         self._last_flush = time.monotonic()

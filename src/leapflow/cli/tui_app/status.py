@@ -19,10 +19,12 @@ from leapflow.cli.tui_app.theme import ResolvedTheme, Theme, detect_theme
 
 
 def _compact_tokens(n: int) -> str:
-    """Format token count: ``12.4K``, ``128K``, ``1.2M``."""
+    """Format token count: ``0.2K``, ``12K``, ``1.2M``."""
     if n < 0:
         return "?"
-    if n < 1_000:
+    if n == 0:
+        return "0"
+    if n < 100:
         return str(n)
     if n < 10_000:
         return f"{n / 1000:.1f}K"
@@ -43,10 +45,23 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}h{mins}m" if mins else f"{hours}h"
 
 
-def _progress_bar(pct: int, width: int = 10) -> str:
+def _progress_bar(pct: float, width: int = 10) -> str:
     """Unicode progress bar: ``████░░░░░░``."""
     filled = int(pct / 100 * width)
+    if pct > 0 and filled == 0:
+        filled = 1
+    filled = min(filled, width)
     return "█" * filled + "░" * (width - filled)
+
+
+def _format_percent(used: int, total: int) -> str:
+    """Format utilization percentage with useful precision at low values."""
+    if total <= 0:
+        return "0%"
+    pct = max(0.0, min(used * 100 / total, 100.0))
+    if 0 < pct < 10:
+        return f"{pct:.1f}%"
+    return f"{int(pct)}%"
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -122,9 +137,10 @@ class StatusBar:
         if self.context_max > 0:
             used = _compact_tokens(self.context_used)
             total = _compact_tokens(self.context_max)
-            pct = min(int(self.context_used * 100 / self.context_max), 100)
+            pct = min(self.context_used * 100 / self.context_max, 100.0)
+            pct_text = _format_percent(self.context_used, self.context_max)
             if narrow:
-                parts.append(("class:status-bar", f"{pct}% "))
+                parts.append(("class:status-bar", f"{pct_text} "))
             else:
                 parts.append(("class:status-bar", f"{used}/{total} "))
                 parts.append(("class:status-bar.dim", "│ "))
@@ -135,11 +151,11 @@ class StatusBar:
                 elif pct >= 75:
                     bar_cls = "class:status-bar.warn"
                 if compact:
-                    parts.append(("class:status-bar", f"{pct}% "))
+                    parts.append(("class:status-bar", f"{pct_text} "))
                 else:
                     bar = _progress_bar(pct)
                     parts.append((bar_cls, f"[{bar}] "))
-                    parts.append(("class:status-bar", f"{pct}% "))
+                    parts.append(("class:status-bar", f"{pct_text} "))
             parts.append(("class:status-bar.dim", "│ "))
 
         elapsed = time.monotonic() - self._session_start

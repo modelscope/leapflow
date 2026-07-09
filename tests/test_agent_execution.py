@@ -198,6 +198,46 @@ async def test_engine_remembers_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_streaming_engine_estimates_context_tokens_without_provider_usage() -> None:
+    """Streaming providers often omit usage; status still needs prompt utilization."""
+    from leapflow.llm.base import LLMChatResponse, LLMProvider
+    from leapflow.platform.mock import MockBridge
+
+    class StreamingOnlyLLM(LLMProvider):
+        async def achat(self, messages, *, stream=True, enable_thinking=False, on_chunk=None, **kwargs):
+            return LLMChatResponse(content="fallback")
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            yield "streamed answer"
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        settings = settings.__class__(
+            **{
+                **settings.__dict__,
+                "stream_output": True,
+                "native_tool_calling_enabled": False,
+            }
+        )
+        rpc = MockBridge()
+        llm = StreamingOnlyLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            events = [event async for event in engine.run_stream("Summarize a long conversation")]
+
+            assert any(event.type == "final" for event in events)
+            assert engine.context_token_count > 0
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
 async def test_immediate_memory_integration() -> None:
     """EpisodicMemoryProvider fragments surface in memory_recent responses."""
     with tempfile.TemporaryDirectory() as td:

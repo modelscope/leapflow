@@ -189,6 +189,7 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
         assert first.metadata == {
             "llm_model": service.context.settings.llm_model,
             "llm_context_length": 700_000,
+            "context_used": 0,
         }
         assert service.context.settings.llm_api_key == "sk-daemon-hot-reload"
         assert service.context.settings.llm_context_length == 700_000
@@ -202,6 +203,56 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
         if stream is not None:
             await stream.aclose()
         await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_service_serializes_engine_chat_streams(tmp_path) -> None:
+    from conftest import make_settings
+    from leapflow.daemon.service import RuntimeLeapService
+    from leapflow.engine import StreamEvent
+
+    class SlowEngine:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.context_token_count = 2_048
+            self._current_session_id = "sess-daemon"
+
+        async def run_stream(self, message: str, *, enable_thinking: bool = False):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                yield StreamEvent(type="chunk", content=f"start:{message}")
+                await asyncio.sleep(0.05)
+                yield StreamEvent(type="final", content=f"done:{message}")
+            finally:
+                self.active -= 1
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.engine = SlowEngine()
+
+        def reload_runtime_config_if_changed(self) -> bool:
+            return False
+
+    settings = make_settings(str(tmp_path))
+    service = RuntimeLeapService(settings, mock_host=True)
+    context = FakeContext()
+    service._ctx = context
+
+    async def collect(message: str) -> list:
+        return [event async for event in service.engine_chat(message)]
+
+    first, second = await asyncio.gather(collect("one"), collect("two"))
+    status = await service.status()
+
+    assert [event.content for event in first] == ["start:one", "done:one"]
+    assert [event.content for event in second] == ["start:two", "done:two"]
+    assert first[0].metadata["context_used"] == 2_048
+    assert first[0].metadata["session_id"] == "sess-daemon"
+    assert second[0].metadata["context_used"] == 2_048
+    assert status["context_used"] == 2_048
+    assert context.engine.max_active == 1
 
 
 @pytest.mark.asyncio

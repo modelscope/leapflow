@@ -210,17 +210,27 @@ class GatewayServer:
         for pid in config.auto_connect:
             manifest = self._manifests.get(pid)
             pc = config.platforms.get(pid)
-            if manifest and pc and pc.enabled:
+            if not (manifest and pc and pc.enabled):
+                continue
+            try:
                 creds = self._config_store.load_platform_credentials(
                     pid, manifest,
                 )
-                if creds:
-                    result = await self.connect_platform(
-                        pid, creds, pc.options,
-                        is_reconnect=True,
-                    )
-                    if result.get("ok"):
-                        connected += 1
+                if not creds:
+                    continue
+                result = await self.connect_platform(
+                    pid, creds, pc.options,
+                    is_reconnect=True,
+                )
+                if result.get("ok"):
+                    connected += 1
+            except Exception as exc:
+                logger.warning(
+                    "gateway.auto_connect_failed platform=%s error=%s",
+                    pid,
+                    exc,
+                    exc_info=True,
+                )
         self._started = True
         return connected
 
@@ -367,12 +377,15 @@ class GatewayServer:
         assert manifest.adapter is not None
         try:
             module = importlib.import_module(manifest.adapter.module)
-        except ImportError:
+        except ImportError as exc:
             deps = manifest.adapter.dependencies
-            if deps:
+            missing_name = getattr(exc, "name", "") or ""
+            module_name = manifest.adapter.module
+            module_missing = missing_name == module_name or module_name.startswith(f"{missing_name}.")
+            if deps and module_missing:
                 hint = f"pip install {' '.join(deps)}"
                 raise ImportError(
-                    f"Adapter module '{manifest.adapter.module}' not found.  "
+                    f"Adapter module '{module_name}' not found.  "
                     f"Install dependencies: {hint}",
                 ) from None
             raise

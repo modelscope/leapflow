@@ -60,6 +60,45 @@ from leapflow.skills.registry import Skill, SkillRegistry
 logger = logging.getLogger(__name__)
 
 
+def _estimate_text_tokens(text: str) -> int:
+    """Approximate token count for status display when provider usage is absent."""
+    if not text:
+        return 0
+    cjk_count = sum(
+        1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u303f"
+    )
+    latin_chars = len(text) - cjk_count
+    return max(1, cjk_count + latin_chars // 4)
+
+
+def _estimate_message_tokens(message: Dict[str, Any]) -> int:
+    """Approximate chat-message token cost, including small role overhead."""
+    content = message.get("content", "")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                elif "text" in item:
+                    parts.append(str(item.get("text", "")))
+                else:
+                    parts.append(str(item))
+            else:
+                parts.append(str(item))
+        content = "\n".join(parts)
+    elif not isinstance(content, str):
+        content = str(content)
+    return 6 + _estimate_text_tokens(content)
+
+
+def _estimate_prompt_tokens(messages: List[Dict[str, Any]]) -> int:
+    """Approximate prompt token count for the exact message batch sent to the LLM."""
+    if not messages:
+        return 0
+    return max(1, sum(_estimate_message_tokens(msg) for msg in messages) + 3)
+
+
 def _log_progress(msg: str) -> None:
     """Print a persistent progress line to stderr (visible to user during `leap run`)."""
     if sys.stderr.isatty():
@@ -1149,6 +1188,7 @@ class AgentEngine:
             compressed = self._compressor.preflight_check(compressed)
             if self._cache_strategy:
                 compressed = self._cache_strategy.optimize(compressed)
+            self._last_context_tokens = _estimate_prompt_tokens(compressed)
 
             _show_progress("thinking", f"round {budget.used}")
             try:
@@ -1502,6 +1542,7 @@ class AgentEngine:
             compressed = self._compressor.preflight_check(compressed)
             if self._cache_strategy:
                 compressed = self._cache_strategy.optimize(compressed)
+            self._last_context_tokens = _estimate_prompt_tokens(compressed)
 
             yield StreamEvent(type="thinking", content=f"round {budget.used}")
 

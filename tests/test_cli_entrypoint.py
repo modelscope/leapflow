@@ -83,6 +83,18 @@ def test_visual_track_defaults_off_without_env(monkeypatch, tmp_path) -> None:
     assert settings.llm_context_length == DEFAULT_LLM_CONTEXT_LENGTH
 
 
+def test_profile_name_rejects_path_traversal(monkeypatch, tmp_path) -> None:
+    from leapflow.config import _build_settings_from_env
+
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LEAPFLOW_PROFILE", "../../escape")
+
+    with pytest.raises(ValueError, match="Invalid LEAPFLOW_PROFILE"):
+        _build_settings_from_env()
+
+    assert not (tmp_path.parent / "escape").exists()
+
+
 def test_context_length_is_exposed_in_env_templates() -> None:
     from leapflow.config import DEFAULT_LLM_CONTEXT_LENGTH
     from leapflow._env_template import ENV_TEMPLATE

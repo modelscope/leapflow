@@ -167,3 +167,21 @@ def test_status_bar_compacts_on_narrow_terminal(monkeypatch) -> None:
     assert "very-long-model" not in rendered
     assert "50%" in rendered
     assert "[" not in rendered
+
+
+def test_status_bar_shows_fractional_k_for_small_context_usage(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "leapflow.cli.tui_app.status.shutil.get_terminal_size",
+        lambda: terminal_size((120, 24)),
+    )
+    status = StatusBar(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    status.update(
+        model_name="qwen3.7-plus",
+        context_used=240,
+        context_max=256_000,
+    )
+
+    rendered = "".join(text for _, text in status())
+    assert "0.2K/256K" in rendered
+    assert "0.1%" in rendered
+    assert "[█░░░░░░░░░]" in rendered

@@ -35,14 +35,22 @@ class SessionKey:
     user_id: str = ""
 
     def __post_init__(self) -> None:
-        for field_val in (self.profile, self.platform, self.chat_id):
+        for field_name in ("profile", "platform", "chat_type", "chat_id", "thread_id", "user_id"):
+            value = getattr(self, field_name)
+            normalized = "" if value is None else str(value)
+            object.__setattr__(self, field_name, normalized)
+
+        for field_name in ("profile", "platform", "chat_type", "chat_id", "thread_id", "user_id"):
+            field_val = getattr(self, field_name)
+            if not field_val:
+                continue
             if any(c in field_val for c in _SINGLE_CHAR_UNSAFE):
                 raise ValueError(
-                    f"Unsafe characters in session key field: {field_val!r}",
+                    f"Unsafe characters in session key field {field_name}: {field_val!r}",
                 )
             if any(sub in field_val for sub in _SUBSTRING_UNSAFE):
                 raise ValueError(
-                    f"Unsafe substring in session key field: {field_val!r}",
+                    f"Unsafe substring in session key field {field_name}: {field_val!r}",
                 )
 
     def __str__(self) -> str:

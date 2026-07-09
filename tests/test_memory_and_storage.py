@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+import duckdb
 
 from leapflow.domain.trajectory import (
     ActionType,
@@ -59,6 +60,22 @@ def test_connection_holder_uses_volatile_duckdb_when_primary_is_locked(
         holder.close()
 
     assert volatile_path.exists() is False
+
+
+def test_write_buffer_drops_permanent_failures(tmp_path) -> None:
+    from leapflow.storage.write_buffer import WriteBuffer
+
+    db_path = tmp_path / "buffer.duckdb"
+    conn = duckdb.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY)")
+        buffer = WriteBuffer(conn, max_count=10)
+        buffer.append("bad-sql", "INSERT INTO missing_table VALUES (?)", [1])
+
+        assert buffer.flush() == 0
+        assert buffer.pending == 0
+    finally:
+        conn.close()
 
 
 # ── Working memory ─────────────────────────────────────────────────

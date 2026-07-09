@@ -1,6 +1,7 @@
 """Runtime-backed LeapService implementation for leapd."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -21,6 +22,7 @@ class RuntimeLeapService:
         self._settings = settings
         self._mock_host = mock_host
         self._ctx: Any | None = None
+        self._engine_lock = asyncio.Lock()
         self._started_at = time.time()
         self._client_count: Callable[[], int] = lambda: 0
 
@@ -77,26 +79,28 @@ class RuntimeLeapService:
         return {"found": found, "session_id": str(current or session_id)}
 
     async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
-        ctx = self.context
-        if ctx.reload_runtime_config_if_changed():
-            self._settings = ctx.settings
-            yield StreamChunk(
-                request_id="",
-                content="Configuration reloaded — LLM settings updated in leapd.",
-                event_type="status",
-                metadata={
-                    "llm_model": getattr(ctx.settings, "llm_model", ""),
-                    "llm_context_length": getattr(ctx.settings, "llm_context_length", 0),
-                },
-            )
-        engine = getattr(ctx, "engine", None)
-        if engine is None:
-            raise RuntimeError("leapd engine is not initialized")
+        async with self._engine_lock:
+            ctx = self.context
+            if ctx.reload_runtime_config_if_changed():
+                self._settings = ctx.settings
+                yield StreamChunk(
+                    request_id="",
+                    content="Configuration reloaded — LLM settings updated in leapd.",
+                    event_type="status",
+                    metadata={
+                        "llm_model": getattr(ctx.settings, "llm_model", ""),
+                        "llm_context_length": getattr(ctx.settings, "llm_context_length", 0),
+                        "context_used": getattr(getattr(ctx, "engine", None), "context_token_count", 0),
+                    },
+                )
+            engine = getattr(ctx, "engine", None)
+            if engine is None:
+                raise RuntimeError("leapd engine is not initialized")
 
-        enable_thinking = bool(kwargs.get("enable_thinking", False))
-        async for event in engine.run_stream(message, enable_thinking=enable_thinking):
-            stream_event = self._normalize_event(event)
-            yield self._chunk_from_event(stream_event)
+            enable_thinking = bool(kwargs.get("enable_thinking", False))
+            async for event in engine.run_stream(message, enable_thinking=enable_thinking):
+                stream_event = self._normalize_event(event)
+                yield self._chunk_from_event(stream_event)
 
     async def engine_cancel(self) -> bool:
         ctx = self.context
@@ -133,6 +137,7 @@ class RuntimeLeapService:
             "active_clients": max(0, self._client_count()),
             "model": getattr(settings, "llm_model", ""),
             "llm_context_length": getattr(settings, "llm_context_length", 0),
+            "context_used": getattr(engine, "context_token_count", 0) if engine is not None else 0,
             "session_id": str(getattr(engine, "_current_session_id", "") or ""),
         }
 
@@ -200,6 +205,8 @@ class RuntimeLeapService:
         session_id = getattr(engine, "_current_session_id", "") if engine else ""
         if session_id:
             metadata.setdefault("session_id", str(session_id))
+        if engine is not None:
+            metadata.setdefault("context_used", getattr(engine, "context_token_count", 0))
         return StreamChunk(
             request_id="",
             content=event.content,

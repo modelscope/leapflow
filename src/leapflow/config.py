@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -26,6 +27,17 @@ from leapflow.domain.trajectory import RecordingMode
 logger = logging.getLogger(__name__)
 
 DEFAULT_LLM_CONTEXT_LENGTH = 256_000
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_profile_name(profile: str) -> str:
+    """Return a safe profile name or raise before any path construction."""
+    normalized = (profile or "default").strip()
+    if not _PROFILE_NAME_RE.fullmatch(normalized):
+        raise ValueError(
+            "Invalid LEAPFLOW_PROFILE; use only letters, numbers, underscores, or dashes"
+        )
+    return normalized
 
 ALL_SIGNAL_CHANNELS = frozenset({
     "click", "app_switch", "clipboard", "clipboard_content",
@@ -63,6 +75,7 @@ def ensure_data_dir(data_dir: Path, *, profile: str = "default") -> None:
     Idempotent — safe to call on every startup. Creates both global
     directories and profile-specific directories under ``profiles/<profile>/``.
     """
+    profile = _validate_profile_name(profile)
     data_dir.mkdir(parents=True, exist_ok=True)
     for sub in _GLOBAL_SUBDIRS:
         (data_dir / sub).mkdir(parents=True, exist_ok=True)
@@ -505,7 +518,7 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     _data_dir = _expand_path(_data_dir_raw)
 
     # Bootstrap: create directory structure + default .env on first run.
-    _profile = os.getenv("LEAPFLOW_PROFILE", "default").strip()
+    _profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
     ensure_data_dir(_data_dir, profile=_profile)
     ensure_default_env(_data_dir)
 
@@ -545,7 +558,7 @@ def _build_settings_from_env() -> Settings:
     max_retries = int(os.getenv("LEAPFLOW_LLM_MAX_RETRIES", "3"))
 
     data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
-    profile = os.getenv("LEAPFLOW_PROFILE", "default").strip()
+    profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
     _profile_dir = data_dir / "profiles" / profile
 
     mock_host = os.getenv("LEAPFLOW_MOCK_HOST", "0").strip() in ("1", "true", "True", "yes")
