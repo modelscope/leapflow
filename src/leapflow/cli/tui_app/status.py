@@ -11,6 +11,7 @@ as the ``text`` argument to ``FormattedTextControl``.
 
 from __future__ import annotations
 
+import shutil
 import time
 from typing import Optional
 
@@ -48,6 +49,13 @@ def _progress_bar(pct: int, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def _truncate(text: str, limit: int) -> str:
+    """Return text truncated to a single-cell-safe display budget."""
+    if limit <= 1:
+        return "…"
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 class StatusBar:
     """Produces status-bar fragments for ``FormattedTextControl``.
 
@@ -81,48 +89,53 @@ class StatusBar:
     def __call__(self) -> list[tuple[str, str]]:
         """Called by FormattedTextControl on every Application redraw."""
         parts: list[tuple[str, str]] = []
+        width = shutil.get_terminal_size().columns
+        compact = width < 72
+        narrow = width < 52
 
         _modes = {
             "idle":      ("class:status-bar",     " ⚡ "),
             "learning":  ("class:status-bar.bad",  " ● "),
             "paused":    ("class:status-bar.warn", " ⏸ "),
             "executing": ("class:status-bar.good", " ▶ "),
+            "daemon":    ("class:status-bar.good", " ◆ "),
         }
         style, icon = _modes.get(self.mode, _modes["idle"])
         parts.append((style, icon))
 
-        if self.model_name:
-            display = self.model_name
-            if len(display) > 20:
-                display = display[:18] + "…"
+        if self.model_name and not narrow:
+            model_limit = 12 if compact else 20
+            display = _truncate(self.model_name, model_limit)
             parts.append(("class:status-bar.strong", f"{display} "))
             parts.append(("class:status-bar.dim", "│ "))
 
         if self.context_max > 0:
             used = _compact_tokens(self.context_used)
             total = _compact_tokens(self.context_max)
-            pct = (
-                min(int(self.context_used * 100 / self.context_max), 100)
-                if self.context_max
-                else 0
-            )
-            parts.append(("class:status-bar", f"{used}/{total} "))
-            parts.append(("class:status-bar.dim", "│ "))
+            pct = min(int(self.context_used * 100 / self.context_max), 100)
+            if narrow:
+                parts.append(("class:status-bar", f"{pct}% "))
+            else:
+                parts.append(("class:status-bar", f"{used}/{total} "))
+                parts.append(("class:status-bar.dim", "│ "))
 
-            bar_cls = "class:status-bar"
-            if pct >= 90:
-                bar_cls = "class:status-bar.bad"
-            elif pct >= 75:
-                bar_cls = "class:status-bar.warn"
-            bar = _progress_bar(pct)
-            parts.append((bar_cls, f"[{bar}] "))
-            parts.append(("class:status-bar", f"{pct}% "))
+                bar_cls = "class:status-bar"
+                if pct >= 90:
+                    bar_cls = "class:status-bar.bad"
+                elif pct >= 75:
+                    bar_cls = "class:status-bar.warn"
+                if compact:
+                    parts.append(("class:status-bar", f"{pct}% "))
+                else:
+                    bar = _progress_bar(pct)
+                    parts.append((bar_cls, f"[{bar}] "))
+                    parts.append(("class:status-bar", f"{pct}% "))
             parts.append(("class:status-bar.dim", "│ "))
 
         elapsed = time.monotonic() - self._session_start
         parts.append(("class:status-bar", f"{_format_duration(elapsed)} "))
 
-        if self.last_turn_elapsed > 0:
+        if self.last_turn_elapsed > 0 and not narrow:
             parts.append(("class:status-bar.dim", "│ "))
             if self.last_turn_elapsed < 1.0:
                 e_str = f"{self.last_turn_elapsed * 1000:.0f}ms"
@@ -130,8 +143,9 @@ class StatusBar:
                 e_str = f"{self.last_turn_elapsed:.1f}s"
             parts.append(("class:status-bar", f"⏲ {e_str} "))
 
-        parts.append(("class:status-bar.dim", "│ "))
-        parts.append(("class:status-bar.good", f"✓ {_format_duration(elapsed)} "))
+        if not compact:
+            parts.append(("class:status-bar.dim", "│ "))
+            parts.append(("class:status-bar.good", f"✓ {_format_duration(elapsed)} "))
 
         return parts
 

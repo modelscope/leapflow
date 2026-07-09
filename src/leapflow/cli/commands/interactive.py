@@ -170,6 +170,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
             context_length=ctx_len,
             mcp_tools=mcp_count,
             gateway_connected=_gateway_connected_names(),
+            theme=theme,
         )
         if storage_volatile:
             console.warning(
@@ -539,6 +540,7 @@ async def cmd_interactive_daemon(
             context_length=getattr(settings, "llm_context_length", 0),
             mcp_tools=0,
             gateway_connected=[],
+            theme=theme,
         )
         console.system("Daemon mode: chat/session persistence is shared across terminals.")
 

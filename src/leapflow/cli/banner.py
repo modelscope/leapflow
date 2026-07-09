@@ -15,6 +15,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
+from leapflow.cli.tui_app.theme import ResolvedTheme, Theme, detect_theme
 from leapflow.version import __version__
 
 VERSION = __version__
@@ -70,13 +71,38 @@ def _categorize_skills(
 
 # ── Rich banner (interactive REPL) ───────────────────────────────────
 
-# Warm gold/amber/bronze palette (inspired by Hermes, adapted for LeapFlow)
-_GOLD = "#FFD700"
-_AMBER = "#FFBF00"
-_BRONZE = "#CD7F32"
-_CREAM = "#FFF8DC"
-_DIM_GOLD = "#B8860B"
-_WARM_GRAY = "#8B8682"
+_MAX_PANEL_WIDTH = 132
+_NARROW_WIDTH = 70
+_MEDIUM_WIDTH = 100
+
+
+class _BannerPalette:
+    def __init__(self, theme: Theme | ResolvedTheme) -> None:
+        self.accent = theme.accent
+        self.accent_dim = theme.accent_dim
+        self.text = theme.text
+        self.muted = theme.text_muted
+        self.border = theme.border
+        self.title = theme.panel_title
+        self.success = theme.success
+
+
+def _trim(text: str, limit: int) -> str:
+    if limit <= 1:
+        return "…"
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _category_limit(width: int) -> int:
+    if width < _NARROW_WIDTH:
+        return 44
+    if width < _MEDIUM_WIDTH:
+        return 56
+    return 72
+
+
+def _render_width(term_width: int) -> int:
+    return max(40, min(term_width, _MAX_PANEL_WIDTH))
 
 
 def display_rich_banner(
@@ -91,8 +117,9 @@ def display_rich_banner(
     mcp_tools: int = 0,
     gateway_connected: Sequence[str] = (),
     show_welcome: bool = True,
+    theme: Theme | ResolvedTheme | None = None,
 ) -> None:
-    """Print the full-width Rich banner panel with tools/skills catalog."""
+    """Print the adaptive Rich banner panel with tools/skills catalog."""
     try:
         from rich.console import Console
         from rich.panel import Panel
@@ -101,21 +128,23 @@ def display_rich_banner(
         display_welcome()
         return
 
-    console = Console(highlight=False, soft_wrap=True)
+    palette = _BannerPalette(theme or detect_theme())
     term_width = shutil.get_terminal_size().columns
+    render_width = _render_width(term_width)
+    console = Console(highlight=False, soft_wrap=True, width=render_width)
 
     # ── Left column: branding + session metadata ──
     left_lines: list[str] = []
     left_lines.append(
-        f"[bold {_GOLD}]L[/] [dim {_DIM_GOLD}].[/] "
-        f"[bold {_GOLD}]E[/] [dim {_DIM_GOLD}].[/] "
-        f"[bold {_GOLD}]A[/] [dim {_DIM_GOLD}].[/] "
-        f"[bold {_GOLD}]P[/]"
+        f"[bold {palette.accent}]L[/] [{palette.accent_dim}].[/] "
+        f"[bold {palette.accent}]E[/] [{palette.accent_dim}].[/] "
+        f"[bold {palette.accent}]A[/] [{palette.accent_dim}].[/] "
+        f"[bold {palette.accent}]P[/]"
     )
-    left_lines.append(f"[{_CREAM}]Learning and Evolving from Actual Practice[/]")
-    left_lines.append(f"[bold {_AMBER}]ModelScope[/]")
+    left_lines.append(f"[{palette.text}]Learning and Evolving from Actual Practice[/]")
+    left_lines.append(f"[bold {palette.accent}]ModelScope[/]")
     if session_id:
-        left_lines.append(f"[{_WARM_GRAY}]Session: {session_id}[/]")
+        left_lines.append(f"[{palette.muted}]Session: {_trim(session_id, 24)}[/]")
     left_lines.append("")
 
     if model:
@@ -126,12 +155,12 @@ def display_rich_banner(
             ctx_label = f"{context_length // 1000}K"
         else:
             ctx_label = str(context_length)
-        ctx_str = f"  [dim {_DIM_GOLD}]({ctx_label} ctx)[/]" if context_length else ""
-        left_lines.append(f"[bold {_AMBER}]{model_short}[/]{ctx_str}")
+        ctx_str = f"  [{palette.muted}]({ctx_label} ctx)[/]" if context_length else ""
+        left_lines.append(f"[bold {palette.accent}]{model_short}[/]{ctx_str}")
 
     if cwd:
         short_cwd = cwd.replace(os.path.expanduser("~"), "~")
-        left_lines.append(f"[{_WARM_GRAY}]{short_cwd}[/]")
+        left_lines.append(f"[{palette.muted}]{_trim(short_cwd, 40)}[/]")
 
     left_content = "\n".join(left_lines)
 
@@ -146,33 +175,35 @@ def display_rich_banner(
         categories = ", ".join(
             f"{cat}({len(names)})" for cat, names in tool_groups.items()
         )
-        if len(categories) > 72:
-            categories = categories[:69] + "…"
-        right_lines.append(f"[bold {_AMBER}]Tools[/] [{_CREAM}]{tool_count} available[/]")
-        right_lines.append(f"[{_DIM_GOLD}]{categories}[/]")
+        category_text = _trim(categories, _category_limit(render_width))
+        right_lines.append(
+            f"[bold {palette.accent}]Tools[/] [{palette.text}]{tool_count} available[/]"
+        )
+        right_lines.append(f"[{palette.accent_dim}]{category_text}[/]")
         if mcp_tools > 0:
-            right_lines.append(f"[{_DIM_GOLD}]mcp:[/] [{_CREAM}]{mcp_tools} platform tools[/]")
+            right_lines.append(
+                f"[{palette.accent_dim}]mcp:[/] [{palette.text}]{mcp_tools} platform tools[/]"
+            )
 
     if skill_count:
         skill_groups = _categorize_skills(skills)
         categories = ", ".join(
             f"{cat}({len(names)})" for cat, names in skill_groups.items()
         )
-        if len(categories) > 72:
-            categories = categories[:69] + "…"
-        right_lines.append(f"[bold {_AMBER}]Skills[/] [{_CREAM}]{skill_count} available[/]")
-        right_lines.append(f"[{_DIM_GOLD}]{categories}[/]")
+        category_text = _trim(categories, _category_limit(render_width))
+        right_lines.append(
+            f"[bold {palette.accent}]Skills[/] [{palette.text}]{skill_count} available[/]"
+        )
+        right_lines.append(f"[{palette.accent_dim}]{category_text}[/]")
 
     if gateway_connected:
         right_lines.append("")
-        right_lines.append(f"[bold {_AMBER}]Gateway[/]")
-        names_str = ", ".join(gateway_connected)
-        if len(names_str) > 52:
-            names_str = names_str[:49] + "…"
-        right_lines.append(f"[green]●[/] [{_CREAM}]{names_str}[/]")
+        right_lines.append(f"[bold {palette.accent}]Gateway[/]")
+        names_str = _trim(", ".join(gateway_connected), 52)
+        right_lines.append(f"[{palette.success}]●[/] [{palette.text}]{names_str}[/]")
 
     if not tool_defs and not skills:
-        right_lines.append(f"[{_WARM_GRAY}]No tools or skills loaded[/]")
+        right_lines.append(f"[{palette.muted}]No tools or skills loaded[/]")
 
     # Summary line
     summary_parts = []
@@ -186,36 +217,34 @@ def display_rich_banner(
         summary_parts.append(f"{len(gateway_connected)} gateway")
     summary_parts.append("/help · /tools · /skills")
     right_lines.append("")
-    right_lines.append(f"[{_WARM_GRAY}]{' · '.join(summary_parts)}[/]")
+    right_lines.append(f"[{palette.muted}]{' · '.join(summary_parts)}[/]")
 
     right_content = "\n".join(right_lines)
 
-    # ── Assembly — full-width panel ──
-    if term_width < 70:
+    # ── Assembly — width-capped panel ──
+    version_label = f"LeapFlow v{VERSION}"
+    conn = f"[{palette.success}]●[/]" if platform_online else f"[{palette.muted}]○[/]"
+    if render_width < _NARROW_WIDTH:
         # Narrow: single-column compact
         combined = left_content + "\n" + right_content
-        version_label = f"LeapFlow v{VERSION}"
-        conn = "[green]●[/]" if platform_online else f"[{_WARM_GRAY}]○[/]"
         panel = Panel(
             combined,
-            title=f"[bold {_GOLD}]{version_label}[/]  {conn}",
-            border_style=_BRONZE,
+            title=f"[{palette.title}]{version_label}[/]  {conn}",
+            border_style=palette.border,
             padding=(0, 1),
             expand=True,
         )
     else:
         layout = Table.grid(padding=(0, 2))
-        left_min = max(32, min(52, term_width // 3))
+        left_min = max(28, min(44, render_width // 3))
         layout.add_column("left", justify="center", min_width=left_min)
         layout.add_column("right", justify="left", ratio=1)
         layout.add_row(left_content, right_content)
 
-        version_label = f"LeapFlow v{VERSION}"
-        conn = "[green]●[/]" if platform_online else f"[{_WARM_GRAY}]○[/]"
         panel = Panel(
             layout,
-            title=f"[bold {_GOLD}]{version_label}[/]  {conn}",
-            border_style=_BRONZE,
+            title=f"[{palette.title}]{version_label}[/]  {conn}",
+            border_style=palette.border,
             padding=(0, 1),
             expand=True,
         )
@@ -225,8 +254,8 @@ def display_rich_banner(
 
     if show_welcome:
         console.print(
-            f"\n[{_CREAM}]Welcome to LeapFlow! "
-            f"Type your message or [bold {_AMBER}]/help[/bold {_AMBER}] for commands.[/]\n",
+            f"\n[{palette.text}]Welcome to LeapFlow! "
+            f"Type your message or [bold {palette.accent}]/help[/bold {palette.accent}] for commands.[/]\n",
         )
 
 

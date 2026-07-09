@@ -44,12 +44,41 @@ _PROMPT_CANDIDATES = (
     "#FFD700",
     "#FACC15",
     "#FFBF00",
+    "#CC6600",
     "#996600",
+    "#8A4B00",
     "#78350F",
     "#FFFFFF",
     "#111827",
 )
-
+_BORDER_CANDIDATES = (
+    "#CD7F32",
+    "#B45309",
+    "#996600",
+    "#8A4B00",
+    "#78350F",
+    "#64748B",
+    "#475569",
+    "#FFFFFF",
+    "#111827",
+)
+_TEXT_CANDIDATES = (
+    "#FFF8DC",
+    "#F8FAFC",
+    "#E5E7EB",
+    "#111827",
+    "#1A1A1A",
+    "#000000",
+)
+_MUTED_TEXT_CANDIDATES = (
+    "#B8860B",
+    "#94A3B8",
+    "#CBD5E1",
+    "#64748B",
+    "#475569",
+    "#808080",
+    "#78350F",
+)
 _ANSI_BG = {
     0: "#000000",
     1: "#800000",
@@ -147,33 +176,33 @@ _DARK = Theme(
 
 _LIGHT = Theme(
     name="light",
-    accent="#996600",
-    accent_dim="#B8860B",
+    accent="#8A4B00",
+    accent_dim="#7A3E00",
     success="#007700",
-    warning="#996600",
+    warning="#8A4B00",
     error="#cc0000",
     info="#0055cc",
-    text="#000000",
-    text_dim="#8B6914",
-    text_muted="#808080",
-    border="#CD7F32",
-    border_dim="#808080",
-    panel_title="bold #996600",
+    text="#111827",
+    text_dim="#475569",
+    text_muted="#64748B",
+    border="#8A4B00",
+    border_dim="#64748B",
+    panel_title="bold #8A4B00",
     recording="bold #cc0000",
     executing="bold #007700",
     code_bg="#ededed",
-    prompt_char="bold #996600",
+    prompt_char="bold #8A4B00",
     input_text="#1A1A1A",
     input_bg=_LIGHT_TERMINAL_BG,
     input_placeholder="#64748B",
-    input_border="#B8860B",
-    input_focus_border="#996600",
+    input_border="#8A4B00",
+    input_focus_border="#78350F",
     input_selection_bg="#D6E4FF",
     input_selection_fg="#111827",
     input_disabled_text="#64748B",
-    toolbar_bg="#f0e8d8",
-    toolbar_fg="#8B6914",
-    prompt_paused="bold #996600",
+    toolbar_bg=_LIGHT_TERMINAL_BG,
+    toolbar_fg="#374151",
+    prompt_paused="bold #8A4B00",
     auto_suggest="#64748B",
 )
 
@@ -286,6 +315,17 @@ def _background_from_env(env: Mapping[str, str] | None = None) -> str | None:
     return None
 
 
+def _looks_light_from_name(value: str) -> bool:
+    normalized = value.strip().lower()
+    if not normalized:
+        return False
+    light_markers = ("light", "day", "paper", "latte", "cream", "solarized-light")
+    dark_markers = ("dark", "night", "black", "dim", "moon", "dracula")
+    if any(marker in normalized for marker in dark_markers):
+        return False
+    return any(marker in normalized for marker in light_markers)
+
+
 def detect_light_mode(env: Mapping[str, str] | None = None) -> bool:
     """Conservatively detect whether the terminal background is light."""
     explicit = _explicit_theme_name(env)
@@ -295,6 +335,10 @@ def detect_light_mode(env: Mapping[str, str] | None = None) -> bool:
     background = _background_from_env(env)
     if background is not None:
         return is_light_color(background)
+
+    for key in ("ITERM_PROFILE", "TERMINAL_PROFILE", "WT_PROFILE_ID"):
+        if _looks_light_from_name(_env_value(env, key)):
+            return True
 
     return False
 
@@ -319,7 +363,9 @@ def resolve_theme(
     if not _HEX_RE.match(background):
         background = base.input_bg
     background = background.upper()
-    input_candidates = _LIGHT_INPUT_CANDIDATES if is_light_color(background) else _DARK_INPUT_CANDIDATES
+    light_background = is_light_color(background)
+    surface_bg = background if light_background else base.toolbar_bg
+    input_candidates = _LIGHT_INPUT_CANDIDATES if light_background else _DARK_INPUT_CANDIDATES
     input_text = ensure_contrast(
         base.input_text,
         background,
@@ -344,6 +390,60 @@ def resolve_theme(
         min_ratio=_SECONDARY_TEXT_MIN_CONTRAST,
         candidates=_PLACEHOLDER_CANDIDATES,
     )
+    text = ensure_contrast(
+        base.text,
+        background,
+        min_ratio=_SECONDARY_TEXT_MIN_CONTRAST,
+        candidates=_TEXT_CANDIDATES,
+    )
+    text_dim = ensure_contrast(
+        base.text_dim,
+        background,
+        min_ratio=_SECONDARY_TEXT_MIN_CONTRAST,
+        candidates=_MUTED_TEXT_CANDIDATES,
+    )
+    text_muted = ensure_contrast(
+        base.text_muted,
+        background,
+        min_ratio=_SECONDARY_TEXT_MIN_CONTRAST,
+        candidates=_MUTED_TEXT_CANDIDATES,
+    )
+    accent = ensure_contrast(
+        base.accent,
+        background,
+        min_ratio=_PROMPT_MIN_CONTRAST,
+        candidates=_PROMPT_CANDIDATES,
+    )
+    accent_dim = ensure_contrast(
+        base.accent_dim,
+        background,
+        min_ratio=_SECONDARY_TEXT_MIN_CONTRAST,
+        candidates=_BORDER_CANDIDATES,
+    )
+    border = ensure_contrast(
+        base.border,
+        background,
+        min_ratio=_SECONDARY_TEXT_MIN_CONTRAST,
+        candidates=_BORDER_CANDIDATES,
+    )
+    border_dim = ensure_contrast(
+        base.border_dim,
+        background,
+        min_ratio=_SECONDARY_TEXT_MIN_CONTRAST,
+        candidates=_BORDER_CANDIDATES,
+    )
+    input_border = ensure_contrast(
+        base.input_border,
+        background,
+        min_ratio=_SECONDARY_TEXT_MIN_CONTRAST,
+        candidates=_BORDER_CANDIDATES,
+    )
+    toolbar_fg = ensure_contrast(
+        base.toolbar_fg,
+        surface_bg,
+        min_ratio=_SECONDARY_TEXT_MIN_CONTRAST,
+        candidates=_MUTED_TEXT_CANDIDATES,
+    )
     prompt_color = ensure_contrast(
         _style_color(base.prompt_char) or base.accent,
         background,
@@ -360,23 +460,29 @@ def resolve_theme(
         base.input_focus_border,
         background,
         min_ratio=_PROMPT_MIN_CONTRAST,
+        candidates=_BORDER_CANDIDATES,
+    )
+    panel_title_color = ensure_contrast(
+        _style_color(base.panel_title) or accent,
+        background,
+        min_ratio=_PROMPT_MIN_CONTRAST,
         candidates=_PROMPT_CANDIDATES,
     )
 
     return ResolvedTheme(
         name=base.name,
-        accent=base.accent,
-        accent_dim=base.accent_dim,
+        accent=accent,
+        accent_dim=accent_dim,
         success=base.success,
         warning=base.warning,
         error=base.error,
         info=base.info,
-        text=base.text,
-        text_dim=base.text_dim,
-        text_muted=base.text_muted,
-        border=base.border,
-        border_dim=base.border_dim,
-        panel_title=base.panel_title,
+        text=text,
+        text_dim=text_dim,
+        text_muted=text_muted,
+        border=border,
+        border_dim=border_dim,
+        panel_title=_with_style_color(base.panel_title, panel_title_color),
         recording=base.recording,
         executing=base.executing,
         code_bg=base.code_bg,
@@ -384,13 +490,13 @@ def resolve_theme(
         input_text=input_text,
         input_bg=background,
         input_placeholder=input_placeholder,
-        input_border=base.input_border,
+        input_border=input_border,
         input_focus_border=focus_border,
         input_selection_bg=base.input_selection_bg,
         input_selection_fg=base.input_selection_fg,
         input_disabled_text=input_disabled_text,
-        toolbar_bg=base.toolbar_bg,
-        toolbar_fg=base.toolbar_fg,
+        toolbar_bg=surface_bg,
+        toolbar_fg=toolbar_fg,
         prompt_paused=_with_style_color(base.prompt_paused, prompt_paused_color),
         auto_suggest=auto_suggest,
         terminal_bg=background,
