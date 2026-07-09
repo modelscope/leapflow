@@ -8,8 +8,11 @@ import os
 import re
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+from dotenv import dotenv_values
 
 from leapflow.platform.cua_client import CuaDriverClient
 from leapflow.platform.event_bus import EventBus
@@ -197,6 +200,15 @@ def _build_visual_components(
     from leapflow.perception.session import PerceptionSession
 
     vlm_api_key = settings.vlm_api_key or settings.llm_api_key
+    if not vlm_api_key.strip():
+        message = (
+            "Visual perception disabled: LEAPFLOW_VLM_API_KEY or "
+            "LEAPFLOW_LLM_API_KEY is required when visual track is enabled."
+        )
+        logger.warning(message)
+        _emit_status(message)
+        return None
+
     vlm_base_url = settings.vlm_base_url or settings.llm_base_url
     vlm_model = settings.vlm_model or settings.llm_model
     vlm_provider = OpenAIChat(
@@ -442,59 +454,8 @@ class Context:
                 )
             self.rpc = CuaDriverClient()
 
-        # ── Multi-provider LLM chain (failover + credential rotation) ──
-        provider_configs = parse_provider_configs(
-            settings.llm_api_key or "missing",
-            settings.llm_base_url,
-            settings.llm_model,
-            fallback_json=settings.llm_fallback_providers,
-            primary_context_length=settings.llm_context_length,
-        )
-        credential_pools = parse_credential_pools(
-            provider_configs,
-            cooldown_s=settings.llm_credential_cooldown_s,
-        )
-        if len(provider_configs) > 1 or credential_pools:
-            self.llm_chain = FailoverChain(
-                provider_configs, credential_pools=credential_pools,
-                circuit_failure_threshold=settings.circuit_breaker_threshold,
-                circuit_cooldown_s=settings.circuit_breaker_cooldown_s,
-            )
-            self.llm = self.llm_chain
-            logger.info(
-                "LLM chain: %d providers, %d credential pools",
-                len(provider_configs), len(credential_pools),
-            )
-        else:
-            self.llm_chain = None
-            self.llm = OpenAIChat(
-                api_key=settings.llm_api_key or "missing",
-                base_url=settings.llm_base_url,
-                model=settings.llm_model,
-                max_retries=settings.llm_max_retries,
-            )
-
-        # ── Auxiliary LLM for cheap operations ──
-        self.auxiliary: Optional[AuxiliaryClient] = None
-        if settings.llm_aux_model:
-            aux_llm = OpenAIChat(
-                api_key=settings.llm_aux_api_key or settings.llm_api_key or "missing",
-                base_url=settings.llm_aux_base_url or settings.llm_base_url,
-                model=settings.llm_aux_model,
-                max_retries=2,
-            )
-            self.auxiliary = AuxiliaryClient(aux_llm)
-            logger.info("Auxiliary LLM configured: %s", settings.llm_aux_model)
-        elif settings.has_llm_credentials:
-            self.auxiliary = AuxiliaryClient(self.llm)
-
-        self.vlm: Optional[OpenAIChat] = None
-        if settings.vlm_model and settings.vlm_model != settings.llm_model:
-            self.vlm = OpenAIChat(
-                api_key=settings.vlm_api_key or settings.llm_api_key or "missing",
-                base_url=settings.vlm_base_url or settings.llm_base_url,
-                model=settings.vlm_model,
-            )
+        self._config_signature = self._runtime_config_signature(settings)
+        self._configure_llm_clients(settings)
 
         self.audit = AuditLogger(settings.audit_log_path)
 
@@ -535,6 +496,179 @@ class Context:
 
         self._tui_approval = _TUIApprovalGate()
         self._approval_gate = SessionAwareGate(self._tui_approval)
+
+    def _configure_llm_clients(self, settings: Settings) -> None:
+        """Build LLM/VLM clients from a settings snapshot."""
+        provider_configs = parse_provider_configs(
+            settings.llm_api_key or "missing",
+            settings.llm_base_url,
+            settings.llm_model,
+            fallback_json=settings.llm_fallback_providers,
+            primary_context_length=settings.llm_context_length,
+        )
+        credential_pools = parse_credential_pools(
+            provider_configs,
+            cooldown_s=settings.llm_credential_cooldown_s,
+        )
+        if len(provider_configs) > 1 or credential_pools:
+            self.llm_chain = FailoverChain(
+                provider_configs,
+                credential_pools=credential_pools,
+                circuit_failure_threshold=settings.circuit_breaker_threshold,
+                circuit_cooldown_s=settings.circuit_breaker_cooldown_s,
+            )
+            self.llm = self.llm_chain
+            logger.info(
+                "LLM chain: %d providers, %d credential pools",
+                len(provider_configs), len(credential_pools),
+            )
+        else:
+            self.llm_chain = None
+            self.llm = OpenAIChat(
+                api_key=settings.llm_api_key or "missing",
+                base_url=settings.llm_base_url,
+                model=settings.llm_model,
+                max_retries=settings.llm_max_retries,
+            )
+
+        self.auxiliary: Optional[AuxiliaryClient] = None
+        if settings.llm_aux_model:
+            aux_llm = OpenAIChat(
+                api_key=settings.llm_aux_api_key or settings.llm_api_key or "missing",
+                base_url=settings.llm_aux_base_url or settings.llm_base_url,
+                model=settings.llm_aux_model,
+                max_retries=2,
+            )
+            self.auxiliary = AuxiliaryClient(aux_llm)
+            logger.info("Auxiliary LLM configured: %s", settings.llm_aux_model)
+        elif settings.has_llm_credentials:
+            self.auxiliary = AuxiliaryClient(self.llm)
+
+        self.vlm: Optional[OpenAIChat] = None
+        if (
+            settings.vlm_model
+            and settings.vlm_model != settings.llm_model
+            and settings.has_vlm_credentials
+        ):
+            self.vlm = OpenAIChat(
+                api_key=settings.vlm_api_key or settings.llm_api_key,
+                base_url=settings.vlm_base_url or settings.llm_base_url,
+                model=settings.vlm_model,
+            )
+
+    @staticmethod
+    def _runtime_config_signature(settings: Settings) -> tuple:
+        """Return a stable signature for user-editable runtime config files."""
+        paths = (
+            settings.data_dir / ".env",
+            settings.data_dir / "config.yaml",
+            Path.cwd() / ".env",
+        )
+        signature = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                signature.append((str(path), 0, 0))
+            else:
+                signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+        return tuple(signature)
+
+    @staticmethod
+    def _bool_env(value: str, default: bool) -> bool:
+        text = value.strip().lower()
+        if not text:
+            return default
+        return text in {"1", "true", "yes", "on"}
+
+    def _load_runtime_settings_from_files(self) -> Settings:
+        """Reload hot-swappable LLM/VLM settings directly from config files."""
+        values: dict[str, str] = {}
+        for path in (self.settings.data_dir / ".env", Path.cwd() / ".env"):
+            if path.exists():
+                values.update({
+                    key: value
+                    for key, value in dotenv_values(path).items()
+                    if value is not None
+                })
+
+        def _value(key: str, current: str) -> str:
+            env_value = os.environ.get(key, "").strip()
+            if env_value:
+                return env_value
+            return str(values.get(key, current)).strip()
+
+        max_retries_raw = _value(
+            "LEAPFLOW_LLM_MAX_RETRIES",
+            str(self.settings.llm_max_retries),
+        )
+        try:
+            max_retries = max(1, int(max_retries_raw))
+        except ValueError:
+            max_retries = self.settings.llm_max_retries
+
+        return replace(
+            self.settings,
+            llm_api_key=_value("LEAPFLOW_LLM_API_KEY", self.settings.llm_api_key),
+            llm_base_url=_value("LEAPFLOW_LLM_BASE_URL", self.settings.llm_base_url).rstrip("/"),
+            llm_model=_value("LEAPFLOW_LLM_MODEL", self.settings.llm_model),
+            llm_max_retries=max_retries,
+            vlm_api_key=_value("LEAPFLOW_VLM_API_KEY", self.settings.vlm_api_key),
+            vlm_base_url=_value("LEAPFLOW_VLM_BASE_URL", self.settings.vlm_base_url).rstrip("/"),
+            vlm_model=_value("LEAPFLOW_VLM_MODEL", self.settings.vlm_model),
+            visual_track_enabled=self._bool_env(
+                _value(
+                    "LEAPFLOW_VISUAL_TRACK_ENABLED",
+                    "1" if self.settings.visual_track_enabled else "0",
+                ),
+                self.settings.visual_track_enabled,
+            ),
+        )
+
+    def reload_runtime_config_if_changed(self) -> bool:
+        """Hot-reload LLM/VLM config when user-editable config files changed."""
+        signature = self._runtime_config_signature(self.settings)
+        if signature == self._config_signature:
+            return False
+
+        previous = self.settings
+        updated = self._load_runtime_settings_from_files()
+        self._config_signature = signature
+        llm_changed = (
+            previous.llm_api_key != updated.llm_api_key
+            or previous.llm_base_url != updated.llm_base_url
+            or previous.llm_model != updated.llm_model
+            or previous.llm_max_retries != updated.llm_max_retries
+            or previous.vlm_api_key != updated.vlm_api_key
+            or previous.vlm_base_url != updated.vlm_base_url
+            or previous.vlm_model != updated.vlm_model
+            or previous.visual_track_enabled != updated.visual_track_enabled
+        )
+        self.settings = updated
+        if not llm_changed:
+            return False
+
+        self._configure_llm_clients(updated)
+        classifier: IntentClassifier = (
+            LLMIntentClassifier(self.llm)
+            if updated.has_llm_credentials
+            else FallbackClassifier()
+        )
+        self.intent_classifier = classifier
+        self.assessor = (
+            LLMSituationalAssessor(self.llm)
+            if updated.has_llm_credentials
+            else None
+        )
+        if self.engine is not None:
+            self.engine.reconfigure_runtime(
+                settings=updated,
+                llm=self.llm,
+                vlm=self.vlm,
+                classifier=classifier,
+            )
+        logger.info("Runtime LLM configuration reloaded")
+        return True
 
     @property
     def storage_volatile(self) -> bool:
@@ -656,9 +790,17 @@ class Context:
         video_segmenter = None
         signal_timeline = None
         if settings.recording_mode.uses_video and settings.visual_track_enabled:
-            video_recorder, video_analyzer, video_segmenter, signal_timeline = (
-                _build_video_components(settings, self.rpc, self.vlm or self.llm)
-            )
+            if settings.has_vlm_credentials:
+                video_recorder, video_analyzer, video_segmenter, signal_timeline = (
+                    _build_video_components(settings, self.rpc, self.vlm or self.llm)
+                )
+            else:
+                message = (
+                    "Video analysis disabled: LEAPFLOW_VLM_API_KEY or "
+                    "LEAPFLOW_LLM_API_KEY is required for visual recording mode."
+                )
+                logger.warning(message)
+                _emit_status(message)
 
         platform_hint = manifest.platform_id.value
 

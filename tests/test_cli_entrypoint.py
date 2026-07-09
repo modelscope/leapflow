@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import argparse
+import logging
+from dataclasses import replace
+
 import pytest
 
 from conftest import make_settings
@@ -62,6 +66,198 @@ async def test_context_initialize_degrades_when_primary_db_is_locked(
         await ctx.cleanup()
 
 
+def test_visual_track_defaults_off_without_env(monkeypatch, tmp_path) -> None:
+    from leapflow.config import _build_settings_from_env
+
+    monkeypatch.delenv("LEAPFLOW_VISUAL_TRACK_ENABLED", raising=False)
+    monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LEAPFLOW_VLM_API_KEY", raising=False)
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path))
+
+    settings = _build_settings_from_env()
+
+    assert settings.visual_track_enabled is False
+    assert settings.has_vlm_credentials is False
+
+
+def test_build_visual_components_degrades_without_credentials(
+    caplog,
+    tmp_path,
+) -> None:
+    from leapflow.cli.context import _build_visual_components
+
+    settings = replace(
+        make_settings(str(tmp_path)),
+        llm_api_key="",
+        vlm_api_key="",
+        visual_track_enabled=True,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="leapflow.cli.context"):
+        perception_session = _build_visual_components(settings, rpc=object())
+
+    assert perception_session is None
+    assert any("Visual perception disabled" in record.message for record in caplog.records)
+
+
+def test_build_visual_components_accepts_vlm_only_credentials(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import leapflow.cli.context as context_module
+
+    captured = {}
+
+    class FakeOpenAIChat:
+        def __init__(self, *, api_key: str, base_url: str, model: str) -> None:
+            captured["api_key"] = api_key
+            captured["base_url"] = base_url
+            captured["model"] = model
+
+    monkeypatch.setattr(context_module, "OpenAIChat", FakeOpenAIChat)
+    settings = replace(
+        make_settings(str(tmp_path)),
+        llm_api_key="",
+        vlm_api_key="vlm-test-key",
+        vlm_base_url="https://vlm.example.invalid/v1",
+        vlm_model="vlm-test-model",
+        visual_track_enabled=True,
+    )
+
+    perception_session = context_module._build_visual_components(settings, rpc=object())
+
+    assert perception_session is not None
+    assert captured == {
+        "api_key": "vlm-test-key",
+        "base_url": "https://vlm.example.invalid/v1",
+        "model": "vlm-test-model",
+    }
+
+
+@pytest.mark.asyncio
+async def test_context_initialize_degrades_visual_track_without_credentials(
+    caplog,
+    tmp_path,
+) -> None:
+    from leapflow.cli.context import Context
+
+    settings = replace(
+        make_settings(str(tmp_path)),
+        llm_api_key="",
+        vlm_api_key="",
+        visual_track_enabled=True,
+    )
+
+    ctx = Context(settings, mock_host=True)
+    with caplog.at_level(logging.WARNING, logger="leapflow.cli.context"):
+        await ctx.initialize()
+    try:
+        assert ctx.perception_session is None
+        assert ctx.engine is not None
+        assert any("Visual perception disabled" in record.message for record in caplog.records)
+    finally:
+        await ctx.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_context_hot_reloads_llm_credentials_from_env_file(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from leapflow.cli.context import Context
+
+    data_dir = tmp_path / "leap-home"
+    data_dir.mkdir()
+    env_path = data_dir / ".env"
+    env_path.write_text(
+        "LEAPFLOW_LLM_API_KEY=\n"
+        "LEAPFLOW_LLM_BASE_URL=https://old.example.invalid/v1\n"
+        "LEAPFLOW_LLM_MODEL=old-model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LEAPFLOW_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("LEAPFLOW_LLM_MODEL", raising=False)
+
+    settings = replace(
+        make_settings(str(tmp_path)),
+        data_dir=data_dir,
+        llm_api_key="",
+        llm_base_url="https://old.example.invalid/v1",
+        llm_model="old-model",
+        vlm_api_key="",
+        visual_track_enabled=False,
+    )
+
+    ctx = Context(settings, mock_host=True)
+    await ctx.initialize()
+    try:
+        assert ctx.settings.has_llm_credentials is False
+        assert ctx.engine is not None
+        assert ctx.engine._settings.has_llm_credentials is False
+
+        env_path.write_text(
+            "LEAPFLOW_LLM_API_KEY=sk-hot-reload\n"
+            "LEAPFLOW_LLM_BASE_URL=https://new.example.invalid/v1\n"
+            "LEAPFLOW_LLM_MODEL=new-model\n",
+            encoding="utf-8",
+        )
+
+        assert ctx.reload_runtime_config_if_changed() is True
+        assert ctx.settings.llm_api_key == "sk-hot-reload"
+        assert ctx.settings.llm_base_url == "https://new.example.invalid/v1"
+        assert ctx.settings.llm_model == "new-model"
+        assert ctx.engine._settings.llm_api_key == "sk-hot-reload"
+        assert ctx.engine._settings.has_llm_credentials is True
+        assert ctx.intent_classifier.__class__.__name__ == "LLMIntentClassifier"
+    finally:
+        await ctx.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_daemon_fallback_initializes_local_interactive_with_real_config(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from leapflow.cli import cli
+    from leapflow.cli.helpers import require_initialized
+    import leapflow.cli.commands.interactive as interactive_module
+    import leapflow.daemon.client as daemon_client
+
+    data_dir = tmp_path / "leap-home"
+    events: list[str] = []
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LEAPFLOW_VLM_API_KEY", raising=False)
+    monkeypatch.delenv("LEAPFLOW_VISUAL_TRACK_ENABLED", raising=False)
+
+    async def fake_ensure_daemon_client(*args, **kwargs):
+        raise daemon_client.DaemonUnavailableError("daemon unavailable")
+
+    async def fake_interactive(ctx, *, resume_id=None) -> int:
+        require_initialized(ctx)
+        assert resume_id is None
+        assert ctx.settings.llm_api_key == ""
+        assert ctx.settings.visual_track_enabled is False
+        assert ctx.perception_session is None
+        events.append("interactive")
+        return 0
+
+    monkeypatch.setattr(daemon_client, "ensure_daemon_client", fake_ensure_daemon_client)
+    monkeypatch.setattr(interactive_module, "cmd_interactive", fake_interactive)
+
+    result = await cli._async_daemon_main(
+        argparse.Namespace(command="interactive", mock_host=True, resume=None)
+    )
+
+    assert result == 0
+    assert events == ["interactive"]
+    assert (data_dir / ".env").exists()
+
+
 def test_leap_default_command_uses_daemon_client(monkeypatch) -> None:
     from leapflow.cli import cli
 
@@ -78,38 +274,36 @@ def test_leap_default_command_uses_daemon_client(monkeypatch) -> None:
     assert captured == {"command": "interactive", "no_daemon": False}
 
 
-def test_leap_no_daemon_initializes_and_runs_interactive(monkeypatch) -> None:
+def test_leap_no_daemon_initializes_and_runs_interactive(monkeypatch, tmp_path) -> None:
     from leapflow.cli import cli
+    from leapflow.cli.helpers import require_initialized
     import leapflow.cli.commands.interactive as interactive_module
 
+    data_dir = tmp_path / "leap-home"
     events: list[str] = []
 
-    class FakeContext:
-        def __init__(self, settings, mock_host: bool) -> None:
-            self.settings = settings
-            self.mock_host = mock_host
-            self.initialized = False
-            events.append("context")
-
-        async def initialize(self) -> None:
-            self.initialized = True
-            events.append("initialize")
-
-        async def cleanup(self) -> None:
-            events.append("cleanup")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LEAPFLOW_VLM_API_KEY", raising=False)
+    monkeypatch.delenv("LEAPFLOW_VISUAL_TRACK_ENABLED", raising=False)
 
     async def fake_interactive(ctx, *, resume_id=None) -> int:
-        assert ctx.initialized is True
+        require_initialized(ctx)
         assert resume_id is None
+        assert ctx.settings.llm_api_key == ""
+        assert ctx.settings.visual_track_enabled is False
+        assert ctx.settings.has_vlm_credentials is False
+        assert ctx.perception_session is None
+        assert ctx.engine is not None
         events.append("interactive")
         return 0
 
-    monkeypatch.setattr(cli, "load_config", lambda: object())
-    monkeypatch.setattr(cli, "Context", FakeContext)
     monkeypatch.setattr(interactive_module, "cmd_interactive", fake_interactive)
 
-    assert cli.main(["--no-daemon"]) == 0
-    assert events == ["context", "initialize", "interactive", "cleanup"]
+    assert cli.main(["--no-daemon", "--mock-host"]) == 0
+    assert events == ["interactive"]
+    assert (data_dir / ".env").exists()
 
 
 def test_leap_prompt_uses_daemon_chat_route(monkeypatch) -> None:

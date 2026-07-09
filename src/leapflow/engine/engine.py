@@ -334,6 +334,35 @@ class AgentEngine:
         """Configure output message sanitizer."""
         self._sanitizer = sanitizer
 
+    def reconfigure_runtime(
+        self,
+        *,
+        settings: Settings,
+        llm: LLMProvider,
+        vlm: Optional[Any],
+        classifier: IntentClassifier,
+    ) -> None:
+        """Refresh runtime LLM configuration without resetting session state."""
+        self._settings = settings
+        self._llm = llm
+        self._vlm = vlm
+        self._classifier = classifier
+        self._skill_merger = SkillMerger(
+            registry=self._registry,
+            llm=llm,
+            execution=self._execution,
+        )
+        if settings.has_llm_credentials:
+            self._graph_planner = GraphPlanner(self._llm, self._registry)
+            self._scheduler = TaskScheduler(
+                self._registry,
+                self._rpc,
+                graph_planner=self._graph_planner,
+            )
+        else:
+            self._graph_planner = None
+            self._scheduler = None
+
     def set_tool_result_budget(self, budget: int) -> None:
         """Override per-tool result truncation budget (e.g. linked to model context)."""
         self._tool_result_budget = max(1, budget)
@@ -1847,7 +1876,6 @@ class AgentEngine:
         """
         from leapflow.skills.tool_executor import ToolCall as TC
         from leapflow.security.redact import redact_sensitive_text
-        from leapflow.security.threat_patterns import is_untrusted_source, wrap_untrusted_result
 
         name = tool_call.get("name", "")
         args = tool_call.get("arguments", {})

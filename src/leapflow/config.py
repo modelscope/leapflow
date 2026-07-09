@@ -407,6 +407,11 @@ class Settings:
     def has_llm_credentials(self) -> bool:
         return bool(self.llm_api_key.strip())
 
+    @property
+    def has_vlm_credentials(self) -> bool:
+        """Return True when visual perception can call a VLM provider."""
+        return bool((self.vlm_api_key or self.llm_api_key).strip())
+
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
     """Recursively merge overlay into base. Overlay values take precedence."""
@@ -440,7 +445,7 @@ def _load_yaml_overlay(data_dir: Path) -> Dict[str, str]:
         if not isinstance(parsed, dict):
             raise ValueError("config.yaml root must be a mapping")
     except Exception as exc:
-        backup = yaml_path.with_suffix(f".yaml.corrupt.bak")
+        backup = yaml_path.with_suffix(".yaml.corrupt.bak")
         logger.warning("config.yaml parse error (%s), backing up to %s", exc, backup.name)
         try:
             shutil.copy2(yaml_path, backup)
@@ -556,7 +561,7 @@ def _build_settings_from_env() -> Settings:
     audit_log_path = os.getenv("LEAPFLOW_AUDIT_LOG_PATH", str(_profile_dir / "audit.jsonl")).strip()
 
     # Visual Track
-    visual_track_enabled = os.getenv("LEAPFLOW_VISUAL_TRACK_ENABLED", "1").strip() in ("1", "true", "True", "yes")
+    visual_track_enabled = os.getenv("LEAPFLOW_VISUAL_TRACK_ENABLED", "0").strip() in ("1", "true", "True", "yes")
     visual_frame_cache_dir = os.getenv("LEAPFLOW_VISUAL_FRAME_CACHE_DIR", str(_profile_dir / "cache" / "frames")).strip()
     visual_sample_strategy = os.getenv("LEAPFLOW_VISUAL_SAMPLE_STRATEGY", "keyframe").strip()
     vlm_model = os.getenv("LEAPFLOW_VLM_MODEL", "").strip() or model

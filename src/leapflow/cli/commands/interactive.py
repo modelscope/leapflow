@@ -265,6 +265,15 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         """Dispatch one user input — slash commands or natural language."""
         global _last_hint
 
+        try:
+            if ctx.reload_runtime_config_if_changed():
+                console.success(
+                    "Configuration reloaded — LLM settings updated for this session."
+                )
+        except Exception as exc:
+            logger.warning("Runtime config reload failed: %s", exc)
+            console.warning(f"Configuration reload failed: {exc}")
+
         _learning = ctx.session and ctx.session.mode == SessionMode.LEARNING
         if _learning:
             ctx.imitation.end_control_input()

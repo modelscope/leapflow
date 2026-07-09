@@ -129,8 +129,10 @@ LEAPFLOW_RECORDING_MODE=video
 
 # ═══════════════════════════════════════════════════════════════════════
 # Visual Track — screenshot-based perception (default/vision_only modes)
+# Disabled by default on first run. Enable only after configuring
+# LEAPFLOW_LLM_API_KEY or LEAPFLOW_VLM_API_KEY.
 # ═══════════════════════════════════════════════════════════════════════
-# LEAPFLOW_VISUAL_TRACK_ENABLED=true
+# LEAPFLOW_VISUAL_TRACK_ENABLED=false
 # LEAPFLOW_VISUAL_FRAME_CACHE_DIR=~/.leapflow/profiles/default/cache/frames
 # LEAPFLOW_VLM_MODEL=
 # LEAPFLOW_VLM_API_KEY=
