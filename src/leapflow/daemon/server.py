@@ -1,0 +1,212 @@
+"""Unix socket JSON-RPC server for leapd."""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import signal
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from leapflow.daemon.lifecycle import cleanup_run_dir, write_pid_file
+from leapflow.daemon.protocol import ErrorCode, METHOD_REGISTRY, RpcRequest, RpcResponse, StreamChunk
+
+logger = logging.getLogger(__name__)
+
+
+class UnixRpcServer:
+    """Newline-delimited JSON-RPC server bound to one Unix socket."""
+
+    def __init__(self, service: Any, *, sock_path: Path, run_dir: Path) -> None:
+        self._service = service
+        self._sock_path = sock_path
+        self._run_dir = run_dir
+        self._server: asyncio.AbstractServer | None = None
+        self._active_connections = 0
+        if hasattr(service, "set_client_count_provider"):
+            service.set_client_count_provider(lambda: self._active_connections)
+
+    @property
+    def active_connections(self) -> int:
+        """Return the current number of connected clients."""
+        return self._active_connections
+
+    async def serve_forever(self) -> None:
+        """Start listening and serve until cancelled."""
+        self._run_dir.mkdir(parents=True, exist_ok=True)
+        self._sock_path.unlink(missing_ok=True)
+        self._server = await asyncio.start_unix_server(
+            self._handle_client,
+            path=str(self._sock_path),
+        )
+        write_pid_file(self._run_dir)
+        try:
+            async with self._server:
+                await self._server.serve_forever()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._sock_path.unlink(missing_ok=True)
+
+    async def stop(self) -> None:
+        """Stop accepting clients and close the listening socket."""
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+        self._sock_path.unlink(missing_ok=True)
+
+    async def _handle_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        self._active_connections += 1
+        try:
+            while not reader.at_eof():
+                raw = await reader.readline()
+                if not raw:
+                    break
+                await self._handle_line(raw, writer)
+        finally:
+            self._active_connections -= 1
+            await _close_writer(writer)
+
+    async def _handle_line(self, raw: bytes, writer: asyncio.StreamWriter) -> None:
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            request = RpcRequest.from_dict(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            response = RpcResponse.fail(
+                "",
+                ErrorCode.PARSE_ERROR,
+                "Invalid JSON-RPC request",
+                data=str(exc),
+            )
+            await _write_json(writer, response.to_json())
+            return
+
+        try:
+            await self._dispatch(request, writer)
+        except NotImplementedError as exc:
+            response = RpcResponse.fail(
+                request.id,
+                ErrorCode.METHOD_NOT_FOUND,
+                str(exc),
+            )
+            await _write_json(writer, response.to_json())
+        except Exception as exc:
+            logger.exception("daemon: request failed method=%s", request.method)
+            response = RpcResponse.fail(
+                request.id,
+                ErrorCode.INTERNAL_ERROR,
+                "Daemon request failed",
+                data=str(exc),
+            )
+            await _write_json(writer, response.to_json())
+
+    async def _dispatch(self, request: RpcRequest, writer: asyncio.StreamWriter) -> None:
+        attr = METHOD_REGISTRY.get(request.method)
+        if attr is None:
+            response = RpcResponse.fail(
+                request.id,
+                ErrorCode.METHOD_NOT_FOUND,
+                f"Unknown method: {request.method}",
+            )
+            await _write_json(writer, response.to_json())
+            return
+
+        method = getattr(self._service, attr)
+        params = dict(request.params or {})
+        if request.method == "engine.chat":
+            await self._dispatch_stream(request, method, params, writer)
+            return
+
+        result = method(**params)
+        if hasattr(result, "__await__"):
+            result = await result
+        response = RpcResponse.success(request.id, result)
+        await _write_json(writer, response.to_json())
+
+    async def _dispatch_stream(
+        self,
+        request: RpcRequest,
+        method: Callable[..., Any],
+        params: dict[str, Any],
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            async for chunk in method(**params):
+                notification = StreamChunk(
+                    request_id=request.id,
+                    content=chunk.content,
+                    done=chunk.done,
+                    event_type=chunk.event_type,
+                    metadata=chunk.metadata,
+                ).to_notification()
+                await _write_json(writer, notification.to_json())
+        except Exception as exc:
+            logger.exception("daemon: stream failed method=%s", request.method)
+            response = RpcResponse.fail(
+                request.id,
+                ErrorCode.INTERNAL_ERROR,
+                "Daemon stream failed",
+                data=str(exc),
+            )
+            await _write_json(writer, response.to_json())
+            return
+
+        done = StreamChunk(request_id=request.id, content="", done=True).to_notification()
+        await _write_json(writer, done.to_json())
+        response = RpcResponse.success(request.id, {"ok": True})
+        await _write_json(writer, response.to_json())
+
+
+async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
+    """Run a daemon server for the provided settings until signalled."""
+    from leapflow.daemon.service import RuntimeLeapService
+
+    run_dir = settings.profile_dir / "run"
+    sock_path = run_dir / "leapd.sock"
+    service = RuntimeLeapService(settings, mock_host=mock_host)
+    await service.start()
+    server = UnixRpcServer(service, sock_path=sock_path, run_dir=run_dir)
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _request_stop() -> None:
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except NotImplementedError:
+            logger.debug("daemon: signal handlers unsupported on this event loop")
+
+    task = asyncio.create_task(server.serve_forever())
+    try:
+        await stop_event.wait()
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        await server.stop()
+        await service.shutdown()
+        cleanup_run_dir(run_dir)
+    return 0
+
+
+async def _write_json(writer: asyncio.StreamWriter, text: str) -> None:
+    writer.write(text.encode("utf-8") + b"\n")
+    await writer.drain()
+
+
+async def _close_writer(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except (BrokenPipeError, ConnectionError, OSError):
+        logger.debug("daemon: client connection closed with transport error", exc_info=True)

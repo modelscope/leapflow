@@ -28,7 +28,7 @@ from leapflow.world_model.trajectory_grader import (
 
 
 def _open_store(tmp_path) -> tuple[SemanticMemoryProvider, ExperienceStore]:
-    lt = SemanticMemoryProvider(db_path=tmp_path / "world_model.duckdb")
+    lt = SemanticMemoryProvider(source=tmp_path / "world_model.duckdb")
     # _ensure_connection() auto-initializes on first legacy method call
     lt._ensure_connection()
     return lt, ExperienceStore(lt)

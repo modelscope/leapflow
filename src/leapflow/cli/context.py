@@ -8,13 +8,16 @@ import os
 import re
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+from dotenv import dotenv_values
 
 from leapflow.platform.cua_client import CuaDriverClient
 from leapflow.platform.event_bus import EventBus
 from leapflow.platform.mock import MockBridge
-from leapflow.config import Settings, load_config
+from leapflow.config import Settings, _load_yaml_overlay
 from leapflow.engine.engine import AgentEngine, build_default_registry
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.intent_classifier import (
@@ -32,13 +35,13 @@ from leapflow.llm.openai_provider import OpenAIChat
 from leapflow.llm.provider_chain import (
     AuxiliaryClient,
     FailoverChain,
-    ProviderConfig,
     parse_credential_pools,
     parse_provider_configs,
 )
 from leapflow.memory import (
     MemoryManager, WorkingMemoryProvider, EpisodicMemoryProvider,
-    SemanticMemoryProvider, EvolutionMemoryProvider, MemoryFragment,
+    SemanticMemoryProvider, EvolutionMemoryProvider, NarrativeProvider,
+    MemoryFragment,
 )
 from leapflow.skills.activator import SkillActivator
 from leapflow.skills.evolution import EMAConfidencePolicy
@@ -50,6 +53,7 @@ from leapflow.learning.codegen import CompositeSkillCodeGenerator, LLMSkillCodeG
 from leapflow.learning.distiller import LLMSkillDistiller, SkillDistiller
 from leapflow.learning.doc_generator import CompositeSkillDocGenerator, LLMSkillDocGenerator
 from leapflow.storage.skill_docs import SkillDocStore
+from leapflow.storage.connection import LocalConnectionHolder
 from leapflow.learning.feedback import FeedbackEvaluator
 from leapflow.storage.skill_library import SkillLibraryStore
 from leapflow.skills.registry import SkillRegistry
@@ -65,26 +69,89 @@ from leapflow.platform.normalizer import EventNormalizer
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from leapflow.platform.observers import RecordingProfile
+    from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+    from leapflow.storage.skill_library import StoredSkill
 
-class _InteractiveApprovalGate:
-    """CLI-mode interactive approval for dangerous shell commands."""
+
+class _TUIApprovalGate:
+    """Rich-styled approval gate for the interactive TUI.
+
+    Displays a styled panel with the action details and accepts:
+    - ``y``/``yes`` → allow this one time
+    - ``a``/``always`` → allow and skip future prompts for this category
+    - ``n``/``no``/Enter → deny
+
+    Implements both ``ApprovalGate`` (unified) and ``CommandApprovalGate``
+    (backward-compatible with ``shell_tools.py``).
+    """
+
+    _CATEGORY_LABELS = {
+        "shell_dangerous": ("Shell Command", "yellow"),
+        "file_write": ("File Write", "yellow"),
+        "gateway_send": ("External Message", "cyan"),
+    }
+
+    async def request_approval(
+        self, request: "ApprovalRequest",
+    ) -> "ApprovalDecision":
+        from leapflow.security.approval import ApprovalDecision
+
+        if not sys.stdin.isatty():
+            return ApprovalDecision.DENY
+
+        label, color = self._CATEGORY_LABELS.get(
+            request.category, ("Action", "yellow"),
+        )
+
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            from rich.text import Text
+
+            console = Console(stderr=True, highlight=False)
+            body = Text()
+            body.append(f"  {request.detail}\n\n", style="bold")
+            body.append("  [y]es  — allow once\n", style="dim")
+            body.append("  [a]lways — allow for this session\n", style="dim")
+            body.append("  [n]o / Enter — deny\n", style="dim")
+            console.print(Panel(
+                body,
+                title=f"[bold {color}]⚠ {label} Approval[/]",
+                border_style=color,
+                padding=(0, 1),
+            ))
+            sys.stderr.write("  → ")
+            sys.stderr.flush()
+        except ImportError:
+            sys.stderr.write(f"⚠ {label}: {request.detail}\n")
+            sys.stderr.write("Approve? [y/a(lways)/N]: ")
+            sys.stderr.flush()
+
+        try:
+            answer = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: input().strip().lower(),
+            )
+        except (EOFError, KeyboardInterrupt):
+            return ApprovalDecision.DENY
+
+        if answer in ("a", "always"):
+            return ApprovalDecision.ALLOW_SESSION
+        if answer in ("y", "yes"):
+            return ApprovalDecision.ALLOW
+        return ApprovalDecision.DENY
 
     async def check(self, command: str) -> bool:
-        if not sys.stdin.isatty():
-            return False
-        try:
-            if sys.stderr.isatty():
-                sys.stderr.write(f"\033[33m⚠ Dangerous command: {command}\033[0m\n")
-            else:
-                sys.stderr.write(f"WARNING: Dangerous command: {command}\n")
-            sys.stderr.write("Approve? [y/N]: ")
-            sys.stderr.flush()
-            answer = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: input().strip().lower()
-            )
-            return answer in ("y", "yes")
-        except (EOFError, KeyboardInterrupt):
-            return False
+        """``CommandApprovalGate`` compatibility — shell_tools calls this."""
+        from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+
+        decision = await self.request_approval(ApprovalRequest(
+            category="shell_dangerous",
+            detail=command,
+            risk_hint=0.7,
+        ))
+        return decision in (ApprovalDecision.ALLOW, ApprovalDecision.ALLOW_SESSION)
 
 
 def _default_recording_profile(settings: Settings) -> Optional["RecordingProfile"]:
@@ -133,6 +200,15 @@ def _build_visual_components(
     from leapflow.perception.session import PerceptionSession
 
     vlm_api_key = settings.vlm_api_key or settings.llm_api_key
+    if not vlm_api_key.strip():
+        message = (
+            "Visual perception disabled: LEAPFLOW_VLM_API_KEY or "
+            "LEAPFLOW_LLM_API_KEY is required when visual track is enabled."
+        )
+        logger.warning(message)
+        _emit_status(message)
+        return None
+
     vlm_base_url = settings.vlm_base_url or settings.llm_base_url
     vlm_model = settings.vlm_model or settings.llm_model
     vlm_provider = OpenAIChat(
@@ -265,7 +341,6 @@ def _register_stored_skill_fallbacks(
     llm: Any,
 ) -> int:
     """Register StoredSkills that lack a parameterized or doc counterpart."""
-    from leapflow.storage.skill_library import StoredSkill
     from leapflow.skills.registry import Skill, SkillMetadata
 
     registered_names = set(registry.names()) if hasattr(registry, 'names') else {s.name for s in registry.list_all()}
@@ -307,19 +382,33 @@ class Context:
         self.settings = settings
         self.effective_mock = bool(mock_host or settings.mock_host)
 
-        # Memory subsystem — provider-based architecture
+        # Shared DuckDB connection holder — single leap.duckdb for all stores (P1).
+        # Created here (lazy, not yet opened) so __init__-time providers such as
+        # SemanticMemoryProvider can bind to it. Eager open + lock detection
+        # happens later in initialize().
+        self._db_holder = LocalConnectionHolder(
+            settings.duckdb_path,
+            volatile_on_lock=True,
+        )
+
+        # Memory subsystem — provider-based architecture (dual-layer)
         working = WorkingMemoryProvider(max_tokens=settings.memory_working_max_tokens)
-        semantic = SemanticMemoryProvider(db_path=settings.duckdb_path)
+        semantic = SemanticMemoryProvider(source=self._db_holder)
         episodic = EpisodicMemoryProvider(
             ttl=settings.memory_episodic_ttl_s,
             max_entries=settings.memory_episodic_max_entries,
             on_promote=_build_promotion_callback(semantic),
         )
         evolution = EvolutionMemoryProvider(max_episodes=settings.memory_evolution_max_episodes)
+        narrative = NarrativeProvider(
+            memory_dir=settings.profile_dir / "memory",
+            workspace_path=str(Path.cwd()),
+        )
 
         self.memory = MemoryManager()
         self.memory.add_provider(working)
         self.memory.add_provider(episodic)
+        self.memory.add_provider(narrative)
         self.memory.add_provider(semantic)
         self.memory.add_provider(evolution)
 
@@ -365,59 +454,8 @@ class Context:
                 )
             self.rpc = CuaDriverClient()
 
-        # ── Multi-provider LLM chain (failover + credential rotation) ──
-        provider_configs = parse_provider_configs(
-            settings.llm_api_key or "missing",
-            settings.llm_base_url,
-            settings.llm_model,
-            fallback_json=settings.llm_fallback_providers,
-            primary_context_length=settings.llm_context_length,
-        )
-        credential_pools = parse_credential_pools(
-            provider_configs,
-            cooldown_s=settings.llm_credential_cooldown_s,
-        )
-        if len(provider_configs) > 1 or credential_pools:
-            self.llm_chain = FailoverChain(
-                provider_configs, credential_pools=credential_pools,
-                circuit_failure_threshold=settings.circuit_breaker_threshold,
-                circuit_cooldown_s=settings.circuit_breaker_cooldown_s,
-            )
-            self.llm = self.llm_chain
-            logger.info(
-                "LLM chain: %d providers, %d credential pools",
-                len(provider_configs), len(credential_pools),
-            )
-        else:
-            self.llm_chain = None
-            self.llm = OpenAIChat(
-                api_key=settings.llm_api_key or "missing",
-                base_url=settings.llm_base_url,
-                model=settings.llm_model,
-                max_retries=settings.llm_max_retries,
-            )
-
-        # ── Auxiliary LLM for cheap operations ──
-        self.auxiliary: Optional[AuxiliaryClient] = None
-        if settings.llm_aux_model:
-            aux_llm = OpenAIChat(
-                api_key=settings.llm_aux_api_key or settings.llm_api_key or "missing",
-                base_url=settings.llm_aux_base_url or settings.llm_base_url,
-                model=settings.llm_aux_model,
-                max_retries=2,
-            )
-            self.auxiliary = AuxiliaryClient(aux_llm)
-            logger.info("Auxiliary LLM configured: %s", settings.llm_aux_model)
-        elif settings.has_llm_credentials:
-            self.auxiliary = AuxiliaryClient(self.llm)
-
-        self.vlm: Optional[OpenAIChat] = None
-        if settings.vlm_model and settings.vlm_model != settings.llm_model:
-            self.vlm = OpenAIChat(
-                api_key=settings.vlm_api_key or settings.llm_api_key or "missing",
-                base_url=settings.vlm_base_url or settings.llm_base_url,
-                model=settings.vlm_model,
-            )
+        self._config_signature = self._runtime_config_signature(settings)
+        self._configure_llm_clients(settings)
 
         self.audit = AuditLogger(settings.audit_log_path)
 
@@ -452,6 +490,254 @@ class Context:
         self._evolution_policy: Optional[EMAConfidencePolicy] = None
         self._pattern_miner: Optional[Any] = None
 
+        # Unified approval gate is resource-free; create it in __init__ so all
+        # initialize() wiring paths can safely reference the same session gate.
+        from leapflow.security.approval import SessionAwareGate
+
+        self._tui_approval = _TUIApprovalGate()
+        self._approval_gate = SessionAwareGate(self._tui_approval)
+
+    def _configure_llm_clients(self, settings: Settings) -> None:
+        """Build LLM/VLM clients from a settings snapshot."""
+        provider_configs = parse_provider_configs(
+            settings.llm_api_key or "missing",
+            settings.llm_base_url,
+            settings.llm_model,
+            fallback_json=settings.llm_fallback_providers,
+            primary_context_length=settings.llm_context_length,
+        )
+        credential_pools = parse_credential_pools(
+            provider_configs,
+            cooldown_s=settings.llm_credential_cooldown_s,
+        )
+        if len(provider_configs) > 1 or credential_pools:
+            self.llm_chain = FailoverChain(
+                provider_configs,
+                credential_pools=credential_pools,
+                circuit_failure_threshold=settings.circuit_breaker_threshold,
+                circuit_cooldown_s=settings.circuit_breaker_cooldown_s,
+            )
+            self.llm = self.llm_chain
+            logger.info(
+                "LLM chain: %d providers, %d credential pools",
+                len(provider_configs), len(credential_pools),
+            )
+        else:
+            self.llm_chain = None
+            self.llm = OpenAIChat(
+                api_key=settings.llm_api_key or "missing",
+                base_url=settings.llm_base_url,
+                model=settings.llm_model,
+                max_retries=settings.llm_max_retries,
+            )
+
+        self.auxiliary: Optional[AuxiliaryClient] = None
+        if settings.llm_aux_model:
+            aux_llm = OpenAIChat(
+                api_key=settings.llm_aux_api_key or settings.llm_api_key or "missing",
+                base_url=settings.llm_aux_base_url or settings.llm_base_url,
+                model=settings.llm_aux_model,
+                max_retries=2,
+            )
+            self.auxiliary = AuxiliaryClient(aux_llm)
+            logger.info("Auxiliary LLM configured: %s", settings.llm_aux_model)
+        elif settings.has_llm_credentials:
+            self.auxiliary = AuxiliaryClient(self.llm)
+
+        self.vlm: Optional[OpenAIChat] = None
+        if (
+            settings.vlm_model
+            and settings.vlm_model != settings.llm_model
+            and settings.has_vlm_credentials
+        ):
+            self.vlm = OpenAIChat(
+                api_key=settings.vlm_api_key or settings.llm_api_key,
+                base_url=settings.vlm_base_url or settings.llm_base_url,
+                model=settings.vlm_model,
+            )
+
+    def _effective_llm_context_length(self, settings: Settings) -> int:
+        """Return the configured runtime context budget for the active provider."""
+        if self.llm_chain is not None:
+            return max(1, int(self.llm_chain.context_length))
+        return max(1, int(settings.llm_context_length))
+
+    def _build_model_capability_registry(self, settings: Settings) -> Any:
+        """Build model capabilities where explicit runtime config wins over static hints."""
+        from leapflow.llm.model_capabilities import ModelCapabilities, ModelCapabilityRegistry
+
+        cap_registry = ModelCapabilityRegistry()
+        base_caps = cap_registry.resolve(settings.llm_model)
+        cap_registry.register(
+            settings.llm_model,
+            ModelCapabilities(
+                context_length=self._effective_llm_context_length(settings),
+                max_output_tokens=base_caps.max_output_tokens,
+                supports_tools=settings.native_tool_calling_enabled,
+                supports_vision=base_caps.supports_vision,
+                supports_thinking=base_caps.supports_thinking,
+                supports_streaming_tools=base_caps.supports_streaming_tools,
+                tokens_per_image=base_caps.tokens_per_image,
+            ),
+        )
+        return cap_registry
+
+    def _sync_engine_runtime_budget(self, settings: Settings) -> None:
+        """Sync engine-visible budgets and model capability metadata from settings."""
+        if self.engine is None:
+            return
+
+        context_length = self._effective_llm_context_length(settings)
+        dynamic_result_budget = min(settings.max_tool_result_chars, context_length // 20)
+        if dynamic_result_budget != settings.max_tool_result_chars:
+            logger.info(
+                "Dynamic tool result budget: %d (context=%d)",
+                dynamic_result_budget,
+                context_length,
+            )
+        self.engine.set_tool_result_budget(dynamic_result_budget)
+        self.engine.set_model_capabilities(self._build_model_capability_registry(settings))
+        logger.debug("Model capability registry wired")
+
+    @staticmethod
+    def _runtime_config_signature(settings: Settings) -> tuple:
+        """Return a stable signature for user-editable runtime config files."""
+        paths = (
+            settings.data_dir / ".env",
+            settings.data_dir / "config.yaml",
+            Path.cwd() / ".env",
+        )
+        signature = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                signature.append((str(path), 0, 0))
+            else:
+                signature.append((str(path), stat.st_mtime_ns, stat.st_size))
+        return tuple(signature)
+
+    @staticmethod
+    def _bool_env(value: str, default: bool) -> bool:
+        text = value.strip().lower()
+        if not text:
+            return default
+        return text in {"1", "true", "yes", "on"}
+
+    def _load_runtime_settings_from_files(self) -> Settings:
+        """Reload hot-swappable LLM/VLM settings directly from config files."""
+        values: dict[str, str] = {}
+        data_env = self.settings.data_dir / ".env"
+        cwd_env = Path.cwd() / ".env"
+        if data_env.exists():
+            values.update({
+                key: value
+                for key, value in dotenv_values(data_env).items()
+                if value is not None
+            })
+        values.update(_load_yaml_overlay(self.settings.data_dir))
+        if cwd_env.exists():
+            values.update({
+                key: value
+                for key, value in dotenv_values(cwd_env).items()
+                if value is not None
+            })
+
+        def _value(key: str, current: str) -> str:
+            env_value = os.environ.get(key, "").strip()
+            if env_value:
+                return env_value
+            return str(values.get(key, current)).strip()
+
+        max_retries_raw = _value(
+            "LEAPFLOW_LLM_MAX_RETRIES",
+            str(self.settings.llm_max_retries),
+        )
+        try:
+            max_retries = max(1, int(max_retries_raw))
+        except ValueError:
+            max_retries = self.settings.llm_max_retries
+
+        context_length_raw = _value(
+            "LEAPFLOW_LLM_CONTEXT_LENGTH",
+            str(self.settings.llm_context_length),
+        )
+        try:
+            llm_context_length = max(1, int(context_length_raw))
+        except ValueError:
+            llm_context_length = self.settings.llm_context_length
+
+        return replace(
+            self.settings,
+            llm_api_key=_value("LEAPFLOW_LLM_API_KEY", self.settings.llm_api_key),
+            llm_base_url=_value("LEAPFLOW_LLM_BASE_URL", self.settings.llm_base_url).rstrip("/"),
+            llm_model=_value("LEAPFLOW_LLM_MODEL", self.settings.llm_model),
+            llm_max_retries=max_retries,
+            llm_context_length=llm_context_length,
+            vlm_api_key=_value("LEAPFLOW_VLM_API_KEY", self.settings.vlm_api_key),
+            vlm_base_url=_value("LEAPFLOW_VLM_BASE_URL", self.settings.vlm_base_url).rstrip("/"),
+            vlm_model=_value("LEAPFLOW_VLM_MODEL", self.settings.vlm_model),
+            visual_track_enabled=self._bool_env(
+                _value(
+                    "LEAPFLOW_VISUAL_TRACK_ENABLED",
+                    "1" if self.settings.visual_track_enabled else "0",
+                ),
+                self.settings.visual_track_enabled,
+            ),
+        )
+
+    def reload_runtime_config_if_changed(self) -> bool:
+        """Hot-reload LLM/VLM config when user-editable config files changed."""
+        signature = self._runtime_config_signature(self.settings)
+        if signature == self._config_signature:
+            return False
+
+        previous = self.settings
+        updated = self._load_runtime_settings_from_files()
+        self._config_signature = signature
+        llm_changed = (
+            previous.llm_api_key != updated.llm_api_key
+            or previous.llm_base_url != updated.llm_base_url
+            or previous.llm_model != updated.llm_model
+            or previous.llm_max_retries != updated.llm_max_retries
+            or previous.llm_context_length != updated.llm_context_length
+            or previous.vlm_api_key != updated.vlm_api_key
+            or previous.vlm_base_url != updated.vlm_base_url
+            or previous.vlm_model != updated.vlm_model
+            or previous.visual_track_enabled != updated.visual_track_enabled
+        )
+        self.settings = updated
+        if not llm_changed:
+            return False
+
+        self._configure_llm_clients(updated)
+        classifier: IntentClassifier = (
+            LLMIntentClassifier(self.llm)
+            if updated.has_llm_credentials
+            else FallbackClassifier()
+        )
+        self.intent_classifier = classifier
+        self.assessor = (
+            LLMSituationalAssessor(self.llm)
+            if updated.has_llm_credentials
+            else None
+        )
+        if self.engine is not None:
+            self.engine.reconfigure_runtime(
+                settings=updated,
+                llm=self.llm,
+                vlm=self.vlm,
+                classifier=classifier,
+            )
+            self._sync_engine_runtime_budget(updated)
+        logger.info("Runtime LLM configuration reloaded")
+        return True
+
+    @property
+    def storage_volatile(self) -> bool:
+        """Return True when this process uses non-persistent fallback storage."""
+        return bool(getattr(self._db_holder, "is_volatile", False))
+
     async def initialize(self) -> None:
         """Async initialization: VSI handshake, pipeline assembly.
 
@@ -463,6 +749,13 @@ class Context:
         settings = self.settings
 
         await self.memory.initialize_all()
+        if self.storage_volatile:
+            _emit_status(
+                "Primary database is locked; running with volatile session storage."
+            )
+            _emit_status(
+                "This window can chat, but new memory/session data will not persist."
+            )
 
         vsi = VirtualSystemInterface(self.rpc)
         bridge_online = False
@@ -525,8 +818,17 @@ class Context:
         if settings.has_llm_credentials:
             codegen = CompositeSkillCodeGenerator(LLMSkillCodeGenerator(self.llm))
 
-        traj_db_path = settings.duckdb_path.parent / "trajectories.duckdb"
-        traj_store = TrajectoryStore(traj_db_path)
+        # Holder was created in __init__ and may already have opened during
+        # memory initialization. Access once here to preserve early lock/fallback
+        # detection before persistent stores are assembled.
+        _ = self._db_holder.connection
+
+        try:
+            traj_store = TrajectoryStore(self._db_holder)
+        except Exception as exc:
+            logger.error("TrajectoryStore init failed: %s", exc)
+            self._db_holder.close()
+            raise SystemExit(f"\nFailed to initialize trajectory store: {exc}") from exc
         distiller: SkillDistiller
         if settings.has_llm_credentials:
             distiller = LLMSkillDistiller(self.llm)
@@ -551,9 +853,17 @@ class Context:
         video_segmenter = None
         signal_timeline = None
         if settings.recording_mode.uses_video and settings.visual_track_enabled:
-            video_recorder, video_analyzer, video_segmenter, signal_timeline = (
-                _build_video_components(settings, self.rpc, self.vlm or self.llm)
-            )
+            if settings.has_vlm_credentials:
+                video_recorder, video_analyzer, video_segmenter, signal_timeline = (
+                    _build_video_components(settings, self.rpc, self.vlm or self.llm)
+                )
+            else:
+                message = (
+                    "Video analysis disabled: LEAPFLOW_VLM_API_KEY or "
+                    "LEAPFLOW_LLM_API_KEY is required for visual recording mode."
+                )
+                logger.warning(message)
+                _emit_status(message)
 
         platform_hint = manifest.platform_id.value
 
@@ -629,8 +939,7 @@ class Context:
                 "(video mode active but timeline unavailable)"
             )
 
-        skill_lib_path = settings.duckdb_path.parent / "skill_library.duckdb"
-        self.skill_lib = SkillLibraryStore(skill_lib_path, audit_logger=self.audit)
+        self.skill_lib = SkillLibraryStore(self._db_holder, audit_logger=self.audit)
         scorer = HeuristicSimilarityScorer()
         llm_scorer = LLMSimilarityScorer(self.llm) if settings.has_llm_credentials else None
         feedback_evaluator = FeedbackEvaluator(
@@ -879,7 +1188,7 @@ class Context:
         from leapflow.engine.confirmation import ConfirmationHandler
         confirmation = ConfirmationHandler(skill_store=self.skill_lib)
 
-        self.session_store = LearningSessionStore(traj_db_path)
+        self.session_store = LearningSessionStore(self._db_holder)
 
         # Learnability assessor
         learnability_assessor = None
@@ -912,7 +1221,7 @@ class Context:
             auto_learn=settings.learn_auto_distill,
             confirmation=confirmation,
             audit=self.audit,
-            storage_path=str(skill_lib_path),
+            storage_path=str(settings.duckdb_path),
             audit_log_path=str(settings.audit_log_path),
             active_learning_observer=observer,
             session_store=self.session_store,
@@ -976,7 +1285,7 @@ class Context:
             ]
             # L2/L3: wire Memory adapters when ExperienceStore is available
             if hasattr(self, 'experience_store') and self.experience_store is not None:
-                from leapflow.copilot.adapters import ExperienceEmbedAdapter, MemoryRAGAdapter
+                from leapflow.copilot.adapters import ExperienceEmbedAdapter
                 from leapflow.copilot.predictors.l2_embed import L2EmbeddingPredictor
                 from leapflow.copilot.predictors.l3_llm import L3LLMPredictor
 
@@ -1051,6 +1360,78 @@ class Context:
         from leapflow.tools.registry_bootstrap import set_memory_manager
         set_memory_manager(self.memory)
 
+        # ── Gateway server (late-bound tool wiring) ──
+        from leapflow.gateway.server import GatewayServer
+        from leapflow.gateway.router import GatewayRouter
+        from leapflow.gateway.events import (
+            GatewayMessageReceived,
+            GatewaySessionCreated,
+            GatewaySessionEnded,
+        )
+        from leapflow.tools.registry_bootstrap import set_gateway_server
+        from leapflow.tools.gateway_tool import set_gateway_approval_gate
+
+        async def _on_gateway_event(event: object) -> None:
+            """Bridge gateway events to episodic memory and logging."""
+            if isinstance(event, GatewayMessageReceived):
+                logger.info(
+                    "gateway.inbound platform=%s session=%s len=%d",
+                    event.source.platform,
+                    event.session_key,
+                    len(event.text),
+                )
+                episodic = self.memory.get_provider("episodic")
+                if episodic is not None and hasattr(episodic, "ingest"):
+                    episodic.ingest(
+                        "gateway.message",
+                        f"[{event.source.platform}:{event.source.user_name or event.source.user_id}] "
+                        f"{event.text[:500]}",
+                        metadata={
+                            "platform": event.source.platform,
+                            "session": event.session_key,
+                        },
+                    )
+            elif isinstance(event, GatewaySessionCreated):
+                logger.info("gateway.session_created key=%s", event.session_key)
+            elif isinstance(event, GatewaySessionEnded):
+                logger.info(
+                    "gateway.session_ended key=%s reason=%s",
+                    event.session_key,
+                    event.reason,
+                )
+                router = getattr(self, "_gateway_router", None)
+                if router is not None:
+                    router.clear_session(event.session_key)
+
+        self.gateway_server = GatewayServer(
+            settings.profile_dir,
+            extra_manifest_dirs=[settings.profile_dir / "gateway" / "manifests"],
+            on_event=_on_gateway_event,
+        )
+        self.gateway_server.discover_manifests()
+        set_gateway_server(self.gateway_server)
+        set_gateway_approval_gate(self._approval_gate)
+
+        async def _gateway_send(source: Any, text: str) -> None:
+            await self.gateway_server.send_reply(source, text)
+
+        from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
+
+        self._gateway_router = GatewayRouter(
+            llm=self.llm,
+            system_prompt=(
+                "You are LeapFlow, a helpful AI assistant responding "
+                "through an external messaging platform.  Be concise "
+                "and conversational."
+            ),
+            send_fn=_gateway_send,
+            tool_definitions=TOOL_DEFINITIONS,
+            tool_handlers=TOOL_HANDLERS,
+        )
+        self.gateway_server.set_message_handler(
+            self._gateway_router.handle_message,
+        )
+
         # ── Build CompressorConfig with LLM callbacks ──
         from leapflow.engine.context_compressor import CompressorConfig
 
@@ -1070,15 +1451,12 @@ class Context:
             token_count_fn=lambda text: len(text) // 4,
         )
 
-        # ── Initialize DuckDBConversationStore (with self-repair) ──
+        # ── Initialize DuckDBConversationStore ──
         self._conversation_store = None
         try:
             from leapflow.storage.conversation_store import DuckDBConversationStore
-            from leapflow.storage.db_repair import check_and_repair
-            conv_db_path = settings.duckdb_path.parent / "conversations.duckdb"
-            check_and_repair(conv_db_path)
-            self._conversation_store = DuckDBConversationStore(conv_db_path)
-            logger.info("ConversationStore initialized: %s", conv_db_path)
+            self._conversation_store = DuckDBConversationStore(self._db_holder)
+            logger.info("ConversationStore initialized")
         except Exception:
             logger.warning("ConversationStore initialization failed", exc_info=True)
 
@@ -1136,12 +1514,11 @@ class Context:
         except Exception:
             logger.debug("MCP Manager initialization skipped", exc_info=True)
 
-        # ── Wire Approval Gate for shell dangerous commands ──
+        # ── Unified approval gate wiring (shell, file, gateway) ──
         try:
             from leapflow.tools.shell_tools import set_approval_gate
-
-            set_approval_gate(_InteractiveApprovalGate())
-            logger.debug("Shell approval gate: interactive CLI mode")
+            set_approval_gate(self._approval_gate)
+            logger.debug("Shell approval gate: unified TUI mode")
         except Exception:
             logger.debug("Shell approval gate setup skipped", exc_info=True)
 
@@ -1215,10 +1592,7 @@ class Context:
         self._evolution_store = None
         try:
             from leapflow.storage.evolution_store import DuckDBEvolutionStore
-            from leapflow.storage.db_repair import check_and_repair
-            evo_db_path = settings.duckdb_path.parent / "evolution.duckdb"
-            check_and_repair(evo_db_path)
-            self._evolution_store = DuckDBEvolutionStore(evo_db_path)
+            self._evolution_store = DuckDBEvolutionStore(self._db_holder)
             # Hydrate in-memory provider from persisted episodes
             persisted = self._evolution_store.load_recent_episodes(
                 limit=settings.memory_evolution_max_episodes,
@@ -1250,15 +1624,18 @@ class Context:
         # ── Wire Smart Approval (auxiliary LLM for command risk) ──
         if self.auxiliary is not None:
             try:
-                from leapflow.tools.shell_tools import CommandApprovalGate
                 aux = self.auxiliary
 
                 class _SmartApprovalGate:
-                    """LLM-assisted approval for dangerous commands.
+                    """LLM-assisted approval that auto-approves low-risk commands.
 
-                    Low-risk commands (score < 0.3) are auto-approved.
-                    Medium-risk prompts the user. High-risk always prompts.
+                    Uses the auxiliary LLM to score risk (0.0–1.0).
+                    Low-risk (< 0.3) auto-approved; others prompt via TUI gate.
+                    Wraps the unified approval gate — session memory still works.
                     """
+                    def __init__(self, delegate: Any) -> None:
+                        self._delegate = delegate
+
                     async def check(self, command: str) -> bool:
                         try:
                             risk = await aux.classify_risk(command)
@@ -1267,10 +1644,10 @@ class Context:
                         if risk < 0.3:
                             logger.debug("smart_approval: auto-approved (risk=%.2f)", risk)
                             return True
-                        return await _InteractiveApprovalGate().check(command)
+                        return await self._delegate.check(command)
 
                 from leapflow.tools.shell_tools import set_approval_gate
-                set_approval_gate(_SmartApprovalGate())
+                set_approval_gate(_SmartApprovalGate(self._approval_gate))
                 logger.debug("Smart approval gate enabled (auxiliary LLM)")
             except Exception:
                 logger.debug("Smart approval setup skipped", exc_info=True)
@@ -1278,78 +1655,52 @@ class Context:
         # ── Wire File Write Approval Gate ──
         try:
             from leapflow.tools.registry_bootstrap import set_file_write_gate
+            from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+
+            _SAFE_EXTENSIONS = frozenset({
+                ".tmp", ".log", ".txt", ".md", ".json", ".yaml", ".yml",
+                ".csv", ".tsv",
+            })
+            approval_gate = self._approval_gate
 
             class _FileWriteGate:
-                """Interactive approval for file writes to important paths."""
-                _APPROVE_EXTENSIONS = frozenset({
-                    ".tmp", ".log", ".txt", ".md", ".json", ".yaml", ".yml",
-                    ".csv", ".tsv",
-                })
+                """File write approval via the unified gate.
+
+                Auto-approves safe extensions and small writes; delegates
+                everything else to the session-aware approval gate.
+                """
                 async def check(self, path: str, content: str) -> bool:
                     from pathlib import Path as _P
                     p = _P(path)
-                    if p.suffix.lower() in self._APPROVE_EXTENSIONS:
+                    if p.suffix.lower() in _SAFE_EXTENSIONS:
                         return True
                     if len(content) < 500:
                         return True
-                    if not sys.stdin.isatty():
-                        return True
-                    if sys.stderr.isatty():
-                        sys.stderr.write(f"\033[33m⚠ File write: {p.name} ({len(content)} chars)\033[0m\n")
-                    else:
-                        sys.stderr.write(f"WARNING: File write: {p.name} ({len(content)} chars)\n")
-                    sys.stderr.write("Approve? [Y/n]: ")
-                    sys.stderr.flush()
-                    try:
-                        answer = await asyncio.get_running_loop().run_in_executor(
-                            None, lambda: input().strip().lower()
-                        )
-                        return answer in ("", "y", "yes")
-                    except (EOFError, KeyboardInterrupt):
-                        return False
+                    decision = await approval_gate.request_approval(
+                        ApprovalRequest(
+                            category="file_write",
+                            detail=f"{p.name} ({len(content)} chars)",
+                            risk_hint=0.4,
+                        ),
+                    )
+                    return decision in (
+                        ApprovalDecision.ALLOW,
+                        ApprovalDecision.ALLOW_SESSION,
+                    )
 
             set_file_write_gate(_FileWriteGate())
-            logger.debug("File write approval gate enabled")
+            logger.debug("File write approval gate: unified")
         except Exception:
             logger.debug("File write gate setup skipped", exc_info=True)
 
-        # ── Token budget dynamic linking (tool result budget ∝ model context) ──
-        context_length = settings.llm_context_length
-        if hasattr(self, 'llm_chain') and self.llm_chain is not None:
-            context_length = self.llm_chain.context_length
-        dynamic_result_budget = min(settings.max_tool_result_chars, context_length // 20)
-        if dynamic_result_budget != settings.max_tool_result_chars:
-            logger.info(
-                "Dynamic tool result budget: %d (context=%d)",
-                dynamic_result_budget, context_length,
-            )
+        # ── Token budget and model capability metadata ─────────────────────
         if self.engine is not None:
-            self.engine.set_tool_result_budget(dynamic_result_budget)
-
-        # ── Wire new engine capabilities ──
-        if self.engine is not None:
+            self._sync_engine_runtime_budget(settings)
             self.engine.set_stale_stream_timeout(settings.stale_stream_timeout_s)
             self.engine.set_default_tool_timeout(settings.default_tool_timeout_s)
 
             if self._evolution_store is not None:
                 self.engine.set_evolution_store(self._evolution_store)
-
-            try:
-                from leapflow.llm.model_capabilities import ModelCapabilityRegistry
-                cap_registry = ModelCapabilityRegistry()
-                if hasattr(self, 'llm_chain') and self.llm_chain is not None:
-                    from leapflow.llm.model_capabilities import ModelCapabilities
-                    cap_registry.register(
-                        settings.llm_model,
-                        ModelCapabilities(
-                            context_length=self.llm_chain.context_length,
-                            supports_tools=settings.native_tool_calling_enabled,
-                        ),
-                    )
-                self.engine.set_model_capabilities(cap_registry)
-                logger.debug("Model capability registry wired")
-            except Exception:
-                logger.debug("ModelCapabilityRegistry setup skipped", exc_info=True)
 
             if hasattr(self, "doc_store") and self.doc_store is not None:
                 self.engine.set_doc_store(self.doc_store)
@@ -1824,6 +2175,14 @@ class Context:
                 except Exception:
                     pass
 
+        # Stop gateway server
+        gw = getattr(self, "gateway_server", None)
+        if gw is not None:
+            try:
+                await gw.stop()
+            except Exception:
+                logger.debug("GatewayServer stop failed", exc_info=True)
+
         # Cancel engine if running
         if self.engine is not None:
             self.engine.cancel()
@@ -1876,6 +2235,12 @@ class Context:
             self.rpc.stop()
         if self.skill_lib:
             self.skill_lib.close()
+        if self.session_store:
+            self.session_store.close()
         if self.imitation:
             self.imitation.store.close()
+        # Close the shared DuckDB connection last (after all stores are done)
+        db_holder = getattr(self, "_db_holder", None)
+        if db_holder is not None:
+            db_holder.close()
         self.audit.close()

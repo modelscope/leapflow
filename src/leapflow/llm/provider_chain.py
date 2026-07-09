@@ -14,19 +14,18 @@ Design choices vs Hermes:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, FrozenSet, List, Optional, Protocol, runtime_checkable
 
-from leapflow.llm.base import ChunkCallback, LLMChatResponse, LLMProvider, ToolCallInfo
+from leapflow.config import DEFAULT_LLM_CONTEXT_LENGTH
+from leapflow.llm.base import ChunkCallback, LLMChatResponse, LLMProvider
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CONTEXT_LENGTH = 128_000
+_DEFAULT_CONTEXT_LENGTH = DEFAULT_LLM_CONTEXT_LENGTH
 
 
 @dataclass(frozen=True)

@@ -60,6 +60,45 @@ from leapflow.skills.registry import Skill, SkillRegistry
 logger = logging.getLogger(__name__)
 
 
+def _estimate_text_tokens(text: str) -> int:
+    """Approximate token count for status display when provider usage is absent."""
+    if not text:
+        return 0
+    cjk_count = sum(
+        1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u303f"
+    )
+    latin_chars = len(text) - cjk_count
+    return max(1, cjk_count + latin_chars // 4)
+
+
+def _estimate_message_tokens(message: Dict[str, Any]) -> int:
+    """Approximate chat-message token cost, including small role overhead."""
+    content = message.get("content", "")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                elif "text" in item:
+                    parts.append(str(item.get("text", "")))
+                else:
+                    parts.append(str(item))
+            else:
+                parts.append(str(item))
+        content = "\n".join(parts)
+    elif not isinstance(content, str):
+        content = str(content)
+    return 6 + _estimate_text_tokens(content)
+
+
+def _estimate_prompt_tokens(messages: List[Dict[str, Any]]) -> int:
+    """Approximate prompt token count for the exact message batch sent to the LLM."""
+    if not messages:
+        return 0
+    return max(1, sum(_estimate_message_tokens(msg) for msg in messages) + 3)
+
+
 def _log_progress(msg: str) -> None:
     """Print a persistent progress line to stderr (visible to user during `leap run`)."""
     if sys.stderr.isatty():
@@ -334,6 +373,35 @@ class AgentEngine:
         """Configure output message sanitizer."""
         self._sanitizer = sanitizer
 
+    def reconfigure_runtime(
+        self,
+        *,
+        settings: Settings,
+        llm: LLMProvider,
+        vlm: Optional[Any],
+        classifier: IntentClassifier,
+    ) -> None:
+        """Refresh runtime LLM configuration without resetting session state."""
+        self._settings = settings
+        self._llm = llm
+        self._vlm = vlm
+        self._classifier = classifier
+        self._skill_merger = SkillMerger(
+            registry=self._registry,
+            llm=llm,
+            execution=self._execution,
+        )
+        if settings.has_llm_credentials:
+            self._graph_planner = GraphPlanner(self._llm, self._registry)
+            self._scheduler = TaskScheduler(
+                self._registry,
+                self._rpc,
+                graph_planner=self._graph_planner,
+            )
+        else:
+            self._graph_planner = None
+            self._scheduler = None
+
     def set_tool_result_budget(self, budget: int) -> None:
         """Override per-tool result truncation budget (e.g. linked to model context)."""
         self._tool_result_budget = max(1, budget)
@@ -592,6 +660,10 @@ class AgentEngine:
 
         # 4. Everything else → unified tool loop (LLM decides tools vs direct response)
         logger.debug("route.unified user_text_len=%d", len(user_text))
+        if not self._settings.has_llm_credentials:
+            msg = self._error_classifier.friendly_message(ErrorCategory.AUTH_PERMANENT)
+            self._wm.remember_chat(build_assistant_message(msg))
+            return msg
         return await self._unified_tool_loop(user_text, enable_thinking=enable_thinking)
 
     async def run_stream(
@@ -638,6 +710,11 @@ class AgentEngine:
 
         # 4. Everything else → unified tool loop (streaming)
         logger.debug("route.unified user_text_len=%d", len(user_text))
+        if not self._settings.has_llm_credentials:
+            msg = self._error_classifier.friendly_message(ErrorCategory.AUTH_PERMANENT)
+            self._wm.remember_chat(build_assistant_message(msg))
+            yield StreamEvent(type="final", content=msg)
+            return
         async for chunk in self._unified_tool_loop_stream(user_text, enable_thinking=enable_thinking):
             yield chunk
 
@@ -1080,6 +1157,7 @@ class AgentEngine:
         ]
 
         content = ""
+        fatal_error: Optional[str] = None
         recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
         result_budget = self._effective_tool_result_budget()
@@ -1110,6 +1188,7 @@ class AgentEngine:
             compressed = self._compressor.preflight_check(compressed)
             if self._cache_strategy:
                 compressed = self._cache_strategy.optimize(compressed)
+            self._last_context_tokens = _estimate_prompt_tokens(compressed)
 
             _show_progress("thinking", f"round {budget.used}")
             try:
@@ -1124,7 +1203,9 @@ class AgentEngine:
                     provider=getattr(self._llm, 'active_provider_name', ''),
                     model=resp.model or '',
                 )
-                self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
+                provider_prompt = usage.get("prompt_tokens", 0)
+                if provider_prompt > 0:
+                    self._last_context_tokens = provider_prompt
                 if self._model_capabilities and resp.model and usage:
                     self._model_capabilities.update_from_usage(resp.model, usage)
             except Exception as exc:
@@ -1146,6 +1227,8 @@ class AgentEngine:
                     tools_kwarg = {}
                     use_native_tools = False
                     continue
+                fatal_error = self._error_classifier.friendly_message(classified, str(exc))
+                logger.error("unified_loop: unrecoverable %s: %s", category_str, exc)
                 break
             _clear_indicator()
 
@@ -1254,7 +1337,7 @@ class AgentEngine:
 
         logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
-        return content if content else "I've reached my processing limit."
+        return content if content else (fatal_error or "I've reached my processing limit.")
 
     async def _post_turn_review(
         self, messages: List[Dict[str, Any]], final_content: str
@@ -1430,6 +1513,7 @@ class AgentEngine:
         ]
 
         content = ""
+        fatal_error: Optional[str] = None
         turn_recovery = TurnRecoveryState()
         use_native_tools = self._settings.native_tool_calling_enabled
         result_budget = self._effective_tool_result_budget()
@@ -1460,6 +1544,7 @@ class AgentEngine:
             compressed = self._compressor.preflight_check(compressed)
             if self._cache_strategy:
                 compressed = self._cache_strategy.optimize(compressed)
+            self._last_context_tokens = _estimate_prompt_tokens(compressed)
 
             yield StreamEvent(type="thinking", content=f"round {budget.used}")
 
@@ -1478,7 +1563,9 @@ class AgentEngine:
                         provider=getattr(self._llm, 'active_provider_name', ''),
                         model=resp.model or '',
                     )
-                    self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
+                    provider_prompt = usage.get("prompt_tokens", 0)
+                    if provider_prompt > 0:
+                        self._last_context_tokens = provider_prompt
                 except Exception as exc:
                     _clear_indicator()
                     classified = self._error_classifier.classify(exc)
@@ -1591,7 +1678,9 @@ class AgentEngine:
                             classified, rec, turn_recovery, messages, budget,
                         ) == "continue":
                             continue
-                        yield StreamEvent(type="error", content=str(exc))
+                        fatal_error = self._error_classifier.friendly_message(classified, str(exc))
+                        logger.error("unified_loop_stream: unrecoverable %s: %s", classified.value, exc)
+                        yield StreamEvent(type="error", content=fatal_error)
                         break
 
                     content = "".join(content_parts).strip()
@@ -1609,7 +1698,9 @@ class AgentEngine:
                             provider=getattr(self._llm, 'active_provider_name', ''),
                             model=resp.model or '',
                         )
-                        self._last_context_tokens = usage.get("prompt_tokens", self._last_context_tokens)
+                        provider_prompt = usage.get("prompt_tokens", 0)
+                        if provider_prompt > 0:
+                            self._last_context_tokens = provider_prompt
                     except Exception as exc:
                         _clear_indicator()
                         classified = self._error_classifier.classify(exc)
@@ -1619,7 +1710,9 @@ class AgentEngine:
                             classified, rec, turn_recovery, messages, budget,
                         ) == "continue":
                             continue
-                        yield StreamEvent(type="error", content=str(exc))
+                        fatal_error = self._error_classifier.friendly_message(classified, str(exc))
+                        logger.error("unified_loop_stream: unrecoverable %s: %s", classified.value, exc)
+                        yield StreamEvent(type="error", content=fatal_error)
                         break
                     _clear_indicator()
                     content = (resp.content or "").strip()
@@ -1693,7 +1786,7 @@ class AgentEngine:
 
         logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
-        yield StreamEvent(type="final", content=content if content else "I've reached my processing limit.")
+        yield StreamEvent(type="final", content=content if content else (fatal_error or "I've reached my processing limit."))
 
 
     # ── Unified Loop Helpers ───────────────────────────────────────────────
@@ -1830,31 +1923,43 @@ class AgentEngine:
         """
         from leapflow.skills.tool_executor import ToolCall as TC
         from leapflow.security.redact import redact_sensitive_text
-        from leapflow.security.threat_patterns import is_untrusted_source, wrap_untrusted_result
 
         name = tool_call.get("name", "")
         args = tool_call.get("arguments", {})
 
         result: Dict[str, Any]
 
-        # Route through ToolBridge when available (single source of truth)
-        if self._tool_bridge is not None:
-            prefixed = f"gp_{name}"
-            result = await self._tool_bridge.dispatch(TC(name=prefixed, params=args))
-            if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
-                return self._post_process_tool_result(name, result)
-            result = await self._tool_bridge.dispatch(TC(name=name, params=args))
-            if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
-                return self._post_process_tool_result(name, result)
-
-        # Fallback: direct handler dispatch
-        handler = handlers.get(name)
-        if handler is None:
-            return {"ok": False, "error": f"Unknown tool: {name}"}
-
         timeout = self._tool_timeouts.get(name, self._default_tool_timeout_s)
         t0 = time.perf_counter()
+
         try:
+            # Route through ToolBridge when available (single source of truth)
+            if self._tool_bridge is not None:
+                prefixed = f"gp_{name}"
+                result = await asyncio.wait_for(
+                    self._tool_bridge.dispatch(TC(name=prefixed, params=args)),
+                    timeout=timeout,
+                )
+                if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
+                    duration = (time.perf_counter() - t0) * 1000
+                    is_ok = not (isinstance(result, dict) and not result.get("ok", True))
+                    self._usage_tracker.record_tool_call(name, is_ok, duration)
+                    return self._post_process_tool_result(name, result)
+                result = await asyncio.wait_for(
+                    self._tool_bridge.dispatch(TC(name=name, params=args)),
+                    timeout=timeout,
+                )
+                if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
+                    duration = (time.perf_counter() - t0) * 1000
+                    is_ok = not (isinstance(result, dict) and not result.get("ok", True))
+                    self._usage_tracker.record_tool_call(name, is_ok, duration)
+                    return self._post_process_tool_result(name, result)
+
+            # Fallback: direct handler dispatch
+            handler = handlers.get(name)
+            if handler is None:
+                return {"ok": False, "error": f"Unknown tool: {name}"}
+
             result = await asyncio.wait_for(handler(args), timeout=timeout)
         except asyncio.TimeoutError:
             duration = (time.perf_counter() - t0) * 1000
@@ -2002,7 +2107,11 @@ class AgentEngine:
             logger.debug("session.persist_message failed", exc_info=True)
 
     async def _prefetch_and_freeze_memory(self, user_text: str) -> str:
-        """Prefetch memory context and freeze snapshot for session duration."""
+        """Prefetch memory context and freeze snapshot for session duration.
+
+        Combines narrative memory (always-on MEMORY.md) with signal-based
+        prefetch results into a unified context block.
+        """
         if self._memory_context_snapshot is not None:
             return self._memory_context_snapshot
 
@@ -2010,6 +2119,19 @@ class AgentEngine:
             self._memory_context_snapshot = ""
             return ""
 
+        parts: list[str] = []
+
+        # Layer 1: Narrative memory (MEMORY.md — always loaded, no timeout)
+        narrative = self._memory_manager.get_provider("narrative")
+        if narrative is not None and hasattr(narrative, "context_block"):
+            try:
+                block = narrative.context_block()
+                if block:
+                    parts.append(block)
+            except Exception:
+                logger.debug("narrative.context_block failed", exc_info=True)
+
+        # Layer 2: Signal-based prefetch (DuckDB — timeout-bounded)
         try:
             entries = await asyncio.wait_for(
                 self._memory_manager.prefetch(
@@ -2018,19 +2140,18 @@ class AgentEngine:
                 timeout=self._settings.memory_prefetch_timeout_s,
             )
             if entries:
-                context = "## Recent Context\n" + "\n".join(
+                parts.append("## Recent Context\n" + "\n".join(
                     f"- [{e.kind.value}] {e.content[:100]}" for e in entries
-                )
-                self._memory_context_snapshot = context
-                return context
+                ))
         except asyncio.TimeoutError:
             logger.debug(
                 "memory.prefetch timed out (%.1fs)", self._settings.memory_prefetch_timeout_s,
             )
         except Exception:
             logger.debug("memory.prefetch failed", exc_info=True)
-        self._memory_context_snapshot = ""
-        return ""
+
+        self._memory_context_snapshot = "\n\n".join(parts)
+        return self._memory_context_snapshot
 
     async def _sync_turn_safe(self, messages: List[Dict[str, Any]]) -> None:
         """Non-blocking wrapper for MemoryManager.sync_turn."""

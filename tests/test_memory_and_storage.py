@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 
 import pytest
+import duckdb
 
 from leapflow.domain.trajectory import (
     ActionType,
@@ -20,6 +22,60 @@ from leapflow.memory import (
 from leapflow.platform.event_bus import EventBus
 from leapflow.platform.protocol import EventTypes
 from leapflow.storage.skill_library import StoredSkill
+from leapflow.storage.connection import LocalConnectionHolder
+from leapflow.storage.duckdb_connect import DatabaseLockedError
+
+
+# ── Storage lock fallback ───────────────────────────────────────────
+
+
+def test_connection_holder_uses_volatile_duckdb_when_primary_is_locked(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import leapflow.storage.connection as connection_module
+
+    primary_path = tmp_path / "leap.duckdb"
+    original_connect = connection_module._lock_aware_connect
+
+    def flaky_connect(db_path: Path):
+        if Path(db_path) == primary_path:
+            raise DatabaseLockedError(primary_path, RuntimeError("locked"))
+        return original_connect(db_path)
+
+    monkeypatch.setattr(connection_module, "_lock_aware_connect", flaky_connect)
+
+    holder = LocalConnectionHolder(primary_path, volatile_on_lock=True)
+    conn = holder.connection
+    volatile_path = holder.db_path
+
+    try:
+        assert holder.is_volatile is True
+        assert holder.locked_error is not None
+        assert volatile_path != primary_path
+        assert volatile_path.name == "leap.duckdb"
+        assert conn.execute("SELECT 1").fetchone() == (1,)
+        assert volatile_path.exists()
+    finally:
+        holder.close()
+
+    assert volatile_path.exists() is False
+
+
+def test_write_buffer_drops_permanent_failures(tmp_path) -> None:
+    from leapflow.storage.write_buffer import WriteBuffer
+
+    db_path = tmp_path / "buffer.duckdb"
+    conn = duckdb.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY)")
+        buffer = WriteBuffer(conn, max_count=10)
+        buffer.append("bad-sql", "INSERT INTO missing_table VALUES (?)", [1])
+
+        assert buffer.flush() == 0
+        assert buffer.pending == 0
+    finally:
+        conn.close()
 
 
 # ── Working memory ─────────────────────────────────────────────────
@@ -288,7 +344,7 @@ def test_skill_library_crud(skill_library) -> None:
 
 
 def test_memory_tiers_integration(tmp_db) -> None:
-    lt = SemanticMemoryProvider(db_path=tmp_db)
+    lt = SemanticMemoryProvider(source=tmp_db)
     lt._ensure_connection()
     try:
 

@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+
+from leapflow.config import DEFAULT_LLM_CONTEXT_LENGTH
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +27,7 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 class ModelCapabilities:
     """Capability descriptor for a specific model."""
 
-    context_length: int = 128_000
+    context_length: int = DEFAULT_LLM_CONTEXT_LENGTH
     max_output_tokens: int = 16_384
     supports_tools: bool = True
     supports_vision: bool = False

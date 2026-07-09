@@ -10,9 +10,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
-
-import duckdb
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 from leapflow.domain.trajectory import (
     ActionType,
@@ -23,11 +21,10 @@ from leapflow.domain.trajectory import (
     Trajectory,
     TrajectoryStep,
 )
+from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
+from leapflow.storage.write_buffer import WriteBuffer, execute_with_retry
 
 logger = logging.getLogger(__name__)
-
-
-_MAX_WRITE_BUFFER = 500
 
 
 class TrajectoryStore:
@@ -35,18 +32,24 @@ class TrajectoryStore:
 
     Write failures are buffered in memory and retried on the next successful
     write, preventing data loss during transient DuckDB errors.
+
+    Accepts either a ``ConnectionHolder`` (shared connection) or a legacy
+    ``Path`` (auto-wrapped in ``LocalConnectionHolder``).
     """
 
-    def __init__(self, db_path: Path) -> None:
-        self._path = db_path
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._con = duckdb.connect(str(self._path))
-        self._write_buffer: list = []
+    def __init__(self, source: Union[ConnectionHolder, Path]) -> None:
+        self._owns_holder = isinstance(source, Path)
+        if self._owns_holder:
+            source = LocalConnectionHolder(source)
+        self._holder = source
+        self._con = self._holder.connection
+        self._write_buffer = WriteBuffer(self._con)
         self._init_schema()
 
     def close(self) -> None:
-        self._flush_buffer()
-        self._con.close()
+        self._write_buffer.flush()
+        if self._owns_holder:
+            self._holder.close()
 
     # ── Schema ──
 
@@ -164,7 +167,8 @@ class TrajectoryStore:
     def save_trajectory(self, traj: Trajectory) -> None:
         """Persist a complete trajectory with all its steps."""
         now = time.time()
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "INSERT OR REPLACE INTO leap_trajectory VALUES (?, ?, ?, ?, ?, ?, ?)",
             [
                 traj.trajectory_id,
@@ -177,7 +181,12 @@ class TrajectoryStore:
             ],
         )
         for idx, step in enumerate(traj.steps):
-            self._insert_step(traj.trajectory_id, idx, step)
+            execute_with_retry(
+                self._con,
+                "INSERT OR REPLACE INTO leap_trajectory_step VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                self._step_params(traj.trajectory_id, idx, step),
+            )
         logger.info(
             "trajectory.saved id=%s steps=%d duration=%.1fs",
             traj.trajectory_id,
@@ -186,55 +195,37 @@ class TrajectoryStore:
         )
 
     def append_step(self, trajectory_id: str, step_idx: int, step: TrajectoryStep) -> None:
-        """Append a single step (buffered on failure)."""
+        """Append a single step (immediate write, buffered on failure)."""
+        sql = (
+            "INSERT OR REPLACE INTO leap_trajectory_step VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        params = self._step_params(trajectory_id, step_idx, step)
         try:
-            self._insert_step(trajectory_id, step_idx, step)
-            self._flush_buffer()
-        except Exception as e:
-            logger.warning("store.append_step buffered: %s", e)
-            self._buffer_write("step", (trajectory_id, step_idx, step))
+            execute_with_retry(self._con, sql, params)
+            self._write_buffer.flush()
+        except Exception as exc:
+            logger.warning("store.append_step buffered: %s", exc)
+            self._write_buffer.append("step", sql, params)
 
     def finalize_trajectory(self, traj: Trajectory) -> None:
-        """Update trajectory header (buffered on failure)."""
+        """Update trajectory header (immediate write, buffered on failure)."""
+        sql = "INSERT OR REPLACE INTO leap_trajectory VALUES (?, ?, ?, ?, ?, ?, ?)"
+        params = [
+            traj.trajectory_id,
+            traj.user_id,
+            traj.start_time,
+            traj.end_time,
+            traj.step_count,
+            json.dumps(traj.metadata, ensure_ascii=False),
+            time.time(),
+        ]
         try:
-            self._finalize_sql(traj)
-            self._flush_buffer()
-        except Exception as e:
-            logger.warning("store.finalize buffered: %s", e)
-            self._buffer_write("finalize", (traj,))
-
-    def _finalize_sql(self, traj: Trajectory) -> None:
-        self._con.execute(
-            "INSERT OR REPLACE INTO leap_trajectory VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [
-                traj.trajectory_id,
-                traj.user_id,
-                traj.start_time,
-                traj.end_time,
-                traj.step_count,
-                json.dumps(traj.metadata, ensure_ascii=False),
-                time.time(),
-            ],
-        )
-
-    def _buffer_write(self, op_type: str, args: tuple) -> None:
-        self._write_buffer.append((op_type, args))
-        if len(self._write_buffer) > _MAX_WRITE_BUFFER:
-            self._write_buffer.pop(0)
-
-    def _flush_buffer(self) -> None:
-        if not self._write_buffer:
-            return
-        remaining = []
-        for op_type, args in self._write_buffer:
-            try:
-                if op_type == "step":
-                    self._insert_step(*args)
-                elif op_type == "finalize":
-                    self._finalize_sql(*args)
-            except Exception:
-                remaining.append((op_type, args))
-        self._write_buffer = remaining
+            execute_with_retry(self._con, sql, params)
+            self._write_buffer.flush()
+        except Exception as exc:
+            logger.warning("store.finalize buffered: %s", exc)
+            self._write_buffer.append("finalize", sql, params)
 
     def load_trajectory(self, trajectory_id: str) -> Optional[Trajectory]:
         """Load a trajectory with all its steps."""
@@ -295,7 +286,8 @@ class TrajectoryStore:
 
     def save_episode(self, episode: Episode) -> None:
         """Persist an episode."""
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "INSERT OR REPLACE INTO leap_episode "
             "(id, trajectory_id, start_idx, end_idx, inferred_goal, "
             "app_sequence, semantic_actions, confidence, created_at, procedure_graph) "
@@ -319,11 +311,17 @@ class TrajectoryStore:
 
     def delete_episodes(self, trajectory_id: str) -> int:
         """Delete all episodes for a trajectory. Returns count deleted."""
-        result = self._con.execute(
-            "DELETE FROM leap_episode WHERE trajectory_id = ? RETURNING id",
+        count = self._con.execute(
+            "SELECT COUNT(*) FROM leap_episode WHERE trajectory_id = ?",
             [trajectory_id],
-        ).fetchall()
-        return len(result)
+        ).fetchone()[0]
+        if count > 0:
+            execute_with_retry(
+                self._con,
+                "DELETE FROM leap_episode WHERE trajectory_id = ?",
+                [trajectory_id],
+            )
+        return count
 
     def load_episodes(self, trajectory_id: str) -> List[Episode]:
         """Load all episodes for a trajectory."""
@@ -356,31 +354,28 @@ class TrajectoryStore:
 
     # ── Internal helpers ──
 
-    def _insert_step(self, trajectory_id: str, idx: int, step: TrajectoryStep) -> None:
-        self._con.execute(
-            "INSERT OR REPLACE INTO leap_trajectory_step VALUES "
-            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                trajectory_id,
-                idx,
-                step.action.timestamp,
-                step.action.action_type.value,
-                step.action.target,
-                step.action.target_label,
-                step.action.target_role,
-                step.action.app_bundle_id,
-                step.action.app_name,
-                json.dumps(step.action.params, ensure_ascii=False) if step.action.params else None,
-                step.state.focused_app,
-                step.state.ax_tree_digest,
-                step.state.clipboard_text,
-                step.state.visual_frame_ref,
-                json.dumps(step.state.ax_tree_snapshot, ensure_ascii=False)
-                if step.state.ax_tree_snapshot
-                else None,
-                step.state.snapshot_level,
-            ],
-        )
+    @staticmethod
+    def _step_params(trajectory_id: str, idx: int, step: TrajectoryStep) -> list:
+        return [
+            trajectory_id,
+            idx,
+            step.action.timestamp,
+            step.action.action_type.value,
+            step.action.target,
+            step.action.target_label,
+            step.action.target_role,
+            step.action.app_bundle_id,
+            step.action.app_name,
+            json.dumps(step.action.params, ensure_ascii=False) if step.action.params else None,
+            step.state.focused_app,
+            step.state.ax_tree_digest,
+            step.state.clipboard_text,
+            step.state.visual_frame_ref,
+            json.dumps(step.state.ax_tree_snapshot, ensure_ascii=False)
+            if step.state.ax_tree_snapshot
+            else None,
+            step.state.snapshot_level,
+        ]
 
     def _load_steps(self, trajectory_id: str) -> List[TrajectoryStep]:
         rows = self._con.execute(

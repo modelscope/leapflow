@@ -9,6 +9,7 @@ from leapflow.memory.manager import MemoryManager
 from leapflow.memory.providers import (
     WorkingMemoryProvider, EpisodicMemoryProvider,
     SemanticMemoryProvider, EvolutionMemoryProvider,
+    NarrativeProvider,
 )
 from leapflow.memory.providers.episodic import MemoryFragment
 from leapflow.memory.providers.semantic import MemoryHit
@@ -34,5 +35,6 @@ __all__ = [
     "MemoryToolSchema", "SignalDomain", "MemoryManager",
     "WorkingMemoryProvider", "EpisodicMemoryProvider",
     "SemanticMemoryProvider", "EvolutionMemoryProvider",
+    "NarrativeProvider",
     "MemoryFragment", "MemoryHit", "SkillEpisode", "decay_weight",
 ]

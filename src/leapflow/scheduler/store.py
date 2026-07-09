@@ -11,11 +11,11 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import List, Optional
-
-import duckdb
+from typing import List, Optional, Union
 
 from leapflow.scheduler.types import ArmedTask
+from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
+from leapflow.storage.write_buffer import execute_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -26,18 +26,23 @@ class TaskStore:
     Provides atomic CRUD and query operations.
     At-most-once guarantee: advance_next_due() atomically updates
     before execution to prevent double-fire on crash recovery.
+
+    Accepts ``ConnectionHolder`` (shared) or legacy ``Path``.
     """
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, source: Union[ConnectionHolder, Path, str]) -> None:
         """Initialize store, creating table if not exists."""
-        self._path = Path(db_path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._con = duckdb.connect(str(self._path))
+        self._owns_holder = isinstance(source, (str, Path))
+        if self._owns_holder:
+            source = LocalConnectionHolder(Path(source))
+        self._holder = source
+        self._con = self._holder.connection
         self._ensure_table()
 
     def close(self) -> None:
-        """Close the DuckDB connection."""
-        self._con.close()
+        """Close the DuckDB connection if owned by this store."""
+        if self._owns_holder:
+            self._holder.close()
 
     # ------------------------------------------------------------------
     # Schema
@@ -73,7 +78,8 @@ class TaskStore:
 
     def save(self, task: ArmedTask) -> None:
         """Insert or update a task."""
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             """
             INSERT OR REPLACE INTO armed_tasks (
                 task_id, skill_name, trigger_type, trigger_config,
@@ -119,8 +125,9 @@ class TaskStore:
 
     def delete(self, task_id: str) -> None:
         """Remove a task."""
-        self._con.execute(
-            "DELETE FROM armed_tasks WHERE task_id = ?", [task_id]
+        execute_with_retry(
+            self._con,
+            "DELETE FROM armed_tasks WHERE task_id = ?", [task_id],
         )
 
     # ------------------------------------------------------------------
@@ -145,14 +152,16 @@ class TaskStore:
 
     def advance_next_due(self, task_id: str, new_due_at: float) -> None:
         """Atomically advance next_due_at (at-most-once guarantee)."""
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "UPDATE armed_tasks SET next_due_at = ? WHERE task_id = ?",
             [new_due_at, task_id],
         )
 
     def update_state(self, task_id: str, new_state: str) -> None:
         """Update task state."""
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             "UPDATE armed_tasks SET state = ? WHERE task_id = ?",
             [new_state, task_id],
         )
@@ -160,7 +169,8 @@ class TaskStore:
     def increment_run_count(self, task_id: str) -> None:
         """Increment run_count and update last_run_at."""
         now = time.time()
-        self._con.execute(
+        execute_with_retry(
+            self._con,
             """
             UPDATE armed_tasks
             SET run_count = run_count + 1, last_run_at = ?

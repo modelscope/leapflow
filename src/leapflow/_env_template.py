@@ -21,6 +21,8 @@ LEAPFLOW_LLM_API_KEY=
 LEAPFLOW_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LEAPFLOW_LLM_MODEL=qwen3.7-plus
 LEAPFLOW_LLM_MAX_RETRIES=3
+# Runtime context budget in tokens. Set to the usable limit for your provider/model.
+LEAPFLOW_LLM_CONTEXT_LENGTH=256000
 
 # ═══════════════════════════════════════════════════════════════════════
 # Platform — CuaDriver communication
@@ -32,7 +34,8 @@ LEAPFLOW_MOCK_HOST=0
 # ═══════════════════════════════════════════════════════════════════════
 # Storage — persistent state (memory, trajectories, skill library)
 # ═══════════════════════════════════════════════════════════════════════
-LEAPFLOW_DUCKDB_PATH=~/.leapflow/memory.duckdb
+# LEAPFLOW_DUCKDB_PATH=~/.leapflow/profiles/default/db/leap.duckdb
+# LEAPFLOW_PROFILE=default
 
 # ═══════════════════════════════════════════════════════════════════════
 # Memory Providers — storage and retrieval configuration
@@ -46,7 +49,7 @@ LEAPFLOW_DUCKDB_PATH=~/.leapflow/memory.duckdb
 # Logging & Audit
 # ═══════════════════════════════════════════════════════════════════════
 LEAPFLOW_LOG_LEVEL=INFO
-LEAPFLOW_AUDIT_LOG_PATH=~/.leapflow/audit.jsonl
+LEAPFLOW_AUDIT_LOG_PATH=~/.leapflow/profiles/default/audit.jsonl
 
 # ═══════════════════════════════════════════════════════════════════════
 # Learning & Execution — SessionController behavior
@@ -96,7 +99,7 @@ LEAPFLOW_RECORDING_MODE=video
 # Max seconds per video segment file before auto-splitting.
 # LEAPFLOW_VIDEO_MAX_SEGMENT_S=600
 # Directory for video segment cache.
-# LEAPFLOW_VIDEO_CACHE_DIR=~/.leapflow/cache/video
+# LEAPFLOW_VIDEO_CACHE_DIR=~/.leapflow/profiles/default/cache/video
 
 # ── Video Analysis ──
 # LEAPFLOW_VIDEO_VLM_URL_SCHEME=base64
@@ -128,9 +131,11 @@ LEAPFLOW_RECORDING_MODE=video
 
 # ═══════════════════════════════════════════════════════════════════════
 # Visual Track — screenshot-based perception (default/vision_only modes)
+# Disabled by default on first run. Enable only after configuring
+# LEAPFLOW_LLM_API_KEY or LEAPFLOW_VLM_API_KEY.
 # ═══════════════════════════════════════════════════════════════════════
-# LEAPFLOW_VISUAL_TRACK_ENABLED=true
-# LEAPFLOW_VISUAL_FRAME_CACHE_DIR=~/.leapflow/cache/frames
+# LEAPFLOW_VISUAL_TRACK_ENABLED=false
+# LEAPFLOW_VISUAL_FRAME_CACHE_DIR=~/.leapflow/profiles/default/cache/frames
 # LEAPFLOW_VLM_MODEL=
 # LEAPFLOW_VLM_API_KEY=
 # LEAPFLOW_VLM_BASE_URL=
@@ -149,7 +154,7 @@ LEAPFLOW_RECORDING_MODE=video
 # Perceptual Field — fine-grained per-context perception control
 # ═══════════════════════════════════════════════════════════════════════
 # LEAPFLOW_PERCEPTUAL_FIELD_ENABLED=false
-# LEAPFLOW_PERCEPTUAL_FIELD_CONFIG=~/.leapflow/perceptual_fields.yaml
+# LEAPFLOW_PERCEPTUAL_FIELD_CONFIG=~/.leapflow/profiles/default/perceptual_fields.yaml
 
 # ═══════════════════════════════════════════════════════════════════════
 # Context Learning Attention — signal/noise filtering during recording

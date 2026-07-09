@@ -8,17 +8,23 @@ bottom while Rich-formatted output scrolls above.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import signal
+import sys
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from leapflow.cli.helpers import require_initialized
 from leapflow.cli.commands.run import _print_execution_result
+from leapflow.cli.helpers import require_initialized
 from leapflow.engine import StreamEvent
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from leapflow.cli.context import Context
     from leapflow.copilot.types import PredictionCandidate
+    from leapflow.daemon.client import DaemonClient
 
 _CLI_INTERACTION_EVENT = "cli.interaction"
 _CLI_EVENT_SOURCE = "interactive_repl"
@@ -26,11 +32,62 @@ _CLI_EVENT_SOURCE = "interactive_repl"
 _last_hint: Optional["PredictionCandidate"] = None
 
 
-async def cmd_interactive(ctx: "Context") -> int:
+async def _prompt_stop_daemon_on_exit(
+    client: "DaemonClient",
+    settings: Any,
+    console: Any,
+) -> None:
+    """Ask whether to stop leapd after a daemon-backed TUI exits."""
+    try:
+        daemon_status = await client.status()
+    except Exception:
+        daemon_status = {}
+    pid = daemon_status.get("pid") or "unknown"
+    console.system(
+        "leapd runs in the background; stop/restart it after reinstalling LeapFlow "
+        "to load new code."
+    )
+    stop = await _ask_yes_no_default_yes(f"Stop leapd now (pid={pid})? [Y/n]: ")
+    if not stop:
+        console.system("leapd kept running. Use `leap daemon restart` when needed.")
+        return
+
+    from leapflow.daemon.lifecycle import send_signal
+
+    run_dir = settings.profile_dir / "run"
+    if send_signal(run_dir, signal.SIGTERM):
+        console.system(f"Sent SIGTERM to leapd (pid={pid}).")
+    else:
+        console.warning("Could not stop leapd; run `leap daemon stop` manually.")
+
+
+async def _ask_yes_no_default_yes(prompt: str) -> bool:
+    """Return True by default, including non-interactive or interrupted prompts."""
+    if not sys.stdin.isatty():
+        return True
+    try:
+        answer = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: input(prompt).strip().lower(),
+        )
+    except (EOFError, KeyboardInterrupt):
+        return True
+    return answer not in {"n", "no"}
+
+
+async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) -> int:
     """Persistent REPL session with hybrid TUI (Application + Rich)."""
     require_initialized(ctx)
 
-    from leapflow.cli.tui_app import detect_theme, LeapConsole, StreamRenderer, LeapApp
+    from leapflow.cli.tui_app import (
+        LeapApp,
+        LeapConsole,
+        SessionExitStats,
+        StreamRenderer,
+        build_exit_summary_lines,
+        detect_theme,
+        summarize_messages,
+    )
     from leapflow.cli.tui_app.status import StatusBar
     from leapflow.cli.banner import display_rich_banner
     from leapflow.cli.commands.registry import completion_entries, resolve_command
@@ -40,6 +97,7 @@ async def cmd_interactive(ctx: "Context") -> int:
         handle_usage,
         handle_model,
         handle_clear,
+        handle_gateway,
     )
     from leapflow.utils.terminal_io import TerminalIOProvider
     from leapflow.engine.session import SessionMode
@@ -49,6 +107,9 @@ async def cmd_interactive(ctx: "Context") -> int:
     console = LeapConsole(theme)
     status = StatusBar(theme)
     io = TerminalIOProvider()
+    exit_stats = SessionExitStats()
+    active_resume_id = ""
+    storage_volatile = bool(getattr(ctx, "storage_volatile", False))
 
     # ── Session callbacks ────────────────────────────────────────────
 
@@ -100,10 +161,6 @@ async def cmd_interactive(ctx: "Context") -> int:
         engine = ctx.engine
         if engine is not None:
             ctx_used = getattr(engine, "context_token_count", 0)
-            cap_registry = getattr(engine, "model_capabilities", None)
-            if cap_registry is not None:
-                caps = cap_registry.resolve(ctx.settings.llm_model)
-                ctx_max = caps.context_length
         mode = _mode_name()
         status.update(
             mode=mode,
@@ -124,12 +181,19 @@ async def cmd_interactive(ctx: "Context") -> int:
         if hasattr(ctx, "platform_tools")
         else 0
     )
-    cap_registry = getattr(ctx.engine, "model_capabilities", None) if ctx.engine else None
-    ctx_len = (
-        cap_registry.resolve(ctx.settings.llm_model).context_length
-        if cap_registry is not None
-        else ctx.settings.llm_context_length
-    )
+    ctx_len = ctx.settings.llm_context_length
+
+    def _gateway_connected_names() -> list[str]:
+        gw = getattr(ctx, "gateway_server", None)
+        if gw is None:
+            return []
+        return [
+            (gw.manifests[s.platform_id].display_name
+             if s.platform_id in gw.manifests
+             else s.platform_id)
+            for s in gw.platform_status()
+            if s.connected
+        ]
 
     def _render_banner() -> None:
         display_rich_banner(
@@ -141,11 +205,64 @@ async def cmd_interactive(ctx: "Context") -> int:
             skills=all_skills,
             context_length=ctx_len,
             mcp_tools=mcp_count,
+            gateway_connected=_gateway_connected_names(),
+            theme=theme,
         )
+        if storage_volatile:
+            console.warning(
+                "Primary database is locked by another LeapFlow instance; "
+                "this window is using volatile storage."
+            )
+            console.system("New memory, session history, and learned skills will not persist here.")
+
+    def _active_chat_session_id() -> str:
+        engine = getattr(ctx, "engine", None)
+        current = getattr(engine, "_current_session_id", "") if engine else ""
+        return str(current or active_resume_id or "")
+
+    def _stored_message_counts(session_id: str) -> tuple[int, int, int] | None:
+        if not session_id:
+            return None
+        store = getattr(ctx, "_conversation_store", None)
+        if store is None:
+            engine = getattr(ctx, "engine", None)
+            store = getattr(engine, "_conversation_store", None) if engine else None
+        if store is None:
+            return None
+        try:
+            messages = store.get_messages(session_id, limit=10_000)
+        except Exception:
+            logger.debug("session summary message lookup failed", exc_info=True)
+            return None
+        return summarize_messages(messages)
+
+    def _print_exit_summary() -> None:
+        session_id = _active_chat_session_id()
+        counts = _stored_message_counts(session_id)
+        if counts is None:
+            message_count = exit_stats.message_count
+            user_messages = exit_stats.user_messages
+            tool_calls = exit_stats.tool_calls
+        else:
+            message_count, user_messages, stored_tool_calls = counts
+            tool_calls = max(stored_tool_calls, exit_stats.tool_calls)
+        if not session_id and message_count == 0:
+            return
+        console.newline()
+        for line in build_exit_summary_lines(
+            session_id=session_id,
+            duration_s=exit_stats.duration_s,
+            message_count=message_count,
+            user_messages=user_messages,
+            tool_calls=tool_calls,
+            resumable=not storage_volatile,
+        ):
+            console.print(line)
 
     # ── Stream response ──────────────────────────────────────────────
 
     async def _stream_response(prompt_text: str) -> None:
+        exit_stats.record_user_message()
         status.mark_turn_start()
         app.agent_running = True
         app.spinner_text = "Thinking…"
@@ -171,15 +288,28 @@ async def cmd_interactive(ctx: "Context") -> int:
                     renderer.feed(str(event))
         finally:
             renderer.finish()
+            if renderer.has_output:
+                exit_stats.record_assistant_message()
+            exit_stats.record_tool_calls(renderer.tool_count)
             app.spinner_text = ""
             app.agent_running = False
             status.mark_turn_end()
+            _update_status()
 
     # ── Input handler (business logic) ───────────────────────────────
 
     async def handle_input(text: str) -> None:
         """Dispatch one user input — slash commands or natural language."""
         global _last_hint
+
+        try:
+            if ctx.reload_runtime_config_if_changed():
+                console.success(
+                    "Configuration reloaded — LLM settings updated for this session."
+                )
+        except Exception as exc:
+            logger.warning("Runtime config reload failed: %s", exc)
+            console.warning(f"Configuration reload failed: {exc}")
 
         _learning = ctx.session and ctx.session.mode == SessionMode.LEARNING
         if _learning:
@@ -225,7 +355,6 @@ async def cmd_interactive(ctx: "Context") -> int:
                         pass
                 elif _learning:
                     ctx.imitation.end_control_input()
-                console.system("Bye!")
                 app.exit()
                 return
 
@@ -244,6 +373,10 @@ async def cmd_interactive(ctx: "Context") -> int:
 
             if canonical == "tools":
                 handle_tools(ctx, console, cmd_args)
+                return
+
+            if canonical == "gateway":
+                handle_gateway(ctx, console, cmd_args)
                 return
 
             if canonical == "usage":
@@ -376,9 +509,274 @@ async def cmd_interactive(ctx: "Context") -> int:
         on_input=handle_input,
     )
 
+    # Auto-connect previously configured gateway platforms
+    gw = getattr(ctx, "gateway_server", None)
+    if gw is not None:
+        try:
+            gw_count = await gw.start()
+            if gw_count > 0:
+                console.system(f"  Gateway: {gw_count} platform(s) reconnected")
+        except Exception:
+            logger.debug("Gateway auto-connect failed", exc_info=True)
+
+    if resume_id and ctx.engine is not None:
+        if ctx.engine.load_session(resume_id):
+            active_resume_id = resume_id
+            console.success(f"Resumed session {resume_id}")
+        else:
+            console.warning(f"Session '{resume_id}' not found; starting a new session.")
+
     _render_banner()
     _update_status()
-    return await app.run()
+    exit_code = 0
+    try:
+        exit_code = await app.run()
+    finally:
+        _print_exit_summary()
+    return exit_code
+
+
+async def cmd_interactive_daemon(
+    client: "DaemonClient",
+    settings: Any,
+    *,
+    resume_id: Optional[str] = None,
+) -> int:
+    """Persistent REPL backed by leapd thin-client RPC."""
+    from leapflow.cli.banner import display_rich_banner
+    from leapflow.cli.commands.registry import completion_entries, resolve_command
+    from leapflow.cli.tui_app import (
+        LeapApp,
+        LeapConsole,
+        SessionExitStats,
+        StreamRenderer,
+        build_exit_summary_lines,
+        detect_theme,
+    )
+    from leapflow.cli.tui_app.status import StatusBar
+    from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
+
+    theme = detect_theme()
+    console = LeapConsole(theme)
+    status = StatusBar(theme)
+    exit_stats = SessionExitStats()
+    active_session_id = str(resume_id or "")
+    turn_count = 0
+    runtime_model_name = str(getattr(settings, "llm_model", ""))
+    runtime_context_length = int(getattr(settings, "llm_context_length", 0) or 0)
+    runtime_context_used = 0
+    runtime_daemon_pid = ""
+
+    def _apply_daemon_runtime_metadata(metadata: dict[str, Any]) -> None:
+        nonlocal active_session_id, runtime_model_name, runtime_context_length
+        nonlocal runtime_context_used, runtime_daemon_pid
+        if metadata.get("pid"):
+            runtime_daemon_pid = str(metadata["pid"])
+        if metadata.get("session_id"):
+            active_session_id = str(metadata["session_id"])
+        if metadata.get("model"):
+            runtime_model_name = str(metadata["model"])
+        if metadata.get("llm_model"):
+            runtime_model_name = str(metadata["llm_model"])
+        if metadata.get("llm_context_length") is not None:
+            try:
+                runtime_context_length = max(1, int(metadata["llm_context_length"]))
+            except (TypeError, ValueError):
+                pass
+        if metadata.get("context_used") is not None:
+            try:
+                runtime_context_used = max(0, int(metadata["context_used"]))
+            except (TypeError, ValueError):
+                pass
+
+    def _update_status() -> None:
+        status.update(
+            mode="daemon",
+            skill_count=0,
+            platform_online=True,
+            model_name=runtime_model_name,
+            session_turns=turn_count,
+            context_used=runtime_context_used,
+            context_max=runtime_context_length,
+        )
+        app.prompt_mode = "daemon"
+
+    def _render_banner() -> None:
+        display_rich_banner(
+            model=runtime_model_name,
+            cwd=os.getcwd(),
+            session_id=active_session_id,
+            platform_online=True,
+            tool_defs=TOOL_DEFINITIONS,
+            skills=[],
+            context_length=runtime_context_length,
+            mcp_tools=0,
+            gateway_connected=[],
+            theme=theme,
+        )
+        daemon_suffix = f" pid={runtime_daemon_pid}" if runtime_daemon_pid else ""
+        console.system(f"Daemon mode{daemon_suffix}: shared runtime across terminals.")
+        console.system("After reinstalling LeapFlow, use `leap daemon restart` to load new code.")
+
+    async def _print_daemon_status() -> None:
+        try:
+            daemon_status = await client.status()
+        except Exception as exc:
+            console.warning(f"Daemon status unavailable: {exc}")
+            return
+        _apply_daemon_runtime_metadata(daemon_status)
+        _update_status()
+        console.system(
+            "leapd "
+            f"pid={daemon_status.get('pid')} "
+            f"profile={daemon_status.get('profile')} "
+            f"clients={daemon_status.get('active_clients')} "
+            f"volatile={daemon_status.get('volatile')}"
+        )
+        db_path = daemon_status.get("db_path")
+        if db_path:
+            console.system(f"DB: {db_path}")
+        config_path = daemon_status.get("config_path")
+        if config_path:
+            console.system(f"Config: {config_path}")
+        project_env_path = daemon_status.get("project_env_path")
+        if project_env_path:
+            console.system(f"Project override: {project_env_path}")
+        runtime_version = daemon_status.get("runtime_version")
+        if runtime_version:
+            console.system(f"Runtime version: {runtime_version}")
+        runtime_source = daemon_status.get("runtime_source")
+        if runtime_source:
+            console.system(f"Runtime source: {runtime_source}")
+        runtime_executable = daemon_status.get("runtime_executable")
+        if runtime_executable:
+            console.system(f"Python: {runtime_executable}")
+        context_length = daemon_status.get("llm_context_length")
+        if context_length:
+            console.system(f"Context budget: {int(context_length):,} tokens")
+        context_used = daemon_status.get("context_used")
+        if context_used is not None:
+            console.system(f"Context used: {int(context_used):,} tokens")
+
+    async def _stream_response(prompt_text: str) -> None:
+        nonlocal active_session_id, turn_count, runtime_model_name
+        nonlocal runtime_context_length, runtime_context_used
+        exit_stats.record_user_message()
+        status.mark_turn_start()
+        app.agent_running = True
+        app.spinner_text = "Thinking…"
+
+        renderer = StreamRenderer(console)
+        renderer.start()
+        try:
+            async for event in client.engine_chat(prompt_text):
+                metadata = event.metadata or {}
+                _apply_daemon_runtime_metadata(metadata)
+                if event.type == "chunk":
+                    renderer.feed(event.content)
+                elif event.type == "thinking":
+                    renderer.feed_thinking(event.content)
+                elif event.type == "tool_start":
+                    app.spinner_text = renderer.tool_started(event.content)
+                elif event.type == "tool_complete":
+                    renderer.tool_finished(event.content)
+                    app.spinner_text = "Thinking…"
+                elif event.type == "final":
+                    if not renderer.text:
+                        renderer.feed(event.content)
+                elif event.type == "error":
+                    renderer.feed(event.content)
+                elif event.type == "status":
+                    console.system(event.content)
+        finally:
+            renderer.finish()
+            if renderer.has_output:
+                exit_stats.record_assistant_message()
+            exit_stats.record_tool_calls(renderer.tool_count)
+            turn_count += 1
+            app.spinner_text = ""
+            app.agent_running = False
+            status.mark_turn_end()
+            _update_status()
+
+    async def handle_input(text: str) -> None:
+        cmd_text = text.lstrip("/") if text.startswith("/") else text
+        cmd_def = resolve_command(cmd_text)
+        if cmd_def is not None:
+            canonical = cmd_def.name
+            if canonical == "exit":
+                app.exit()
+                return
+            if canonical == "help":
+                _show_help(console)
+                return
+            if canonical == "status":
+                await _print_daemon_status()
+                return
+            if canonical == "clear":
+                _render_banner()
+                return
+            if canonical in {"tools", "usage", "model"}:
+                console.system(
+                    f"/{canonical} is not available in daemon mode yet; "
+                    "chat and resume are daemon-backed in this phase."
+                )
+                return
+            console.warning(
+                f"/{canonical} is not available in daemon mode yet. "
+                "Use --no-daemon for legacy in-process commands."
+            )
+            return
+
+        console.rule()
+        await _stream_response(text)
+
+    def _print_exit_summary() -> None:
+        if not active_session_id and exit_stats.message_count == 0:
+            return
+        console.newline()
+        for line in build_exit_summary_lines(
+            session_id=active_session_id,
+            duration_s=exit_stats.duration_s,
+            message_count=exit_stats.message_count,
+            user_messages=exit_stats.user_messages,
+            tool_calls=exit_stats.tool_calls,
+            resumable=True,
+        ):
+            console.print(line)
+
+    app = LeapApp(
+        console=console,
+        theme=theme,
+        status=status,
+        commands=completion_entries(),
+        data_dir=getattr(settings, "data_dir", None),
+        on_input=handle_input,
+    )
+
+    if resume_id:
+        result = await client.session_resume(resume_id)
+        if result.get("found"):
+            active_session_id = str(result.get("session_id") or resume_id)
+            console.success(f"Resumed session {active_session_id}")
+        else:
+            console.warning(f"Session '{resume_id}' not found; starting a new session.")
+            active_session_id = ""
+
+    try:
+        _apply_daemon_runtime_metadata(await client.status())
+    except Exception as exc:
+        console.warning(f"Daemon status unavailable: {exc}")
+
+    _render_banner()
+    _update_status()
+    exit_code = 0
+    try:
+        exit_code = await app.run()
+    finally:
+        _print_exit_summary()
+        await _prompt_stop_daemon_on_exit(client, settings, console)
+    return exit_code
 
 
 # ── Command handlers ─────────────────────────────────────────────────

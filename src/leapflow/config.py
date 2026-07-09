@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -25,6 +26,19 @@ from leapflow.domain.trajectory import RecordingMode
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_LLM_CONTEXT_LENGTH = 256_000
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_profile_name(profile: str) -> str:
+    """Return a safe profile name or raise before any path construction."""
+    normalized = (profile or "default").strip()
+    if not _PROFILE_NAME_RE.fullmatch(normalized):
+        raise ValueError(
+            "Invalid LEAPFLOW_PROFILE; use only letters, numbers, underscores, or dashes"
+        )
+    return normalized
+
 ALL_SIGNAL_CHANNELS = frozenset({
     "click", "app_switch", "clipboard", "clipboard_content",
     "keyboard", "scroll", "drag",
@@ -35,24 +49,40 @@ def _expand_path(value: str) -> Path:
     return Path(value.replace("~", str(Path.home()))).expanduser()
 
 
-# Standard subdirectories created under the data directory on first run.
-_STANDARD_SUBDIRS = [
-    "var",
+# Global subdirectories (shared across profiles).
+_GLOBAL_SUBDIRS = [
+    "logs",
+]
+
+# Per-profile subdirectories — created under profiles/<profile>/.
+_PROFILE_SUBDIRS = [
+    "db",
+    "memory",
+    "memory/global",
+    "skills",
     "cache",
     "cache/frames",
     "cache/video",
-    "skills",
+    "run",
+    "gateway",
+    "gateway/manifests",
 ]
 
 
-def ensure_data_dir(data_dir: Path) -> None:
+def ensure_data_dir(data_dir: Path, *, profile: str = "default") -> None:
     """Create the LeapFlow data directory and standard subdirectories.
 
-    Idempotent — safe to call on every startup.
+    Idempotent — safe to call on every startup. Creates both global
+    directories and profile-specific directories under ``profiles/<profile>/``.
     """
+    profile = _validate_profile_name(profile)
     data_dir.mkdir(parents=True, exist_ok=True)
-    for sub in _STANDARD_SUBDIRS:
+    for sub in _GLOBAL_SUBDIRS:
         (data_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    profile_dir = data_dir / "profiles" / profile
+    for sub in _PROFILE_SUBDIRS:
+        (profile_dir / sub).mkdir(parents=True, exist_ok=True)
 
 
 def ensure_default_env(data_dir: Path) -> bool:
@@ -72,12 +102,14 @@ def ensure_default_env(data_dir: Path) -> bool:
     if sys.stderr.isatty():
         sys.stderr.write(
             f"\033[2m→ Created default config: {env_path}\033[0m\n"
-            f"\033[2m  Edit LEAPFLOW_LLM_API_KEY to configure your LLM provider.\033[0m\n"
+            f"\033[2m  Edit LEAPFLOW_LLM_API_KEY in this file to configure your LLM provider.\033[0m\n"
+            f"\033[2m  Optional project override: ./.env in your working directory.\033[0m\n"
         )
     else:
         sys.stderr.write(
             f"→ Created default config: {env_path}\n"
-            f"  Edit LEAPFLOW_LLM_API_KEY to configure your LLM provider.\n"
+            f"  Edit LEAPFLOW_LLM_API_KEY in this file to configure your LLM provider.\n"
+            f"  Optional project override: ./.env in your working directory.\n"
         )
     sys.stderr.flush()
     return True
@@ -104,11 +136,12 @@ class Settings:
     memory_prefetch_timeout_s: float = 2.0       # max wait for prefetch in PREPARING
     memory_prefetch_limit: int = 5               # max entries injected per turn
 
-    # ── Data Root ──
+    # ── Data Root & Profile ──
     data_dir: Path = Path("~/.leapflow")
+    profile: str = "default"
 
     # Audit
-    audit_log_path: Path = Path("~/.leapflow/audit.jsonl")
+    audit_log_path: Path = Path("~/.leapflow/profiles/default/audit.jsonl")
 
     # Imitation Learning
     pattern_library_path: str = ""        # Custom patterns.yaml path (empty = use default)
@@ -132,13 +165,13 @@ class Settings:
     confirm_default_level: str = "confirm"  # Default confirmation level
 
     # Skill Documents (SKILL.md)
-    skills_dir: Path = Path("~/.leapflow/skills/")
+    skills_dir: Path = Path("~/.leapflow/profiles/default/skills/")
     skill_view_max_chars: int = 5000  # Max chars returned by skill_view tool
     skill_min_quality: float = 0.5    # SkillIndex quality threshold
 
     # Visual Track
     visual_track_enabled: bool = False
-    visual_frame_cache_dir: Path = Path("~/.leapflow/cache/frames")
+    visual_frame_cache_dir: Path = Path("~/.leapflow/profiles/default/cache/frames")
     visual_sample_strategy: str = "keyframe"  # keyframe | periodic | all
     vlm_model: str = ""  # 空则复用 llm_model
     vlm_api_key: str = ""  # 空则复用 llm_api_key
@@ -181,7 +214,7 @@ class Settings:
 
     # ── Perceptual Field ──
     perceptual_field_enabled: bool = False
-    perceptual_field_config: str = "~/.leapflow/perceptual_fields.yaml"
+    perceptual_field_config: str = "~/.leapflow/profiles/default/perceptual_fields.yaml"
 
     # ── Context Learning Attention ──
     attention_foreground_gate: bool = True
@@ -256,7 +289,7 @@ class Settings:
     video_resolution_scale: float = 0.75
     video_codec: str = "h264"
     video_max_segment_s: int = 600
-    video_cache_dir: Path = Path("~/.leapflow/cache/video")
+    video_cache_dir: Path = Path("~/.leapflow/profiles/default/cache/video")
     video_cache_max_age_days: int = 7           # 视频缓存最大保留天数
     video_cache_max_size_gb: float = 5.0        # 视频缓存最大占用空间(GB)
     video_l2_enabled: bool = True
@@ -321,7 +354,7 @@ class Settings:
     llm_aux_model: str = ""  # Auxiliary model for cheap operations (empty = reuse primary)
     llm_aux_api_key: str = ""  # Aux API key (empty = reuse primary)
     llm_aux_base_url: str = ""  # Aux base URL (empty = reuse primary)
-    llm_context_length: int = 128_000  # Primary provider's context window
+    llm_context_length: int = DEFAULT_LLM_CONTEXT_LENGTH  # Primary provider's runtime context budget
     llm_credential_cooldown_s: float = 60.0  # Per-key rate-limit cooldown
 
     # ── Stream & Tool Robustness ──
@@ -383,8 +416,18 @@ class Settings:
     scheduler_default_tier: str = "auto"  # auto | local | cloud
 
     @property
+    def profile_dir(self) -> Path:
+        """Root directory for the active profile."""
+        return self.data_dir / "profiles" / self.profile
+
+    @property
     def has_llm_credentials(self) -> bool:
         return bool(self.llm_api_key.strip())
+
+    @property
+    def has_vlm_credentials(self) -> bool:
+        """Return True when visual perception can call a VLM provider."""
+        return bool((self.vlm_api_key or self.llm_api_key).strip())
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
@@ -419,7 +462,7 @@ def _load_yaml_overlay(data_dir: Path) -> Dict[str, str]:
         if not isinstance(parsed, dict):
             raise ValueError("config.yaml root must be a mapping")
     except Exception as exc:
-        backup = yaml_path.with_suffix(f".yaml.corrupt.bak")
+        backup = yaml_path.with_suffix(".yaml.corrupt.bak")
         logger.warning("config.yaml parse error (%s), backing up to %s", exc, backup.name)
         try:
             shutil.copy2(yaml_path, backup)
@@ -475,7 +518,8 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     _data_dir = _expand_path(_data_dir_raw)
 
     # Bootstrap: create directory structure + default .env on first run.
-    ensure_data_dir(_data_dir)
+    _profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
+    ensure_data_dir(_data_dir, profile=_profile)
     ensure_default_env(_data_dir)
 
     if env_file is None:
@@ -514,9 +558,11 @@ def _build_settings_from_env() -> Settings:
     max_retries = int(os.getenv("LEAPFLOW_LLM_MAX_RETRIES", "3"))
 
     data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
+    profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
+    _profile_dir = data_dir / "profiles" / profile
 
     mock_host = os.getenv("LEAPFLOW_MOCK_HOST", "0").strip() in ("1", "true", "True", "yes")
-    duckdb = os.getenv("LEAPFLOW_DUCKDB_PATH", "~/.leapflow/memory.duckdb").strip()
+    duckdb = os.getenv("LEAPFLOW_DUCKDB_PATH", str(_profile_dir / "db" / "leap.duckdb")).strip()
     log_level = os.getenv("LEAPFLOW_LOG_LEVEL", "INFO").strip()
 
     # Memory Providers
@@ -529,11 +575,11 @@ def _build_settings_from_env() -> Settings:
     memory_prefetch_limit = int(os.getenv("LEAPFLOW_MEMORY_PREFETCH_LIMIT", "5"))
 
     # Audit
-    audit_log_path = os.getenv("LEAPFLOW_AUDIT_LOG_PATH", "~/.leapflow/audit.jsonl").strip()
+    audit_log_path = os.getenv("LEAPFLOW_AUDIT_LOG_PATH", str(_profile_dir / "audit.jsonl")).strip()
 
     # Visual Track
-    visual_track_enabled = os.getenv("LEAPFLOW_VISUAL_TRACK_ENABLED", "1").strip() in ("1", "true", "True", "yes")
-    visual_frame_cache_dir = os.getenv("LEAPFLOW_VISUAL_FRAME_CACHE_DIR", "~/.leapflow/cache/frames").strip()
+    visual_track_enabled = os.getenv("LEAPFLOW_VISUAL_TRACK_ENABLED", "0").strip() in ("1", "true", "True", "yes")
+    visual_frame_cache_dir = os.getenv("LEAPFLOW_VISUAL_FRAME_CACHE_DIR", str(_profile_dir / "cache" / "frames")).strip()
     visual_sample_strategy = os.getenv("LEAPFLOW_VISUAL_SAMPLE_STRATEGY", "keyframe").strip()
     vlm_model = os.getenv("LEAPFLOW_VLM_MODEL", "").strip() or model
     vlm_api_key = os.getenv("LEAPFLOW_VLM_API_KEY", "").strip()
@@ -542,7 +588,7 @@ def _build_settings_from_env() -> Settings:
     privacy_sensitive_apps = tuple(b.strip() for b in privacy_sensitive_apps_raw.split(",") if b.strip()) if privacy_sensitive_apps_raw else ()
 
     # Skill Documents
-    skills_dir = os.getenv("LEAPFLOW_SKILLS_DIR", "~/.leapflow/skills/").strip()
+    skills_dir = os.getenv("LEAPFLOW_SKILLS_DIR", str(_profile_dir / "skills")).strip()
     skill_view_max_chars = int(os.getenv("LEAPFLOW_SKILL_VIEW_MAX_CHARS", "5000"))
     skill_min_quality = float(os.getenv("LEAPFLOW_SKILL_MIN_QUALITY", "0.5"))
 
@@ -590,7 +636,7 @@ def _build_settings_from_env() -> Settings:
     # Perceptual Field
     perceptual_field_enabled = _bool("LEAPFLOW_PERCEPTUAL_FIELD_ENABLED", "false")
     perceptual_field_config = os.getenv(
-        "LEAPFLOW_PERCEPTUAL_FIELD_CONFIG", "~/.leapflow/perceptual_fields.yaml"
+        "LEAPFLOW_PERCEPTUAL_FIELD_CONFIG", str(_profile_dir / "perceptual_fields.yaml")
     ).strip()
 
     # Context Learning Attention
@@ -668,7 +714,7 @@ def _build_settings_from_env() -> Settings:
     video_resolution_scale = float(os.getenv("LEAPFLOW_VIDEO_RESOLUTION_SCALE", "0.75"))
     video_codec = os.getenv("LEAPFLOW_VIDEO_CODEC", "h264").strip()
     video_max_segment_s = int(os.getenv("LEAPFLOW_VIDEO_MAX_SEGMENT_S", "600"))
-    video_cache_dir = os.getenv("LEAPFLOW_VIDEO_CACHE_DIR", "~/.leapflow/cache/video").strip()
+    video_cache_dir = os.getenv("LEAPFLOW_VIDEO_CACHE_DIR", str(_profile_dir / "cache" / "video")).strip()
     video_cache_max_age_days = int(os.getenv("LEAPFLOW_VIDEO_CACHE_MAX_AGE_DAYS", "7"))
     video_cache_max_size_gb = float(os.getenv("LEAPFLOW_VIDEO_CACHE_MAX_SIZE_GB", "5.0"))
     video_l2_enabled = _bool("LEAPFLOW_VIDEO_L2_ENABLED", "true")
@@ -731,7 +777,7 @@ def _build_settings_from_env() -> Settings:
     llm_aux_model = os.getenv("LEAPFLOW_LLM_AUX_MODEL", "").strip()
     llm_aux_api_key = os.getenv("LEAPFLOW_LLM_AUX_API_KEY", "").strip()
     llm_aux_base_url = os.getenv("LEAPFLOW_LLM_AUX_BASE_URL", "").strip()
-    llm_context_length = int(os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", "128000"))
+    llm_context_length = int(os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", str(DEFAULT_LLM_CONTEXT_LENGTH)))
     llm_credential_cooldown_s = float(os.getenv("LEAPFLOW_LLM_CREDENTIAL_COOLDOWN_S", "60.0"))
 
     # Stream & Tool Robustness
@@ -824,6 +870,7 @@ def _build_settings_from_env() -> Settings:
         memory_prefetch_timeout_s=memory_prefetch_timeout_s,
         memory_prefetch_limit=memory_prefetch_limit,
         data_dir=data_dir,
+        profile=profile,
         audit_log_path=_expand_path(audit_log_path),
         skills_dir=_expand_path(skills_dir),
         skill_view_max_chars=skill_view_max_chars,

@@ -61,6 +61,10 @@ class StreamRenderer:
         return self._buffer
 
     @property
+    def has_output(self) -> bool:
+        return bool(self._buffer.strip() or self._thinking_buffer.strip())
+
+    @property
     def elapsed(self) -> float:
         """Seconds since streaming started."""
         return time.monotonic() - self._start_time if self._start_time else 0.0

@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -37,7 +38,6 @@ from typing import (
 
 from prompt_toolkit import Application
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
@@ -48,6 +48,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.widgets import TextArea
 
+from leapflow.cli.tui_app.command import TuiCommand
 from leapflow.cli.tui_app.input import build_completer
 from leapflow.cli.tui_app.status import StatusBar
 from leapflow.cli.tui_app.theme import Theme
@@ -57,8 +58,19 @@ if TYPE_CHECKING:
 
 _HISTORY_FILENAME = "history"
 _REFRESH_INTERVAL_S = 0.5
+_LARGE_PASTE_CHAR_THRESHOLD = 4_000
+_LARGE_PASTE_LINE_THRESHOLD = 24
+_PASTE_COMPACTOR_ATTR = "_leapflow_paste_compactor_installed"
 
 InputHandler = Callable[[str], Union[Awaitable[None], None]]
+
+
+@dataclass(frozen=True)
+class _PasteBlock:
+    """Full pasted content stored outside the prompt buffer."""
+
+    marker: str
+    text: str
 
 
 class LeapApp:
@@ -92,7 +104,11 @@ class LeapApp:
         self._prompt_mode = "idle"
         self._spinner_text = ""
         self._tool_start_time: float = 0.0
-        self._pending_input: asyncio.Queue[str] = asyncio.Queue()
+        self._next_command_id = 1
+        self._next_paste_id = 1
+        self._paste_blocks: dict[str, _PasteBlock] = {}
+        self._active_command: Optional[TuiCommand] = None
+        self._pending_input: asyncio.Queue[TuiCommand] = asyncio.Queue()
 
         data_dir = data_dir or Path(
             os.environ.get("LEAPFLOW_DATA_DIR", "~/.leapflow")
@@ -133,6 +149,83 @@ class LeapApp:
         self._tool_start_time = time.monotonic() if value else 0.0
         self._invalidate()
 
+    def submit_text(self, text: str) -> TuiCommand:
+        """Submit user text into the serial TUI command queue."""
+        normalized = self._resolve_paste_blocks(text).strip()
+        if not normalized:
+            raise ValueError("Cannot submit an empty TUI command")
+        command = TuiCommand.create(command_id=self._next_command_id, text=normalized)
+        self._next_command_id += 1
+        self._pending_input.put_nowait(command)
+        self._sync_task_counts()
+        if self._active_command is not None or self._pending_input.qsize() > 1:
+            self._console.command_card(command)
+        self._invalidate()
+        return command
+
+    def _should_compact_paste(self, text: str) -> bool:
+        """Return True when rendering pasted text directly would hurt TUI responsiveness."""
+        if len(text) >= _LARGE_PASTE_CHAR_THRESHOLD:
+            return True
+        return text.count("\n") + 1 >= _LARGE_PASTE_LINE_THRESHOLD
+
+    def _compact_tokens(self, text: str) -> str:
+        size = len(text)
+        if size < 1_000:
+            return f"{size} chars"
+        if size < 1_000_000:
+            return f"{size / 1000:.1f}K chars"
+        return f"{size / 1_000_000:.1f}M chars"
+
+    def _paste_marker(self, text: str) -> str:
+        paste_id = self._next_paste_id
+        self._next_paste_id += 1
+        line_count = text.count("\n") + 1
+        marker = (
+            f"[pasted block #{paste_id}: {self._compact_tokens(text)}, "
+            f"{line_count} lines; full text will be submitted]"
+        )
+        self._paste_blocks[marker] = _PasteBlock(marker=marker, text=text)
+        return marker
+
+    def _resolve_paste_blocks(self, text: str) -> str:
+        """Replace compact paste markers with the original full pasted content."""
+        if not self._paste_blocks:
+            return text
+        resolved = text
+        for marker, block in self._paste_blocks.items():
+            if marker in resolved:
+                resolved = resolved.replace(marker, block.text)
+        self._paste_blocks.clear()
+        return resolved
+
+    def _insert_paste_text(self, buffer: Any, text: str) -> None:
+        """Insert pasted text, compacting large blocks to keep terminal rendering smooth."""
+        if not text:
+            return
+        if self._should_compact_paste(text):
+            buffer.insert_text(self._paste_marker(text))
+            self._invalidate()
+            return
+        buffer.insert_text(text)
+
+    def _install_paste_compactor(self, buffer: Any) -> None:
+        """Compact bulk Buffer inserts even when paste bypasses key bindings."""
+        if getattr(buffer, _PASTE_COMPACTOR_ATTR, False):
+            return
+        original_insert_text = buffer.insert_text
+        ref = self
+
+        def insert_text(text: str, *args: Any, **kwargs: Any) -> None:
+            if isinstance(text, str) and ref._should_compact_paste(text):
+                original_insert_text(ref._paste_marker(text), *args, **kwargs)
+                ref._invalidate()
+                return
+            original_insert_text(text, *args, **kwargs)
+
+        buffer.insert_text = insert_text
+        setattr(buffer, _PASTE_COMPACTOR_ATTR, True)
+
     # ── Lifecycle ────────────────────────────────────────────────────
 
     async def run(self) -> int:
@@ -164,7 +257,7 @@ class LeapApp:
         """Drain pending_input and dispatch to on_input handler."""
         while not self._should_exit:
             try:
-                text = await asyncio.wait_for(
+                command = await asyncio.wait_for(
                     self._pending_input.get(), timeout=0.1
                 )
             except asyncio.TimeoutError:
@@ -172,19 +265,33 @@ class LeapApp:
             except asyncio.CancelledError:
                 return
 
-            if not text:
+            if not command.text.strip():
+                self._sync_task_counts()
                 continue
 
+            self._active_command = command.mark_running()
+            self._agent_running = True
+            self._sync_task_counts()
+            self._console.command_card(self._active_command)
             try:
                 if self._on_input is not None:
-                    result = self._on_input(text)
+                    result = self._on_input(command.text)
                     if asyncio.iscoroutine(result):
                         await result
+                if self._active_command is not None:
+                    finished = self._active_command.mark_done()
+                    self._console.command_card(finished)
             except Exception as exc:
+                if self._active_command is not None:
+                    failed = self._active_command.mark_failed(f"{type(exc).__name__}: {exc}")
+                    self._console.command_card(failed)
                 self._console.error(f"{exc}")
-                self._agent_running = False
                 self._spinner_text = ""
                 self._tool_start_time = 0.0
+            finally:
+                self._active_command = None
+                self._agent_running = False
+                self._sync_task_counts()
                 self._invalidate()
 
     # ── Layout construction ──────────────────────────────────────────
@@ -199,18 +306,19 @@ class LeapApp:
             return ref._prompt_fragments()
 
         area = TextArea(
-            height=Dimension(min=1, max=8, preferred=1),
+            height=Dimension(min=1, max=4, preferred=1),
             prompt=get_prompt,
-            style=f"{self._theme.input_text} bold",
+            style="class:input-area",
             multiline=True,
             wrap_lines=True,
-            read_only=Condition(lambda: ref._agent_running),
+            dont_extend_height=True,
             history=FileHistory(str(self._history_path)),
             completer=completer,
             complete_while_typing=True,
             auto_suggest=AutoSuggestFromHistory(),
         )
         area.buffer.tempfile_suffix = ".md"
+        self._install_paste_compactor(area.buffer)
         return area
 
     def _build_application(self) -> Application[Any]:
@@ -257,12 +365,17 @@ class LeapApp:
             text = event.app.current_buffer.text.strip()
             if not text:
                 return
-            ref._pending_input.put_nowait(text)
-            event.app.current_buffer.reset(append_to_history=True)
+            has_compacted_paste = bool(ref._paste_blocks)
+            ref.submit_text(text)
+            event.app.current_buffer.reset(append_to_history=not has_compacted_paste)
 
         @kb.add(Keys.Escape, Keys.Enter)
         def _(event):
             event.current_buffer.insert_text("\n")
+
+        @kb.add(Keys.BracketedPaste)
+        def _(event):
+            ref._insert_paste_text(event.current_buffer, event.data)
 
         @kb.add(Keys.ControlD)
         def _(event):
@@ -271,16 +384,28 @@ class LeapApp:
 
         @kb.add(Keys.ControlC)
         def _(event):
-            if not ref._agent_running:
-                ref._should_exit = True
-                event.app.exit()
+            if event.current_buffer.text:
+                event.current_buffer.reset()
+                ref._paste_blocks.clear()
+                return
+            if ref._agent_running:
+                ref._console.system(
+                    "Task is running. Keep typing to queue the next instruction; "
+                    "use /exit after it finishes to leave."
+                )
+                return
+            ref._should_exit = True
+            event.app.exit()
 
         return kb
 
     def _build_style(self) -> PTStyle:
         t = self._theme
+        input_style = f"bg:{t.input_bg} {t.input_text} bold"
+        disabled_style = f"bg:{t.input_bg} {t.input_disabled_text}"
         return PTStyle.from_dict({
-            "input-area": f"{t.input_text} bold",
+            "input-area": input_style,
+            "input-area.disabled": disabled_style,
             "prompt": t.prompt_char,
             "prompt.working": t.accent_dim,
             "prompt.recording": t.recording,
@@ -294,6 +419,8 @@ class LeapApp:
             "status-bar.bad": f"bg:{t.toolbar_bg} {t.error}",
             "hint": t.text_dim,
             "auto-suggest": t.auto_suggest,
+            "placeholder": t.input_placeholder,
+            "selection": f"bg:{t.input_selection_bg} {t.input_selection_fg}",
         })
 
     # ── Fragment providers ───────────────────────────────────────────
@@ -331,6 +458,12 @@ class LeapApp:
         return 1 if self._spinner_text else 0
 
     # ── Internal ─────────────────────────────────────────────────────
+
+    def _sync_task_counts(self) -> None:
+        self._status.update_task_counts(
+            running=1 if self._active_command is not None else 0,
+            queued=self._pending_input.qsize(),
+        )
 
     def _invalidate(self) -> None:
         if self._app.is_running:

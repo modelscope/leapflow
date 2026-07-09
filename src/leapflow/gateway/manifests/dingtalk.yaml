@@ -1,0 +1,49 @@
+platform_id: dingtalk
+display_name: "钉钉 (DingTalk)"
+description: "钉钉企业协作平台"
+category: im
+
+credentials:
+  - key: app_key
+    label: AppKey
+    required: true
+    secret: false
+    help_zh: "钉钉开放平台 → 应用开发 → 企业内部应用 → 凭证与基础信息 → AppKey"
+    help_en: "DingTalk Open Platform → App Dev → Internal App → Credentials → AppKey"
+  - key: app_secret
+    label: AppSecret
+    required: true
+    secret: true
+    help_zh: "同页面 → AppSecret"
+    help_en: "Same page → AppSecret"
+
+options:
+  - key: robot_code
+    label: 机器人编码
+    type: string
+    required: false
+    help_zh: "如使用自定义机器人，请提供 robot_code（可选）"
+    help_en: "Provide robot_code if using a custom bot (optional)"
+
+setup_guide:
+  summary_zh: |
+    接入钉钉需要在钉钉开放平台创建企业内部应用并开启机器人能力。
+    完成后请提供 AppKey 和 AppSecret。
+  summary_en: |
+    To connect DingTalk, create an internal app on open-dev.dingtalk.com
+    with bot capability. Then provide your AppKey and AppSecret.
+  steps_zh:
+    - "打开 https://open-dev.dingtalk.com → 应用开发 → 企业内部应用 → 创建应用"
+    - "在「应用能力」中添加「机器人」"
+    - "在「凭证与基础信息」复制 AppKey 和 AppSecret"
+    - "在「权限管理」中添加消息相关权限"
+  console_url: "https://open-dev.dingtalk.com"
+
+validation:
+  method: dingtalk_token_check
+  timeout_s: 10
+
+adapter:
+  module: leapflow.gateway.adapters.dingtalk
+  class: DingTalkAdapter
+  dependencies: [dingtalk-stream]

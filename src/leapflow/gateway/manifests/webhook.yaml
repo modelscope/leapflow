@@ -1,0 +1,50 @@
+platform_id: webhook
+display_name: "Webhook (Generic)"
+description: Generic HTTP webhook receiver for custom integrations
+category: webhook
+
+credentials:
+  - key: webhook_secret
+    label: Webhook Secret
+    required: false
+    secret: true
+    help_zh: "HMAC 签名密钥（推荐设置，用于验证请求来源）"
+    help_en: "HMAC signing secret (recommended, used to verify request origin)"
+
+options:
+  - key: host
+    label: 绑定地址
+    type: string
+    default: "127.0.0.1"
+    help_zh: "HTTP 服务绑定地址"
+    help_en: "HTTP server bind address"
+  - key: port
+    label: 端口
+    type: string
+    default: "9090"
+    help_zh: "HTTP 服务端口"
+    help_en: "HTTP server port"
+  - key: path
+    label: 路径
+    type: string
+    default: "/webhook"
+    help_zh: "Webhook 接收路径"
+    help_en: "Webhook receive path"
+
+setup_guide:
+  summary_zh: |
+    通用 Webhook 接收器，接受 HTTP POST 请求并触发 Agent 处理。
+    可选设置 HMAC 签名密钥以验证请求来源。
+  summary_en: |
+    Generic webhook receiver that accepts HTTP POST requests
+    and triggers agent processing. Optionally set an HMAC secret
+    to verify request origin.
+
+validation:
+  method: ""
+  timeout_s: 5
+
+adapter:
+  module: leapflow.gateway.adapters.webhook
+  class: WebhookAdapter
+  dependencies: [aiohttp]

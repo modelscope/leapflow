@@ -23,31 +23,46 @@ class _PatternSpec(NamedTuple):
 
 
 def _compile_patterns() -> List[_PatternSpec]:
-    """Build redaction patterns, ordered by frequency for early exit."""
+    """Build redaction patterns, ordered by frequency for early exit.
+
+    The ``gate`` substring is checked first (fast ``in`` test) — the regex
+    is only compiled/run when the gate matches.  This keeps log formatting
+    near-zero cost for messages that contain no secrets.
+    """
     specs: List[tuple[str, str, str]] = [
-        # Known API key prefixes
+        # ── Known API key prefixes ────────────────────────────
         ("sk-", r"\bsk-[A-Za-z0-9_\-]{8,}", "api_key"),
         ("ghp_", r"\bghp_[A-Za-z0-9]{36,}", "github_pat"),
         ("gho_", r"\bgho_[A-Za-z0-9]{36,}", "github_oauth"),
         ("xoxb-", r"\bxoxb-[A-Za-z0-9\-]{30,}", "slack_bot"),
         ("xoxp-", r"\bxoxp-[A-Za-z0-9\-]{30,}", "slack_user"),
         ("AKIA", r"\bAKIA[A-Z0-9]{16}", "aws_access_key"),
-        # JWT tokens
+        ("hf_", r"\bhf_[A-Za-z0-9]{10,}", "huggingface"),
+        # ── Platform tokens (gateway) ─────────────────────────
+        # Telegram bot token: 123456789:AABBccDDeeFF…
+        ("/bot", r"\d{8,}:[A-Za-z0-9_\-]{30,}", "telegram_bot_token"),
+        # Feishu app IDs (cli_a…) are non-secret but Feishu tenant
+        # access tokens (t-…) and app_tickets are secret.
+        ("t-", r"\bt-[A-Za-z0-9_\-]{20,}", "feishu_access_token"),
+        # Encrypted credential values in gateway.yaml
+        ("enc:fernet:", r"enc:fernet:[A-Za-z0-9_=\+/\-]{20,}", "fernet_cipher"),
+        ("enc:b64:", r"enc:b64:[A-Za-z0-9_=\+/]{8,}", "b64_cipher"),
+        # ── JWT tokens ────────────────────────────────────────
         ("eyJ", r"\beyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}", "jwt"),
-        # Auth headers
+        # ── Auth headers ──────────────────────────────────────
         ("Bearer", r"(?i)Bearer\s+[A-Za-z0-9_\-\.]{20,}", "auth_header"),
         ("x-api-key", r"(?i)x-api-key[:\s]+[A-Za-z0-9_\-]{10,}", "api_header"),
         ("Authorization", r"(?i)Authorization[:\s]+\S{10,}", "auth_header"),
-        # ENV assignments (KEY=value)
-        ("API_KEY=", r"(?i)(?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)\s*=\s*\S{6,}", "env_assignment"),
-        # JSON/YAML key-value secrets
-        ('"apiKey"', r'(?i)"(?:api[_-]?key|secret|token|password|credential)"\s*:\s*"[^"]{6,}"', "json_secret"),
-        ("password:", r"(?i)password\s*:\s*\S{6,}", "yaml_secret"),
-        # Database URLs with credentials
+        # ── ENV / config assignments ──────────────────────────
+        ("=", r"(?i)(?:API_KEY|APP_SECRET|APP_KEY|BOT_TOKEN|SECRET|TOKEN|PASSWORD|CREDENTIAL)\s*=\s*\S{6,}", "env_assignment"),
+        # ── JSON/YAML key-value secrets ───────────────────────
+        ('"', r'(?i)"(?:api[_-]?key|app[_-]?secret|app[_-]?key|bot[_-]?token|secret|token|password|credential|access[_-]?token|webhook[_-]?secret)"\s*:\s*"[^"]{6,}"', "json_secret"),
+        ("secret:", r"(?i)(?:app_secret|app_key|bot_token|password|secret)\s*:\s*\S{6,}", "yaml_secret"),
+        # ── Database URLs ─────────────────────────────────────
         ("://", r"(?i)(?:postgres|mysql|mongodb|redis)://\S+:\S+@\S+", "db_url"),
-        # Private keys
+        # ── Private keys ──────────────────────────────────────
         ("-----BEGIN", r"-----BEGIN\s+(?:RSA|DSA|EC|OPENSSH)?\s*PRIVATE\s+KEY-----", "private_key"),
-        # Bare URL tokens
+        # ── URL-embedded tokens ───────────────────────────────
         ("@github.com", r"https?://[A-Za-z0-9_\-]+@github\.com\S*", "url_token"),
     ]
     return [

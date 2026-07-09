@@ -65,8 +65,7 @@ def _get_coordinator(ctx: "Context"):
         return ctx.coordinator
 
     # Build one from settings
-    db_path = ctx.settings.data_dir / "scheduler.duckdb"
-    store = TaskStore(db_path)
+    store = TaskStore(ctx.settings.duckdb_path)
 
     # Local scheduler with a simple skill executor
     class _SimpleExecutor:

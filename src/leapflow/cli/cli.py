@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
 try:
@@ -38,7 +39,7 @@ async def _async_main(args: argparse.Namespace) -> int:
 
         if cmd == "interactive":
             from leapflow.cli.commands.interactive import cmd_interactive
-            return await cmd_interactive(ctx)
+            return await cmd_interactive(ctx, resume_id=getattr(args, "resume", None))
         elif cmd == "chat":
             from leapflow.cli.commands.chat import cmd_chat
             return await cmd_chat(ctx, args.prompt, getattr(args, "thinking", False))
@@ -86,12 +87,67 @@ async def _async_host(args: argparse.Namespace) -> int:
     return await cmd_host(args)
 
 
+async def _async_daemon_main(args: argparse.Namespace) -> int:
+    """Run chat/interactive through a shared leapd daemon."""
+    from leapflow.daemon.client import DaemonUnavailableError, ensure_daemon_client
+
+    settings = load_config()
+    mock_host = getattr(args, "mock_host", False)
+
+    def _status(message: str) -> None:
+        sys.stderr.write(f"\033[2m→ {message}\033[0m\n")
+        sys.stderr.flush()
+
+    try:
+        client = await ensure_daemon_client(
+            settings,
+            mock_host=mock_host,
+            status_callback=_status,
+        )
+    except DaemonUnavailableError as exc:
+        sys.stderr.write(
+            "\033[33m→ leapd unavailable; falling back to local volatile-capable mode.\033[0m\n"
+        )
+        sys.stderr.write(f"\033[2m  {exc}\033[0m\n")
+        sys.stderr.flush()
+        return await _async_main(args)
+
+    cmd = args.command
+    if cmd == "interactive":
+        from leapflow.cli.commands.interactive import cmd_interactive_daemon
+
+        return await cmd_interactive_daemon(
+            client,
+            settings,
+            resume_id=getattr(args, "resume", None),
+        )
+    if cmd == "chat":
+        from leapflow.cli.commands.chat import cmd_chat_daemon
+
+        return await cmd_chat_daemon(client, args.prompt, getattr(args, "thinking", False))
+
+    return await _async_main(args)
+
+
+def _daemon_enabled(args: argparse.Namespace) -> bool:
+    """Return whether chat/interactive should use leapd."""
+    if getattr(args, "no_daemon", False):
+        return False
+    raw = os.getenv("LEAPFLOW_DAEMON", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--mock-host",
         action="store_true",
         help="Force in-process mock platform (overrides LEAPFLOW_MOCK_HOST).",
+    )
+    common.add_argument(
+        "--no-daemon",
+        action="store_true",
+        help="Run chat/interactive in the legacy in-process mode.",
     )
 
     parser = argparse.ArgumentParser(
@@ -101,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     parser.add_argument("--thinking", action="store_true", help="Enable LLM reasoning mode")
+    parser.add_argument("--resume", metavar="ID", help="Resume a previous chat session")
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -148,24 +205,56 @@ def main(argv: list[str] | None = None) -> int:
     host_sub.add_parser("doctor", help="Run cua-driver connectivity health check")
     host_sub.add_parser("install", help="Install cua-driver")
 
+    # leap daemon
+    daemon_parser = subparsers.add_parser("daemon", help="Manage leapd daemon")
+    daemon_sub = daemon_parser.add_subparsers(dest="daemon_action")
+    daemon_sub.add_parser("status", help="Show daemon status")
+    daemon_sub.add_parser("start", help="Start daemon for the active profile")
+    daemon_sub.add_parser("stop", help="Stop running daemon")
+    daemon_sub.add_parser("restart", help="Restart daemon for the active profile")
+    serve_parser = daemon_sub.add_parser("serve", help=argparse.SUPPRESS)
+    serve_parser.add_argument("--internal", action="store_true", help=argparse.SUPPRESS)
+
     # ── Pre-parse: detect if first non-flag arg is a known subcommand ──
     # If not, treat everything non-flag as a chat prompt.
-    known_commands = {"teach", "run", "skills", "relearn", "host"}
+    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon"}
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
 
-    # Find first non-flag argument
+    # Find first non-flag argument, skipping values owned by global options.
+    value_options = {"--resume"}
     prompt_words: list[str] = []
     first_pos = None
+    skip_next = False
     for i, tok in enumerate(effective_argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in value_options:
+            skip_next = True
+            continue
         if tok.startswith("-"):
             continue
         first_pos = i
         break
 
     if first_pos is not None and effective_argv[first_pos] not in known_commands:
-        # Collect all non-flag tokens as prompt, remove them from argv for argparse
-        flags = [t for t in effective_argv if t.startswith("-")]
-        prompt_words = [t for t in effective_argv if not t.startswith("-")]
+        # Collect all non-option prompt tokens while preserving global option values.
+        flags: list[str] = []
+        prompt_words = []
+        skip_next = False
+        for tok in effective_argv:
+            if skip_next:
+                flags.append(tok)
+                skip_next = False
+                continue
+            if tok in value_options:
+                flags.append(tok)
+                skip_next = True
+                continue
+            if tok.startswith("-"):
+                flags.append(tok)
+            else:
+                prompt_words.append(tok)
         effective_argv = flags
 
     args = parser.parse_args(effective_argv)
@@ -195,7 +284,14 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write("\n\033[2m→ Interrupted\033[0m\n")
             return 130
 
+    # Daemon command does not need Context initialization
+    if args.command == "daemon":
+        from leapflow.cli.commands.daemon import cmd_daemon
+        return cmd_daemon(args)
+
     try:
+        if args.command in {"interactive", "chat"} and _daemon_enabled(args):
+            return asyncio.run(_async_daemon_main(args))
         return asyncio.run(_async_main(args))
     except KeyboardInterrupt:
         sys.stderr.write("\n\033[2m→ Interrupted\033[0m\n")

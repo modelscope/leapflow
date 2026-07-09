@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 
 import duckdb
 
@@ -27,6 +27,7 @@ from leapflow.memory.protocol import (
     MemoryQuery,
     SignalDomain,
 )
+from leapflow.storage.connection import ConnectionHolder
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +96,9 @@ class SemanticMemoryProvider:
     Accepts all MemoryKinds — acts as the universal long-term store.
     """
 
-    def __init__(self, db_path: Path) -> None:
-        self._db_path = db_path
+    def __init__(self, source: Union[ConnectionHolder, Path]) -> None:
+        self._owns_holder = isinstance(source, Path)
+        self._source = source
         self._con: Optional[duckdb.DuckDBPyConnection] = None
 
     # ── Protocol properties ───────────────────────────────────────────
@@ -109,15 +111,18 @@ class SemanticMemoryProvider:
 
     async def initialize(self, **kwargs: Any) -> None:
         """Open DB connection, ensure schema exists, migrate if needed."""
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._con = duckdb.connect(str(self._db_path))
+        if self._owns_holder:
+            from leapflow.storage.duckdb_connect import connect as safe_connect
+            self._con = safe_connect(self._source)  # type: ignore[arg-type]
+        else:
+            self._con = self._source.connection  # type: ignore[union-attr]
         self._init_schema()
 
     async def shutdown(self) -> None:
-        """Close DB connection."""
-        if self._con:
+        """Close DB connection only if we own it."""
+        if self._owns_holder and self._con:
             self._con.close()
-            self._con = None
+        self._con = None
 
     def accepts(self, entry: MemoryEntry) -> bool:
         # Semantic tier accepts everything — it's the final store
@@ -125,11 +130,13 @@ class SemanticMemoryProvider:
 
     async def insert(self, entry: MemoryEntry) -> str:
         """Persist an entry to DuckDB. Returns entry_id."""
+        from leapflow.storage.write_buffer import execute_with_retry
         con = self._connection()
         now = time.time()
         meta_json = json.dumps(entry.metadata, ensure_ascii=False)
         path = entry.metadata.get("path")
-        con.execute(
+        execute_with_retry(
+            con,
             """
             INSERT INTO leap_memory (id, kind, domain, content, path, metadata, created_at, accessed_at, access_count)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -229,19 +236,27 @@ class SemanticMemoryProvider:
 
     async def delete(self, entry_id: str) -> bool:
         """Remove an entry by ID."""
+        from leapflow.storage.write_buffer import execute_with_retry
         con = self._connection()
-        result = con.execute(
-            "DELETE FROM leap_memory WHERE id = ? RETURNING id", [entry_id]
-        ).fetchall()
-        return len(result) > 0
+        count = con.execute(
+            "SELECT COUNT(*) FROM leap_memory WHERE id = ?", [entry_id]
+        ).fetchone()[0]
+        if count > 0:
+            execute_with_retry(
+                con, "DELETE FROM leap_memory WHERE id = ?", [entry_id]
+            )
+            return True
+        return False
 
     # ── Additional public methods ─────────────────────────────────────
 
     def touch(self, entry_id: str) -> None:
         """Increment access count and update accessed_at timestamp."""
+        from leapflow.storage.write_buffer import execute_with_retry
         con = self._connection()
         now = time.time()
-        con.execute(
+        execute_with_retry(
+            con,
             "UPDATE leap_memory SET accessed_at = ?, access_count = access_count + 1 WHERE id = ?",
             [now, entry_id],
         )
@@ -254,21 +269,31 @@ class SemanticMemoryProvider:
         protected_kinds: Sequence[str] = ("skill_episode", "prediction", "skill", "prediction_experience"),
     ) -> int:
         """Remove old, low-value rows. Protected kinds are exempt."""
+        from leapflow.storage.write_buffer import execute_with_retry
         con = self._connection()
         cutoff = time.time() - max_age_days * 86400
         placeholders = ",".join(["?"] * len(protected_kinds))
-        result = con.execute(
+        count_row = con.execute(
             f"""
-            DELETE FROM leap_memory
+            SELECT COUNT(*) FROM leap_memory
             WHERE created_at < ?
               AND access_count <= 1
               AND kind NOT IN ({placeholders})
-            RETURNING id
             """,
             [cutoff] + list(protected_kinds),
-        ).fetchall()
-        deleted = len(result)
-        if deleted:
+        ).fetchone()
+        deleted = count_row[0] if count_row else 0
+        if deleted > 0:
+            execute_with_retry(
+                con,
+                f"""
+                DELETE FROM leap_memory
+                WHERE created_at < ?
+                  AND access_count <= 1
+                  AND kind NOT IN ({placeholders})
+                """,
+                [cutoff] + list(protected_kinds),
+            )
             logger.info("semantic.prune deleted=%d cutoff_days=%.0f", deleted, max_age_days)
         return deleted
 
@@ -290,12 +315,14 @@ class SemanticMemoryProvider:
         memory_id: Optional[str] = None,
     ) -> str:
         """Insert a row using the legacy (kind, content) signature."""
+        from leapflow.storage.write_buffer import execute_with_retry
         con = self._ensure_connection()
         mid = memory_id or str(uuid.uuid4())
         now = time.time()
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
         domain = SignalDomain.FILESYSTEM.value if "file" in kind else SignalDomain.SYSTEM.value
-        con.execute(
+        execute_with_retry(
+            con,
             """
             INSERT INTO leap_memory (id, kind, domain, content, path, metadata, created_at, accessed_at, access_count)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -318,13 +345,15 @@ class SemanticMemoryProvider:
         Useful for singleton state blobs (e.g. Markov state) that must
         be overwritten on each session rather than duplicated.
         """
+        from leapflow.storage.write_buffer import execute_with_retry
         con = self._ensure_connection()
         mid = memory_id or str(uuid.uuid4())
         now = time.time()
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
         domain = SignalDomain.FILESYSTEM.value if "file" in kind else SignalDomain.SYSTEM.value
-        con.execute("DELETE FROM leap_memory WHERE id = ?", [mid])
-        con.execute(
+        execute_with_retry(con, "DELETE FROM leap_memory WHERE id = ?", [mid])
+        execute_with_retry(
+            con,
             """
             INSERT INTO leap_memory (id, kind, domain, content, path, metadata, created_at, accessed_at, access_count)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -497,9 +526,11 @@ class SemanticMemoryProvider:
 
     def update_metadata(self, memory_id: str, metadata: Dict[str, Any]) -> None:
         """Update the metadata JSON for a given row."""
+        from leapflow.storage.write_buffer import execute_with_retry
         con = self._ensure_connection()
         meta_json = json.dumps(metadata, ensure_ascii=False)
-        con.execute(
+        execute_with_retry(
+            con,
             "UPDATE leap_memory SET metadata = ? WHERE id = ?",
             [meta_json, memory_id],
         )
@@ -537,9 +568,11 @@ class SemanticMemoryProvider:
                 access_count=entry.access_count,
             )
         try:
+            from leapflow.storage.write_buffer import execute_with_retry
             con = self._ensure_connection()
             meta_json = json.dumps(entry.metadata, ensure_ascii=False)
-            con.execute(
+            execute_with_retry(
+                con,
                 """
                 INSERT INTO leap_memory (id, kind, domain, content, path, metadata, created_at, accessed_at, access_count)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -614,8 +647,11 @@ class SemanticMemoryProvider:
     def _ensure_connection(self) -> duckdb.DuckDBPyConnection:
         """Ensure DB is connected, auto-initializing if needed (for legacy callers)."""
         if self._con is None:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._con = duckdb.connect(str(self._db_path))
+            if self._owns_holder:
+                from leapflow.storage.duckdb_connect import connect as safe_connect
+                self._con = safe_connect(self._source)  # type: ignore[arg-type]
+            else:
+                self._con = self._source.connection  # type: ignore[union-attr]
             self._init_schema()
         return self._con
 

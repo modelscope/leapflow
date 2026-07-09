@@ -53,7 +53,7 @@ class PerceptionConfig:
     """Top-level perception module configuration."""
 
     enabled: bool = False
-    frame_cache_dir: Path = field(default_factory=lambda: Path("~/.leapflow/cache/frames"))
+    frame_cache_dir: Path = field(default_factory=lambda: Path("~/.leapflow/profiles/default/cache/frames"))
     privacy_sensitive_apps: FrozenSet[str] = field(default_factory=frozenset)
 
     # Sampling

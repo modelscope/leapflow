@@ -96,7 +96,7 @@ def trajectory_store(tmp_db: Path) -> TrajectoryStore:
 
 @pytest.fixture
 def long_term_memory(tmp_db: Path) -> SemanticMemoryProvider:
-    lt = SemanticMemoryProvider(db_path=tmp_db)
+    lt = SemanticMemoryProvider(source=tmp_db)
     lt._ensure_connection()
     yield lt
     lt.close()
