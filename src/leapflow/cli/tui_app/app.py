@@ -60,7 +60,7 @@ _HISTORY_FILENAME = "history"
 _REFRESH_INTERVAL_S = 0.5
 _LARGE_PASTE_CHAR_THRESHOLD = 4_000
 _LARGE_PASTE_LINE_THRESHOLD = 24
-_PASTE_PREVIEW_LIMIT = 80
+_PASTE_COMPACTOR_ATTR = "_leapflow_paste_compactor_installed"
 
 InputHandler = Callable[[str], Union[Awaitable[None], None]]
 
@@ -181,11 +181,9 @@ class LeapApp:
         paste_id = self._next_paste_id
         self._next_paste_id += 1
         line_count = text.count("\n") + 1
-        first_line = " ".join(text.strip().split())[:_PASTE_PREVIEW_LIMIT]
-        preview = f": {first_line}" if first_line else ""
         marker = (
-            f"⟪pasted block #{paste_id}: {self._compact_tokens(text)}, "
-            f"{line_count} lines{preview} — full text will be submitted⟫"
+            f"[pasted block #{paste_id}: {self._compact_tokens(text)}, "
+            f"{line_count} lines; full text will be submitted]"
         )
         self._paste_blocks[marker] = _PasteBlock(marker=marker, text=text)
         return marker
@@ -210,6 +208,23 @@ class LeapApp:
             self._invalidate()
             return
         buffer.insert_text(text)
+
+    def _install_paste_compactor(self, buffer: Any) -> None:
+        """Compact bulk Buffer inserts even when paste bypasses key bindings."""
+        if getattr(buffer, _PASTE_COMPACTOR_ATTR, False):
+            return
+        original_insert_text = buffer.insert_text
+        ref = self
+
+        def insert_text(text: str, *args: Any, **kwargs: Any) -> None:
+            if isinstance(text, str) and ref._should_compact_paste(text):
+                original_insert_text(ref._paste_marker(text), *args, **kwargs)
+                ref._invalidate()
+                return
+            original_insert_text(text, *args, **kwargs)
+
+        buffer.insert_text = insert_text
+        setattr(buffer, _PASTE_COMPACTOR_ATTR, True)
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
@@ -303,6 +318,7 @@ class LeapApp:
             auto_suggest=AutoSuggestFromHistory(),
         )
         area.buffer.tempfile_suffix = ".md"
+        self._install_paste_compactor(area.buffer)
         return area
 
     def _build_application(self) -> Application[Any]:

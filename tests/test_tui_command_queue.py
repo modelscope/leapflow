@@ -139,10 +139,42 @@ def test_large_paste_is_compacted_but_submits_full_text() -> None:
     assert pasted not in buffer.text
     assert "pasted block #1" in buffer.text
     assert "full text will be submitted" in buffer.text
+    assert buffer.text.isascii()
     command = app.submit_text(f"Please summarize:\n{buffer.text}")
 
     assert command.text == f"Please summarize:\n{pasted}".strip()
     assert app._paste_blocks == {}
+
+
+@pytest.mark.asyncio
+async def test_buffer_insert_compacts_large_english_paste() -> None:
+    app, _console, _status = _make_app()
+    pasted = "long english line\n" * 400
+
+    app._input_area.buffer.insert_text(pasted)
+
+    visible = app._input_area.buffer.text
+    assert pasted not in visible
+    assert visible.startswith("[pasted block #1:")
+    assert "full text will be submitted" in visible
+    assert len(visible) < 120
+    assert app.submit_text(visible).text == pasted.strip()
+
+
+@pytest.mark.asyncio
+async def test_buffer_insert_compacts_large_chinese_paste_with_ascii_marker() -> None:
+    app, _console, _status = _make_app()
+    pasted = "这是一段用于验证中文大段粘贴不会直接渲染的内容。\n" * 300
+
+    app._input_area.buffer.insert_text(pasted)
+
+    visible = app._input_area.buffer.text
+    assert pasted not in visible
+    assert "这是一段" not in visible
+    assert visible.startswith("[pasted block #1:")
+    assert visible.isascii()
+    assert len(visible) < 120
+    assert app.submit_text(visible).text == pasted.strip()
 
 
 def test_small_paste_stays_inline() -> None:
