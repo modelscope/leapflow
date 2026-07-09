@@ -296,10 +296,6 @@ def detect_light_mode(env: Mapping[str, str] | None = None) -> bool:
     if background is not None:
         return is_light_color(background)
 
-    term_program = _env_value(env, "TERM_PROGRAM")
-    if term_program == "Apple_Terminal":
-        return True
-
     return False
 
 

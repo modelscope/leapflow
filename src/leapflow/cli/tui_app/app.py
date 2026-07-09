@@ -199,11 +199,12 @@ class LeapApp:
             return ref._prompt_fragments()
 
         area = TextArea(
-            height=Dimension(min=1, max=8, preferred=1),
+            height=Dimension(min=1, max=4, preferred=1),
             prompt=get_prompt,
             style="class:input-area",
             multiline=True,
             wrap_lines=True,
+            dont_extend_height=True,
             read_only=Condition(lambda: ref._agent_running),
             history=FileHistory(str(self._history_path)),
             completer=completer,

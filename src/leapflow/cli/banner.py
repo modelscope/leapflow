@@ -97,7 +97,6 @@ def display_rich_banner(
         from rich.console import Console
         from rich.panel import Panel
         from rich.table import Table
-        from rich.text import Text
     except ImportError:
         display_welcome()
         return
@@ -107,7 +106,6 @@ def display_rich_banner(
 
     # ── Left column: branding + session metadata ──
     left_lines: list[str] = []
-    left_lines.append("")
     left_lines.append(
         f"[bold {_GOLD}]L[/] [dim {_DIM_GOLD}].[/] "
         f"[bold {_GOLD}]E[/] [dim {_DIM_GOLD}].[/] "
@@ -135,33 +133,35 @@ def display_rich_banner(
         short_cwd = cwd.replace(os.path.expanduser("~"), "~")
         left_lines.append(f"[{_WARM_GRAY}]{short_cwd}[/]")
 
-    left_lines.append("")
     left_content = "\n".join(left_lines)
 
-    # ── Right column: tools + skills catalog ──
+    # ── Right column: compact capability overview ──
     right_lines: list[str] = []
 
-    if tool_defs:
-        tool_groups = _categorize_tools(tool_defs)
-        right_lines.append(f"[bold {_AMBER}]Available Tools[/]")
-        for cat, names in tool_groups.items():
-            names_str = ", ".join(sorted(names))
-            if len(names_str) > 52:
-                names_str = names_str[:49] + "…"
-            right_lines.append(f"[{_DIM_GOLD}]{cat}:[/] [{_CREAM}]{names_str}[/]")
+    tool_count = len(tool_defs) if tool_defs else 0
+    skill_count = len(skills) if skills else 0
 
+    if tool_count:
+        tool_groups = _categorize_tools(tool_defs)
+        categories = ", ".join(
+            f"{cat}({len(names)})" for cat, names in tool_groups.items()
+        )
+        if len(categories) > 72:
+            categories = categories[:69] + "…"
+        right_lines.append(f"[bold {_AMBER}]Tools[/] [{_CREAM}]{tool_count} available[/]")
+        right_lines.append(f"[{_DIM_GOLD}]{categories}[/]")
         if mcp_tools > 0:
             right_lines.append(f"[{_DIM_GOLD}]mcp:[/] [{_CREAM}]{mcp_tools} platform tools[/]")
 
-    if skills:
-        right_lines.append("")
-        right_lines.append(f"[bold {_AMBER}]Available Skills[/]")
+    if skill_count:
         skill_groups = _categorize_skills(skills)
-        for cat, names in skill_groups.items():
-            names_str = ", ".join(sorted(names))
-            if len(names_str) > 52:
-                names_str = names_str[:49] + "…"
-            right_lines.append(f"[{_DIM_GOLD}]{cat}:[/] [{_CREAM}]{names_str}[/]")
+        categories = ", ".join(
+            f"{cat}({len(names)})" for cat, names in skill_groups.items()
+        )
+        if len(categories) > 72:
+            categories = categories[:69] + "…"
+        right_lines.append(f"[bold {_AMBER}]Skills[/] [{_CREAM}]{skill_count} available[/]")
+        right_lines.append(f"[{_DIM_GOLD}]{categories}[/]")
 
     if gateway_connected:
         right_lines.append("")
@@ -175,8 +175,6 @@ def display_rich_banner(
         right_lines.append(f"[{_WARM_GRAY}]No tools or skills loaded[/]")
 
     # Summary line
-    tool_count = len(tool_defs) if tool_defs else 0
-    skill_count = len(skills) if skills else 0
     summary_parts = []
     if tool_count:
         summary_parts.append(f"{tool_count} tools")
@@ -186,7 +184,7 @@ def display_rich_banner(
         summary_parts.append(f"{mcp_tools} mcp")
     if gateway_connected:
         summary_parts.append(f"{len(gateway_connected)} gateway")
-    summary_parts.append("/help for commands")
+    summary_parts.append("/help · /tools · /skills")
     right_lines.append("")
     right_lines.append(f"[{_WARM_GRAY}]{' · '.join(summary_parts)}[/]")
 
@@ -202,12 +200,12 @@ def display_rich_banner(
             combined,
             title=f"[bold {_GOLD}]{version_label}[/]  {conn}",
             border_style=_BRONZE,
-            padding=(0, 2),
+            padding=(0, 1),
             expand=True,
         )
     else:
-        layout = Table.grid(padding=(0, 3))
-        left_min = max(38, term_width // 3)
+        layout = Table.grid(padding=(0, 2))
+        left_min = max(32, min(52, term_width // 3))
         layout.add_column("left", justify="center", min_width=left_min)
         layout.add_column("right", justify="left", ratio=1)
         layout.add_row(left_content, right_content)
@@ -218,7 +216,7 @@ def display_rich_banner(
             layout,
             title=f"[bold {_GOLD}]{version_label}[/]  {conn}",
             border_style=_BRONZE,
-            padding=(0, 2),
+            padding=(0, 1),
             expand=True,
         )
 

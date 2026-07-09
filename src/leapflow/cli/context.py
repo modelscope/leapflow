@@ -9,12 +9,12 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from leapflow.platform.cua_client import CuaDriverClient
 from leapflow.platform.event_bus import EventBus
 from leapflow.platform.mock import MockBridge
-from leapflow.config import Settings, load_config
+from leapflow.config import Settings
 from leapflow.engine.engine import AgentEngine, build_default_registry
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.intent_classifier import (
@@ -32,7 +32,6 @@ from leapflow.llm.openai_provider import OpenAIChat
 from leapflow.llm.provider_chain import (
     AuxiliaryClient,
     FailoverChain,
-    ProviderConfig,
     parse_credential_pools,
     parse_provider_configs,
 )
@@ -52,7 +51,7 @@ from leapflow.learning.distiller import LLMSkillDistiller, SkillDistiller
 from leapflow.learning.doc_generator import CompositeSkillDocGenerator, LLMSkillDocGenerator
 from leapflow.storage.skill_docs import SkillDocStore
 from leapflow.storage.duckdb_connect import DatabaseLockedError
-from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
+from leapflow.storage.connection import LocalConnectionHolder
 from leapflow.learning.feedback import FeedbackEvaluator
 from leapflow.storage.skill_library import SkillLibraryStore
 from leapflow.skills.registry import SkillRegistry
@@ -67,6 +66,11 @@ from leapflow.platform.normalizer import EventNormalizer
 
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from leapflow.platform.observers import RecordingProfile
+    from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+    from leapflow.storage.skill_library import StoredSkill
 
 
 class _TUIApprovalGate:
@@ -326,7 +330,6 @@ def _register_stored_skill_fallbacks(
     llm: Any,
 ) -> int:
     """Register StoredSkills that lack a parameterized or doc counterpart."""
-    from leapflow.storage.skill_library import StoredSkill
     from leapflow.skills.registry import Skill, SkillMetadata
 
     registered_names = set(registry.names()) if hasattr(registry, 'names') else {s.name for s in registry.list_all()}
@@ -523,6 +526,13 @@ class Context:
         # Skill evolution & PatternMiner
         self._evolution_policy: Optional[EMAConfidencePolicy] = None
         self._pattern_miner: Optional[Any] = None
+
+        # Unified approval gate is resource-free; create it in __init__ so all
+        # initialize() wiring paths can safely reference the same session gate.
+        from leapflow.security.approval import SessionAwareGate
+
+        self._tui_approval = _TUIApprovalGate()
+        self._approval_gate = SessionAwareGate(self._tui_approval)
 
     async def initialize(self) -> None:
         """Async initialization: VSI handshake, pipeline assembly.
@@ -1061,7 +1071,7 @@ class Context:
             ]
             # L2/L3: wire Memory adapters when ExperienceStore is available
             if hasattr(self, 'experience_store') and self.experience_store is not None:
-                from leapflow.copilot.adapters import ExperienceEmbedAdapter, MemoryRAGAdapter
+                from leapflow.copilot.adapters import ExperienceEmbedAdapter
                 from leapflow.copilot.predictors.l2_embed import L2EmbeddingPredictor
                 from leapflow.copilot.predictors.l3_llm import L3LLMPredictor
 
@@ -1289,12 +1299,7 @@ class Context:
         except Exception:
             logger.debug("MCP Manager initialization skipped", exc_info=True)
 
-        # ── Unified approval gate (shell, file, gateway) ──
-        from leapflow.security.approval import SessionAwareGate
-
-        self._tui_approval = _TUIApprovalGate()
-        self._approval_gate = SessionAwareGate(self._tui_approval)
-
+        # ── Unified approval gate wiring (shell, file, gateway) ──
         try:
             from leapflow.tools.shell_tools import set_approval_gate
             set_approval_gate(self._approval_gate)

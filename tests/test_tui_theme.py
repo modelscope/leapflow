@@ -73,6 +73,14 @@ def test_colorfgbg_background_detection() -> None:
     assert detect_light_mode({"COLORFGBG": "15;0"}) is False
 
 
+def test_terminal_program_alone_does_not_force_light_theme() -> None:
+    theme = detect_theme({"TERM_PROGRAM": "Apple_Terminal"}, is_tty=True)
+
+    assert theme.name == "dark"
+    assert theme.input_bg == "#0B1F24"
+    assert contrast_ratio(theme.input_text, theme.input_bg) >= 7.0
+
+
 def test_prompt_toolkit_accepts_base_and_resolved_theme_styles() -> None:
     _style_for(_DARK)
     _style_for(_LIGHT)
@@ -91,3 +99,5 @@ def test_leap_app_style_builder_accepts_resolved_theme(tmp_path) -> None:
     )
 
     assert app._build_style() is not None
+    assert app._input_area.window.height.max == 4
+    assert app._input_area.window.dont_extend_height() is True
