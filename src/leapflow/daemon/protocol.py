@@ -15,7 +15,7 @@ import json
 import uuid
 from dataclasses import asdict, dataclass, field
 from enum import IntEnum
-from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Protocol, runtime_checkable
 
 
 class ErrorCode(IntEnum):
@@ -105,16 +105,25 @@ class RpcNotification:
 
 @dataclass(frozen=True)
 class StreamChunk:
-    """A single streaming chunk (for engine.chat streaming responses)."""
+    """A single streaming chunk for daemon engine events."""
     request_id: str
     content: str
     done: bool = False
+    event_type: Literal[
+        "chunk", "final", "tool_start", "tool_complete", "thinking", "status", "error"
+    ] = "chunk"
+    metadata: Optional[Dict[str, Any]] = None
 
     def to_notification(self) -> RpcNotification:
-        return RpcNotification(
-            method="stream.chunk",
-            params={"id": self.request_id, "content": self.content, "done": self.done},
-        )
+        params: Dict[str, Any] = {
+            "id": self.request_id,
+            "content": self.content,
+            "done": self.done,
+            "event_type": self.event_type,
+        }
+        if self.metadata:
+            params["metadata"] = self.metadata
+        return RpcNotification(method="stream.chunk", params=params)
 
 
 # ══════════════════════════════════════════════════════════════════════

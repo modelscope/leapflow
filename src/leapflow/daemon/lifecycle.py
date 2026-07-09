@@ -24,6 +24,8 @@ import logging
 import os
 import signal
 import socket
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -175,6 +177,43 @@ def send_signal(run_dir: Path, sig: int = signal.SIGTERM) -> bool:
         return True
     except OSError:
         return False
+
+
+def spawn_daemon(settings: object, *, mock_host: bool = False) -> subprocess.Popen[bytes]:
+    """Spawn a detached leapd process for the active environment."""
+    run_dir = getattr(settings, "profile_dir") / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "leapd.log"
+    command = [sys.executable, "-m", "leapflow"]
+    if mock_host:
+        command.append("--mock-host")
+    command.extend(["daemon", "serve", "--internal"])
+    log_file = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_file.close()
+    logger.info("daemon: spawned pid=%s log=%s", proc.pid, log_path)
+    return proc
+
+
+def wait_ready(run_dir: Path, *, timeout_s: float = 30.0, interval_s: float = 0.1) -> DaemonInfo:
+    """Wait until the daemon socket becomes healthy or timeout expires."""
+    deadline = time.time() + max(0.1, timeout_s)
+    last = DaemonInfo.discover(run_dir)
+    while time.time() < deadline:
+        last = DaemonInfo.discover(run_dir)
+        if last.is_healthy:
+            return last
+        time.sleep(max(0.01, interval_s))
+    return last
 
 
 # ── Internal helpers ──

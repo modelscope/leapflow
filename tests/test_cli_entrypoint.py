@@ -62,7 +62,23 @@ async def test_context_initialize_degrades_when_primary_db_is_locked(
         await ctx.cleanup()
 
 
-def test_leap_default_command_initializes_and_runs_interactive(monkeypatch) -> None:
+def test_leap_default_command_uses_daemon_client(monkeypatch) -> None:
+    from leapflow.cli import cli
+
+    captured = {}
+
+    async def fake_daemon_main(args):
+        captured["command"] = args.command
+        captured["no_daemon"] = args.no_daemon
+        return 0
+
+    monkeypatch.setattr(cli, "_async_daemon_main", fake_daemon_main)
+
+    assert cli.main([]) == 0
+    assert captured == {"command": "interactive", "no_daemon": False}
+
+
+def test_leap_no_daemon_initializes_and_runs_interactive(monkeypatch) -> None:
     from leapflow.cli import cli
     import leapflow.cli.commands.interactive as interactive_module
 
@@ -92,5 +108,21 @@ def test_leap_default_command_initializes_and_runs_interactive(monkeypatch) -> N
     monkeypatch.setattr(cli, "Context", FakeContext)
     monkeypatch.setattr(interactive_module, "cmd_interactive", fake_interactive)
 
-    assert cli.main([]) == 0
+    assert cli.main(["--no-daemon"]) == 0
     assert events == ["context", "initialize", "interactive", "cleanup"]
+
+
+def test_leap_prompt_uses_daemon_chat_route(monkeypatch) -> None:
+    from leapflow.cli import cli
+
+    captured = {}
+
+    async def fake_daemon_main(args):
+        captured["command"] = args.command
+        captured["prompt"] = args.prompt
+        return 0
+
+    monkeypatch.setattr(cli, "_async_daemon_main", fake_daemon_main)
+
+    assert cli.main(["hello", "world"]) == 0
+    assert captured == {"command": "chat", "prompt": "hello world"}

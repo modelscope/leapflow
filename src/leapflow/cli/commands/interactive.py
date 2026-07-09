@@ -11,7 +11,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from leapflow.cli.commands.run import _print_execution_result
 from leapflow.cli.helpers import require_initialized
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from leapflow.cli.context import Context
     from leapflow.copilot.types import PredictionCandidate
+    from leapflow.daemon.client import DaemonClient
 
 _CLI_INTERACTION_EVENT = "cli.interaction"
 _CLI_EVENT_SOURCE = "interactive_repl"
@@ -477,6 +478,189 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
             console.success(f"Resumed session {resume_id}")
         else:
             console.warning(f"Session '{resume_id}' not found; starting a new session.")
+
+    _render_banner()
+    _update_status()
+    exit_code = 0
+    try:
+        exit_code = await app.run()
+    finally:
+        _print_exit_summary()
+    return exit_code
+
+
+async def cmd_interactive_daemon(
+    client: "DaemonClient",
+    settings: Any,
+    *,
+    resume_id: Optional[str] = None,
+) -> int:
+    """Persistent REPL backed by leapd thin-client RPC."""
+    from leapflow.cli.banner import display_rich_banner
+    from leapflow.cli.commands.registry import completion_entries, resolve_command
+    from leapflow.cli.tui_app import (
+        LeapApp,
+        LeapConsole,
+        SessionExitStats,
+        StreamRenderer,
+        build_exit_summary_lines,
+        detect_theme,
+    )
+    from leapflow.cli.tui_app.status import StatusBar
+    from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
+
+    theme = detect_theme()
+    console = LeapConsole(theme)
+    status = StatusBar(theme)
+    exit_stats = SessionExitStats()
+    active_session_id = str(resume_id or "")
+    turn_count = 0
+
+    def _update_status() -> None:
+        status.update(
+            mode="daemon",
+            skill_count=0,
+            platform_online=True,
+            model_name=getattr(settings, "llm_model", ""),
+            session_turns=turn_count,
+            context_used=0,
+            context_max=getattr(settings, "llm_context_length", 0),
+        )
+        app.prompt_mode = "daemon"
+
+    def _render_banner() -> None:
+        display_rich_banner(
+            model=getattr(settings, "llm_model", ""),
+            cwd=os.getcwd(),
+            session_id=active_session_id,
+            platform_online=True,
+            tool_defs=TOOL_DEFINITIONS,
+            skills=[],
+            context_length=getattr(settings, "llm_context_length", 0),
+            mcp_tools=0,
+            gateway_connected=[],
+        )
+        console.system("Daemon mode: chat/session persistence is shared across terminals.")
+
+    async def _print_daemon_status() -> None:
+        try:
+            daemon_status = await client.status()
+        except Exception as exc:
+            console.warning(f"Daemon status unavailable: {exc}")
+            return
+        console.system(
+            "leapd "
+            f"pid={daemon_status.get('pid')} "
+            f"profile={daemon_status.get('profile')} "
+            f"clients={daemon_status.get('active_clients')} "
+            f"volatile={daemon_status.get('volatile')}"
+        )
+        db_path = daemon_status.get("db_path")
+        if db_path:
+            console.system(f"DB: {db_path}")
+
+    async def _stream_response(prompt_text: str) -> None:
+        nonlocal active_session_id, turn_count
+        exit_stats.record_user_message()
+        status.mark_turn_start()
+        app.agent_running = True
+        app.spinner_text = "Thinking…"
+
+        renderer = StreamRenderer(console)
+        renderer.start()
+        try:
+            async for event in client.engine_chat(prompt_text):
+                metadata = event.metadata or {}
+                if metadata.get("session_id"):
+                    active_session_id = str(metadata["session_id"])
+                if event.type == "chunk":
+                    renderer.feed(event.content)
+                elif event.type == "thinking":
+                    renderer.feed_thinking(event.content)
+                elif event.type == "tool_start":
+                    app.spinner_text = renderer.tool_started(event.content)
+                elif event.type == "tool_complete":
+                    renderer.tool_finished(event.content)
+                    app.spinner_text = "Thinking…"
+                elif event.type == "final":
+                    if not renderer.text:
+                        renderer.feed(event.content)
+                elif event.type == "error":
+                    renderer.feed(event.content)
+        finally:
+            renderer.finish()
+            if renderer.has_output:
+                exit_stats.record_assistant_message()
+            exit_stats.record_tool_calls(renderer.tool_count)
+            turn_count += 1
+            app.spinner_text = ""
+            app.agent_running = False
+            status.mark_turn_end()
+            _update_status()
+
+    async def handle_input(text: str) -> None:
+        cmd_text = text.lstrip("/") if text.startswith("/") else text
+        cmd_def = resolve_command(cmd_text)
+        if cmd_def is not None:
+            canonical = cmd_def.name
+            if canonical == "exit":
+                app.exit()
+                return
+            if canonical == "help":
+                _show_help(console)
+                return
+            if canonical == "status":
+                await _print_daemon_status()
+                return
+            if canonical == "clear":
+                _render_banner()
+                return
+            if canonical in {"tools", "usage", "model"}:
+                console.system(
+                    f"/{canonical} is not available in daemon mode yet; "
+                    "chat and resume are daemon-backed in this phase."
+                )
+                return
+            console.warning(
+                f"/{canonical} is not available in daemon mode yet. "
+                "Use --no-daemon for legacy in-process commands."
+            )
+            return
+
+        console.rule()
+        await _stream_response(text)
+
+    def _print_exit_summary() -> None:
+        if not active_session_id and exit_stats.message_count == 0:
+            return
+        console.newline()
+        for line in build_exit_summary_lines(
+            session_id=active_session_id,
+            duration_s=exit_stats.duration_s,
+            message_count=exit_stats.message_count,
+            user_messages=exit_stats.user_messages,
+            tool_calls=exit_stats.tool_calls,
+            resumable=True,
+        ):
+            console.print(line)
+
+    app = LeapApp(
+        console=console,
+        theme=theme,
+        status=status,
+        commands=completion_entries(),
+        data_dir=getattr(settings, "data_dir", None),
+        on_input=handle_input,
+    )
+
+    if resume_id:
+        result = await client.session_resume(resume_id)
+        if result.get("found"):
+            active_session_id = str(result.get("session_id") or resume_id)
+            console.success(f"Resumed session {active_session_id}")
+        else:
+            console.warning(f"Session '{resume_id}' not found; starting a new session.")
+            active_session_id = ""
 
     _render_banner()
     _update_status()

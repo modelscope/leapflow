@@ -135,12 +135,12 @@ def test_global_resume_routes_to_interactive(monkeypatch) -> None:
 
     captured = {}
 
-    async def fake_async_main(args):
+    async def fake_daemon_main(args):
         captured["command"] = args.command
         captured["resume"] = args.resume
         return 0
 
-    monkeypatch.setattr(cli, "_async_main", fake_async_main)
+    monkeypatch.setattr(cli, "_async_daemon_main", fake_daemon_main)
 
     assert cli.main(["--resume", "abc123"]) == 0
     assert captured == {"command": "interactive", "resume": "abc123"}
