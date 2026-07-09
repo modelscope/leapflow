@@ -230,18 +230,53 @@ class GatewayServer:
             await self.disconnect_platform(pid)
         self._started = False
 
-    # ── Reply delivery ────────────────────────────────────────
+    # ── Outbound messaging ──────────────────────────────────
+
+    async def send_message(
+        self,
+        platform_id: str,
+        chat_id: str,
+        text: str,
+        *,
+        thread_id: str = "",
+        reply_to_id: str = "",
+    ) -> Dict[str, Any]:
+        """Send a message to any connected platform conversation.
+
+        Public API for the ``gateway_send`` tool and any component that
+        needs proactive outbound messaging.  Unlike ``send_reply``,
+        this does not require a prior inbound ``MessageSource``.
+        """
+        adapter = self._adapters.get(platform_id)
+        if adapter is None:
+            return {"ok": False, "error": f"Platform '{platform_id}' is not connected"}
+        target = SendTarget(
+            platform=platform_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            reply_to_id=reply_to_id,
+        )
+        content = OutboundContent(text=text)
+        try:
+            result = await adapter.send(target, content)
+            return {
+                "ok": result.ok,
+                "message_id": result.message_id,
+                **({"error": result.error} if result.error else {}),
+            }
+        except Exception as exc:
+            from leapflow.security.redact import redact_sensitive_text
+            safe_err = redact_sensitive_text(str(exc), force=True)
+            return {"ok": False, "error": f"Send failed: {safe_err}"}
 
     async def send_reply(
         self,
         source: MessageSource,
         text: str,
-    ) -> Optional["SendResult"]:
+    ) -> Optional[SendResult]:
         """Send a reply back to the originating conversation.
 
-        Public API for ``GatewayRouter`` and any other component that
-        needs to deliver outbound messages.  Returns ``None`` if no
-        adapter is connected for the platform.
+        Convenience wrapper around ``send_message`` for ``GatewayRouter``.
         """
         adapter = self._adapters.get(source.platform)
         if adapter is None:
@@ -256,6 +291,13 @@ class GatewayServer:
         )
         content = OutboundContent(text=text)
         return await adapter.send(target, content)
+
+    def remove_platform_config(self, platform_id: str) -> None:
+        """Remove a platform's saved configuration from disk.
+
+        Public API — avoids callers needing direct ``_config_store`` access.
+        """
+        self._config_store.remove_platform(platform_id)
 
     # ── Message routing ──────────────────────────────────────
 

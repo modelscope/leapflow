@@ -193,6 +193,16 @@ class LeapService(Protocol):
         """Return status of all gateway platforms."""
         ...
 
+    async def gateway_send(
+        self,
+        platform: str,
+        chat_id: str,
+        text: str,
+        thread_id: str = "",
+    ) -> Dict[str, Any]:
+        """Send a message to a connected platform conversation."""
+        ...
+
 
 # ══════════════════════════════════════════════════════════════════════
 # Method registry — maps JSON-RPC method names to LeapService methods
@@ -213,4 +223,5 @@ METHOD_REGISTRY: Dict[str, str] = {
     "gateway.connect": "gateway_connect",
     "gateway.disconnect": "gateway_disconnect",
     "gateway.status": "gateway_status",
+    "gateway.send": "gateway_send",
 }

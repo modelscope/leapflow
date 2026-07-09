@@ -5,6 +5,13 @@ Sits between ``GatewayServer`` (message ingress) and the LLM/tool layer
 history so concurrent conversations on different platforms don't collide
 with each other or the interactive CLI.
 
+Tool support
+~~~~~~~~~~~~
+The router can optionally execute a **restricted** set of safe tools
+(read-only: memory_search, time_get, skills_list, etc.) during inbound
+message processing.  Dangerous tools (shell_run, file_write, delegate_task)
+are excluded by default — configurable via ``allowed_tools``.
+
 Module boundary
 ~~~~~~~~~~~~~~~
 Depends on ``leapflow.llm`` (LLM provider interface) and optionally on
@@ -15,7 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence
 
 from leapflow.gateway.protocol import (
     InboundMessage,
@@ -27,6 +34,14 @@ from leapflow.gateway.protocol import (
 logger = logging.getLogger(__name__)
 
 SendFn = Callable[[MessageSource, str], Coroutine[Any, Any, None]]
+
+SAFE_TOOLS: frozenset[str] = frozenset({
+    "memory_search", "memory_add",
+    "time_get", "env_info",
+    "skills_list", "skill_view",
+    "text_search",
+    "gateway_connect", "gateway_send",
+})
 
 
 class GatewayRouter:
@@ -41,8 +56,17 @@ class GatewayRouter:
     send_fn
         ``async (source, reply_text) -> None`` — called to deliver the
         LLM response back to the originating conversation.
+    tool_definitions
+        OpenAI-format tool schemas.  Filtered to ``allowed_tools`` on init.
+    tool_handlers
+        ``name → async handler`` mapping.  Filtered to ``allowed_tools``.
+    allowed_tools
+        Frozenset of tool names permitted for gateway sessions.
+        Defaults to ``SAFE_TOOLS`` (read-only, no shell/file-write).
     max_history
         Maximum messages retained per session before tail-trimming.
+    max_tool_rounds
+        Maximum number of LLM→tool→LLM rounds before forcing a text reply.
     """
 
     def __init__(
@@ -51,14 +75,28 @@ class GatewayRouter:
         llm: Any,
         system_prompt: str = "",
         send_fn: SendFn,
+        tool_definitions: Sequence[Dict[str, Any]] = (),
+        tool_handlers: Optional[Dict[str, Any]] = None,
+        allowed_tools: frozenset[str] = SAFE_TOOLS,
         max_history: int = 50,
+        max_tool_rounds: int = 3,
     ) -> None:
         self._llm = llm
         self._system_prompt = system_prompt
         self._send_fn = send_fn
         self._max_history = max_history
+        self._max_tool_rounds = max_tool_rounds
         self._sessions: Dict[str, List[Dict[str, Any]]] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
+
+        self._tool_defs = [
+            td for td in tool_definitions
+            if td.get("function", {}).get("name", "") in allowed_tools
+        ]
+        all_handlers = tool_handlers or {}
+        self._tool_handlers = {
+            k: v for k, v in all_handlers.items() if k in allowed_tools
+        }
 
     async def handle_message(
         self,
@@ -88,17 +126,7 @@ class GatewayRouter:
         history.append({"role": "user", "content": message.text})
         self._trim_history(history)
 
-        try:
-            resp = await self._llm.achat(history, stream=False)
-            reply = (resp.content or "").strip()
-        except Exception:
-            logger.error(
-                "LLM call failed for gateway session %s",
-                session_key,
-                exc_info=True,
-            )
-            return
-
+        reply = await self._llm_with_tools(history)
         if not reply:
             return
 
@@ -111,6 +139,56 @@ class GatewayRouter:
                 session_key,
                 exc_info=True,
             )
+
+    async def _llm_with_tools(
+        self,
+        history: List[Dict[str, Any]],
+    ) -> str:
+        """Call LLM with optional tool loop (bounded rounds)."""
+        llm_kwargs: Dict[str, Any] = {}
+        if self._tool_defs:
+            llm_kwargs["tools"] = self._tool_defs
+
+        for _round in range(self._max_tool_rounds + 1):
+            try:
+                resp = await self._llm.achat(history, stream=False, **llm_kwargs)
+            except Exception:
+                logger.error("LLM call failed in gateway router", exc_info=True)
+                return ""
+
+            tool_calls = getattr(resp, "tool_calls", None)
+            if not tool_calls:
+                return (resp.content or "").strip()
+
+            for tc in tool_calls:
+                handler = self._tool_handlers.get(tc.name)
+                if handler is None:
+                    history.append({
+                        "role": "tool",
+                        "tool_call_id": getattr(tc, "id", ""),
+                        "content": f"Unknown tool: {tc.name}",
+                    })
+                    continue
+                try:
+                    tool_args = getattr(tc, "arguments", {})
+                    if isinstance(tool_args, str):
+                        import json
+                        tool_args = json.loads(tool_args)
+                    result = await asyncio.wait_for(handler(tool_args), timeout=30)
+                    result_text = str(result)[:2000]
+                except asyncio.TimeoutError:
+                    result_text = f"Tool '{tc.name}' timed out"
+                except Exception as exc:
+                    result_text = f"Tool error: {type(exc).__name__}"
+
+                history.append({
+                    "role": "tool",
+                    "tool_call_id": getattr(tc, "id", ""),
+                    "content": result_text,
+                })
+
+        logger.warning("Gateway router: max tool rounds exceeded")
+        return ""
 
     def _trim_history(self, history: List[Dict[str, Any]]) -> None:
         """Keep history under budget by discarding oldest non-system messages."""

@@ -1,8 +1,8 @@
-"""Gateway connection management tool for the agent.
+"""Gateway tools for the agent — configuration AND messaging.
 
-Enables conversational platform configuration: users say
-"connect to feishu" and the agent guides them through setup
-in 1–3 conversation turns.
+Two tools:
+- ``gateway_connect``: conversational platform configuration
+- ``gateway_send``: proactive outbound messaging to connected platforms
 
 SECURITY: Tool results NEVER contain credential values.
 Credentials flow: user message → LLM parse → tool handler → vault.
@@ -215,7 +215,7 @@ async def _action_remove(
         return {"ok": False, "error": "Platform ID is required"}
 
     await _gateway_server_ref.disconnect_platform(platform)
-    _gateway_server_ref._config_store.remove_platform(platform)
+    _gateway_server_ref.remove_platform_config(platform)
     return {"ok": True, "status": "removed"}
 
 
@@ -250,10 +250,77 @@ async def _action_status(
 
 
 # ═══════════════════════════════════════════════════════════════
+# gateway_send handler — proactive outbound messaging
+# ═══════════════════════════════════════════════════════════════
+
+async def gateway_send_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle ``gateway_send`` tool calls — send messages to connected platforms.
+
+    Enables the agent to proactively message any connected platform
+    conversation (e.g. post to a Feishu group, reply in a Telegram chat).
+    """
+    if _gateway_server_ref is None:
+        return {"ok": False, "error": "Gateway not initialised"}
+
+    platform = params.get("platform", "")
+    chat_id = params.get("chat_id", "")
+    text = params.get("text", "")
+
+    if not platform:
+        return {"ok": False, "error": "platform is required"}
+    if not chat_id:
+        return {"ok": False, "error": "chat_id is required"}
+    if not text:
+        return {"ok": False, "error": "text is required"}
+
+    return await _gateway_server_ref.send_message(
+        platform,
+        chat_id,
+        text,
+        thread_id=params.get("thread_id", ""),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
 # Tool registration (OpenAI function calling schema)
 # ═══════════════════════════════════════════════════════════════
 
 GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "gateway_send",
+            "description": (
+                "Send a message to a connected external platform "
+                "(Feishu group, Telegram chat, DingTalk conversation, etc.).  "
+                "Requires the platform to be connected via gateway_connect first.  "
+                "Use gateway_connect with action='list' to see connected platforms "
+                "and available chat IDs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "platform": {
+                        "type": "string",
+                        "description": "Platform ID (feishu, telegram, dingtalk, etc.)",
+                    },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Target chat/group/channel ID",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Message text to send",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread/topic ID for threaded replies (optional)",
+                    },
+                },
+                "required": ["platform", "chat_id", "text"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -319,9 +386,22 @@ GATEWAY_BRIDGE_TOOLS: List[Dict[str, Any]] = [
         },
         "handler": gateway_connect_handler,
     },
+    {
+        "name": "gp_gateway_send",
+        "description": "Send a message to a connected external platform.",
+        "parameters": {
+            "platform": "string (required) — platform ID",
+            "chat_id": "string (required) — target chat/group ID",
+            "text": "string (required) — message text",
+            "thread_id": "string (optional) — thread ID for replies",
+        },
+        "handler": gateway_send_handler,
+    },
 ]
 
 GATEWAY_TOOL_HANDLERS: Dict[str, Any] = {
     "gateway_connect": gateway_connect_handler,
     "gp_gateway_connect": gateway_connect_handler,
+    "gateway_send": gateway_send_handler,
+    "gp_gateway_send": gateway_send_handler,
 }

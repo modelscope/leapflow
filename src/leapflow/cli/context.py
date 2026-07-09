@@ -1130,6 +1130,8 @@ class Context:
         async def _gateway_send(source: Any, text: str) -> None:
             await self.gateway_server.send_reply(source, text)
 
+        from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
+
         self._gateway_router = GatewayRouter(
             llm=self.llm,
             system_prompt=(
@@ -1138,6 +1140,8 @@ class Context:
                 "and conversational."
             ),
             send_fn=_gateway_send,
+            tool_definitions=TOOL_DEFINITIONS,
+            tool_handlers=TOOL_HANDLERS,
         )
         self.gateway_server.set_message_handler(
             self._gateway_router.handle_message,

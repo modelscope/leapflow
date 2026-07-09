@@ -442,17 +442,22 @@ LeapFlow can connect to external messaging platforms — **Feishu (Lark)**, **Di
 | **Lazy Loading** | Platform SDK dependencies are imported only when a platform is first connected, keeping CLI startup instant. |
 | **Adapter Protocol** | Platform adapters implement a simple Python `Protocol` — `connect()`, `disconnect()`, `send()`, `on_message` callback — extensible via `PlatformAdapterMixin` for graceful degradation. |
 | **Auto-Reconnect** | Previously configured platforms are automatically reconnected on startup. Connection state persists across sessions via `gateway.yaml`. |
-| **Independent Sessions** | Each external chat gets its own conversation history, isolated from the CLI session and other chats. Messages are routed through a per-session LLM processing loop. |
+| **Bidirectional** | Inbound: platform messages are processed through LLM with safe tool access. Outbound: the agent can proactively send messages via `gateway_send`. |
+| **Independent Sessions** | Each external chat gets its own conversation history with a restricted tool set (read-only), isolated from the CLI session. |
 | **Event-Driven** | Inbound messages are logged to episodic memory and emitted as typed events (`GatewayMessageReceived`, `GatewaySessionCreated`, `GatewaySessionEnded`) for downstream subscribers. |
 
 ### Architecture
 
 ```
-External Platform (Feishu, Telegram, ...)
-        │
-        ▼
-  ┌─────────────┐    ┌──────────────┐    ┌─────────────┐
-  │  Platform    │───▶│  Gateway     │───▶│  Gateway    │───▶ LLM
+                       ┌──────────────────┐
+                       │  CLI Agent       │
+                       │  (AgentEngine)   │
+                       │                  │
+                       │  gateway_send ──▶│──┐
+                       └──────────────────┘  │
+                                             │ send_message()
+  ┌─────────────┐    ┌──────────────┐    ┌───▼─────────┐
+  │  Platform    │───▶│  Gateway     │───▶│  Gateway    │───▶ LLM + safe tools
   │  Adapter     │    │  Server      │    │  Router     │◀─── reply
   │  (Protocol)  │◀───│  (lifecycle) │◀───│  (per-      │
   └─────────────┘    │              │    │   session)  │

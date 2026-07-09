@@ -1854,24 +1854,37 @@ class AgentEngine:
 
         result: Dict[str, Any]
 
-        # Route through ToolBridge when available (single source of truth)
-        if self._tool_bridge is not None:
-            prefixed = f"gp_{name}"
-            result = await self._tool_bridge.dispatch(TC(name=prefixed, params=args))
-            if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
-                return self._post_process_tool_result(name, result)
-            result = await self._tool_bridge.dispatch(TC(name=name, params=args))
-            if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
-                return self._post_process_tool_result(name, result)
-
-        # Fallback: direct handler dispatch
-        handler = handlers.get(name)
-        if handler is None:
-            return {"ok": False, "error": f"Unknown tool: {name}"}
-
         timeout = self._tool_timeouts.get(name, self._default_tool_timeout_s)
         t0 = time.perf_counter()
+
         try:
+            # Route through ToolBridge when available (single source of truth)
+            if self._tool_bridge is not None:
+                prefixed = f"gp_{name}"
+                result = await asyncio.wait_for(
+                    self._tool_bridge.dispatch(TC(name=prefixed, params=args)),
+                    timeout=timeout,
+                )
+                if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
+                    duration = (time.perf_counter() - t0) * 1000
+                    is_ok = not (isinstance(result, dict) and not result.get("ok", True))
+                    self._usage_tracker.record_tool_call(name, is_ok, duration)
+                    return self._post_process_tool_result(name, result)
+                result = await asyncio.wait_for(
+                    self._tool_bridge.dispatch(TC(name=name, params=args)),
+                    timeout=timeout,
+                )
+                if not (isinstance(result, dict) and "unknown_tool" in str(result.get("error", ""))):
+                    duration = (time.perf_counter() - t0) * 1000
+                    is_ok = not (isinstance(result, dict) and not result.get("ok", True))
+                    self._usage_tracker.record_tool_call(name, is_ok, duration)
+                    return self._post_process_tool_result(name, result)
+
+            # Fallback: direct handler dispatch
+            handler = handlers.get(name)
+            if handler is None:
+                return {"ok": False, "error": f"Unknown tool: {name}"}
+
             result = await asyncio.wait_for(handler(args), timeout=timeout)
         except asyncio.TimeoutError:
             duration = (time.perf_counter() - t0) * 1000

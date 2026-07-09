@@ -39,6 +39,7 @@ _TOOL_CATEGORIES: Dict[str, str] = {
     "hub_pull": "hub",
     "hub_search": "hub",
     "gateway_connect": "gateway",
+    "gateway_send": "gateway",
 }
 
 
