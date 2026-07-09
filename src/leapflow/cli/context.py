@@ -50,7 +50,6 @@ from leapflow.learning.codegen import CompositeSkillCodeGenerator, LLMSkillCodeG
 from leapflow.learning.distiller import LLMSkillDistiller, SkillDistiller
 from leapflow.learning.doc_generator import CompositeSkillDocGenerator, LLMSkillDocGenerator
 from leapflow.storage.skill_docs import SkillDocStore
-from leapflow.storage.duckdb_connect import DatabaseLockedError
 from leapflow.storage.connection import LocalConnectionHolder
 from leapflow.learning.feedback import FeedbackEvaluator
 from leapflow.storage.skill_library import SkillLibraryStore
@@ -375,7 +374,10 @@ class Context:
         # Created here (lazy, not yet opened) so __init__-time providers such as
         # SemanticMemoryProvider can bind to it. Eager open + lock detection
         # happens later in initialize().
-        self._db_holder = LocalConnectionHolder(settings.duckdb_path)
+        self._db_holder = LocalConnectionHolder(
+            settings.duckdb_path,
+            volatile_on_lock=True,
+        )
 
         # Memory subsystem — provider-based architecture (dual-layer)
         working = WorkingMemoryProvider(max_tokens=settings.memory_working_max_tokens)
@@ -534,6 +536,11 @@ class Context:
         self._tui_approval = _TUIApprovalGate()
         self._approval_gate = SessionAwareGate(self._tui_approval)
 
+    @property
+    def storage_volatile(self) -> bool:
+        """Return True when this process uses non-persistent fallback storage."""
+        return bool(getattr(self._db_holder, "is_volatile", False))
+
     async def initialize(self) -> None:
         """Async initialization: VSI handshake, pipeline assembly.
 
@@ -545,6 +552,13 @@ class Context:
         settings = self.settings
 
         await self.memory.initialize_all()
+        if self.storage_volatile:
+            _emit_status(
+                "Primary database is locked; running with volatile session storage."
+            )
+            _emit_status(
+                "This window can chat, but new memory/session data will not persist."
+            )
 
         vsi = VirtualSystemInterface(self.rpc)
         bridge_online = False
@@ -607,15 +621,10 @@ class Context:
         if settings.has_llm_credentials:
             codegen = CompositeSkillCodeGenerator(LLMSkillCodeGenerator(self.llm))
 
-        try:
-            # Holder was created in __init__ (lazy); eagerly open now to detect
-            # a cross-instance lock as early as possible.
-            _ = self._db_holder.connection  # eagerly open to detect lock
-        except DatabaseLockedError as exc:
-            logger.error("Database locked: %s", exc)
-            raise SystemExit(
-                f"\n{exc}\n\nHint: close the other instance or wait for it to finish."
-            ) from exc
+        # Holder was created in __init__ and may already have opened during
+        # memory initialization. Access once here to preserve early lock/fallback
+        # detection before persistent stores are assembled.
+        _ = self._db_holder.connection
 
         try:
             traj_store = TrajectoryStore(self._db_holder)

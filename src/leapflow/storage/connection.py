@@ -13,12 +13,16 @@ call ``duckdb.connect()`` themselves.
 from __future__ import annotations
 
 import logging
+import tempfile
 from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
 import duckdb
 
-from leapflow.storage.duckdb_connect import connect as _lock_aware_connect
+from leapflow.storage.duckdb_connect import (
+    DatabaseLockedError,
+    connect as _lock_aware_connect,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,20 +55,46 @@ class LocalConnectionHolder:
     leapd daemon (P4).
     """
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, volatile_on_lock: bool = False) -> None:
         self._db_path = db_path
         self._conn: Optional[duckdb.DuckDBPyConnection] = None
+        self._volatile_on_lock = volatile_on_lock
+        self._volatile_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._locked_error: DatabaseLockedError | None = None
 
     @property
     def db_path(self) -> Path:
         return self._db_path
 
     @property
+    def is_volatile(self) -> bool:
+        return self._volatile_dir is not None
+
+    @property
+    def locked_error(self) -> DatabaseLockedError | None:
+        return self._locked_error
+
+    @property
     def connection(self) -> duckdb.DuckDBPyConnection:
         if self._conn is None:
-            self._conn = _lock_aware_connect(self._db_path)
+            self._conn = self._connect()
             logger.info("duckdb: opened %s", self._db_path.name)
         return self._conn
+
+    def _connect(self) -> duckdb.DuckDBPyConnection:
+        try:
+            return _lock_aware_connect(self._db_path)
+        except DatabaseLockedError as exc:
+            if not self._volatile_on_lock:
+                raise
+            self._locked_error = exc
+            self._volatile_dir = tempfile.TemporaryDirectory(prefix="leapflow-volatile-")
+            self._db_path = Path(self._volatile_dir.name) / "leap.duckdb"
+            logger.warning(
+                "duckdb: primary database locked; using volatile session database at %s",
+                self._db_path,
+            )
+            return _lock_aware_connect(self._db_path)
 
     def close(self) -> None:
         if self._conn is not None:
@@ -74,3 +104,6 @@ class LocalConnectionHolder:
             except Exception:
                 pass
             self._conn = None
+        if self._volatile_dir is not None:
+            self._volatile_dir.cleanup()
+            self._volatile_dir = None

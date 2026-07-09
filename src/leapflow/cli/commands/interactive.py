@@ -63,6 +63,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     io = TerminalIOProvider()
     exit_stats = SessionExitStats()
     active_resume_id = ""
+    storage_volatile = bool(getattr(ctx, "storage_volatile", False))
 
     # ── Session callbacks ────────────────────────────────────────────
 
@@ -169,6 +170,12 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
             mcp_tools=mcp_count,
             gateway_connected=_gateway_connected_names(),
         )
+        if storage_volatile:
+            console.warning(
+                "Primary database is locked by another LeapFlow instance; "
+                "this window is using volatile storage."
+            )
+            console.system("New memory, session history, and learned skills will not persist here.")
 
     def _active_chat_session_id() -> str:
         engine = getattr(ctx, "engine", None)
@@ -210,6 +217,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
             message_count=message_count,
             user_messages=user_messages,
             tool_calls=tool_calls,
+            resumable=not storage_volatile,
         ):
             console.print(line)
 

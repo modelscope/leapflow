@@ -27,6 +27,41 @@ async def test_context_initialize_wires_gateway_approval_gate(tmp_path) -> None:
         await ctx.cleanup()
 
 
+@pytest.mark.asyncio
+async def test_context_initialize_degrades_when_primary_db_is_locked(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from pathlib import Path
+
+    from leapflow.cli.context import Context
+    from leapflow.storage.duckdb_connect import DatabaseLockedError
+    import leapflow.storage.connection as connection_module
+
+    settings = make_settings(str(tmp_path))
+    original_connect = connection_module._lock_aware_connect
+
+    def locked_primary_connect(db_path: Path):
+        if Path(db_path) == settings.duckdb_path:
+            raise DatabaseLockedError(settings.duckdb_path, RuntimeError("locked"))
+        return original_connect(db_path)
+
+    monkeypatch.setattr(
+        connection_module,
+        "_lock_aware_connect",
+        locked_primary_connect,
+    )
+
+    ctx = Context(settings, mock_host=True)
+    await ctx.initialize()
+    try:
+        assert ctx.storage_volatile is True
+        assert ctx.engine is not None
+        assert ctx._db_holder.db_path != settings.duckdb_path
+    finally:
+        await ctx.cleanup()
+
+
 def test_leap_default_command_initializes_and_runs_interactive(monkeypatch) -> None:
     from leapflow.cli import cli
     import leapflow.cli.commands.interactive as interactive_module

@@ -76,6 +76,26 @@ def test_empty_session_summary_degrades_to_goodbye() -> None:
     ) == ["Goodbye!"]
 
 
+def test_volatile_session_summary_does_not_offer_resume() -> None:
+    lines = build_exit_summary_lines(
+        session_id="volatile123",
+        duration_s=5,
+        message_count=2,
+        user_messages=1,
+        tool_calls=0,
+        resumable=False,
+    )
+
+    assert lines == [
+        "Session not saved:",
+        "  This window used volatile storage because the primary database was locked.",
+        "",
+        "Session:        volatile123",
+        "Duration:       5s",
+        "Messages:       2 (1 user, 0 tool calls)",
+    ]
+
+
 def test_summarize_messages_counts_tool_call_shapes() -> None:
     total, users, tools = summarize_messages([
         _Message("user"),

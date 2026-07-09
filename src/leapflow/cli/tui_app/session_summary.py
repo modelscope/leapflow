@@ -76,20 +76,32 @@ def build_exit_summary_lines(
     user_messages: int,
     tool_calls: int,
     resume_command: str = "leap --resume",
+    resumable: bool = True,
 ) -> list[str]:
     """Build Hermes-style TUI exit summary lines."""
     normalized_session_id = session_id.strip()
     if not normalized_session_id:
         return ["Goodbye!"]
 
-    return [
-        "Resume this session with:",
-        f"  {resume_command} {normalized_session_id}",
-        "",
+    stats = [
         f"Session:        {normalized_session_id}",
         f"Duration:       {format_duration(duration_s)}",
         (
             f"Messages:       {message_count} "
             f"({user_messages} user, {tool_calls} tool calls)"
         ),
+    ]
+    if not resumable:
+        return [
+            "Session not saved:",
+            "  This window used volatile storage because the primary database was locked.",
+            "",
+            *stats,
+        ]
+
+    return [
+        "Resume this session with:",
+        f"  {resume_command} {normalized_session_id}",
+        "",
+        *stats,
     ]
