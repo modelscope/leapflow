@@ -40,11 +40,19 @@ class _FailingStreamService(_FakeService):
         raise RuntimeError("stream exploded")
 
 
-async def _start_server(run_dir: Path, service=None):
+class _SlowFirstChunkService(_FakeService):
+    async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+        await asyncio.sleep(0.08)
+        yield StreamChunk(request_id="", content=f"slow {message}", event_type="chunk")
+        yield StreamChunk(request_id="", content="done", event_type="final")
+
+
+async def _start_server(run_dir: Path, service=None, *, stream_heartbeat_s: float | None = None):
     server = UnixRpcServer(
         service or _FakeService(),
         sock_path=run_dir / "leapd.sock",
         run_dir=run_dir,
+        stream_heartbeat_s=stream_heartbeat_s,
     )
     task = asyncio.create_task(server.serve_forever())
     for _ in range(50):
@@ -76,6 +84,34 @@ async def test_daemon_client_receives_stream_events() -> None:
         ("final", "done"),
     ]
     assert events[0].metadata == {"session_id": "sess-1"}
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_stream_heartbeat_prevents_idle_timeout() -> None:
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        server, task, run_dir = await _start_server(
+            Path(root) / "run",
+            service=_SlowFirstChunkService(),
+            stream_heartbeat_s=0.01,
+        )
+        client = DaemonClient(run_dir / "leapd.sock", timeout_s=0.03)
+
+        try:
+            events = [event async for event in client.engine_chat("world")]
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    heartbeat_events = [event for event in events if event.metadata == {"heartbeat": True}]
+    assert heartbeat_events
+    assert [(event.type, event.content) for event in events[-2:]] == [
+        ("chunk", "slow world"),
+        ("final", "done"),
+    ]
 
 
 @pytest.mark.asyncio

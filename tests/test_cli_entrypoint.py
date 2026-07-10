@@ -433,6 +433,51 @@ def test_leap_daemon_restart_routes_to_daemon_command(monkeypatch) -> None:
     assert captured == {"action": "restart"}
 
 
+def test_stdin_echo_guard_restores_and_flushes_tty(monkeypatch) -> None:
+    from leapflow.cli import cli
+
+    calls = []
+
+    class FakeStdin:
+        def isatty(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return 7
+
+    class FakeTermios:
+        ECHO = 8
+        TCSADRAIN = 1
+        TCIFLUSH = 2
+        error = OSError
+
+        @staticmethod
+        def tcgetattr(fd):
+            calls.append(("get", fd))
+            return [0, 0, 0, 15]
+
+        @staticmethod
+        def tcsetattr(fd, when, attrs):
+            calls.append(("set", fd, when, attrs[3]))
+
+        @staticmethod
+        def tcflush(fd, queue):
+            calls.append(("flush", fd, queue))
+
+    monkeypatch.setattr(cli.sys, "stdin", FakeStdin())
+    monkeypatch.setattr(cli, "termios", FakeTermios)
+
+    with cli._StdinEchoGuard():
+        pass
+
+    assert calls == [
+        ("get", 7),
+        ("set", 7, FakeTermios.TCSADRAIN, 7),
+        ("set", 7, FakeTermios.TCSADRAIN, 15),
+        ("flush", 7, FakeTermios.TCIFLUSH),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_daemon_tui_exit_prompt_stops_by_default(monkeypatch, tmp_path) -> None:
     from leapflow.cli.commands import interactive as interactive_module

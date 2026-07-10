@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -50,6 +49,11 @@ from prompt_toolkit.widgets import TextArea
 
 from leapflow.cli.tui_app.command import TuiCommand
 from leapflow.cli.tui_app.input import build_completer
+from leapflow.cli.tui_app.paste import (
+    PASTE_FRAGMENT_WINDOW_S,
+    PasteHeuristics,
+    PasteStore,
+)
 from leapflow.cli.tui_app.status import StatusBar
 from leapflow.cli.tui_app.theme import Theme
 
@@ -58,19 +62,9 @@ if TYPE_CHECKING:
 
 _HISTORY_FILENAME = "history"
 _REFRESH_INTERVAL_S = 0.5
-_LARGE_PASTE_CHAR_THRESHOLD = 4_000
-_LARGE_PASTE_LINE_THRESHOLD = 24
 _PASTE_COMPACTOR_ATTR = "_leapflow_paste_compactor_installed"
 
 InputHandler = Callable[[str], Union[Awaitable[None], None]]
-
-
-@dataclass(frozen=True)
-class _PasteBlock:
-    """Full pasted content stored outside the prompt buffer."""
-
-    marker: str
-    text: str
 
 
 class LeapApp:
@@ -105,8 +99,13 @@ class LeapApp:
         self._spinner_text = ""
         self._tool_start_time: float = 0.0
         self._next_command_id = 1
-        self._next_paste_id = 1
-        self._paste_blocks: dict[str, _PasteBlock] = {}
+        self._paste_heuristics = PasteHeuristics()
+        self._paste_store = PasteStore(self._paste_heuristics)
+        self._paste_blocks = self._paste_store.blocks
+        self._paste_fragment_text = ""
+        self._paste_fragment_start_cursor = 0
+        self._paste_fragment_last_at = 0.0
+        self._active_fragment_marker: Optional[str] = None
         self._active_command: Optional[TuiCommand] = None
         self._pending_input: asyncio.Queue[TuiCommand] = asyncio.Queue()
 
@@ -165,39 +164,48 @@ class LeapApp:
 
     def _should_compact_paste(self, text: str) -> bool:
         """Return True when rendering pasted text directly would hurt TUI responsiveness."""
-        if len(text) >= _LARGE_PASTE_CHAR_THRESHOLD:
-            return True
-        return text.count("\n") + 1 >= _LARGE_PASTE_LINE_THRESHOLD
-
-    def _compact_tokens(self, text: str) -> str:
-        size = len(text)
-        if size < 1_000:
-            return f"{size} chars"
-        if size < 1_000_000:
-            return f"{size / 1000:.1f}K chars"
-        return f"{size / 1_000_000:.1f}M chars"
+        return self._paste_heuristics.should_compact_block(text)
 
     def _paste_marker(self, text: str) -> str:
-        paste_id = self._next_paste_id
-        self._next_paste_id += 1
-        line_count = text.count("\n") + 1
-        marker = (
-            f"[pasted block #{paste_id}: {self._compact_tokens(text)}, "
-            f"{line_count} lines; full text will be submitted]"
-        )
-        self._paste_blocks[marker] = _PasteBlock(marker=marker, text=text)
-        return marker
+        """Create a safe visible marker while keeping full text in the side channel."""
+        return self._paste_store.create_marker(text)
 
     def _resolve_paste_blocks(self, text: str) -> str:
         """Replace compact paste markers with the original full pasted content."""
-        if not self._paste_blocks:
-            return text
-        resolved = text
-        for marker, block in self._paste_blocks.items():
-            if marker in resolved:
-                resolved = resolved.replace(marker, block.text)
-        self._paste_blocks.clear()
-        return resolved
+        return self._paste_store.resolve(text)
+
+    def _clear_paste_state(self) -> None:
+        """Clear both side-channel paste blocks and in-flight fragment state."""
+        self._paste_store.clear()
+        self._reset_paste_fragment_window()
+
+    def _reset_paste_fragment_window(self) -> None:
+        """Forget pending fragmented paste detection state."""
+        self._paste_fragment_text = ""
+        self._paste_fragment_start_cursor = 0
+        self._paste_fragment_last_at = 0.0
+        self._active_fragment_marker = None
+
+    def _fragment_continues(self, now: float) -> bool:
+        """Return True when an insert arrives inside the paste-fragment window."""
+        if self._paste_fragment_last_at <= 0:
+            return False
+        return now - self._paste_fragment_last_at <= PASTE_FRAGMENT_WINDOW_S
+
+    def _replace_fragment_with_marker(self, buffer: Any, marker: str) -> bool:
+        """Replace already-rendered fragmented paste text with a safe marker."""
+        start = self._paste_fragment_start_cursor
+        fragment = self._paste_fragment_text
+        end = start + len(fragment)
+        try:
+            current = buffer.text
+            if current[start:end] != fragment:
+                return False
+            buffer.text = f"{current[:start]}{marker}{current[end:]}"
+            buffer.cursor_position = start + len(marker)
+            return True
+        except (AttributeError, TypeError, ValueError):
+            return False
 
     def _insert_paste_text(self, buffer: Any, text: str) -> None:
         """Insert pasted text, compacting large blocks to keep terminal rendering smooth."""
@@ -205,26 +213,81 @@ class LeapApp:
             return
         if self._should_compact_paste(text):
             buffer.insert_text(self._paste_marker(text))
+            self._reset_paste_fragment_window()
             self._invalidate()
             return
         buffer.insert_text(text)
 
     def _install_paste_compactor(self, buffer: Any) -> None:
-        """Compact bulk Buffer inserts even when paste bypasses key bindings."""
+        """Compact bulk and fragmented Buffer inserts before they hurt rendering."""
         if getattr(buffer, _PASTE_COMPACTOR_ATTR, False):
             return
         original_insert_text = buffer.insert_text
         ref = self
 
         def insert_text(text: str, *args: Any, **kwargs: Any) -> None:
-            if isinstance(text, str) and ref._should_compact_paste(text):
-                original_insert_text(ref._paste_marker(text), *args, **kwargs)
+            if not isinstance(text, str) or not text:
+                original_insert_text(text, *args, **kwargs)
+                return
+
+            now = time.monotonic()
+            if ref._active_fragment_marker and ref._fragment_continues(now):
+                ref._paste_store.append_to_marker(ref._active_fragment_marker, text)
+                ref._paste_fragment_last_at = now
                 ref._invalidate()
                 return
+            if not ref._fragment_continues(now):
+                ref._reset_paste_fragment_window()
+
+            if ref._should_compact_paste(text):
+                original_insert_text(ref._paste_marker(text), *args, **kwargs)
+                ref._paste_fragment_last_at = now
+                ref._invalidate()
+                return
+
+            if not ref._paste_fragment_text:
+                ref._paste_fragment_start_cursor = int(getattr(buffer, "cursor_position", 0))
             original_insert_text(text, *args, **kwargs)
+            ref._paste_fragment_text += text
+            ref._paste_fragment_last_at = now
+
+            if ref._paste_heuristics.should_compact_fragment_window(ref._paste_fragment_text):
+                marker = ref._paste_marker(ref._paste_fragment_text)
+                if ref._replace_fragment_with_marker(buffer, marker):
+                    ref._paste_fragment_text = ""
+                    ref._active_fragment_marker = marker
+                    ref._paste_fragment_last_at = now
+                    ref._invalidate()
 
         buffer.insert_text = insert_text
         setattr(buffer, _PASTE_COMPACTOR_ATTR, True)
+
+    def _accept_auto_suggestion(self, buffer: Any) -> bool:
+        """Accept the visible auto-suggestion when one is available."""
+        suggestion = getattr(buffer, "suggestion", None)
+        suggestion_text = getattr(suggestion, "text", "") if suggestion else ""
+        if not suggestion_text:
+            return False
+        buffer.insert_text(suggestion_text)
+        return True
+
+    def _accept_or_start_completion(self, buffer: Any) -> None:
+        """Accept the selected completion or open/cycle completion candidates."""
+        complete_state = getattr(buffer, "complete_state", None)
+        current_completion = getattr(complete_state, "current_completion", None)
+        if current_completion is not None:
+            buffer.apply_completion(current_completion)
+            return
+        if self._accept_auto_suggestion(buffer):
+            return
+        buffer.complete_next()
+
+    def _move_right_or_accept_suggestion(self, buffer: Any) -> None:
+        """Keep normal Right-arrow movement while accepting visible suggestions at EOL."""
+        if getattr(buffer, "cursor_position", 0) >= len(getattr(buffer, "text", "")):
+            if self._accept_auto_suggestion(buffer):
+                return
+        buffer.cursor_right()
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
@@ -365,13 +428,22 @@ class LeapApp:
             text = event.app.current_buffer.text.strip()
             if not text:
                 return
-            has_compacted_paste = bool(ref._paste_blocks)
+            has_compacted_paste = ref._paste_store.has_blocks
             ref.submit_text(text)
             event.app.current_buffer.reset(append_to_history=not has_compacted_paste)
+            ref._reset_paste_fragment_window()
 
         @kb.add(Keys.Escape, Keys.Enter)
         def _(event):
             event.current_buffer.insert_text("\n")
+
+        @kb.add(Keys.Tab)
+        def _(event):
+            ref._accept_or_start_completion(event.current_buffer)
+
+        @kb.add(Keys.Right)
+        def _(event):
+            ref._move_right_or_accept_suggestion(event.current_buffer)
 
         @kb.add(Keys.BracketedPaste)
         def _(event):
@@ -386,7 +458,7 @@ class LeapApp:
         def _(event):
             if event.current_buffer.text:
                 event.current_buffer.reset()
-                ref._paste_blocks.clear()
+                ref._clear_paste_state()
                 return
             if ref._agent_running:
                 ref._console.system(

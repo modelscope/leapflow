@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import signal
 from collections.abc import Callable
 from pathlib import Path
@@ -14,14 +15,32 @@ from leapflow.daemon.protocol import ErrorCode, METHOD_REGISTRY, RpcRequest, Rpc
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_STREAM_HEARTBEAT_S = 10.0
+
+
+def _stream_heartbeat_interval() -> float:
+    raw = os.getenv("LEAPFLOW_DAEMON_STREAM_HEARTBEAT", str(_DEFAULT_STREAM_HEARTBEAT_S)).strip()
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return _DEFAULT_STREAM_HEARTBEAT_S
+
 
 class UnixRpcServer:
     """Newline-delimited JSON-RPC server bound to one Unix socket."""
 
-    def __init__(self, service: Any, *, sock_path: Path, run_dir: Path) -> None:
+    def __init__(
+        self,
+        service: Any,
+        *,
+        sock_path: Path,
+        run_dir: Path,
+        stream_heartbeat_s: float | None = None,
+    ) -> None:
         self._service = service
         self._sock_path = sock_path
         self._run_dir = run_dir
+        self._stream_heartbeat_s = stream_heartbeat_s or _stream_heartbeat_interval()
         self._server: asyncio.AbstractServer | None = None
         self._active_connections = 0
         if hasattr(service, "set_client_count_provider"):
@@ -135,8 +154,21 @@ class UnixRpcServer:
         params: dict[str, Any],
         writer: asyncio.StreamWriter,
     ) -> None:
+        stream = None
+        pending: asyncio.Task | None = None
         try:
-            async for chunk in method(**params):
+            stream = method(**params)
+            pending = asyncio.create_task(anext(stream))
+            while True:
+                done, _ = await asyncio.wait({pending}, timeout=self._stream_heartbeat_s)
+                if not done:
+                    await self._write_stream_heartbeat(request.id, writer)
+                    continue
+                try:
+                    chunk = pending.result()
+                except StopAsyncIteration:
+                    pending = None
+                    break
                 notification = StreamChunk(
                     request_id=request.id,
                     content=chunk.content,
@@ -145,7 +177,15 @@ class UnixRpcServer:
                     metadata=chunk.metadata,
                 ).to_notification()
                 await _write_json(writer, notification.to_json())
+                pending = asyncio.create_task(anext(stream))
         except Exception as exc:
+            if pending is not None and not pending.done():
+                pending.cancel()
+            if stream is not None and hasattr(stream, "aclose"):
+                try:
+                    await stream.aclose()
+                except Exception:
+                    logger.debug("daemon: failed to close stream after error", exc_info=True)
             logger.exception("daemon: stream failed method=%s", request.method)
             response = RpcResponse.fail(
                 request.id,
@@ -160,6 +200,19 @@ class UnixRpcServer:
         await _write_json(writer, done.to_json())
         response = RpcResponse.success(request.id, {"ok": True})
         await _write_json(writer, response.to_json())
+
+    async def _write_stream_heartbeat(
+        self,
+        request_id: str,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        notification = StreamChunk(
+            request_id=request_id,
+            content="Still working...",
+            event_type="status",
+            metadata={"heartbeat": True},
+        ).to_notification()
+        await _write_json(writer, notification.to_json())
 
 
 async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:

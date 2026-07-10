@@ -5,6 +5,9 @@ from contextlib import suppress
 
 import pytest
 
+import leapflow.cli.tui_app.app as app_module
+from prompt_toolkit.auto_suggest import Suggestion
+from prompt_toolkit.completion import Completion
 from leapflow.cli.tui_app.app import LeapApp
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
 from leapflow.cli.tui_app.theme import _LIGHT, resolve_theme
@@ -81,6 +84,53 @@ def test_submit_text_rejects_empty_commands() -> None:
     assert app._pending_input.qsize() == 0
     assert console.cards == []
     assert status.counts == []
+
+
+def test_tab_accepts_selected_completion() -> None:
+    app, _console, _status = _make_app()
+    buffer = app._input_area.buffer
+    buffer.text = "/he"
+    buffer.cursor_position = len(buffer.text)
+    completion = Completion("/help", start_position=-len(buffer.text))
+    buffer._set_completions([completion])
+
+    app._accept_or_start_completion(buffer)
+
+    assert buffer.text == "/help"
+    assert buffer.cursor_position == len("/help")
+
+
+@pytest.mark.asyncio
+async def test_tab_accepts_visible_auto_suggestion() -> None:
+    app, _console, _status = _make_app()
+    buffer = app._input_area.buffer
+    buffer.text = "你能"
+    buffer.cursor_position = len(buffer.text)
+    buffer.suggestion = Suggestion("帮我找一找 hub 上有啥 skill 么？")
+
+    app._accept_or_start_completion(buffer)
+
+    assert buffer.text == "你能帮我找一找 hub 上有啥 skill 么？"
+
+
+@pytest.mark.asyncio
+async def test_right_arrow_accepts_suggestion_only_at_end() -> None:
+    app, _console, _status = _make_app()
+    buffer = app._input_area.buffer
+    buffer.text = "abc"
+    buffer.cursor_position = 1
+    buffer.suggestion = Suggestion("def")
+
+    app._move_right_or_accept_suggestion(buffer)
+
+    assert buffer.text == "abc"
+    assert buffer.cursor_position == 2
+
+    buffer.cursor_position = len(buffer.text)
+    app._move_right_or_accept_suggestion(buffer)
+
+    assert buffer.text == "abcdef"
+    assert buffer.cursor_position == len("abcdef")
 
 
 @pytest.mark.asyncio
@@ -175,6 +225,76 @@ async def test_buffer_insert_compacts_large_chinese_paste_with_ascii_marker() ->
     assert visible.isascii()
     assert len(visible) < 120
     assert app.submit_text(visible).text == pasted.strip()
+
+
+@pytest.mark.asyncio
+async def test_fragmented_chinese_paste_compacts_and_submits_full_text() -> None:
+    app, _console, _status = _make_app()
+    pasted = "经济活动达到最低点，经济增长理论，索洛增长模型。" * 80
+
+    for index in range(0, len(pasted), 18):
+        app._input_area.buffer.insert_text(pasted[index:index + 18])
+
+    visible = app._input_area.buffer.text
+    assert pasted not in visible
+    assert "经济活动" not in visible
+    assert visible.startswith("[pasted block #1:")
+    assert visible.isascii()
+    assert len(visible) < 120
+    assert app.submit_text(visible).text == pasted.strip()
+
+
+@pytest.mark.asyncio
+async def test_fragmented_english_single_line_paste_compacts() -> None:
+    app, _console, _status = _make_app()
+    pasted = "capital accumulation and productivity growth " * 80
+
+    for index in range(0, len(pasted), 16):
+        app._input_area.buffer.insert_text(pasted[index:index + 16])
+
+    visible = app._input_area.buffer.text
+    assert pasted not in visible
+    assert visible.startswith("[pasted block #1:")
+    assert visible.isascii()
+    assert app.submit_text(visible).text == pasted.strip()
+
+
+@pytest.mark.asyncio
+async def test_control_character_paste_is_compacted_and_sanitized() -> None:
+    app, _console, _status = _make_app()
+    pasted = "normal\rtext\x1b[31mred\x1b[0m\x00tail\u202edone"
+
+    app._input_area.buffer.insert_text(pasted)
+
+    visible = app._input_area.buffer.text
+    assert visible.startswith("[pasted block #1:")
+    assert visible.isascii()
+    assert "\x1b" not in visible
+    command = app.submit_text(visible)
+    assert command.text == "normal\ntextredtaildone"
+
+
+@pytest.mark.asyncio
+async def test_fragmented_paste_window_expiry_keeps_followup_typing_visible(monkeypatch) -> None:
+    app, _console, _status = _make_app()
+    clock = 100.0
+
+    def fake_monotonic() -> float:
+        return clock
+
+    monkeypatch.setattr(app_module.time, "monotonic", fake_monotonic)
+    pasted = "fragmented paste " * 80
+    for index in range(0, len(pasted), 20):
+        app._input_area.buffer.insert_text(pasted[index:index + 20])
+
+    visible = app._input_area.buffer.text
+    assert visible.startswith("[pasted block #1:")
+
+    clock = 101.0
+    app._input_area.buffer.insert_text(" follow-up")
+
+    assert app._input_area.buffer.text == f"{visible} follow-up"
+    assert app.submit_text(app._input_area.buffer.text).text == f"{pasted} follow-up".strip()
 
 
 def test_small_paste_stays_inline() -> None:

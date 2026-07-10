@@ -687,7 +687,8 @@ async def cmd_interactive_daemon(
                 elif event.type == "error":
                     renderer.feed(event.content)
                 elif event.type == "status":
-                    console.system(event.content)
+                    if not metadata.get("heartbeat"):
+                        console.system(event.content)
         finally:
             renderer.finish()
             if renderer.has_output:
