@@ -13,12 +13,74 @@ accumulated response is rendered as Rich Markdown.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 
 _FINAL_RESPONSE_INDENT_SPACES = 4
 _FINAL_RESPONSE_MARGIN_TOP = 1
+_TOOL_DETAIL_LIMIT = 180
+
+
+def _metadata_text(metadata: dict[str, Any] | None, key: str) -> str:
+    if not metadata:
+        return ""
+    value = metadata.get(key)
+    return value if isinstance(value, str) else ("" if value is None else str(value))
+
+
+def _truncate_detail(text: str, *, limit: int = _TOOL_DETAIL_LIMIT) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1] + "…"
+
+
+def _tool_action_detail(metadata: dict[str, Any] | None) -> str:
+    if not metadata:
+        return ""
+    command = _metadata_text(metadata, "command") or _metadata_text(metadata, "cmd")
+    if command:
+        return f"$ {_truncate_detail(command)}"
+    path = _metadata_text(metadata, "path")
+    pattern = _metadata_text(metadata, "pattern")
+    if path and pattern:
+        return f"path={_truncate_detail(path)} pattern={_truncate_detail(pattern, limit=80)}"
+    if path:
+        return f"path={_truncate_detail(path)}"
+    query = _metadata_text(metadata, "query")
+    if query:
+        return f"query={_truncate_detail(query)}"
+    url = _metadata_text(metadata, "url")
+    if url:
+        return f"url={_truncate_detail(url)}"
+    return _truncate_detail(_metadata_text(metadata, "args_summary"))
+
+
+def _tool_result_detail(metadata: dict[str, Any] | None) -> str:
+    if not metadata:
+        return ""
+    if metadata.get("ok") is False:
+        exit_code = metadata.get("exit_code")
+        prefix = f"exit={exit_code} " if exit_code is not None else ""
+        detail = (
+            _metadata_text(metadata, "stderr_preview")
+            or _metadata_text(metadata, "error_preview")
+            or _metadata_text(metadata, "result_preview")
+        )
+        return _truncate_detail(prefix + detail) if detail or prefix else "failed"
+    detail = (
+        _metadata_text(metadata, "stdout_preview")
+        or _metadata_text(metadata, "content_preview")
+        or _metadata_text(metadata, "output_preview")
+        or _metadata_text(metadata, "result_preview")
+    )
+    if detail:
+        return _truncate_detail(detail)
+    if metadata.get("path"):
+        return f"path={_truncate_detail(str(metadata['path']))}"
+    return "ok (no output)"
+
 
 if TYPE_CHECKING:
     from leapflow.cli.tui_app.console import LeapConsole
@@ -93,22 +155,40 @@ class StreamRenderer:
         """Append a thinking/reasoning chunk."""
         self._thinking_buffer += chunk
 
-    def tool_started(self, name: str) -> str:
+    def tool_started(self, name: str, metadata: dict[str, Any] | None = None) -> str:
         """Mark a tool call as started. Returns spinner text for LeapApp."""
         self._active_tool = name
         self._tool_start_time = time.monotonic()
+        detail = _tool_action_detail(metadata)
+        line = Text()
+        line.append("  ⚡ ", style="leap.accent")
+        line.append(name, style="bold")
+        if detail:
+            line.append("  ", style="dim")
+            line.append(detail, style="leap.dim")
+        self._console.print(line)
         return f"⚡ {name}"
 
-    def tool_finished(self, name: str = "", output: str = "") -> None:
+    def tool_finished(
+        self,
+        name: str = "",
+        output: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Mark a tool call as finished; print completion line immediately."""
         tool_name = name or self._active_tool
         if tool_name and self._tool_start_time > 0:
             duration = time.monotonic() - self._tool_start_time
             self._tool_history.append((tool_name, duration))
+            ok = metadata.get("ok", True) if metadata else True
             line = Text()
-            line.append("  ✓ ", style="leap.success")
+            line.append("  ✓ " if ok else "  ✗ ", style="leap.success" if ok else "leap.error")
             line.append(tool_name, style="bold")
             line.append(f"  {_format_elapsed(duration)}", style="dim")
+            detail = _tool_result_detail(metadata) or _truncate_detail(output)
+            if detail:
+                line.append("  ", style="dim")
+                line.append(detail, style="leap.dim" if ok else "leap.error")
             self._console.print(line)
         self._active_tool = ""
         self._tool_start_time = 0.0

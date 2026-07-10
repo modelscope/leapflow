@@ -117,6 +117,22 @@ class DaemonClient:
         result = await self.request("host.restart")
         return dict(result or {})
 
+    async def tools_list(self) -> dict[str, Any]:
+        """Return daemon-owned tool summary for slash-command rendering."""
+        result = await self.request("tools.list")
+        return dict(result or {})
+
+    async def usage_summary(self) -> dict[str, Any]:
+        """Return token usage for the daemon-owned session."""
+        result = await self.request("usage.summary")
+        return dict(result or {})
+
+    async def model_info(self, model_name: str = "") -> dict[str, Any]:
+        """Return daemon-owned model information."""
+        params = {"model_name": model_name} if model_name else {}
+        result = await self.request("model.info", params)
+        return dict(result or {})
+
     async def approval_status(self) -> dict[str, Any]:
         """Return pending daemon approval requests."""
         result = await self.request("approval.status")

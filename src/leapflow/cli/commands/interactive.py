@@ -220,7 +220,8 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     )
     from leapflow.cli.tui_app.status import StatusBar
     from leapflow.cli.banner import display_rich_banner
-    from leapflow.cli.commands.registry import completion_entries, resolve_command
+    from leapflow.cli.commands.registry import completion_entries
+    from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
         handle_status,
         handle_tools,
@@ -238,6 +239,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     status = StatusBar(theme)
     io = TerminalIOProvider()
     exit_stats = SessionExitStats()
+    command_router = CommandRouter("in_process")
     active_resume_id = ""
     storage_volatile = bool(getattr(ctx, "storage_volatile", False))
 
@@ -407,9 +409,12 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                     elif event.type == "thinking":
                         renderer.feed_thinking(event.content)
                     elif event.type == "tool_start":
-                        app.spinner_text = renderer.tool_started(event.content)
+                        app.spinner_text = renderer.tool_started(
+                            event.content,
+                            metadata=event.metadata or {},
+                        )
                     elif event.type == "tool_complete":
-                        renderer.tool_finished(event.content)
+                        renderer.tool_finished(event.content, metadata=event.metadata or {})
                         app.spinner_text = "Thinking…"
                     elif event.type == "final":
                         if not renderer.text:
@@ -470,11 +475,16 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         console.rule()
 
         # ── Slash command dispatch ──
-        cmd_text = text.lstrip("/") if text.startswith("/") else text
-        cmd_def = resolve_command(cmd_text)
-        if cmd_def is not None:
+        invocation = command_router.parse(text)
+        if invocation is not None:
+            unsupported = command_router.unsupported_result(invocation)
+            if unsupported is not None:
+                render_command_result(console, unsupported)
+                return
+            cmd_text = invocation.text
+            cmd_def = invocation.command
             canonical = cmd_def.name
-            cmd_args = cmd_text[len(canonical):].strip()
+            cmd_args = invocation.args
 
             if canonical == "exit":
                 if ctx.session and ctx.session.mode == SessionMode.LEARNING:
@@ -489,7 +499,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 return
 
             if canonical == "help":
-                _show_help(console)
+                _show_help(console, runtime="in_process")
                 return
 
             if canonical == "status":
@@ -695,7 +705,13 @@ async def cmd_interactive_daemon(
 ) -> int:
     """Persistent REPL backed by leapd thin-client RPC."""
     from leapflow.cli.banner import display_rich_banner
-    from leapflow.cli.commands.registry import completion_entries, resolve_command
+    from leapflow.cli.commands.registry import completion_entries
+    from leapflow.cli.commands.router import CommandRouter, render_command_result
+    from leapflow.cli.commands.slash_handlers import (
+        render_model_payload,
+        render_tools_payload,
+        render_usage_payload,
+    )
     from leapflow.cli.tui_app import (
         LeapApp,
         LeapConsole,
@@ -712,6 +728,7 @@ async def cmd_interactive_daemon(
     console = LeapConsole(theme)
     status = StatusBar(theme)
     exit_stats = SessionExitStats()
+    command_router = CommandRouter("daemon")
     active_session_id = str(resume_id or "")
     turn_count = 0
     runtime_model_name = str(getattr(settings, "llm_model", ""))
@@ -895,9 +912,12 @@ async def cmd_interactive_daemon(
                 elif event.type == "thinking":
                     renderer.feed_thinking(event.content)
                 elif event.type == "tool_start":
-                    app.spinner_text = renderer.tool_started(event.content)
+                    app.spinner_text = renderer.tool_started(
+                        event.content,
+                        metadata=metadata,
+                    )
                 elif event.type == "tool_complete":
-                    renderer.tool_finished(event.content)
+                    renderer.tool_finished(event.content, metadata=metadata)
                     app.spinner_text = "Thinking…"
                 elif event.type == "final":
                     if not renderer.text:
@@ -940,21 +960,25 @@ async def cmd_interactive_daemon(
             await _stream_response(prompt_text, allow_retry=False, record_user=False)
 
     async def handle_input(text: str) -> None:
-        cmd_text = text.lstrip("/") if text.startswith("/") else text
-        cmd_def = resolve_command(cmd_text)
-        if cmd_def is not None:
-            canonical = cmd_def.name
+        invocation = command_router.parse(text)
+        if invocation is not None:
+            unsupported = command_router.unsupported_result(invocation)
+            if unsupported is not None:
+                render_command_result(console, unsupported)
+                return
+            canonical = invocation.command.name
+            cmd_args = invocation.args
             if canonical == "exit":
                 app.exit()
                 return
             if canonical == "help":
-                _show_help(console)
+                _show_help(console, runtime="daemon")
                 return
             if canonical == "status":
                 await _print_daemon_status()
                 return
             if canonical == "host":
-                action = _host_action(cmd_text[len(canonical):].strip())
+                action = _host_action(cmd_args)
                 try:
                     if action == "status":
                         result = await bridge.call(
@@ -992,11 +1016,45 @@ async def cmd_interactive_daemon(
             if canonical == "clear":
                 _render_banner()
                 return
-            if canonical in {"tools", "usage", "model"}:
-                console.system(
-                    f"/{canonical} is not available in daemon mode yet; "
-                    "chat and resume are daemon-backed in this phase."
-                )
+            if canonical == "tools":
+                try:
+                    payload = await bridge.call(
+                        lambda current_client: current_client.tools_list(),
+                        description="tools list",
+                    )
+                except Exception as exc:
+                    console.warning(f"Tools unavailable: {exc}")
+                    return
+                render_tools_payload(console, payload)
+                return
+            if canonical == "usage":
+                try:
+                    payload = await bridge.call(
+                        lambda current_client: current_client.usage_summary(),
+                        description="usage summary",
+                    )
+                except Exception as exc:
+                    console.warning(f"Usage unavailable: {exc}")
+                    return
+                render_usage_payload(console, payload)
+                return
+            if canonical == "model":
+                try:
+                    payload = await bridge.call(
+                        lambda current_client: current_client.model_info(cmd_args),
+                        description="model info",
+                    )
+                except Exception as exc:
+                    console.warning(f"Model info unavailable: {exc}")
+                    return
+                render_model_payload(console, payload)
+                return
+            if canonical == "run":
+                if not cmd_args:
+                    console.warning("Usage: /run <trigger>")
+                    return
+                console.system("Running through daemon chat stream; approvals and host state stay visible.")
+                await _stream_response(cmd_args)
                 return
             console.warning(
                 f"/{canonical} is not available in daemon mode yet. "
@@ -1372,11 +1430,11 @@ def _handle_shortcuts(ctx: "Context", console, line: str) -> bool:
     return False
 
 
-def _show_help(console) -> None:
+def _show_help(console, runtime: str = "in_process") -> None:
     """Display categorized help using the command registry."""
     from leapflow.cli.commands.registry import commands_by_category
 
-    categories = commands_by_category()
+    categories = commands_by_category(runtime=runtime)  # type: ignore[arg-type]
 
     console.print()
     for category, cmds in categories.items():
@@ -1394,8 +1452,16 @@ def _show_help(console) -> None:
                 ]
                 if visible:
                     aliases = f" [dim]({', '.join(visible)})[/]"
+            support = ""
+            if not cmd.supports_runtime(runtime):  # type: ignore[arg-type]
+                support = " [dim]not in daemon[/]" if runtime == "daemon" else " [dim]not in this mode[/]"
+            effect = ""
+            if cmd.requires_host:
+                effect = " [dim]host[/]"
+            elif cmd.requires_llm:
+                effect = " [dim]llm[/]"
             console.print(
-                f"    [cyan]{name:<28}[/] {cmd.description}{aliases}"
+                f"    [cyan]{name:<28}[/] {cmd.description}{aliases}{effect}{support}"
             )
         console.print()
 

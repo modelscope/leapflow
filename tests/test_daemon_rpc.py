@@ -326,6 +326,107 @@ async def test_daemon_client_host_lifecycle_rpc() -> None:
 
 
 @pytest.mark.asyncio
+async def test_daemon_client_slash_metadata_rpc() -> None:
+    class SlashMetadataService(_FakeService):
+        async def tools_list(self) -> dict[str, Any]:
+            return {"ok": True, "groups": {"core": ["chat"]}, "total": 1, "mcp_count": 0}
+
+        async def usage_summary(self) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "model": "test-model",
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "turn_count": 2,
+                "context_used": 15,
+                "context_length": 100,
+            }
+
+        async def model_info(self, model_name: str = "") -> dict[str, Any]:
+            return {
+                "ok": True,
+                "model": "test-model",
+                "context_length": 100,
+                "requested_model": model_name,
+                "switch_supported": False,
+                "env_var": "LEAPFLOW_LLM_MODEL",
+            }
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        server, task, run_dir = await _start_server(Path(root) / "run", service=SlashMetadataService())
+        client = DaemonClient(run_dir / "leapd.sock")
+        try:
+            tools = await client.tools_list()
+            usage = await client.usage_summary()
+            model = await client.model_info("next-model")
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert tools["groups"] == {"core": ["chat"]}
+    assert usage["total_tokens"] == 15
+    assert model["requested_model"] == "next-model"
+
+
+@pytest.mark.asyncio
+async def test_runtime_service_slash_metadata_payloads() -> None:
+    from conftest import make_settings
+    from leapflow.daemon.service import RuntimeLeapService
+
+    class FakeSummary:
+        prompt_tokens = 12
+        completion_tokens = 8
+        total_tokens = 20
+
+    class FakeUsageTracker:
+        def summary(self) -> FakeSummary:
+            return FakeSummary()
+
+    class FakeCapabilities:
+        context_length = 4096
+
+    class FakeCapabilityRegistry:
+        def resolve(self, model: str) -> FakeCapabilities:
+            return FakeCapabilities()
+
+    class FakeEngine:
+        usage_tracker = FakeUsageTracker()
+        model_capabilities = FakeCapabilityRegistry()
+        context_token_count = 20
+        turn_count = 3
+
+    class FakeRpc:
+        connected = False
+
+    class FakeContext:
+        def __init__(self, settings) -> None:
+            self.settings = settings
+            self.engine = FakeEngine()
+            self.rpc = FakeRpc()
+            self.platform_tools: list[Any] = []
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        settings = make_settings(root)
+        service = RuntimeLeapService(settings, mock_host=True)
+        service._ctx = FakeContext(settings)
+        tools = await service.tools_list()
+        usage = await service.usage_summary()
+        model = await service.model_info("other-model")
+
+    assert tools["ok"] is True
+    assert tools["total"] > 0
+    assert usage["total_tokens"] == 20
+    assert usage["context_length"] == 4096
+    assert model["model"] == settings.llm_model
+    assert model["requested_model"] == "other-model"
+
+
+@pytest.mark.asyncio
 async def test_runtime_service_host_lifecycle_delegates_to_context() -> None:
     from conftest import make_settings
     from leapflow.daemon.service import RuntimeLeapService

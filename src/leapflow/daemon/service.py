@@ -200,6 +200,24 @@ class RuntimeLeapService:
                 return {"ok": False, "started": False, "last_error": "host lifecycle is unavailable"}
             return dict(await restart())
 
+    async def tools_list(self) -> dict[str, Any]:
+        """Return daemon-owned tool summary for slash-command rendering."""
+        from leapflow.cli.commands.slash_handlers import build_tools_payload
+
+        return build_tools_payload(self.context)
+
+    async def usage_summary(self) -> dict[str, Any]:
+        """Return token usage for the current daemon-owned session."""
+        from leapflow.cli.commands.slash_handlers import build_usage_payload
+
+        return build_usage_payload(self.context)
+
+    async def model_info(self, model_name: str = "") -> dict[str, Any]:
+        """Return active daemon model information and restart guidance."""
+        from leapflow.cli.commands.slash_handlers import build_model_payload
+
+        return build_model_payload(self.context, model_name)
+
     async def approval_status(self) -> dict[str, Any]:
         """Return currently pending daemon approval requests."""
         return {"pending": self._pending_payloads()}

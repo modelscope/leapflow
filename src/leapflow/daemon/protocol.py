@@ -203,6 +203,18 @@ class LeapService(Protocol):
         """Restart the host backend."""
         ...
 
+    async def tools_list(self) -> Dict[str, Any]:
+        """Return available tool groups for slash-command rendering."""
+        ...
+
+    async def usage_summary(self) -> Dict[str, Any]:
+        """Return token usage for the current daemon session."""
+        ...
+
+    async def model_info(self, model_name: str = "") -> Dict[str, Any]:
+        """Return active model information and switch guidance."""
+        ...
+
     async def approval_status(self) -> Dict[str, Any]:
         """Return pending approval requests."""
         ...
@@ -274,6 +286,9 @@ METHOD_REGISTRY: Dict[str, str] = {
     "host.start": "host_start",
     "host.stop": "host_stop",
     "host.restart": "host_restart",
+    "tools.list": "tools_list",
+    "usage.summary": "usage_summary",
+    "model.info": "model_info",
     "approval.status": "approval_status",
     "approval.resolve": "approval_resolve",
     "approval.cancel": "approval_cancel",

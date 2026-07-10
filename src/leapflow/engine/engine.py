@@ -59,6 +59,67 @@ from leapflow.skills.registry import Skill, SkillRegistry
 
 logger = logging.getLogger(__name__)
 
+_TOOL_ARGS_PREVIEW_LIMIT = 160
+_TOOL_RESULT_PREVIEW_LIMIT = 240
+
+
+def _single_line_preview(value: Any, *, limit: int) -> str:
+    """Return a compact single-line preview for UI metadata."""
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else json.dumps(value, default=str, ensure_ascii=False)
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1] + "…"
+
+
+def _tool_args_metadata(tool_name: str, arguments: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Build safe, compact tool-start metadata for streaming UIs."""
+    args = dict(arguments or {})
+    metadata: Dict[str, Any] = {
+        "tool_name": tool_name,
+        "args_summary": _single_line_preview(args, limit=_TOOL_ARGS_PREVIEW_LIMIT),
+    }
+    for key in ("command", "cmd", "path", "pattern", "query", "url"):
+        value = args.get(key)
+        if value:
+            metadata[key] = _single_line_preview(value, limit=_TOOL_ARGS_PREVIEW_LIMIT)
+    return metadata
+
+
+def _tool_result_metadata(
+    tool_name: str,
+    arguments: Dict[str, Any] | None,
+    result: Any,
+) -> Dict[str, Any]:
+    """Build safe, compact tool-completion metadata for streaming UIs."""
+    metadata = _tool_args_metadata(tool_name, arguments)
+    metadata["ok"] = True
+    if isinstance(result, dict):
+        metadata["ok"] = bool(result.get("ok", True))
+        for key in ("exit_code", "path", "lines", "truncated", "bytes_written"):
+            if key in result:
+                metadata[key] = result[key]
+        for key in ("stdout", "stderr", "content", "output", "error"):
+            value = result.get(key)
+            if value:
+                metadata[f"{key}_preview"] = _single_line_preview(
+                    value,
+                    limit=_TOOL_RESULT_PREVIEW_LIMIT,
+                )
+        if not any(key.endswith("_preview") for key in metadata):
+            metadata["result_preview"] = _single_line_preview(
+                result,
+                limit=_TOOL_RESULT_PREVIEW_LIMIT,
+            )
+    else:
+        metadata["result_preview"] = _single_line_preview(
+            result,
+            limit=_TOOL_RESULT_PREVIEW_LIMIT,
+        )
+    return metadata
+
 
 def _estimate_text_tokens(text: str) -> int:
     """Approximate token count for status display when provider usage is absent."""
@@ -1645,12 +1706,22 @@ class AgentEngine:
                     )
 
                     for tc in native_calls:
-                        yield StreamEvent(type="tool_start", content=tc.name)
-                    await self._execute_tools_concurrent(
+                        yield StreamEvent(
+                            type="tool_start",
+                            content=tc.name,
+                            metadata=_tool_args_metadata(tc.name, tc.arguments),
+                        )
+                    results = await self._execute_tools_concurrent(
                         native_calls, TOOL_HANDLERS, trace=trace, messages=messages
                     )
+                    result_by_id = {str(item.get("id")): item for item in results}
                     for tc in native_calls:
-                        yield StreamEvent(type="tool_complete", content=tc.name)
+                        item = result_by_id.get(str(tc.id), {})
+                        yield StreamEvent(
+                            type="tool_complete",
+                            content=tc.name,
+                            metadata=_tool_result_metadata(tc.name, tc.arguments, item.get("result")),
+                        )
 
                     failures = self._count_consecutive_tool_failures(messages)
                     turn_recovery.consecutive_tool_failures = failures
@@ -1768,10 +1839,22 @@ class AgentEngine:
                 return
 
             messages.append(build_assistant_message(content))
-            yield StreamEvent(type="tool_start", content=tool_call['name'])
+            yield StreamEvent(
+                type="tool_start",
+                content=tool_call['name'],
+                metadata=_tool_args_metadata(tool_call['name'], tool_call.get("arguments")),
+            )
             result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
             _clear_indicator()
-            yield StreamEvent(type="tool_complete", content=tool_call['name'])
+            yield StreamEvent(
+                type="tool_complete",
+                content=tool_call['name'],
+                metadata=_tool_result_metadata(
+                    tool_call['name'],
+                    tool_call.get("arguments"),
+                    result,
+                ),
+            )
             _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
             trace.record(
                 ExecutionMode.ACTING,
@@ -1854,13 +1937,15 @@ class AgentEngine:
         *,
         trace: ExecutionTrace,
         messages: List[Dict[str, Any]],
-    ) -> None:
+    ) -> list[Dict[str, Any]]:
         """Execute native tool calls respecting concurrency policy.
 
         Concurrent group runs via asyncio.gather; sequential group runs one-by-one.
-        Results are appended to messages in OpenAI tool-result format.
+        Results are appended to messages in OpenAI tool-result format and returned
+        for streaming UI metadata.
         """
         result_budget = self._effective_tool_result_budget()
+        executed: list[Dict[str, Any]] = []
         tc_wrappers = [
             ConcurrentToolCall(id=tc.id, name=tc.name, arguments=tc.arguments)
             for tc in native_calls
@@ -1880,7 +1965,8 @@ class AgentEngine:
                 )
                 result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
-            return
+                executed.append({"id": tc.id, "name": tc.name, "arguments": tc.arguments, "result": result})
+            return executed
 
         concurrent, sequential = self._concurrency_policy.partition(tc_wrappers)
         logger.info(
@@ -1922,6 +2008,12 @@ class AgentEngine:
                     )
                     result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
+                executed.append({
+                    "id": ctc.id,
+                    "name": ctc.name,
+                    "arguments": ctc.arguments,
+                    "result": error_result if isinstance(result, Exception) else result,
+                })
 
         for i, ctc in enumerate(sequential):
             _show_progress("executing", ctc.name, step=i + 1, total=len(sequential))
@@ -1936,6 +2028,8 @@ class AgentEngine:
             )
             result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
             messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
+            executed.append({"id": ctc.id, "name": ctc.name, "arguments": ctc.arguments, "result": result})
+        return executed
 
     async def _execute_general_tool(
         self, tool_call: Dict[str, Any], handlers: Dict[str, Any]

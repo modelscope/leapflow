@@ -11,6 +11,7 @@ from prompt_toolkit.completion import Completion
 from leapflow.cli.tui_app.app import LeapApp
 from leapflow.cli.tui_app.console import LeapConsole
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
+from leapflow.cli.tui_app.stream import StreamRenderer
 from leapflow.cli.tui_app.theme import _LIGHT, resolve_theme
 
 
@@ -158,6 +159,70 @@ def test_command_card_keeps_elapsed_in_title_not_body(monkeypatch) -> None:
     assert "done" in title
     assert "elapsed:" not in body
     assert "summarize the current project layout" in body
+
+
+def test_stream_renderer_prints_tool_command_and_success_preview() -> None:
+    class CaptureConsole:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def print(self, renderable) -> None:
+            self.lines.append(getattr(renderable, "plain", str(renderable)))
+
+        def thinking(self, text: str) -> None:
+            pass
+
+        def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
+            pass
+
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+            pass
+
+        def newline(self) -> None:
+            pass
+
+    console = CaptureConsole()
+    renderer = StreamRenderer(console)  # type: ignore[arg-type]
+    renderer.start()
+
+    renderer.tool_started("shell_run", metadata={"command": "python -V"})
+    renderer.tool_finished("shell_run", metadata={"ok": True, "stdout_preview": "Python 3.13.0"})
+
+    assert any("shell_run" in line and "$ python -V" in line for line in console.lines)
+    assert any("shell_run" in line and "Python 3.13.0" in line for line in console.lines)
+
+
+def test_stream_renderer_prints_tool_failure_exit_and_stderr() -> None:
+    class CaptureConsole:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def print(self, renderable) -> None:
+            self.lines.append(getattr(renderable, "plain", str(renderable)))
+
+        def thinking(self, text: str) -> None:
+            pass
+
+        def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
+            pass
+
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+            pass
+
+        def newline(self) -> None:
+            pass
+
+    console = CaptureConsole()
+    renderer = StreamRenderer(console)  # type: ignore[arg-type]
+    renderer.start()
+
+    renderer.tool_started("shell_run", metadata={"command": "false"})
+    renderer.tool_finished(
+        "shell_run",
+        metadata={"ok": False, "exit_code": 1, "stderr_preview": "permission denied"},
+    )
+
+    assert any("✗" in line and "exit=1 permission denied" in line for line in console.lines)
 
 
 @pytest.mark.asyncio
