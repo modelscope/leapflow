@@ -17,6 +17,15 @@ def test_context_constructs_approval_gate_before_initialize(tmp_path) -> None:
 
     assert hasattr(ctx, "_approval_gate")
     assert hasattr(ctx, "_tui_approval")
+    assert not hasattr(ctx, "shortcuts")
+
+
+def test_shortcut_commands_are_not_registered() -> None:
+    from leapflow.cli.commands.registry import commands_by_category, resolve_command
+
+    assert resolve_command("shortcut") is None
+    assert resolve_command("shortcut add hello = hi") is None
+    assert "Shortcuts" not in commands_by_category()
 
 
 @pytest.mark.asyncio

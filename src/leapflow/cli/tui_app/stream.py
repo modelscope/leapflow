@@ -82,6 +82,12 @@ def _tool_context_detail(metadata: dict[str, Any] | None) -> str:
     guidance = _metadata_text(metadata, "context_guidance")
     if guidance:
         parts.append(_truncate_detail(guidance, limit=72))
+    disclosure = _metadata_text(metadata, "disclosure_level")
+    if disclosure:
+        parts.append(f"disclosure={disclosure}")
+    disclosure_reason = _metadata_text(metadata, "disclosure_reason")
+    if disclosure_reason:
+        parts.append(_truncate_detail(disclosure_reason, limit=72))
     read_count = metadata.get("read_count")
     if metadata.get("repeat_read") and read_count is not None:
         parts.append(f"repeat-read x{read_count}")

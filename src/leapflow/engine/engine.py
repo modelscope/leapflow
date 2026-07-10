@@ -23,6 +23,13 @@ from leapflow.engine.context_control import (
     ContextWindowController,
     ToolEvidenceBuilder,
 )
+from leapflow.engine.context_disclosure import (
+    DisclosureLevel,
+    DisclosurePlanner,
+    DisclosureRuntimeState,
+    MemoryDisclosure,
+    PromptAssemblyPlan,
+)
 from leapflow.engine.error_classifier import (
     ErrorCategory,
     ErrorClassifier,
@@ -42,7 +49,6 @@ from leapflow.engine.tool_concurrency import (
     ToolCall as ConcurrentToolCall,
     ToolConcurrencyPolicy,
 )
-from leapflow.engine.shortcuts import ShortcutStore
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.scheduler import TaskScheduler
 from leapflow.engine.session import SessionController
@@ -293,6 +299,15 @@ class _LoopContext:
     prefetch_done: bool = False  # track whether memory prefetch ran this loop
 
 
+@dataclass(frozen=True)
+class _PromptAssembly:
+    """Resolved prompt pieces for a unified-loop turn."""
+
+    system: str
+    plan: PromptAssemblyPlan
+    prior_turns: List[Dict[str, Any]]
+
+
 class AgentEngine:
     """Coordinates perception memory, LLM reasoning, RPC execution, and skills."""
 
@@ -314,7 +329,6 @@ class AgentEngine:
         execution: Optional[Any] = None,
         skill_activator: Optional[Any] = None,
         session: Optional[SessionController] = None,
-        shortcuts: Optional["ShortcutStore"] = None,
         vlm: Optional[Any] = None,
         memory_manager: Optional[MemoryManager] = None,
         evolution: Optional[EvolutionMemoryProvider] = None,
@@ -332,7 +346,6 @@ class AgentEngine:
         self._imm = imm
         self._registry = registry
         self._classifier = classifier
-        self._shortcuts = shortcuts
         self._imitation = imitation
         self._skill_library = skill_library
         self._skill_merger = SkillMerger(
@@ -447,6 +460,8 @@ class AgentEngine:
             ),
         )
         self._last_context_snapshot: dict[str, Any] = {}
+        self._last_disclosure_metadata: dict[str, Any] = {}
+        self._disclosure_planner = DisclosurePlanner()
         self._healer = MessageHealer()
 
         # B2: Prompt cache optimization (None = disabled)
@@ -789,6 +804,106 @@ class AgentEngine:
                 logger.debug("model capability lookup failed", exc_info=True)
         return max(1, int(self._settings.llm_context_length))
 
+    async def _assemble_unified_prompt(
+        self,
+        user_text: str,
+        *,
+        tool_definitions: List[Dict[str, Any]],
+        enable_thinking: bool,
+        slash_command: bool = False,
+    ) -> _PromptAssembly:
+        """Resolve progressive disclosure and build the system prompt."""
+        from leapflow.prompts.templates import UNIFIED_SYSTEM_TEMPLATE
+
+        runtime = DisclosureRuntimeState(
+            enable_thinking=enable_thinking,
+            native_tools_enabled=self._settings.native_tool_calling_enabled,
+            slash_command=slash_command,
+            context_posture=str(self._last_context_snapshot.get("context_posture") or "baseline"),
+            recent_failure=bool(self._last_context_snapshot.get("forced_final_answer")),
+        )
+        try:
+            plan = self._disclosure_planner.plan(user_text, tool_definitions, runtime)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            logger.warning("disclosure planning failed; falling back to full context: %s", exc)
+            plan = DisclosurePlanner().full_plan(
+                user_text,
+                tool_definitions,
+                runtime,
+                "planner fallback preserved unified-loop behavior",
+            )
+
+        tool_catalog = self._format_tool_catalog(list(plan.catalog_definitions))
+        memory_context = ""
+        if plan.memory == MemoryDisclosure.SESSION_SUMMARY:
+            memory_context = self._build_session_summary_context(max_messages=plan.max_prior_turns)
+        elif plan.memory in {MemoryDisclosure.QUERY_RETRIEVAL, MemoryDisclosure.TASK_RETRIEVAL}:
+            memory_context = await self._prefetch_and_freeze_memory(user_text)
+        skill_section = self._build_skill_section(include_skills=plan.level != DisclosureLevel.LIGHT)
+        system = UNIFIED_SYSTEM_TEMPLATE.format(
+            tool_catalog=tool_catalog,
+            skill_section=skill_section,
+            memory_context=memory_context,
+        )
+        self._last_disclosure_metadata = plan.metadata()
+        prior_turns = self._prior_turns_for_plan(plan)
+        return _PromptAssembly(system=system, plan=plan, prior_turns=prior_turns)
+
+    def _build_session_summary_context(self, *, max_messages: int) -> str:
+        """Return a compact local session summary without retrieval or extra LLM calls."""
+        messages = self._wm.as_chat_messages()
+        summary_lines: list[str] = []
+        for message in messages[-max(0, max_messages):]:
+            role = str(message.get("role") or "").strip()
+            if role not in {"user", "assistant"}:
+                continue
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)
+            elif not isinstance(content, str):
+                content = str(content)
+            preview = _single_line_preview(content, limit=180)
+            if preview:
+                summary_lines.append(f"- {role}: {preview}")
+        if not summary_lines:
+            return ""
+        return "\n## Recent Session Summary\n" + "\n".join(summary_lines) + "\n"
+
+    def _build_skill_section(self, *, include_skills: bool) -> str:
+        """Return compact learned-skill prompt text when the plan allows it."""
+        if not include_skills or not self._skill_index:
+            return ""
+        entries = self._skill_index.get_entries()
+        if not entries:
+            return ""
+        skill_index_text = self._skill_index.compact_index_text(entries)
+        return (
+            "\n## Learned Skills\n"
+            "You have access to the following learned skills. "
+            "Use `gp_skills_list` to browse or `gp_skill_view` to read details:\n"
+            f"{skill_index_text}\n"
+        )
+
+    def _prior_turns_for_plan(self, plan: PromptAssemblyPlan) -> List[Dict[str, Any]]:
+        """Return bounded prior conversation turns according to the disclosure plan."""
+        wm_history = self._wm.as_chat_messages()
+        prior_turns: List[Dict[str, Any]] = [
+            message for message in wm_history
+            if isinstance(message.get("role"), str) and message["role"] in ("user", "assistant")
+        ]
+        return prior_turns[-max(0, plan.max_prior_turns):]
+
+    @staticmethod
+    def _planned_enable_thinking(plan: PromptAssemblyPlan, requested: bool) -> bool:
+        """Apply the plan-level reasoning gate to the provider request."""
+        return requested and plan.reasoning.value != "off"
+
+    def _planned_tools_kwarg(self, plan: PromptAssemblyPlan) -> Dict[str, Any]:
+        """Return provider tool schemas only when the plan discloses native tools."""
+        if plan.native_tools and plan.tool_definitions:
+            return {"tools": list(plan.tool_definitions)}
+        return {}
+
     def _prepare_llm_messages(
         self,
         messages: List[Dict[str, Any]],
@@ -848,6 +963,9 @@ class AgentEngine:
             "context_signal": governance.get("dominant_signal", ""),
             "context_guidance": governance.get("guidance", ""),
             "context_convergence_reason": governance.get("convergence_reason", ""),
+            "disclosure": dict(self._last_disclosure_metadata),
+            "disclosure_level": self._last_disclosure_metadata.get("level", ""),
+            "disclosure_reason": self._last_disclosure_metadata.get("reason", ""),
         }
         if compressed:
             self._usage_tracker.mark_compression()
@@ -890,6 +1008,12 @@ class AgentEngine:
             guidance = snapshot.get("context_guidance")
             if guidance:
                 metadata.setdefault("context_guidance", guidance)
+            disclosure_level = snapshot.get("disclosure_level")
+            if disclosure_level:
+                metadata.setdefault("disclosure_level", disclosure_level)
+            disclosure_reason = snapshot.get("disclosure_reason")
+            if disclosure_reason:
+                metadata.setdefault("disclosure_reason", disclosure_reason)
             trace = snapshot.get("compression_trace")
             if isinstance(trace, dict) and trace.get("stages_applied"):
                 metadata.setdefault("compression_stages", trace.get("stages_applied"))
@@ -906,15 +1030,7 @@ class AgentEngine:
         logger.info("audit.user_input chars=%s", len(user_text))
         self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
 
-        # 1. Shortcut match (zero cost, exact keyword)
-        if self._shortcuts:
-            reply = self._shortcuts.match(user_text)
-            if reply:
-                self._wm.remember_chat(build_user_message_text(user_text))
-                self._wm.remember_chat(build_assistant_message(reply))
-                return reply
-
-        # 2. Slash command (skill injection — zero-ambiguity activation)
+        # 1. Slash command (skill injection — zero-ambiguity activation)
         if user_text.startswith("/") and self._skill_injector:
             self._inject_pending_skill_reminder()
             self._wm.remember_chat(build_user_message_text(user_text))
@@ -924,11 +1040,11 @@ class AgentEngine:
         self._inject_pending_skill_reminder()
         self._wm.remember_chat(build_user_message_text(user_text))
 
-        # 3. Teach command (special session mode switch)
+        # 2. Teach command (special session mode switch)
         if self._is_teach_command(user_text):
             return await self._handle_learn_command(user_text)
 
-        # 4. Everything else → unified tool loop (LLM decides tools vs direct response)
+        # 3. Everything else → unified tool loop (LLM decides tools vs direct response)
         logger.debug("route.unified user_text_len=%d", len(user_text))
         if not self._settings.has_llm_credentials:
             msg = self._error_classifier.friendly_message(ErrorCategory.AUTH_PERMANENT)
@@ -942,7 +1058,7 @@ class AgentEngine:
         """Like run(), but yields text chunks for streamable responses.
 
         Yields:
-            str: legacy plain-text chunks (shortcuts, teach commands).
+            str: legacy plain-text chunks (teach commands).
             StreamEvent(type="chunk"): real-time token fragments.
             StreamEvent(type="final"): complete assembled response.
             StreamEvent(type="tool_call"): internal tool invocation (suppress display).
@@ -951,16 +1067,7 @@ class AgentEngine:
         logger.info("audit.user_input chars=%s", len(user_text))
         self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
 
-        # 1. Shortcut match (zero cost)
-        if self._shortcuts:
-            reply = self._shortcuts.match(user_text)
-            if reply:
-                self._wm.remember_chat(build_user_message_text(user_text))
-                self._wm.remember_chat(build_assistant_message(reply))
-                yield reply
-                return
-
-        # 2. Slash command (skill injection)
+        # 1. Slash command (skill injection)
         if user_text.startswith("/") and self._skill_injector:
             self._inject_pending_skill_reminder()
             self._wm.remember_chat(build_user_message_text(user_text))
@@ -972,13 +1079,13 @@ class AgentEngine:
         self._inject_pending_skill_reminder()
         self._wm.remember_chat(build_user_message_text(user_text))
 
-        # 3. Teach command (special session mode switch)
+        # 2. Teach command (special session mode switch)
         if self._is_teach_command(user_text):
             result = await self._handle_learn_command(user_text)
             yield result
             return
 
-        # 4. Everything else → unified tool loop (streaming)
+        # 3. Everything else → unified tool loop (streaming)
         logger.debug("route.unified user_text_len=%d", len(user_text))
         if not self._settings.has_llm_credentials:
             msg = self._error_classifier.friendly_message(ErrorCategory.AUTH_PERMANENT)
@@ -1379,63 +1486,32 @@ class AgentEngine:
                 if injection:
                     user_text = injection  # Replace user_text with skill injection
 
-        from leapflow.prompts.templates import UNIFIED_SYSTEM_TEMPLATE
         from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
 
         budget = IterationBudget.for_react(self._budget_config)
         trace = ExecutionTrace()
-
-        # Build tool catalog text (for system prompt readability)
-        tool_catalog = self._format_tool_catalog(TOOL_DEFINITIONS)
-
-        memory_context = await self._prefetch_and_freeze_memory(user_text)
-
-        skill_section = ""
-        if self._skill_index:
-            entries = self._skill_index.get_entries()
-            if entries:
-                skill_index_text = self._skill_index.compact_index_text(entries)
-                skill_section = (
-                    "\n## Learned Skills\n"
-                    "You have access to the following learned skills. "
-                    "Use `gp_skills_list` to browse or `gp_skill_view` to read details:\n"
-                    f"{skill_index_text}\n"
-                )
-
-        # Build system prompt
-        system = UNIFIED_SYSTEM_TEMPLATE.format(
-            tool_catalog=tool_catalog,
-            skill_section=skill_section,
-            memory_context=memory_context,
+        assembly = await self._assemble_unified_prompt(
+            user_text,
+            tool_definitions=TOOL_DEFINITIONS,
+            enable_thinking=enable_thinking,
+            slash_command=user_text.startswith("/"),
         )
-
-        # Inject prior conversation turns from working memory for multi-turn coherence
-        wm_history = self._wm.as_chat_messages()
-        # Filter to keep only recent user/assistant exchanges (skip system events)
-        prior_turns: List[Dict[str, Any]] = [
-            m for m in wm_history
-            if isinstance(m.get("role"), str) and m["role"] in ("user", "assistant")
-        ]
-        # Limit to last N turns to avoid overwhelming context
-        max_prior_turns = 10
-        prior_turns = prior_turns[-max_prior_turns:]
+        planned_enable_thinking = self._planned_enable_thinking(assembly.plan, enable_thinking)
 
         messages: List[Dict[str, Any]] = [
-            build_system_message(system),
-            *prior_turns,
+            build_system_message(assembly.system),
+            *assembly.prior_turns,
             build_user_message_text(user_text),
         ]
 
         content = ""
         fatal_error: Optional[str] = None
         recovery = TurnRecoveryState()
-        use_native_tools = self._settings.native_tool_calling_enabled
+        use_native_tools = assembly.plan.native_tools
         result_budget = self._effective_tool_result_budget()
         self._usage_tracker.reset()
 
-        tools_kwarg: Dict[str, Any] = {}
-        if use_native_tools and TOOL_DEFINITIONS:
-            tools_kwarg["tools"] = TOOL_DEFINITIONS
+        tools_kwarg: Dict[str, Any] = self._planned_tools_kwarg(assembly.plan)
 
         self._cancel_requested = False
         _signal_watermark = [time.time()]
@@ -1463,7 +1539,7 @@ class AgentEngine:
             _show_progress("thinking", f"round {budget.used}")
             try:
                 resp = await self._llm.achat(
-                    compressed, stream=False, enable_thinking=enable_thinking,
+                    compressed, stream=False, enable_thinking=planned_enable_thinking,
                     **tools_kwarg,
                 )
                 recovery.record_api_success()
@@ -1738,58 +1814,32 @@ class AgentEngine:
                 if injection:
                     user_text = injection
 
-        from leapflow.prompts.templates import UNIFIED_SYSTEM_TEMPLATE
         from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
 
         budget = IterationBudget.for_react(self._budget_config)
         trace = ExecutionTrace()
-
-        tool_catalog = self._format_tool_catalog(TOOL_DEFINITIONS)
-
-        memory_context = await self._prefetch_and_freeze_memory(user_text)
-
-        skill_section = ""
-        if self._skill_index:
-            idx_entries = self._skill_index.get_entries()
-            if idx_entries:
-                skill_index_text = self._skill_index.compact_index_text(idx_entries)
-                skill_section = (
-                    "\n## Learned Skills\n"
-                    "You have access to the following learned skills. "
-                    "Use `gp_skills_list` to browse or `gp_skill_view` to read details:\n"
-                    f"{skill_index_text}\n"
-                )
-
-        system = UNIFIED_SYSTEM_TEMPLATE.format(
-            tool_catalog=tool_catalog,
-            skill_section=skill_section,
-            memory_context=memory_context,
+        assembly = await self._assemble_unified_prompt(
+            user_text,
+            tool_definitions=TOOL_DEFINITIONS,
+            enable_thinking=enable_thinking,
+            slash_command=user_text.startswith("/"),
         )
-
-        # Prior conversation context
-        wm_history = self._wm.as_chat_messages()
-        prior_turns: List[Dict[str, Any]] = [
-            m for m in wm_history
-            if isinstance(m.get("role"), str) and m["role"] in ("user", "assistant")
-        ]
-        prior_turns = prior_turns[-10:]
+        planned_enable_thinking = self._planned_enable_thinking(assembly.plan, enable_thinking)
 
         messages: List[Dict[str, Any]] = [
-            build_system_message(system),
-            *prior_turns,
+            build_system_message(assembly.system),
+            *assembly.prior_turns,
             build_user_message_text(user_text),
         ]
 
         content = ""
         fatal_error: Optional[str] = None
         turn_recovery = TurnRecoveryState()
-        use_native_tools = self._settings.native_tool_calling_enabled
+        use_native_tools = assembly.plan.native_tools
         result_budget = self._effective_tool_result_budget()
         self._usage_tracker.reset()
 
-        tools_kwarg: Dict[str, Any] = {}
-        if use_native_tools and TOOL_DEFINITIONS:
-            tools_kwarg["tools"] = TOOL_DEFINITIONS
+        tools_kwarg: Dict[str, Any] = self._planned_tools_kwarg(assembly.plan)
 
         session_id = self._ensure_session(user_text)
 
@@ -1821,7 +1871,7 @@ class AgentEngine:
             if use_native_tools and tools_kwarg:
                 try:
                     resp = await self._llm.achat(
-                        compressed, stream=False, enable_thinking=enable_thinking,
+                        compressed, stream=False, enable_thinking=planned_enable_thinking,
                         **tools_kwarg,
                     )
                     turn_recovery.record_api_success()
@@ -1928,7 +1978,7 @@ class AgentEngine:
                     try:
                         _clear_indicator()
                         raw_stream = self._llm.achat_stream(
-                            compressed, enable_thinking=enable_thinking,
+                            compressed, enable_thinking=planned_enable_thinking,
                         )
                         guarded = stale_guarded_stream(
                             raw_stream, timeout_s=self._stale_stream_timeout_s,
@@ -1970,7 +2020,7 @@ class AgentEngine:
                 else:
                     try:
                         resp = await self._llm.achat(
-                            compressed, stream=False, enable_thinking=enable_thinking,
+                            compressed, stream=False, enable_thinking=planned_enable_thinking,
                         )
                         turn_recovery.record_api_success()
                         usage = resp.usage or {}

@@ -238,6 +238,110 @@ async def test_streaming_engine_estimates_context_tokens_without_provider_usage(
 
 
 @pytest.mark.asyncio
+async def test_progressive_disclosure_light_query_omits_tools_and_thinking() -> None:
+    """Plain chat should stay on the light path even when thinking is requested."""
+    from leapflow.llm.base import LLMChatResponse, LLMProvider
+    from leapflow.platform.mock import MockBridge
+
+    class CaptureLLM(LLMProvider):
+        def __init__(self) -> None:
+            self.messages: list[dict] = []
+            self.kwargs: dict = {}
+            self.enable_thinking = True
+            self.call_count = 0
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, on_chunk=None, **kwargs):
+            self.call_count += 1
+            self.messages = list(messages)
+            self.kwargs = dict(kwargs)
+            self.enable_thinking = enable_thinking
+            return LLMChatResponse(content="I am LeapFlow.")
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            if False:
+                yield ""
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        settings = settings.__class__(
+            **{
+                **settings.__dict__,
+                "native_tool_calling_enabled": True,
+            }
+        )
+        rpc = MockBridge()
+        llm = CaptureLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("chat")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            out = await engine.run("hello", enable_thinking=True)
+
+            assert out == "I am LeapFlow."
+            assert llm.call_count == 1
+            assert "tools" not in llm.kwargs
+            assert llm.enable_thinking is False
+            assert "file_read" not in str(llm.messages[0].get("content", ""))
+            snapshot = engine.context_budget_snapshot
+            assert snapshot["disclosure_level"] == "light"
+            assert snapshot["disclosure"]["native_tools"] is False
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_progressive_disclosure_file_query_selects_file_schemas() -> None:
+    """File-oriented requests should disclose file schemas without the full catalog."""
+    from leapflow.llm.base import LLMChatResponse, LLMProvider
+    from leapflow.platform.mock import MockBridge
+
+    class CaptureLLM(LLMProvider):
+        def __init__(self) -> None:
+            self.kwargs: dict = {}
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, on_chunk=None, **kwargs):
+            self.kwargs = dict(kwargs)
+            return LLMChatResponse(content="Done")
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            if False:
+                yield ""
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        settings = settings.__class__(
+            **{
+                **settings.__dict__,
+                "native_tool_calling_enabled": True,
+            }
+        )
+        rpc = MockBridge()
+        llm = CaptureLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("file")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            await engine.run("Read src/leapflow/engine/engine.py")
+
+            tools = llm.kwargs.get("tools", [])
+            names = {tool.get("function", {}).get("name", "") for tool in tools}
+            assert "file_read" in names
+            assert "file_list" in names
+            assert "shell_run" not in names
+            assert engine.context_budget_snapshot["disclosure_level"] == "selected_tools"
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
 async def test_immediate_memory_integration() -> None:
     """EpisodicMemoryProvider fragments surface in memory_recent responses."""
     with tempfile.TemporaryDirectory() as td:

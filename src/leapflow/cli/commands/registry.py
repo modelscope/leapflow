@@ -106,11 +106,6 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("hub pull", "Pull skill from hub", "Hub", args_hint="<skill>"),
     CommandDef("hub search", "Search hub for skills", "Hub", args_hint="<query>"),
 
-    # Shortcuts
-    CommandDef("shortcut", "List shortcuts", "Shortcuts", aliases=("shortcut list",)),
-    CommandDef("shortcut add", "Add a quick-reply shortcut", "Shortcuts", args_hint="<pattern> = <reply>"),
-    CommandDef("shortcut remove", "Remove a shortcut", "Shortcuts", args_hint="<pattern>"),
-
     # Gateway
     CommandDef("gateway", "Show connected platforms and gateway status", "Gateway", effect=CommandEffect.EXTERNAL),
 

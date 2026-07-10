@@ -590,10 +590,6 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 _print_execution_result(result)
                 return
 
-            if canonical.startswith("shortcut"):
-                if _handle_shortcuts(ctx, console, cmd_text):
-                    return
-
             if canonical == "arm":
                 from leapflow.cli.commands.scheduler import cmd_arm
 
@@ -1402,43 +1398,6 @@ def _handle_skills(ctx: "Context", console, line: str) -> bool:
             console.success(f"Skill '{name}' deleted.")
         else:
             console.warning(f"Skill '{name}' not found.")
-        return True
-
-    return False
-
-
-def _handle_shortcuts(ctx: "Context", console, line: str) -> bool:
-    """Handle shortcut commands. Returns True if handled."""
-    if line in ("shortcut list", "shortcut", "快捷短语"):
-        shortcuts = ctx.shortcuts.list_all()
-        if not shortcuts:
-            console.system("No shortcuts configured.")
-        else:
-            console.system(f"Shortcuts ({len(shortcuts)}):")
-            for pattern, reply in shortcuts.items():
-                console.system(f"  {pattern} → {reply}")
-        return True
-
-    if line.startswith("shortcut add ") or line.startswith("快捷短语 添加 "):
-        rest = line.split(" ", 2)[-1]
-        if "=" not in rest:
-            console.warning("Usage: shortcut add <pattern> = <reply>")
-            return True
-        pattern, reply = rest.split("=", 1)
-        pattern, reply = pattern.strip(), reply.strip()
-        if not pattern or not reply:
-            console.warning("Usage: shortcut add <pattern> = <reply>")
-            return True
-        ctx.shortcuts.add(pattern, reply)
-        console.success(f"Shortcut added: {pattern} → {reply}")
-        return True
-
-    if line.startswith("shortcut remove ") or line.startswith("快捷短语 删除 "):
-        pattern = line.split(" ", 2)[-1].strip()
-        if ctx.shortcuts.remove(pattern):
-            console.success(f"Shortcut removed: {pattern}")
-        else:
-            console.warning(f"Shortcut not found: {pattern}")
         return True
 
     return False

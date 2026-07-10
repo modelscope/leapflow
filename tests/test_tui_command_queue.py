@@ -308,6 +308,8 @@ def test_stream_renderer_prints_compression_and_posture_metadata() -> None:
             "compression_reason": "threshold-triggered",
             "context_posture": "research",
             "context_guidance": "maintain research ledger and synthesize findings",
+            "disclosure_level": "selected_tools",
+            "disclosure_reason": "selected capabilities matched observable task signals",
         },
     )
 
@@ -317,6 +319,8 @@ def test_stream_renderer_prints_compression_and_posture_metadata() -> None:
         and "threshold-triggered" in line
         and "research" in line
         and "maintain research ledger" in line
+        and "disclosure=selected_tools" in line
+        and "selected capabilities matched" in line
         for line in console.lines
     )
 

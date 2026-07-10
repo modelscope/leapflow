@@ -290,7 +290,14 @@ class RuntimeLeapService:
             guidance = safe_snapshot.get("context_guidance")
             if guidance:
                 metadata["context_guidance"] = str(guidance)
-            for key in ("compression_reason", "compression_savings_ratio", "compression_saved_tokens"):
+            for key in (
+                "compression_reason",
+                "compression_savings_ratio",
+                "compression_saved_tokens",
+                "disclosure_level",
+                "disclosure_reason",
+                "disclosure",
+            ):
                 if safe_snapshot.get(key) is not None:
                     metadata[key] = safe_snapshot[key]
             metadata["context_budget_snapshot"] = safe_snapshot

@@ -33,6 +33,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - **System Boundary Awareness**: LeapFlow is a multi-entry, multi-module runtime. Changes must account for the affected path across CLI/TUI, leapd, engine, skills/tools, LLM, storage, memory, gateway, hub, and platform adapters.
 - **TUI as the Primary User Entry**: The interactive TUI is the default product surface. Preserve streaming feedback, command queue behavior, approval prompts, status bar accuracy, long-input robustness, history, and session continuity.
 - **leapd Runtime Consistency**: Daemon-backed behavior must preserve lifecycle correctness: start, stop, restart, status, RPC streaming, cancellation, pending approvals, runtime config reload, multi-client state, and version consistency.
+- **Progressive Context Disclosure (PCD)**: Keep one unified execution loop, but never default every turn to full disclosure. Each LLM call must use the smallest sufficient PromptAssemblyPlan for tools, memory, history, reasoning, streaming, and risk; upgrade progressively only when observable signals require it.
 - **Dependency Inversion**: Core logic depends on Protocol abstractions, never on concrete implementations
 - **Protocol over ABC**: Use `typing.Protocol` with `runtime_checkable` for all extension points
 - **Event-Driven Communication**: Modules interact through typed events on EventBus, not direct imports
@@ -47,6 +48,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - Implement against the Protocol, never against another implementation
 - Consider affected user journeys before changing shared flows; do not introduce regressions, broken links, or worse experiences in adjacent paths
 - Keep common paths transparent: long-running work must stream progress, surface recoverable errors clearly, and avoid silent stalls.
+- For context assembly, prefer manifest-driven progressive disclosure over shortcuts or intent-handler sprawl: expose compact capability indexes, selected schemas, and targeted memory only when the current plan needs them.
 - Preserve security and audit paths: dangerous actions, file writes, outbound messages, credentials, and path access must flow through the existing policy, approval, redaction, and audit mechanisms.
 - Maintain backward-compatible migrations for persistent state, configuration, skills, trajectories, sessions, and profile data.
 - Write unit tests before or alongside the implementation
@@ -86,6 +88,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - Hardcoded paths, URLs, thresholds without config escape hatch
 - Chinese comments in source code (English only)
 - Speculative infrastructure: no hooks or extension points without a concrete consumer
+- Shortcut-style natural-language fitting and large intent-handler taxonomies; use stable runtime gates plus capability manifests instead.
 - Bare `except:` clauses — always specify the exception type
 - `# TODO: implement` stubs — implement or don't commit
 

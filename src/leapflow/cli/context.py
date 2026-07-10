@@ -60,7 +60,6 @@ from leapflow.engine.audit import AuditLogger
 from leapflow.learning.similarity import HeuristicSimilarityScorer, LLMSimilarityScorer
 from leapflow.platform.adapters.darwin import DarwinExecutionAdapter, DarwinPerceptionAdapter
 from leapflow.domain.platform import PlatformManifest
-from leapflow.engine.shortcuts import ShortcutStore
 from leapflow.engine.situational_assessor import LLMSituationalAssessor
 from leapflow.platform.facade import VirtualSystemInterface
 from leapflow.platform.normalizer import EventNormalizer
@@ -427,7 +426,6 @@ class Context:
 
         self.audit = AuditLogger(settings.audit_log_path)
 
-        self.shortcuts = ShortcutStore(Path.cwd() / ".leapflow" / "shortcuts.yaml")
         self.assessor: Optional[LLMSituationalAssessor] = None
 
         self.perception_session: Optional[Any] = None
@@ -1671,7 +1669,6 @@ class Context:
             execution=execution_adapter,
             skill_activator=activator,
             session=self.session,
-            shortcuts=self.shortcuts,
             vlm=self.vlm,
             memory_manager=self.memory,
             evolution=self._evolution,
