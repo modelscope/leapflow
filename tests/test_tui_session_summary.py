@@ -20,13 +20,25 @@ class _Message:
 
 class _Console:
     def __init__(self) -> None:
-        self.markdown_calls: list[tuple[str, int]] = []
+        self.markdown_calls: list[dict[str, object]] = []
         self.thinking_calls: list[str] = []
         self.labels: list[tuple[float, int]] = []
         self.lines = 0
 
-    def markdown(self, text: str, *, indent: int = 0) -> None:
-        self.markdown_calls.append((text, indent))
+    def markdown(
+        self,
+        text: str,
+        *,
+        indent: int = 0,
+        margin_top: int = 0,
+        margin_bottom: int = 0,
+    ) -> None:
+        self.markdown_calls.append({
+            "text": text,
+            "indent": indent,
+            "margin_top": margin_top,
+            "margin_bottom": margin_bottom,
+        })
 
     def thinking(self, text: str) -> None:
         self.thinking_calls.append(text)
@@ -130,7 +142,7 @@ def test_stream_renderer_exposes_output_without_private_access() -> None:
     assert renderer.has_output is True
 
 
-def test_stream_renderer_indents_final_response_only() -> None:
+def test_stream_renderer_spaces_and_indents_final_response_only() -> None:
     console = _Console()
     renderer = StreamRenderer(console)
     renderer.start()
@@ -140,7 +152,12 @@ def test_stream_renderer_indents_final_response_only() -> None:
     renderer.finish()
 
     assert console.thinking_calls == ["internal reasoning"]
-    assert console.markdown_calls == [("final **answer**", 4)]
+    assert console.markdown_calls == [{
+        "text": "final **answer**",
+        "indent": 4,
+        "margin_top": 1,
+        "margin_bottom": 0,
+    }]
     assert len(console.labels) == 1
     assert console.lines == 1
 

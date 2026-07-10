@@ -9,6 +9,7 @@ import leapflow.cli.tui_app.app as app_module
 from prompt_toolkit.auto_suggest import Suggestion
 from prompt_toolkit.completion import Completion
 from leapflow.cli.tui_app.app import LeapApp
+from leapflow.cli.tui_app.console import LeapConsole
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
 from leapflow.cli.tui_app.theme import _LIGHT, resolve_theme
 
@@ -131,6 +132,32 @@ async def test_right_arrow_accepts_suggestion_only_at_end() -> None:
 
     assert buffer.text == "abcdef"
     assert buffer.cursor_position == len("abcdef")
+
+
+def test_command_card_keeps_elapsed_in_title_not_body(monkeypatch) -> None:
+    class CapturingConsole:
+        width = 100
+
+        def __init__(self) -> None:
+            self.rendered = []
+
+        def print(self, renderable) -> None:
+            self.rendered.append(renderable)
+
+    capture = CapturingConsole()
+    leap_console = LeapConsole(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    monkeypatch.setattr(leap_console, "_console", capture)
+
+    command = TuiCommand.create(command_id=1, text="summarize the current project layout")
+    command = command.mark_running().mark_done()
+    leap_console.command_card(command)
+
+    panel = capture.rendered[0]
+    title = getattr(panel.title, "plain", str(panel.title))
+    body = getattr(panel.renderable, "plain", str(panel.renderable))
+    assert "done" in title
+    assert "elapsed:" not in body
+    assert "summarize the current project layout" in body
 
 
 @pytest.mark.asyncio

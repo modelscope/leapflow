@@ -11,8 +11,8 @@ Adding a new command = appending one ``CommandDef`` to ``COMMAND_REGISTRY``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,7 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("help", "Show available commands", "Session", aliases=("?", "帮助")),
     CommandDef("clear", "Clear screen and reset display", "Session"),
     CommandDef("status", "Show session info, model, context, and platform", "Session"),
+    CommandDef("host", "Start, stop, or inspect CuaDriver OS control", "Session", args_hint="[status|start|stop|restart]"),
     CommandDef("exit", "Quit LeapFlow", "Session", aliases=("quit", "q", "退出")),
 
     # Chat
@@ -114,6 +115,5 @@ def completion_entries() -> List[Tuple[str, str]]:
     """Build the completion list for LeapApp's TextArea completer."""
     entries: List[Tuple[str, str]] = []
     for cmd in COMMAND_REGISTRY:
-        full = f"/{cmd.name}" if cmd.args_hint else f"/{cmd.name}"
         entries.append((cmd.name, cmd.description))
     return entries

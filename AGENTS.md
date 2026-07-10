@@ -1,5 +1,7 @@
 # AGENTS.md
 
+This document is the LeapFlow engineering collaboration contract. It is not only a style guide: it defines the design, runtime, UX, safety, and verification rules that every implementation change must follow.
+
 ## Design Philosophy
 
 1. **Signal-Driven Intelligence** — All agent intelligence derives from observing real-world signals, not from hardcoded rules. If a behavior cannot be learned from signals, it is not in scope.
@@ -12,52 +14,73 @@
 
 5. **LLM-Native Design** — Design for LLM reasoning first. Protocols over classes. Declarative over imperative. Context over configuration.
 
+6. **User-Centric Reliability** — User experience is part of correctness. Every change must keep common paths easy, predictable, recoverable, and must not degrade adjacent workflows.
+
 ## Code Quality Requirements
 
-- SOLID principles are non-negotiable
+- SOLID principles are non-negotiable; implementations must be cohesive, well-factored, and easy to reason about
 - Occam's Razor: maximize elegance and efficiency, reject unnecessary complexity
-- Design for generalization and universality
+- Design for generalization and universality; prefer reusable domain concepts over one-off special cases
 - Easy to extend, avoid hardcoding and hard rules
 - Industrial-grade robustness: every external call has timeout, retry, and fallback
+- User experience is a first-class quality bar: optimize for clarity, ease of use, fast feedback, and graceful recovery
 - All comments and docstrings in English
 - Type annotations on all public APIs
 - No bare except — always specify exception types
 
 ## Architecture Principles
 
+- **System Boundary Awareness**: LeapFlow is a multi-entry, multi-module runtime. Changes must account for the affected path across CLI/TUI, leapd, engine, skills/tools, LLM, storage, memory, gateway, hub, and platform adapters.
+- **TUI as the Primary User Entry**: The interactive TUI is the default product surface. Preserve streaming feedback, command queue behavior, approval prompts, status bar accuracy, long-input robustness, history, and session continuity.
+- **leapd Runtime Consistency**: Daemon-backed behavior must preserve lifecycle correctness: start, stop, restart, status, RPC streaming, cancellation, pending approvals, runtime config reload, multi-client state, and version consistency.
 - **Dependency Inversion**: Core logic depends on Protocol abstractions, never on concrete implementations
 - **Protocol over ABC**: Use `typing.Protocol` with `runtime_checkable` for all extension points
 - **Event-Driven Communication**: Modules interact through typed events on EventBus, not direct imports
 - **Immutable Domain Types**: Use `@dataclass(frozen=True)` or `NamedTuple` for domain objects
-- **Config-Driven Behavior**: Thresholds, intervals, feature flags — all configurable via env vars
-- **Graceful Degradation**: Every optional component (LLM, Hub, OS Host) can be absent without crash
+- **Config-Driven Behavior**: Thresholds, intervals, feature flags, model budgets, platform capabilities, hub backends, gateway manifests, and paths must be configurable through Settings/env/config layers.
+- **Graceful Degradation**: Every optional component (LLM, Hub) can be absent without crash
 - **Single Source of Truth**: DuckDB for persistence, EventBus for communication, Settings for configuration
 
 ## Implementation Guidelines
 
 - Define the Protocol first — the contract is the design
 - Implement against the Protocol, never against another implementation
+- Consider affected user journeys before changing shared flows; do not introduce regressions, broken links, or worse experiences in adjacent paths
+- Keep common paths transparent: long-running work must stream progress, surface recoverable errors clearly, and avoid silent stalls.
+- Preserve security and audit paths: dangerous actions, file writes, outbound messages, credentials, and path access must flow through the existing policy, approval, redaction, and audit mechanisms.
+- Maintain backward-compatible migrations for persistent state, configuration, skills, trajectories, sessions, and profile data.
 - Write unit tests before or alongside the implementation
 - Integrate via EventBus events, not direct function calls between modules
 - Every module must be importable standalone without side effects
 - No placeholder stubs — implement fully or do not add the code
 - ANSI output must check `sys.stdout.isatty()` before emitting escape codes
 
+## Review Requirements
+
+- **Deep review for large changes**: When a change substantially affects architecture, runtime behavior, user flows, persistence, safety, or multiple modules, perform an additional deep review before considering the work complete.
+- **Design goal check**: Verify that the implementation actually achieves the intended design goal and is not just a local patch.
+- **Optimality check**: Evaluate whether the solution is the simplest robust design, avoids unnecessary abstractions, and fits the existing architecture.
+- **Regression impact check**: Inspect affected modules and user journeys for logic bugs, degraded UX, broken compatibility, slower feedback, weaker diagnostics, or worse failure recovery.
+- **SOLID and extensibility check**: Look for responsibility leaks, tight coupling, hardcoded paths/thresholds/rules, magic strings, and choices that reduce generalization or future extension.
+- **Fix what the review finds**: If the review identifies correctness, design, UX, SOLID, hardcoding, or extensibility issues, fix and simplify them directly rather than only reporting them.
+
 ## Testing Philosophy
 
-- **Unit tests must be hermetic**: no network, no OS Host, no LLM calls
+- **Unit tests must be hermetic**: no network, no LLM calls
 - **py_compile all modified files**: syntax errors caught before test run
 - **Import chain verification**: every new module must be importable standalone
 - **Existing tests must not regress**: all tests must pass after every change
+- **User-facing flows must not regress**: preserve or improve usability, feedback clarity, and failure recovery for impacted paths
 - **Verification sequence**: compile → import → unit test → integration (if applicable)
 - **Behavior contracts over snapshots**: assert invariants, not frozen values
-- **Mock at boundaries only**: mock external I/O (network, disk, OS Host), never internal logic
+- **Mock at boundaries only**: mock external I/O (network, disk), never internal logic
+- **Change-scoped validation**: Run the most specific relevant tests first, then broaden only as needed: CLI/TUI changes require CLI/TUI tests; leapd changes require daemon RPC/lifecycle tests; storage or memory changes require persistence tests; gateway or approval changes require security/approval tests; skills, learning, perception, and copilot changes require their lifecycle or pipeline tests.
 
 ## What to Avoid
 
 - Over-engineering: if you need 3+ files for a simple feature, rethink
 - Premature optimization: measure first, optimize only bottlenecks
-- God objects: no class should exceed 300 lines
+- God objects: no class should exceed 500 lines; approaching this limit requires checking whether policy, state, rendering, protocol, storage, or adapter responsibilities should be split.
 - Magic strings: use constants or enums
 - Blocking the event loop: all IO must be async or `run_in_executor`
 - Hardcoded paths, URLs, thresholds without config escape hatch

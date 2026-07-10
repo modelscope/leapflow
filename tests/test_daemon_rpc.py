@@ -243,6 +243,87 @@ async def test_runtime_service_status_reports_host_backend() -> None:
 
 
 @pytest.mark.asyncio
+async def test_daemon_client_host_lifecycle_rpc() -> None:
+    class HostRpcService(_FakeService):
+        async def host_status(self) -> dict[str, Any]:
+            return {"backend": "mock", "started": False}
+
+        async def host_start(self) -> dict[str, Any]:
+            return {"ok": True, "backend": "cua-driver", "started": True}
+
+        async def host_stop(self) -> dict[str, Any]:
+            return {"ok": True, "backend": "mock", "started": False}
+
+        async def host_restart(self) -> dict[str, Any]:
+            return {"ok": True, "backend": "cua-driver", "started": True, "changed": True}
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        server, task, run_dir = await _start_server(Path(root) / "run", service=HostRpcService())
+        client = DaemonClient(run_dir / "leapd.sock")
+        try:
+            status = await client.host_status()
+            started = await client.host_start()
+            stopped = await client.host_stop()
+            restarted = await client.host_restart()
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert status == {"backend": "mock", "started": False}
+    assert started["started"] is True
+    assert stopped["backend"] == "mock"
+    assert restarted["changed"] is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_service_host_lifecycle_delegates_to_context() -> None:
+    from conftest import make_settings
+    from leapflow.daemon.service import RuntimeLeapService
+
+    class FakeContext:
+        def __init__(self, settings) -> None:
+            self.settings = settings
+            self.calls: list[str] = []
+            self.rpc = object()
+
+        async def host_backend_status(self) -> dict[str, Any]:
+            self.calls.append("status")
+            return {"backend": "mock", "started": False}
+
+        async def host_backend_start(self) -> dict[str, Any]:
+            self.calls.append("start")
+            return {"ok": True, "backend": "cua-driver", "started": True}
+
+        async def host_backend_stop(self) -> dict[str, Any]:
+            self.calls.append("stop")
+            return {"ok": True, "backend": "mock", "started": False}
+
+        async def host_backend_restart(self) -> dict[str, Any]:
+            self.calls.append("restart")
+            return {"ok": True, "backend": "cua-driver", "started": True}
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        settings = make_settings(root)
+        service = RuntimeLeapService(settings, mock_host=True)
+        ctx = FakeContext(settings)
+        service._ctx = ctx
+        status = await service.host_status()
+        started = await service.host_start()
+        stopped = await service.host_stop()
+        restarted = await service.host_restart()
+
+    assert status["backend"] == "mock"
+    assert started["started"] is True
+    assert stopped["started"] is False
+    assert restarted["backend"] == "cua-driver"
+    assert ctx.calls == ["status", "start", "stop", "restart"]
+
+
+@pytest.mark.asyncio
 async def test_daemon_client_approval_resolve_rpc() -> None:
     class ApprovalRpcService(_FakeService):
         async def approval_resolve(self, pending_id: str, decision: str, reason: str = "") -> dict[str, Any]:

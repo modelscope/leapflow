@@ -157,6 +157,41 @@ class RuntimeLeapService:
             "host_backend": self._host_backend_status(ctx),
         }
 
+    async def host_status(self) -> dict[str, Any]:
+        """Return daemon-owned host backend status."""
+        ctx = self.context
+        status = getattr(ctx, "host_backend_status", None)
+        if callable(status):
+            return dict(await status())
+        return self._host_backend_status(ctx)
+
+    async def host_start(self) -> dict[str, Any]:
+        """Start daemon-owned CuaDriver without resetting chat state."""
+        async with self._engine_lock:
+            ctx = self.context
+            start = getattr(ctx, "host_backend_start", None)
+            if not callable(start):
+                return {"ok": False, "started": False, "last_error": "host lifecycle is unavailable"}
+            return dict(await start())
+
+    async def host_stop(self) -> dict[str, Any]:
+        """Stop daemon-owned CuaDriver without shutting down leapd."""
+        async with self._engine_lock:
+            ctx = self.context
+            stop = getattr(ctx, "host_backend_stop", None)
+            if not callable(stop):
+                return {"ok": False, "started": False, "last_error": "host lifecycle is unavailable"}
+            return dict(await stop())
+
+    async def host_restart(self) -> dict[str, Any]:
+        """Restart daemon-owned CuaDriver without resetting chat state."""
+        async with self._engine_lock:
+            ctx = self.context
+            restart = getattr(ctx, "host_backend_restart", None)
+            if not callable(restart):
+                return {"ok": False, "started": False, "last_error": "host lifecycle is unavailable"}
+            return dict(await restart())
+
     async def approval_status(self) -> dict[str, Any]:
         """Return currently pending daemon approval requests."""
         return {"pending": self._pending_payloads()}

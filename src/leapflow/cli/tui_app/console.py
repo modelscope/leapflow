@@ -27,6 +27,16 @@ _COMMAND_CARD_MIN_SUMMARY = 32
 _COMMAND_CARD_PADDING = 24
 
 
+def _format_card_elapsed(seconds: float) -> str:
+    """Format command-card elapsed time without consuming a body line."""
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    return f"{minutes}m{seconds - minutes * 60:.0f}s"
+
+
 def _build_rich_theme(theme: Theme | ResolvedTheme) -> RichTheme:
     """Map LeapFlow theme to a Rich style dict."""
     return RichTheme({
@@ -100,12 +110,11 @@ class LeapConsole:
         if command.error:
             body.append("\n")
             body.append(command.error, style="leap.error")
-        if command.elapsed_s > 0:
-            body.append("\n")
-            body.append(f"elapsed: {command.elapsed_s:.1f}s", style="leap.dim")
         title = Text()
         title.append(command.label, style="bold")
         title.append(f" {command.status.value}", style=title_styles[command.status])
+        if command.elapsed_s > 0:
+            title.append(f"  {_format_card_elapsed(command.elapsed_s)}", style="leap.dim")
         self._console.print(Panel(
             body,
             title=title,
@@ -114,15 +123,26 @@ class LeapConsole:
             padding=(0, 1),
         ))
 
-    def markdown(self, text: str, *, code_theme: str = "monokai", indent: int = 0) -> None:
-        """Render markdown content with syntax-highlighted code blocks."""
+    def markdown(
+        self,
+        text: str,
+        *,
+        code_theme: str = "monokai",
+        indent: int = 0,
+        margin_top: int = 0,
+        margin_bottom: int = 0,
+    ) -> None:
+        """Render markdown content with optional visual spacing."""
         if not text.strip():
             return
         md = Markdown(
             text,
             code_theme=code_theme if self._theme.name == "dark" else "default",
         )
-        renderable = Padding(md, (0, 0, 0, indent)) if indent > 0 else md
+        if indent > 0 or margin_top > 0 or margin_bottom > 0:
+            renderable = Padding(md, (margin_top, 0, margin_bottom, indent))
+        else:
+            renderable = md
         self._console.print(renderable)
 
     def code(self, source: str, language: str = "python", *, title: str = "") -> None:

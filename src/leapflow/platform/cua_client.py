@@ -633,6 +633,11 @@ class CuaDriverClient(HostRpc):
         prefix = method.split(".", 1)[0] if method else ""
         return self._timeout_map.get(prefix, self._call_timeout)
 
+    @property
+    def connected(self) -> bool:
+        """Return True when the cua-driver MCP session is active."""
+        return self._session.started
+
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     def start(self) -> None:

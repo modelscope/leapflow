@@ -75,6 +75,40 @@ async def _ask_yes_no_default_yes(prompt: str) -> bool:
     return answer not in {"n", "no"}
 
 
+def _host_started(status: dict[str, Any]) -> bool:
+    return bool(status.get("started")) and str(status.get("backend") or "") != "mock"
+
+
+def _print_host_status(console: Any, host: dict[str, Any]) -> None:
+    backend = str(host.get("backend") or "unknown")
+    if _host_started(host):
+        console.success("Host is on — CuaDriver OS control is connected.")
+    else:
+        console.system("Host is off — CuaDriver is not running for this session.")
+    console.system(
+        "Host/CuaDriver lets LeapFlow see and control the desktop: screenshots, UI automation, "
+        "app/clipboard actions."
+    )
+    console.system(
+        "Stopping it releases the background CuaDriver process; chat, memory, approvals, "
+        "skills, and non-OS tools keep working."
+    )
+    tools = host.get("tools_count")
+    extra = f" tools={tools}" if tools is not None else ""
+    console.system(f"backend={backend} started={host.get('started')}{extra}")
+    if host.get("last_error"):
+        console.warning(f"host error: {host['last_error']}")
+
+
+def _host_action(args: str) -> str:
+    action = (args or "status").strip().lower()
+    if action in {"on", "up", "enable"}:
+        return "start"
+    if action in {"off", "down", "disable"}:
+        return "stop"
+    return action
+
+
 async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) -> int:
     """Persistent REPL session with hybrid TUI (Application + Rich)."""
     require_initialized(ctx)
@@ -366,6 +400,26 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 handle_status(ctx, console, cmd_args)
                 return
 
+            if canonical == "host":
+                action = _host_action(cmd_args)
+                if action == "status":
+                    result = await ctx.host_backend_status()
+                elif action == "start":
+                    console.system("Starting CuaDriver OS control for this session…")
+                    result = await ctx.host_backend_start()
+                elif action == "stop":
+                    console.system("Stopping CuaDriver OS control; chat and memory stay available…")
+                    result = await ctx.host_backend_stop()
+                elif action == "restart":
+                    console.system("Restarting CuaDriver OS control…")
+                    result = await ctx.host_backend_restart()
+                else:
+                    console.warning("Usage: /host [status|start|stop|restart]")
+                    return
+                _print_host_status(console, result)
+                _update_status()
+                return
+
             if canonical == "clear":
                 handle_clear(ctx, console, cmd_args)
                 _render_banner()
@@ -566,10 +620,11 @@ async def cmd_interactive_daemon(
     runtime_context_length = int(getattr(settings, "llm_context_length", 0) or 0)
     runtime_context_used = 0
     runtime_daemon_pid = ""
+    runtime_host_online = False
 
     def _apply_daemon_runtime_metadata(metadata: dict[str, Any]) -> None:
         nonlocal active_session_id, runtime_model_name, runtime_context_length
-        nonlocal runtime_context_used, runtime_daemon_pid
+        nonlocal runtime_context_used, runtime_daemon_pid, runtime_host_online
         if metadata.get("pid"):
             runtime_daemon_pid = str(metadata["pid"])
         if metadata.get("session_id"):
@@ -588,12 +643,15 @@ async def cmd_interactive_daemon(
                 runtime_context_used = max(0, int(metadata["context_used"]))
             except (TypeError, ValueError):
                 pass
+        host = metadata.get("host_backend")
+        if isinstance(host, dict):
+            runtime_host_online = _host_started(host)
 
     def _update_status() -> None:
         status.update(
             mode="daemon",
             skill_count=0,
-            platform_online=True,
+            platform_online=runtime_host_online,
             model_name=runtime_model_name,
             session_turns=turn_count,
             context_used=runtime_context_used,
@@ -606,7 +664,7 @@ async def cmd_interactive_daemon(
             model=runtime_model_name,
             cwd=os.getcwd(),
             session_id=active_session_id,
-            platform_online=True,
+            platform_online=runtime_host_online,
             tool_defs=TOOL_DEFINITIONS,
             skills=[],
             context_length=runtime_context_length,
@@ -657,6 +715,9 @@ async def cmd_interactive_daemon(
         context_used = daemon_status.get("context_used")
         if context_used is not None:
             console.system(f"Context used: {int(context_used):,} tokens")
+        host = daemon_status.get("host_backend")
+        if isinstance(host, dict):
+            _print_host_status(console, host)
 
     async def _handle_daemon_approval(event: StreamEvent) -> None:
         from leapflow.cli.approval_view import prompt_approval
@@ -733,6 +794,30 @@ async def cmd_interactive_daemon(
                 return
             if canonical == "status":
                 await _print_daemon_status()
+                return
+            if canonical == "host":
+                action = _host_action(cmd_text[len(canonical):].strip())
+                try:
+                    if action == "status":
+                        result = await client.host_status()
+                    elif action == "start":
+                        console.system("Starting CuaDriver OS control for this session…")
+                        result = await client.host_start()
+                    elif action == "stop":
+                        console.system("Stopping CuaDriver OS control; chat and memory stay available…")
+                        result = await client.host_stop()
+                    elif action == "restart":
+                        console.system("Restarting CuaDriver OS control…")
+                        result = await client.host_restart()
+                    else:
+                        console.warning("Usage: /host [status|start|stop|restart]")
+                        return
+                except Exception as exc:
+                    console.warning(f"Host control failed: {exc}")
+                    return
+                _apply_daemon_runtime_metadata({"host_backend": result})
+                _print_host_status(console, result)
+                _update_status()
                 return
             if canonical == "clear":
                 _render_banner()

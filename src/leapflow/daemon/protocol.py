@@ -187,6 +187,22 @@ class LeapService(Protocol):
         """Return daemon status (uptime, connections, db path, etc.)."""
         ...
 
+    async def host_status(self) -> Dict[str, Any]:
+        """Return host backend status."""
+        ...
+
+    async def host_start(self) -> Dict[str, Any]:
+        """Start the host backend if available."""
+        ...
+
+    async def host_stop(self) -> Dict[str, Any]:
+        """Stop the host backend and keep the daemon runtime alive."""
+        ...
+
+    async def host_restart(self) -> Dict[str, Any]:
+        """Restart the host backend."""
+        ...
+
     async def approval_status(self) -> Dict[str, Any]:
         """Return pending approval requests."""
         ...
@@ -254,6 +270,10 @@ METHOD_REGISTRY: Dict[str, str] = {
     "scheduler.arm": "scheduler_arm",
     "daemon.status": "status",
     "daemon.shutdown": "shutdown",
+    "host.status": "host_status",
+    "host.start": "host_start",
+    "host.stop": "host_stop",
+    "host.restart": "host_restart",
     "approval.status": "approval_status",
     "approval.resolve": "approval_resolve",
     "approval.cancel": "approval_cancel",

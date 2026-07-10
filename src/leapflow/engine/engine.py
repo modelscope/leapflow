@@ -375,6 +375,33 @@ class AgentEngine:
         """Configure output message sanitizer."""
         self._sanitizer = sanitizer
 
+    def reconfigure_host_backend(
+        self,
+        *,
+        rpc: HostRpc,
+        perception: Optional[Any],
+        execution: Optional[Any],
+        tool_bridge: Optional[Any],
+    ) -> None:
+        """Refresh host RPC and adapters without resetting chat/session state."""
+        self._rpc = rpc
+        self._perception = perception
+        self._execution = execution
+        self._tool_bridge = tool_bridge
+        self._skill_merger = SkillMerger(
+            registry=self._registry,
+            llm=self._llm,
+            execution=execution,
+        )
+        if self._settings.has_llm_credentials:
+            self._scheduler = TaskScheduler(
+                self._registry,
+                rpc,
+                graph_planner=self._graph_planner,
+            )
+        else:
+            self._scheduler = None
+
     def reconfigure_runtime(
         self,
         *,

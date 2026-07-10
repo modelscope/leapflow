@@ -96,6 +96,26 @@ class DaemonClient:
         result = await self.request("daemon.status")
         return dict(result or {})
 
+    async def host_status(self) -> dict[str, Any]:
+        """Return daemon-owned host backend status."""
+        result = await self.request("host.status")
+        return dict(result or {})
+
+    async def host_start(self) -> dict[str, Any]:
+        """Start the daemon-owned host backend."""
+        result = await self.request("host.start")
+        return dict(result or {})
+
+    async def host_stop(self) -> dict[str, Any]:
+        """Stop the daemon-owned host backend."""
+        result = await self.request("host.stop")
+        return dict(result or {})
+
+    async def host_restart(self) -> dict[str, Any]:
+        """Restart the daemon-owned host backend."""
+        result = await self.request("host.restart")
+        return dict(result or {})
+
     async def approval_status(self) -> dict[str, Any]:
         """Return pending daemon approval requests."""
         result = await self.request("approval.status")

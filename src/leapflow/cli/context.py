@@ -439,6 +439,10 @@ class Context:
         self.session_store: Optional[LearningSessionStore] = None
         self.engine: Optional[AgentEngine] = None
         self.intent_classifier: Optional[IntentClassifier] = None
+        self._platform_manifest: Optional[PlatformManifest] = None
+        self._platform_perception: Optional[Any] = None
+        self._platform_execution: Optional[Any] = None
+        self._platform_event_callback: Optional[Callable[[Any], None]] = None
 
         # World Model components (wired during initialize)
         self.learning_budget: Optional[Any] = None
@@ -709,6 +713,155 @@ class Context:
         logger.info("Runtime LLM configuration reloaded")
         return True
 
+    def _host_backend_snapshot(self) -> dict[str, Any]:
+        snapshot = getattr(self.rpc, "status_snapshot", None)
+        if callable(snapshot):
+            try:
+                return dict(snapshot())
+            except Exception as exc:
+                return {
+                    "backend": type(self.rpc).__name__,
+                    "started": False,
+                    "pid": None,
+                    "pid_source": "unavailable",
+                    "last_error": str(exc),
+                }
+        return {
+            "backend": type(self.rpc).__name__,
+            "started": bool(getattr(self.rpc, "connected", False)),
+            "pid": None,
+            "pid_source": "unavailable",
+        }
+
+    async def host_backend_status(self) -> dict[str, Any]:
+        """Return the current daemon-owned host backend status."""
+        return self._host_backend_snapshot()
+
+    async def host_backend_start(self) -> dict[str, Any]:
+        """Start CuaDriver and rewire runtime host adapters in-place."""
+        if self.effective_mock:
+            return {
+                "ok": False,
+                "backend": "mock",
+                "started": False,
+                "pid": None,
+                "pid_source": "unavailable",
+                "last_error": "host backend is disabled by mock mode",
+            }
+        if isinstance(self.rpc, CuaDriverClient) and self.rpc.connected:
+            status = self._host_backend_snapshot()
+            status.update({"ok": True, "changed": False})
+            return status
+
+        previous_rpc = self.rpc
+        next_rpc = CuaDriverClient()
+        try:
+            next_rpc.start()
+            manifest = await VirtualSystemInterface(next_rpc).handshake()
+            await self._rewire_host_backend(next_rpc, manifest, bridge_online=True)
+        except Exception as exc:
+            try:
+                next_rpc.stop()
+            except Exception:
+                logger.debug("CuaDriverClient cleanup failed after start error", exc_info=True)
+            return {
+                "ok": False,
+                "backend": "cua-driver",
+                "started": False,
+                "pid": None,
+                "pid_source": "unavailable",
+                "last_error": str(exc),
+            }
+
+        if isinstance(previous_rpc, CuaDriverClient) and previous_rpc is not next_rpc:
+            try:
+                previous_rpc.stop()
+            except Exception:
+                logger.debug("previous CuaDriverClient stop failed after host start", exc_info=True)
+        status = self._host_backend_snapshot()
+        status.update({"ok": True, "changed": True})
+        return status
+
+    async def host_backend_stop(self) -> dict[str, Any]:
+        """Stop CuaDriver while preserving chat, memory, and daemon runtime state."""
+        previous_rpc = self.rpc
+        stop_error = ""
+        if isinstance(previous_rpc, CuaDriverClient):
+            try:
+                previous_rpc.stop()
+            except Exception as exc:
+                stop_error = str(exc)
+                logger.debug("CuaDriverClient stop failed during host_backend_stop", exc_info=True)
+
+        mock_rpc = MockBridge()
+        mock_rpc.on_event(self.event_bus.handle_event)
+        manifest = PlatformManifest.default_darwin()
+        await self._rewire_host_backend(mock_rpc, manifest, bridge_online=False)
+        status = self._host_backend_snapshot()
+        status.update({"ok": not stop_error, "changed": True})
+        if stop_error:
+            status["last_error"] = stop_error
+        return status
+
+    async def host_backend_restart(self) -> dict[str, Any]:
+        """Restart CuaDriver and keep daemon/session state intact."""
+        await self.host_backend_stop()
+        return await self.host_backend_start()
+
+    async def _rewire_host_backend(
+        self,
+        rpc: CuaDriverClient | MockBridge,
+        manifest: PlatformManifest,
+        *,
+        bridge_online: bool,
+    ) -> None:
+        previous_callback = self._platform_event_callback
+        if previous_callback is not None:
+            self.event_bus.unsubscribe(previous_callback)
+            self._platform_event_callback = None
+
+        self.rpc = rpc
+        self.event_bus.set_normalizer(EventNormalizer(manifest))
+
+        perception: Any
+        execution_adapter: Any
+        if not self.effective_mock and bridge_online:
+            perception = DarwinPerceptionAdapter(rpc, manifest)
+            execution_adapter = DarwinExecutionAdapter(rpc, manifest)
+            self.event_bus.subscribe(perception.enqueue_event)
+            self._platform_event_callback = perception.enqueue_event
+            home = str(Path.home())
+            cwd = str(Path.cwd())
+            for watch_path in dict.fromkeys([home, cwd]):
+                try:
+                    result = await rpc.call("fs.subscribe", {"path": watch_path})
+                    logger.info("Subscribed to FS events after host switch: %s", watch_path)
+                    for evt in (result.get("recent") or []):
+                        await self.event_bus.handle_event("event.fs_change", dict(evt))
+                except Exception as exc:
+                    logger.warning("Failed to subscribe FS events for %s: %s", watch_path, exc)
+        else:
+            from leapflow.platform.adapters.mock import MockExecutionAdapter, MockPerceptionAdapter
+            perception = MockPerceptionAdapter()
+            execution_adapter = MockExecutionAdapter()
+
+        self._platform_manifest = manifest
+        self._platform_perception = perception
+        self._platform_execution = execution_adapter
+
+        if self.engine is not None:
+            from leapflow.skills.bridge_factory import build_tool_bridge
+            from leapflow.tools import bootstrap_tools
+
+            tool_bridge = build_tool_bridge(execution_adapter, perception)
+            bootstrap_tools(tool_bridge)
+            self.engine.reconfigure_host_backend(
+                rpc=rpc,
+                perception=perception,
+                execution=execution_adapter,
+                tool_bridge=tool_bridge,
+            )
+
     @property
     def storage_volatile(self) -> bool:
         """Return True when this process uses non-persistent fallback storage."""
@@ -771,6 +924,7 @@ class Context:
             perception = DarwinPerceptionAdapter(self.rpc, manifest)
             execution_adapter = DarwinExecutionAdapter(self.rpc, manifest)
             self.event_bus.subscribe(perception.enqueue_event)
+            self._platform_event_callback = perception.enqueue_event
             home = str(Path.home())
             cwd = str(Path.cwd())
             for watch_path in dict.fromkeys([home, cwd]):
@@ -785,6 +939,11 @@ class Context:
             from leapflow.platform.adapters.mock import MockExecutionAdapter, MockPerceptionAdapter
             perception = MockPerceptionAdapter()
             execution_adapter = MockExecutionAdapter()
+            self._platform_event_callback = None
+
+        self._platform_manifest = manifest
+        self._platform_perception = perception
+        self._platform_execution = execution_adapter
 
         logger.info(
             "Platform: %s (v%s) | Capabilities: %d",
