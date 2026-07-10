@@ -91,6 +91,22 @@ def _print_runtime_status(status: dict) -> None:
         print(f"project_env: {status['project_env_path']}")
     if status.get("db_path"):
         print(f"db: {status['db_path']}")
+    host = status.get("host_backend")
+    if isinstance(host, dict):
+        print(
+            "host: "
+            f"backend={host.get('backend')} "
+            f"started={host.get('started')} "
+            f"pid={host.get('pid')}"
+        )
+        if host.get("command"):
+            args = " ".join(str(arg) for arg in host.get("args") or [])
+            command = f"{host.get('command')} {args}".strip()
+            print(f"host_command: {command}")
+        if host.get("capability_version"):
+            print(f"host_capability: {host['capability_version']}")
+        if host.get("last_error"):
+            print(f"host_error: {host['last_error']}")
 
 
 def _start(settings: object, mock_host: bool) -> int:

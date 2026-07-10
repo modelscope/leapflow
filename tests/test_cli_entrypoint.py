@@ -479,6 +479,148 @@ def test_stdin_echo_guard_restores_and_flushes_tty(monkeypatch) -> None:
     ]
 
 
+def test_context_uses_mock_bridge_when_cua_driver_disabled(tmp_path) -> None:
+    from leapflow.cli.context import Context
+    from leapflow.platform.mock import MockBridge
+
+    settings = replace(make_settings(str(tmp_path)), mock_host=False, use_cua_driver=False)
+    ctx = Context(settings, mock_host=False)
+
+    assert isinstance(ctx.rpc, MockBridge)
+
+
+@pytest.mark.asyncio
+async def test_context_initialize_replaces_failed_cua_driver_with_mock(monkeypatch, tmp_path) -> None:
+    import leapflow.cli.context as context_module
+    from leapflow.platform.mock import MockBridge
+
+    class FailingCuaDriverClient:
+        def start(self) -> None:
+            raise RuntimeError("cua-driver unavailable")
+
+        def stop(self) -> None:
+            raise AssertionError("failed driver should be replaced")
+
+    settings = replace(make_settings(str(tmp_path)), mock_host=False, use_cua_driver=True)
+    monkeypatch.setattr(context_module, "CuaDriverClient", FailingCuaDriverClient)
+
+    ctx = context_module.Context(settings, mock_host=False)
+    await ctx.initialize()
+    try:
+        assert isinstance(ctx.rpc, MockBridge)
+        assert ctx.engine is not None
+    finally:
+        await ctx.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_context_cleanup_continues_when_cua_driver_stop_fails(tmp_path) -> None:
+    from leapflow.cli.context import Context
+    from leapflow.platform.cua_client import CuaDriverClient
+
+    class FailingCuaDriverClient(CuaDriverClient):
+        def __init__(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            raise RuntimeError("stop failed")
+
+    class CloseTracker:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    ctx = Context(make_settings(str(tmp_path)), mock_host=True)
+    await ctx.initialize()
+    tracker = CloseTracker()
+    ctx.rpc = FailingCuaDriverClient()
+    ctx.skill_lib = tracker
+
+    await ctx.cleanup()
+
+    assert tracker.closed is True
+
+
+@pytest.mark.asyncio
+async def test_host_doctor_stops_client_when_probe_fails(monkeypatch) -> None:
+    from leapflow.cli.commands import host as host_module
+    import leapflow.platform.cua_client as cua_module
+
+    calls: list[str] = []
+
+    class FakeSession:
+        available_tools = {"list_apps": set()}
+        capability_version = "test-cap"
+
+        def call_tool_sync(self, name, args, timeout=5.0):
+            calls.append(f"probe:{name}")
+            raise RuntimeError("probe failed")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self._session = FakeSession()
+
+        def start(self) -> None:
+            calls.append("start")
+
+        def stop(self) -> None:
+            calls.append("stop")
+
+    monkeypatch.setattr(host_module, "_cua_driver_installed", lambda: True)
+    monkeypatch.setattr(host_module, "_cua_driver_version", lambda: "test-version")
+    monkeypatch.setattr(host_module.shutil, "which", lambda command: "/tmp/cua-driver")
+    monkeypatch.setattr(cua_module, "CuaDriverClient", FakeClient)
+
+    result = await host_module._cmd_doctor()
+
+    assert result == 1
+    assert calls == ["start", "probe:list_apps", "stop"]
+
+
+@pytest.mark.asyncio
+async def test_host_status_reports_daemon_host_backend(monkeypatch, tmp_path, capsys) -> None:
+    from conftest import make_settings
+    from leapflow.cli.commands import host as host_module
+
+    class Info:
+        pid = 123
+        is_healthy = True
+        is_running = True
+        sock_path = tmp_path / "leapd.sock"
+
+    settings = replace(make_settings(str(tmp_path)), use_cua_driver=True)
+
+    async def fake_fetch(settings_obj):
+        return Info(), {
+            "host_backend": {
+                "backend": "cua-driver",
+                "started": True,
+                "pid": None,
+                "pid_source": "unavailable",
+                "command": "/tmp/cua-driver",
+                "args": ["mcp"],
+                "tools_count": 3,
+                "restart_count": 1,
+            }
+        }, ""
+
+    monkeypatch.setattr(host_module, "load_config", lambda: settings)
+    monkeypatch.setattr(host_module, "_fetch_leapd_status", fake_fetch)
+    monkeypatch.setattr(host_module, "_read_pid_file", lambda: None)
+    monkeypatch.setattr(host_module, "_cua_driver_installed", lambda: True)
+    monkeypatch.setattr(host_module, "_cua_driver_version", lambda: "test-version")
+    monkeypatch.setattr(host_module.shutil, "which", lambda command: "/tmp/cua-driver")
+
+    assert await host_module._cmd_status() == 0
+
+    output = capsys.readouterr().out
+    assert "leapd healthy" in output
+    assert "Backend: cua-driver started=True" in output
+    assert "Tools: 3 restarts=1" in output
+
+
 @pytest.mark.asyncio
 async def test_daemon_tui_exit_prompt_stops_by_default(monkeypatch, tmp_path) -> None:
     from leapflow.cli.commands import interactive as interactive_module

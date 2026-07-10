@@ -169,6 +169,80 @@ async def test_runtime_service_streams_pending_approval_and_resolves(tmp_path) -
 
 
 @pytest.mark.asyncio
+async def test_daemon_shutdown_rpc_triggers_server_stop() -> None:
+    class ShutdownService(_FakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.shutdown_called = False
+
+        async def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        run_dir = Path(root) / "run"
+        service = ShutdownService()
+        shutdown_event = asyncio.Event()
+        server = UnixRpcServer(
+            service,
+            sock_path=run_dir / "leapd.sock",
+            run_dir=run_dir,
+            on_shutdown=shutdown_event.set,
+        )
+        task = asyncio.create_task(server.serve_forever())
+        for _ in range(50):
+            if (run_dir / "leapd.sock").exists():
+                break
+            await asyncio.sleep(0.02)
+        else:
+            task.cancel()
+            raise AssertionError("server did not start")
+        client = DaemonClient(run_dir / "leapd.sock")
+        try:
+            await client.shutdown()
+            await asyncio.wait_for(shutdown_event.wait(), timeout=1.0)
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert service.shutdown_called is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_service_status_reports_host_backend() -> None:
+    from conftest import make_settings
+    from leapflow.daemon.service import RuntimeLeapService
+
+    class FakeRpc:
+        def status_snapshot(self) -> dict[str, Any]:
+            return {"backend": "cua-driver", "started": True, "tools_count": 2}
+
+    class FakeContext:
+        rpc = FakeRpc()
+        engine = None
+        storage_volatile = False
+
+        def __init__(self, settings) -> None:
+            self.settings = settings
+            self._db_holder = None
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        settings = make_settings(root)
+        service = RuntimeLeapService(settings, mock_host=True)
+        service._ctx = FakeContext(settings)
+        status = await service.status()
+
+    assert status["host_backend"] == {
+        "backend": "cua-driver",
+        "started": True,
+        "tools_count": 2,
+    }
+
+
+@pytest.mark.asyncio
 async def test_daemon_client_approval_resolve_rpc() -> None:
     class ApprovalRpcService(_FakeService):
         async def approval_resolve(self, pending_id: str, decision: str, reason: str = "") -> dict[str, Any]:
@@ -426,6 +500,14 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
         "config_path": "/home/.leapflow/.env",
         "project_env_path": "/repo/.env",
         "db_path": "/home/.leapflow/db/leap.duckdb",
+        "host_backend": {
+            "backend": "cua-driver",
+            "started": True,
+            "pid": None,
+            "command": "/tmp/cua-driver",
+            "args": ["mcp"],
+            "capability_version": "test-cap",
+        },
     })
 
     output = capsys.readouterr().out
@@ -434,6 +516,9 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
     assert "version: 0.0.test" in output
     assert "source: /repo/src/leapflow/__init__.py" in output
     assert "python: /venv/bin/python" in output
+    assert "host: backend=cua-driver started=True pid=None" in output
+    assert "host_command: /tmp/cua-driver mcp" in output
+    assert "host_capability: test-cap" in output
 
 
 def test_daemon_restart_stops_waits_and_starts(monkeypatch, tmp_path) -> None:

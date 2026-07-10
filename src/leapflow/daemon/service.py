@@ -154,6 +154,7 @@ class RuntimeLeapService:
             "runtime_executable": sys.executable,
             "runtime_version": self._runtime_version(),
             "pending_approvals": len(self._approval_pending),
+            "host_backend": self._host_backend_status(ctx),
         }
 
     async def approval_status(self) -> dict[str, Any]:
@@ -193,6 +194,23 @@ class RuntimeLeapService:
         except ImportError:
             return "unknown"
         return str(__version__)
+
+    def _host_backend_status(self, ctx: Any | None) -> dict[str, Any]:
+        if ctx is None:
+            return {"backend": "none", "started": False, "reason": "runtime_not_initialized"}
+        rpc = getattr(ctx, "rpc", None)
+        snapshot = getattr(rpc, "status_snapshot", None)
+        if callable(snapshot):
+            try:
+                return dict(snapshot())
+            except Exception as exc:
+                return {"backend": type(rpc).__name__, "started": False, "last_error": str(exc)}
+        return {
+            "backend": type(rpc).__name__ if rpc is not None else "none",
+            "started": rpc is not None,
+            "pid": None,
+            "pid_source": "unavailable",
+        }
 
     async def shutdown(self) -> None:
         if self._ctx is None:

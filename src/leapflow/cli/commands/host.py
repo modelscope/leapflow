@@ -7,6 +7,7 @@ observers for passive signal collection.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import platform as platform_mod
 import shutil
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Optional
 
 from leapflow.config import load_config
+
+logger = logging.getLogger(__name__)
 
 # ── ANSI colors ──────────────────────────────────────────────────────────
 
@@ -120,16 +123,50 @@ def _remove_pid_file() -> None:
         pass
 
 
+async def _fetch_leapd_status(settings: object) -> tuple[object, Optional[dict], str]:
+    """Return leapd discovery info plus runtime status when available."""
+    from leapflow.daemon.client import DaemonClient
+    from leapflow.daemon.lifecycle import DaemonInfo
+
+    run_dir = getattr(settings, "profile_dir") / "run"
+    info = DaemonInfo.discover(run_dir)
+    if not info.is_healthy or info.sock_path is None:
+        return info, None, ""
+    try:
+        return info, await DaemonClient(info.sock_path).status(), ""
+    except Exception as exc:
+        return info, None, str(exc)
+
+
+async def _stop_leapd_if_running(settings: object) -> bool:
+    """Stop leapd so the daemon-owned CuaDriverClient releases its MCP session."""
+    from leapflow.daemon.lifecycle import DaemonInfo, send_signal
+
+    run_dir = getattr(settings, "profile_dir") / "run"
+    info = DaemonInfo.discover(run_dir)
+    if not info.is_running:
+        return False
+    if send_signal(run_dir, signal.SIGTERM):
+        _ok(f"Sent SIGTERM to leapd (PID {info.pid})")
+        return True
+    _warn("leapd is running but could not be signalled")
+    return False
+
+
 # ── Subcommand implementations ──────────────────────────────────────────
 
 
 async def _cmd_status() -> int:
-    """Show cua-driver installation and ObservationDaemon status."""
-    print(f"{_CYAN}LEAP Host \u2014 Status{_RESET}")
+    """Show cua-driver installation and background runtime status."""
+    settings = load_config()
+    print(f"{_CYAN}LEAP Host — Status{_RESET}")
     print()
 
     # cua-driver installation
     print(f"  {_BOLD}cua-driver{_RESET}")
+    if not getattr(settings, "use_cua_driver", True):
+        _warn("Disabled by LEAPFLOW_USE_CUA_DRIVER=false")
+        _info("LeapFlow will run in degraded mode without OS execution.")
     if _cua_driver_installed():
         version = _cua_driver_version()
         version_str = version if version else "installed (version unknown)"
@@ -138,6 +175,33 @@ async def _cmd_status() -> int:
     else:
         _fail("Not installed")
         _info(f"Install: {_CUA_INSTALL_URL}")
+    print()
+
+    # leapd-managed host backend status
+    print(f"  {_BOLD}leapd host backend{_RESET}")
+    leapd_info, runtime, runtime_error = await _fetch_leapd_status(settings)
+    if getattr(leapd_info, "is_healthy", False):
+        _ok(f"leapd healthy (PID {getattr(leapd_info, 'pid', None)})")
+        host = runtime.get("host_backend") if isinstance(runtime, dict) else None
+        if isinstance(host, dict):
+            _info(
+                "Backend: "
+                f"{host.get('backend')} started={host.get('started')} "
+                f"pid={host.get('pid')} ({host.get('pid_source')})"
+            )
+            if host.get("command"):
+                args = " ".join(str(arg) for arg in host.get("args") or [])
+                _info(f"Command: {str(host.get('command'))} {args}".strip())
+            _info(f"Tools: {host.get('tools_count', 0)} restarts={host.get('restart_count', 0)}")
+            if host.get("last_error"):
+                _warn(f"Last error: {host['last_error']}")
+        elif runtime_error:
+            _warn(f"Runtime status unavailable: {runtime_error}")
+        else:
+            _info("No host backend details reported by leapd")
+    else:
+        _info(getattr(leapd_info, "format_status", lambda: "leapd not running")())
+        _info("Start with: leap daemon start")
     print()
 
     # ObservationDaemon status
@@ -230,12 +294,21 @@ async def _cmd_start() -> int:
 
 
 async def _cmd_stop() -> int:
-    """Stop ObservationDaemon background process."""
-    print(f"{_CYAN}LEAP Host \u2014 Stop{_RESET}")
+    """Stop leapd-owned host backend and ObservationDaemon background process."""
+    print(f"{_CYAN}LEAP Host — Stop{_RESET}")
+
+    settings = load_config()
+    leapd_stopped = await _stop_leapd_if_running(settings)
+    if leapd_stopped:
+        _info("daemon-owned CuaDriverClient will release its MCP session during shutdown")
 
     pid = _read_pid_file()
     if pid is None:
-        _warn("ObservationDaemon is not running")
+        if not leapd_stopped:
+            _warn("ObservationDaemon is not running")
+        else:
+            _info("ObservationDaemon is not running")
+        _info("For CuaDriver.app daemon debugging, upstream also supports: cua-driver stop")
         return 0
 
     # Send SIGTERM for graceful shutdown
@@ -261,6 +334,7 @@ async def _cmd_stop() -> int:
 
     _remove_pid_file()
     _ok("ObservationDaemon stopped")
+    _info("For CuaDriver.app daemon debugging, upstream also supports: cua-driver stop")
     return 0
 
 
@@ -286,6 +360,7 @@ async def _cmd_doctor() -> int:
     print(f"  {_BOLD}2. MCP connectivity{_RESET}")
     _info("Starting MCP session...")
 
+    client = None
     try:
         from leapflow.platform.cua_client import CuaDriverClient
 
@@ -318,10 +393,8 @@ async def _cmd_doctor() -> int:
         if cap_version:
             _info(f"Capability version: {cap_version}")
 
-        client.stop()
-        _ok("Session closed cleanly")
         print()
-        _ok("All checks passed \u2014 cua-driver is healthy")
+        _ok("All checks passed — cua-driver is healthy")
         return 0
 
     except Exception as exc:
@@ -329,6 +402,14 @@ async def _cmd_doctor() -> int:
         _info("Ensure cua-driver is properly installed and accessible.")
         _info(f"Documentation: {_CUA_INSTALL_URL}")
         return 1
+    finally:
+        if client is not None:
+            try:
+                client.stop()
+                _ok("Session closed cleanly")
+            except Exception as exc:
+                logger.warning("host doctor: CuaDriverClient cleanup failed", exc_info=True)
+                _warn(f"Session cleanup failed: {exc}")
 
 
 async def _cmd_install() -> int:

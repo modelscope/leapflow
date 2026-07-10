@@ -405,7 +405,10 @@ class Context:
             privacy_filter=self.privacy_manager,
         )
         self.rpc: CuaDriverClient | MockBridge
-        if self.effective_mock:
+        if self.effective_mock or not settings.use_cua_driver:
+            if not self.effective_mock:
+                _emit_status("cua-driver disabled by LEAPFLOW_USE_CUA_DRIVER=false")
+                _emit_status("Running in degraded mode (no OS execution)")
             self.rpc = MockBridge()
             self.rpc.on_event(self.event_bus.handle_event)
         else:
@@ -749,6 +752,9 @@ class Context:
                         "  Check permissions (macOS TCC) or run: leap host doctor"
                     )
                 _emit_status("Running in degraded mode (no OS execution)")
+                self.rpc = MockBridge()
+                self.rpc.on_event(self.event_bus.handle_event)
+                vsi = VirtualSystemInterface(self.rpc)
                 manifest = PlatformManifest.default_darwin()
                 vsi._manifest = manifest
         else:
@@ -2186,7 +2192,10 @@ class Context:
         # Shutdown all memory providers (stops GC, closes DB)
         await self.memory.shutdown_all()
         if isinstance(self.rpc, CuaDriverClient):
-            self.rpc.stop()
+            try:
+                self.rpc.stop()
+            except Exception:
+                logger.debug("CuaDriverClient stop failed during cleanup", exc_info=True)
         if self.skill_lib:
             self.skill_lib.close()
         if self.session_store:

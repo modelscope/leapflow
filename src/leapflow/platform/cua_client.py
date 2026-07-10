@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -192,6 +193,10 @@ class _McpSession:
         self._shutdown_event: Optional[asyncio.Event] = None
         self._lifecycle_future: Optional[concurrent.futures.Future] = None
         self._setup_error: Optional[BaseException] = None
+        self._command: str = _CUA_DRIVER_CMD
+        self._args: List[str] = list(_CUA_DRIVER_ARGS_DEFAULT)
+        self._last_error: str = ""
+        self._restart_count = 0
 
     @property
     def started(self) -> bool:
@@ -204,6 +209,22 @@ class _McpSession:
     @property
     def capability_version(self) -> str:
         return self._capability_version
+
+    @property
+    def command(self) -> str:
+        return self._command
+
+    @property
+    def args(self) -> List[str]:
+        return list(self._args)
+
+    @property
+    def last_error(self) -> str:
+        return self._last_error
+
+    @property
+    def restart_count(self) -> int:
+        return self._restart_count
 
     def has_tool(self, name: str) -> bool:
         """True if tools/list advertised this tool name."""
@@ -231,6 +252,9 @@ class _McpSession:
                 )
 
             command, args = _resolve_mcp_invocation(_CUA_DRIVER_CMD)
+            self._command = command
+            self._args = list(args)
+            self._last_error = ""
             params = StdioServerParameters(
                 command=command,
                 args=args,
@@ -249,6 +273,7 @@ class _McpSession:
                         await self._shutdown_event.wait()
         except BaseException as e:
             self._setup_error = e
+            self._last_error = str(e)
             self._ready_event.set()
             raise
         finally:
@@ -292,6 +317,7 @@ class _McpSession:
         """Spawn lifecycle coroutine and wait for ready. Caller must hold lock."""
         self._ready_event = threading.Event()
         self._setup_error = None
+        self._last_error = ""
         self._shutdown_event = None
         self._tools = {}
         self._capability_version = ""
@@ -352,6 +378,7 @@ class _McpSession:
             except Exception as e:
                 logger.debug("cleanup before reconnect: %s", e)
         self._started = False
+        self._restart_count += 1
         self._start_lifecycle()
         self._started = True
 
@@ -584,6 +611,8 @@ class CuaDriverClient(HostRpc):
         self._keepalive_interval = keepalive_interval
         self._keepalive_task: Optional[asyncio.Task] = None
         self._closed = False
+        self._last_start_time: Optional[float] = None
+        self._last_error = ""
         # Per-method-prefix timeout overrides
         self._timeout_map: Dict[str, float] = {
             "ping": 3.0,
@@ -608,8 +637,16 @@ class CuaDriverClient(HostRpc):
 
     def start(self) -> None:
         """Initialize the bridge and MCP session."""
-        self._session.start()
-        self._start_keepalive()
+        self._closed = False
+        try:
+            self._session.start()
+            self._start_keepalive()
+        except Exception as exc:
+            self._last_error = str(exc)
+            self._bridge.stop()
+            raise
+        self._last_start_time = time.time()
+        self._last_error = ""
         logger.info("CuaDriverClient started (tools: %d)", len(self._session.available_tools))
 
     def stop(self) -> None:
@@ -627,6 +664,23 @@ class CuaDriverClient(HostRpc):
             _mcp_logger.setLevel(_prev_level)
         self._bridge.stop()
         logger.info("CuaDriverClient stopped")
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        """Return a diagnostic snapshot for daemon and host status surfaces."""
+        return {
+            "backend": "cua-driver",
+            "started": self._session.started,
+            "closed": self._closed,
+            "command": self._session.command,
+            "args": self._session.args,
+            "pid": None,
+            "pid_source": "unavailable",
+            "capability_version": self._session.capability_version,
+            "tools_count": len(self._session.available_tools),
+            "last_start_time": self._last_start_time,
+            "last_error": self._last_error or self._session.last_error,
+            "restart_count": self._session.restart_count,
+        }
 
     def _start_keepalive(self) -> None:
         """Start periodic heartbeat on the bridge loop."""

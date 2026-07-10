@@ -16,6 +16,7 @@ from leapflow.daemon.protocol import ErrorCode, METHOD_REGISTRY, RpcRequest, Rpc
 logger = logging.getLogger(__name__)
 
 _DEFAULT_STREAM_HEARTBEAT_S = 10.0
+_DEFAULT_IDLE_TIMEOUT_S = 600.0
 
 
 def _stream_heartbeat_interval() -> float:
@@ -24,6 +25,14 @@ def _stream_heartbeat_interval() -> float:
         return max(1.0, float(raw))
     except ValueError:
         return _DEFAULT_STREAM_HEARTBEAT_S
+
+
+def _daemon_idle_timeout() -> float:
+    raw = os.getenv("LEAPFLOW_DAEMON_IDLE_TIMEOUT_S", str(_DEFAULT_IDLE_TIMEOUT_S)).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _DEFAULT_IDLE_TIMEOUT_S
 
 
 class UnixRpcServer:
@@ -36,11 +45,13 @@ class UnixRpcServer:
         sock_path: Path,
         run_dir: Path,
         stream_heartbeat_s: float | None = None,
+        on_shutdown: Callable[[], None] | None = None,
     ) -> None:
         self._service = service
         self._sock_path = sock_path
         self._run_dir = run_dir
         self._stream_heartbeat_s = stream_heartbeat_s or _stream_heartbeat_interval()
+        self._on_shutdown = on_shutdown
         self._server: asyncio.AbstractServer | None = None
         self._active_connections = 0
         if hasattr(service, "set_client_count_provider"):
@@ -146,6 +157,8 @@ class UnixRpcServer:
             result = await result
         response = RpcResponse.success(request.id, result)
         await _write_json(writer, response.to_json())
+        if request.method == "daemon.shutdown" and self._on_shutdown is not None:
+            self._on_shutdown()
 
     async def _dispatch_stream(
         self,
@@ -223,13 +236,18 @@ async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
     sock_path = run_dir / "leapd.sock"
     service = RuntimeLeapService(settings, mock_host=mock_host)
     await service.start()
-    server = UnixRpcServer(service, sock_path=sock_path, run_dir=run_dir)
-
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
     def _request_stop() -> None:
         stop_event.set()
+
+    server = UnixRpcServer(
+        service,
+        sock_path=sock_path,
+        run_dir=run_dir,
+        on_shutdown=_request_stop,
+    )
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -238,9 +256,21 @@ async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
             logger.debug("daemon: signal handlers unsupported on this event loop")
 
     task = asyncio.create_task(server.serve_forever())
+    idle_task = asyncio.create_task(
+        _watch_idle_shutdown(
+            server,
+            stop_event,
+            idle_timeout_s=_daemon_idle_timeout(),
+        )
+    )
     try:
         await stop_event.wait()
     finally:
+        idle_task.cancel()
+        try:
+            await idle_task
+        except asyncio.CancelledError:
+            pass
         task.cancel()
         try:
             await task
@@ -250,6 +280,26 @@ async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
         await service.shutdown()
         cleanup_run_dir(run_dir)
     return 0
+
+
+async def _watch_idle_shutdown(
+    server: UnixRpcServer,
+    stop_event: asyncio.Event,
+    *,
+    idle_timeout_s: float,
+) -> None:
+    if idle_timeout_s <= 0:
+        return
+    last_active = asyncio.get_running_loop().time()
+    interval = min(30.0, max(1.0, idle_timeout_s / 10.0))
+    while not stop_event.is_set():
+        if server.active_connections > 0:
+            last_active = asyncio.get_running_loop().time()
+        elif asyncio.get_running_loop().time() - last_active >= idle_timeout_s:
+            logger.info("daemon: idle timeout reached; shutting down")
+            stop_event.set()
+            return
+        await asyncio.sleep(interval)
 
 
 async def _write_json(writer: asyncio.StreamWriter, text: str) -> None:
