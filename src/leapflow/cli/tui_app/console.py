@@ -12,7 +12,7 @@ import sys
 from typing import Optional
 
 from rich.console import Console
-from rich.markdown import Markdown
+from rich.markdown import CodeBlock, Markdown
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.rule import Rule
@@ -53,6 +53,31 @@ def _build_rich_theme(theme: Theme | ResolvedTheme) -> RichTheme:
         "leap.panel_title": theme.panel_title,
         "rule.line": theme.border,
     })
+
+
+class _TerminalBackgroundCodeBlock(CodeBlock):
+    """Markdown code block that keeps the user's terminal background."""
+
+    def __rich_console__(self, console, options):
+        code = str(self.text).rstrip()
+        yield Syntax(
+            code,
+            self.lexer_name,
+            theme=self.theme,
+            word_wrap=True,
+            background_color="default",
+            padding=1,
+        )
+
+
+class _TerminalBackgroundMarkdown(Markdown):
+    """Rich Markdown variant with transparent fenced code blocks."""
+
+    elements = {
+        **Markdown.elements,
+        "fence": _TerminalBackgroundCodeBlock,
+        "code_block": _TerminalBackgroundCodeBlock,
+    }
 
 
 class LeapConsole:
@@ -135,7 +160,7 @@ class LeapConsole:
         """Render markdown content with optional visual spacing."""
         if not text.strip():
             return
-        md = Markdown(
+        md = _TerminalBackgroundMarkdown(
             text,
             code_theme=code_theme if self._theme.name == "dark" else "default",
         )
@@ -152,6 +177,7 @@ class LeapConsole:
             language,
             theme="monokai" if self._theme.name == "dark" else "default",
             line_numbers=len(source.splitlines()) > 5,
+            background_color="default",
             padding=(0, 1),
         )
         if title:
@@ -208,7 +234,12 @@ class LeapConsole:
 
         style = "leap.error" if is_error else "leap.border"
         self._console.print(Panel(
-            Syntax(display, "text", theme="monokai" if self._theme.name == "dark" else "default")
+            Syntax(
+                display,
+                "text",
+                theme="monokai" if self._theme.name == "dark" else "default",
+                background_color="default",
+            )
             if not is_error else Text(display),
             title=f"{'✗' if is_error else '↳'} {name}",
             border_style=style,

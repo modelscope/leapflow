@@ -6,6 +6,7 @@ from prompt_toolkit.styles import Style as PTStyle
 
 from leapflow.cli.banner import display_rich_banner
 from leapflow.cli.tui_app.app import LeapApp
+from leapflow.cli.tui_app.console import _TerminalBackgroundCodeBlock, _TerminalBackgroundMarkdown
 from leapflow.cli.tui_app.status import StatusBar
 from leapflow.cli.tui_app.theme import (
     _DARK,
@@ -149,6 +150,18 @@ def test_rich_banner_accepts_resolved_theme(capsys) -> None:
     output = capsys.readouterr().out
     assert "LeapFlow" in output
     assert "#FFF8DC" not in output
+
+
+def test_markdown_code_blocks_use_terminal_background() -> None:
+    from rich.console import Console
+
+    assert _TerminalBackgroundMarkdown.elements["fence"] is _TerminalBackgroundCodeBlock
+    block = _TerminalBackgroundCodeBlock("text", "monokai")
+    block.text = "config -> engine"
+
+    syntax = next(block.__rich_console__(Console(), Console().options))
+
+    assert syntax.background_color == "default"
 
 
 def test_status_bar_compacts_on_narrow_terminal(monkeypatch) -> None:
