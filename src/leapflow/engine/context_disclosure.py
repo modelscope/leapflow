@@ -18,6 +18,7 @@ class DisclosureLevel(str, Enum):
     LIGHT = "light"
     INDEXED_CAPABILITIES = "indexed_capabilities"
     SELECTED_TOOLS = "selected_tools"
+    PROJECT_RESEARCH = "project_research"
     FULL = "full"
 
 
@@ -165,6 +166,13 @@ class DisclosurePlanner:
             )
 
         selected = self._select_capabilities(user_text, manifests)
+        if _needs_project_research(user_text):
+            return self.project_research_plan(
+                user_text,
+                tool_definitions,
+                runtime,
+                "project research task needs scoped file/document evidence without full catalog",
+            )
         if self._needs_full_context(user_text, selected, runtime):
             return self.full_plan(user_text, tool_definitions, runtime, "task requires broad execution context")
 
@@ -197,6 +205,37 @@ class DisclosurePlanner:
             risk_level="none",
             reason="no external capability signal detected",
             max_prior_turns=2,
+        )
+
+    def project_research_plan(
+        self,
+        user_text: str,
+        tool_definitions: Sequence[Mapping[str, Any]],
+        runtime: DisclosureRuntimeState,
+        reason: str,
+    ) -> PromptAssemblyPlan:
+        """Build a scoped research plan for code/doc exploration tasks."""
+        selected_defs: list[Mapping[str, Any]] = []
+        selected_names: list[str] = []
+        for tool_definition in tool_definitions:
+            manifest = CapabilityManifest.from_tool_definition(tool_definition)
+            if manifest.category in {"file", "memory", "system"} and not manifest.requires_approval:
+                selected_defs.append(tool_definition)
+                if manifest.name:
+                    selected_names.append(manifest.name)
+        return PromptAssemblyPlan(
+            level=DisclosureLevel.PROJECT_RESEARCH,
+            tool_definitions=tuple(selected_defs),
+            catalog_definitions=tuple(selected_defs),
+            memory=MemoryDisclosure.TASK_RETRIEVAL,
+            history=HistoryDisclosure.RECENT,
+            reasoning=ReasoningDisclosure.AUTO if runtime.enable_thinking else ReasoningDisclosure.OFF,
+            native_tools=runtime.native_tools_enabled and bool(selected_defs),
+            stream_mode="tool_aware",
+            risk_level="read_only",
+            reason=reason,
+            selected_tool_names=tuple(sorted(set(selected_names))),
+            max_prior_turns=6,
         )
 
     def full_plan(
@@ -238,10 +277,16 @@ class DisclosurePlanner:
             if any(token and token in normalized for token in _name_tokens(manifest.name)):
                 selected.append(manifest)
                 continue
-            if manifest.category in {"hub", "gateway"} and any(token in normalized for token in ("hub", "gateway", "message", "send")):
+            if (
+                manifest.category in {"hub", "gateway"}
+                and any(token in normalized for token in ("hub", "gateway", "message", "send"))
+            ):
                 selected.append(manifest)
                 continue
-            if manifest.category == "delegate" and any(token in normalized for token in ("delegate", "subagent", "parallel", "子任务")):
+            if (
+                manifest.category == "delegate"
+                and any(token in normalized for token in ("delegate", "subagent", "parallel", "子任务"))
+            ):
                 selected.append(manifest)
                 continue
             if any(token in normalized for token in _description_tokens(haystack)):
@@ -363,15 +408,52 @@ def _asks_about_capabilities(text: str) -> bool:
 
 def _needs_memory(text: str, manifests: Sequence[CapabilityManifest]) -> bool:
     normalized = _normalize(text)
-    return any(manifest.category == "memory" for manifest in manifests) or any(token in normalized for token in ("memory", "remember", "recall", "history", "记忆", "之前"))
+    return any(manifest.category == "memory" for manifest in manifests) or any(
+        token in normalized for token in ("memory", "remember", "recall", "history", "记忆", "之前")
+    )
+
+
+def _needs_project_research(text: str) -> bool:
+    normalized = _normalize(text)
+    architecture_signals = (
+        "architecture", "diagram", "mermaid", "system design", "dependency map",
+        "架构", "框图", "架构图", "系统设计", "依赖图",
+    )
+    project_scope_signals = (
+        "project", "repo", "repository", "codebase", "docs", "documentation",
+        "项目", "仓库", "代码库", "文档",
+    )
+    code_scope_signals = (
+        "source", "src", "module", "package", "readme", "源码", "模块",
+    )
+    strong_research_verbs = (
+        "study", "research", "analyze", "inspect", "review", "summarize", "map",
+        "generate", "draw", "trace", "梳理", "研究", "分析", "总结", "生成",
+    )
+    weak_research_verbs = ("read", "give", "读取", "给出")
+    has_explicit_file = bool(re.search(r"[\w./-]+\.[a-z0-9]{1,8}\b", normalized))
+    has_architecture = any(signal in normalized for signal in architecture_signals)
+    has_project_scope = any(signal in normalized for signal in project_scope_signals)
+    has_code_scope = any(signal in normalized for signal in code_scope_signals)
+    has_strong_verb = any(verb in normalized for verb in strong_research_verbs)
+    has_weak_verb = any(verb in normalized for verb in weak_research_verbs)
+
+    if has_explicit_file and not (has_architecture or has_project_scope):
+        return False
+    if has_architecture and (has_strong_verb or has_weak_verb or has_project_scope):
+        return True
+    if has_project_scope and (has_strong_verb or (has_weak_verb and has_code_scope)):
+        return True
+    return has_strong_verb and has_project_scope and has_code_scope
 
 
 def _has_complexity_signal(normalized_text: str) -> bool:
     return any(
         token in normalized_text
         for token in (
-            "implement", "refactor", "debug", "root cause", "architecture", "design", "analyze", "test",
-            "实现", "重构", "调试", "根因", "架构", "设计", "深入分析", "执行", "代码", "测试",
+            "implement", "refactor", "debug", "root cause", "architecture", "design",
+            "analyze", "test", "实现", "重构", "调试", "根因", "架构", "设计",
+            "深入分析", "执行", "代码", "测试",
         )
     )
 

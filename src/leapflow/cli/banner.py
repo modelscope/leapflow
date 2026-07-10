@@ -74,17 +74,24 @@ def _categorize_skills(
 _MAX_PANEL_WIDTH = 132
 _NARROW_WIDTH = 70
 _MEDIUM_WIDTH = 100
+_BANNER_ACCENT = "#FFBF00"
+_BANNER_ACCENT_DIM = "#B8860B"
+_BANNER_TEXT = "#FFF8DC"
+_BANNER_MUTED = "#8B8682"
+_BANNER_BORDER = "#CD7F32"
+_BANNER_TITLE = "bold #FFD700"
+_BANNER_SUCCESS = "#87D687"
 
 
 class _BannerPalette:
-    def __init__(self, theme: Theme | ResolvedTheme) -> None:
-        self.accent = theme.accent
-        self.accent_dim = theme.accent_dim
-        self.text = theme.text
-        self.muted = theme.text_muted
-        self.border = theme.border
-        self.title = theme.panel_title
-        self.success = theme.success
+    def __init__(self, _theme: Theme | ResolvedTheme) -> None:
+        self.accent = _BANNER_ACCENT
+        self.accent_dim = _BANNER_ACCENT_DIM
+        self.text = _BANNER_TEXT
+        self.muted = _BANNER_MUTED
+        self.border = _BANNER_BORDER
+        self.title = _BANNER_TITLE
+        self.success = _BANNER_SUCCESS
 
 
 def _trim(text: str, limit: int) -> str:

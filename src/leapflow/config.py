@@ -139,6 +139,7 @@ class Settings:
     # ── Data Root & Profile ──
     data_dir: Path = Path("~/.leapflow")
     profile: str = "default"
+    workspace_root: Path = Path(".")
 
     # Audit
     audit_log_path: Path = Path("~/.leapflow/profiles/default/audit.jsonl")
@@ -570,6 +571,9 @@ def _build_settings_from_env() -> Settings:
 
     data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
     profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
+    workspace_root = _expand_path(
+        os.getenv("LEAPFLOW_WORKSPACE_ROOT", str(Path.cwd())).strip() or str(Path.cwd())
+    ).resolve()
     _profile_dir = data_dir / "profiles" / profile
 
     mock_host = os.getenv("LEAPFLOW_MOCK_HOST", "0").strip() in ("1", "true", "True", "yes")
@@ -893,6 +897,7 @@ def _build_settings_from_env() -> Settings:
         memory_prefetch_limit=memory_prefetch_limit,
         data_dir=data_dir,
         profile=profile,
+        workspace_root=workspace_root,
         audit_log_path=_expand_path(audit_log_path),
         skills_dir=_expand_path(skills_dir),
         skill_view_max_chars=skill_view_max_chars,

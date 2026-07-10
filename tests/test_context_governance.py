@@ -116,7 +116,32 @@ def test_long_task_controller_reports_repeated_reads() -> None:
     assert metadata["context_evidence"] is True
     assert metadata["read_count"] == 2
     assert metadata["repeat_read"] is True
-    assert "synthesize" in controller.convergence_notice(2)
+    notice = controller.convergence_notice(2)
+    assert "repeated reads" in notice
+    assert "complementary project evidence" in notice
+    assert "synthesize" in notice
+
+
+def test_context_governance_reset_clears_turn_scope() -> None:
+    controller = LongTaskContextController(
+        evidence_builder=ToolEvidenceBuilder(max_content_chars=240),
+        repeated_read_limit=1,
+        convergence_round=20,
+    )
+    args = {"path": "/tmp/repeated.py"}
+    result = {"ok": True, "path": "/tmp/repeated.py", "content": "print(1)", "mode": "raw"}
+
+    controller.compact_tool_result("file_read", args, result)
+    controller.compact_tool_result("file_read", args, result)
+    assert controller.snapshot().repeated_reads == 1
+
+    controller.reset_turn_scope()
+
+    snapshot = controller.snapshot()
+    assert snapshot.repeated_reads == 0
+    assert snapshot.sources_seen == 0
+    assert snapshot.evidence_count == 0
+    assert controller.convergence_notice(1) == ""
 
 
 def test_long_task_metadata_avoids_noise_for_uncompacted_tools() -> None:

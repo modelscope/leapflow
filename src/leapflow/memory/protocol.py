@@ -75,6 +75,9 @@ class MemoryQuery:
     min_score: float = 0.0
     include_expired: bool = False
     cross_domain: bool = False  # Enable cross-domain correlation
+    workspace_root: str = ""
+    task_id: str = ""
+    scope_keywords: List[str] = field(default_factory=list)
 
 
 @dataclass

@@ -10,6 +10,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
 
 from leapflow.platform.protocol import HostRpc, Methods
@@ -74,6 +75,7 @@ logger = logging.getLogger(__name__)
 
 _TOOL_ARGS_PREVIEW_LIMIT = 160
 _TOOL_RESULT_PREVIEW_LIMIT = 240
+_TASK_CONTRACT_HEADING = "## Task Contract"
 
 
 def _single_line_preview(value: Any, *, limit: int) -> str:
@@ -308,6 +310,39 @@ class _PromptAssembly:
     prior_turns: List[Dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class TaskContract:
+    """Stable per-turn task contract that survives compression and retrieval drift."""
+
+    task_id: str
+    original_request: str
+    workspace_root: str
+    allowed_roots: tuple[str, ...]
+    research_protocol: tuple[str, ...] = ()
+
+    def render(self) -> str:
+        """Render the contract as a compact system block."""
+        lines = [
+            "## Task Contract",
+            f"- Task ID: {self.task_id}",
+            f"- Original user request: {self.original_request}",
+            f"- Workspace root: {self.workspace_root}",
+            f"- Allowed roots: {', '.join(self.allowed_roots)}",
+            (
+                "- Treat relative project paths as relative to the workspace root; never infer `.` "
+                "as the project root when a workspace root is provided."
+            ),
+            (
+                "- Preserve this task contract across summarization, compression, "
+                "tool loops, and memory retrieval."
+            ),
+        ]
+        if self.research_protocol:
+            lines.append("- Research protocol:")
+            lines.extend(f"  - {item}" for item in self.research_protocol)
+        return "\n".join(lines)
+
+
 class AgentEngine:
     """Coordinates perception memory, LLM reasoning, RPC execution, and skills."""
 
@@ -461,6 +496,7 @@ class AgentEngine:
         )
         self._last_context_snapshot: dict[str, Any] = {}
         self._last_disclosure_metadata: dict[str, Any] = {}
+        self._current_task_contract: TaskContract | None = None
         self._disclosure_planner = DisclosurePlanner()
         self._healer = MessageHealer()
 
@@ -804,6 +840,111 @@ class AgentEngine:
                 logger.debug("model capability lookup failed", exc_info=True)
         return max(1, int(self._settings.llm_context_length))
 
+    def _begin_turn_context(self, user_text: str) -> None:
+        """Reset turn-scoped state and build the stable task contract."""
+        self._memory_context_snapshot = None
+        self._last_context_snapshot = {}
+        self._last_disclosure_metadata = {}
+        self._context_governance_controller.reset_turn_scope()
+        self._current_task_contract = self._build_task_contract(user_text)
+
+    def _build_task_contract(self, user_text: str) -> TaskContract:
+        workspace_root = (
+            Path(getattr(self._settings, "workspace_root", Path.cwd()))
+            .expanduser()
+            .resolve()
+        )
+        protocol = self._research_protocol_for(user_text)
+        return TaskContract(
+            task_id=f"turn-{self._session_turn_count}",
+            original_request=user_text.strip(),
+            workspace_root=str(workspace_root),
+            allowed_roots=(str(workspace_root),),
+            research_protocol=protocol,
+        )
+
+    @staticmethod
+    def _research_protocol_for(user_text: str) -> tuple[str, ...]:
+        normalized = user_text.lower()
+        architecture_tokens = (
+            "architecture", "diagram", "design", "架构", "架构图", "系统设计", "框图",
+        )
+        if not any(token in normalized for token in architecture_tokens):
+            return ()
+        return (
+            "Identify the active project root before reading files.",
+            "Start from README, AGENTS, docs index, and top-level source layout.",
+            "Use outlines, symbols, and bounded ranges before raw full-file reads.",
+            "Cross-check entrypoints, core orchestration, representative modules, and tests.",
+            "Produce a concise subsystem map and Mermaid architecture diagram grounded in evidence.",
+        )
+
+    def _task_scope_keywords(self, user_text: str) -> list[str]:
+        keywords = _keywords_from_query(user_text)
+        contract = self._current_task_contract
+        if contract:
+            workspace_name = Path(contract.workspace_root).name
+            if workspace_name:
+                keywords.append(workspace_name)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for keyword in keywords:
+            key = keyword.lower()
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(keyword)
+        return deduped[:12]
+
+    def _task_contract_block(self) -> str:
+        if not self._current_task_contract:
+            return ""
+        return self._current_task_contract.render()
+
+    def _append_task_contract_to_system(self, system: str) -> str:
+        block = self._task_contract_block()
+        if not block:
+            return system
+        base = self._strip_task_contract_block(system)
+        return f"{base.rstrip()}\n\n{block}\n" if base.strip() else f"{block}\n"
+
+    @staticmethod
+    def _strip_task_contract_block(content: str) -> str:
+        marker = f"\n{_TASK_CONTRACT_HEADING}"
+        if content.startswith(_TASK_CONTRACT_HEADING):
+            return ""
+        marker_index = content.find(marker)
+        if marker_index == -1:
+            return content
+        return content[:marker_index].rstrip()
+
+    def _ensure_task_contract_message(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        block = self._task_contract_block()
+        if not block:
+            return messages
+        prepared: list[Dict[str, Any]] = []
+        inserted = False
+        for message in messages:
+            if message.get("role") != "system":
+                prepared.append(message)
+                continue
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                prepared.append(message)
+                continue
+            base = self._strip_task_contract_block(content)
+            if not inserted:
+                updated = dict(message)
+                updated["content"] = f"{base.rstrip()}\n\n{block}\n" if base.strip() else f"{block}\n"
+                prepared.append(updated)
+                inserted = True
+            elif base.strip():
+                updated = dict(message)
+                updated["content"] = base
+                prepared.append(updated)
+        if inserted:
+            return prepared
+        return [build_system_message(block), *prepared]
+
     async def _assemble_unified_prompt(
         self,
         user_text: str,
@@ -845,6 +986,7 @@ class AgentEngine:
             skill_section=skill_section,
             memory_context=memory_context,
         )
+        system = self._append_task_contract_to_system(system)
         self._last_disclosure_metadata = plan.metadata()
         prior_turns = self._prior_turns_for_plan(plan)
         return _PromptAssembly(system=system, plan=plan, prior_turns=prior_turns)
@@ -859,7 +1001,10 @@ class AgentEngine:
                 continue
             content = message.get("content", "")
             if isinstance(content, list):
-                content = " ".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)
+                content = " ".join(
+                    str(part.get("text", part)) if isinstance(part, dict) else str(part)
+                    for part in content
+                )
             elif not isinstance(content, str):
                 content = str(content)
             preview = _single_line_preview(content, limit=180)
@@ -915,17 +1060,20 @@ class AgentEngine:
         context_length = self._active_context_length()
         token_count = self._context_controller.estimator.estimate_messages(messages)
         prepared = self._compressor.compress(messages, token_count=token_count)
+        prepared = self._ensure_task_contract_message(prepared)
         compression_trace = self._compressor.last_trace.as_dict()
         prepared = self._compressor.preflight_check(prepared, context_length=context_length)
+        prepared = self._ensure_task_contract_message(prepared)
         if self._cache_strategy:
             prepared = self._cache_strategy.optimize(prepared)
+            prepared = self._ensure_task_contract_message(prepared)
         decision = self._context_controller.prepare(
             prepared,
             tools=tools,
             context_length=context_length,
             compressor=self._compressor,
         )
-        prepared = decision.messages
+        prepared = self._ensure_task_contract_message(decision.messages)
         compression_trace = self._compressor.last_trace.as_dict()
         warning = self._context_controller.warning_notice(
             decision.snapshot,
@@ -935,6 +1083,7 @@ class AgentEngine:
         for notice in (warning, convergence):
             if notice:
                 prepared = [*prepared, build_user_message_text(notice)]
+        prepared = self._ensure_task_contract_message(prepared)
         snapshot = self._context_controller.estimator.snapshot(
             prepared,
             tools=tools,
@@ -1028,7 +1177,7 @@ class AgentEngine:
         """Entrypoint: simplified routing with unified tool loop as default path."""
         self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
-        self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
+        self._begin_turn_context(user_text)
 
         # 1. Slash command (skill injection — zero-ambiguity activation)
         if user_text.startswith("/") and self._skill_injector:
@@ -1065,7 +1214,7 @@ class AgentEngine:
         """
         self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
-        self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
+        self._begin_turn_context(user_text)
 
         # 1. Slash command (skill injection)
         if user_text.startswith("/") and self._skill_injector:
@@ -1536,7 +1685,6 @@ class AgentEngine:
                 round_number=budget.used,
             )
 
-            _show_progress("thinking", f"round {budget.used}")
             try:
                 resp = await self._llm.achat(
                     compressed, stream=False, enable_thinking=planned_enable_thinking,
@@ -1863,8 +2011,6 @@ class AgentEngine:
                 tools=tools_kwarg.get("tools") if use_native_tools else None,
                 round_number=budget.used,
             )
-
-            yield StreamEvent(type="thinking", content=f"round {budget.used}")
 
             content = ""
 
@@ -2501,7 +2647,17 @@ class AgentEngine:
         try:
             entries = await asyncio.wait_for(
                 self._memory_manager.prefetch(
-                    user_text, limit=self._settings.memory_prefetch_limit,
+                    user_text,
+                    limit=self._settings.memory_prefetch_limit,
+                    workspace_root=(
+                        self._current_task_contract.workspace_root
+                        if self._current_task_contract else ""
+                    ),
+                    task_id=(
+                        self._current_task_contract.task_id
+                        if self._current_task_contract else ""
+                    ),
+                    scope_keywords=self._task_scope_keywords(user_text),
                 ),
                 timeout=self._settings.memory_prefetch_timeout_s,
             )

@@ -18,6 +18,7 @@ from leapflow.learning.similarity import (
     _token_jaccard,
 )
 from leapflow.memory import decay_weight
+from leapflow.prompts.templates import UNIFIED_SYSTEM_TEMPLATE
 from leapflow.world_model._json_utils import extract_json_object
 
 
@@ -132,6 +133,17 @@ def test_causal_graph_connected_components() -> None:
     comp_sets = [frozenset(c) for c in components]
     assert frozenset({a.id, b.id}) in comp_sets
     assert frozenset({c.id, d.id}) in comp_sets
+
+
+def test_unified_system_template_escapes_literal_tool_protocol_json() -> None:
+    rendered = UNIFIED_SYSTEM_TEMPLATE.format(
+        tool_catalog="- **skills_list**(): List installed skills",
+        skill_section="",
+        memory_context="",
+    )
+
+    assert '{"name": "tool_name", "arguments": {"key": "value"}}' in rendered
+    assert '{"name": ..., "arguments": ...}' in rendered
 
 
 def test_json_extraction_variants() -> None:

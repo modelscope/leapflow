@@ -51,6 +51,21 @@ def _build_rich_theme(theme: Theme | ResolvedTheme) -> RichTheme:
         "leap.recording": theme.recording,
         "leap.executing": theme.executing,
         "leap.panel_title": theme.panel_title,
+        "leap.answer_border": theme.statusbar_dim,
+        "leap.answer_title": f"bold {theme.statusbar_accent}",
+        "leap.tool": theme.text_muted,
+        "leap.tool_name": f"bold {theme.text_muted}",
+        "markdown.h1": f"bold {theme.text}",
+        "markdown.h2": f"bold {theme.accent_dim}",
+        "markdown.h3": f"bold {theme.text_dim}",
+        "markdown.h4": f"bold {theme.text_dim}",
+        "markdown.h5": theme.text_dim,
+        "markdown.h6": theme.text_dim,
+        "markdown.strong": f"bold {theme.text}",
+        "markdown.em": theme.text_dim,
+        "markdown.hr": theme.border_dim,
+        "markdown.item": theme.text,
+        "markdown.code": f"bold {theme.info}",
         "rule.line": theme.border,
     })
 
@@ -64,7 +79,7 @@ class _TerminalBackgroundCodeBlock(CodeBlock):
             code,
             self.lexer_name,
             theme=self.theme,
-            word_wrap=True,
+            word_wrap=False,
             background_color="default",
             padding=1,
         )
@@ -257,6 +272,15 @@ class LeapConsole:
             title_align="left",
             border_style="leap.border",
             padding=(0, 1),
+        ))
+
+    def answer_label(self) -> None:
+        """Print a clear warm boundary before the user-facing final answer."""
+        title = Text(" LeapFlow ", style="leap.answer_title")
+        self._console.print(Rule(
+            title=title,
+            style="leap.answer_border",
+            align="left",
         ))
 
     def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:

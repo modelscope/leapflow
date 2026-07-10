@@ -48,6 +48,33 @@ def test_disclosure_planner_selects_file_tools_without_full_catalog() -> None:
     assert "file_list" in names
     assert "shell_run" not in names
 
+    package_plan = planner.plan(
+        "Read package.json and summarize dependencies",
+        TOOL_DEFINITIONS,
+        DisclosureRuntimeState(native_tools_enabled=True),
+    )
+    assert package_plan.level == DisclosureLevel.SELECTED_TOOLS
+
+
+def test_disclosure_planner_selects_project_research_without_full_catalog() -> None:
+    planner = DisclosurePlanner()
+
+    plan = planner.plan(
+        "Read and study this codebase, then generate a system architecture diagram",
+        TOOL_DEFINITIONS,
+        DisclosureRuntimeState(native_tools_enabled=True, enable_thinking=True),
+    )
+
+    names = _tool_names(plan)
+    assert plan.level == DisclosureLevel.PROJECT_RESEARCH
+    assert plan.native_tools is True
+    assert plan.memory.value == "task_retrieval"
+    assert plan.reasoning.value == "auto"
+    assert "file_read" in names
+    assert "file_list" in names
+    assert "shell_run" not in names
+    assert not any(name.startswith("hub") for name in names)
+
 
 def test_disclosure_planner_uses_index_for_capability_questions() -> None:
     planner = DisclosurePlanner()

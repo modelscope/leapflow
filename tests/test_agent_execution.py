@@ -286,9 +286,57 @@ async def test_progressive_disclosure_light_query_omits_tools_and_thinking() -> 
             assert "tools" not in llm.kwargs
             assert llm.enable_thinking is False
             assert "file_read" not in str(llm.messages[0].get("content", ""))
+            system_prompt = str(llm.messages[0].get("content", ""))
+            assert "## Presentation Style" in system_prompt
+            assert "No leaked tool protocol" in system_prompt
+            assert "Theme-safe colors" in system_prompt
+            assert "## Task Contract" in system_prompt
+            assert "Original user request: hello" in system_prompt
+            assert "Workspace root:" in system_prompt
+            assert "never infer `.` as the project root" in system_prompt
             snapshot = engine.context_budget_snapshot
             assert snapshot["disclosure_level"] == "light"
             assert snapshot["disclosure"]["native_tools"] is False
+        finally:
+            lt.close()
+
+
+def test_task_contract_replaces_stale_contract_block() -> None:
+    """Compression recovery should keep exactly one current task contract."""
+    from leapflow.platform.mock import MockBridge
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        rpc = MockBridge()
+        llm = StubLLM(["ok"])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("chat")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            engine._session_turn_count = 1
+            engine._begin_turn_context("first request")
+            stale_contract = engine._task_contract_block()
+            engine._session_turn_count = 2
+            engine._begin_turn_context("second request")
+
+            prepared = engine._ensure_task_contract_message([
+                {"role": "system", "content": f"base system\n\n{stale_contract}\n"},
+                {"role": "system", "content": stale_contract},
+                {"role": "user", "content": "second request"},
+            ])
+            system_text = "\n".join(
+                str(message.get("content", ""))
+                for message in prepared
+                if message.get("role") == "system"
+            )
+
+            assert system_text.count("## Task Contract") == 1
+            assert "Original user request: second request" in system_text
+            assert "Original user request: first request" not in system_text
         finally:
             lt.close()
 

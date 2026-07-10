@@ -41,8 +41,10 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout.containers import Float, FloatContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.widgets import TextArea
@@ -271,16 +273,89 @@ class LeapApp:
         buffer.insert_text(suggestion_text)
         return True
 
+    def _completion_is_open(self, buffer: Any) -> bool:
+        """Return True when prompt_toolkit is showing completion candidates."""
+        return getattr(buffer, "complete_state", None) is not None
+
+    def _close_completion(self, buffer: Any) -> bool:
+        """Close the active completion menu when present."""
+        if not self._completion_is_open(buffer):
+            return False
+        buffer.cancel_completion()
+        self._invalidate()
+        return True
+
+    def _cursor_at_first_input_line(self, buffer: Any) -> bool:
+        """Return True when Up should leave line navigation and enter history."""
+        try:
+            return buffer.document.cursor_position_row <= 0
+        except (AttributeError, TypeError):
+            return True
+
+    def _cursor_at_last_input_line(self, buffer: Any) -> bool:
+        """Return True when Down should leave line navigation and enter history."""
+        try:
+            document = buffer.document
+            return document.cursor_position_row >= document.line_count - 1
+        except (AttributeError, TypeError):
+            return True
+
+    def _move_history_backward(self, buffer: Any) -> bool:
+        """Move to an older history entry while preserving the current draft."""
+        before_index = getattr(buffer, "working_index", None)
+        try:
+            buffer.history_backward()
+        except AttributeError:
+            return False
+        moved = getattr(buffer, "working_index", None) != before_index
+        if moved:
+            self._invalidate()
+        return moved
+
+    def _move_history_forward(self, buffer: Any) -> bool:
+        """Move to a newer history entry, restoring the draft at the newest slot."""
+        before_index = getattr(buffer, "working_index", None)
+        try:
+            buffer.history_forward()
+        except AttributeError:
+            return False
+        moved = getattr(buffer, "working_index", None) != before_index
+        if moved:
+            self._invalidate()
+        return moved
+
+    def _completion_previous_or_cursor_up(self, buffer: Any) -> None:
+        """Navigate completion candidates, then history, then multiline cursor movement."""
+        if self._completion_is_open(buffer):
+            buffer.complete_previous()
+            return
+        if self._cursor_at_first_input_line(buffer) and self._move_history_backward(buffer):
+            return
+        buffer.cursor_up()
+
+    def _completion_next_or_cursor_down(self, buffer: Any) -> None:
+        """Navigate completion candidates, then history, then multiline cursor movement."""
+        if self._completion_is_open(buffer):
+            buffer.complete_next()
+            return
+        if self._cursor_at_last_input_line(buffer) and self._move_history_forward(buffer):
+            return
+        buffer.cursor_down()
+
     def _accept_or_start_completion(self, buffer: Any) -> None:
-        """Accept the selected completion or open/cycle completion candidates."""
+        """Accept the selected completion or open completion candidates."""
         complete_state = getattr(buffer, "complete_state", None)
         current_completion = getattr(complete_state, "current_completion", None)
+        if complete_state is not None and current_completion is None:
+            buffer.complete_next()
+            complete_state = getattr(buffer, "complete_state", None)
+            current_completion = getattr(complete_state, "current_completion", None)
         if current_completion is not None:
             buffer.apply_completion(current_completion)
             return
         if self._accept_auto_suggestion(buffer):
             return
-        buffer.complete_next()
+        buffer.start_completion(select_first=True)
 
     def _move_right_or_accept_suggestion(self, buffer: Any) -> None:
         """Keep normal Right-arrow movement while accepting visible suggestions at EOL."""
@@ -396,7 +471,23 @@ class LeapApp:
             wrap_lines=False,
             style="class:status-bar",
         )
-        layout = Layout(HSplit([spinner, status_bar, self._input_area]))
+        root = HSplit([spinner, status_bar, self._input_area])
+        layout = Layout(
+            FloatContainer(
+                content=root,
+                floats=[
+                    Float(
+                        xcursor=True,
+                        ycursor=True,
+                        content=CompletionsMenu(
+                            max_height=12,
+                            scroll_offset=1,
+                            display_arrows=True,
+                        ),
+                    )
+                ],
+            )
+        )
 
         cursor_kwargs: dict[str, Any] = {}
         try:
@@ -425,13 +516,32 @@ class LeapApp:
 
         @kb.add(Keys.Enter)
         def _(event):
-            text = event.app.current_buffer.text.strip()
+            buffer = event.app.current_buffer
+            complete_state = getattr(buffer, "complete_state", None)
+            current_completion = getattr(complete_state, "current_completion", None)
+            if complete_state is not None and current_completion is None:
+                buffer.complete_next()
+                complete_state = getattr(buffer, "complete_state", None)
+                current_completion = getattr(complete_state, "current_completion", None)
+            if current_completion is not None:
+                before = buffer.text
+                buffer.apply_completion(current_completion)
+                if buffer.text != before:
+                    return
+            text = buffer.text.strip()
             if not text:
                 return
             has_compacted_paste = ref._paste_store.has_blocks
             ref.submit_text(text)
-            event.app.current_buffer.reset(append_to_history=not has_compacted_paste)
+            buffer.reset(append_to_history=not has_compacted_paste)
             ref._reset_paste_fragment_window()
+
+        @kb.add(Keys.Escape)
+        def _(event):
+            if ref._close_completion(event.current_buffer):
+                return
+            event.current_buffer.reset()
+            ref._clear_paste_state()
 
         @kb.add(Keys.Escape, Keys.Enter)
         def _(event):
@@ -440,6 +550,14 @@ class LeapApp:
         @kb.add(Keys.Tab)
         def _(event):
             ref._accept_or_start_completion(event.current_buffer)
+
+        @kb.add(Keys.Up)
+        def _(event):
+            ref._completion_previous_or_cursor_up(event.current_buffer)
+
+        @kb.add(Keys.Down)
+        def _(event):
+            ref._completion_next_or_cursor_down(event.current_buffer)
 
         @kb.add(Keys.Right)
         def _(event):
@@ -483,16 +601,21 @@ class LeapApp:
             "prompt.recording": t.recording,
             "prompt.paused": t.prompt_paused,
             "prompt.executing": t.executing,
-            "status-bar": f"bg:{t.toolbar_bg} {t.toolbar_fg}",
-            "status-bar.strong": f"bg:{t.toolbar_bg} bold {t.accent}",
-            "status-bar.dim": f"bg:{t.toolbar_bg} {t.text_muted}",
-            "status-bar.good": f"bg:{t.toolbar_bg} {t.success}",
+            "status-bar": f"bg:{t.toolbar_bg} {t.statusbar_fg}",
+            "status-bar.strong": f"bg:{t.toolbar_bg} bold {t.statusbar_accent}",
+            "status-bar.dim": f"bg:{t.toolbar_bg} {t.statusbar_dim}",
+            "status-bar.good": f"bg:{t.toolbar_bg} {t.statusbar_good}",
             "status-bar.warn": f"bg:{t.toolbar_bg} {t.warning}",
             "status-bar.bad": f"bg:{t.toolbar_bg} {t.error}",
             "hint": t.text_dim,
             "auto-suggest": t.auto_suggest,
             "placeholder": t.input_placeholder,
             "selection": f"bg:{t.input_selection_bg} {t.input_selection_fg}",
+            "completion-menu": f"bg:{t.toolbar_bg} {t.input_text}",
+            "completion-menu.completion": f"bg:{t.toolbar_bg} {t.input_text}",
+            "completion-menu.completion.current": f"bg:{t.input_selection_bg} bold {t.input_selection_fg}",
+            "completion-menu.meta.completion": f"bg:{t.toolbar_bg} {t.text_muted}",
+            "completion-menu.meta.completion.current": f"bg:{t.input_selection_bg} {t.input_selection_fg}",
         })
 
     # ── Fragment providers ───────────────────────────────────────────

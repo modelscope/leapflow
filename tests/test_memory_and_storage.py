@@ -19,6 +19,8 @@ from leapflow.domain.trajectory import (
 from leapflow.memory import (
     EpisodicMemoryProvider, SemanticMemoryProvider, WorkingMemoryProvider,
 )
+from leapflow.memory.manager import MemoryManager
+from leapflow.memory.protocol import MemoryEntry, MemoryKind, SignalDomain
 from leapflow.platform.event_bus import EventBus
 from leapflow.platform.protocol import EventTypes
 from leapflow.storage.skill_library import StoredSkill
@@ -160,6 +162,38 @@ def test_long_term_metadata_preserved(long_term_memory: SemanticMemoryProvider) 
     by_id = long_term_memory.get_by_id(mid)
     assert by_id is not None
     assert by_id.metadata == {"topic": "planning", "priority": "high"}
+
+
+def test_memory_manager_scope_gate_filters_other_workspaces(tmp_path: Path) -> None:
+    manager = MemoryManager()
+    workspace = tmp_path / "active_project"
+    workspace.mkdir()
+    active = MemoryEntry(
+        kind=MemoryKind.CONVERSATION,
+        domain=SignalDomain.SYSTEM,
+        content="Architecture notes for active_project",
+        metadata={"path": str(workspace / "README.md")},
+    )
+    other = MemoryEntry(
+        kind=MemoryKind.CONVERSATION,
+        domain=SignalDomain.SYSTEM,
+        content="Architecture notes for active_project but from another workspace",
+        metadata={"path": str(tmp_path / "other_workspace" / "paper.pdf")},
+    )
+    global_note = MemoryEntry(
+        kind=MemoryKind.CONVERSATION,
+        domain=SignalDomain.SYSTEM,
+        content="Architecture notes for active_project without path metadata",
+        metadata={},
+    )
+
+    scoped = manager._scope_entries(
+        [active, other, global_note],
+        workspace_root=str(workspace),
+        scope_keywords=["architecture"],
+    )
+
+    assert scoped == [active, global_note]
 
 
 # ── Immediate memory ───────────────────────────────────────────────

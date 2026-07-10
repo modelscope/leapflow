@@ -8,9 +8,12 @@ import pytest
 import leapflow.cli.tui_app.app as app_module
 from prompt_toolkit.auto_suggest import Suggestion
 from prompt_toolkit.completion import Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import to_plain_text
 from leapflow.cli.tui_app.app import LeapApp
 from leapflow.cli.tui_app.console import LeapConsole
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
+from leapflow.cli.tui_app.input import SlashCommandCompleter
 from leapflow.cli.tui_app.stream import StreamRenderer
 from leapflow.cli.tui_app.theme import _LIGHT, resolve_theme
 
@@ -51,13 +54,18 @@ async def _wait_for(condition, *, timeout: float = 1.0) -> None:
     raise AssertionError("condition was not met before timeout")
 
 
-def _make_app(on_input=None) -> tuple[LeapApp, _FakeConsole, _FakeStatus]:
+def _make_app(
+    on_input=None,
+    *,
+    commands: tuple[tuple[str, str], ...] = (),
+) -> tuple[LeapApp, _FakeConsole, _FakeStatus]:
     console = _FakeConsole()
     status = _FakeStatus()
     app = LeapApp(
         console=console,
         theme=resolve_theme(_LIGHT, terminal_bg="#FFFFFF"),
         status=status,
+        commands=commands,
         on_input=on_input,
     )
     return app, console, status
@@ -88,9 +96,43 @@ def test_submit_text_rejects_empty_commands() -> None:
     assert status.counts == []
 
 
+def test_slash_completer_shows_commands_and_descriptions() -> None:
+    completer = SlashCommandCompleter((
+        ("help", "Show available commands"),
+        ("teach start", "Start teaching mode"),
+    ))
+
+    completions = list(completer.get_completions(Document("/", 1), None))
+
+    assert [completion.text for completion in completions] == ["/help", "/teach start"]
+    assert [to_plain_text(completion.display) for completion in completions] == ["/help", "/teach start"]
+    assert to_plain_text(completions[0].display_meta) == "Show available commands"
+
+
+def test_slash_completer_filters_multi_word_commands() -> None:
+    completer = SlashCommandCompleter((
+        ("teach start", "Start teaching mode"),
+        ("teach stop", "Stop and distill skill"),
+        ("tools", "List available tools"),
+    ))
+
+    completions = list(completer.get_completions(Document("/teach s", len("/teach s")), None))
+
+    assert [completion.text for completion in completions] == ["/teach start", "/teach stop"]
+    assert all(completion.start_position == -len("/teach s") for completion in completions)
+
+
+def test_slash_completer_does_not_pollute_natural_language() -> None:
+    completer = SlashCommandCompleter((("help", "Show available commands"),))
+
+    assert list(completer.get_completions(Document("please help", len("please help")), None)) == []
+
+
 def test_tab_accepts_selected_completion() -> None:
     app, _console, _status = _make_app()
     buffer = app._input_area.buffer
+    buffer.completer = None
+    buffer.auto_suggest = None
     buffer.text = "/he"
     buffer.cursor_position = len(buffer.text)
     completion = Completion("/help", start_position=-len(buffer.text))
@@ -100,6 +142,89 @@ def test_tab_accepts_selected_completion() -> None:
 
     assert buffer.text == "/help"
     assert buffer.cursor_position == len("/help")
+
+
+def test_escape_closes_visible_completion_menu() -> None:
+    app, _console, _status = _make_app()
+    buffer = app._input_area.buffer
+    buffer.completer = None
+    buffer.auto_suggest = None
+    buffer.text = "/h"
+    buffer.cursor_position = len(buffer.text)
+    buffer._set_completions([Completion("/help", start_position=-len(buffer.text))])
+
+    assert app._close_completion(buffer) is True
+
+    assert buffer.complete_state is None
+
+
+def test_down_arrow_navigates_visible_completion_menu() -> None:
+    app, _console, _status = _make_app()
+    buffer = app._input_area.buffer
+    buffer.completer = None
+    buffer.auto_suggest = None
+    buffer.text = "/h"
+    buffer.cursor_position = len(buffer.text)
+    buffer._set_completions([
+        Completion("/help", start_position=-len(buffer.text)),
+        Completion("/host", start_position=-len(buffer.text)),
+    ])
+
+    app._completion_next_or_cursor_down(buffer)
+    first = buffer.complete_state.current_completion
+    app._completion_next_or_cursor_down(buffer)
+    second = buffer.complete_state.current_completion
+
+    assert first is not None and first.text == "/help"
+    assert second is not None and second.text == "/host"
+
+
+def test_history_navigation_restores_unsubmitted_draft() -> None:
+    app, _console, _status = _make_app()
+    buffer = app._input_area.buffer
+    buffer.completer = None
+    buffer.auto_suggest = None
+    buffer.text = "你是谁"
+    buffer.cursor_position = len(buffer.text)
+    buffer._working_lines.appendleft("上一条消息")
+    buffer.working_index += 1
+
+    app._completion_previous_or_cursor_up(buffer)
+
+    assert buffer.text == "上一条消息"
+    assert buffer.cursor_position == len("上一条消息")
+
+    app._completion_next_or_cursor_down(buffer)
+
+    assert buffer.text == "你是谁"
+    assert buffer.cursor_position == len("你是谁")
+
+
+def test_up_arrow_keeps_multiline_cursor_navigation_before_history() -> None:
+    app, _console, _status = _make_app()
+    buffer = app._input_area.buffer
+    buffer.completer = None
+    buffer.auto_suggest = None
+    buffer.text = "第一行\n第二行"
+    buffer._working_lines.appendleft("上一条消息")
+    buffer.working_index += 1
+    buffer.cursor_position = len(buffer.text)
+    working_index = buffer.working_index
+
+    app._completion_previous_or_cursor_up(buffer)
+
+    assert buffer.text == "第一行\n第二行"
+    assert buffer.working_index == working_index
+    assert buffer.document.cursor_position_row == 0
+
+
+def test_leap_app_exposes_completion_menu_styles() -> None:
+    app, _console, _status = _make_app(commands=(("help", "Show available commands"),))
+    style = app._build_style()
+
+    assert style.get_attrs_for_style_str("class:completion-menu.completion") is not None
+    assert style.get_attrs_for_style_str("class:completion-menu.meta.completion.current") is not None
+    assert app._input_area.buffer.completer is not None
 
 
 @pytest.mark.asyncio
@@ -265,9 +390,10 @@ def test_stream_renderer_prints_context_evidence_metadata() -> None:
 
     assert any(
         "file_read" in line
-        and "mode=symbols" in line
+        and "symbols" in line
         and "truncated" in line
-        and "repeat-read x3" in line
+        and "repeat×3" in line
+        and "repeat-read" not in line
         for line in console.lines
     )
 
@@ -314,15 +440,58 @@ def test_stream_renderer_prints_compression_and_posture_metadata() -> None:
     )
 
     assert any(
-        "compressed=trim+summarize" in line
-        and "saved≈42%" in line
-        and "threshold-triggered" in line
-        and "research" in line
-        and "maintain research ledger" in line
-        and "disclosure=selected_tools" in line
-        and "selected capabilities matched" in line
+        "passed" in line
+        and "[research · evidence · compressed]" in line
+        and "saved≈" not in line
+        and "threshold-triggered" not in line
+        and "maintain research ledger" not in line
+        and "selected capabilities matched" not in line
         for line in console.lines
     )
+
+
+def test_stream_renderer_suppresses_structured_tool_blobs_and_compacts_paths() -> None:
+    class CaptureConsole:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def print(self, renderable) -> None:
+            self.lines.append(getattr(renderable, "plain", str(renderable)))
+
+        def thinking(self, text: str) -> None:
+            pass
+
+        def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
+            pass
+
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+            pass
+
+        def newline(self) -> None:
+            pass
+
+    console = CaptureConsole()
+    renderer = StreamRenderer(console)  # type: ignore[arg-type]
+    renderer.start()
+    long_path = "/very/long/path/that/should/not/dominate/the/tool/log/with/many/nested/segments/src/leapflow"
+
+    renderer.tool_started("file_list", metadata={"path": long_path})
+    renderer.tool_finished(
+        "file_list",
+        metadata={
+            "ok": True,
+            "path": long_path,
+            "result_preview": '{"ok": true, "entries": [{"name": "a"}, {"name": "b"}]}',
+            "context_evidence": True,
+            "disclosure_level": "full",
+            "disclosure_reason": "task requires broad execution context",
+        },
+    )
+
+    assert any("path=…/segments/src/leapflow" in line for line in console.lines)
+    assert not any(long_path in line for line in console.lines)
+    assert any("file_list" in line and "ok [disclosure=full · evidence]" in line for line in console.lines)
+    assert not any("entries" in line or "task requires broad" in line for line in console.lines)
 
 
 @pytest.mark.asyncio

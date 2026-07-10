@@ -23,6 +23,7 @@ class _Console:
         self.markdown_calls: list[dict[str, object]] = []
         self.thinking_calls: list[str] = []
         self.labels: list[tuple[float, int]] = []
+        self.answer_labels = 0
         self.lines = 0
 
     def markdown(
@@ -42,6 +43,9 @@ class _Console:
 
     def thinking(self, text: str) -> None:
         self.thinking_calls.append(text)
+
+    def answer_label(self) -> None:
+        self.answer_labels += 1
 
     def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
         self.labels.append((elapsed_s, tool_count))
@@ -159,7 +163,87 @@ def test_stream_renderer_spaces_and_indents_final_response_only() -> None:
         "margin_bottom": 0,
     }]
     assert len(console.labels) == 1
+    assert console.answer_labels == 1
     assert console.lines == 1
+
+
+def test_stream_renderer_suppresses_synthetic_round_thinking() -> None:
+    console = _Console()
+    renderer = StreamRenderer(console)
+    renderer.start()
+
+    renderer.feed_thinking("round 1")
+    renderer.feed_thinking("round 2round 3")
+    assert renderer.has_output is False
+
+    renderer.feed("final answer")
+    renderer.finish()
+
+    assert console.thinking_calls == []
+    assert console.markdown_calls[0]["text"] == "final answer"
+
+
+def test_stream_renderer_keeps_meaningful_thinking_lines() -> None:
+    console = _Console()
+    renderer = StreamRenderer(console)
+    renderer.start()
+
+    renderer.feed_thinking("round 1")
+    renderer.feed_thinking("Reading relevant files")
+    renderer.feed_thinking("round 2\nSynthesizing findings")
+    renderer.feed("final answer")
+    renderer.finish()
+
+    assert console.thinking_calls == ["Reading relevant files\nSynthesizing findings"]
+
+
+def test_stream_renderer_sanitizes_tool_protocol_from_final_answer() -> None:
+    console = _Console()
+    renderer = StreamRenderer(console)
+    renderer.start()
+
+    renderer.feed("""
+  · skills_list  {}
+  ✓ skills_list  4ms  ok [disclosure=indexed_capabilities]
+
+```json
+{"name": "skills_list", "arguments": {}}
+```
+
+目前可用能力如下：
+
+{"name": "skills_list", "arguments": {"query": "", "source": "local"}}
+
+- 文件操作
+- Shell 命令执行
+""")
+    renderer.finish()
+
+    text = str(console.markdown_calls[0]["text"])
+    assert "skills_list" not in text
+    assert "arguments" not in text
+    assert "目前可用能力如下" in text
+    assert "文件操作" in text
+    assert console.answer_labels == 1
+
+
+def test_stream_renderer_keeps_regular_json_examples() -> None:
+    console = _Console()
+    renderer = StreamRenderer(console)
+    renderer.start()
+
+    renderer.feed("""
+配置示例：
+
+```json
+{"theme": "dark", "enabled": true}
+```
+""")
+    renderer.finish()
+
+    text = str(console.markdown_calls[0]["text"])
+    assert '"theme": "dark"' in text
+    assert '"enabled": true' in text
 
 
 def test_global_resume_routes_to_interactive(monkeypatch) -> None:

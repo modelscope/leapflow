@@ -399,6 +399,15 @@ class ContextGovernanceController:
         self._tool_counts: dict[str, int] = {}
         self._evidence_count = 0
 
+    def reset_turn_scope(self) -> None:
+        """Clear per-turn exploration state so posture never leaks across tasks."""
+        self._reads.clear()
+        self._sources_seen.clear()
+        self._tool_counts.clear()
+        self._evidence_count = 0
+
+    reset_task_scope = reset_turn_scope
+
     def compact_tool_result(self, tool_name: str, arguments: Dict[str, Any] | None, result: Any) -> Any:
         """Return evidence and update the session exploration ledger."""
         self._tool_counts[tool_name] = self._tool_counts.get(tool_name, 0) + 1
@@ -460,7 +469,11 @@ class ContextGovernanceController:
             posture = _POSTURE_CONVERGING
             dominant_signal = "repeat-read" if repeated_reads > 0 else "long-exploration"
             convergence_reason = "repeat reads detected" if repeated_reads > 0 else "exploration round limit reached"
-            guidance = "deduplicate evidence and prefer targeted reads"
+            guidance = (
+                "switch to complementary sources, outlines, symbols, or bounded ranges"
+                if repeated_reads > 0 else
+                "deduplicate evidence and prefer targeted reads"
+            )
         elif sources_seen >= cfg.research_source_threshold or self._evidence_count >= cfg.research_evidence_threshold:
             posture = _POSTURE_RESEARCH
             dominant_signal = "multi-source" if sources_seen >= cfg.research_source_threshold else "evidence-volume"
@@ -488,6 +501,13 @@ class ContextGovernanceController:
         snapshot = self.snapshot(round_number=round_number)
         if not snapshot.should_converge:
             return ""
+        if snapshot.dominant_signal == "repeat-read":
+            return (
+                "SYSTEM: Adaptive context governance detected repeated reads. "
+                "Do not reread the same raw source again. Pivot to complementary project evidence: "
+                "directory outline, symbols, bounded line ranges, adjacent modules, tests, docs, or synthesize "
+                "from the evidence already gathered if enough context exists."
+            )
         reason = snapshot.convergence_reason or snapshot.dominant_signal or "context pressure"
         return (
             "SYSTEM: Adaptive context governance is converging "
