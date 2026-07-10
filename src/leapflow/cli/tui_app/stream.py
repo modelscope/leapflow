@@ -29,7 +29,8 @@ _TOOL_CONTEXT_TAG_LIMIT = 3
 _SYNTHETIC_THINKING_ROUND_RE = re.compile(r"round\s*\d+", re.IGNORECASE)
 _FENCED_BLOCK_RE = re.compile(r"```(?P<lang>[\w+-]*)\s*\n(?P<body>.*?)\n```", re.DOTALL)
 _TOOL_AUDIT_LINE_RE = re.compile(
-    r"^\s*[·✓✗]\s+[A-Za-z_][\w.-]*(?:\s|$).*",
+    r"^\s*(?:·|✓|✗|📁|📄|✍️?|🧠|🧭|💻|🌐|🧩|🔧|❌)\s+"
+    r"[A-Za-z_][\w.-]*(?:\s|$).*",
     re.MULTILINE,
 )
 _JSON_DECODER = json.JSONDecoder()
@@ -198,6 +199,29 @@ def _tool_context_detail(metadata: dict[str, Any] | None) -> str:
     tags = _context_tags(metadata)
     return f"[{' · '.join(tags)}]" if tags else ""
 
+
+def _tool_icon(name: str, *, ok: bool = True) -> str:
+    if not ok:
+        return "❌"
+    if name.startswith("file_list"):
+        return "📁"
+    if name.startswith("file_read"):
+        return "📄"
+    if name.startswith("file_write") or name.startswith("file_edit"):
+        return "✍️"
+    if name.startswith("memory"):
+        return "🧠"
+    if name.startswith("env"):
+        return "🧭"
+    if name.startswith("shell") or name.startswith("bash"):
+        return "💻"
+    if name.startswith("web") or name.startswith("browser"):
+        return "🌐"
+    if name.startswith("skill"):
+        return "🧩"
+    return "🔧"
+
+
 def _tool_result_detail(metadata: dict[str, Any] | None) -> str:
     if not metadata:
         return ""
@@ -209,9 +233,7 @@ def _tool_result_detail(metadata: dict[str, Any] | None) -> str:
             or _metadata_text(metadata, "error_preview")
             or _metadata_text(metadata, "result_preview")
         )
-        base = _truncate_detail(prefix + detail, limit=_TOOL_OUTPUT_LIMIT) if detail or prefix else "failed"
-        context = _tool_context_detail(metadata)
-        return f"{base} {context}" if context else base
+        return _truncate_detail(prefix + detail, limit=_TOOL_OUTPUT_LIMIT) if detail or prefix else "failed"
     detail = (
         _metadata_text(metadata, "stdout_preview")
         or _metadata_text(metadata, "content_preview")
@@ -219,11 +241,8 @@ def _tool_result_detail(metadata: dict[str, Any] | None) -> str:
         or _metadata_text(metadata, "result_preview")
     )
     if detail and not _looks_like_structured_blob(detail):
-        base = _truncate_detail(detail, limit=_TOOL_OUTPUT_LIMIT)
-    else:
-        base = "ok"
-    context = _tool_context_detail(metadata)
-    return f"{base} {context}" if context else base
+        return _truncate_detail(detail, limit=_TOOL_OUTPUT_LIMIT)
+    return ""
 
 
 if TYPE_CHECKING:
@@ -262,6 +281,7 @@ class StreamRenderer:
         self._start_time: float = 0.0
         self._tool_start_time: float = 0.0
         self._active_tool: str = ""
+        self._active_tool_detail: str = ""
         self._tool_history: list[tuple[str, float]] = []
 
     @property
@@ -287,6 +307,7 @@ class StreamRenderer:
         self._buffer = ""
         self._thinking_buffer = ""
         self._active_tool = ""
+        self._active_tool_detail = ""
         self._tool_history = []
         self._start_time = time.monotonic()
         self._tool_start_time = 0.0
@@ -307,16 +328,9 @@ class StreamRenderer:
     def tool_started(self, name: str, metadata: dict[str, Any] | None = None) -> str:
         """Mark a tool call as started. Returns spinner text for LeapApp."""
         self._active_tool = name
+        self._active_tool_detail = _tool_action_detail(metadata)
         self._tool_start_time = time.monotonic()
-        detail = _tool_action_detail(metadata)
-        line = Text()
-        line.append("  · ", style="leap.tool")
-        line.append(name, style="leap.tool_name")
-        if detail:
-            line.append("  ", style="leap.tool")
-            line.append(detail, style="leap.tool")
-        self._console.print(line)
-        return f"⚡ {name}"
+        return f"{_tool_icon(name)} {name}"
 
     def tool_finished(
         self,
@@ -324,24 +338,29 @@ class StreamRenderer:
         output: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Mark a tool call as finished; print completion line immediately."""
+        """Mark a tool call as finished; print one compact audit line."""
         tool_name = name or self._active_tool
         if tool_name and self._tool_start_time > 0:
             duration = time.monotonic() - self._tool_start_time
             self._tool_history.append((tool_name, duration))
             ok = metadata.get("ok", True) if metadata else True
+            action_detail = self._active_tool_detail or _tool_action_detail(metadata)
+            result_detail = _tool_result_detail(metadata) or _truncate_detail(output, limit=_TOOL_OUTPUT_LIMIT)
             line = Text()
             status_style = "leap.tool" if ok else "leap.error"
             name_style = "leap.tool_name" if ok else "leap.error"
-            line.append("  ✓ " if ok else "  ✗ ", style=status_style)
+            line.append(f"  {_tool_icon(tool_name, ok=ok)} ", style=status_style)
             line.append(tool_name, style=name_style)
-            line.append(f"  {_format_elapsed(duration)}", style="leap.tool")
-            detail = _tool_result_detail(metadata) or _truncate_detail(output, limit=_TOOL_OUTPUT_LIMIT)
-            if detail:
+            if action_detail:
                 line.append("  ", style="leap.tool")
-                line.append(detail, style="leap.tool" if ok else "leap.error")
+                line.append(action_detail, style="leap.tool")
+            if result_detail:
+                line.append(" → ", style="leap.tool" if ok else "leap.error")
+                line.append(result_detail, style="leap.tool" if ok else "leap.error")
+            line.append(f" | {_format_elapsed(duration)}", style="leap.tool")
             self._console.print(line)
         self._active_tool = ""
+        self._active_tool_detail = ""
         self._tool_start_time = 0.0
 
     def finish(self) -> None:

@@ -313,8 +313,12 @@ def test_stream_renderer_prints_tool_command_and_success_preview() -> None:
     renderer.tool_started("shell_run", metadata={"command": "python -V"})
     renderer.tool_finished("shell_run", metadata={"ok": True, "stdout_preview": "Python 3.13.0"})
 
-    assert any("shell_run" in line and "$ python -V" in line for line in console.lines)
-    assert any("shell_run" in line and "Python 3.13.0" in line for line in console.lines)
+    assert len(console.lines) == 1
+    line = console.lines[0]
+    assert "💻 shell_run" in line
+    assert "$ python -V" in line
+    assert "→ Python 3.13.0" in line
+    assert " | " in line
 
 
 def test_stream_renderer_prints_tool_failure_exit_and_stderr() -> None:
@@ -347,7 +351,12 @@ def test_stream_renderer_prints_tool_failure_exit_and_stderr() -> None:
         metadata={"ok": False, "exit_code": 1, "stderr_preview": "permission denied"},
     )
 
-    assert any("✗" in line and "exit=1 permission denied" in line for line in console.lines)
+    assert len(console.lines) == 1
+    line = console.lines[0]
+    assert "❌ shell_run" in line
+    assert "$ false" in line
+    assert "→ exit=1 permission denied" in line
+    assert " | " in line
 
 
 def test_stream_renderer_prints_context_evidence_metadata() -> None:
@@ -388,14 +397,16 @@ def test_stream_renderer_prints_context_evidence_metadata() -> None:
         },
     )
 
-    assert any(
-        "file_read" in line
-        and "symbols" in line
-        and "truncated" in line
-        and "repeat×3" in line
-        and "repeat-read" not in line
-        for line in console.lines
-    )
+    assert len(console.lines) == 1
+    line = console.lines[0]
+    assert "📄 file_read" in line
+    assert "path=/tmp/sample.py" in line
+    assert " | " in line
+    assert "symbols" not in line
+    assert "truncated" not in line
+    assert "repeat×3" not in line
+    assert "evidence" not in line
+    assert "repeat-read" not in line
 
 
 def test_stream_renderer_prints_compression_and_posture_metadata() -> None:
@@ -439,15 +450,19 @@ def test_stream_renderer_prints_compression_and_posture_metadata() -> None:
         },
     )
 
-    assert any(
-        "passed" in line
-        and "[research · evidence · compressed]" in line
-        and "saved≈" not in line
-        and "threshold-triggered" not in line
-        and "maintain research ledger" not in line
-        and "selected capabilities matched" not in line
-        for line in console.lines
-    )
+    assert len(console.lines) == 1
+    line = console.lines[0]
+    assert "💻 shell_run" in line
+    assert "$ pytest" in line
+    assert "→ passed" in line
+    assert " | " in line
+    assert "research" not in line
+    assert "evidence" not in line
+    assert "compressed" not in line
+    assert "saved≈" not in line
+    assert "threshold-triggered" not in line
+    assert "maintain research ledger" not in line
+    assert "selected capabilities matched" not in line
 
 
 def test_stream_renderer_suppresses_structured_tool_blobs_and_compacts_paths() -> None:
@@ -488,10 +503,17 @@ def test_stream_renderer_suppresses_structured_tool_blobs_and_compacts_paths() -
         },
     )
 
-    assert any("path=…/segments/src/leapflow" in line for line in console.lines)
-    assert not any(long_path in line for line in console.lines)
-    assert any("file_list" in line and "ok [disclosure=full · evidence]" in line for line in console.lines)
-    assert not any("entries" in line or "task requires broad" in line for line in console.lines)
+    assert len(console.lines) == 1
+    line = console.lines[0]
+    assert "📁 file_list" in line
+    assert "path=…/segments/src/leapflow" in line
+    assert " | " in line
+    assert long_path not in line
+    assert "ok" not in line
+    assert "disclosure" not in line
+    assert "evidence" not in line
+    assert "entries" not in line
+    assert "task requires broad" not in line
 
 
 @pytest.mark.asyncio
