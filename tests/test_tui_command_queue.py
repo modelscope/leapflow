@@ -225,6 +225,53 @@ def test_stream_renderer_prints_tool_failure_exit_and_stderr() -> None:
     assert any("✗" in line and "exit=1 permission denied" in line for line in console.lines)
 
 
+def test_stream_renderer_prints_context_evidence_metadata() -> None:
+    class CaptureConsole:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def print(self, renderable) -> None:
+            self.lines.append(getattr(renderable, "plain", str(renderable)))
+
+        def thinking(self, text: str) -> None:
+            pass
+
+        def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
+            pass
+
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+            pass
+
+        def newline(self) -> None:
+            pass
+
+    console = CaptureConsole()
+    renderer = StreamRenderer(console)  # type: ignore[arg-type]
+    renderer.start()
+
+    renderer.tool_started("file_read", metadata={"path": "/tmp/sample.py"})
+    renderer.tool_finished(
+        "file_read",
+        metadata={
+            "ok": True,
+            "path": "/tmp/sample.py",
+            "mode": "symbols",
+            "context_evidence": True,
+            "tool_truncated": True,
+            "repeat_read": True,
+            "read_count": 3,
+        },
+    )
+
+    assert any(
+        "file_read" in line
+        and "mode=symbols" in line
+        and "truncated" in line
+        and "repeat-read x3" in line
+        for line in console.lines
+    )
+
+
 @pytest.mark.asyncio
 async def test_process_loop_marks_failed_commands_and_recovers_counts() -> None:
     async def on_input(text: str) -> None:

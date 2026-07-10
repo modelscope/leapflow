@@ -49,12 +49,22 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "file_read",
-            "description": "Read the content of a text file.",
+            "description": (
+                "Read the content of a text file. For long tasks over large files, "
+                "prefer mode='outline' or mode='symbols' first, then use mode='raw' "
+                "with start_line for the specific range you actually need."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path to read"},
                     "max_lines": {"type": "integer", "description": "Max lines to return (default: 200)"},
+                    "start_line": {"type": "integer", "description": "1-based line to start reading from (default: 1)"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["raw", "outline", "symbols"],
+                        "description": "raw=exact lines, outline=headings/structure, symbols=class/function signatures",
+                    },
                 },
                 "required": ["path"],
             },
@@ -241,10 +251,15 @@ _BRIDGE_TOOLS = [
     },
     {
         "name": "gp_file_read",
-        "description": "Read the content of a text file.",
+        "description": (
+            "Read the content of a text file. Use mode='outline'/'symbols' for large "
+            "files before reading raw ranges, to reduce context usage in long tasks."
+        ),
         "parameters": {
             "path": "string (required) — file path to read",
             "max_lines": "integer (optional) — max lines to return (default: 200)",
+            "start_line": "integer (optional) — 1-based starting line (default: 1)",
+            "mode": "string (optional) — raw|outline|symbols (default: raw)",
         },
         "handler": file_read,
     },

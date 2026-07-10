@@ -57,6 +57,23 @@ def _tool_action_detail(metadata: dict[str, Any] | None) -> str:
     return _truncate_detail(_metadata_text(metadata, "args_summary"))
 
 
+def _tool_context_detail(metadata: dict[str, Any] | None) -> str:
+    if not metadata:
+        return ""
+    parts: list[str] = []
+    mode = _metadata_text(metadata, "mode")
+    if mode and mode != "raw":
+        parts.append(f"mode={mode}")
+    if metadata.get("tool_truncated"):
+        parts.append("truncated")
+    read_count = metadata.get("read_count")
+    if metadata.get("repeat_read") and read_count is not None:
+        parts.append(f"repeat-read x{read_count}")
+    elif metadata.get("context_evidence"):
+        parts.append("evidence")
+    return ", ".join(parts)
+
+
 def _tool_result_detail(metadata: dict[str, Any] | None) -> str:
     if not metadata:
         return ""
@@ -68,7 +85,9 @@ def _tool_result_detail(metadata: dict[str, Any] | None) -> str:
             or _metadata_text(metadata, "error_preview")
             or _metadata_text(metadata, "result_preview")
         )
-        return _truncate_detail(prefix + detail) if detail or prefix else "failed"
+        base = _truncate_detail(prefix + detail) if detail or prefix else "failed"
+        context = _tool_context_detail(metadata)
+        return f"{base} ({context})" if context else base
     detail = (
         _metadata_text(metadata, "stdout_preview")
         or _metadata_text(metadata, "content_preview")
@@ -76,10 +95,13 @@ def _tool_result_detail(metadata: dict[str, Any] | None) -> str:
         or _metadata_text(metadata, "result_preview")
     )
     if detail:
-        return _truncate_detail(detail)
-    if metadata.get("path"):
-        return f"path={_truncate_detail(str(metadata['path']))}"
-    return "ok (no output)"
+        base = _truncate_detail(detail)
+    elif metadata.get("path"):
+        base = f"path={_truncate_detail(str(metadata['path']))}"
+    else:
+        base = "ok (no output)"
+    context = _tool_context_detail(metadata)
+    return f"{base} ({context})" if context else base
 
 
 if TYPE_CHECKING:

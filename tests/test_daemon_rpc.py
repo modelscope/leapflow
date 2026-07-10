@@ -644,6 +644,15 @@ async def test_runtime_service_serializes_engine_chat_streams(tmp_path) -> None:
             self.active = 0
             self.max_active = 0
             self.context_token_count = 2_048
+            self.context_budget_snapshot = {
+                "message_tokens": 1_800,
+                "tool_schema_tokens": 248,
+                "total_tokens": 2_048,
+                "context_length": 16_000,
+                "ratio": 0.128,
+                "compressed": False,
+                "forced_final_answer": False,
+            }
             self._current_session_id = "sess-daemon"
 
         async def run_stream(self, message: str, *, enable_thinking: bool = False):
@@ -677,9 +686,13 @@ async def test_runtime_service_serializes_engine_chat_streams(tmp_path) -> None:
     assert [event.content for event in first] == ["start:one", "done:one"]
     assert [event.content for event in second] == ["start:two", "done:two"]
     assert first[0].metadata["context_used"] == 2_048
+    assert first[0].metadata["context_budget_snapshot"]["total_tokens"] == 2_048
+    assert first[0].metadata["context_budget_snapshot"]["tool_schema_tokens"] == 248
+    assert first[0].metadata["llm_context_length"] == 16_000
     assert first[0].metadata["session_id"] == "sess-daemon"
     assert second[0].metadata["context_used"] == 2_048
     assert status["context_used"] == 2_048
+    assert status["context_budget_snapshot"]["total_tokens"] == 2_048
     assert context.engine.max_active == 1
 
 

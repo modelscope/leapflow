@@ -16,6 +16,12 @@ from leapflow.platform.protocol import HostRpc, Methods
 from leapflow.config import Settings
 from leapflow.engine.budget import BudgetConfig, BudgetStatus, IterationBudget
 from leapflow.engine.context_compressor import CompressorConfig, ContextCompressor
+from leapflow.engine.context_control import (
+    ContextBudgetEstimator,
+    ContextWindowController,
+    LongTaskContextController,
+    ToolEvidenceBuilder,
+)
 from leapflow.engine.error_classifier import (
     ErrorCategory,
     ErrorClassifier,
@@ -414,10 +420,24 @@ class AgentEngine:
             )
         )
         self._compressor = ContextCompressor(CompressorConfig(
+            token_budget=max(1, int(settings.llm_context_length * settings.context_hard_limit_ratio)),
             threshold=settings.compress_threshold,
             keep_tail=settings.compress_keep_tail,
             max_output_chars=settings.max_tool_output_chars,
         ))
+        self._context_controller = ContextWindowController(
+            estimator=ContextBudgetEstimator(),
+            hard_limit_ratio=settings.context_hard_limit_ratio,
+            warning_ratio=settings.context_warning_ratio,
+        )
+        self._long_task_controller = LongTaskContextController(
+            evidence_builder=ToolEvidenceBuilder(
+                max_content_chars=settings.tool_evidence_max_chars,
+            ),
+            repeated_read_limit=settings.repeated_read_limit,
+            convergence_round=settings.long_task_convergence_round,
+        )
+        self._last_context_snapshot: dict[str, Any] = {}
         self._healer = MessageHealer()
 
         # B2: Prompt cache optimization (None = disabled)
@@ -476,6 +496,24 @@ class AgentEngine:
         self._llm = llm
         self._vlm = vlm
         self._classifier = classifier
+        self._compressor = ContextCompressor(CompressorConfig(
+            token_budget=max(1, int(settings.llm_context_length * settings.context_hard_limit_ratio)),
+            threshold=settings.compress_threshold,
+            keep_tail=settings.compress_keep_tail,
+            max_output_chars=settings.max_tool_output_chars,
+        ))
+        self._context_controller = ContextWindowController(
+            estimator=ContextBudgetEstimator(),
+            hard_limit_ratio=settings.context_hard_limit_ratio,
+            warning_ratio=settings.context_warning_ratio,
+        )
+        self._long_task_controller = LongTaskContextController(
+            evidence_builder=ToolEvidenceBuilder(
+                max_content_chars=settings.tool_evidence_max_chars,
+            ),
+            repeated_read_limit=settings.repeated_read_limit,
+            convergence_round=settings.long_task_convergence_round,
+        )
         self._skill_merger = SkillMerger(
             registry=self._registry,
             llm=llm,
@@ -717,8 +755,96 @@ class AgentEngine:
 
     @property
     def context_token_count(self) -> int:
-        """Prompt tokens from the most recent API call (context utilization)."""
+        """Estimated provider-visible prompt tokens from the most recent API call."""
         return self._last_context_tokens
+
+    @property
+    def context_budget_snapshot(self) -> dict[str, Any]:
+        """Last prompt-budget snapshot for status/daemon metadata."""
+        return dict(self._last_context_snapshot)
+
+    def _active_context_length(self) -> int:
+        """Return the runtime context length for the active model/provider."""
+        if self._model_capabilities is not None:
+            try:
+                return max(1, int(self._model_capabilities.resolve(self._settings.llm_model).context_length))
+            except Exception:
+                logger.debug("model capability lookup failed", exc_info=True)
+        return max(1, int(self._settings.llm_context_length))
+
+    def _prepare_llm_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Any = None,
+        round_number: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Compress and hard-gate messages before sending them to the provider."""
+        context_length = self._active_context_length()
+        token_count = self._context_controller.estimator.estimate_messages(messages)
+        prepared = self._compressor.compress(messages, token_count=token_count)
+        prepared = self._compressor.preflight_check(prepared, context_length=context_length)
+        if self._cache_strategy:
+            prepared = self._cache_strategy.optimize(prepared)
+        decision = self._context_controller.prepare(
+            prepared,
+            tools=tools,
+            context_length=context_length,
+            compressor=self._compressor,
+        )
+        prepared = decision.messages
+        warning = self._context_controller.warning_notice(
+            decision.snapshot,
+            round_number=round_number,
+        )
+        convergence = self._long_task_controller.convergence_notice(round_number)
+        for notice in (warning, convergence):
+            if notice:
+                prepared = [*prepared, build_user_message_text(notice)]
+        snapshot = self._context_controller.estimator.snapshot(
+            prepared,
+            tools=tools,
+            context_length=context_length,
+        )
+        self._last_context_tokens = snapshot.total_tokens
+        self._last_context_snapshot = {
+            "message_tokens": snapshot.message_tokens,
+            "tool_schema_tokens": snapshot.tool_schema_tokens,
+            "total_tokens": snapshot.total_tokens,
+            "context_length": snapshot.context_length,
+            "ratio": snapshot.ratio,
+            "compressed": decision.compressed,
+            "forced_final_answer": decision.forced_final_answer,
+        }
+        if decision.compressed:
+            self._usage_tracker.mark_compression()
+        return prepared
+
+    def _record_provider_usage(self, model: str, usage: Dict[str, Any]) -> None:
+        """Prefer provider prompt usage when available and learn observed limits."""
+        provider_prompt = int(usage.get("prompt_tokens", 0) or 0)
+        if provider_prompt > 0:
+            self._last_context_tokens = provider_prompt
+            self._last_context_snapshot = {
+                **self._last_context_snapshot,
+                "provider_prompt_tokens": provider_prompt,
+                "total_tokens": provider_prompt,
+            }
+        if self._model_capabilities and model and usage:
+            self._model_capabilities.update_from_usage(model, usage)
+
+    def _compact_tool_result(self, tool_name: str, arguments: Dict[str, Any] | None, result: Any) -> Any:
+        """Return compact tool evidence for LLM replay."""
+        return self._long_task_controller.compact_tool_result(tool_name, arguments, result)
+
+    def _tool_context_metadata(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any] | None,
+        result: Any,
+    ) -> Dict[str, Any]:
+        """Return additional UI metadata from long-task context handling."""
+        return self._long_task_controller.tool_metadata(tool_name, arguments, result)
 
     async def run(self, user_text: str, *, enable_thinking: bool = False) -> str:
         """Entrypoint: simplified routing with unified tool loop as default path."""
@@ -1274,11 +1400,11 @@ class AgentEngine:
             self._inject_live_signals(messages, _signal_watermark)
 
             healed = self._healer.heal(messages)
-            compressed = self._compressor.compress(healed)
-            compressed = self._compressor.preflight_check(compressed)
-            if self._cache_strategy:
-                compressed = self._cache_strategy.optimize(compressed)
-            self._last_context_tokens = _estimate_prompt_tokens(compressed)
+            compressed = self._prepare_llm_messages(
+                healed,
+                tools=tools_kwarg.get("tools"),
+                round_number=budget.used,
+            )
 
             _show_progress("thinking", f"round {budget.used}")
             try:
@@ -1295,9 +1421,7 @@ class AgentEngine:
                 )
                 provider_prompt = usage.get("prompt_tokens", 0)
                 if provider_prompt > 0:
-                    self._last_context_tokens = provider_prompt
-                if self._model_capabilities and resp.model and usage:
-                    self._model_capabilities.update_from_usage(resp.model, usage)
+                    self._record_provider_usage(resp.model or '', usage)
             except Exception as exc:
                 _clear_indicator()
                 classified = self._error_classifier.classify(exc)
@@ -1400,8 +1524,8 @@ class AgentEngine:
                     break
             else:
                 recovery.record_tool_success()
-
-            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+            result_payload = self._compact_tool_result(tool_call['name'], tool_call.get("arguments"), result)
+            result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
             messages.append(build_user_message_text(
                 f"Tool result ({tool_call['name']}):\n{result_text}"
             ))
@@ -1630,11 +1754,11 @@ class AgentEngine:
             self._inject_live_signals(messages, _signal_watermark)
 
             healed = self._healer.heal(messages)
-            compressed = self._compressor.compress(healed)
-            compressed = self._compressor.preflight_check(compressed)
-            if self._cache_strategy:
-                compressed = self._cache_strategy.optimize(compressed)
-            self._last_context_tokens = _estimate_prompt_tokens(compressed)
+            compressed = self._prepare_llm_messages(
+                healed,
+                tools=tools_kwarg.get("tools") if use_native_tools else None,
+                round_number=budget.used,
+            )
 
             yield StreamEvent(type="thinking", content=f"round {budget.used}")
 
@@ -1655,7 +1779,7 @@ class AgentEngine:
                     )
                     provider_prompt = usage.get("prompt_tokens", 0)
                     if provider_prompt > 0:
-                        self._last_context_tokens = provider_prompt
+                        self._record_provider_usage(resp.model or '', usage)
                 except Exception as exc:
                     _clear_indicator()
                     classified = self._error_classifier.classify(exc)
@@ -1720,7 +1844,10 @@ class AgentEngine:
                         yield StreamEvent(
                             type="tool_complete",
                             content=tc.name,
-                            metadata=_tool_result_metadata(tc.name, tc.arguments, item.get("result")),
+                            metadata={
+                                **_tool_result_metadata(tc.name, tc.arguments, item.get("result")),
+                                **self._tool_context_metadata(tc.name, tc.arguments, item.get("result")),
+                            },
                         )
 
                     failures = self._count_consecutive_tool_failures(messages)
@@ -1849,11 +1976,18 @@ class AgentEngine:
             yield StreamEvent(
                 type="tool_complete",
                 content=tool_call['name'],
-                metadata=_tool_result_metadata(
-                    tool_call['name'],
-                    tool_call.get("arguments"),
-                    result,
-                ),
+                metadata={
+                    **_tool_result_metadata(
+                        tool_call['name'],
+                        tool_call.get("arguments"),
+                        result,
+                    ),
+                    **self._tool_context_metadata(
+                        tool_call['name'],
+                        tool_call.get("arguments"),
+                        result,
+                    ),
+                },
             )
             _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
             trace.record(
@@ -1872,7 +2006,8 @@ class AgentEngine:
             else:
                 turn_recovery.record_tool_success()
 
-            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+            result_payload = self._compact_tool_result(tool_call['name'], tool_call.get("arguments"), result)
+            result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
             messages.append(build_user_message_text(
                 f"Tool result ({tool_call['name']}):\n{result_text}"
             ))
@@ -1963,7 +2098,8 @@ class AgentEngine:
                     action=tool_call_dict,
                     observation=result if isinstance(result, dict) else {"result": str(result)},
                 )
-                result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+                result_payload = self._compact_tool_result(tc.name, tc.arguments, result)
+                result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
                 executed.append({"id": tc.id, "name": tc.name, "arguments": tc.arguments, "result": result})
             return executed
@@ -1998,7 +2134,8 @@ class AgentEngine:
                         action=tool_call_dict,
                         observation=error_result,
                     )
-                    result_text = json.dumps(error_result, default=str, ensure_ascii=False)[:result_budget]
+                    result_payload = self._compact_tool_result(ctc.name, ctc.arguments, error_result)
+                    result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
                 else:
                     _print_tool_result(ctc.name, result, enabled=self._settings.verbose_progress)
                     trace.record(
@@ -2006,7 +2143,8 @@ class AgentEngine:
                         action=tool_call_dict,
                         observation=result if isinstance(result, dict) else {"result": str(result)},
                     )
-                    result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+                    result_payload = self._compact_tool_result(ctc.name, ctc.arguments, result)
+                    result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
                 executed.append({
                     "id": ctc.id,
@@ -2026,7 +2164,8 @@ class AgentEngine:
                 action=tool_call_dict,
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
-            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+            result_payload = self._compact_tool_result(ctc.name, ctc.arguments, result)
+            result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
             messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
             executed.append({"id": ctc.id, "name": ctc.name, "arguments": ctc.arguments, "result": result})
         return executed

@@ -340,6 +340,11 @@ class Settings:
     compress_keep_tail: int = 4
     max_tool_output_chars: int = 2000
     max_tool_result_chars: int = 3000  # Per-tool result truncation for LLM context
+    context_hard_limit_ratio: float = 0.92
+    context_warning_ratio: float = 0.75
+    tool_evidence_max_chars: int = 1200
+    repeated_read_limit: int = 2
+    long_task_convergence_round: int = 12
 
     # ── Error Recovery ──
     error_transient_max_retries: int = 3
@@ -763,6 +768,11 @@ def _build_settings_from_env() -> Settings:
     compress_keep_tail = int(os.getenv("LEAPFLOW_COMPRESS_KEEP_TAIL", "4"))
     max_tool_output_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_OUTPUT_CHARS", "2000"))
     max_tool_result_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_RESULT_CHARS", "3000"))
+    context_hard_limit_ratio = float(os.getenv("LEAPFLOW_CONTEXT_HARD_LIMIT_RATIO", "0.92"))
+    context_warning_ratio = float(os.getenv("LEAPFLOW_CONTEXT_WARNING_RATIO", "0.75"))
+    tool_evidence_max_chars = int(os.getenv("LEAPFLOW_TOOL_EVIDENCE_MAX_CHARS", "1200"))
+    repeated_read_limit = int(os.getenv("LEAPFLOW_REPEATED_READ_LIMIT", "2"))
+    long_task_convergence_round = int(os.getenv("LEAPFLOW_LONG_TASK_CONVERGENCE_ROUND", "12"))
 
     # Error Recovery
     error_transient_max_retries = int(os.getenv("LEAPFLOW_ERROR_TRANSIENT_MAX_RETRIES", "3"))
@@ -1011,6 +1021,11 @@ def _build_settings_from_env() -> Settings:
         compress_keep_tail=compress_keep_tail,
         max_tool_output_chars=max_tool_output_chars,
         max_tool_result_chars=max_tool_result_chars,
+        context_hard_limit_ratio=context_hard_limit_ratio,
+        context_warning_ratio=context_warning_ratio,
+        tool_evidence_max_chars=tool_evidence_max_chars,
+        repeated_read_limit=repeated_read_limit,
+        long_task_convergence_round=long_task_convergence_round,
         # Error Recovery
         error_transient_max_retries=error_transient_max_retries,
         error_rate_limit_base_delay=error_rate_limit_base_delay,

@@ -99,9 +99,8 @@ class RuntimeLeapService:
                     content="Configuration reloaded — LLM settings updated in leapd.",
                     event_type="status",
                     metadata={
+                        **self._engine_context_metadata(getattr(ctx, "engine", None), ctx.settings),
                         "llm_model": getattr(ctx.settings, "llm_model", ""),
-                        "llm_context_length": getattr(ctx.settings, "llm_context_length", 0),
-                        "context_used": getattr(getattr(ctx, "engine", None), "context_token_count", 0),
                     },
                 )
             engine = getattr(ctx, "engine", None)
@@ -142,6 +141,7 @@ class RuntimeLeapService:
         db_holder = getattr(ctx, "_db_holder", None) if ctx is not None else None
         config_path = os.path.join(str(getattr(settings, "data_dir", "")), ".env")
         project_env_path = os.path.join(os.getcwd(), ".env")
+        context_metadata = self._engine_context_metadata(engine, settings)
         return {
             "pid": os.getpid(),
             "profile": getattr(settings, "profile", "default"),
@@ -155,8 +155,9 @@ class RuntimeLeapService:
             "active_connections": max(0, self._client_count()),
             "connected_clients": len(self._client_leases()),
             "model": getattr(settings, "llm_model", ""),
-            "llm_context_length": getattr(settings, "llm_context_length", 0),
-            "context_used": getattr(engine, "context_token_count", 0) if engine is not None else 0,
+            "llm_context_length": context_metadata.get("llm_context_length", getattr(settings, "llm_context_length", 0)),
+            "context_used": context_metadata.get("context_used", 0),
+            "context_budget_snapshot": context_metadata.get("context_budget_snapshot", {}),
             "session_id": str(getattr(engine, "_current_session_id", "") or ""),
             "runtime_source": self._runtime_source(),
             "runtime_executable": sys.executable,
@@ -255,6 +256,28 @@ class RuntimeLeapService:
         except ImportError:
             return "unknown"
         return str(__version__)
+
+    def _engine_context_metadata(self, engine: Any | None, settings: Any) -> dict[str, Any]:
+        """Return safe context-budget metadata for daemon status and stream events."""
+        context_length = max(0, int(getattr(settings, "llm_context_length", 0) or 0))
+        metadata: dict[str, Any] = {
+            "llm_context_length": context_length,
+            "context_used": 0,
+        }
+        if engine is None:
+            return metadata
+        metadata["context_used"] = max(0, int(getattr(engine, "context_token_count", 0) or 0))
+        snapshot = getattr(engine, "context_budget_snapshot", {})
+        if callable(snapshot):
+            snapshot = snapshot()
+        if isinstance(snapshot, dict) and snapshot:
+            safe_snapshot = dict(snapshot)
+            if safe_snapshot.get("context_length"):
+                metadata["llm_context_length"] = max(1, int(safe_snapshot["context_length"]))
+            if safe_snapshot.get("total_tokens") is not None:
+                metadata["context_used"] = max(0, int(safe_snapshot["total_tokens"]))
+            metadata["context_budget_snapshot"] = safe_snapshot
+        return metadata
 
     def _host_backend_status(self, ctx: Any | None) -> dict[str, Any]:
         if ctx is None:
@@ -471,7 +494,7 @@ class RuntimeLeapService:
         if session_id:
             metadata.setdefault("session_id", str(session_id))
         if engine is not None:
-            metadata.setdefault("context_used", getattr(engine, "context_token_count", 0))
+            metadata.update(self._engine_context_metadata(engine, getattr(ctx, "settings", self._settings)))
         return StreamChunk(
             request_id="",
             content=event.content,

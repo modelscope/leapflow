@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, FrozenSet
+from typing import Any, Dict, FrozenSet, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,67 @@ _BINARY_EXTENSIONS: FrozenSet[str] = frozenset({
 })
 
 _MAX_READ_CHARS = 100_000
+_FILE_LIST_LIMIT = 100
+_FILE_READ_MODES = frozenset({"raw", "outline", "symbols"})
+_SYMBOL_PREFIXES = (
+    "class ", "def ", "async def ", "function ", "const ", "let ", "var ",
+    "interface ", "type ", "enum ", "struct ", "trait ", "impl ",
+)
+
+
+def _safe_int(value: Any, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _line_window(lines: list[str], *, start_line: int, max_lines: int) -> tuple[list[str], int, int]:
+    start = max(0, start_line - 1)
+    end = min(len(lines), start + max_lines)
+    return lines[start:end], start + 1, end
+
+
+def _outline_lines(lines: Iterable[str], *, limit: int) -> list[tuple[int, str]]:
+    outline: list[tuple[int, str]] = []
+    for index, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(('#', '##', '###', '- ', '* ')):
+            outline.append((index, f"{index}: {stripped}"))
+        elif stripped.endswith((':', '{')) and len(stripped) < 140:
+            outline.append((index, f"{index}: {stripped}"))
+        if len(outline) >= limit:
+            break
+    return outline
+
+
+def _symbol_lines(lines: Iterable[str], *, limit: int) -> list[tuple[int, str]]:
+    symbols: list[tuple[int, str]] = []
+    for index, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(_SYMBOL_PREFIXES) or stripped.startswith("@dataclass"):
+            symbols.append((index, f"{index}: {stripped}"))
+        if len(symbols) >= limit:
+            break
+    return symbols
+
+
+def _read_text_window(path: Path, *, max_chars: int) -> tuple[str, bool]:
+    """Read at most max_chars characters plus one sentinel without loading huge files."""
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        raw = handle.read(max_chars + 1)
+    if len(raw) <= max_chars:
+        return raw, False
+    logger.debug("file_read: truncated to %d chars", max_chars)
+    return raw[:max_chars], True
 
 
 def _is_write_blocked(path: Path) -> bool:
@@ -100,13 +161,25 @@ async def file_list(params: Dict[str, Any]) -> Dict[str, Any]:
             "size": item.stat().st_size if item.is_file() else None,
         })
 
-    return {"ok": True, "path": str(target), "entries": entries[:100]}
+    visible = entries[:_FILE_LIST_LIMIT]
+    return {
+        "ok": True,
+        "path": str(target),
+        "entries": visible,
+        "entry_count": len(entries),
+        "truncated": len(entries) > len(visible),
+    }
 
 
 async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Read text file content with line limit and security guards."""
+    """Read text file content with context-aware modes and security guards."""
     path = params.get("path", "")
-    max_lines = int(params.get("max_lines", 200))
+    max_lines = _safe_int(params.get("max_lines", 200), 200, minimum=1, maximum=2000)
+    start_line = _safe_int(params.get("start_line", 1), 1, minimum=1)
+    max_chars = _safe_int(params.get("max_chars", _MAX_READ_CHARS), _MAX_READ_CHARS, minimum=200, maximum=_MAX_READ_CHARS)
+    mode = str(params.get("mode", "raw") or "raw").strip().lower()
+    if mode not in _FILE_READ_MODES:
+        mode = "raw"
 
     if not path:
         return {"ok": False, "error": "Missing required parameter: path"}
@@ -128,14 +201,30 @@ async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": f"Binary file cannot be read as text: {target.name}"}
 
     try:
-        raw = target.read_text(errors="replace")
-        if len(raw) > _MAX_READ_CHARS:
-            raw = raw[:_MAX_READ_CHARS]
-            logger.debug("file_read: truncated to %d chars", _MAX_READ_CHARS)
+        raw, raw_truncated = _read_text_window(target, max_chars=max_chars)
 
         lines = raw.splitlines()
-        truncated = len(lines) > max_lines
-        content = "\n".join(lines[:max_lines])
+        selected_lines, selected_start, selected_end = _line_window(
+            lines,
+            start_line=start_line,
+            max_lines=max_lines,
+        )
+        line_truncated = selected_end < len(lines)
+
+        if mode == "outline":
+            outline = _outline_lines(lines, limit=max_lines)
+            content = "\n".join(text for _, text in outline)
+            selected_start = outline[0][0] if outline else 1
+            selected_end = outline[-1][0] if outline else 0
+            line_truncated = raw_truncated or len(outline) >= max_lines
+        elif mode == "symbols":
+            symbols = _symbol_lines(lines, limit=max_lines)
+            content = "\n".join(text for _, text in symbols)
+            selected_start = symbols[0][0] if symbols else 1
+            selected_end = symbols[-1][0] if symbols else 0
+            line_truncated = raw_truncated or len(symbols) >= max_lines
+        else:
+            content = "\n".join(selected_lines)
 
         try:
             from leapflow.security.redact import redact_sensitive_text
@@ -157,7 +246,11 @@ async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
             "path": str(target),
             "content": content,
             "lines": len(lines),
-            "truncated": truncated,
+            "start_line": selected_start,
+            "end_line": selected_end,
+            "selected_lines": len(content.splitlines()) if content else 0,
+            "mode": mode,
+            "truncated": raw_truncated or line_truncated,
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
