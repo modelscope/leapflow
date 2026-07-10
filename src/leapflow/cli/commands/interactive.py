@@ -658,6 +658,24 @@ async def cmd_interactive_daemon(
         if context_used is not None:
             console.system(f"Context used: {int(context_used):,} tokens")
 
+    async def _handle_daemon_approval(event: StreamEvent) -> None:
+        from leapflow.cli.approval_view import prompt_approval
+        from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+
+        metadata = event.metadata or {}
+        payload = metadata.get("approval")
+        if not isinstance(payload, dict):
+            return
+        pending_id = str(payload.get("pending_id") or "")
+        if not pending_id:
+            return
+        app.spinner_text = "Waiting for approval…"
+        request = ApprovalRequest.from_dict(payload)
+        decision = await prompt_approval(request)
+        value = decision.value if isinstance(decision, ApprovalDecision) else str(decision)
+        await client.approval_resolve(pending_id, value)
+        app.spinner_text = "Thinking…"
+
     async def _stream_response(prompt_text: str) -> None:
         nonlocal active_session_id, turn_count, runtime_model_name
         nonlocal runtime_context_length, runtime_context_used
@@ -686,6 +704,8 @@ async def cmd_interactive_daemon(
                         renderer.feed(event.content)
                 elif event.type == "error":
                     renderer.feed(event.content)
+                elif event.type == "approval_request":
+                    await _handle_daemon_approval(event)
                 elif event.type == "status":
                     if not metadata.get("heartbeat"):
                         console.system(event.content)

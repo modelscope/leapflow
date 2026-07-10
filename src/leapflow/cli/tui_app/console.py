@@ -13,6 +13,7 @@ from typing import Optional
 
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
@@ -113,7 +114,7 @@ class LeapConsole:
             padding=(0, 1),
         ))
 
-    def markdown(self, text: str, *, code_theme: str = "monokai") -> None:
+    def markdown(self, text: str, *, code_theme: str = "monokai", indent: int = 0) -> None:
         """Render markdown content with syntax-highlighted code blocks."""
         if not text.strip():
             return
@@ -121,7 +122,8 @@ class LeapConsole:
             text,
             code_theme=code_theme if self._theme.name == "dark" else "default",
         )
-        self._console.print(md)
+        renderable = Padding(md, (0, 0, 0, indent)) if indent > 0 else md
+        self._console.print(renderable)
 
     def code(self, source: str, language: str = "python", *, title: str = "") -> None:
         """Render a standalone code block with syntax highlighting."""

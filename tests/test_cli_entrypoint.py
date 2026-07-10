@@ -27,7 +27,8 @@ async def test_context_initialize_wires_gateway_approval_gate(tmp_path) -> None:
     ctx = Context(make_settings(str(tmp_path)), mock_host=True)
     await ctx.initialize()
     try:
-        assert gateway_tool._approval_gate is ctx._approval_gate
+        assert gateway_tool._approval_gate is ctx._approval_orchestrator
+        assert gateway_tool._approval_gate.grants is ctx._approval_orchestrator.grants
     finally:
         await ctx.cleanup()
 

@@ -184,9 +184,10 @@ async def file_write(params: Dict[str, Any]) -> Dict[str, Any]:
         from leapflow.tools.registry_bootstrap import get_file_write_gate
         gate = get_file_write_gate()
         if gate is not None:
-            approved = await gate.check(str(target), content)
+            approved = await gate.check(str(target), content, mode)
             if not approved:
-                return {"ok": False, "error": f"File write denied by approval gate: {target.name}"}
+                message = str(getattr(gate, "denial_message", "") or f"File write denied by approval gate: {target.name}")
+                return {"ok": False, "error": message}
     except ImportError:
         pass
 

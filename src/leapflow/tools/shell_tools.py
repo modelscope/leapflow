@@ -32,6 +32,15 @@ class CommandApprovalGate(Protocol):
         ...
 
 
+@runtime_checkable
+class ActionApprovalEvaluator(Protocol):
+    """Protocol for structured action approval evaluators."""
+
+    async def evaluate(self, action: Any) -> Any:
+        """Return an approval result for a structured action."""
+        ...
+
+
 # Hardline blocks: NEVER bypassed regardless of approval
 _HARDLINE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\brm\s+.*-[^\s]*r[^\s]*f|\brm\s+.*-[^\s]*f[^\s]*r", re.IGNORECASE),
@@ -50,7 +59,8 @@ _DANGEROUS_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bchown\b", re.IGNORECASE),
     re.compile(r"\bcurl\b.*\|\s*(ba)?sh", re.IGNORECASE),
     re.compile(r"\bwget\b.*\|\s*(ba)?sh", re.IGNORECASE),
-    re.compile(r"\b(pip|npm)\s+install\s+--.*(-g|global)", re.IGNORECASE),
+    re.compile(r"\b(?:python[23]?|perl|ruby|node|bash|sh|zsh|ksh)\s+<<", re.IGNORECASE),
+    re.compile(r"\b(pip|npm|brew)\s+install\b", re.IGNORECASE),
     re.compile(r"\bgit\s+push\s+.*--force\b", re.IGNORECASE),
     re.compile(r"\brm\s+-r\b", re.IGNORECASE),
     re.compile(r"\bkill\s+-9\b", re.IGNORECASE),
@@ -88,6 +98,25 @@ def _is_cwd_blocked(cwd: str | None) -> bool:
     return any(resolved.startswith(prefix) for prefix in _BLOCKED_CWD_PREFIXES)
 
 
+async def _approve_command(command: str, cwd: str | None) -> tuple[bool, str]:
+    if _approval_gate is None:
+        return False, "Dangerous command blocked (no approval gate configured)"
+    try:
+        if isinstance(_approval_gate, ActionApprovalEvaluator):
+            from leapflow.security.actions import ActionDescriptor
+
+            result = await _approval_gate.evaluate(ActionDescriptor.shell(command, cwd=cwd))
+            if getattr(result, "approved", False):
+                return True, ""
+            message = str(getattr(result, "denial_message", "") or "Dangerous command requires approval (denied)")
+            return False, message
+        approved = await _approval_gate.check(command)
+        return approved, "" if approved else "Dangerous command requires approval (denied)"
+    except Exception:
+        logger.debug("shell approval check failed", exc_info=True)
+        return False, "Dangerous command requires approval (denied)"
+
+
 async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a shell command with timeout protection and safety layers."""
     command = params.get("command", "")
@@ -104,15 +133,9 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": f"Working directory blocked by safety policy: {cwd}"}
 
     if _is_dangerous(command):
-        if _approval_gate is not None:
-            try:
-                approved = await _approval_gate.check(command)
-            except Exception:
-                approved = False
-            if not approved:
-                return {"ok": False, "error": "Dangerous command requires approval (denied)"}
-        else:
-            return {"ok": False, "error": "Dangerous command blocked (no approval gate configured)"}
+        approved, message = await _approve_command(command, cwd)
+        if not approved:
+            return {"ok": False, "error": message}
 
     try:
         proc = await asyncio.create_subprocess_shell(

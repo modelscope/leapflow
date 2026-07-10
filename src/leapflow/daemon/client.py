@@ -96,6 +96,33 @@ class DaemonClient:
         result = await self.request("daemon.status")
         return dict(result or {})
 
+    async def approval_status(self) -> dict[str, Any]:
+        """Return pending daemon approval requests."""
+        result = await self.request("approval.status")
+        return dict(result or {})
+
+    async def approval_resolve(
+        self,
+        pending_id: str,
+        decision: str,
+        *,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Resolve a pending daemon approval request."""
+        result = await self.request(
+            "approval.resolve",
+            {"pending_id": pending_id, "decision": decision, "reason": reason},
+        )
+        return dict(result or {})
+
+    async def approval_cancel(self, pending_id: str, *, reason: str = "cancelled") -> dict[str, Any]:
+        """Cancel a pending daemon approval request."""
+        result = await self.request(
+            "approval.cancel",
+            {"pending_id": pending_id, "reason": reason},
+        )
+        return dict(result or {})
+
     async def shutdown(self) -> None:
         """Request graceful daemon shutdown."""
         await self.request("daemon.shutdown")
@@ -178,6 +205,8 @@ def _event_from_params(params: dict[str, Any]) -> StreamEvent:
         "thinking",
         "status",
         "error",
+        "approval_request",
+        "approval_response",
     }:
         event_type = "chunk"
     metadata = params.get("metadata")

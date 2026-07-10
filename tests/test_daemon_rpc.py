@@ -115,6 +115,92 @@ async def test_daemon_client_stream_heartbeat_prevents_idle_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_service_streams_pending_approval_and_resolves(tmp_path) -> None:
+    from conftest import make_settings
+    from leapflow.daemon.service import RuntimeLeapService
+    from leapflow.engine import StreamEvent
+    from leapflow.security.actions import ActionDescriptor
+    from leapflow.security.approval import ApprovalRequest
+
+    service = RuntimeLeapService(make_settings(str(tmp_path)), mock_host=True)
+
+    class ApprovalEngine:
+        context_token_count = 0
+        _current_session_id = "sess-approval"
+
+        async def run_stream(self, message: str, *, enable_thinking: bool = False):
+            request = ApprovalRequest(
+                category="shell.command",
+                detail="python << 'EOF'\nprint('ok')\nEOF",
+                action=ActionDescriptor.shell("python << 'EOF'\nprint('ok')\nEOF"),
+            )
+            decision = await service._request_approval(request)
+            yield StreamEvent(type="final", content=f"decision={decision}")
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.engine = ApprovalEngine()
+
+        def reload_runtime_config_if_changed(self) -> bool:
+            return False
+
+    service._ctx = FakeContext()
+    stream = service.engine_chat("needs approval")
+    try:
+        approval_event = await anext(stream)
+        payload = (approval_event.metadata or {}).get("approval")
+
+        assert approval_event.event_type == "approval_request"
+        assert isinstance(payload, dict)
+        assert payload["pending_id"]
+        status = await service.approval_status()
+        assert len(status["pending"]) == 1
+
+        resolved = await service.approval_resolve(payload["pending_id"], "definitely_not_valid")
+        final = await anext(stream)
+    finally:
+        await stream.aclose()
+
+    assert resolved == {"ok": True, "pending_id": payload["pending_id"], "decision": "deny"}
+    assert final.event_type == "final"
+    assert final.content == "decision=deny"
+    assert final.metadata["session_id"] == "sess-approval"
+    assert await service.approval_status() == {"pending": []}
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_approval_resolve_rpc() -> None:
+    class ApprovalRpcService(_FakeService):
+        async def approval_resolve(self, pending_id: str, decision: str, reason: str = "") -> dict[str, Any]:
+            return {"ok": True, "pending_id": pending_id, "decision": decision, "reason": reason}
+
+        async def approval_status(self) -> dict[str, Any]:
+            return {"pending": []}
+
+        async def approval_cancel(self, pending_id: str, reason: str = "cancelled") -> dict[str, Any]:
+            return {"ok": True, "pending_id": pending_id, "decision": "deny", "reason": reason}
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        server, task, run_dir = await _start_server(Path(root) / "run", service=ApprovalRpcService())
+        client = DaemonClient(run_dir / "leapd.sock")
+        try:
+            result = await client.approval_resolve("p1", "allow_once", reason="user")
+            status = await client.approval_status()
+            cancelled = await client.approval_cancel("p2")
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert result == {"ok": True, "pending_id": "p1", "decision": "allow_once", "reason": "user"}
+    assert status == {"pending": []}
+    assert cancelled["decision"] == "deny"
+
+
+@pytest.mark.asyncio
 async def test_daemon_client_reports_unknown_method() -> None:
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
         server, task, run_dir = await _start_server(Path(root) / "run")

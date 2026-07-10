@@ -284,19 +284,36 @@ async def gateway_send_handler(params: Dict[str, Any]) -> Dict[str, Any]:
 
     if _approval_gate is not None:
         try:
+            from leapflow.security.actions import ActionDescriptor
             from leapflow.security.approval import ApprovalDecision, ApprovalRequest
 
-            preview = text[:80] + ("…" if len(text) > 80 else "")
-            decision = await _approval_gate.request_approval(ApprovalRequest(
-                category=f"gateway_send:{platform}",
-                detail=f"Send to {platform}/{chat_id}: {preview}",
-                risk_hint=0.5,
-                metadata={"platform": platform, "chat_id": chat_id},
-            ))
-            if decision == ApprovalDecision.DENY:
-                return {"ok": False, "error": "Outbound message denied by approval gate"}
+            action = ActionDescriptor.gateway_send(platform, chat_id, text, metadata={
+                "thread_id": params.get("thread_id", ""),
+            })
+            if hasattr(_approval_gate, "evaluate"):
+                result = await _approval_gate.evaluate(action)
+                if not getattr(result, "approved", False):
+                    error = str(getattr(result, "denial_message", "") or "Outbound message denied by approval gate")
+                    return {"ok": False, "error": error}
+            else:
+                preview = text[:80] + ("…" if len(text) > 80 else "")
+                decision = await _approval_gate.request_approval(ApprovalRequest(
+                    category=action.kind,
+                    detail=f"Send to {platform}/{chat_id}: {preview}",
+                    risk_hint=0.5,
+                    metadata={"platform": platform, "chat_id": chat_id},
+                    action=action,
+                ))
+                if decision not in {
+                    ApprovalDecision.ALLOW,
+                    ApprovalDecision.ALLOW_ONCE,
+                    ApprovalDecision.ALLOW_SESSION,
+                    ApprovalDecision.ALLOW_ALWAYS,
+                }:
+                    return {"ok": False, "error": "Outbound message denied by approval gate"}
         except Exception:
             logger.debug("gateway_send approval check failed", exc_info=True)
+            return {"ok": False, "error": "Outbound message approval check failed"}
 
     return await _gateway_server_ref.send_message(
         platform,

@@ -199,12 +199,14 @@ class StreamEvent:
     - tool_complete: tool execution finished (content = brief result).
     - thinking: reasoning/thinking phase indicator.
     - status: lifecycle status update.
+    - approval_request: human approval request from a daemon-side action.
+    - approval_response: human approval resolution notification.
     - error: error notification.
     """
 
     type: Literal[
         "chunk", "final", "tool_start", "tool_complete",
-        "thinking", "status", "error",
+        "thinking", "status", "error", "approval_request", "approval_response",
     ]
     content: str
     metadata: Optional[Dict[str, Any]] = None

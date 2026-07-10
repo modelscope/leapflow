@@ -110,7 +110,15 @@ class StreamChunk:
     content: str
     done: bool = False
     event_type: Literal[
-        "chunk", "final", "tool_start", "tool_complete", "thinking", "status", "error"
+        "chunk",
+        "final",
+        "tool_start",
+        "tool_complete",
+        "thinking",
+        "status",
+        "error",
+        "approval_request",
+        "approval_response",
     ] = "chunk"
     metadata: Optional[Dict[str, Any]] = None
 
@@ -179,6 +187,23 @@ class LeapService(Protocol):
         """Return daemon status (uptime, connections, db path, etc.)."""
         ...
 
+    async def approval_status(self) -> Dict[str, Any]:
+        """Return pending approval requests."""
+        ...
+
+    async def approval_resolve(
+        self,
+        pending_id: str,
+        decision: str,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Resolve a pending approval request."""
+        ...
+
+    async def approval_cancel(self, pending_id: str, reason: str = "cancelled") -> Dict[str, Any]:
+        """Cancel a pending approval request."""
+        ...
+
     async def shutdown(self) -> None:
         """Graceful shutdown."""
         ...
@@ -229,6 +254,9 @@ METHOD_REGISTRY: Dict[str, str] = {
     "scheduler.arm": "scheduler_arm",
     "daemon.status": "status",
     "daemon.shutdown": "shutdown",
+    "approval.status": "approval_status",
+    "approval.resolve": "approval_resolve",
+    "approval.cancel": "approval_cancel",
     "gateway.connect": "gateway_connect",
     "gateway.disconnect": "gateway_disconnect",
     "gateway.status": "gateway_status",

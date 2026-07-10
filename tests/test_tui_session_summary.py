@@ -20,13 +20,13 @@ class _Message:
 
 class _Console:
     def __init__(self) -> None:
-        self.markdown_calls: list[str] = []
+        self.markdown_calls: list[tuple[str, int]] = []
         self.thinking_calls: list[str] = []
         self.labels: list[tuple[float, int]] = []
         self.lines = 0
 
-    def markdown(self, text: str) -> None:
-        self.markdown_calls.append(text)
+    def markdown(self, text: str, *, indent: int = 0) -> None:
+        self.markdown_calls.append((text, indent))
 
     def thinking(self, text: str) -> None:
         self.thinking_calls.append(text)
@@ -128,6 +128,21 @@ def test_stream_renderer_exposes_output_without_private_access() -> None:
 
     renderer.feed("hello")
     assert renderer.has_output is True
+
+
+def test_stream_renderer_indents_final_response_only() -> None:
+    console = _Console()
+    renderer = StreamRenderer(console)
+    renderer.start()
+
+    renderer.feed_thinking("internal reasoning")
+    renderer.feed("final **answer**")
+    renderer.finish()
+
+    assert console.thinking_calls == ["internal reasoning"]
+    assert console.markdown_calls == [("final **answer**", 4)]
+    assert len(console.labels) == 1
+    assert console.lines == 1
 
 
 def test_global_resume_routes_to_interactive(monkeypatch) -> None:

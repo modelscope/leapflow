@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 
 from rich.text import Text
 
+_FINAL_RESPONSE_INDENT_SPACES = 4
+
 if TYPE_CHECKING:
     from leapflow.cli.tui_app.console import LeapConsole
 
@@ -116,7 +118,7 @@ class StreamRenderer:
             self._console.thinking(self._thinking_buffer)
 
         if self._buffer.strip():
-            self._console.markdown(self._buffer)
+            self._console.markdown(self._buffer, indent=_FINAL_RESPONSE_INDENT_SPACES)
 
         self._console.response_label(self.elapsed, tool_count=self.tool_count)
         self._console.newline()
