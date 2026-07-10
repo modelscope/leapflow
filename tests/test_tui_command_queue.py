@@ -272,6 +272,55 @@ def test_stream_renderer_prints_context_evidence_metadata() -> None:
     )
 
 
+def test_stream_renderer_prints_compression_and_posture_metadata() -> None:
+    class CaptureConsole:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def print(self, renderable) -> None:
+            self.lines.append(getattr(renderable, "plain", str(renderable)))
+
+        def thinking(self, text: str) -> None:
+            pass
+
+        def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
+            pass
+
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+            pass
+
+        def newline(self) -> None:
+            pass
+
+    console = CaptureConsole()
+    renderer = StreamRenderer(console)  # type: ignore[arg-type]
+    renderer.start()
+
+    renderer.tool_started("shell_run", metadata={"command": "pytest"})
+    renderer.tool_finished(
+        "shell_run",
+        metadata={
+            "ok": True,
+            "stdout_preview": "passed",
+            "context_evidence": True,
+            "compression_stages": ["trim", "summarize"],
+            "compression_savings_ratio": 0.42,
+            "compression_reason": "threshold-triggered",
+            "context_posture": "research",
+            "context_guidance": "maintain research ledger and synthesize findings",
+        },
+    )
+
+    assert any(
+        "compressed=trim+summarize" in line
+        and "saved≈42%" in line
+        and "threshold-triggered" in line
+        and "research" in line
+        and "maintain research ledger" in line
+        for line in console.lines
+    )
+
+
 @pytest.mark.asyncio
 async def test_process_loop_marks_failed_commands_and_recovers_counts() -> None:
     async def on_input(text: str) -> None:

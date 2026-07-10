@@ -66,6 +66,22 @@ def _tool_context_detail(metadata: dict[str, Any] | None) -> str:
         parts.append(f"mode={mode}")
     if metadata.get("tool_truncated"):
         parts.append("truncated")
+    stages = metadata.get("compression_stages")
+    if isinstance(stages, list) and stages:
+        stage_text = "+".join(str(stage) for stage in stages[:3])
+        parts.append(f"compressed={stage_text}")
+        savings = metadata.get("compression_savings_ratio")
+        if isinstance(savings, (int, float)) and savings > 0:
+            parts.append(f"saved≈{int(savings * 100)}%")
+        reason = _metadata_text(metadata, "compression_reason")
+        if reason:
+            parts.append(reason)
+    posture = _metadata_text(metadata, "context_posture")
+    if posture and posture != "baseline":
+        parts.append(posture)
+    guidance = _metadata_text(metadata, "context_guidance")
+    if guidance:
+        parts.append(_truncate_detail(guidance, limit=72))
     read_count = metadata.get("read_count")
     if metadata.get("repeat_read") and read_count is not None:
         parts.append(f"repeat-read x{read_count}")

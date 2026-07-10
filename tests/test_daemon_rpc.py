@@ -652,6 +652,11 @@ async def test_runtime_service_serializes_engine_chat_streams(tmp_path) -> None:
                 "ratio": 0.128,
                 "compressed": False,
                 "forced_final_answer": False,
+                "context_posture": "research",
+                "context_signal": "multi-source",
+                "context_guidance": "maintain research ledger and synthesize findings",
+                "compression_reason": "threshold-triggered",
+                "compression_savings_ratio": 0.25,
             }
             self._current_session_id = "sess-daemon"
 
@@ -689,10 +694,18 @@ async def test_runtime_service_serializes_engine_chat_streams(tmp_path) -> None:
     assert first[0].metadata["context_budget_snapshot"]["total_tokens"] == 2_048
     assert first[0].metadata["context_budget_snapshot"]["tool_schema_tokens"] == 248
     assert first[0].metadata["llm_context_length"] == 16_000
+    assert first[0].metadata["context_posture"] == "research"
+    assert first[0].metadata["context_signal"] == "multi-source"
+    assert first[0].metadata["context_guidance"] == "maintain research ledger and synthesize findings"
+    assert first[0].metadata["compression_reason"] == "threshold-triggered"
+    assert first[0].metadata["compression_savings_ratio"] == 0.25
     assert first[0].metadata["session_id"] == "sess-daemon"
     assert second[0].metadata["context_used"] == 2_048
     assert status["context_used"] == 2_048
     assert status["context_budget_snapshot"]["total_tokens"] == 2_048
+    assert status["context_posture"] == "research"
+    assert status["context_guidance"] == "maintain research ledger and synthesize findings"
+    assert status["compression_reason"] == "threshold-triggered"
     assert context.engine.max_active == 1
 
 

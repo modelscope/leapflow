@@ -1,14 +1,14 @@
-"""Context-window control primitives for long-running agent tasks.
+"""Adaptive context governance primitives for every agent interaction.
 
-The module keeps context accounting, overflow prevention, and tool-result
-compaction independent from AgentEngine so the execution loop can remain small
-and policy can evolve without touching tool dispatch code.
+The module keeps context accounting, overflow prevention, exploration-ledger
+tracking, and tool-result compaction independent from AgentEngine so all normal
+interactions get long-task resilience without exposing a separate user mode.
 """
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Protocol, Sequence, runtime_checkable
 
@@ -19,6 +19,16 @@ _MESSAGE_OVERHEAD_TOKENS = 8
 _TOOL_SCHEMA_OVERHEAD_TOKENS = 12
 _DEFAULT_HEAD_RATIO = 0.55
 _DEFAULT_TAIL_RATIO = 0.25
+_EVIDENCE_TOOLS = frozenset({
+    "file_read", "gp_file_read",
+    "file_list", "gp_file_list",
+    "shell_run", "gp_shell_run",
+})
+_POSTURE_BASELINE = "baseline"
+_POSTURE_EXPANDED = "expanded"
+_POSTURE_RESEARCH = "research"
+_POSTURE_CONVERGING = "converging"
+_POSTURE_FINALIZING = "finalizing"
 
 
 @runtime_checkable
@@ -321,35 +331,95 @@ class ToolEvidenceBuilder:
         return f"{text[:head]}\n\n[... {omitted:,} chars omitted ...]\n\n{text[-tail:]}"
 
 
+@dataclass(frozen=True)
+class ContextPostureConfig:
+    """Configurable thresholds for adaptive context-governance posture."""
+
+    expanded_ratio: float = 0.60
+    finalizing_ratio: float = 0.90
+    expanded_evidence_threshold: int = 2
+    expanded_tool_call_threshold: int = 3
+    research_source_threshold: int = 3
+    research_evidence_threshold: int = 5
+
+
+@dataclass(frozen=True)
+class ExplorationSnapshot:
+    """Compact user-visible state for the adaptive exploration ledger."""
+
+    posture: str = _POSTURE_BASELINE
+    sources_seen: int = 0
+    evidence_count: int = 0
+    repeated_reads: int = 0
+    tool_calls: int = 0
+    dominant_signal: str = ""
+    should_converge: bool = False
+    convergence_reason: str = ""
+    guidance: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return a JSON-serializable snapshot for daemon/TUI metadata."""
+        return {
+            "posture": self.posture,
+            "sources_seen": self.sources_seen,
+            "evidence_count": self.evidence_count,
+            "repeated_reads": self.repeated_reads,
+            "tool_calls": self.tool_calls,
+            "dominant_signal": self.dominant_signal,
+            "should_converge": self.should_converge,
+            "convergence_reason": self.convergence_reason,
+            "guidance": self.guidance,
+        }
+
+
 @dataclass
-class LongTaskContextController:
-    """Per-turn controller for exploration-heavy tasks."""
+class ContextGovernanceController:
+    """Adaptive exploration ledger for all interactions, not a separate mode."""
 
     evidence_builder: ToolEvidenceBuilder
     repeated_read_limit: int = 2
     convergence_round: int = 12
+    posture_config: ContextPostureConfig = field(default_factory=ContextPostureConfig)
+    evidence_tools: frozenset[str] = _EVIDENCE_TOOLS
+    research_source_threshold: int | None = None
+    research_evidence_threshold: int | None = None
 
     def __post_init__(self) -> None:
+        if self.research_source_threshold is not None or self.research_evidence_threshold is not None:
+            self.posture_config = ContextPostureConfig(
+                expanded_ratio=self.posture_config.expanded_ratio,
+                finalizing_ratio=self.posture_config.finalizing_ratio,
+                expanded_evidence_threshold=self.posture_config.expanded_evidence_threshold,
+                expanded_tool_call_threshold=self.posture_config.expanded_tool_call_threshold,
+                research_source_threshold=self.research_source_threshold or self.posture_config.research_source_threshold,
+                research_evidence_threshold=self.research_evidence_threshold or self.posture_config.research_evidence_threshold,
+            )
         self._reads: dict[str, int] = {}
+        self._sources_seen: set[str] = set()
+        self._tool_counts: dict[str, int] = {}
+        self._evidence_count = 0
 
     def compact_tool_result(self, tool_name: str, arguments: Dict[str, Any] | None, result: Any) -> Any:
-        """Return evidence and update exploration ledger."""
+        """Return evidence and update the session exploration ledger."""
+        self._tool_counts[tool_name] = self._tool_counts.get(tool_name, 0) + 1
+        if tool_name in self.evidence_tools:
+            self._evidence_count += 1
         if tool_name in {"file_read", "gp_file_read"}:
             path = str((arguments or {}).get("path") or (result.get("path") if isinstance(result, dict) else ""))
             if path:
                 key = str(Path(path).expanduser())
                 self._reads[key] = self._reads.get(key, 0) + 1
+                self._sources_seen.add(key)
+        elif tool_name in {"file_list", "gp_file_list"}:
+            path = str((arguments or {}).get("path") or (result.get("path") if isinstance(result, dict) else ""))
+            if path:
+                self._sources_seen.add(str(Path(path).expanduser()))
         return self.evidence_builder.build(tool_name, arguments, result)
 
     def tool_metadata(self, tool_name: str, arguments: Dict[str, Any] | None, result: Any) -> Dict[str, Any]:
-        """Build UX metadata about long-task context handling."""
+        """Build UX metadata about adaptive context handling."""
         metadata: Dict[str, Any] = {}
-        evidence_tools = {
-            "file_read", "gp_file_read",
-            "file_list", "gp_file_list",
-            "shell_run", "gp_shell_run",
-        }
-        if tool_name in evidence_tools:
+        if tool_name in self.evidence_tools:
             metadata["context_evidence"] = True
         if tool_name in {"file_read", "gp_file_read"}:
             path = str((arguments or {}).get("path") or "")
@@ -362,13 +432,68 @@ class LongTaskContextController:
                 metadata["tool_truncated"] = True
             if result.get("mode"):
                 metadata["mode"] = result.get("mode")
+        ledger = self.snapshot()
+        if metadata and ledger.posture != _POSTURE_BASELINE:
+            metadata["context_posture"] = ledger.posture
+            metadata["context_signal"] = ledger.dominant_signal
+            if ledger.guidance:
+                metadata["context_guidance"] = ledger.guidance
         return metadata
+
+    def snapshot(self, *, context_ratio: float = 0.0, round_number: int = 0) -> ExplorationSnapshot:
+        """Return the current adaptive-governance posture without exposing a mode."""
+        cfg = self.posture_config
+        repeated_reads = sum(1 for count in self._reads.values() if count > self.repeated_read_limit)
+        tool_calls = sum(self._tool_counts.values())
+        sources_seen = len(self._sources_seen)
+        dominant_signal = ""
+        posture = _POSTURE_BASELINE
+        guidance = ""
+        convergence_reason = ""
+
+        if context_ratio >= cfg.finalizing_ratio:
+            posture = _POSTURE_FINALIZING
+            dominant_signal = "context-critical"
+            convergence_reason = "context budget is critical"
+            guidance = "finalize with existing evidence"
+        elif repeated_reads > 0 or round_number >= self.convergence_round:
+            posture = _POSTURE_CONVERGING
+            dominant_signal = "repeat-read" if repeated_reads > 0 else "long-exploration"
+            convergence_reason = "repeat reads detected" if repeated_reads > 0 else "exploration round limit reached"
+            guidance = "deduplicate evidence and prefer targeted reads"
+        elif sources_seen >= cfg.research_source_threshold or self._evidence_count >= cfg.research_evidence_threshold:
+            posture = _POSTURE_RESEARCH
+            dominant_signal = "multi-source" if sources_seen >= cfg.research_source_threshold else "evidence-volume"
+            guidance = "maintain research ledger and synthesize findings"
+        elif context_ratio >= cfg.expanded_ratio or self._evidence_count >= cfg.expanded_evidence_threshold or tool_calls >= cfg.expanded_tool_call_threshold:
+            posture = _POSTURE_EXPANDED
+            dominant_signal = "context-growing" if context_ratio >= cfg.expanded_ratio else "tool-activity"
+            guidance = "prefer outline, symbols, or range reads before raw content"
+
+        should_converge = posture in {_POSTURE_CONVERGING, _POSTURE_FINALIZING}
+        return ExplorationSnapshot(
+            posture=posture,
+            sources_seen=sources_seen,
+            evidence_count=self._evidence_count,
+            repeated_reads=repeated_reads,
+            tool_calls=tool_calls,
+            dominant_signal=dominant_signal,
+            should_converge=should_converge,
+            convergence_reason=convergence_reason,
+            guidance=guidance,
+        )
 
     def convergence_notice(self, round_number: int) -> str:
         """Return a notice that nudges synthesis after excessive exploration."""
-        if round_number < self.convergence_round:
+        snapshot = self.snapshot(round_number=round_number)
+        if not snapshot.should_converge:
             return ""
+        reason = snapshot.convergence_reason or snapshot.dominant_signal or "context pressure"
         return (
-            "SYSTEM: You have explored for many rounds. Stop broad reading, "
-            "deduplicate evidence already gathered, and synthesize the final answer."
+            "SYSTEM: Adaptive context governance is converging "
+            f"({reason}). Stop broad reading, deduplicate evidence already gathered, "
+            "prefer targeted reads, and synthesize the final answer."
         )
+
+
+LongTaskContextController = ContextGovernanceController

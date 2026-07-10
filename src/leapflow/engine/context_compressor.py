@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable
@@ -544,6 +543,39 @@ class DropStage:
         return head + [drop_notice] + tail
 
 
+@dataclass(frozen=True)
+class CompressionTrace:
+    """Observable summary of a compression pass for UI and audit metadata."""
+
+    stages_applied: List[str] = field(default_factory=list)
+    stage_effects: List[Dict[str, Any]] = field(default_factory=list)
+    tokens_before: int = 0
+    tokens_after: int = 0
+    messages_before: int = 0
+    messages_after: int = 0
+    savings_ratio: float = 0.0
+    saved_tokens: int = 0
+    forced: bool = False
+    preflight_truncated_messages: int = 0
+    decision_reason: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return a compact JSON-serializable representation."""
+        return {
+            "stages_applied": list(self.stages_applied),
+            "stage_effects": [dict(effect) for effect in self.stage_effects],
+            "tokens_before": self.tokens_before,
+            "tokens_after": self.tokens_after,
+            "messages_before": self.messages_before,
+            "messages_after": self.messages_after,
+            "savings_ratio": self.savings_ratio,
+            "saved_tokens": self.saved_tokens,
+            "forced": self.forced,
+            "preflight_truncated_messages": self.preflight_truncated_messages,
+            "decision_reason": self.decision_reason,
+        }
+
+
 class ContextCompressor:
     """Multi-stage context compression orchestrator.
 
@@ -555,6 +587,12 @@ class ContextCompressor:
     def __init__(self, config: CompressorConfig = CompressorConfig()) -> None:
         self._config = config
         self._stages: List[CompressionStage] = self._build_stages(config)
+        self._last_trace = CompressionTrace()
+
+    @property
+    def last_trace(self) -> CompressionTrace:
+        """Return the most recent compression trace."""
+        return self._last_trace
 
     def _build_stages(self, config: CompressorConfig) -> List[CompressionStage]:
         """Build stage chain from config."""
@@ -588,20 +626,105 @@ class ContextCompressor:
 
         if token_count <= 0:
             token_count = self._count_tokens(messages)
+        tokens_before = token_count
+        messages_before = len(messages)
+        stages_applied: List[str] = []
 
+        stage_effects: List[Dict[str, Any]] = []
         for stage in self._stages:
             if stage.should_apply(messages, token_count, budget):
+                before_count = token_count
+                before_messages = len(messages)
                 messages = stage.apply(messages, budget)
-                token_count = self._count_tokens(messages)
+                next_count = self._count_tokens(messages)
+                changed = next_count != before_count or len(messages) != before_messages
+                if changed:
+                    stages_applied.append(stage.name)
+                    stage_effects.append({
+                        "stage": stage.name,
+                        "tokens_before": before_count,
+                        "tokens_after": next_count,
+                        "messages_before": before_messages,
+                        "messages_after": len(messages),
+                    })
+                token_count = next_count
 
+        self._last_trace = self._build_trace(
+            stages_applied=stages_applied,
+            stage_effects=stage_effects,
+            tokens_before=tokens_before,
+            tokens_after=token_count,
+            messages_before=messages_before,
+            messages_after=len(messages),
+            decision_reason="threshold-triggered" if stages_applied else "within-budget",
+        )
         return messages
 
     def force_compress(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Force all stages regardless of thresholds (for overflow recovery)."""
         budget = self._config.token_budget
+        original_tokens = self._count_tokens(messages)
+        current_tokens = original_tokens
+        messages_before = len(messages)
+        stages_applied: List[str] = []
+        stage_effects: List[Dict[str, Any]] = []
         for stage in self._stages:
+            before_count = current_tokens
+            before_messages = len(messages)
             messages = stage.apply(messages, budget)
+            next_count = self._count_tokens(messages)
+            changed = next_count != before_count or len(messages) != before_messages
+            if changed:
+                stages_applied.append(stage.name)
+                stage_effects.append({
+                    "stage": stage.name,
+                    "tokens_before": before_count,
+                    "tokens_after": next_count,
+                    "messages_before": before_messages,
+                    "messages_after": len(messages),
+                })
+            current_tokens = next_count
+        tokens_after = self._count_tokens(messages)
+        self._last_trace = self._build_trace(
+            stages_applied=stages_applied,
+            stage_effects=stage_effects,
+            tokens_before=original_tokens,
+            tokens_after=tokens_after,
+            messages_before=messages_before,
+            messages_after=len(messages),
+            forced=True,
+            decision_reason="hard-gate-overflow",
+        )
         return messages
+
+    @staticmethod
+    def _build_trace(
+        *,
+        stages_applied: List[str],
+        tokens_before: int,
+        tokens_after: int,
+        messages_before: int,
+        messages_after: int,
+        stage_effects: List[Dict[str, Any]] | None = None,
+        forced: bool = False,
+        preflight_truncated_messages: int = 0,
+        decision_reason: str = "",
+    ) -> CompressionTrace:
+        saved = max(0, tokens_before - tokens_after)
+        savings_ratio = saved / tokens_before if tokens_before > 0 else 0.0
+        return CompressionTrace(
+            stages_applied=stages_applied,
+            stage_effects=stage_effects or [],
+            tokens_before=max(0, tokens_before),
+            tokens_after=max(0, tokens_after),
+            messages_before=max(0, messages_before),
+            messages_after=max(0, messages_after),
+            savings_ratio=savings_ratio,
+            saved_tokens=saved,
+            forced=forced,
+            preflight_truncated_messages=max(0, preflight_truncated_messages),
+            decision_reason=decision_reason,
+        )
 
     def _count_tokens(self, messages: List[Dict[str, Any]]) -> int:
         """Count tokens using external tokenizer if available, else estimate."""
@@ -635,7 +758,7 @@ class ContextCompressor:
         Strategy: truncate any non-system message exceeding huge_message_chars,
         preserving head + tail with a truncation notice.
         """
-        modified = False
+        truncated_count = 0
         result = []
         for msg in messages:
             if msg.get("role") == "system":
@@ -656,15 +779,57 @@ class ContextCompressor:
             )
             new_msg = dict(msg, content=truncated_content)
             result.append(new_msg)
-            modified = True
+            truncated_count += 1
             logger.info(
                 "preflight: truncated %s message from %d to %d chars",
                 msg.get("role", "?"), len(content), len(truncated_content),
             )
 
         estimated_tokens = self._count_tokens(result)
+        preflight_messages_after = len(result)
         if estimated_tokens > context_length * 0.9:
             result = self.force_compress(result)
+            previous = self._last_trace
+            self._last_trace = CompressionTrace(
+                stages_applied=[*(['preflight'] if truncated_count else []), *previous.stages_applied],
+                stage_effects=[
+                    *([{
+                        "stage": "preflight",
+                        "tokens_before": self._count_tokens(messages),
+                        "tokens_after": estimated_tokens,
+                        "messages_before": len(messages),
+                        "messages_after": preflight_messages_after,
+                    }] if truncated_count else []),
+                    *previous.stage_effects,
+                ],
+                tokens_before=max(previous.tokens_before, estimated_tokens),
+                tokens_after=previous.tokens_after,
+                messages_before=max(previous.messages_before, len(messages)),
+                messages_after=previous.messages_after,
+                savings_ratio=previous.savings_ratio,
+                saved_tokens=previous.saved_tokens,
+                forced=previous.forced,
+                preflight_truncated_messages=truncated_count,
+                decision_reason="huge-message-preflight+hard-gate-overflow" if truncated_count else previous.decision_reason,
+            )
+        elif truncated_count:
+            tokens_before = self._count_tokens(messages)
+            self._last_trace = self._build_trace(
+                stages_applied=["preflight"],
+                stage_effects=[{
+                    "stage": "preflight",
+                    "tokens_before": tokens_before,
+                    "tokens_after": estimated_tokens,
+                    "messages_before": len(messages),
+                    "messages_after": len(result),
+                }],
+                tokens_before=tokens_before,
+                tokens_after=estimated_tokens,
+                messages_before=len(messages),
+                messages_after=len(result),
+                preflight_truncated_messages=truncated_count,
+                decision_reason="huge-message-preflight",
+            )
 
         return result
 

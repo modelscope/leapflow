@@ -157,6 +157,11 @@ class RuntimeLeapService:
             "model": getattr(settings, "llm_model", ""),
             "llm_context_length": context_metadata.get("llm_context_length", getattr(settings, "llm_context_length", 0)),
             "context_used": context_metadata.get("context_used", 0),
+            "context_posture": context_metadata.get("context_posture", "baseline"),
+            "context_signal": context_metadata.get("context_signal", ""),
+            "context_guidance": context_metadata.get("context_guidance", ""),
+            "compression_reason": context_metadata.get("compression_reason", ""),
+            "compression_savings_ratio": context_metadata.get("compression_savings_ratio", 0.0),
             "context_budget_snapshot": context_metadata.get("context_budget_snapshot", {}),
             "session_id": str(getattr(engine, "_current_session_id", "") or ""),
             "runtime_source": self._runtime_source(),
@@ -276,6 +281,18 @@ class RuntimeLeapService:
                 metadata["llm_context_length"] = max(1, int(safe_snapshot["context_length"]))
             if safe_snapshot.get("total_tokens") is not None:
                 metadata["context_used"] = max(0, int(safe_snapshot["total_tokens"]))
+            posture = safe_snapshot.get("context_posture")
+            if posture:
+                metadata["context_posture"] = str(posture)
+            signal = safe_snapshot.get("context_signal")
+            if signal:
+                metadata["context_signal"] = str(signal)
+            guidance = safe_snapshot.get("context_guidance")
+            if guidance:
+                metadata["context_guidance"] = str(guidance)
+            for key in ("compression_reason", "compression_savings_ratio", "compression_saved_tokens"):
+                if safe_snapshot.get(key) is not None:
+                    metadata[key] = safe_snapshot[key]
             metadata["context_budget_snapshot"] = safe_snapshot
         return metadata
 

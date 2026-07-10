@@ -50,9 +50,9 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "function": {
             "name": "file_read",
             "description": (
-                "Read the content of a text file. For long tasks over large files, "
+                "Read text file content with adaptive context governance. For large or unfamiliar files, "
                 "prefer mode='outline' or mode='symbols' first, then use mode='raw' "
-                "with start_line for the specific range you actually need."
+                "with start_line/max_lines for the specific range you actually need."
             ),
             "parameters": {
                 "type": "object",
@@ -60,6 +60,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "path": {"type": "string", "description": "File path to read"},
                     "max_lines": {"type": "integer", "description": "Max lines to return (default: 200)"},
                     "start_line": {"type": "integer", "description": "1-based line to start reading from (default: 1)"},
+                    "max_chars": {"type": "integer", "description": "Max characters to read before line filtering (default bounded by runtime guard)"},
                     "mode": {
                         "type": "string",
                         "enum": ["raw", "outline", "symbols"],
@@ -252,13 +253,14 @@ _BRIDGE_TOOLS = [
     {
         "name": "gp_file_read",
         "description": (
-            "Read the content of a text file. Use mode='outline'/'symbols' for large "
-            "files before reading raw ranges, to reduce context usage in long tasks."
+            "Read text file content with adaptive context governance. Use mode='outline'/'symbols' for large "
+            "or unfamiliar files before reading raw ranges, to reduce context usage by default."
         ),
         "parameters": {
             "path": "string (required) — file path to read",
             "max_lines": "integer (optional) — max lines to return (default: 200)",
             "start_line": "integer (optional) — 1-based starting line (default: 1)",
+            "max_chars": "integer (optional) — max characters to read before line filtering",
             "mode": "string (optional) — raw|outline|symbols (default: raw)",
         },
         "handler": file_read,

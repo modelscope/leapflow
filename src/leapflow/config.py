@@ -345,6 +345,12 @@ class Settings:
     tool_evidence_max_chars: int = 1200
     repeated_read_limit: int = 2
     long_task_convergence_round: int = 12
+    context_expanded_ratio: float = 0.60
+    context_finalizing_ratio: float = 0.90
+    context_expanded_evidence_threshold: int = 2
+    context_expanded_tool_call_threshold: int = 3
+    context_research_source_threshold: int = 3
+    context_research_evidence_threshold: int = 5
 
     # ── Error Recovery ──
     error_transient_max_retries: int = 3
@@ -773,6 +779,12 @@ def _build_settings_from_env() -> Settings:
     tool_evidence_max_chars = int(os.getenv("LEAPFLOW_TOOL_EVIDENCE_MAX_CHARS", "1200"))
     repeated_read_limit = int(os.getenv("LEAPFLOW_REPEATED_READ_LIMIT", "2"))
     long_task_convergence_round = int(os.getenv("LEAPFLOW_LONG_TASK_CONVERGENCE_ROUND", "12"))
+    context_expanded_ratio = float(os.getenv("LEAPFLOW_CONTEXT_EXPANDED_RATIO", "0.60"))
+    context_finalizing_ratio = float(os.getenv("LEAPFLOW_CONTEXT_FINALIZING_RATIO", "0.90"))
+    context_expanded_evidence_threshold = int(os.getenv("LEAPFLOW_CONTEXT_EXPANDED_EVIDENCE_THRESHOLD", "2"))
+    context_expanded_tool_call_threshold = int(os.getenv("LEAPFLOW_CONTEXT_EXPANDED_TOOL_CALL_THRESHOLD", "3"))
+    context_research_source_threshold = int(os.getenv("LEAPFLOW_CONTEXT_RESEARCH_SOURCE_THRESHOLD", "3"))
+    context_research_evidence_threshold = int(os.getenv("LEAPFLOW_CONTEXT_RESEARCH_EVIDENCE_THRESHOLD", "5"))
 
     # Error Recovery
     error_transient_max_retries = int(os.getenv("LEAPFLOW_ERROR_TRANSIENT_MAX_RETRIES", "3"))
@@ -1026,6 +1038,12 @@ def _build_settings_from_env() -> Settings:
         tool_evidence_max_chars=tool_evidence_max_chars,
         repeated_read_limit=repeated_read_limit,
         long_task_convergence_round=long_task_convergence_round,
+        context_expanded_ratio=context_expanded_ratio,
+        context_finalizing_ratio=context_finalizing_ratio,
+        context_expanded_evidence_threshold=context_expanded_evidence_threshold,
+        context_expanded_tool_call_threshold=context_expanded_tool_call_threshold,
+        context_research_source_threshold=context_research_source_threshold,
+        context_research_evidence_threshold=context_research_evidence_threshold,
         # Error Recovery
         error_transient_max_retries=error_transient_max_retries,
         error_rate_limit_base_delay=error_rate_limit_base_delay,

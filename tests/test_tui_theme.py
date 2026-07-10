@@ -185,3 +185,21 @@ def test_status_bar_shows_fractional_k_for_small_context_usage(monkeypatch) -> N
     assert "0.2K/256K" in rendered
     assert "0.1%" in rendered
     assert "[█░░░░░░░░░]" in rendered
+
+
+def test_status_bar_shows_adaptive_context_state(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "leapflow.cli.tui_app.status.shutil.get_terminal_size",
+        lambda: terminal_size((120, 24)),
+    )
+    status = StatusBar(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    status.update(
+        model_name="qwen3.7-plus",
+        context_used=80_000,
+        context_max=100_000,
+        context_state="research",
+    )
+
+    rendered = "".join(text for _, text in status())
+    assert "80%" in rendered
+    assert "research" in rendered

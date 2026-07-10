@@ -290,9 +290,15 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     def _update_status() -> None:
         ctx_used = 0
         ctx_max = ctx.settings.llm_context_length
+        ctx_state = "baseline"
         engine = ctx.engine
         if engine is not None:
             ctx_used = getattr(engine, "context_token_count", 0)
+            snapshot = getattr(engine, "context_budget_snapshot", {})
+            if callable(snapshot):
+                snapshot = snapshot()
+            if isinstance(snapshot, dict):
+                ctx_state = str(snapshot.get("context_posture") or "baseline")
         mode = _mode_name()
         status.update(
             mode=mode,
@@ -302,6 +308,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
             session_turns=getattr(engine, "turn_count", 0) if engine else 0,
             context_used=ctx_used,
             context_max=ctx_max,
+            context_state=ctx_state,
         )
         app.prompt_mode = mode
 
@@ -734,6 +741,7 @@ async def cmd_interactive_daemon(
     runtime_model_name = str(getattr(settings, "llm_model", ""))
     runtime_context_length = int(getattr(settings, "llm_context_length", 0) or 0)
     runtime_context_used = 0
+    runtime_context_state = "baseline"
     runtime_daemon_pid = ""
     runtime_host_online = False
     client_lease = ClientLease(
@@ -744,7 +752,7 @@ async def cmd_interactive_daemon(
 
     def _apply_daemon_runtime_metadata(metadata: dict[str, Any]) -> None:
         nonlocal active_session_id, runtime_model_name, runtime_context_length
-        nonlocal runtime_context_used, runtime_daemon_pid, runtime_host_online
+        nonlocal runtime_context_used, runtime_context_state, runtime_daemon_pid, runtime_host_online
         if metadata.get("pid"):
             runtime_daemon_pid = str(metadata["pid"])
         if metadata.get("session_id"):
@@ -763,6 +771,11 @@ async def cmd_interactive_daemon(
                 runtime_context_used = max(0, int(metadata["context_used"]))
             except (TypeError, ValueError):
                 pass
+        if metadata.get("context_posture"):
+            runtime_context_state = str(metadata["context_posture"])
+        elif isinstance(metadata.get("context_budget_snapshot"), dict):
+            snapshot = metadata["context_budget_snapshot"]
+            runtime_context_state = str(snapshot.get("context_posture") or runtime_context_state)
         host = metadata.get("host_backend")
         if isinstance(host, dict):
             runtime_host_online = _host_started(host)
@@ -791,6 +804,7 @@ async def cmd_interactive_daemon(
             session_turns=turn_count,
             context_used=runtime_context_used,
             context_max=runtime_context_length,
+            context_state=runtime_context_state,
         )
         app.prompt_mode = "daemon"
 

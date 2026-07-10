@@ -4,8 +4,11 @@ from typing import Any
 
 import pytest
 
+from leapflow.engine.context_compressor import CompressorConfig, ContextCompressor
 from leapflow.engine.context_control import (
     ContextBudgetEstimator,
+    ContextGovernanceController,
+    ContextPostureConfig,
     ContextWindowController,
     LongTaskContextController,
     ToolEvidenceBuilder,
@@ -49,6 +52,29 @@ def test_context_window_controller_forces_final_answer_when_over_budget() -> Non
     assert decision.forced_final_answer is True
     assert any("final answer now" in str(item.get("content", "")) for item in decision.messages)
     assert len(decision.messages) < len(messages) + 1
+
+
+def test_context_compressor_records_transparent_trace() -> None:
+    compressor = ContextCompressor(CompressorConfig(
+        token_budget=100,
+        max_output_chars=120,
+        enabled_stages=["trim"],
+    ))
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "tool", "content": "A" * 1_000},
+    ]
+
+    prepared = compressor.compress(messages)
+    trace = compressor.last_trace.as_dict()
+
+    assert prepared[1]["content"] != messages[1]["content"]
+    assert trace["stages_applied"] == ["trim"]
+    assert trace["stage_effects"][0]["stage"] == "trim"
+    assert trace["decision_reason"] == "threshold-triggered"
+    assert trace["tokens_after"] < trace["tokens_before"]
+    assert trace["saved_tokens"] > 0
+    assert trace["savings_ratio"] > 0
 
 
 def test_tool_evidence_builder_compacts_file_read_content() -> None:
@@ -101,6 +127,54 @@ def test_long_task_metadata_avoids_noise_for_uncompacted_tools() -> None:
     metadata = controller.tool_metadata("time_get", {}, {"ok": True, "result": "now"})
 
     assert metadata == {}
+
+
+def test_context_governance_controller_keeps_long_task_alias() -> None:
+    controller = ContextGovernanceController(
+        evidence_builder=ToolEvidenceBuilder(max_content_chars=240),
+        posture_config=ContextPostureConfig(
+            expanded_evidence_threshold=1,
+            expanded_tool_call_threshold=10,
+            research_source_threshold=10,
+            research_evidence_threshold=10,
+        ),
+    )
+
+    controller.compact_tool_result(
+        "shell_run",
+        {"command": "pytest"},
+        {"ok": True, "stdout": "passed", "stderr": ""},
+    )
+    snapshot = controller.snapshot().as_dict()
+
+    assert isinstance(LongTaskContextController(
+        evidence_builder=ToolEvidenceBuilder(max_content_chars=240),
+    ), ContextGovernanceController)
+    assert snapshot["posture"] == "expanded"
+    assert snapshot["guidance"] == "prefer outline, symbols, or range reads before raw content"
+
+
+def test_exploration_ledger_promotes_without_explicit_mode() -> None:
+    controller = LongTaskContextController(
+        evidence_builder=ToolEvidenceBuilder(max_content_chars=240),
+        repeated_read_limit=1,
+        convergence_round=20,
+    )
+
+    for index in range(3):
+        path = f"/tmp/source_{index}.py"
+        controller.compact_tool_result(
+            "file_read",
+            {"path": path},
+            {"ok": True, "path": path, "content": "print(1)", "mode": "symbols"},
+        )
+
+    snapshot = controller.snapshot().as_dict()
+
+    assert snapshot["posture"] == "research"
+    assert snapshot["sources_seen"] == 3
+    assert snapshot["dominant_signal"] == "multi-source"
+    assert snapshot["guidance"] == "maintain research ledger and synthesize findings"
 
 
 @pytest.mark.asyncio

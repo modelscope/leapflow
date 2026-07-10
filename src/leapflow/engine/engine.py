@@ -18,8 +18,9 @@ from leapflow.engine.budget import BudgetConfig, BudgetStatus, IterationBudget
 from leapflow.engine.context_compressor import CompressorConfig, ContextCompressor
 from leapflow.engine.context_control import (
     ContextBudgetEstimator,
+    ContextGovernanceController,
+    ContextPostureConfig,
     ContextWindowController,
-    LongTaskContextController,
     ToolEvidenceBuilder,
 )
 from leapflow.engine.error_classifier import (
@@ -430,12 +431,20 @@ class AgentEngine:
             hard_limit_ratio=settings.context_hard_limit_ratio,
             warning_ratio=settings.context_warning_ratio,
         )
-        self._long_task_controller = LongTaskContextController(
+        self._context_governance_controller = ContextGovernanceController(
             evidence_builder=ToolEvidenceBuilder(
                 max_content_chars=settings.tool_evidence_max_chars,
             ),
             repeated_read_limit=settings.repeated_read_limit,
             convergence_round=settings.long_task_convergence_round,
+            posture_config=ContextPostureConfig(
+                expanded_ratio=settings.context_expanded_ratio,
+                finalizing_ratio=settings.context_finalizing_ratio,
+                expanded_evidence_threshold=settings.context_expanded_evidence_threshold,
+                expanded_tool_call_threshold=settings.context_expanded_tool_call_threshold,
+                research_source_threshold=settings.context_research_source_threshold,
+                research_evidence_threshold=settings.context_research_evidence_threshold,
+            ),
         )
         self._last_context_snapshot: dict[str, Any] = {}
         self._healer = MessageHealer()
@@ -507,12 +516,20 @@ class AgentEngine:
             hard_limit_ratio=settings.context_hard_limit_ratio,
             warning_ratio=settings.context_warning_ratio,
         )
-        self._long_task_controller = LongTaskContextController(
+        self._context_governance_controller = ContextGovernanceController(
             evidence_builder=ToolEvidenceBuilder(
                 max_content_chars=settings.tool_evidence_max_chars,
             ),
             repeated_read_limit=settings.repeated_read_limit,
             convergence_round=settings.long_task_convergence_round,
+            posture_config=ContextPostureConfig(
+                expanded_ratio=settings.context_expanded_ratio,
+                finalizing_ratio=settings.context_finalizing_ratio,
+                expanded_evidence_threshold=settings.context_expanded_evidence_threshold,
+                expanded_tool_call_threshold=settings.context_expanded_tool_call_threshold,
+                research_source_threshold=settings.context_research_source_threshold,
+                research_evidence_threshold=settings.context_research_evidence_threshold,
+            ),
         )
         self._skill_merger = SkillMerger(
             registry=self._registry,
@@ -783,6 +800,7 @@ class AgentEngine:
         context_length = self._active_context_length()
         token_count = self._context_controller.estimator.estimate_messages(messages)
         prepared = self._compressor.compress(messages, token_count=token_count)
+        compression_trace = self._compressor.last_trace.as_dict()
         prepared = self._compressor.preflight_check(prepared, context_length=context_length)
         if self._cache_strategy:
             prepared = self._cache_strategy.optimize(prepared)
@@ -793,11 +811,12 @@ class AgentEngine:
             compressor=self._compressor,
         )
         prepared = decision.messages
+        compression_trace = self._compressor.last_trace.as_dict()
         warning = self._context_controller.warning_notice(
             decision.snapshot,
             round_number=round_number,
         )
-        convergence = self._long_task_controller.convergence_notice(round_number)
+        convergence = self._context_governance_controller.convergence_notice(round_number)
         for notice in (warning, convergence):
             if notice:
                 prepared = [*prepared, build_user_message_text(notice)]
@@ -806,6 +825,11 @@ class AgentEngine:
             tools=tools,
             context_length=context_length,
         )
+        governance = self._context_governance_controller.snapshot(
+            context_ratio=snapshot.ratio,
+            round_number=round_number,
+        ).as_dict()
+        compressed = decision.compressed or bool(compression_trace.get("stages_applied"))
         self._last_context_tokens = snapshot.total_tokens
         self._last_context_snapshot = {
             "message_tokens": snapshot.message_tokens,
@@ -813,10 +837,19 @@ class AgentEngine:
             "total_tokens": snapshot.total_tokens,
             "context_length": snapshot.context_length,
             "ratio": snapshot.ratio,
-            "compressed": decision.compressed,
+            "compressed": compressed,
             "forced_final_answer": decision.forced_final_answer,
+            "compression_trace": compression_trace,
+            "compression_reason": compression_trace.get("decision_reason", ""),
+            "compression_savings_ratio": compression_trace.get("savings_ratio", 0.0),
+            "compression_saved_tokens": compression_trace.get("saved_tokens", 0),
+            "context_governance": governance,
+            "context_posture": governance.get("posture", "baseline"),
+            "context_signal": governance.get("dominant_signal", ""),
+            "context_guidance": governance.get("guidance", ""),
+            "context_convergence_reason": governance.get("convergence_reason", ""),
         }
-        if decision.compressed:
+        if compressed:
             self._usage_tracker.mark_compression()
         return prepared
 
@@ -829,13 +862,14 @@ class AgentEngine:
                 **self._last_context_snapshot,
                 "provider_prompt_tokens": provider_prompt,
                 "total_tokens": provider_prompt,
+                "ratio": provider_prompt / max(1, int(self._last_context_snapshot.get("context_length") or 1)),
             }
         if self._model_capabilities and model and usage:
             self._model_capabilities.update_from_usage(model, usage)
 
     def _compact_tool_result(self, tool_name: str, arguments: Dict[str, Any] | None, result: Any) -> Any:
         """Return compact tool evidence for LLM replay."""
-        return self._long_task_controller.compact_tool_result(tool_name, arguments, result)
+        return self._context_governance_controller.compact_tool_result(tool_name, arguments, result)
 
     def _tool_context_metadata(
         self,
@@ -843,8 +877,28 @@ class AgentEngine:
         arguments: Dict[str, Any] | None,
         result: Any,
     ) -> Dict[str, Any]:
-        """Return additional UI metadata from long-task context handling."""
-        return self._long_task_controller.tool_metadata(tool_name, arguments, result)
+        """Return additional UI metadata from adaptive context handling."""
+        metadata = self._context_governance_controller.tool_metadata(tool_name, arguments, result)
+        snapshot = self._last_context_snapshot
+        if snapshot:
+            posture = snapshot.get("context_posture")
+            if posture and posture != "baseline":
+                metadata.setdefault("context_posture", posture)
+            signal = snapshot.get("context_signal")
+            if signal:
+                metadata.setdefault("context_signal", signal)
+            guidance = snapshot.get("context_guidance")
+            if guidance:
+                metadata.setdefault("context_guidance", guidance)
+            trace = snapshot.get("compression_trace")
+            if isinstance(trace, dict) and trace.get("stages_applied"):
+                metadata.setdefault("compression_stages", trace.get("stages_applied"))
+                metadata.setdefault("compression_savings_ratio", trace.get("savings_ratio", 0.0))
+                metadata.setdefault("compression_saved_tokens", trace.get("saved_tokens", 0))
+                metadata.setdefault("compression_reason", trace.get("decision_reason", ""))
+            if snapshot.get("forced_final_answer"):
+                metadata.setdefault("context_posture", "finalizing")
+        return metadata
 
     async def run(self, user_text: str, *, enable_thinking: bool = False) -> str:
         """Entrypoint: simplified routing with unified tool loop as default path."""
