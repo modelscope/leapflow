@@ -369,6 +369,70 @@ async def test_daemon_fallback_initializes_local_interactive_with_real_config(
     assert (data_dir / ".env").exists()
 
 
+@pytest.mark.asyncio
+async def test_daemon_runtime_bridge_recovers_and_resumes_session() -> None:
+    from leapflow.cli.commands.interactive import _DaemonRuntimeBridge
+    from leapflow.daemon.client import DaemonUnavailableError
+
+    class Console:
+        def __init__(self) -> None:
+            self.warnings: list[str] = []
+            self.systems: list[str] = []
+            self.successes: list[str] = []
+
+        def warning(self, message: str) -> None:
+            self.warnings.append(message)
+
+        def system(self, message: str) -> None:
+            self.systems.append(message)
+
+        def success(self, message: str) -> None:
+            self.successes.append(message)
+
+    class BrokenClient:
+        async def status(self):
+            raise DaemonUnavailableError("socket disappeared")
+
+    class RecoveredClient:
+        def __init__(self) -> None:
+            self.resumed: list[str] = []
+
+        async def status(self):
+            return {"pid": 99, "session_id": "sess-1"}
+
+        async def session_resume(self, session_id: str):
+            self.resumed.append(session_id)
+            return {"found": True, "session_id": session_id}
+
+    class Settings:
+        pass
+
+    active_session_id = "sess-1"
+    metadata: list[dict] = []
+    recovered = RecoveredClient()
+
+    async def factory(settings, *, mock_host: bool = False, status_callback=None):
+        if status_callback is not None:
+            status_callback("Connected to recovered leapd.")
+        return recovered
+
+    bridge = _DaemonRuntimeBridge(
+        BrokenClient(),
+        Settings(),
+        Console(),
+        session_id_getter=lambda: active_session_id,
+        session_id_setter=lambda value: None,
+        metadata_applier=metadata.append,
+        client_factory=factory,
+    )
+
+    result = await bridge.call(lambda current_client: current_client.status(), description="status")
+
+    assert result == {"pid": 99, "session_id": "sess-1"}
+    assert recovered.resumed == ["sess-1"]
+    assert metadata == [{"pid": 99, "session_id": "sess-1"}]
+
+
 def test_leap_default_command_uses_daemon_client(monkeypatch) -> None:
     from leapflow.cli import cli
 
@@ -697,6 +761,52 @@ async def test_daemon_tui_exit_prompt_can_keep_daemon(monkeypatch, tmp_path) -> 
 
     await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
 
+    assert any("kept running" in message for message in console.systems)
+
+
+@pytest.mark.asyncio
+async def test_daemon_tui_exit_prompt_keeps_daemon_by_default_for_other_clients(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from leapflow.cli.commands import interactive as interactive_module
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    class Client:
+        async def status(self):
+            return {"pid": 1234, "connected_clients": 2}
+
+    class Console:
+        def __init__(self) -> None:
+            self.systems: list[str] = []
+            self.warnings: list[str] = []
+
+        def system(self, message: str) -> None:
+            self.systems.append(message)
+
+        def warning(self, message: str) -> None:
+            self.warnings.append(message)
+
+    class Settings:
+        profile_dir = tmp_path
+
+    prompts: list[str] = []
+
+    async def default_no(prompt: str) -> bool:
+        prompts.append(prompt)
+        return False
+
+    def fail_send_signal(*args, **kwargs):
+        raise AssertionError("daemon should be kept running while other clients exist")
+
+    monkeypatch.setattr(interactive_module, "_ask_yes_no_default_no", default_no)
+    monkeypatch.setattr(lifecycle_module, "send_signal", fail_send_signal)
+    console = Console()
+
+    await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
+
+    assert prompts == ["Stop leapd anyway (pid=1234)? [y/N]: "]
+    assert any("other Leap client" in message for message in console.systems)
     assert any("kept running" in message for message in console.systems)
 
 

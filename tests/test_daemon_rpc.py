@@ -115,6 +115,52 @@ async def test_daemon_client_stream_heartbeat_prevents_idle_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_client_lease_blocks_daemon_idle_shutdown(tmp_path) -> None:
+    from leapflow.daemon.lease import ClientLease, read_active_client_leases
+    from leapflow.daemon.server import _watch_idle_shutdown
+
+    class IdleServer:
+        active_connections = 0
+
+        def __init__(self, run_dir: Path) -> None:
+            self._run_dir = run_dir
+
+        @property
+        def run_dir(self) -> Path:
+            return self._run_dir
+
+    run_dir = tmp_path / "run"
+    lease = ClientLease(run_dir, kind="tui", session_id="sess-live", touch_interval_s=1.0)
+    await lease.start()
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        _watch_idle_shutdown(
+            IdleServer(run_dir),
+            stop_event,
+            idle_timeout_s=0.03,
+            lease_ttl_s=1.0,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await asyncio.sleep(0.08)
+        assert not stop_event.is_set()
+        snapshots = read_active_client_leases(run_dir, ttl_s=1.0)
+        assert [(item.kind, item.session_id, item.state) for item in snapshots] == [
+            ("tui", "sess-live", "idle")
+        ]
+
+        await lease.stop()
+        await asyncio.wait_for(stop_event.wait(), timeout=0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
 async def test_runtime_service_streams_pending_approval_and_resolves(tmp_path) -> None:
     from conftest import make_settings
     from leapflow.daemon.service import RuntimeLeapService
@@ -570,6 +616,7 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
     _print_runtime_status({
         "profile": "default",
         "active_clients": 1,
+        "connected_clients": 2,
         "volatile": False,
         "model": "qwen3.7-plus",
         "context_used": 256,
@@ -592,7 +639,7 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
     })
 
     output = capsys.readouterr().out
-    assert "runtime: profile=default clients=1 volatile=False" in output
+    assert "runtime: profile=default clients=1 connected=2 volatile=False" in output
     assert "model: qwen3.7-plus context=256/256000" in output
     assert "version: 0.0.test" in output
     assert "source: /repo/src/leapflow/__init__.py" in output

@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+from leapflow.daemon.lease import ClientLeaseSnapshot
 from leapflow.daemon.protocol import StreamChunk
 from leapflow.engine import StreamEvent
 from leapflow.memory.protocol import MemoryEntry, MemoryQuery
@@ -27,12 +28,17 @@ class RuntimeLeapService:
         self._engine_lock = asyncio.Lock()
         self._started_at = time.time()
         self._client_count: Callable[[], int] = lambda: 0
+        self._client_leases: Callable[[], list[ClientLeaseSnapshot]] = lambda: []
         self._approval_pending: dict[str, dict[str, Any]] = {}
         self._approval_event_queue: asyncio.Queue[StreamChunk] | None = None
 
     def set_client_count_provider(self, provider: Callable[[], int]) -> None:
         """Set a lightweight callback used by status reporting."""
         self._client_count = provider
+
+    def set_client_lease_provider(self, provider: Callable[[], list[ClientLeaseSnapshot]]) -> None:
+        """Set a callback used to report live client leases."""
+        self._client_leases = provider
 
     async def start(self) -> None:
         """Initialize the daemon-owned runtime once."""
@@ -146,6 +152,8 @@ class RuntimeLeapService:
             "volatile": bool(getattr(ctx, "storage_volatile", False)) if ctx is not None else False,
             "uptime_s": max(0.0, time.time() - self._started_at),
             "active_clients": max(0, self._client_count()),
+            "active_connections": max(0, self._client_count()),
+            "connected_clients": len(self._client_leases()),
             "model": getattr(settings, "llm_model", ""),
             "llm_context_length": getattr(settings, "llm_context_length", 0),
             "context_used": getattr(engine, "context_token_count", 0) if engine is not None else 0,

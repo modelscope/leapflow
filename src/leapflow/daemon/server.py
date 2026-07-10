@@ -10,6 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from leapflow.daemon.lease import default_lease_ttl_s, read_active_client_leases
 from leapflow.daemon.lifecycle import cleanup_run_dir, write_pid_file
 from leapflow.daemon.protocol import ErrorCode, METHOD_REGISTRY, RpcRequest, RpcResponse, StreamChunk
 
@@ -56,6 +57,13 @@ class UnixRpcServer:
         self._active_connections = 0
         if hasattr(service, "set_client_count_provider"):
             service.set_client_count_provider(lambda: self._active_connections)
+        if hasattr(service, "set_client_lease_provider"):
+            service.set_client_lease_provider(lambda: read_active_client_leases(self._run_dir))
+
+    @property
+    def run_dir(self) -> Path:
+        """Return the daemon runtime directory."""
+        return self._run_dir
 
     @property
     def active_connections(self) -> int:
@@ -287,13 +295,21 @@ async def _watch_idle_shutdown(
     stop_event: asyncio.Event,
     *,
     idle_timeout_s: float,
+    lease_ttl_s: float | None = None,
+    poll_interval_s: float | None = None,
 ) -> None:
     if idle_timeout_s <= 0:
         return
     last_active = asyncio.get_running_loop().time()
-    interval = min(30.0, max(1.0, idle_timeout_s / 10.0))
+    interval = poll_interval_s or min(30.0, max(1.0, idle_timeout_s / 10.0))
+    max_lease_age = default_lease_ttl_s() if lease_ttl_s is None else lease_ttl_s
     while not stop_event.is_set():
-        if server.active_connections > 0:
+        has_lease = await asyncio.to_thread(
+            read_active_client_leases,
+            server.run_dir,
+            ttl_s=max_lease_age,
+        )
+        if server.active_connections > 0 or has_lease:
             last_active = asyncio.get_running_loop().time()
         elif asyncio.get_running_loop().time() - last_active >= idle_timeout_s:
             logger.info("daemon: idle timeout reached; shutting down")

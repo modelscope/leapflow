@@ -47,7 +47,19 @@ async def _prompt_stop_daemon_on_exit(
         "leapd runs in the background; stop/restart it after reinstalling LeapFlow "
         "to load new code."
     )
-    stop = await _ask_yes_no_default_yes(f"Stop leapd now (pid={pid})? [Y/n]: ")
+    connected_clients = daemon_status.get("connected_clients")
+    other_clients = 0
+    try:
+        other_clients = max(0, int(connected_clients or 0))
+    except (TypeError, ValueError):
+        other_clients = 0
+    if other_clients > 0:
+        console.system(
+            f"Detected {other_clients} other Leap client(s); keeping leapd running by default."
+        )
+        stop = await _ask_yes_no_default_no(f"Stop leapd anyway (pid={pid})? [y/N]: ")
+    else:
+        stop = await _ask_yes_no_default_yes(f"Stop leapd now (pid={pid})? [Y/n]: ")
     if not stop:
         console.system("leapd kept running. Use `leap daemon restart` when needed.")
         return
@@ -73,6 +85,20 @@ async def _ask_yes_no_default_yes(prompt: str) -> bool:
     except (EOFError, KeyboardInterrupt):
         return True
     return answer not in {"n", "no"}
+
+
+async def _ask_yes_no_default_no(prompt: str) -> bool:
+    """Return False by default, including non-interactive or interrupted prompts."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: input(prompt).strip().lower(),
+        )
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in {"y", "yes"}
 
 
 def _host_started(status: dict[str, Any]) -> bool:
@@ -107,6 +133,76 @@ def _host_action(args: str) -> str:
     if action in {"off", "down", "disable"}:
         return "stop"
     return action
+
+
+class _DaemonRuntimeBridge:
+    """Reconnectable bridge for daemon-backed TUI runtime calls."""
+
+    def __init__(
+        self,
+        client: "DaemonClient",
+        settings: Any,
+        console: Any,
+        *,
+        session_id_getter: Any,
+        session_id_setter: Any,
+        metadata_applier: Any,
+        lease: Any | None = None,
+        mock_host: bool = False,
+        client_factory: Any | None = None,
+    ) -> None:
+        self.client = client
+        self._settings = settings
+        self._console = console
+        self._session_id_getter = session_id_getter
+        self._session_id_setter = session_id_setter
+        self._metadata_applier = metadata_applier
+        self._lease = lease
+        self._mock_host = mock_host
+        self._client_factory = client_factory
+
+    async def call(self, operation: Any, *, description: str) -> Any:
+        """Run one RPC operation and recover the daemon once on connection failure."""
+        from leapflow.daemon.client import DaemonUnavailableError
+
+        try:
+            return await operation(self.client)
+        except DaemonUnavailableError as exc:
+            await self.recover(f"{description} failed: {exc}")
+            return await operation(self.client)
+
+    async def recover(self, reason: str) -> None:
+        """Reconnect or restart leapd, then restore runtime metadata and session."""
+        from leapflow.daemon.client import recover_daemon_client
+
+        self._console.warning(f"Lost connection to leapd; attempting recovery. {reason}")
+
+        def _status(message: str) -> None:
+            self._console.system(message)
+
+        factory = self._client_factory or recover_daemon_client
+        self.client = await factory(
+            self._settings,
+            mock_host=self._mock_host,
+            status_callback=_status,
+        )
+        status = await self.client.status()
+        self._metadata_applier(status)
+        session_id = str(self._session_id_getter() or "")
+        if session_id:
+            result = await self.client.session_resume(session_id)
+            if result.get("found"):
+                restored = str(result.get("session_id") or session_id)
+                self._session_id_setter(restored)
+                self._console.success(f"Reconnected to leapd and resumed session {restored}")
+            else:
+                self._console.warning(
+                    f"Reconnected to leapd, but session '{session_id}' was not found."
+                )
+        else:
+            self._console.success("Reconnected to leapd.")
+        if self._lease is not None:
+            await self._lease.touch(state="idle", session_id=str(self._session_id_getter() or ""))
 
 
 async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) -> int:
@@ -595,6 +691,7 @@ async def cmd_interactive_daemon(
     settings: Any,
     *,
     resume_id: Optional[str] = None,
+    mock_host: bool = False,
 ) -> int:
     """Persistent REPL backed by leapd thin-client RPC."""
     from leapflow.cli.banner import display_rich_banner
@@ -608,6 +705,7 @@ async def cmd_interactive_daemon(
         detect_theme,
     )
     from leapflow.cli.tui_app.status import StatusBar
+    from leapflow.daemon.lease import ClientLease
     from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
 
     theme = detect_theme()
@@ -621,6 +719,11 @@ async def cmd_interactive_daemon(
     runtime_context_used = 0
     runtime_daemon_pid = ""
     runtime_host_online = False
+    client_lease = ClientLease(
+        settings.profile_dir / "run",
+        kind="tui",
+        session_id=active_session_id,
+    )
 
     def _apply_daemon_runtime_metadata(metadata: dict[str, Any]) -> None:
         nonlocal active_session_id, runtime_model_name, runtime_context_length
@@ -646,6 +749,21 @@ async def cmd_interactive_daemon(
         host = metadata.get("host_backend")
         if isinstance(host, dict):
             runtime_host_online = _host_started(host)
+
+    def _set_active_session_id(session_id: str) -> None:
+        nonlocal active_session_id
+        active_session_id = session_id
+
+    bridge = _DaemonRuntimeBridge(
+        client,
+        settings,
+        console,
+        session_id_getter=lambda: active_session_id,
+        session_id_setter=_set_active_session_id,
+        metadata_applier=_apply_daemon_runtime_metadata,
+        lease=client_lease,
+        mock_host=mock_host,
+    )
 
     def _update_status() -> None:
         status.update(
@@ -678,7 +796,10 @@ async def cmd_interactive_daemon(
 
     async def _print_daemon_status() -> None:
         try:
-            daemon_status = await client.status()
+            daemon_status = await bridge.call(
+                lambda current_client: current_client.status(),
+                description="daemon status",
+            )
         except Exception as exc:
             console.warning(f"Daemon status unavailable: {exc}")
             return
@@ -689,6 +810,7 @@ async def cmd_interactive_daemon(
             f"pid={daemon_status.get('pid')} "
             f"profile={daemon_status.get('profile')} "
             f"clients={daemon_status.get('active_clients')} "
+            f"connected={daemon_status.get('connected_clients', 0)} "
             f"volatile={daemon_status.get('volatile')}"
         )
         db_path = daemon_status.get("db_path")
@@ -734,22 +856,39 @@ async def cmd_interactive_daemon(
         request = ApprovalRequest.from_dict(payload)
         decision = await prompt_approval(request)
         value = decision.value if isinstance(decision, ApprovalDecision) else str(decision)
-        await client.approval_resolve(pending_id, value)
+        await bridge.call(
+            lambda current_client: current_client.approval_resolve(pending_id, value),
+            description="approval resolve",
+        )
         app.spinner_text = "Thinking…"
 
-    async def _stream_response(prompt_text: str) -> None:
-        nonlocal active_session_id, turn_count, runtime_model_name
-        nonlocal runtime_context_length, runtime_context_used
-        exit_stats.record_user_message()
+    async def _stream_response(
+        prompt_text: str,
+        *,
+        allow_retry: bool = True,
+        record_user: bool = True,
+    ) -> None:
+        nonlocal turn_count
+        from leapflow.daemon.client import DaemonUnavailableError
+
+        if record_user:
+            exit_stats.record_user_message()
         status.mark_turn_start()
         app.agent_running = True
         app.spinner_text = "Thinking…"
+        await client_lease.touch(state="streaming", session_id=active_session_id)
 
         renderer = StreamRenderer(console)
         renderer.start()
+        retry_error: DaemonUnavailableError | None = None
+        saw_real_event = False
+        turn_completed = False
         try:
-            async for event in client.engine_chat(prompt_text):
+            async for event in bridge.client.engine_chat(prompt_text):
                 metadata = event.metadata or {}
+                is_heartbeat = event.type == "status" and metadata.get("heartbeat")
+                if not is_heartbeat:
+                    saw_real_event = True
                 _apply_daemon_runtime_metadata(metadata)
                 if event.type == "chunk":
                     renderer.feed(event.content)
@@ -766,20 +905,39 @@ async def cmd_interactive_daemon(
                 elif event.type == "error":
                     renderer.feed(event.content)
                 elif event.type == "approval_request":
+                    await client_lease.touch(state="approval", session_id=active_session_id)
                     await _handle_daemon_approval(event)
+                    await client_lease.touch(state="streaming", session_id=active_session_id)
                 elif event.type == "status":
                     if not metadata.get("heartbeat"):
                         console.system(event.content)
+            turn_completed = True
+        except DaemonUnavailableError as exc:
+            if allow_retry and not saw_real_event:
+                retry_error = exc
+            else:
+                console.warning(
+                    "Lost connection to leapd after the turn started; "
+                    "the command was not replayed to avoid duplicate side effects."
+                )
+                raise
         finally:
             renderer.finish()
             if renderer.has_output:
                 exit_stats.record_assistant_message()
             exit_stats.record_tool_calls(renderer.tool_count)
-            turn_count += 1
+            if turn_completed:
+                turn_count += 1
             app.spinner_text = ""
             app.agent_running = False
             status.mark_turn_end()
+            await client_lease.touch(state="idle", session_id=active_session_id)
             _update_status()
+
+        if retry_error is not None:
+            await bridge.recover(f"chat stream failed before output: {retry_error}")
+            console.system("Retrying the interrupted request once after reconnecting to leapd.")
+            await _stream_response(prompt_text, allow_retry=False, record_user=False)
 
     async def handle_input(text: str) -> None:
         cmd_text = text.lstrip("/") if text.startswith("/") else text
@@ -799,16 +957,28 @@ async def cmd_interactive_daemon(
                 action = _host_action(cmd_text[len(canonical):].strip())
                 try:
                     if action == "status":
-                        result = await client.host_status()
+                        result = await bridge.call(
+                            lambda current_client: current_client.host_status(),
+                            description="host status",
+                        )
                     elif action == "start":
                         console.system("Starting CuaDriver OS control for this session…")
-                        result = await client.host_start()
+                        result = await bridge.call(
+                            lambda current_client: current_client.host_start(),
+                            description="host start",
+                        )
                     elif action == "stop":
                         console.system("Stopping CuaDriver OS control; chat and memory stay available…")
-                        result = await client.host_stop()
+                        result = await bridge.call(
+                            lambda current_client: current_client.host_stop(),
+                            description="host stop",
+                        )
                     elif action == "restart":
                         console.system("Restarting CuaDriver OS control…")
-                        result = await client.host_restart()
+                        result = await bridge.call(
+                            lambda current_client: current_client.host_restart(),
+                            description="host restart",
+                        )
                     else:
                         console.warning("Usage: /host [status|start|stop|restart]")
                         return
@@ -861,7 +1031,10 @@ async def cmd_interactive_daemon(
     )
 
     if resume_id:
-        result = await client.session_resume(resume_id)
+        result = await bridge.call(
+            lambda current_client: current_client.session_resume(resume_id),
+            description="session resume",
+        )
         if result.get("found"):
             active_session_id = str(result.get("session_id") or resume_id)
             console.success(f"Resumed session {active_session_id}")
@@ -870,7 +1043,10 @@ async def cmd_interactive_daemon(
             active_session_id = ""
 
     try:
-        _apply_daemon_runtime_metadata(await client.status())
+        _apply_daemon_runtime_metadata(await bridge.call(
+            lambda current_client: current_client.status(),
+            description="daemon status",
+        ))
     except Exception as exc:
         console.warning(f"Daemon status unavailable: {exc}")
 
@@ -878,10 +1054,12 @@ async def cmd_interactive_daemon(
     _update_status()
     exit_code = 0
     try:
+        await client_lease.start()
         exit_code = await app.run()
     finally:
+        await client_lease.stop()
         _print_exit_summary()
-        await _prompt_stop_daemon_on_exit(client, settings, console)
+        await _prompt_stop_daemon_on_exit(bridge.client, settings, console)
     return exit_code
 
 

@@ -66,10 +66,15 @@ async def _runtime_status(sock_path: Path) -> dict:
 
 
 def _print_runtime_status(status: dict) -> None:
+    connected_clients = status.get("connected_clients")
+    connection_suffix = (
+        f" connected={connected_clients}" if connected_clients is not None else ""
+    )
     print(
         "runtime: "
         f"profile={status.get('profile')} "
-        f"clients={status.get('active_clients')} "
+        f"clients={status.get('active_clients')}"
+        f"{connection_suffix} "
         f"volatile={status.get('volatile')}"
     )
     print(

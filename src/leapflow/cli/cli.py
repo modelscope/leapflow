@@ -157,6 +157,7 @@ async def _async_daemon_main(args: argparse.Namespace) -> int:
             client,
             settings,
             resume_id=getattr(args, "resume", None),
+            mock_host=mock_host,
         )
     if cmd == "chat":
         from leapflow.cli.commands.chat import cmd_chat_daemon
