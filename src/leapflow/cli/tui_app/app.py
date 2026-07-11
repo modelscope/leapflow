@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections import deque
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -37,6 +38,7 @@ from typing import (
 
 from prompt_toolkit import Application
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.formatted_text.utils import fragment_list_len
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
@@ -45,11 +47,12 @@ from prompt_toolkit.layout.containers import Float, FloatContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.layout.processors import Processor, Transformation
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.widgets import TextArea
 
-from leapflow.cli.tui_app.command import TuiCommand
+from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
 from leapflow.cli.tui_app.input import build_completer
 from leapflow.cli.tui_app.paste import (
     PASTE_FRAGMENT_WINDOW_S,
@@ -65,8 +68,92 @@ if TYPE_CHECKING:
 _HISTORY_FILENAME = "history"
 _REFRESH_INTERVAL_S = 0.5
 _PASTE_COMPACTOR_ATTR = "_leapflow_paste_compactor_installed"
+_PLACEHOLDER_CURSOR_SPACER = "    "
 
 InputHandler = Callable[[str], Union[Awaitable[None], None]]
+ControlHandler = Callable[[str], bool]
+
+
+def _format_inline_duration(seconds: float) -> str:
+    """Format short elapsed text for inline TUI guidance."""
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    return f"{minutes}m{seconds - minutes * 60:.0f}s"
+
+
+class _DynamicPlaceholderProcessor(Processor):
+    """Render the input prompt and contextual placeholder text."""
+
+    def __init__(
+        self,
+        provider: Callable[[], str],
+        prompt_provider: Callable[[], list[tuple[str, str]]],
+    ) -> None:
+        self._provider = provider
+        self._prompt_provider = prompt_provider
+
+    def apply_transformation(self, transformation_input: Any) -> Transformation:
+        document = getattr(transformation_input, "document", None)
+        is_first_line = getattr(transformation_input, "lineno", 0) == 0
+        has_text = bool(getattr(document, "text", "")) if document is not None else False
+        if not is_first_line:
+            return Transformation(transformation_input.fragments)
+        prompt_fragments = self._prompt_provider()
+        if has_text:
+            prefix = prompt_fragments
+            fragments = [*prefix, *transformation_input.fragments]
+        else:
+            placeholder = self._provider()
+            placeholder_fragments = [
+                ("class:placeholder", _PLACEHOLDER_CURSOR_SPACER),
+                ("class:placeholder", placeholder),
+            ] if placeholder else []
+            prefix = [*prompt_fragments, *placeholder_fragments]
+            fragments = [*prefix, *transformation_input.fragments]
+        shift_position = fragment_list_len(prefix)
+        return Transformation(
+            fragments,
+            source_to_display=lambda index: index + shift_position,
+            display_to_source=lambda index: index - shift_position,
+        )
+
+
+class _CommandQueue:
+    """Small observable async queue for TUI command scheduling."""
+
+    def __init__(self) -> None:
+        self._items: deque[TuiCommand] = deque()
+        self._ready = asyncio.Event()
+
+    def put_nowait(self, command: TuiCommand) -> None:
+        self._items.append(command)
+        self._ready.set()
+
+    async def get(self) -> TuiCommand:
+        while not self._items:
+            self._ready.clear()
+            await self._ready.wait()
+        command = self._items.popleft()
+        if not self._items:
+            self._ready.clear()
+        return command
+
+    def get_nowait(self) -> TuiCommand:
+        if not self._items:
+            raise asyncio.QueueEmpty
+        command = self._items.popleft()
+        if not self._items:
+            self._ready.clear()
+        return command
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+    def snapshot(self) -> list[TuiCommand]:
+        return list(self._items)
 
 
 class LeapApp:
@@ -89,11 +176,13 @@ class LeapApp:
         commands: Sequence[tuple[str, str]] = (),
         data_dir: Optional[Path] = None,
         on_input: Optional[InputHandler] = None,
+        on_control: Optional[ControlHandler] = None,
     ) -> None:
         self._console = console
         self._theme = theme
         self._status = status
         self._on_input = on_input
+        self._on_control = on_control
 
         self._should_exit = False
         self._agent_running = False
@@ -101,6 +190,11 @@ class LeapApp:
         self._spinner_text = ""
         self._tool_start_time: float = 0.0
         self._next_command_id = 1
+        self._queue_paused = False
+        self._active_dispatch_task: Optional[asyncio.Task[Any]] = None
+        self._active_terminal_status: Optional[TuiCommandStatus] = None
+        self._active_terminal_reason = ""
+        self._last_control_c_at = 0.0
         self._paste_heuristics = PasteHeuristics()
         self._paste_store = PasteStore(self._paste_heuristics)
         self._paste_blocks = self._paste_store.blocks
@@ -109,7 +203,7 @@ class LeapApp:
         self._paste_fragment_last_at = 0.0
         self._active_fragment_marker: Optional[str] = None
         self._active_command: Optional[TuiCommand] = None
-        self._pending_input: asyncio.Queue[TuiCommand] = asyncio.Queue()
+        self._pending_input = _CommandQueue()
 
         data_dir = data_dir or Path(
             os.environ.get("LEAPFLOW_DATA_DIR", "~/.leapflow")
@@ -155,14 +249,133 @@ class LeapApp:
         normalized = self._resolve_paste_blocks(text).strip()
         if not normalized:
             raise ValueError("Cannot submit an empty TUI command")
+        if self._dispatch_control_text(normalized):
+            return TuiCommand.create(command_id=0, text=normalized).mark_done()
         command = TuiCommand.create(command_id=self._next_command_id, text=normalized)
         self._next_command_id += 1
         self._pending_input.put_nowait(command)
         self._sync_task_counts()
-        if self._active_command is not None or self._pending_input.qsize() > 1:
+        if self._active_command is not None or self._pending_input.qsize() > 1 or self._queue_paused:
             self._console.command_card(command)
         self._invalidate()
         return command
+
+    @property
+    def queue_paused(self) -> bool:
+        """Return whether queued commands are currently held."""
+        return self._queue_paused
+
+    @property
+    def active_command(self) -> Optional[TuiCommand]:
+        """Return the currently running command, if any."""
+        return self._active_command
+
+    def queued_commands(self) -> list[TuiCommand]:
+        """Return a snapshot of pending commands in queue order."""
+        return self._pending_input.snapshot()
+
+    def pause_queue(self) -> bool:
+        """Pause starting future queued commands; current work continues."""
+        if self._queue_paused:
+            return False
+        self._queue_paused = True
+        self._sync_task_counts()
+        self._invalidate()
+        return True
+
+    def resume_queue(self) -> bool:
+        """Resume starting queued commands."""
+        if not self._queue_paused:
+            return False
+        self._queue_paused = False
+        self._sync_task_counts()
+        self._invalidate()
+        return True
+
+    def clear_queued_commands(self, reason: str = "cleared by user") -> list[TuiCommand]:
+        """Drop every pending command and render them as skipped."""
+        dropped: list[TuiCommand] = []
+        while True:
+            try:
+                command = self._pending_input.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            skipped = command.mark_skipped(reason)
+            dropped.append(skipped)
+            self._console.command_card(skipped)
+        self._sync_task_counts()
+        self._invalidate()
+        return dropped
+
+    def drop_queued_command(self, command_id: int, reason: str = "dropped by user") -> Optional[TuiCommand]:
+        """Drop one queued command by id while preserving queue order."""
+        kept: list[TuiCommand] = []
+        dropped: Optional[TuiCommand] = None
+        while True:
+            try:
+                command = self._pending_input.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if command.id == command_id and dropped is None:
+                dropped = command.mark_skipped(reason)
+                self._console.command_card(dropped)
+            else:
+                kept.append(command)
+        for command in kept:
+            self._pending_input.put_nowait(command)
+        self._sync_task_counts()
+        self._invalidate()
+        return dropped
+
+    def request_cancel_active(self, reason: str = "cancelled by user") -> Optional[TuiCommand]:
+        """Mark current work as cancelled and cancel its dispatch task."""
+        return self._request_finish_active(TuiCommandStatus.CANCELLED, reason)
+
+    def request_skip_active(self, reason: str = "skipped by user") -> Optional[TuiCommand]:
+        """Mark current work as skipped and cancel its dispatch task."""
+        return self._request_finish_active(TuiCommandStatus.SKIPPED, reason)
+
+    def _request_finish_active(self, status: TuiCommandStatus, reason: str) -> Optional[TuiCommand]:
+        if self._active_command is None:
+            return None
+        self._active_terminal_status = status
+        self._active_terminal_reason = reason
+        terminal = self._terminal_command(self._active_command, status, reason)
+        self._active_command = terminal
+        self._console.command_card(terminal)
+        task = self._active_dispatch_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._spinner_text = ""
+        self._tool_start_time = 0.0
+        self._sync_task_counts()
+        self._invalidate()
+        return terminal
+
+    def _terminal_command(
+        self,
+        command: TuiCommand,
+        status: TuiCommandStatus,
+        reason: str,
+    ) -> TuiCommand:
+        if status == TuiCommandStatus.CANCELLED:
+            return command.mark_cancelled(reason)
+        if status == TuiCommandStatus.SKIPPED:
+            return command.mark_skipped(reason)
+        return command.mark_failed(reason)
+
+    def _dispatch_control_text(self, text: str) -> bool:
+        handler = self._on_control
+        if handler is None:
+            return False
+        try:
+            handled = handler(text)
+        except Exception as exc:
+            self._console.error(f"Task control failed: {exc}")
+            return True
+        if handled:
+            self._invalidate()
+        return handled
 
     def _should_compact_paste(self, text: str) -> bool:
         """Return True when rendering pasted text directly would hurt TUI responsiveness."""
@@ -394,6 +607,9 @@ class LeapApp:
     async def _process_loop(self) -> None:
         """Drain pending_input and dispatch to on_input handler."""
         while not self._should_exit:
+            if self._queue_paused:
+                await asyncio.sleep(0.1)
+                continue
             try:
                 command = await asyncio.wait_for(
                     self._pending_input.get(), timeout=0.1
@@ -408,6 +624,8 @@ class LeapApp:
                 continue
 
             self._active_command = command.mark_running()
+            self._active_terminal_status = None
+            self._active_terminal_reason = ""
             self._agent_running = True
             self._sync_task_counts()
             self._console.command_card(self._active_command)
@@ -415,10 +633,23 @@ class LeapApp:
                 if self._on_input is not None:
                     result = self._on_input(command.text)
                     if asyncio.iscoroutine(result):
-                        await result
-                if self._active_command is not None:
+                        self._active_dispatch_task = asyncio.create_task(result)
+                        await self._active_dispatch_task
+                if self._active_command is not None and self._active_terminal_status is None:
                     finished = self._active_command.mark_done()
                     self._console.command_card(finished)
+            except asyncio.CancelledError:
+                if self._active_command is not None and self._active_terminal_status is not None:
+                    terminal = self._terminal_command(
+                        self._active_command,
+                        self._active_terminal_status,
+                        self._active_terminal_reason or self._active_terminal_status.value,
+                    )
+                    if terminal.status != self._active_command.status:
+                        self._console.command_card(terminal)
+                elif self._active_command is not None:
+                    cancelled = self._active_command.mark_cancelled("cancelled by user")
+                    self._console.command_card(cancelled)
             except Exception as exc:
                 if self._active_command is not None:
                     failed = self._active_command.mark_failed(f"{type(exc).__name__}: {exc}")
@@ -428,6 +659,9 @@ class LeapApp:
                 self._tool_start_time = 0.0
             finally:
                 self._active_command = None
+                self._active_dispatch_task = None
+                self._active_terminal_status = None
+                self._active_terminal_reason = ""
                 self._agent_running = False
                 self._sync_task_counts()
                 self._invalidate()
@@ -440,12 +674,9 @@ class LeapApp:
         completer = build_completer(commands)
         ref = self
 
-        def get_prompt():
-            return ref._prompt_fragments()
-
         area = TextArea(
             height=Dimension(min=1, max=4, preferred=1),
-            prompt=get_prompt,
+            prompt="",
             style="class:input-area",
             multiline=True,
             wrap_lines=True,
@@ -454,6 +685,10 @@ class LeapApp:
             completer=completer,
             complete_while_typing=True,
             auto_suggest=AutoSuggestFromHistory(),
+            input_processors=[_DynamicPlaceholderProcessor(
+                ref._placeholder_text,
+                ref._prompt_fragments,
+            )],
         )
         area.buffer.tempfile_suffix = ".md"
         self._install_paste_compactor(area.buffer)
@@ -579,9 +814,14 @@ class LeapApp:
                 ref._clear_paste_state()
                 return
             if ref._agent_running:
+                now = time.monotonic()
+                if now - ref._last_control_c_at <= 2.0 and ref._dispatch_control_text("/cancel"):
+                    ref._last_control_c_at = 0.0
+                    return
+                ref._last_control_c_at = now
                 ref._console.system(
-                    "Task is running. Keep typing to queue the next instruction; "
-                    "use /exit after it finishes to leave."
+                    "Task is running. Type /cancel to stop, /skip to continue the queue, "
+                    "or press Ctrl+C again to cancel."
                 )
                 return
             ref._should_exit = True
@@ -609,7 +849,7 @@ class LeapApp:
             "status-bar.bad": f"bg:{t.toolbar_bg} {t.error}",
             "hint": t.text_dim,
             "auto-suggest": t.auto_suggest,
-            "placeholder": t.input_placeholder,
+            "placeholder": f"{t.input_placeholder} nobold",
             "selection": f"bg:{t.input_selection_bg} {t.input_selection_fg}",
             "completion-menu": f"bg:{t.toolbar_bg} {t.input_text}",
             "completion-menu.completion": f"bg:{t.toolbar_bg} {t.input_text}",
@@ -621,6 +861,11 @@ class LeapApp:
     # ── Fragment providers ───────────────────────────────────────────
 
     def _prompt_fragments(self) -> list[tuple[str, str]]:
+        if self._queue_paused:
+            return [
+                ("class:prompt.paused", "⏸ "),
+                ("class:prompt", "❯ "),
+            ]
         if self._agent_running:
             return [("class:prompt.working", "⚕ ")]
         _mode_prompts = {
@@ -636,6 +881,21 @@ class LeapApp:
         }
         return _mode_prompts.get(self._prompt_mode, [("class:prompt", "❯ ")])
 
+    def _placeholder_text(self) -> str:
+        """Return contextual input guidance for an empty buffer."""
+        if self._queue_paused:
+            return "Queue paused · /resume continue · /drop <id> remove · /queue view"
+        if self._active_command is not None:
+            command = self._active_command
+            elapsed = _format_inline_duration(command.elapsed_s)
+            return (
+                f"Running {command.label} {elapsed} · type to queue next · "
+                "/cancel stop · /skip next · /queue view"
+            )
+        if self._pending_input.qsize() > 0:
+            return f"{self._pending_input.qsize()} queued · /pause hold · /queue view · /drop <id> remove"
+        return "Ask LeapFlow… /help commands · /status runtime · /queue tasks"
+
     def _spinner_fragments(self) -> list[tuple[str, str]]:
         if not self._spinner_text:
             return []
@@ -647,7 +907,10 @@ class LeapApp:
                 elapsed = f"  ({m:02d}m{s:02d}s)"
             else:
                 elapsed = f"  ({dt:.1f}s)"
-        return [("class:hint", f"  {self._spinner_text}{elapsed}")]
+        text = f"  {self._spinner_text}{elapsed}"
+        if self._active_command is not None and self._active_command.elapsed_s >= 30:
+            text += " · /cancel stop · /skip next · /queue view"
+        return [("class:hint", text)]
 
     def _spinner_height(self) -> int:
         return 1 if self._spinner_text else 0

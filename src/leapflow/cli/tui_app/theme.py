@@ -16,6 +16,7 @@ from typing import Mapping
 _HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 _INPUT_TEXT_MIN_CONTRAST = 7.0
 _SECONDARY_TEXT_MIN_CONTRAST = 4.5
+_PLACEHOLDER_MIN_CONTRAST = 3.0
 _PROMPT_MIN_CONTRAST = 5.0
 
 _DARK_TERMINAL_BG = "#0B1F24"
@@ -166,7 +167,7 @@ _DARK = Theme(
     prompt_char="bold #E6DDC4",
     input_text="#F8FAFC",
     input_bg=_DARK_TERMINAL_BG,
-    input_placeholder="#94A3B8",
+    input_placeholder="#64748B",
     input_border="#8FA09B",
     input_focus_border="#E6DDC4",
     input_selection_bg="#334155",
@@ -387,7 +388,7 @@ def resolve_theme(
     input_placeholder = ensure_contrast(
         base.input_placeholder,
         background,
-        min_ratio=_SECONDARY_TEXT_MIN_CONTRAST,
+        min_ratio=_PLACEHOLDER_MIN_CONTRAST,
         candidates=_PLACEHOLDER_CANDIDATES,
     )
     auto_suggest = ensure_contrast(

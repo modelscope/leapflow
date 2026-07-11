@@ -138,12 +138,16 @@ class LeapConsole:
             TuiCommandStatus.RUNNING: "leap.accent",
             TuiCommandStatus.DONE: "leap.success",
             TuiCommandStatus.FAILED: "leap.error",
+            TuiCommandStatus.CANCELLED: "leap.warning",
+            TuiCommandStatus.SKIPPED: "leap.warning",
         }
         title_styles = {
             TuiCommandStatus.QUEUED: "leap.muted",
             TuiCommandStatus.RUNNING: "leap.accent",
             TuiCommandStatus.DONE: "leap.success",
             TuiCommandStatus.FAILED: "leap.error",
+            TuiCommandStatus.CANCELLED: "leap.warning",
+            TuiCommandStatus.SKIPPED: "leap.warning",
         }
         summary_limit = max(_COMMAND_CARD_MIN_SUMMARY, self.width - _COMMAND_CARD_PADDING)
         body = Text(command.summary(limit=summary_limit), style="leap.muted")

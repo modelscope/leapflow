@@ -80,18 +80,26 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     ),
     CommandDef("exit", "Quit LeapFlow", "Session", aliases=("quit", "q", "退出"), supports_daemon=True),
 
+    # Task Control
+    CommandDef("cancel", "Cancel the currently running task", "Task Control", aliases=("abort",), supports_daemon=True, effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("skip", "Skip the current running task and continue the queue", "Task Control", supports_daemon=True, effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("pause", "Pause starting queued tasks", "Task Control", supports_daemon=True, effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("resume", "Resume queued task execution", "Task Control", supports_daemon=True, effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("queue", "Show or clear queued tasks", "Task Control", args_hint="[clear]", supports_daemon=True, effect=CommandEffect.READ_ONLY),
+    CommandDef("drop", "Remove a queued task by id", "Task Control", args_hint="<id>", supports_daemon=True, effect=CommandEffect.SESSION),
+
     # Chat
     CommandDef("model", "Show or switch active model", "Chat", args_hint="[model_name]", supports_daemon=True, requires_llm=True),
     CommandDef("usage", "Show token usage for current session", "Chat", supports_daemon=True, requires_llm=True),
 
     # Teaching
     CommandDef("teach start", "Start teaching mode", "Teaching", aliases=("teach",), args_hint="[goal]"),
-    CommandDef("teach stop", "Stop and distill skill", "Teaching", aliases=("stop", "done")),
+    CommandDef("teach stop", "Stop and distill skill", "Teaching"),
     CommandDef("teach pause", "Pause recording", "Teaching"),
     CommandDef("teach resume", "Resume recording", "Teaching"),
     CommandDef("teach discard", "Discard current recording", "Teaching"),
+    CommandDef("teach skip", "Mark last n steps as noise", "Teaching", args_hint="[n]"),
     CommandDef("annotate", "Add annotation during teaching", "Teaching", args_hint="<text>"),
-    CommandDef("skip", "Mark last n steps as noise", "Teaching", args_hint="[n]"),
 
     # Skills & Tools
     CommandDef("skills", "List all skills", "Skills & Tools", aliases=("skills list",)),

@@ -45,7 +45,7 @@ def _style_for(theme):
         "status-bar.bad": f"bg:{theme.toolbar_bg} {theme.error}",
         "hint": theme.text_dim,
         "auto-suggest": theme.auto_suggest,
-        "placeholder": theme.input_placeholder,
+        "placeholder": f"{theme.input_placeholder} nobold",
         "selection": f"bg:{theme.input_selection_bg} {theme.input_selection_fg}",
     })
 
@@ -62,6 +62,15 @@ def test_dark_background_resolves_readable_input_text() -> None:
     assert theme.input_text in {"#FFFFFF", "#F8FAFC", "#E5E7EB", "#D1D5DB"}
     assert contrast_ratio(theme.input_text, theme.input_bg) >= 7.0
     assert contrast_ratio(theme.auto_suggest, theme.input_bg) >= 4.5
+    assert contrast_ratio(theme.input_placeholder, theme.input_bg) >= 3.0
+
+
+def test_placeholder_is_visually_subordinate_on_dark_theme() -> None:
+    theme = resolve_theme(_DARK, terminal_bg="#0B1F24")
+
+    assert theme.input_placeholder == "#64748B"
+    assert contrast_ratio(theme.input_placeholder, theme.input_bg) >= 3.0
+    assert contrast_ratio(theme.input_placeholder, theme.input_bg) < contrast_ratio(theme.input_text, theme.input_bg)
 
 
 def test_light_background_resolves_readable_input_text() -> None:
@@ -69,7 +78,7 @@ def test_light_background_resolves_readable_input_text() -> None:
 
     assert theme.input_text in {"#111827", "#1A1A1A", "#000000", "#374151"}
     assert contrast_ratio(theme.input_text, theme.input_bg) >= 7.0
-    assert contrast_ratio(theme.input_placeholder, theme.input_bg) >= 4.5
+    assert contrast_ratio(theme.input_placeholder, theme.input_bg) >= 3.0
     assert contrast_ratio(theme.border, theme.input_bg) >= 4.5
     assert contrast_ratio(theme.input_border, theme.input_bg) >= 4.5
     assert contrast_ratio(theme.input_focus_border, theme.input_bg) >= 5.0

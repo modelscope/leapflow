@@ -87,6 +87,11 @@ class DaemonClient:
         finally:
             await _close_writer(writer)
 
+    async def engine_cancel(self) -> bool:
+        """Request cancellation of the daemon-owned active engine turn."""
+        result = await self.request("engine.cancel")
+        return bool(result)
+
     async def session_resume(self, session_id: str) -> dict[str, Any]:
         """Ask the daemon to load an existing conversation session."""
         result = await self.request("session.resume", {"session_id": session_id})

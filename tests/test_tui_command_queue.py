@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +11,7 @@ from prompt_toolkit.auto_suggest import Suggestion
 from prompt_toolkit.completion import Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import to_plain_text
-from leapflow.cli.tui_app.app import LeapApp
+from leapflow.cli.tui_app.app import LeapApp, _DynamicPlaceholderProcessor
 from leapflow.cli.tui_app.console import LeapConsole
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
 from leapflow.cli.tui_app.input import SlashCommandCompleter
@@ -23,6 +24,7 @@ class _FakeConsole:
         self.cards: list[TuiCommand] = []
         self.errors: list[str] = []
         self.systems: list[str] = []
+        self.warnings: list[str] = []
 
     def command_card(self, command: TuiCommand) -> None:
         self.cards.append(command)
@@ -32,6 +34,9 @@ class _FakeConsole:
 
     def system(self, message: str) -> None:
         self.systems.append(message)
+
+    def warning(self, message: str) -> None:
+        self.warnings.append(message)
 
 
 class _FakeStatus:
@@ -58,6 +63,7 @@ def _make_app(
     on_input=None,
     *,
     commands: tuple[tuple[str, str], ...] = (),
+    on_control=None,
 ) -> tuple[LeapApp, _FakeConsole, _FakeStatus]:
     console = _FakeConsole()
     status = _FakeStatus()
@@ -67,6 +73,7 @@ def _make_app(
         status=status,
         commands=commands,
         on_input=on_input,
+        on_control=on_control,
     )
     return app, console, status
 
@@ -552,6 +559,229 @@ def test_failed_command_error_is_single_line_and_truncated() -> None:
     assert "\n" not in failed.error
     assert len(failed.error) == 240
     assert failed.error.endswith("…")
+
+
+def test_cancelled_and_skipped_commands_are_terminal() -> None:
+    command = TuiCommand.create(command_id=1, text="long task").mark_running()
+
+    cancelled = command.mark_cancelled("user pressed cancel")
+    skipped = command.mark_skipped("user skipped")
+
+    assert cancelled.status is TuiCommandStatus.CANCELLED
+    assert cancelled.error == "user pressed cancel"
+    assert cancelled.finished_at > 0
+    assert skipped.status is TuiCommandStatus.SKIPPED
+    assert skipped.error == "user skipped"
+    assert skipped.finished_at > 0
+
+
+def test_placeholder_processor_indents_hint_after_prompt_space() -> None:
+    processor = _DynamicPlaceholderProcessor(
+        lambda: "Queue paused · /resume continue",
+        lambda: [("class:prompt", "❯ ")],
+    )
+    empty_input = SimpleNamespace(
+        document=SimpleNamespace(text=""),
+        lineno=0,
+        fragments=[],
+    )
+
+    transformed = processor.apply_transformation(empty_input)
+
+    assert transformed.fragments == [
+        ("class:prompt", "❯ "),
+        ("class:placeholder", "    "),
+        ("class:placeholder", "Queue paused · /resume continue"),
+    ]
+    assert sum(text.count("❯") for _style, text in transformed.fragments) == 1
+
+
+def test_prompt_prefix_is_preserved_with_placeholder_hint() -> None:
+    app, _console, _status = _make_app()
+    processor = _DynamicPlaceholderProcessor(
+        app._placeholder_text,
+        app._prompt_fragments,
+    )
+    empty_input = SimpleNamespace(
+        document=SimpleNamespace(text=""),
+        lineno=0,
+        fragments=[],
+    )
+
+    transformed = processor.apply_transformation(empty_input)
+
+    assert transformed.fragments == [
+        ("class:prompt", "❯ "),
+        ("class:placeholder", "    "),
+        ("class:placeholder", app._placeholder_text()),
+    ]
+    assert sum(text.count("❯") for _style, text in transformed.fragments) == 1
+
+
+def test_placeholder_processor_hides_hint_after_user_input() -> None:
+    processor = _DynamicPlaceholderProcessor(
+        lambda: "Ask LeapFlow…",
+        lambda: [("class:prompt", "❯ ")],
+    )
+    typed_input = SimpleNamespace(
+        document=SimpleNamespace(text="hello"),
+        lineno=0,
+        fragments=[("", "hello")],
+    )
+
+    transformed = processor.apply_transformation(typed_input)
+
+    assert transformed.fragments == [("class:prompt", "❯ "), ("", "hello")]
+
+
+def test_control_commands_are_handled_without_queueing() -> None:
+    handled: list[str] = []
+
+    def on_control(text: str) -> bool:
+        handled.append(text)
+        return text == "/cancel"
+
+    app, _console, status = _make_app(on_control=on_control)
+
+    command = app.submit_text("/cancel")
+
+    assert command.id == 0
+    assert command.status is TuiCommandStatus.DONE
+    assert handled == ["/cancel"]
+    assert app._pending_input.qsize() == 0
+    assert status.counts == []
+
+
+@pytest.mark.asyncio
+async def test_pause_queue_holds_and_resume_runs_pending_command() -> None:
+    processed: list[str] = []
+
+    async def on_input(text: str) -> None:
+        processed.append(text)
+
+    app, console, status = _make_app(on_input=on_input)
+    app.pause_queue()
+    app.submit_text("held command")
+    worker = asyncio.create_task(app._process_loop())
+    try:
+        await asyncio.sleep(0.05)
+        assert processed == []
+        assert app._pending_input.qsize() == 1
+        assert app.queue_paused is True
+
+        app.resume_queue()
+        await _wait_for(lambda: processed == ["held command"])
+    finally:
+        app._should_exit = True
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+
+    assert [card.status for card in console.cards] == [
+        TuiCommandStatus.QUEUED,
+        TuiCommandStatus.RUNNING,
+        TuiCommandStatus.DONE,
+    ]
+    assert status.counts[-1] == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_cancel_active_command_continues_queued_work() -> None:
+    started = asyncio.Event()
+    processed: list[str] = []
+
+    async def on_input(text: str) -> None:
+        processed.append(text)
+        if text == "first command":
+            started.set()
+            await asyncio.sleep(10)
+
+    app, console, status = _make_app(on_input=on_input)
+    app.submit_text("first command")
+    app.submit_text("second command")
+    worker = asyncio.create_task(app._process_loop())
+    try:
+        await _wait_for(lambda: started.is_set())
+        cancelled = app.request_cancel_active("cancelled in test")
+        assert cancelled is not None
+        await _wait_for(lambda: processed == ["first command", "second command"])
+    finally:
+        app._should_exit = True
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+
+    rendered = [(card.id, card.status) for card in console.cards]
+    assert rendered == [
+        (2, TuiCommandStatus.QUEUED),
+        (1, TuiCommandStatus.RUNNING),
+        (1, TuiCommandStatus.CANCELLED),
+        (2, TuiCommandStatus.RUNNING),
+        (2, TuiCommandStatus.DONE),
+    ]
+    assert console.cards[2].error == "cancelled in test"
+    assert status.counts[-1] == (0, 0)
+
+
+def test_queue_drop_and_clear_render_skipped_commands() -> None:
+    app, console, status = _make_app()
+    app.submit_text("first")
+    app.submit_text("second")
+    app.submit_text("third")
+
+    dropped = app.drop_queued_command(2, "not needed")
+    cleared = app.clear_queued_commands("clear rest")
+
+    assert dropped is not None
+    assert dropped.id == 2
+    assert [command.id for command in cleared] == [1, 3]
+    assert app._pending_input.qsize() == 0
+    assert [card.status for card in console.cards] == [
+        TuiCommandStatus.QUEUED,
+        TuiCommandStatus.QUEUED,
+        TuiCommandStatus.SKIPPED,
+        TuiCommandStatus.SKIPPED,
+        TuiCommandStatus.SKIPPED,
+    ]
+    assert status.counts[-1] == (0, 0)
+
+
+def test_task_control_commands_are_registered_for_completion() -> None:
+    from leapflow.cli.commands.registry import completion_entries, resolve_command
+
+    entries = dict(completion_entries())
+
+    assert resolve_command("cancel") is not None
+    assert resolve_command("skip") is not None
+    assert resolve_command("teach skip") is not None
+    assert resolve_command("stop") is None
+    assert entries["cancel"] == "Cancel the currently running task"
+    assert entries["queue"] == "Show or clear queued tasks"
+
+
+@pytest.mark.asyncio
+async def test_teach_skip_command_marks_noise_steps() -> None:
+    from leapflow.cli.commands.interactive import _handle_teach
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.skipped = 0
+
+        def mark_skip(self, count: int) -> int:
+            self.skipped = count
+            return count
+
+    session = FakeSession()
+    ctx = SimpleNamespace(session=session)
+    console = _FakeConsole()
+
+    handled = await _handle_teach(ctx, console, "teach skip 3", learning=False)
+    legacy_handled = await _handle_teach(ctx, console, "skip 2", learning=True)
+
+    assert handled is True
+    assert legacy_handled is False
+    assert session.skipped == 3
+    assert console.systems == ["Marked 3 step(s) as noise."]
 
 
 class _FakeBuffer:

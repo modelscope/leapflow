@@ -32,6 +32,8 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 
 - **System Boundary Awareness**: LeapFlow is a multi-entry, multi-module runtime. Changes must account for the affected path across CLI/TUI, leapd, engine, skills/tools, LLM, storage, memory, gateway, hub, and platform adapters.
 - **TUI as the Primary User Entry**: The interactive TUI is the default product surface. Preserve streaming feedback, command queue behavior, approval prompts, status bar accuracy, long-input robustness, history, and session continuity.
+- **TUI Command Clarity**: Global task-control commands stay short and unambiguous (`/cancel`, `/skip`, `/pause`, `/resume`, `/queue`, `/drop`); teach-mode controls must use the `/teach ...` namespace and should not keep bare compatibility aliases during early iteration.
+- **TUI Prompt Ownership**: Input prompt and placeholder rendering must have a single owner. Avoid duplicate prompt sources; placeholder text stays visually subordinate, offset after the prompt, and disappears as soon as the user types.
 - **leapd Runtime Consistency**: Daemon-backed behavior must preserve lifecycle correctness: start, stop, restart, status, RPC streaming, cancellation, pending approvals, runtime config reload, multi-client state, and version consistency.
 - **Progressive Context Disclosure (PCD)**: Keep one unified execution loop, but never default every turn to full disclosure. Each LLM call must use the smallest sufficient PromptAssemblyPlan for tools, memory, history, reasoning, streaming, and risk; upgrade progressively only when observable signals require it.
 - **Dependency Inversion**: Core logic depends on Protocol abstractions, never on concrete implementations

@@ -17,6 +17,7 @@ from leapflow.daemon.server import UnixRpcServer
 class _FakeService:
     def __init__(self) -> None:
         self._client_count = lambda: 0
+        self.cancelled = False
 
     def set_client_count_provider(self, provider) -> None:
         self._client_count = provider
@@ -32,6 +33,10 @@ class _FakeService:
 
     async def status(self) -> dict[str, Any]:
         return {"pid": 123, "active_clients": self._client_count(), "profile": "test"}
+
+    async def engine_cancel(self) -> bool:
+        self.cancelled = True
+        return True
 
 
 class _FailingStreamService(_FakeService):
@@ -84,6 +89,27 @@ async def test_daemon_client_receives_stream_events() -> None:
         ("final", "done"),
     ]
     assert events[0].metadata == {"session_id": "sess-1"}
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_can_cancel_engine_turn() -> None:
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        service = _FakeService()
+        server, task, run_dir = await _start_server(Path(root) / "run", service=service)
+        client = DaemonClient(run_dir / "leapd.sock")
+
+        try:
+            cancelled = await client.engine_cancel()
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert cancelled is True
+    assert service.cancelled is True
 
 
 @pytest.mark.asyncio

@@ -135,6 +135,15 @@ def _host_action(args: str) -> str:
     return action
 
 
+def _format_queue_elapsed(seconds: float) -> str:
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    return f"{minutes}m{seconds - minutes * 60:.0f}s"
+
+
 class _DaemonRuntimeBridge:
     """Reconnectable bridge for daemon-backed TUI runtime calls."""
 
@@ -554,7 +563,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 handle_model(ctx, console, cmd_args)
                 return
 
-            if canonical.startswith("teach") or canonical in ("annotate", "skip"):
+            if canonical.startswith("teach") or canonical == "annotate":
                 if await _handle_teach(ctx, console, cmd_text, _learning):
                     await _after_dispatch(text)
                     return
@@ -657,6 +666,76 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         else:
             _last_hint = None
 
+    def _render_queue_state() -> None:
+        active = app.active_command
+        queued = app.queued_commands()
+        if active is None and not queued:
+            console.system("Queue is empty.")
+            return
+        if active is not None:
+            console.system(f"{active.label} {active.status.value} {_format_queue_elapsed(active.elapsed_s)}  {active.summary()}")
+        for command in queued:
+            console.system(f"{command.label} {command.status.value}  {command.summary()}")
+        if app.queue_paused:
+            console.system("Queue is paused — use /resume to continue.")
+
+    def _handle_task_control(text: str) -> bool:
+        invocation = command_router.parse(text)
+        if invocation is None:
+            return False
+        canonical = invocation.command.name
+        args = invocation.args.strip()
+        if canonical not in {"cancel", "skip", "pause", "resume", "queue", "drop"}:
+            return False
+        if canonical == "cancel":
+            cancelled = app.request_cancel_active("cancelled by user")
+            if cancelled is None:
+                console.system("No running task to cancel.")
+            else:
+                engine = getattr(ctx, "engine", None)
+                if engine is not None and hasattr(engine, "cancel"):
+                    engine.cancel()
+                console.warning(f"Cancelled {cancelled.label}. Continuing queued work.")
+            return True
+        if canonical == "skip":
+            skipped = app.request_skip_active("skipped by user")
+            if skipped is None:
+                console.system("No running task to skip.")
+            else:
+                engine = getattr(ctx, "engine", None)
+                if engine is not None and hasattr(engine, "cancel"):
+                    engine.cancel()
+                console.warning(f"Skipped {skipped.label}. Continuing queued work.")
+            return True
+        if canonical == "pause":
+            changed = app.pause_queue()
+            console.system("Queue paused. Current running task continues; new queued tasks will wait." if changed else "Queue is already paused.")
+            return True
+        if canonical == "resume":
+            changed = app.resume_queue()
+            console.system("Queue resumed." if changed else "Queue is not paused.")
+            return True
+        if canonical == "queue":
+            if args.lower() == "clear":
+                dropped = app.clear_queued_commands("cleared by user")
+                console.system(f"Cleared {len(dropped)} queued task(s).")
+            else:
+                _render_queue_state()
+            return True
+        if canonical == "drop":
+            try:
+                command_id = int(args)
+            except ValueError:
+                console.warning("Usage: /drop <queued_task_id>")
+                return True
+            dropped = app.drop_queued_command(command_id, "dropped by user")
+            if dropped is None:
+                console.warning(f"No queued task #{command_id}.")
+            else:
+                console.system(f"Dropped {dropped.label}.")
+            return True
+        return False
+
     # ── Create and run the Application ───────────────────────────────
 
     app = LeapApp(
@@ -670,6 +749,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
             else None
         ),
         on_input=handle_input,
+        on_control=_handle_task_control,
     )
 
     # Auto-connect previously configured gateway platforms
@@ -1089,6 +1169,83 @@ async def cmd_interactive_daemon(
         ):
             console.print(line)
 
+    def _render_queue_state() -> None:
+        active = app.active_command
+        queued = app.queued_commands()
+        if active is None and not queued:
+            console.system("Queue is empty.")
+            return
+        if active is not None:
+            console.system(f"{active.label} {active.status.value} {_format_queue_elapsed(active.elapsed_s)}  {active.summary()}")
+        for command in queued:
+            console.system(f"{command.label} {command.status.value}  {command.summary()}")
+        if app.queue_paused:
+            console.system("Queue is paused — use /resume to continue.")
+
+    def _request_daemon_cancel() -> None:
+        async def cancel_remote() -> None:
+            try:
+                await bridge.call(
+                    lambda current_client: current_client.engine_cancel(),
+                    description="engine cancel",
+                )
+            except Exception as exc:
+                console.warning(f"Daemon cancel failed: {exc}")
+        asyncio.create_task(cancel_remote())
+
+    def _handle_task_control(text: str) -> bool:
+        invocation = command_router.parse(text)
+        if invocation is None:
+            return False
+        canonical = invocation.command.name
+        args = invocation.args.strip()
+        if canonical not in {"cancel", "skip", "pause", "resume", "queue", "drop"}:
+            return False
+        if canonical == "cancel":
+            cancelled = app.request_cancel_active("cancelled by user")
+            if cancelled is None:
+                console.system("No running task to cancel.")
+            else:
+                _request_daemon_cancel()
+                console.warning(f"Cancelled {cancelled.label}. Continuing queued work.")
+            return True
+        if canonical == "skip":
+            skipped = app.request_skip_active("skipped by user")
+            if skipped is None:
+                console.system("No running task to skip.")
+            else:
+                _request_daemon_cancel()
+                console.warning(f"Skipped {skipped.label}. Continuing queued work.")
+            return True
+        if canonical == "pause":
+            changed = app.pause_queue()
+            console.system("Queue paused. Current running task continues; new queued tasks will wait." if changed else "Queue is already paused.")
+            return True
+        if canonical == "resume":
+            changed = app.resume_queue()
+            console.system("Queue resumed." if changed else "Queue is not paused.")
+            return True
+        if canonical == "queue":
+            if args.lower() == "clear":
+                dropped = app.clear_queued_commands("cleared by user")
+                console.system(f"Cleared {len(dropped)} queued task(s).")
+            else:
+                _render_queue_state()
+            return True
+        if canonical == "drop":
+            try:
+                command_id = int(args)
+            except ValueError:
+                console.warning("Usage: /drop <queued_task_id>")
+                return True
+            dropped = app.drop_queued_command(command_id, "dropped by user")
+            if dropped is None:
+                console.warning(f"No queued task #{command_id}.")
+            else:
+                console.system(f"Dropped {dropped.label}.")
+            return True
+        return False
+
     app = LeapApp(
         console=console,
         theme=theme,
@@ -1096,6 +1253,7 @@ async def cmd_interactive_daemon(
         commands=completion_entries(),
         data_dir=getattr(settings, "data_dir", None),
         on_input=handle_input,
+        on_control=_handle_task_control,
     )
 
     if resume_id:
@@ -1146,7 +1304,7 @@ async def _handle_teach(
         or line == "teach"
     ):
         if ctx.session and ctx.session.mode == SessionMode.LEARNING:
-            console.warning("Already in teaching mode. Say 'teach stop' to end.")
+            console.warning("Already in teaching mode. Say '/teach stop' to end.")
             return True
         goal = ""
         if line.startswith("teach start "):
@@ -1159,13 +1317,14 @@ async def _handle_teach(
             if goal:
                 console.system(f"Goal: {goal}")
             console.system(
-                "Commands: stop │ discard │ pause │ resume │ annotate <text> │ skip [n]"
+                "Commands: /teach stop │ /teach discard │ /teach pause │ "
+                "/teach resume │ /teach skip [n] │ /annotate <text>"
             )
         except Exception as e:
             console.error(str(e))
         return True
 
-    if line in ("teach stop", "stop", "done", "教学结束", "结束"):
+    if line == "teach stop":
         if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
             if learning:
                 ctx.imitation.end_control_input()
@@ -1229,14 +1388,7 @@ async def _handle_teach(
             console.error(str(e))
         return True
 
-    if line in (
-        "teach quit",
-        "teach discard",
-        "quit",
-        "discard",
-        "退出教学",
-        "放弃",
-    ):
+    if line in ("teach quit", "teach discard"):
         if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
             console.warning("Not in teaching mode.")
             return True
@@ -1247,7 +1399,7 @@ async def _handle_teach(
             console.error(str(e))
         return True
 
-    if line in ("teach save", "save", "保存"):
+    if line == "teach save":
         if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
             console.warning("Not in teaching mode.")
             return True
@@ -1257,32 +1409,32 @@ async def _handle_teach(
             console.success("Session saved for later resume.")
             if learning_session:
                 console.system(
-                    f"  Resume with: teach resume {learning_session.session_id}"
+                    f"  Resume with: /teach resume {learning_session.session_id}"
                 )
         except Exception as e:
             console.error(str(e))
         return True
 
-    if line in ("teach pause", "pause", "暂停"):
+    if line == "teach pause":
         if ctx.session:
             ctx.session.pause_learning()
             console.system("Recording paused.")
         return True
 
-    if line in ("teach resume", "resume", "继续"):
+    if line == "teach resume":
         from leapflow.engine.session import SessionMode as SM
 
         if ctx.session and ctx.session.mode == SM.LEARNING:
             ctx.session.resume_learning()
             console.system("Recording resumed.")
         else:
-            console.warning("Not in teaching mode. Use 'teach resume <id>'.")
+            console.warning("Not in teaching mode. Use '/teach resume <id>'.")
         return True
 
     if line.startswith("teach resume "):
         resume_id = line[len("teach resume "):].strip()
         if not resume_id:
-            console.warning("Usage: teach resume <session_id>")
+            console.warning("Usage: /teach resume <session_id>")
             return True
         if ctx.session and ctx.session.mode == SessionMode.LEARNING:
             console.warning("Already in teaching mode. Stop first.")
@@ -1308,9 +1460,9 @@ async def _handle_teach(
             console.system("Annotation added.")
         return True
 
-    if line.startswith("skip") or line.startswith("跳过"):
+    if line.startswith("teach skip"):
         parts = line.split()
-        n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+        n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
         if ctx.session:
             count = ctx.session.mark_skip(n)
             console.system(f"Marked {count} step(s) as noise.")
