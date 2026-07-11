@@ -144,6 +144,9 @@ def test_unified_system_template_escapes_literal_tool_protocol_json() -> None:
 
     assert '{"name": "tool_name", "arguments": {"key": "value"}}' in rendered
     assert '{"name": ..., "arguments": ...}' in rendered
+    assert "Avoid redundant tool calls" in rendered
+    assert "same tool with the same arguments" in rendered
+    assert "existing tool result already answers" in rendered
 
 
 def test_json_extraction_variants() -> None:

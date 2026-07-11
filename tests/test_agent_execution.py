@@ -288,6 +288,9 @@ async def test_progressive_disclosure_light_query_omits_tools_and_thinking() -> 
             assert "file_read" not in str(llm.messages[0].get("content", ""))
             system_prompt = str(llm.messages[0].get("content", ""))
             assert "## Presentation Style" in system_prompt
+            assert "Avoid redundant tool calls" in system_prompt
+            assert "same tool with the same arguments" in system_prompt
+            assert "existing tool result already answers" in system_prompt
             assert "No leaked tool protocol" in system_prompt
             assert "Theme-safe colors" in system_prompt
             assert "## Task Contract" in system_prompt
