@@ -2,15 +2,13 @@
 
 ``leap daemon status``  — show whether leapd is running
 ``leap daemon start``   — start leapd for the active profile
-``leap daemon stop``    — send SIGTERM to a running leapd
+``leap daemon stop``    — stop running daemon and verify shutdown
 ``leap daemon restart`` — restart leapd so code/config changes take effect
 """
 from __future__ import annotations
 
 import asyncio
-import signal
 import sys
-import time
 from argparse import Namespace
 from pathlib import Path
 
@@ -29,9 +27,9 @@ def cmd_daemon(args: Namespace) -> int:
     if action == "start":
         return _start(settings, getattr(args, "mock_host", False))
     if action == "stop":
-        return _stop(run_dir)
+        return _stop(run_dir, force=getattr(args, "force", False))
     if action == "restart":
-        return _restart(settings, getattr(args, "mock_host", False))
+        return _restart(settings, getattr(args, "mock_host", False), force=getattr(args, "force", False))
     if action == "serve":
         if not getattr(args, "internal", False):
             sys.stderr.write("'leap daemon serve' is an internal command. Use 'leap daemon start'.\n")
@@ -138,8 +136,8 @@ def _start(settings: object, mock_host: bool) -> int:
     return asyncio.run(_run())
 
 
-def _stop(run_dir: Path) -> int:
-    from leapflow.daemon.lifecycle import DaemonInfo, send_signal, cleanup_stale
+def _stop(run_dir: Path, *, force: bool = False, timeout_s: float = 10.0) -> int:
+    from leapflow.daemon.lifecycle import DaemonInfo, cleanup_stale, stop_daemon
 
     info = DaemonInfo.discover(run_dir)
     if not info.is_running:
@@ -150,35 +148,50 @@ def _stop(run_dir: Path) -> int:
             print("leapd is not running.")
         return 0
 
-    if send_signal(run_dir, signal.SIGTERM):
-        print(f"Sent SIGTERM to leapd (pid={info.pid}).")
+    graceful_requested = False
+    if info.is_healthy and info.sock_path is not None:
+        graceful_requested = _request_shutdown(info.sock_path)
+    print(f"Stopping leapd (pid={info.pid})...")
+    result = stop_daemon(
+        run_dir,
+        timeout_s=timeout_s,
+        force=force,
+        grace_timeout_s=2.0 if graceful_requested else 0.0,
+    )
+    if result.stopped:
+        suffix = " with force" if result.forced else ""
+        print(f"leapd stopped{suffix}.")
         return 0
 
-    sys.stderr.write("Failed to stop leapd.\n")
+    sys.stderr.write(
+        f"Timed out waiting for leapd to stop (pid={result.pid}). "
+        "Run 'leap daemon stop --force' or inspect the process manually.\n"
+    )
     return 1
 
 
-def _restart(settings: object, mock_host: bool) -> int:
+def _request_shutdown(sock_path: Path) -> bool:
+    from leapflow.daemon.client import DaemonClient, DaemonUnavailableError
+
+    async def _run() -> bool:
+        try:
+            await DaemonClient(sock_path, timeout_s=2.0).shutdown()
+            return True
+        except DaemonUnavailableError:
+            return False
+
+    return asyncio.run(_run())
+
+
+def _restart(settings: object, mock_host: bool, *, force: bool = False) -> int:
     run_dir = settings.profile_dir / "run"
     print("Restarting leapd...")
-    stop_code = _stop(run_dir)
+    stop_code = _stop(run_dir, force=force, timeout_s=10.0)
     if stop_code != 0:
+        sys.stderr.write("Restart aborted because old leapd did not stop cleanly.\n")
         return stop_code
-    if not _wait_stopped(run_dir):
-        sys.stderr.write("Timed out waiting for leapd to stop.\n")
-        return 1
     return _start(settings, mock_host)
 
-
-def _wait_stopped(run_dir: Path, *, timeout_s: float = 10.0) -> bool:
-    from leapflow.daemon.lifecycle import DaemonInfo
-
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if not DaemonInfo.discover(run_dir).is_running:
-            return True
-        time.sleep(0.1)
-    return not DaemonInfo.discover(run_dir).is_running
 
 
 async def _serve(settings: object, mock_host: bool) -> int:

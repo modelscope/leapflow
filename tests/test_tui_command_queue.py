@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import leapflow.cli.tui_app.app as app_module
+from leapflow.security.approval import ApprovalDecision, ApprovalRequest
 from prompt_toolkit.auto_suggest import Suggestion
 from prompt_toolkit.completion import Completion
 from prompt_toolkit.document import Document
@@ -76,6 +77,81 @@ def _make_app(
         on_control=on_control,
     )
     return app, console, status
+
+
+@pytest.mark.asyncio
+async def test_tui_approval_modal_is_keyboard_selectable() -> None:
+    app, _console, _status = _make_app()
+    request = ApprovalRequest(
+        category="shell.command",
+        detail="python -m pip install aiohttp",
+        default_choice="allow_once",
+    )
+
+    task = asyncio.create_task(app.request_approval(request))
+    await _wait_for(lambda: app._approval_modal is not None)
+    modal = app._approval_modal
+    assert modal is not None
+    assert modal.selected_index == 0
+
+    modal.move(1)
+    assert modal.selected_index == 1
+    fragments = modal.fragments()
+    rendered = "".join(text for _style, text in fragments)
+    assert "→" not in rendered
+    assert "╭" in rendered and "╮" in rendered
+    assert "╰" in rendered and "╯" in rendered
+    assert "▶ 2. Allow for this session" in rendered
+
+    modal.choose_selected()
+    assert await task == ApprovalDecision.ALLOW_SESSION
+    assert app._approval_modal is None
+
+
+@pytest.mark.asyncio
+async def test_tui_approval_modal_preserves_frame_and_choices_in_small_height() -> None:
+    request = ApprovalRequest(
+        category="shell.command",
+        detail="python3 -m pip install aiohttp requests --user --quiet 2>&1\n" * 5,
+        choices=("allow_once", "allow_session", "allow_always", "deny"),
+        display={
+            "summary": "Run shell command",
+            "reason": "This shell command has side effects or reaches external systems.",
+        },
+    )
+    modal = app_module.ApprovalModal.create(request)
+
+    rendered = "".join(text for _style, text in modal.fragments(max_height=14))
+    lines = [line for line in rendered.splitlines() if line]
+
+    assert len(lines) <= 14
+    assert lines[0].startswith("╭") and lines[0].endswith("╮")
+    assert lines[-1].startswith("╰") and lines[-1].endswith("╯")
+    assert "1. Allow once" in rendered
+    assert "2. Allow for this session" in rendered
+    assert "3. Add to permanent allowlist" in rendered
+    assert "4. Deny" in rendered
+
+
+@pytest.mark.asyncio
+async def test_tui_approval_modal_shortcuts_and_details() -> None:
+    app, _console, _status = _make_app()
+    request = ApprovalRequest(
+        category="gateway_send",
+        detail="send external message\n" * 8,
+        choices=("allow_once", "show_details", "deny"),
+    )
+
+    task = asyncio.create_task(app.request_approval(request))
+    await _wait_for(lambda: app._approval_modal is not None)
+    modal = app._approval_modal
+    assert modal is not None
+
+    assert modal.choose_text("2") is True
+    assert modal.show_details is True
+    assert task.done() is False
+    assert modal.choose_text("n") is True
+    assert await task == ApprovalDecision.DENY
 
 
 def test_submit_text_assigns_ids_and_keeps_input_editable() -> None:
@@ -326,6 +402,47 @@ def test_stream_renderer_prints_tool_command_and_success_preview() -> None:
     assert "$ python -V" in line
     assert "→ Python 3.13.0" in line
     assert " | " in line
+
+
+def test_stream_renderer_prints_normalized_tool_name_with_alias_hint() -> None:
+    class CaptureConsole:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def print(self, renderable) -> None:
+            self.lines.append(getattr(renderable, "plain", str(renderable)))
+
+        def thinking(self, text: str) -> None:
+            pass
+
+        def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
+            pass
+
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+            pass
+
+        def newline(self) -> None:
+            pass
+
+    console = CaptureConsole()
+    renderer = StreamRenderer(console)  # type: ignore[arg-type]
+    renderer.start()
+    metadata = {
+        "ok": True,
+        "path": "/tmp/demo",
+        "original_tool_name": "list_directory",
+        "normalized_tool_name": "file_list",
+    }
+
+    spinner = renderer.tool_started("list_directory", metadata=metadata)
+    renderer.tool_finished("list_directory", metadata=metadata)
+
+    assert spinner == "📁 file_list"
+    assert len(console.lines) == 1
+    line = console.lines[0]
+    assert "📁 file_list" in line
+    assert "alias=list_directory" in line
+    assert "list_directory  path=" not in line
 
 
 def test_stream_renderer_prints_tool_failure_exit_and_stderr() -> None:
@@ -590,10 +707,12 @@ def test_placeholder_processor_indents_hint_after_prompt_space() -> None:
 
     assert transformed.fragments == [
         ("class:prompt", "❯ "),
-        ("class:placeholder", "    "),
+        ("class:placeholder", "  "),
         ("class:placeholder", "Queue paused · /resume continue"),
     ]
     assert sum(text.count("❯") for _style, text in transformed.fragments) == 1
+    assert transformed.source_to_display(0) == len("❯ ")
+    assert transformed.display_to_source(len("❯   Queue paused · /resume continue")) == 0
 
 
 def test_prompt_prefix_is_preserved_with_placeholder_hint() -> None:
@@ -612,10 +731,11 @@ def test_prompt_prefix_is_preserved_with_placeholder_hint() -> None:
 
     assert transformed.fragments == [
         ("class:prompt", "❯ "),
-        ("class:placeholder", "    "),
+        ("class:placeholder", "  "),
         ("class:placeholder", app._placeholder_text()),
     ]
     assert sum(text.count("❯") for _style, text in transformed.fragments) == 1
+    assert transformed.source_to_display(0) == len("❯ ")
 
 
 def test_placeholder_processor_hides_hint_after_user_input() -> None:
@@ -632,6 +752,8 @@ def test_placeholder_processor_hides_hint_after_user_input() -> None:
     transformed = processor.apply_transformation(typed_input)
 
     assert transformed.fragments == [("class:prompt", "❯ "), ("", "hello")]
+    assert transformed.source_to_display(0) == len("❯ ")
+    assert transformed.display_to_source(len("❯ ") + 1) == 1
 
 
 def test_control_commands_are_handled_without_queueing() -> None:

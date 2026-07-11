@@ -22,8 +22,9 @@ from leapflow.tools.gateway_tool import (
     GATEWAY_BRIDGE_TOOLS,
     GATEWAY_TOOL_DEFINITIONS,
     GATEWAY_TOOL_HANDLERS,
-    set_gateway_server,
+    set_gateway_server as set_gateway_server,
 )
+from leapflow.tools.name_resolver import ToolRegistry
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -442,6 +443,13 @@ async def _delegate_task_handler(params: Dict[str, Any]) -> Dict[str, Any]:
 
 TOOL_HANDLERS["delegate_task"] = _delegate_task_handler
 TOOL_HANDLERS["gp_delegate_task"] = _delegate_task_handler
+
+
+TOOL_REGISTRY = ToolRegistry.from_definitions(
+    TOOL_DEFINITIONS,
+    TOOL_HANDLERS,
+    bridge_tools=_BRIDGE_TOOLS,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────

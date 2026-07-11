@@ -70,12 +70,44 @@ from leapflow.learning.active_learning import SkillMerger
 from leapflow.skills.builtin import app_launcher, clipboard_manager, file_organizer
 from leapflow.storage.skill_library import SkillLibraryStore
 from leapflow.skills.registry import Skill, SkillRegistry
+from leapflow.tools.name_resolver import ToolRegistry, ToolResolution
 
 logger = logging.getLogger(__name__)
 
 _TOOL_ARGS_PREVIEW_LIMIT = 160
 _TOOL_RESULT_PREVIEW_LIMIT = 240
 _TASK_CONTRACT_HEADING = "## Task Contract"
+
+
+def _default_tool_registry() -> ToolRegistry:
+    """Return the canonical runtime tool registry."""
+    from leapflow.tools.registry_bootstrap import TOOL_REGISTRY
+
+    return TOOL_REGISTRY
+
+
+def _resolve_tool_name(tool_name: str, arguments: Dict[str, Any] | None = None) -> ToolResolution:
+    """Resolve a tool name through the runtime registry."""
+    return _default_tool_registry().resolve(tool_name, arguments or {})
+
+
+def _normalize_tool_name(tool_name: str) -> str:
+    """Return the canonical executable tool name when resolution is safe."""
+    return _default_tool_registry().normalize_name(tool_name)
+
+
+def _normalize_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a resolved tool call while preserving the original tool name."""
+    original_name = str(tool_call.get("name", ""))
+    arguments = tool_call.get("arguments") or {}
+    resolution = _resolve_tool_name(original_name, arguments)
+    if not resolution.auto_executable or resolution.normalized_name is None:
+        return {**tool_call, **resolution.to_metadata()}
+    return {
+        **tool_call,
+        "name": resolution.normalized_name,
+        **resolution.to_metadata(),
+    }
 
 
 def _single_line_preview(value: Any, *, limit: int) -> str:
@@ -89,13 +121,27 @@ def _single_line_preview(value: Any, *, limit: int) -> str:
     return compact[: limit - 1] + "…"
 
 
-def _tool_args_metadata(tool_name: str, arguments: Dict[str, Any] | None) -> Dict[str, Any]:
+def _tool_args_metadata(
+    tool_name: str,
+    arguments: Dict[str, Any] | None,
+    *,
+    original_tool_name: str | None = None,
+) -> Dict[str, Any]:
     """Build safe, compact tool-start metadata for streaming UIs."""
     args = dict(arguments or {})
+    original_name = original_tool_name or tool_name
     metadata: Dict[str, Any] = {
         "tool_name": tool_name,
+        "original_tool_name": original_name,
+        "normalized_tool_name": tool_name,
         "args_summary": _single_line_preview(args, limit=_TOOL_ARGS_PREVIEW_LIMIT),
     }
+    resolution = _resolve_tool_name(original_name, args)
+    metadata.update(resolution.to_metadata())
+    metadata["tool_name"] = tool_name
+    metadata["normalized_tool_name"] = tool_name
+    if original_name != tool_name:
+        metadata["alias"] = original_name
     for key in ("command", "cmd", "path", "pattern", "query", "url"):
         value = args.get(key)
         if value:
@@ -107,15 +153,24 @@ def _tool_result_metadata(
     tool_name: str,
     arguments: Dict[str, Any] | None,
     result: Any,
+    *,
+    original_tool_name: str | None = None,
 ) -> Dict[str, Any]:
     """Build safe, compact tool-completion metadata for streaming UIs."""
-    metadata = _tool_args_metadata(tool_name, arguments)
+    metadata = _tool_args_metadata(tool_name, arguments, original_tool_name=original_tool_name)
     metadata["ok"] = True
     if isinstance(result, dict):
         metadata["ok"] = bool(result.get("ok", True))
         for key in ("exit_code", "path", "lines", "truncated", "bytes_written"):
             if key in result:
                 metadata[key] = result[key]
+        for key in ("error_type", "retryable", "resolution_status", "resolution_confidence"):
+            if key in result:
+                metadata[key] = result[key]
+        for key in ("suggestions", "available_tools"):
+            value = result.get(key)
+            if value:
+                metadata[key] = value
         for key in ("stdout", "stderr", "content", "output", "error"):
             value = result.get(key)
             if value:
@@ -134,6 +189,30 @@ def _tool_result_metadata(
             limit=_TOOL_RESULT_PREVIEW_LIMIT,
         )
     return metadata
+
+
+def _is_retryable_unknown_tool_result(result: Any) -> bool:
+    """Return whether a tool result can drive a one-shot name correction retry."""
+    return isinstance(result, dict) and result.get("error_type") == "unknown_tool" and bool(
+        result.get("retryable", False)
+    )
+
+
+def _unknown_tool_retry_prompt(result: Dict[str, Any]) -> str:
+    """Build a compact structured correction prompt for a bad tool name."""
+    suggestions = result.get("suggestions") or []
+    available = result.get("available_tools") or []
+    suggestions_text = ", ".join(str(item) for item in suggestions[:5]) or "none"
+    available_text = ", ".join(str(item) for item in available[:12])
+    return (
+        "SYSTEM: The previous tool call used an unavailable tool name. "
+        f"Original tool: {result.get('original_tool_name', '')}. "
+        f"Resolution: {result.get('resolution_status', 'unknown')} "
+        f"({result.get('resolution_reason', 'no match')}). "
+        f"Suggested canonical tools: {suggestions_text}. "
+        f"Available tools include: {available_text}. "
+        "Retry once using an exact canonical tool name and valid arguments, or answer without a tool if no tool fits."
+    )
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -1658,6 +1737,7 @@ class AgentEngine:
         recovery = TurnRecoveryState()
         use_native_tools = assembly.plan.native_tools
         result_budget = self._effective_tool_result_budget()
+        unknown_tool_retry_used = False
         self._usage_tracker.reset()
 
         tools_kwarg: Dict[str, Any] = self._planned_tools_kwarg(assembly.plan)
@@ -1750,9 +1830,22 @@ class AgentEngine:
                 messages.append(assistant_msg)
                 self._persist_message(session_id, "assistant", content, tool_calls=assistant_msg.get("tool_calls"))
 
-                await self._execute_tools_concurrent(
+                results = await self._execute_tools_concurrent(
                     native_calls, TOOL_HANDLERS, trace=trace, messages=messages,
                 )
+
+                retryable_unknown = next(
+                    (
+                        item.get("result")
+                        for item in results
+                        if _is_retryable_unknown_tool_result(item.get("result"))
+                    ),
+                    None,
+                )
+                if retryable_unknown and not unknown_tool_retry_used:
+                    unknown_tool_retry_used = True
+                    messages.append(build_user_message_text(_unknown_tool_retry_prompt(retryable_unknown)))
+                    continue
 
                 failures = self._count_consecutive_tool_failures(messages)
                 recovery.consecutive_tool_failures = failures
@@ -1783,31 +1876,40 @@ class AgentEngine:
                 break
 
             messages.append(build_assistant_message(content))
-            _show_progress("executing", tool_call['name'])
-            result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
+            normalized_tool_call = _normalize_tool_call(tool_call)
+            tool_name = str(normalized_tool_call["name"])
+            tool_arguments = normalized_tool_call.get("arguments")
+            _show_progress("executing", tool_name)
+            result = await self._execute_general_tool(normalized_tool_call, TOOL_HANDLERS)
             _clear_indicator()
-            _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
+            _print_tool_result(tool_name, result, enabled=self._settings.verbose_progress)
             trace.record(
                 ExecutionMode.ACTING,
-                action=tool_call,
+                action=normalized_tool_call,
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
 
             is_error = isinstance(result, dict) and not result.get("ok", True)
             if is_error:
                 recovery.record_tool_failure()
-                if recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
-                    logger.warning("unified_loop: %d consecutive tool failures, stopping",
-                                   recovery.consecutive_tool_failures)
-                    break
             else:
                 recovery.record_tool_success()
-            result_payload = self._compact_tool_result(tool_call['name'], tool_call.get("arguments"), result)
+            result_payload = self._compact_tool_result(tool_name, tool_arguments, result)
             result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
             messages.append(build_user_message_text(
-                f"Tool result ({tool_call['name']}):\n{result_text}"
+                f"Tool result ({tool_name}):\n{result_text}"
             ))
-            self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
+            self._persist_message(session_id, "tool", result_text, tool_name=tool_name)
+
+            if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
+                unknown_tool_retry_used = True
+                messages.append(build_user_message_text(_unknown_tool_retry_prompt(result)))
+                continue
+
+            if is_error and recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                logger.warning("unified_loop: %d consecutive tool failures, stopping",
+                               recovery.consecutive_tool_failures)
+                break
 
             if self._check_guardrail(messages) == "halt":
                 break
@@ -1985,6 +2087,7 @@ class AgentEngine:
         turn_recovery = TurnRecoveryState()
         use_native_tools = assembly.plan.native_tools
         result_budget = self._effective_tool_result_budget()
+        unknown_tool_retry_used = False
         self._usage_tracker.reset()
 
         tools_kwarg: Dict[str, Any] = self._planned_tools_kwarg(assembly.plan)
@@ -2080,28 +2183,54 @@ class AgentEngine:
                     )
 
                     for tc in native_calls:
+                        resolved_call = _normalize_tool_call({"name": tc.name, "arguments": tc.arguments})
+                        normalized_name = str(resolved_call["name"])
+                        original_name = str(resolved_call.get("original_tool_name") or tc.name)
                         yield StreamEvent(
                             type="tool_start",
-                            content=tc.name,
-                            metadata=_tool_args_metadata(tc.name, tc.arguments),
+                            content=normalized_name,
+                            metadata=_tool_args_metadata(
+                                normalized_name,
+                                tc.arguments,
+                                original_tool_name=original_name,
+                            ),
                         )
                     results = await self._execute_tools_concurrent(
                         native_calls, TOOL_HANDLERS, trace=trace, messages=messages
                     )
                     result_by_id = {str(item.get("id")): item for item in results}
+                    retryable_unknown = next(
+                        (
+                            item.get("result")
+                            for item in results
+                            if _is_retryable_unknown_tool_result(item.get("result"))
+                        ),
+                        None,
+                    )
                     for tc in native_calls:
                         item = result_by_id.get(str(tc.id), {})
+                        normalized_name = str(item.get("name") or _normalize_tool_name(tc.name))
+                        original_name = str(item.get("original_tool_name") or tc.name)
                         yield StreamEvent(
                             type="tool_complete",
-                            content=tc.name,
+                            content=normalized_name,
                             metadata={
-                                **_tool_result_metadata(tc.name, tc.arguments, item.get("result")),
-                                **self._tool_context_metadata(tc.name, tc.arguments, item.get("result")),
+                                **_tool_result_metadata(
+                                    normalized_name,
+                                    tc.arguments,
+                                    item.get("result"),
+                                    original_tool_name=original_name,
+                                ),
+                                **self._tool_context_metadata(normalized_name, tc.arguments, item.get("result")),
                             },
                         )
 
                     failures = self._count_consecutive_tool_failures(messages)
                     turn_recovery.consecutive_tool_failures = failures
+                    if retryable_unknown and not unknown_tool_retry_used:
+                        unknown_tool_retry_used = True
+                        messages.append(build_user_message_text(_unknown_tool_retry_prompt(retryable_unknown)))
+                        continue
                     if failures >= self._settings.max_consecutive_tool_failures:
                         logger.warning("unified_loop_stream: %d consecutive tool failures, stopping", failures)
                         break
@@ -2216,52 +2345,67 @@ class AgentEngine:
                 return
 
             messages.append(build_assistant_message(content))
+            normalized_tool_call = _normalize_tool_call(tool_call)
+            tool_name = str(normalized_tool_call["name"])
+            original_tool_name = str(normalized_tool_call.get("original_tool_name", tool_name))
+            tool_arguments = normalized_tool_call.get("arguments")
             yield StreamEvent(
                 type="tool_start",
-                content=tool_call['name'],
-                metadata=_tool_args_metadata(tool_call['name'], tool_call.get("arguments")),
+                content=tool_name,
+                metadata=_tool_args_metadata(
+                    tool_name,
+                    tool_arguments,
+                    original_tool_name=original_tool_name,
+                ),
             )
-            result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
+            result = await self._execute_general_tool(normalized_tool_call, TOOL_HANDLERS)
             _clear_indicator()
             yield StreamEvent(
                 type="tool_complete",
-                content=tool_call['name'],
+                content=tool_name,
                 metadata={
                     **_tool_result_metadata(
-                        tool_call['name'],
-                        tool_call.get("arguments"),
+                        tool_name,
+                        tool_arguments,
                         result,
+                        original_tool_name=original_tool_name,
                     ),
                     **self._tool_context_metadata(
-                        tool_call['name'],
-                        tool_call.get("arguments"),
+                        tool_name,
+                        tool_arguments,
                         result,
                     ),
                 },
             )
-            _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
+            _print_tool_result(tool_name, result, enabled=self._settings.verbose_progress)
             trace.record(
                 ExecutionMode.ACTING,
-                action=tool_call,
+                action=normalized_tool_call,
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
 
             is_error = isinstance(result, dict) and not result.get("ok", True)
             if is_error:
                 turn_recovery.record_tool_failure()
-                if turn_recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
-                    logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
-                                   turn_recovery.consecutive_tool_failures)
-                    break
             else:
                 turn_recovery.record_tool_success()
 
-            result_payload = self._compact_tool_result(tool_call['name'], tool_call.get("arguments"), result)
+            result_payload = self._compact_tool_result(tool_name, tool_arguments, result)
             result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
             messages.append(build_user_message_text(
-                f"Tool result ({tool_call['name']}):\n{result_text}"
+                f"Tool result ({tool_name}):\n{result_text}"
             ))
-            self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
+            self._persist_message(session_id, "tool", result_text, tool_name=tool_name)
+
+            if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
+                unknown_tool_retry_used = True
+                messages.append(build_user_message_text(_unknown_tool_retry_prompt(result)))
+                continue
+
+            if is_error and turn_recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
+                               turn_recovery.consecutive_tool_failures)
+                break
 
             if self._check_guardrail(messages) == "halt":
                 break
@@ -2331,27 +2475,40 @@ class AgentEngine:
         """
         result_budget = self._effective_tool_result_budget()
         executed: list[Dict[str, Any]] = []
+        original_names_by_id = {str(tc.id): str(tc.name) for tc in native_calls}
         tc_wrappers = [
-            ConcurrentToolCall(id=tc.id, name=tc.name, arguments=tc.arguments)
+            ConcurrentToolCall(
+                id=tc.id,
+                name=str(_normalize_tool_call({"name": tc.name, "arguments": tc.arguments})["name"]),
+                arguments=tc.arguments,
+            )
             for tc in native_calls
         ]
 
         if not self._concurrency_policy or len(tc_wrappers) <= 1:
             for i, tc in enumerate(native_calls):
-                _show_progress("executing", tc.name, step=i + 1, total=len(native_calls))
-                tool_call_dict = {"name": tc.name, "arguments": tc.arguments}
+                original_name = str(tc.name)
+                tool_call_dict = _normalize_tool_call({"name": original_name, "arguments": tc.arguments})
+                normalized_name = str(tool_call_dict["name"])
+                _show_progress("executing", normalized_name, step=i + 1, total=len(native_calls))
                 result = await self._execute_general_tool(tool_call_dict, handlers)
                 _clear_indicator()
-                _print_tool_result(tc.name, result, enabled=self._settings.verbose_progress)
+                _print_tool_result(normalized_name, result, enabled=self._settings.verbose_progress)
                 trace.record(
                     ExecutionMode.ACTING,
                     action=tool_call_dict,
                     observation=result if isinstance(result, dict) else {"result": str(result)},
                 )
-                result_payload = self._compact_tool_result(tc.name, tc.arguments, result)
+                result_payload = self._compact_tool_result(normalized_name, tc.arguments, result)
                 result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
-                executed.append({"id": tc.id, "name": tc.name, "arguments": tc.arguments, "result": result})
+                executed.append({
+                    "id": tc.id,
+                    "name": normalized_name,
+                    "original_tool_name": str(tool_call_dict.get("original_tool_name") or original_name),
+                    "arguments": tc.arguments,
+                    "result": result,
+                })
             return executed
 
         concurrent, sequential = self._concurrency_policy.partition(tc_wrappers)
@@ -2364,7 +2521,13 @@ class AgentEngine:
         # Execute concurrent group via asyncio.gather
         if concurrent:
             async def _run_one(ctc: ConcurrentToolCall) -> Dict[str, Any]:
-                tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+                original_name = original_names_by_id.get(str(ctc.id), ctc.name)
+                tool_call_dict = {
+                    "name": ctc.name,
+                    "arguments": ctc.arguments,
+                    "original_tool_name": original_name,
+                    "normalized_tool_name": ctc.name,
+                }
                 return await self._execute_general_tool(tool_call_dict, handlers)
 
             gather_results = await asyncio.gather(
@@ -2372,7 +2535,13 @@ class AgentEngine:
                 return_exceptions=True,
             )
             for ctc, result in zip(concurrent, gather_results):
-                tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+                original_name = original_names_by_id.get(str(ctc.id), ctc.name)
+                tool_call_dict = {
+                    "name": ctc.name,
+                    "arguments": ctc.arguments,
+                    "original_tool_name": original_name,
+                    "normalized_tool_name": ctc.name,
+                }
                 if isinstance(result, Exception):
                     error_result: Dict[str, Any] = {
                         "ok": False,
@@ -2399,13 +2568,20 @@ class AgentEngine:
                 executed.append({
                     "id": ctc.id,
                     "name": ctc.name,
+                    "original_tool_name": original_name,
                     "arguments": ctc.arguments,
                     "result": error_result if isinstance(result, Exception) else result,
                 })
 
         for i, ctc in enumerate(sequential):
+            original_name = original_names_by_id.get(str(ctc.id), ctc.name)
             _show_progress("executing", ctc.name, step=i + 1, total=len(sequential))
-            tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+            tool_call_dict = {
+                "name": ctc.name,
+                "arguments": ctc.arguments,
+                "original_tool_name": original_name,
+                "normalized_tool_name": ctc.name,
+            }
             result = await self._execute_general_tool(tool_call_dict, handlers)
             _clear_indicator()
             _print_tool_result(ctc.name, result, enabled=self._settings.verbose_progress)
@@ -2417,7 +2593,13 @@ class AgentEngine:
             result_payload = self._compact_tool_result(ctc.name, ctc.arguments, result)
             result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
             messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
-            executed.append({"id": ctc.id, "name": ctc.name, "arguments": ctc.arguments, "result": result})
+            executed.append({
+                "id": ctc.id,
+                "name": ctc.name,
+                "original_tool_name": original_name,
+                "arguments": ctc.arguments,
+                "result": result,
+            })
         return executed
 
     async def _execute_general_tool(
@@ -2436,8 +2618,25 @@ class AgentEngine:
         from leapflow.skills.tool_executor import ToolCall as TC
         from leapflow.security.redact import redact_sensitive_text
 
-        name = tool_call.get("name", "")
+        original_name = str(tool_call.get("original_tool_name") or tool_call.get("name", ""))
+        proposed_name = str(tool_call.get("name", ""))
         args = tool_call.get("arguments", {})
+        registry = _default_tool_registry()
+        resolution = registry.resolve(proposed_name, args)
+        if not resolution.auto_executable or resolution.normalized_name is None:
+            return registry.unknown_result(
+                ToolResolution(
+                    original_name=original_name,
+                    normalized_name=resolution.normalized_name,
+                    status=resolution.status,
+                    confidence=resolution.confidence,
+                    reason=resolution.reason,
+                    suggestions=resolution.suggestions,
+                    auto_executable=False,
+                    risk_level=resolution.risk_level,
+                )
+            )
+        name = resolution.normalized_name
 
         result: Dict[str, Any]
 
@@ -2470,7 +2669,8 @@ class AgentEngine:
             # Fallback: direct handler dispatch
             handler = handlers.get(name)
             if handler is None:
-                return {"ok": False, "error": f"Unknown tool: {name}"}
+                missing_resolution = registry.resolve(original_name, args)
+                return registry.unknown_result(missing_resolution)
 
             result = await asyncio.wait_for(handler(args), timeout=timeout)
         except asyncio.TimeoutError:

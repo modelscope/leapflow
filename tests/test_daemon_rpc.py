@@ -802,7 +802,75 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
     assert "host_capability: test-cap" in output
 
 
-def test_daemon_restart_stops_waits_and_starts(monkeypatch, tmp_path) -> None:
+def test_stop_daemon_sends_sigterm_waits_and_cleans(monkeypatch, tmp_path) -> None:
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    running = lifecycle_module.DaemonInfo(
+        pid=1234,
+        sock_path=tmp_path / "run" / "leapd.sock",
+        start_time=None,
+        is_running=True,
+        is_healthy=True,
+    )
+    stopped = lifecycle_module.DaemonInfo(
+        pid=1234,
+        sock_path=None,
+        start_time=None,
+        is_running=False,
+        is_healthy=False,
+    )
+    states = [running, stopped]
+    signals: list[int] = []
+
+    def discover(run_dir):
+        return states.pop(0) if states else stopped
+
+    def send_signal(run_dir, sig):
+        signals.append(sig)
+        return True
+
+    monkeypatch.setattr(lifecycle_module.DaemonInfo, "discover", staticmethod(discover))
+    monkeypatch.setattr(lifecycle_module, "send_signal", send_signal)
+    monkeypatch.setattr(lifecycle_module, "cleanup_stale", lambda run_dir: True)
+
+    result = lifecycle_module.stop_daemon(tmp_path / "run", timeout_s=1.0)
+
+    assert result.stopped is True
+    assert result.signal_sent is True
+    assert result.stale_cleaned is True
+    assert signals == [lifecycle_module.signal.SIGTERM]
+
+
+def test_stop_daemon_force_escalates_after_timeout(monkeypatch, tmp_path) -> None:
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    running = lifecycle_module.DaemonInfo(
+        pid=1234,
+        sock_path=tmp_path / "run" / "leapd.sock",
+        start_time=None,
+        is_running=True,
+        is_healthy=False,
+    )
+    signals: list[int] = []
+
+    monkeypatch.setattr(lifecycle_module.DaemonInfo, "discover", staticmethod(lambda run_dir: running))
+    monkeypatch.setattr(lifecycle_module, "send_signal", lambda run_dir, sig: signals.append(sig) or True)
+
+    result = lifecycle_module.stop_daemon(
+        tmp_path / "run",
+        timeout_s=0.05,
+        force=True,
+        force_timeout_s=0.05,
+        poll_interval_s=0.01,
+    )
+
+    assert result.stopped is False
+    assert result.timed_out is True
+    assert result.forced is True
+    assert signals == [lifecycle_module.signal.SIGTERM, lifecycle_module.signal.SIGKILL]
+
+
+def test_daemon_restart_stops_and_starts(monkeypatch, tmp_path) -> None:
     from leapflow.cli.commands import daemon as daemon_module
 
     calls: list[str] = []
@@ -810,12 +878,34 @@ def test_daemon_restart_stops_waits_and_starts(monkeypatch, tmp_path) -> None:
     class Settings:
         profile_dir = tmp_path
 
-    monkeypatch.setattr(daemon_module, "_stop", lambda run_dir: calls.append("stop") or 0)
-    monkeypatch.setattr(daemon_module, "_wait_stopped", lambda run_dir: calls.append("wait") or True)
+    monkeypatch.setattr(
+        daemon_module,
+        "_stop",
+        lambda run_dir, **kwargs: calls.append(f"stop:{kwargs.get('force')}") or 0,
+    )
     monkeypatch.setattr(daemon_module, "_start", lambda settings, mock_host: calls.append("start") or 0)
 
-    assert daemon_module._restart(Settings(), mock_host=True) == 0
-    assert calls == ["stop", "wait", "start"]
+    assert daemon_module._restart(Settings(), mock_host=True, force=True) == 0
+    assert calls == ["stop:True", "start"]
+
+
+def test_daemon_restart_aborts_when_stop_fails(monkeypatch, tmp_path) -> None:
+    from leapflow.cli.commands import daemon as daemon_module
+
+    calls: list[str] = []
+
+    class Settings:
+        profile_dir = tmp_path
+
+    monkeypatch.setattr(
+        daemon_module,
+        "_stop",
+        lambda run_dir, **kwargs: calls.append("stop") or 1,
+    )
+    monkeypatch.setattr(daemon_module, "_start", lambda settings, mock_host: calls.append("start") or 0)
+
+    assert daemon_module._restart(Settings(), mock_host=True) == 1
+    assert calls == ["stop"]
 
 
 def test_stream_chunk_notification_preserves_event_shape() -> None:

@@ -38,12 +38,13 @@ from typing import (
 
 from prompt_toolkit import Application
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text.utils import fragment_list_len
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import HSplit, Layout, Window
-from prompt_toolkit.layout.containers import Float, FloatContainer
+from prompt_toolkit.layout.containers import ConditionalContainer, Float, FloatContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
@@ -52,6 +53,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.widgets import TextArea
 
+from leapflow.cli.tui_app.approval_modal import ApprovalModal, request_is_expired
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
 from leapflow.cli.tui_app.input import build_completer
 from leapflow.cli.tui_app.paste import (
@@ -61,6 +63,7 @@ from leapflow.cli.tui_app.paste import (
 )
 from leapflow.cli.tui_app.status import StatusBar
 from leapflow.cli.tui_app.theme import Theme
+from leapflow.security.approval import ApprovalDecision, ApprovalRequest
 
 if TYPE_CHECKING:
     from leapflow.cli.tui_app.console import LeapConsole
@@ -68,7 +71,7 @@ if TYPE_CHECKING:
 _HISTORY_FILENAME = "history"
 _REFRESH_INTERVAL_S = 0.5
 _PASTE_COMPACTOR_ATTR = "_leapflow_paste_compactor_installed"
-_PLACEHOLDER_CURSOR_SPACER = "    "
+_PLACEHOLDER_CURSOR_SPACER = "  "
 
 InputHandler = Callable[[str], Union[Awaitable[None], None]]
 ControlHandler = Callable[[str], bool]
@@ -105,19 +108,23 @@ class _DynamicPlaceholderProcessor(Processor):
         if has_text:
             prefix = prompt_fragments
             fragments = [*prefix, *transformation_input.fragments]
-        else:
-            placeholder = self._provider()
-            placeholder_fragments = [
-                ("class:placeholder", _PLACEHOLDER_CURSOR_SPACER),
-                ("class:placeholder", placeholder),
-            ] if placeholder else []
-            prefix = [*prompt_fragments, *placeholder_fragments]
-            fragments = [*prefix, *transformation_input.fragments]
-        shift_position = fragment_list_len(prefix)
+            shift_position = fragment_list_len(prefix)
+            return Transformation(
+                fragments,
+                source_to_display=lambda index: index + shift_position,
+                display_to_source=lambda index: index - shift_position,
+            )
+        placeholder = self._provider()
+        placeholder_fragments = [
+            ("class:placeholder", _PLACEHOLDER_CURSOR_SPACER),
+            ("class:placeholder", placeholder),
+        ] if placeholder else []
+        fragments = [*prompt_fragments, *placeholder_fragments, *transformation_input.fragments]
+        shift_position = fragment_list_len(prompt_fragments)
         return Transformation(
             fragments,
             source_to_display=lambda index: index + shift_position,
-            display_to_source=lambda index: index - shift_position,
+            display_to_source=lambda _index: 0,
         )
 
 
@@ -204,6 +211,7 @@ class LeapApp:
         self._active_fragment_marker: Optional[str] = None
         self._active_command: Optional[TuiCommand] = None
         self._pending_input = _CommandQueue()
+        self._approval_modal: Optional[ApprovalModal] = None
 
         data_dir = data_dir or Path(
             os.environ.get("LEAPFLOW_DATA_DIR", "~/.leapflow")
@@ -243,6 +251,30 @@ class LeapApp:
         self._spinner_text = value
         self._tool_start_time = time.monotonic() if value else 0.0
         self._invalidate()
+
+    async def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
+        """Show a native TUI approval modal and return the selected decision."""
+        if request_is_expired(request):
+            return ApprovalDecision.DENY
+        if self._approval_modal is not None:
+            return ApprovalDecision.DENY
+        from leapflow.cli.approval_view import remaining_seconds
+
+        modal = ApprovalModal.create(request)
+        self._approval_modal = modal
+        self._input_area.buffer.reset()
+        self._clear_paste_state()
+        self._invalidate()
+        try:
+            timeout = remaining_seconds(request)
+            return await asyncio.wait_for(asyncio.shield(modal.future), timeout=timeout)
+        except asyncio.TimeoutError:
+            modal.deny()
+            return ApprovalDecision.DENY
+        finally:
+            if self._approval_modal is modal:
+                self._approval_modal = None
+            self._invalidate()
 
     def submit_text(self, text: str) -> TuiCommand:
         """Submit user text into the serial TUI command queue."""
@@ -700,13 +732,27 @@ class LeapApp:
             height=self._spinner_height,
             wrap_lines=True,
         )
+        status_gap = Window(
+            content=FormattedTextControl(lambda: []),
+            height=1,
+            style="class:status-gap",
+        )
         status_bar = Window(
             content=FormattedTextControl(self._status),
             height=1,
             wrap_lines=False,
             style="class:status-bar",
         )
-        root = HSplit([spinner, status_bar, self._input_area])
+        root = HSplit([spinner, status_gap, status_bar, self._input_area])
+        approval_overlay = ConditionalContainer(
+            Window(
+                content=FormattedTextControl(self._approval_fragments),
+                height=Dimension(min=10, max=24, preferred=24),
+                wrap_lines=False,
+                style="class:approval.modal",
+            ),
+            filter=Condition(lambda: self._approval_modal is not None),
+        )
         layout = Layout(
             FloatContainer(
                 content=root,
@@ -719,7 +765,13 @@ class LeapApp:
                             scroll_offset=1,
                             display_arrows=True,
                         ),
-                    )
+                    ),
+                    Float(
+                        top=1,
+                        left=2,
+                        right=2,
+                        content=approval_overlay,
+                    ),
                 ],
             )
         )
@@ -748,9 +800,26 @@ class LeapApp:
     def _build_keybindings(self) -> KeyBindings:
         kb = KeyBindings()
         ref = self
+        approval_filter = Condition(lambda: ref._approval_modal is not None)
+
+        def choose_approval_text(text: str) -> None:
+            modal = ref._approval_modal
+            if modal is None:
+                return
+            if modal.choose_text(text):
+                ref._invalidate()
+
+        for key in ("1", "2", "3", "4", "5", "6", "7", "8", "9", "y", "o", "s", "a", "n", "d", "v"):
+            @kb.add(key, filter=approval_filter)
+            def _(event, key=key):
+                choose_approval_text(key)
 
         @kb.add(Keys.Enter)
         def _(event):
+            if ref._approval_modal is not None:
+                ref._approval_modal.choose_selected()
+                ref._invalidate()
+                return
             buffer = event.app.current_buffer
             complete_state = getattr(buffer, "complete_state", None)
             current_completion = getattr(complete_state, "current_completion", None)
@@ -773,6 +842,10 @@ class LeapApp:
 
         @kb.add(Keys.Escape)
         def _(event):
+            if ref._approval_modal is not None:
+                ref._approval_modal.deny()
+                ref._invalidate()
+                return
             if ref._close_completion(event.current_buffer):
                 return
             event.current_buffer.reset()
@@ -788,10 +861,18 @@ class LeapApp:
 
         @kb.add(Keys.Up)
         def _(event):
+            if ref._approval_modal is not None:
+                ref._approval_modal.move(-1)
+                ref._invalidate()
+                return
             ref._completion_previous_or_cursor_up(event.current_buffer)
 
         @kb.add(Keys.Down)
         def _(event):
+            if ref._approval_modal is not None:
+                ref._approval_modal.move(1)
+                ref._invalidate()
+                return
             ref._completion_next_or_cursor_down(event.current_buffer)
 
         @kb.add(Keys.Right)
@@ -809,6 +890,10 @@ class LeapApp:
 
         @kb.add(Keys.ControlC)
         def _(event):
+            if ref._approval_modal is not None:
+                ref._approval_modal.deny()
+                ref._invalidate()
+                return
             if event.current_buffer.text:
                 event.current_buffer.reset()
                 ref._clear_paste_state()
@@ -841,6 +926,7 @@ class LeapApp:
             "prompt.recording": t.recording,
             "prompt.paused": t.prompt_paused,
             "prompt.executing": t.executing,
+            "status-gap": "",
             "status-bar": f"bg:{t.toolbar_bg} {t.statusbar_fg}",
             "status-bar.strong": f"bg:{t.toolbar_bg} bold {t.statusbar_accent}",
             "status-bar.dim": f"bg:{t.toolbar_bg} {t.statusbar_dim}",
@@ -856,6 +942,15 @@ class LeapApp:
             "completion-menu.completion.current": f"bg:{t.input_selection_bg} bold {t.input_selection_fg}",
             "completion-menu.meta.completion": f"bg:{t.toolbar_bg} {t.text_muted}",
             "completion-menu.meta.completion.current": f"bg:{t.input_selection_bg} {t.input_selection_fg}",
+            "approval.modal": f"bg:{t.input_bg} {t.text}",
+            "approval.border": t.warning,
+            "approval.title": f"bold {t.warning}",
+            "approval.summary": f"bold {t.text}",
+            "approval.label": t.text_dim,
+            "approval.detail": t.warning,
+            "approval.dim": t.text_muted,
+            "approval.option": t.text,
+            "approval.selected": f"bg:{t.input_selection_bg} bold {t.input_selection_fg}",
         })
 
     # ── Fragment providers ───────────────────────────────────────────
@@ -895,6 +990,12 @@ class LeapApp:
         if self._pending_input.qsize() > 0:
             return f"{self._pending_input.qsize()} queued · /pause hold · /queue view · /drop <id> remove"
         return "Ask LeapFlow… /help commands · /status runtime · /queue tasks"
+
+    def _approval_fragments(self) -> list[tuple[str, str]]:
+        modal = self._approval_modal
+        if modal is None:
+            return []
+        return modal.fragments()
 
     def _spinner_fragments(self) -> list[tuple[str, str]]:
         if not self._spinner_text:

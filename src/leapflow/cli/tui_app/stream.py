@@ -22,6 +22,7 @@ from rich.text import Text
 
 _FINAL_RESPONSE_INDENT_SPACES = 4
 _FINAL_RESPONSE_MARGIN_TOP = 1
+_FINAL_RESPONSE_MARGIN_BOTTOM = 1
 _TOOL_INPUT_LIMIT = 96
 _TOOL_OUTPUT_LIMIT = 96
 _TOOL_PATH_LIMIT = 72
@@ -327,10 +328,12 @@ class StreamRenderer:
 
     def tool_started(self, name: str, metadata: dict[str, Any] | None = None) -> str:
         """Mark a tool call as started. Returns spinner text for LeapApp."""
-        self._active_tool = name
+        metadata = metadata or {}
+        tool_name = _metadata_text(metadata, "normalized_tool_name") or name
+        self._active_tool = tool_name
         self._active_tool_detail = _tool_action_detail(metadata)
         self._tool_start_time = time.monotonic()
-        return f"{_tool_icon(name)} {name}"
+        return f"{_tool_icon(tool_name)} {tool_name}"
 
     def tool_finished(
         self,
@@ -339,11 +342,14 @@ class StreamRenderer:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """Mark a tool call as finished; print one compact audit line."""
-        tool_name = name or self._active_tool
+        metadata = metadata or {}
+        tool_name = _metadata_text(metadata, "normalized_tool_name") or name or self._active_tool
+        original_tool_name = _metadata_text(metadata, "original_tool_name")
+        alias_detail = original_tool_name if original_tool_name and original_tool_name != tool_name else ""
         if tool_name and self._tool_start_time > 0:
             duration = time.monotonic() - self._tool_start_time
             self._tool_history.append((tool_name, duration))
-            ok = metadata.get("ok", True) if metadata else True
+            ok = metadata.get("ok", True)
             action_detail = self._active_tool_detail or _tool_action_detail(metadata)
             result_detail = _tool_result_detail(metadata) or _truncate_detail(output, limit=_TOOL_OUTPUT_LIMIT)
             line = Text()
@@ -354,6 +360,9 @@ class StreamRenderer:
             if action_detail:
                 line.append("  ", style="leap.tool")
                 line.append(action_detail, style="leap.tool")
+            if alias_detail:
+                line.append("  ", style="leap.tool")
+                line.append(f"alias={alias_detail}", style="leap.tool")
             if result_detail:
                 line.append(" → ", style="leap.tool" if ok else "leap.error")
                 line.append(result_detail, style="leap.tool" if ok else "leap.error")
@@ -377,6 +386,7 @@ class StreamRenderer:
                 answer,
                 indent=_FINAL_RESPONSE_INDENT_SPACES,
                 margin_top=_FINAL_RESPONSE_MARGIN_TOP,
+                margin_bottom=_FINAL_RESPONSE_MARGIN_BOTTOM,
             )
 
         self._console.response_label(self.elapsed, tool_count=self.tool_count)

@@ -74,16 +74,14 @@ if TYPE_CHECKING:
 
 
 class _TUIApprovalGate:
-    """Rich-styled approval gate for the interactive TUI.
+    """Approval gate that delegates to the active TUI surface when available."""
 
-    Displays a styled panel with the action details and accepts:
-    - ``y``/``yes`` → allow this one time
-    - ``a``/``always`` → allow and skip future prompts for this category
-    - ``n``/``no``/Enter → deny
+    def __init__(self) -> None:
+        self._handler: Optional[Callable[["ApprovalRequest"], Any]] = None
 
-    Implements both ``ApprovalGate`` (unified) and ``CommandApprovalGate``
-    (backward-compatible with ``shell_tools.py``).
-    """
+    def set_handler(self, handler: Optional[Callable[["ApprovalRequest"], Any]]) -> None:
+        """Set the active TUI approval handler."""
+        self._handler = handler
 
     _CATEGORY_LABELS = {
         "shell_dangerous": ("Shell Command", "yellow"),
@@ -94,6 +92,12 @@ class _TUIApprovalGate:
     async def request_approval(
         self, request: "ApprovalRequest",
     ) -> "ApprovalDecision":
+        handler = self._handler
+        if handler is not None:
+            result = handler(request)
+            if hasattr(result, "__await__"):
+                return await result
+            return result
         from leapflow.cli.approval_view import prompt_approval
 
         return await prompt_approval(request)
@@ -474,6 +478,10 @@ class Context:
             grants=JsonApprovalGrantStore(approval_dir / "grants.json"),
             audit=ApprovalAuditLog(approval_dir / "audit.jsonl"),
         )
+
+    def set_approval_handler(self, handler: Optional[Callable[["ApprovalRequest"], Any]]) -> None:
+        """Bind the current interactive surface as the approval renderer."""
+        self._tui_approval.set_handler(handler)
 
     def _configure_llm_clients(self, settings: Settings) -> None:
         """Build LLM/VLM clients from a settings snapshot."""

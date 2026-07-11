@@ -43,7 +43,7 @@ async def prompt_approval(request: ApprovalRequest) -> ApprovalDecision:
     if not sys.stdin.isatty():
         return ApprovalDecision.DENY
 
-    choices = _build_choices(request)
+    choices = build_approval_choices(request)
     show_details = False
     while True:
         if _is_expired(request):
@@ -52,16 +52,16 @@ async def prompt_approval(request: ApprovalRequest) -> ApprovalDecision:
         try:
             answer = await asyncio.wait_for(
                 asyncio.get_running_loop().run_in_executor(
-                    None, lambda: input("  → ").strip().lower(),
+                    None, lambda: input("Select approval choice: ").strip().lower(),
                 ),
-                timeout=_remaining_seconds(request),
+                timeout=remaining_seconds(request),
             )
         except TimeoutError:
             return ApprovalDecision.DENY
         except (EOFError, KeyboardInterrupt):
             return ApprovalDecision.DENY
 
-        selected = _resolve_choice(answer, choices)
+        selected = resolve_approval_choice(answer, choices)
         if selected is None:
             return ApprovalDecision.DENY
         if selected.key == "show_details":
@@ -70,7 +70,8 @@ async def prompt_approval(request: ApprovalRequest) -> ApprovalDecision:
         return selected.decision or ApprovalDecision.DENY
 
 
-def _build_choices(request: ApprovalRequest) -> list[ApprovalChoice]:
+def build_approval_choices(request: ApprovalRequest) -> list[ApprovalChoice]:
+    """Build selectable approval choices for a request."""
     keys = list(request.choices or ("allow_once", "allow_session", "deny"))
     if "deny" not in keys:
         keys.append("deny")
@@ -84,7 +85,8 @@ def _build_choices(request: ApprovalRequest) -> list[ApprovalChoice]:
     return choices
 
 
-def _resolve_choice(answer: str, choices: list[ApprovalChoice]) -> ApprovalChoice | None:
+def resolve_approval_choice(answer: str, choices: list[ApprovalChoice]) -> ApprovalChoice | None:
+    """Resolve a typed approval answer to a selectable choice."""
     if not answer:
         return next((choice for choice in choices if choice.key == "deny"), None)
     aliases = {
@@ -113,12 +115,12 @@ def _resolve_choice(answer: str, choices: list[ApprovalChoice]) -> ApprovalChoic
 
 
 def _render(request: ApprovalRequest, choices: list[ApprovalChoice], *, show_details: bool) -> None:
-    title = str(request.display.get("title") or _title_for(request))
+    title = str(request.display.get("title") or title_for_approval(request))
     summary = str(request.display.get("summary") or request.category)
-    reason = str(request.display.get("reason") or _risk_reason(request))
+    reason = str(request.display.get("reason") or risk_reason(request))
     detail = redact_sensitive_text(request.detail, force=True)
     if not show_details:
-        detail = _truncate_detail(detail)
+        detail = truncate_detail(detail)
 
     try:
         from rich.console import Console
@@ -135,7 +137,7 @@ def _render(request: ApprovalRequest, choices: list[ApprovalChoice], *, show_det
             for line in textwrap.wrap(reason, width=72) or [reason]:
                 body.append(f"- {line}\n", style="dim")
             body.append("\n")
-        remaining = _remaining_seconds(request)
+        remaining = remaining_seconds(request)
         if remaining is not None:
             body.append(f"Defaults to Deny in {int(remaining)}s.\n\n", style="dim")
         for idx, choice in enumerate(choices, start=1):
@@ -150,7 +152,7 @@ def _render(request: ApprovalRequest, choices: list[ApprovalChoice], *, show_det
         sys.stderr.write(f"⚠ {title}\n\n{summary}\n\n{detail}\n\n")
         if reason:
             sys.stderr.write(f"Why approval is needed: {reason}\n\n")
-        remaining = _remaining_seconds(request)
+        remaining = remaining_seconds(request)
         if remaining is not None:
             sys.stderr.write(f"Defaults to Deny in {int(remaining)}s.\n\n")
         for idx, choice in enumerate(choices, start=1):
@@ -158,7 +160,8 @@ def _render(request: ApprovalRequest, choices: list[ApprovalChoice], *, show_det
         sys.stderr.flush()
 
 
-def _title_for(request: ApprovalRequest) -> str:
+def title_for_approval(request: ApprovalRequest) -> str:
+    """Return the display title for an approval request."""
     if request.risk is not None:
         if request.risk.level.value == "high":
             return "High Risk Action"
@@ -167,7 +170,8 @@ def _title_for(request: ApprovalRequest) -> str:
     return "Action Approval"
 
 
-def _risk_reason(request: ApprovalRequest) -> str:
+def risk_reason(request: ApprovalRequest) -> str:
+    """Return the human-readable risk reason for an approval request."""
     if request.risk is None:
         return ""
     if request.risk.explanation:
@@ -175,24 +179,50 @@ def _risk_reason(request: ApprovalRequest) -> str:
     return ", ".join(request.risk.reasons)
 
 
-def _remaining_seconds(request: ApprovalRequest) -> float | None:
+def remaining_seconds(request: ApprovalRequest) -> float | None:
+    """Return seconds before approval expiry, if the request has a deadline."""
     if request.expires_at is None:
         return None
     return max(0.0, float(request.expires_at) - time.time())
 
 
 def _is_expired(request: ApprovalRequest) -> bool:
-    remaining = _remaining_seconds(request)
+    remaining = remaining_seconds(request)
     return remaining is not None and remaining <= 0.0
 
 
-def _truncate_detail(text: str, *, max_lines: int = 6, width: int = 88) -> str:
+def truncate_detail(text: str, *, max_lines: int = 6, width: int = 88) -> str:
+    """Truncate approval detail for compact rendering."""
     wrapped: list[str] = []
     for line in text.splitlines() or [text]:
         wrapped.extend(textwrap.wrap(line, width=width, replace_whitespace=False) or [""])
     if len(wrapped) <= max_lines:
         return "\n".join(wrapped)
     return "\n".join(wrapped[: max_lines - 1] + ["… (choose Show full details)"])
+
+
+def _build_choices(request: ApprovalRequest) -> list[ApprovalChoice]:
+    return build_approval_choices(request)
+
+
+def _resolve_choice(answer: str, choices: list[ApprovalChoice]) -> ApprovalChoice | None:
+    return resolve_approval_choice(answer, choices)
+
+
+def _title_for(request: ApprovalRequest) -> str:
+    return title_for_approval(request)
+
+
+def _risk_reason(request: ApprovalRequest) -> str:
+    return risk_reason(request)
+
+
+def _remaining_seconds(request: ApprovalRequest) -> float | None:
+    return remaining_seconds(request)
+
+
+def _truncate_detail(text: str, *, max_lines: int = 6, width: int = 88) -> str:
+    return truncate_detail(text, max_lines=max_lines, width=width)
 
 
 def _indent(text: str) -> str:

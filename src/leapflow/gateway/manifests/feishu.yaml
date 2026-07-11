@@ -21,10 +21,28 @@ options:
   - key: connection_mode
     label: 连接模式
     type: choice
-    choices: [websocket, webhook]
-    default: websocket
-    help_zh: "WebSocket 无需公网 IP（推荐），Webhook 需要公网回调地址"
-    help_en: "WebSocket needs no public IP (recommended), Webhook requires public callback URL"
+    choices: [webhook]
+    default: webhook
+    help_zh: "当前内置适配器使用本地 HTTP Webhook 接收事件；WebSocket SDK 模式将作为后续增强"
+    help_en: "The built-in adapter currently receives events through a local HTTP webhook; SDK WebSocket mode is a later enhancement"
+  - key: host
+    label: 绑定地址
+    type: string
+    default: "127.0.0.1"
+    help_zh: "Webhook 服务绑定地址（默认仅本机访问）"
+    help_en: "Webhook server bind address (default: localhost only)"
+  - key: port
+    label: 端口
+    type: string
+    default: "9091"
+    help_zh: "Webhook 服务端口"
+    help_en: "Webhook server port"
+  - key: path
+    label: 路径
+    type: string
+    default: "/feishu/events"
+    help_zh: "飞书事件回调路径"
+    help_en: "Feishu event callback path"
 
 setup_guide:
   summary_zh: |
@@ -47,4 +65,4 @@ validation:
 adapter:
   module: leapflow.gateway.adapters.feishu
   class: FeishuAdapter
-  dependencies: [lark-oapi]
+  dependencies: []

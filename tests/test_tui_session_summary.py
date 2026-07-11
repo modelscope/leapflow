@@ -160,7 +160,7 @@ def test_stream_renderer_spaces_and_indents_final_response_only() -> None:
         "text": "final **answer**",
         "indent": 4,
         "margin_top": 1,
-        "margin_bottom": 0,
+        "margin_bottom": 1,
     }]
     assert len(console.labels) == 1
     assert console.answer_labels == 1

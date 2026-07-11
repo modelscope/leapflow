@@ -248,8 +248,10 @@ def main(argv: list[str] | None = None) -> int:
     daemon_sub = daemon_parser.add_subparsers(dest="daemon_action")
     daemon_sub.add_parser("status", help="Show daemon status")
     daemon_sub.add_parser("start", help="Start daemon for the active profile")
-    daemon_sub.add_parser("stop", help="Stop running daemon")
-    daemon_sub.add_parser("restart", help="Restart daemon for the active profile")
+    stop_parser = daemon_sub.add_parser("stop", help="Stop running daemon")
+    stop_parser.add_argument("--force", action="store_true", help="Escalate to SIGKILL if graceful stop times out")
+    restart_parser = daemon_sub.add_parser("restart", help="Restart daemon for the active profile")
+    restart_parser.add_argument("--force", action="store_true", help="Force old daemon shutdown before restart")
     serve_parser = daemon_sub.add_parser("serve", help=argparse.SUPPRESS)
     serve_parser.add_argument("--internal", action="store_true", help=argparse.SUPPRESS)
 

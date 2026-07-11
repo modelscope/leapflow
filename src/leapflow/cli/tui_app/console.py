@@ -204,9 +204,20 @@ class LeapConsole:
         else:
             self._console.print(syntax)
 
-    def system(self, message: str, *, style: str = "leap.dim") -> None:
-        """Print a system/info message in muted style."""
+    def system(
+        self,
+        message: str,
+        *,
+        style: str = "leap.dim",
+        margin_top: int = 0,
+        margin_bottom: int = 0,
+    ) -> None:
+        """Print a system/info message in muted style with optional spacing."""
+        for _ in range(max(0, margin_top)):
+            self._console.print()
         self._console.print(f"  {message}", style=style)
+        for _ in range(max(0, margin_bottom)):
+            self._console.print()
 
     def success(self, message: str) -> None:
         self._console.print(f"  ✓ {message}", style="leap.success")

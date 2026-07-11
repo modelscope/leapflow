@@ -703,6 +703,9 @@ async def test_daemon_tui_exit_prompt_stops_by_default(monkeypatch, tmp_path) ->
         async def status(self):
             return {"pid": 1234}
 
+        async def shutdown(self):
+            calls.append("shutdown")
+
     class Console:
         def __init__(self) -> None:
             self.systems: list[str] = []
@@ -720,19 +723,20 @@ async def test_daemon_tui_exit_prompt_stops_by_default(monkeypatch, tmp_path) ->
     async def yes(prompt: str) -> bool:
         return True
 
-    def record_signal(run_dir, sig):
-        calls.append((run_dir, sig))
-        return True
+    def record_stop(run_dir, **kwargs):
+        calls.append((run_dir, kwargs))
+        return lifecycle_module.StopDaemonResult(pid=1234, stopped=True)
 
     calls = []
     monkeypatch.setattr(interactive_module, "_ask_yes_no_default_yes", yes)
-    monkeypatch.setattr(lifecycle_module, "send_signal", record_signal)
+    monkeypatch.setattr(lifecycle_module, "stop_daemon", record_stop)
     console = Console()
 
     await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
 
-    assert calls
-    assert "Sent SIGTERM" in console.systems[-1]
+    assert "shutdown" in calls
+    assert any(isinstance(call, tuple) and call[0] == tmp_path / "run" for call in calls)
+    assert "leapd stopped" in console.systems[-1]
 
 
 @pytest.mark.asyncio
@@ -758,14 +762,14 @@ async def test_daemon_tui_exit_prompt_can_keep_daemon(monkeypatch, tmp_path) -> 
     class Settings:
         profile_dir = tmp_path
 
-    def fail_send_signal(*args, **kwargs):
+    def fail_stop(*args, **kwargs):
         raise AssertionError("daemon should be kept running")
 
     async def no(prompt: str) -> bool:
         return False
 
     monkeypatch.setattr(interactive_module, "_ask_yes_no_default_yes", no)
-    monkeypatch.setattr(lifecycle_module, "send_signal", fail_send_signal)
+    monkeypatch.setattr(lifecycle_module, "stop_daemon", fail_stop)
     console = Console()
 
     await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
@@ -805,11 +809,11 @@ async def test_daemon_tui_exit_prompt_keeps_daemon_by_default_for_other_clients(
         prompts.append(prompt)
         return False
 
-    def fail_send_signal(*args, **kwargs):
+    def fail_stop(*args, **kwargs):
         raise AssertionError("daemon should be kept running while other clients exist")
 
     monkeypatch.setattr(interactive_module, "_ask_yes_no_default_no", default_no)
-    monkeypatch.setattr(lifecycle_module, "send_signal", fail_send_signal)
+    monkeypatch.setattr(lifecycle_module, "stop_daemon", fail_stop)
     console = Console()
 
     await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)

@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import signal
 import sys
 import time
 from typing import TYPE_CHECKING, Any, Optional
@@ -64,13 +63,29 @@ async def _prompt_stop_daemon_on_exit(
         console.system("leapd kept running. Use `leap daemon restart` when needed.")
         return
 
-    from leapflow.daemon.lifecycle import send_signal
+    from leapflow.daemon.lifecycle import stop_daemon
 
     run_dir = settings.profile_dir / "run"
-    if send_signal(run_dir, signal.SIGTERM):
-        console.system(f"Sent SIGTERM to leapd (pid={pid}).")
+    console.system(f"Stopping leapd (pid={pid})...")
+    graceful_requested = False
+    try:
+        await asyncio.wait_for(client.shutdown(), timeout=2.0)
+        graceful_requested = True
+    except Exception:
+        graceful_requested = False
+    result = await asyncio.to_thread(
+        stop_daemon,
+        run_dir,
+        timeout_s=5.0,
+        grace_timeout_s=1.0 if graceful_requested else 0.0,
+    )
+    if result.stopped:
+        console.system("leapd stopped.")
     else:
-        console.warning("Could not stop leapd; run `leap daemon stop` manually.")
+        console.warning(
+            f"leapd did not stop within the exit window (pid={result.pid}). "
+            "Run `leap daemon stop --force` if it remains unhealthy."
+        )
 
 
 async def _ask_yes_no_default_yes(prompt: str) -> bool:
@@ -751,6 +766,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         on_input=handle_input,
         on_control=_handle_task_control,
     )
+    ctx.set_approval_handler(app.request_approval)
 
     # Auto-connect previously configured gateway platforms
     gw = getattr(ctx, "gateway_server", None)
@@ -775,6 +791,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     try:
         exit_code = await app.run()
     finally:
+        ctx.set_approval_handler(None)
         _print_exit_summary()
     return exit_code
 
@@ -949,7 +966,6 @@ async def cmd_interactive_daemon(
             _print_host_status(console, host)
 
     async def _handle_daemon_approval(event: StreamEvent) -> None:
-        from leapflow.cli.approval_view import prompt_approval
         from leapflow.security.approval import ApprovalDecision, ApprovalRequest
 
         metadata = event.metadata or {}
@@ -961,7 +977,7 @@ async def cmd_interactive_daemon(
             return
         app.spinner_text = "Waiting for approval…"
         request = ApprovalRequest.from_dict(payload)
-        decision = await prompt_approval(request)
+        decision = await app.request_approval(request)
         value = decision.value if isinstance(decision, ApprovalDecision) else str(decision)
         await bridge.call(
             lambda current_client: current_client.approval_resolve(pending_id, value),

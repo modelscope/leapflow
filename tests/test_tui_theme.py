@@ -144,6 +144,47 @@ def test_leap_app_style_builder_accepts_resolved_theme(tmp_path) -> None:
     assert app._input_area.window.dont_extend_height() is True
 
 
+def test_leap_app_layout_keeps_status_breathing_gap(tmp_path) -> None:
+    theme = resolve_theme(_DARK, terminal_bg="#102A2E")
+    app = LeapApp(
+        console=None,
+        theme=theme,
+        status=lambda: [],
+        data_dir=tmp_path,
+        on_input=None,
+    )
+
+    root = app._app.layout.container.content
+    children = root.children
+
+    assert len(children) == 4
+    assert children[1].style == "class:status-gap"
+    assert children[1].height == 1
+    assert app._build_style().get_attrs_for_style_str("class:status-gap").bgcolor == ""
+    assert children[2].style == "class:status-bar"
+    assert children[3] is app._input_area.window
+
+
+def test_console_system_supports_visual_spacing() -> None:
+    class CaptureConsole:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def print(self, *args, **kwargs) -> None:
+            self.calls.append((args, kwargs))
+
+    console = LeapConsole(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    capture = CaptureConsole()
+    console._console = capture  # type: ignore[assignment]
+
+    console.system("After reinstalling LeapFlow, use `leap daemon restart`.", margin_bottom=1)
+
+    assert capture.calls == [
+        (("  After reinstalling LeapFlow, use `leap daemon restart`.",), {"style": "leap.dim"}),
+        ((), {}),
+    ]
+
+
 def test_rich_banner_accepts_resolved_theme(capsys) -> None:
     theme = resolve_theme(_LIGHT, terminal_bg="#FFFFFF")
 

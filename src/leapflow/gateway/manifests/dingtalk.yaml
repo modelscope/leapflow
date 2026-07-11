@@ -18,12 +18,43 @@ credentials:
     help_en: "Same page → AppSecret"
 
 options:
+  - key: connection_mode
+    label: 连接模式
+    type: choice
+    choices: [webhook]
+    default: webhook
+    help_zh: "当前内置适配器使用本地 HTTP Webhook 接收事件；dingtalk-stream 模式将作为后续增强"
+    help_en: "The built-in adapter currently receives events through a local HTTP webhook; dingtalk-stream mode is a later enhancement"
   - key: robot_code
     label: 机器人编码
     type: string
     required: false
-    help_zh: "如使用自定义机器人，请提供 robot_code（可选）"
-    help_en: "Provide robot_code if using a custom bot (optional)"
+    help_zh: "如使用自定义机器人发送消息，请提供 robot_code（可选）"
+    help_en: "Provide robot_code when sending through a custom bot (optional)"
+  - key: agent_id
+    label: Agent ID
+    type: string
+    required: false
+    help_zh: "如使用企业会话消息发送，请提供 agent_id（可选）"
+    help_en: "Provide agent_id when sending corporate conversation messages (optional)"
+  - key: host
+    label: 绑定地址
+    type: string
+    default: "127.0.0.1"
+    help_zh: "Webhook 服务绑定地址（默认仅本机访问）"
+    help_en: "Webhook server bind address (default: localhost only)"
+  - key: port
+    label: 端口
+    type: string
+    default: "9092"
+    help_zh: "Webhook 服务端口"
+    help_en: "Webhook server port"
+  - key: path
+    label: 路径
+    type: string
+    default: "/dingtalk/events"
+    help_zh: "钉钉事件回调路径"
+    help_en: "DingTalk event callback path"
 
 setup_guide:
   summary_zh: |
@@ -46,4 +77,4 @@ validation:
 adapter:
   module: leapflow.gateway.adapters.dingtalk
   class: DingTalkAdapter
-  dependencies: [dingtalk-stream]
+  dependencies: []

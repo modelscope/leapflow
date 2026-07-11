@@ -47,4 +47,4 @@ validation:
 adapter:
   module: leapflow.gateway.adapters.webhook
   class: WebhookAdapter
-  dependencies: [aiohttp]
+  dependencies: []

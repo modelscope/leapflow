@@ -81,6 +81,19 @@ class DaemonInfo:
         return "leapd not running"
 
 
+@dataclass(frozen=True)
+class StopDaemonResult:
+    """Outcome of a bounded daemon stop transaction."""
+
+    pid: Optional[int]
+    stopped: bool
+    signal_sent: bool = False
+    forced: bool = False
+    stale_cleaned: bool = False
+    timed_out: bool = False
+    error: str = ""
+
+
 class DaemonLock:
     """Advisory file lock for daemon leader election.
 
@@ -179,6 +192,65 @@ def send_signal(run_dir: Path, sig: int = signal.SIGTERM) -> bool:
         return False
 
 
+def stop_daemon(
+    run_dir: Path,
+    *,
+    timeout_s: float = 10.0,
+    force: bool = False,
+    grace_timeout_s: float = 0.0,
+    poll_interval_s: float = 0.1,
+    force_timeout_s: float = 2.0,
+) -> StopDaemonResult:
+    """Stop leapd as a bounded transaction and verify final state."""
+    info = DaemonInfo.discover(run_dir)
+    pid = info.pid
+    if not info.is_running:
+        stale_cleaned = cleanup_stale(run_dir) if pid is not None else False
+        return StopDaemonResult(pid=pid, stopped=True, stale_cleaned=stale_cleaned)
+
+    deadline = time.time() + max(0.1, timeout_s)
+    interval = max(0.01, poll_interval_s)
+    if grace_timeout_s > 0:
+        grace_deadline = min(deadline, time.time() + grace_timeout_s)
+        if _wait_until_stopped(run_dir, deadline=grace_deadline, interval_s=interval):
+            stale_cleaned = cleanup_stale(run_dir)
+            return StopDaemonResult(pid=pid, stopped=True, stale_cleaned=stale_cleaned)
+
+    signal_sent = send_signal(run_dir, signal.SIGTERM)
+    if not signal_sent and not DaemonInfo.discover(run_dir).is_running:
+        stale_cleaned = cleanup_stale(run_dir)
+        return StopDaemonResult(pid=pid, stopped=True, stale_cleaned=stale_cleaned)
+    if not signal_sent:
+        return StopDaemonResult(pid=pid, stopped=False, error="failed to send SIGTERM")
+
+    if _wait_until_stopped(run_dir, deadline=deadline, interval_s=interval):
+        stale_cleaned = cleanup_stale(run_dir)
+        return StopDaemonResult(pid=pid, stopped=True, signal_sent=True, stale_cleaned=stale_cleaned)
+
+    forced = False
+    if force:
+        forced = send_signal(run_dir, signal.SIGKILL)
+        kill_deadline = time.time() + max(0.1, force_timeout_s)
+        if forced and _wait_until_stopped(run_dir, deadline=kill_deadline, interval_s=interval):
+            stale_cleaned = cleanup_stale(run_dir)
+            return StopDaemonResult(
+                pid=pid,
+                stopped=True,
+                signal_sent=True,
+                forced=True,
+                stale_cleaned=stale_cleaned,
+            )
+
+    return StopDaemonResult(
+        pid=pid,
+        stopped=False,
+        signal_sent=True,
+        forced=forced,
+        timed_out=True,
+        error="timed out waiting for leapd to stop",
+    )
+
+
 def spawn_daemon(settings: object, *, mock_host: bool = False) -> subprocess.Popen[bytes]:
     """Spawn a detached leapd process for the active environment."""
     run_dir = getattr(settings, "profile_dir") / "run"
@@ -214,6 +286,14 @@ def wait_ready(run_dir: Path, *, timeout_s: float = 30.0, interval_s: float = 0.
             return last
         time.sleep(max(0.01, interval_s))
     return last
+
+
+def _wait_until_stopped(run_dir: Path, *, deadline: float, interval_s: float) -> bool:
+    while time.time() < deadline:
+        if not DaemonInfo.discover(run_dir).is_running:
+            return True
+        time.sleep(interval_s)
+    return not DaemonInfo.discover(run_dir).is_running
 
 
 # ── Internal helpers ──

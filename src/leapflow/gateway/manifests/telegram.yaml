@@ -49,4 +49,4 @@ validation:
 adapter:
   module: leapflow.gateway.adapters.telegram
   class: TelegramAdapter
-  dependencies: [aiohttp]
+  dependencies: []

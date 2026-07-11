@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from pathlib import Path
 import sys
 import time
@@ -115,6 +116,28 @@ async def test_prompt_approval_expired_request_denies(monkeypatch) -> None:
     )
 
     assert await prompt_approval(request) == ApprovalDecision.DENY
+
+
+@pytest.mark.asyncio
+async def test_prompt_approval_uses_plain_fallback_prompt(monkeypatch) -> None:
+    from leapflow.cli import approval_view
+    from leapflow.cli.approval_view import prompt_approval
+    from leapflow.security.approval import ApprovalRequest
+
+    prompts: list[str] = []
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(approval_view, "_render", lambda *_args, **_kwargs: None)
+
+    def fake_input(prompt: str) -> str:
+        prompts.append(prompt)
+        return "n"
+
+    monkeypatch.setattr(builtins, "input", fake_input)
+
+    request = ApprovalRequest(category="shell.command", detail="echo hello")
+
+    assert await prompt_approval(request) == ApprovalDecision.DENY
+    assert prompts == ["Select approval choice: "]
 
 
 @pytest.mark.asyncio

@@ -13,8 +13,8 @@ from leapflow.daemon.lifecycle import (
     DaemonInfo,
     DaemonLock,
     cleanup_stale,
-    send_signal,
     spawn_daemon,
+    stop_daemon,
     wait_ready,
 )
 from leapflow.daemon.protocol import RpcRequest
@@ -256,25 +256,15 @@ async def recover_daemon_client(
         if not info.is_running:
             raise
         _emit(status_callback, f"Restarting unhealthy leapd (pid={info.pid})...")
-        if not send_signal(run_dir):
+        result = await asyncio.to_thread(stop_daemon, run_dir, timeout_s=10.0)
+        if not result.stopped:
             raise exc
-        if not await _wait_stopped(run_dir):
-            raise exc
-        cleanup_stale(run_dir)
         return await ensure_daemon_client(
             settings,
             mock_host=mock_host,
             status_callback=status_callback,
         )
 
-
-async def _wait_stopped(run_dir: Path, *, timeout_s: float = 10.0) -> bool:
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    while asyncio.get_running_loop().time() < deadline:
-        if not DaemonInfo.discover(run_dir).is_running:
-            return True
-        await asyncio.sleep(0.1)
-    return not DaemonInfo.discover(run_dir).is_running
 
 
 def _event_from_params(params: dict[str, Any]) -> StreamEvent:
