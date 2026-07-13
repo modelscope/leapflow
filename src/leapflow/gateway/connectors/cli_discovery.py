@@ -184,8 +184,6 @@ class HelpParser:
                 continue
             if in_section:
                 if not stripped:
-                    if entries:
-                        break
                     continue
                 if stripped.startswith("{") and stripped.endswith("}"):
                     continue
@@ -211,8 +209,6 @@ class HelpParser:
                 continue
             if in_section:
                 if not stripped:
-                    if args:
-                        break
                     continue
                 match = _FLAG_RE.match(line)
                 if match:

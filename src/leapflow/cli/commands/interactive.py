@@ -31,6 +31,11 @@ _CLI_EVENT_SOURCE = "interactive_repl"
 _last_hint: Optional["PredictionCandidate"] = None
 
 
+def _is_app_command(canonical: str) -> bool:
+    """Return true only for `/app` or `/app ...`, not `/apple`."""
+    return canonical == "app" or canonical.startswith("app ")
+
+
 async def _prompt_stop_daemon_on_exit(
     client: "DaemonClient",
     settings: Any,
@@ -571,7 +576,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 handle_gateway(ctx, console, cmd_args)
                 return
 
-            if canonical.startswith("app"):
+            if _is_app_command(canonical):
                 app_args = cmd_text[len("app"):].strip()
                 await handle_app(ctx, console, app_args)
                 _update_status()
@@ -1163,7 +1168,7 @@ async def cmd_interactive_daemon(
                     return
                 render_model_payload(console, payload)
                 return
-            if canonical.startswith("app"):
+            if _is_app_command(canonical):
                 app_args = invocation.text[len("app"):].strip()
                 try:
                     payload = await bridge.call(

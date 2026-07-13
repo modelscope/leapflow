@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Mapping
 
 import pytest
@@ -18,6 +19,25 @@ class FakeProcess:
 
     async def communicate(self) -> tuple[bytes, bytes]:
         return self._stdout, self._stderr
+
+
+class HangingFakeProcess:
+    def __init__(self) -> None:
+        self.returncode = None
+        self.killed = False
+        self.waited = False
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        await asyncio.sleep(60)
+        return b"", b""
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        self.waited = True
+        return int(self.returncode or 0)
 
 
 @pytest.mark.asyncio
@@ -168,6 +188,29 @@ async def test_cli_backend_status_reports_contract_mismatch(monkeypatch) -> None
     assert status.metadata["failure_code"] == "cli_contract_mismatch"
     assert status.metadata["recoverable"] is False
     assert "lark-cli --profile work auth status --json" in status.metadata["next_steps"]
+
+
+@pytest.mark.asyncio
+async def test_cli_backend_kills_subprocess_on_timeout(monkeypatch) -> None:
+    process = HangingFakeProcess()
+
+    async def fake_exec(*_argv, **_kwargs):
+        return process
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+    backend = CliBackend(binary="lark-cli")
+    spec = ActionSpec(
+        name="im.send_message",
+        backend_kind=BackendKind.CLI.value,
+        backend_config={"argv": ("im", "+messages-send"), "timeout_s": 0.01},
+    )
+
+    result = await backend.execute(spec, {})
+
+    assert result.ok is False
+    assert "timed out" in result.error
+    assert process.killed is True
+    assert process.waited is True
 
 
 @pytest.mark.asyncio

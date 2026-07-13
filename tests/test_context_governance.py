@@ -7,6 +7,7 @@ import pytest
 from leapflow.engine.context_compressor import (
     CompressorConfig,
     ContextCompressor,
+    SummarizeStage,
     adaptive_trim_chars,
     estimate_text_tokens,
 )
@@ -37,6 +38,27 @@ def test_context_estimator_counts_messages_and_tool_schemas() -> None:
     assert snapshot.tool_schema_tokens > 0
     assert snapshot.total_tokens == snapshot.message_tokens + snapshot.tool_schema_tokens
     assert 0 < snapshot.ratio < 1
+
+
+def test_context_compressor_tolerates_none_tool_calls() -> None:
+    compressor = ContextCompressor(CompressorConfig(
+        token_budget=100,
+        token_count_fn=lambda text: len(str(text)),
+    ))
+    messages = [
+        {"role": "assistant", "content": "plain response", "tool_calls": None},
+        {"role": "user", "content": "next request"},
+    ]
+
+    formatted = SummarizeStage._format_turns_for_summary(messages)
+    summary = SummarizeStage._deterministic_summary(messages)
+    sanitized = SummarizeStage._sanitize_tool_pairs(messages)
+    token_count = compressor._count_tokens(messages)
+
+    assert "plain response" in formatted
+    assert "next request" in summary
+    assert sanitized == messages
+    assert token_count > 0
 
 
 def test_context_window_controller_forces_final_answer_when_over_budget() -> None:

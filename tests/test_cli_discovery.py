@@ -199,6 +199,37 @@ class TestHelpParser:
         assert "--version" not in flag_names
 
 
+    def test_parse_subcommands_across_blank_lines(self) -> None:
+        help_text = """\
+Usage: demo [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  first     First command
+
+  second    Second command after a blank line
+  third     Third command
+"""
+        parser = HelpParser()
+        result = parser.parse(help_text, binary="demo")
+
+        assert [cmd.name for cmd in result.subcommands] == ["first", "second", "third"]
+
+    def test_parse_arguments_across_blank_lines(self) -> None:
+        help_text = """\
+Usage: demo send [OPTIONS]
+
+Options:
+  --chat-id TEXT  Target chat (required)
+
+  --text TEXT     Message text (required)
+  --dry-run       Preview only
+"""
+        parser = HelpParser()
+        result = parser.parse(help_text, binary="demo", prefix=["send"])
+
+        assert [arg.name for arg in result.arguments] == ["chat_id", "text", "dry_run"]
+
+
 # ── DiscoveredCommand → ActionSpec builders ──────────────────────────
 
 class TestSpecBuilders:

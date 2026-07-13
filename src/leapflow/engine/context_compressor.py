@@ -495,7 +495,7 @@ class SummarizeStage:
         for i, msg in enumerate(messages):
             role = msg.get("role", "unknown")
             content = str(msg.get("content", ""))
-            tool_calls = msg.get("tool_calls", [])
+            tool_calls = msg.get("tool_calls") or []
             if role == "assistant" and tool_calls:
                 tool_names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
                 lines.append(f"[Turn {i+1}] ASSISTANT: called tools: {', '.join(tool_names)}")
@@ -521,7 +521,7 @@ class SummarizeStage:
         for msg in middle:
             role = msg.get("role", "")
             content = str(msg.get("content", ""))
-            tool_calls = msg.get("tool_calls", [])
+            tool_calls = msg.get("tool_calls") or []
             if role == "assistant" and tool_calls:
                 parts = []
                 for tc in tool_calls:
@@ -565,7 +565,7 @@ class SummarizeStage:
         """Remove orphaned tool results and strip orphaned tool_calls."""
         available_call_ids: set[str] = set()
         for msg in messages:
-            for tc in msg.get("tool_calls", []):
+            for tc in msg.get("tool_calls") or []:
                 call_id = tc.get("id", "") or tc.get("call_id", "")
                 if call_id:
                     available_call_ids.add(call_id)
@@ -931,7 +931,7 @@ class ContextCompressor:
                                 total += fn(part.get("text", ""))
                             elif part.get("type") in ("image_url", "input_image", "image"):
                                 total += _IMAGE_TOKEN_ESTIMATE
-                for tc in msg.get("tool_calls", []):
+                for tc in msg.get("tool_calls") or []:
                     args = tc.get("function", {}).get("arguments", "")
                     if isinstance(args, str):
                         total += fn(args)
@@ -1054,7 +1054,7 @@ class ContextCompressor:
                     elif part_type in ("image_url", "input_image", "image"):
                         image_count += 1
 
-            for tc in msg.get("tool_calls", []):
+            for tc in msg.get("tool_calls") or []:
                 args = tc.get("function", {}).get("arguments", "")
                 if isinstance(args, str):
                     total_tokens += estimate_text_tokens(args)

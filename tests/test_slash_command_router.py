@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from leapflow.cli.commands.router import CommandRouter
+from leapflow.cli.commands.interactive import _is_app_command
 
 
 def test_command_router_parses_command_args_and_runtime_support() -> None:
@@ -64,6 +65,13 @@ def test_app_commands_are_registered_for_completion() -> None:
     assert entries["app status"] == "Show App Connector status"
     assert entries["app connect"] == "Connect a supported external app"
     assert entries["app actions"] == "List App Connector action domains"
+
+
+def test_interactive_app_command_boundary_rejects_prefix_collisions() -> None:
+    assert _is_app_command("app") is True
+    assert _is_app_command("app status feishu") is True
+    assert _is_app_command("apple") is False
+    assert _is_app_command("application status") is False
 
 
 def test_command_router_returns_standard_unsupported_result() -> None:

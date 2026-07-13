@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+from contextlib import suppress
 from typing import Any, Mapping, Sequence
 
 from leapflow.gateway.connectors.cli_discovery import CliDiscovery
@@ -275,6 +276,7 @@ class CliBackend:
         return value
 
     async def _run_json(self, argv: Sequence[str], *, timeout_s: float) -> ActionResult:
+        proc: asyncio.subprocess.Process | None = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -286,6 +288,11 @@ class CliBackend:
         except FileNotFoundError:
             return ActionResult(ok=False, error=f"CLI binary not found: {self._binary}")
         except asyncio.TimeoutError:
+            if proc is not None:
+                with suppress(ProcessLookupError):
+                    proc.kill()
+                with suppress(ProcessLookupError, asyncio.TimeoutError):
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
             return ActionResult(ok=False, error=f"CLI command timed out after {timeout_s}s")
         except OSError as exc:
             return ActionResult(ok=False, error=redact_sensitive_text(str(exc), force=True))
