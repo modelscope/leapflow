@@ -252,6 +252,8 @@ class ToolEvidenceBuilder:
         """Return a compact, JSON-serializable result preserving task evidence."""
         if not isinstance(result, dict):
             return self._compact_value(result)
+        if tool_name == "platform_connect":
+            return self._app_connector_evidence(result)
         if result.get("ok") is False:
             return self._compact_error(result)
         if tool_name in {"file_read", "gp_file_read"}:
@@ -305,6 +307,56 @@ class ToolEvidenceBuilder:
             "ok": False,
             "error": self._head_tail(str(result.get("error", "unknown error")), self._max_content_chars),
         }
+
+    def _app_connector_evidence(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        evidence: Dict[str, Any] = {
+            "ok": bool(result.get("ok", True)),
+            "kind": "app_connector_evidence",
+        }
+        for key in (
+            "platform",
+            "stage",
+            "onboarding_state",
+            "recovery_hint",
+            "next_steps",
+            "error",
+            "status",
+            "connected",
+        ):
+            if key in result:
+                evidence[key] = self._compact_value(result[key])
+        if isinstance(result.get("preflight_result"), dict):
+            evidence["preflight_result"] = self._app_preflight_evidence(result["preflight_result"])
+        if "required_fields" in result:
+            evidence["required_fields"] = self._compact_value(result["required_fields"])
+        return evidence
+
+    def _app_check_evidence(self, checks: List[Any]) -> List[Dict[str, Any]]:
+        return [
+            {
+                compact_key: check.get(compact_key)
+                for compact_key in ("key", "kind", "status", "failure_code", "requires_approval", "auto_run")
+                if isinstance(check, dict) and compact_key in check
+            }
+            for check in checks[: self._max_items]
+        ]
+
+    def _app_preflight_evidence(self, preflight: Dict[str, Any]) -> Dict[str, Any]:
+        evidence: Dict[str, Any] = {}
+        for key in ("ready", "stage", "backend_kind", "recoverable", "detail", "recovery_hint", "next_steps"):
+            if key in preflight:
+                evidence[key] = self._compact_value(preflight[key])
+        checks = preflight.get("checks")
+        if isinstance(checks, list):
+            evidence["checks"] = self._app_check_evidence(checks)
+        metadata = preflight.get("metadata")
+        if isinstance(metadata, dict):
+            evidence["metadata"] = {
+                key: self._compact_value(metadata[key])
+                for key in ("binary", "binary_path", "profile", "identity", "auth_status")
+                if key in metadata
+            }
+        return evidence
 
     def _compact_mapping(self, result: Dict[str, Any]) -> Dict[str, Any]:
         compact: Dict[str, Any] = {}

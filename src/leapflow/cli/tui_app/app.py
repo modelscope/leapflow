@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import time
 from collections import deque
 from pathlib import Path
@@ -727,6 +728,9 @@ class LeapApp:
         return area
 
     def _build_application(self) -> Application[Any]:
+        no_approval = Condition(lambda: self._approval_modal is None)
+        has_approval = Condition(lambda: self._approval_modal is not None)
+
         spinner = Window(
             content=FormattedTextControl(self._spinner_fragments),
             height=self._spinner_height,
@@ -743,8 +747,7 @@ class LeapApp:
             wrap_lines=False,
             style="class:status-bar",
         )
-        root = HSplit([spinner, status_gap, status_bar, self._input_area])
-        approval_overlay = ConditionalContainer(
+        approval_panel = ConditionalContainer(
             Window(
                 content=FormattedTextControl(self._approval_fragments),
                 height=self._approval_height,
@@ -752,8 +755,15 @@ class LeapApp:
                 dont_extend_height=True,
                 style="class:approval.modal",
             ),
-            filter=Condition(lambda: self._approval_modal is not None),
+            filter=has_approval,
         )
+        root = HSplit([
+            ConditionalContainer(spinner, filter=no_approval),
+            approval_panel,
+            ConditionalContainer(status_gap, filter=no_approval),
+            status_bar,
+            ConditionalContainer(self._input_area, filter=no_approval),
+        ])
         layout = Layout(
             FloatContainer(
                 content=root,
@@ -766,13 +776,6 @@ class LeapApp:
                             scroll_offset=1,
                             display_arrows=True,
                         ),
-                    ),
-                    Float(
-                        top=0,
-                        bottom=2,
-                        left=2,
-                        right=2,
-                        content=approval_overlay,
                     ),
                 ],
             )
@@ -993,17 +996,22 @@ class LeapApp:
             return f"{self._pending_input.qsize()} queued · /pause hold · /queue view · /drop <id> remove"
         return "Ask LeapFlow… /help commands · /status runtime · /queue tasks"
 
+    def _approval_max_lines(self) -> int:
+        """Terminal-aware max height for the inline approval panel."""
+        terminal_lines = shutil.get_terminal_size((80, 24)).lines
+        return max(8, terminal_lines - 2)
+
     def _approval_fragments(self) -> list[tuple[str, str]]:
         modal = self._approval_modal
         if modal is None:
             return []
-        return modal.fragments()
+        return modal.fragments(max_lines=self._approval_max_lines())
 
     def _approval_height(self) -> int:
         modal = self._approval_modal
         if modal is None:
             return 0
-        return modal.line_count()
+        return modal.line_count(max_lines=self._approval_max_lines())
 
     def _spinner_fragments(self) -> list[tuple[str, str]]:
         if not self._spinner_text:

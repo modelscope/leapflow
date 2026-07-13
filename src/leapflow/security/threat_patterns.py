@@ -17,7 +17,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
 
 class ThreatScope(Enum):

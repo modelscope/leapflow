@@ -51,6 +51,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - Consider affected user journeys before changing shared flows; do not introduce regressions, broken links, or worse experiences in adjacent paths
 - Keep common paths transparent: long-running work must stream progress, surface recoverable errors clearly, and avoid silent stalls.
 - For context assembly, prefer manifest-driven progressive disclosure over shortcuts or intent-handler sprawl: expose compact capability indexes, selected schemas, and targeted memory only when the current plan needs them.
+- Avoid rule-based natural-language fitting by default. Do not add keyword/action-verb/alias enumerations, intent-handler taxonomies, or brittle routing rules when LLM-native capability disclosure, manifests, schemas, protocols, or configuration-driven contracts can solve the problem. If a rule-based method is truly unavoidable for a stable protocol boundary, offline fallback, or safety hard gate, explain the necessity, scope, alternatives, and rollback path to a human and obtain explicit second confirmation before implementation.
 - Preserve security and audit paths: dangerous actions, file writes, outbound messages, credentials, and path access must flow through the existing policy, approval, redaction, and audit mechanisms.
 - Maintain backward-compatible migrations for persistent state, configuration, skills, trajectories, sessions, and profile data.
 - Write unit tests before or alongside the implementation
@@ -62,6 +63,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 ## Review Requirements
 
 - **Deep review for large changes**: When a change substantially affects architecture, runtime behavior, user flows, persistence, safety, or multiple modules, perform an additional deep review before considering the work complete.
+- **Human confirmation for TUI changes**: Any TUI layout or interaction-logic change requires a second human confirmation before it is considered ready.
 - **Design goal check**: Verify that the implementation actually achieves the intended design goal and is not just a local patch.
 - **Optimality check**: Evaluate whether the solution is the simplest robust design, avoids unnecessary abstractions, and fits the existing architecture.
 - **Regression impact check**: Inspect affected modules and user journeys for logic bugs, degraded UX, broken compatibility, slower feedback, weaker diagnostics, or worse failure recovery.
@@ -90,7 +92,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - Hardcoded paths, URLs, thresholds without config escape hatch
 - Chinese comments in source code (English only)
 - Speculative infrastructure: no hooks or extension points without a concrete consumer
-- Shortcut-style natural-language fitting and large intent-handler taxonomies; use stable runtime gates plus capability manifests instead.
+- Shortcut-style natural-language fitting and large intent-handler taxonomies; use stable runtime gates plus capability manifests instead. Rule-based keyword/action-verb/alias matching is prohibited by default and requires explicit human second confirmation before implementation when unavoidable.
 - Bare `except:` clauses — always specify the exception type
 - `# TODO: implement` stubs — implement or don't commit
 

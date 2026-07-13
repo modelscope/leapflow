@@ -64,6 +64,23 @@ def test_default_risk_classifier_detects_heredoc() -> None:
     assert risk.allow_permanent is False
 
 
+def test_platform_action_risk_uses_registered_metadata() -> None:
+    action = ActionDescriptor.platform_action(
+        "feishu",
+        "mail.search_unread",
+        {"query": "urgent"},
+        backend_kind="cli",
+        metadata={"effect": "read", "risk_level": "high"},
+    )
+
+    risk = DefaultRiskClassifier().assess(action)
+
+    assert risk.level == RiskLevel.HIGH
+    assert risk.reasons == ("registered_platform_action",)
+    assert risk.allow_permanent is False
+    assert risk.metadata["backend_kind"] == "cli"
+
+
 def test_approval_request_round_trips_request_id() -> None:
     from leapflow.security.approval import ApprovalRequest
 

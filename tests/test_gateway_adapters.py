@@ -10,6 +10,7 @@ from leapflow.gateway.adapters.dingtalk import DingTalkAdapter
 from leapflow.gateway.adapters.feishu import FeishuAdapter
 from leapflow.gateway.adapters.telegram import TelegramAdapter
 from leapflow.gateway.adapters.webhook import WebhookAdapter
+from leapflow.gateway.connectors.protocol import ActionResult, BackendStatus
 from leapflow.gateway.manifest import ManifestLoader
 from leapflow.gateway.protocol import InboundMessage, OutboundContent, SendTarget
 from leapflow.gateway.server import GatewayServer
@@ -48,7 +49,7 @@ def test_builtin_manifest_adapter_modules_are_importable() -> None:
         "api_server": {"api_key": "0123456789abcdef"},
         "webhook": {"webhook_secret": ""},
         "telegram": {"bot_token": "token"},
-        "feishu": {"app_id": "app", "app_secret": "secret"},
+        "feishu": {},
         "dingtalk": {"app_key": "key", "app_secret": "secret"},
     }
 
@@ -153,43 +154,40 @@ async def test_telegram_adapter_send_and_update_normalization() -> None:
     assert received[0].text == "incoming"
 
 
+class FakeExecutionBackend:
+    kind = "cli"
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, Mapping[str, Any]]] = []
+
+    async def status(self) -> BackendStatus:
+        return BackendStatus(ok=True, backend_kind=self.kind)
+
+    async def authenticate(self, payload: Mapping[str, Any]) -> BackendStatus:
+        return BackendStatus(ok=True, backend_kind=self.kind, metadata=dict(payload))
+
+    async def execute(self, spec, payload: Mapping[str, Any]) -> ActionResult:
+        self.executed.append((spec.name, payload))
+        return ActionResult(ok=True, resource_id="om_1", data={"message_id": "om_1"})
+
+
 @pytest.mark.asyncio
-async def test_feishu_adapter_connect_send_and_event_normalization() -> None:
-    fake_http = FakeJsonHttpClient({
-        "tenant_access_token": (200, {"code": 0, "tenant_access_token": "tenant-token"}),
-        "/im/v1/messages": (200, {"code": 0, "data": {"message_id": "om_1"}}),
-    })
-    received: list[InboundMessage] = []
-    adapter = FeishuAdapter(app_id="app", app_secret="secret", port=0, http_client=fake_http)
-    adapter.on_message = received.append
+async def test_feishu_adapter_uses_cli_backend_for_send() -> None:
+    backend = FakeExecutionBackend()
+    adapter = FeishuAdapter(profile="bot-reader", backend=backend)
 
     await adapter.connect()
-    try:
-        result = await adapter.send(
-            SendTarget(platform="feishu", chat_id="oc_1"),
-            OutboundContent(text="hello feishu"),
-        )
-        status, data = await post_json_for_test(adapter.local_url, {
-            "event": {
-                "message": {
-                    "message_id": "om_in",
-                    "chat_id": "oc_1",
-                    "chat_type": "group",
-                    "content": "{\"text\": \"incoming feishu\"}",
-                },
-                "sender": {"sender_id": {"open_id": "ou_1"}, "sender_type": "user"},
-            },
-        })
-    finally:
-        await adapter.disconnect()
+    result = await adapter.send(
+        SendTarget(platform="feishu", chat_id="oc_1"),
+        OutboundContent(text="hello feishu"),
+    )
+    await adapter.disconnect()
 
     assert result.ok is True
-    assert status == 202
-    assert data["ok"] is True
     assert result.message_id == "om_1"
-    assert fake_http.requests[1]["headers"]["Authorization"] == "Bearer tenant-token"
-    assert received[0].text == "incoming feishu"
-    assert received[0].source.user_id == "ou_1"
+    assert backend.executed == [
+        ("im.send_message", {"chat_id": "oc_1", "thread_id": "", "text": "hello feishu"}),
+    ]
 
 
 @pytest.mark.asyncio

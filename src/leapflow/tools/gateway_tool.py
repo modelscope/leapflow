@@ -17,11 +17,14 @@ logger = logging.getLogger(__name__)
 
 _gateway_server_ref: Any = None
 _approval_gate: Any = None
+_pending_app_onboarding: Dict[str, Any] | None = None
 
 
 def set_gateway_server(server: Any) -> None:
     """Install ``GatewayServer`` reference for tool dispatch (late-bound)."""
-    global _gateway_server_ref
+    global _gateway_server_ref, _pending_app_onboarding
+    if server is not _gateway_server_ref:
+        _pending_app_onboarding = None
     _gateway_server_ref = server
 
 
@@ -29,6 +32,52 @@ def set_gateway_approval_gate(gate: Any) -> None:
     """Install approval gate for outbound messaging (late-bound)."""
     global _approval_gate
     _approval_gate = gate
+
+
+def build_app_connector_prompt_section() -> str:
+    """Build a compact App Connector capability index for the current prompt.
+
+    This function does not classify user text. It only exposes the currently
+    supported platform manifests so the LLM can use its normal language
+    understanding in the same turn and choose the right connector tool.
+    """
+    if _gateway_server_ref is None:
+        return ""
+    manifests = getattr(_gateway_server_ref, "manifests", {}) or {}
+    if not manifests:
+        return ""
+
+    lines = [
+        "\n## App Connector Capability Index",
+        "LeapFlow can onboard and manage these external apps through `platform_connect`.",
+        "For requests about connecting, setting up, configuring, enabling, or managing a supported app, use `platform_connect` first instead of generating SDK/Webhook sample code.",
+        "Use `action='guide'` with the matching `platform` to start onboarding; use `action='list'` when the app is unclear.",
+        "When a pending onboarding state is present, continue from that state with `platform_connect` instead of asking the user to restate the app.",
+        "Supported apps:",
+    ]
+    for platform_id, manifest in sorted(manifests.items()):
+        backend = dict(getattr(manifest, "backend", {}) or {})
+        backend_kind = str(backend.get("kind") or "adapter")
+        domains = dict(getattr(manifest, "actions", {}) or {}).get("initial_domains") or ()
+        domain_text = f"; domains={', '.join(str(item) for item in domains)}" if domains else ""
+        lines.append(
+            f"- `{platform_id}`: {getattr(manifest, 'display_name', platform_id)} "
+            f"(category={getattr(manifest, 'category', '')}; backend={backend_kind}{domain_text})"
+        )
+    if _pending_app_onboarding:
+        state = dict(_pending_app_onboarding)
+        next_actions = state.get("next_actions") or []
+        next_text = "; next=" + " | ".join(str(item) for item in next_actions[:3]) if next_actions else ""
+        lines.extend([
+            "",
+            "Pending App Onboarding State:",
+            (
+                f"- platform=`{state.get('platform_id', '')}`; stage={state.get('stage', 'unknown')}; "
+                f"backend={state.get('backend_kind', 'unknown')}; recoverable={state.get('recoverable', True)}{next_text}"
+            ),
+            "Use this state to continue app onboarding; do not ask the user to repeat known platform details.",
+        ])
+    return "\n".join(lines) + "\n"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -66,6 +115,40 @@ async def gateway_connect_handler(params: Dict[str, Any]) -> Dict[str, Any]:
     return await handler(platform, params)
 
 
+async def platform_connect_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle platform connection management across backend kinds."""
+    if _gateway_server_ref is None:
+        return {"ok": False, "error": "Gateway not initialised"}
+    action = params.get("action", "list")
+    platform = params.get("platform", "")
+    if action == "connect":
+        if not platform:
+            return {"ok": False, "error": "platform is required"}
+        return await _action_connect(platform, params)
+    if action == "preflight":
+        if not platform:
+            return {"ok": False, "error": "platform is required"}
+        return await _action_preflight(platform, params)
+    if action == "events_start":
+        if not platform:
+            return {"ok": False, "error": "platform is required"}
+        return await _gateway_server_ref.start_platform_events(
+            platform,
+            checkpoint=str(params.get("checkpoint") or ""),
+        )
+    if action == "events_stop":
+        if not platform:
+            return {"ok": False, "error": "platform is required"}
+        return await _gateway_server_ref.stop_platform_events(platform)
+    if action == "events_status":
+        if not platform:
+            return {"ok": False, "error": "platform is required"}
+        return await _gateway_server_ref.platform_event_status(platform)
+    if action in {"list", "guide", "disconnect", "remove", "status"}:
+        return await gateway_connect_handler(params)
+    return {"ok": False, "error": f"Unknown action: {action}"}
+
+
 # ── Action implementations ───────────────────────────────────
 
 async def _action_list(
@@ -90,6 +173,8 @@ async def _action_list(
         if s.connected and s.connected_since > 0:
             uptime_s = int(time.time() - s.connected_since)
             entry["uptime"] = _format_uptime(uptime_s)
+        if getattr(s, "metadata", None):
+            entry["diagnostics"] = dict(s.metadata)
         platforms.append(entry)
     return {"ok": True, "platforms": platforms}
 
@@ -156,6 +241,16 @@ async def _action_guide(
     if options:
         result["optional_settings"] = options
 
+    preflight_checks = _manifest_preflight_checks(manifest)
+    if preflight_checks:
+        result["preflight_checks"] = preflight_checks
+        preflight = await _run_manifest_preflight(platform, manifest, _params)
+        result["preflight_result"] = preflight
+        result["onboarding_state"] = _remember_app_onboarding(platform, manifest, preflight)
+        result["recovery_hint"] = preflight.get("recovery_hint") or "Complete the preflight checks first; LeapFlow will then reuse the authorized backend profile."
+        if preflight.get("next_steps"):
+            result["next_steps"] = preflight["next_steps"]
+
     result["setup_form"] = {
         "fields": [
             {
@@ -167,15 +262,24 @@ async def _action_guide(
             for c in manifest.credentials
         ],
         "console_url": manifest.setup_guide.console_url,
+        "backend": dict(manifest.backend),
+        "actions": dict(manifest.actions),
     }
 
     required = [c for c in manifest.credentials if c.required]
-    labels = " / ".join(c.label for c in required)
-    result["prompt_hint"] = (
-        f"Present the setup steps above, then ask the user to provide "
-        f"{labels} in a single reply.  Do NOT repeat credential values "
-        f"in your response."
-    )
+    if required:
+        labels = " / ".join(c.label for c in required)
+        result["prompt_hint"] = (
+            f"Present the setup steps above, then ask the user to provide "
+            f"{labels} in a single reply.  Do NOT repeat credential values "
+            f"in your response."
+        )
+    else:
+        result["prompt_hint"] = (
+            "Present the setup steps and current preflight result. If all safe checks are ready, "
+            "call platform_connect with action='connect'. If a preflight step requires installation, "
+            "authorization, or credentials, ask only for that missing user action and avoid repeating known details."
+        )
 
     return result
 
@@ -188,17 +292,184 @@ async def _action_connect(
     SECURITY: credentials flow into ``connect_platform()`` which encrypts
     and persists them.  Return value contains **only** status.
     """
+    manifest = _gateway_server_ref.manifests.get(platform)
     credentials = params.get("credentials", {})
     options = params.get("options", {})
 
     if not platform:
         return {"ok": False, "error": "Platform ID is required"}
-    if not credentials:
+    if manifest is None:
+        return {"ok": False, "error": f"Unknown platform: {platform}"}
+    has_required_credentials = any(c.required for c in manifest.credentials)
+    if has_required_credentials and not credentials:
         return await _action_guide(platform, params)
 
-    return await _gateway_server_ref.connect_platform(
+    result = await _gateway_server_ref.connect_platform(
         platform, credentials, options,
     )
+    return _decorate_app_connection_result(platform, manifest, result)
+
+
+async def _action_preflight(
+    platform: str, params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run safe manifest-driven preflight checks for a platform."""
+    manifest = _gateway_server_ref.manifests.get(platform)
+    if not platform:
+        return {"ok": False, "error": "Platform ID is required"}
+    if manifest is None:
+        return {"ok": False, "error": f"Unknown platform: {platform}"}
+    preflight = await _run_manifest_preflight(platform, manifest, params)
+    state = _remember_app_onboarding(platform, manifest, preflight)
+    return {
+        "ok": bool(preflight.get("ready")),
+        "platform": platform,
+        "stage": state.get("stage"),
+        "preflight_result": preflight,
+        "onboarding_state": state,
+        "recovery_hint": preflight.get("recovery_hint", ""),
+        "next_steps": list(preflight.get("next_steps") or ()),
+    }
+
+
+def _decorate_app_connection_result(platform: str, manifest: Any, result: Dict[str, Any]) -> Dict[str, Any]:
+    response = dict(result)
+    if response.get("ok"):
+        response["onboarding_state"] = _remember_app_onboarding(
+            platform,
+            manifest,
+            {
+                "ready": True,
+                "stage": "connected",
+                "backend_kind": _manifest_backend_kind(manifest),
+                "recoverable": False,
+                "next_steps": [],
+            },
+        )
+        return response
+
+    diagnostics = dict(response.get("diagnostics") or response.get("metadata") or {})
+    stage = _stage_from_backend_metadata(diagnostics, default="connect_failed")
+    preflight = {
+        "ready": False,
+        "stage": stage,
+        "backend_kind": _manifest_backend_kind(manifest),
+        "recoverable": bool(diagnostics.get("recoverable", True)),
+        "recovery_hint": response.get("recovery_hint") or diagnostics.get("recovery_hint") or response.get("error", ""),
+        "next_steps": response.get("next_steps") or diagnostics.get("next_steps") or [],
+        "metadata": diagnostics,
+    }
+    response["onboarding_state"] = _remember_app_onboarding(platform, manifest, preflight)
+    response.setdefault("recovery_hint", preflight["recovery_hint"])
+    if preflight["next_steps"]:
+        response.setdefault("next_steps", preflight["next_steps"])
+    return response
+
+
+def _manifest_backend_kind(manifest: Any) -> str:
+    backend = dict(getattr(manifest, "backend", {}) or {})
+    return str(backend.get("kind") or "adapter")
+
+
+def _manifest_option_default(manifest: Any, key: str, fallback: Any = "") -> Any:
+    for option in getattr(manifest, "options", ()) or ():
+        if str(getattr(option, "key", "")) == key:
+            value = getattr(option, "default", fallback)
+            return fallback if value is None else value
+    return fallback
+
+
+def _stage_from_backend_metadata(metadata: Dict[str, Any], *, default: str) -> str:
+    detail = str(metadata.get("detail") or metadata.get("error") or metadata.get("last_error") or "").lower()
+    auth_status = str(metadata.get("auth_status") or "").lower()
+    failure_code = str(metadata.get("failure_code") or metadata.get("error_code") or "").lower()
+    if failure_code == "cli_contract_mismatch":
+        return "cli_contract_mismatch"
+    if metadata.get("binary_path") or auth_status == "authorized":
+        if auth_status == "authorized":
+            return "auth_ready"
+        if auth_status in {"not_ready", "unknown"}:
+            return "auth_missing"
+        return default
+    if "binary not found" in detail or "not found" in detail or auth_status == "unknown":
+        return "cli_missing"
+    if "unauthor" in detail or "login" in detail or "token" in detail:
+        return "auth_missing"
+    return default
+
+
+async def _run_manifest_preflight(platform: str, manifest: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+    backend_kind = _manifest_backend_kind(manifest)
+    if backend_kind != "cli":
+        return {
+            "ready": True,
+            "stage": "ready",
+            "backend_kind": backend_kind,
+            "recoverable": False,
+            "checks": [],
+            "next_steps": [f"platform_connect action=connect platform={platform}"],
+        }
+
+    from leapflow.gateway.backends.cli_backend import CliBackend
+
+    backend = dict(getattr(manifest, "backend", {}) or {})
+    options = dict(params.get("options") or {})
+    binary = str(options.get("binary") or backend.get("binary") or _manifest_option_default(manifest, "binary", "lark-cli"))
+    profile = str(options.get("profile") or _manifest_option_default(manifest, "profile", ""))
+    identity = str(options.get("identity") or _manifest_option_default(manifest, "identity", ""))
+    status = await CliBackend(binary=binary, profile=profile, identity=identity, timeout_s=6.0).status()
+    metadata = dict(status.metadata)
+    stage = "auth_ready" if status.ok else _stage_from_backend_metadata(metadata, default="auth_missing")
+    checks = _preflight_checks_with_status(_manifest_preflight_checks(manifest), stage)
+    next_steps = list(metadata.get("next_steps") or [])
+    if status.ok:
+        next_steps = [f"platform_connect action=connect platform={platform}"]
+    return {
+        "ready": bool(status.ok),
+        "stage": stage,
+        "backend_kind": backend_kind,
+        "recoverable": bool(metadata.get("recoverable", not status.ok)),
+        "checks": checks,
+        "detail": status.detail,
+        "metadata": metadata,
+        "recovery_hint": metadata.get("recovery_hint", "") if not status.ok else "CLI backend is authorized; continue with platform_connect action='connect'.",
+        "next_steps": next_steps,
+    }
+
+
+def _preflight_checks_with_status(checks: list[Dict[str, Any]], stage: str) -> list[Dict[str, Any]]:
+    decorated: list[Dict[str, Any]] = []
+    for check in checks:
+        item = dict(check)
+        key = str(item.get("key") or "")
+        if stage == "auth_ready":
+            item["status"] = "passed"
+        elif stage == "cli_missing":
+            item["status"] = "failed" if key == "cli_installed" else "blocked"
+        elif stage == "auth_missing":
+            item["status"] = "passed" if key == "cli_installed" else ("failed" if key == "cli_status" else "blocked")
+        elif stage == "cli_contract_mismatch":
+            item["status"] = "passed" if key == "cli_installed" else ("failed" if key == "cli_status" else "blocked")
+        else:
+            item["status"] = "pending"
+        decorated.append(item)
+    return decorated
+
+
+def _remember_app_onboarding(platform: str, manifest: Any, preflight: Dict[str, Any]) -> Dict[str, Any]:
+    global _pending_app_onboarding
+    state = {
+        "platform_id": platform,
+        "platform": getattr(manifest, "display_name", platform),
+        "stage": preflight.get("stage") or "unknown",
+        "backend_kind": preflight.get("backend_kind") or _manifest_backend_kind(manifest),
+        "ready": bool(preflight.get("ready")),
+        "recoverable": bool(preflight.get("recoverable", True)),
+        "last_error": preflight.get("detail") or preflight.get("recovery_hint") or "",
+        "next_actions": list(preflight.get("next_steps") or ()),
+    }
+    _pending_app_onboarding = state if state["stage"] != "connected" else None
+    return state
 
 
 async def _action_disconnect(
@@ -243,6 +514,10 @@ async def _action_status(
             entry["error"] = s.error
         if s.connected and s.connected_since > 0:
             entry["uptime"] = _format_uptime(int(time.time() - s.connected_since))
+        if getattr(s, "metadata", None):
+            entry["diagnostics"] = dict(s.metadata)
+            if s.metadata.get("recovery_hint"):
+                entry["recovery_hint"] = s.metadata["recovery_hint"]
         return entry
 
     if platform:
@@ -254,6 +529,92 @@ async def _action_status(
                 return result
         return {"ok": False, "error": f"Platform not found: {platform}"}
     return {"ok": True, "platforms": [_status_entry(s) for s in statuses]}
+
+
+def _manifest_preflight_checks(manifest: Any) -> list[Dict[str, Any]]:
+    backend = dict(getattr(manifest, "backend", {}) or {})
+    if backend.get("kind") != "cli":
+        return []
+    binary = str(backend.get("binary") or "lark-cli")
+    return [
+        {
+            "key": "cli_installed",
+            "label": "Install CLI",
+            "kind": "check",
+            "auto_run": True,
+            "requires_approval": False,
+            "command": f"{binary} --version",
+            "help": f"Ensure '{binary}' is installed and available on PATH.",
+            "failure_code": "cli_missing",
+        },
+        {
+            "key": "cli_authorized",
+            "label": "Authorize profile",
+            "kind": "interactive_auth",
+            "auto_run": False,
+            "requires_approval": True,
+            "command": f"{binary} auth login --json",
+            "help": "Authorize the selected CLI identity once in the official CLI.",
+            "failure_code": "auth_missing",
+        },
+        {
+            "key": "cli_status",
+            "label": "Verify status",
+            "kind": "check",
+            "auto_run": True,
+            "requires_approval": False,
+            "command": f"{binary} auth status --json",
+            "help": "Confirm the selected CLI profile is ready before connecting.",
+            "failure_code": "auth_missing",
+        },
+    ]
+
+
+def _manifest_action_spec(platform: str, action: str) -> Any:
+    manifest = _gateway_server_ref.manifests.get(platform) if _gateway_server_ref is not None else None
+    if manifest is None:
+        return None
+    actions = dict(getattr(manifest, "actions", {}) or {})
+    pack = str(actions.get("pack") or "")
+    if not pack:
+        return None
+    try:
+        from leapflow.gateway.connectors.action_registry import ActionRegistry
+
+        return ActionRegistry.from_module(pack).get(action)
+    except (ImportError, AttributeError, ValueError):
+        logger.debug("platform.action_pack_lookup_failed platform=%s action=%s", platform, action, exc_info=True)
+        return None
+
+
+def _platform_action_unavailable_response(platform: str, action: str) -> Dict[str, Any]:
+    manifest = _gateway_server_ref.manifests.get(platform) if _gateway_server_ref is not None else None
+    if manifest is None:
+        return {"ok": False, "failure_code": "unknown_platform", "error": f"Unknown platform: {platform}"}
+    if _manifest_action_spec(platform, action) is None:
+        actions = dict(getattr(manifest, "actions", {}) or {})
+        return {
+            "ok": False,
+            "failure_code": "unknown_platform_action",
+            "error": f"Unknown platform action: {platform}.{action}",
+            "available_actions": actions,
+        }
+    recovery_hint = "Connect the platform backend before running registered platform actions."
+    next_steps = [
+        f"platform_connect action=guide platform={platform}",
+        f"platform_connect action=preflight platform={platform}",
+        f"platform_connect action=connect platform={platform}",
+    ]
+    response: Dict[str, Any] = {
+        "ok": False,
+        "failure_code": "platform_not_connected",
+        "error": f"Platform '{platform}' is not connected; registered action '{action}' cannot run yet.",
+        "recovery_hint": recovery_hint,
+        "next_steps": next_steps,
+    }
+    if _pending_app_onboarding and _pending_app_onboarding.get("platform_id") == platform:
+        response["onboarding_state"] = dict(_pending_app_onboarding)
+    return response
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -281,6 +642,28 @@ async def gateway_send_handler(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "chat_id is required"}
     if not text:
         return {"ok": False, "error": "text is required"}
+
+    spec = _gateway_server_ref.get_platform_action_spec(platform, "im.send_message")
+    if spec is None:
+        unavailable = _platform_action_unavailable_response(platform, "im.send_message")
+        if unavailable.get("failure_code") != "unknown_platform_action":
+            return unavailable
+    else:
+        delegated = await platform_action_handler({
+            "platform": platform,
+            "action": "im.send_message",
+            "payload": {
+                "chat_id": chat_id,
+                "text": text,
+                "thread_id": params.get("thread_id", ""),
+            },
+            "source_tool": "gateway_send",
+        })
+        if delegated.get("ok"):
+            if delegated.get("resource_id") and "message_id" not in delegated:
+                delegated["message_id"] = delegated["resource_id"]
+            delegated.setdefault("source_tool", "gateway_send")
+        return delegated
 
     if _approval_gate is not None:
         try:
@@ -323,11 +706,126 @@ async def gateway_send_handler(params: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute a registered platform action through the gateway boundary."""
+    if _gateway_server_ref is None:
+        return {"ok": False, "error": "Gateway not initialised"}
+    platform = str(params.get("platform") or "")
+    action_name = str(params.get("action") or "")
+    payload = params.get("payload") or {}
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "payload must be an object"}
+    if not platform:
+        return {"ok": False, "error": "platform is required"}
+    if not action_name:
+        return {"ok": False, "error": "action is required"}
+
+    spec = _gateway_server_ref.get_platform_action_spec(platform, action_name)
+    if spec is None:
+        return _platform_action_unavailable_response(platform, action_name)
+    preview = await _gateway_server_ref.preview_platform_action(platform, action_name, payload)
+    if not preview.get("ok"):
+        return {"ok": False, "error": str(preview.get("error") or "Platform action preview failed")}
+
+    if _approval_gate is not None:
+        try:
+            from leapflow.security.actions import ActionDescriptor
+            from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+
+            approval_action = ActionDescriptor.platform_action(
+                platform,
+                action_name,
+                payload,
+                backend_kind=spec.backend_kind,
+                metadata={
+                    "effect": spec.effect,
+                    "risk_level": spec.risk_level,
+                    "output_policy": spec.output_policy,
+                    "preview": preview.get("summary", ""),
+                },
+            )
+            if hasattr(_approval_gate, "evaluate"):
+                result = await _approval_gate.evaluate(approval_action)
+                if not getattr(result, "approved", False):
+                    error = str(getattr(result, "denial_message", "") or "Platform action denied by approval gate")
+                    return {"ok": False, "error": error}
+            else:
+                decision = await _approval_gate.request_approval(ApprovalRequest(
+                    category=approval_action.kind,
+                    detail=str(preview.get("summary") or approval_action.summary),
+                    risk_hint=0.6,
+                    metadata={
+                        "platform": platform,
+                        "action": action_name,
+                        "backend_kind": spec.backend_kind,
+                        "risk_level": spec.risk_level,
+                    },
+                    action=approval_action,
+                ))
+                if decision not in {
+                    ApprovalDecision.ALLOW,
+                    ApprovalDecision.ALLOW_ONCE,
+                    ApprovalDecision.ALLOW_SESSION,
+                    ApprovalDecision.ALLOW_ALWAYS,
+                }:
+                    return {"ok": False, "error": "Platform action denied by approval gate"}
+        except Exception:
+            logger.debug("platform_action approval check failed", exc_info=True)
+            return {"ok": False, "error": "Platform action approval check failed"}
+
+    return await _gateway_server_ref.execute_platform_action(platform, action_name, payload)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Tool registration (OpenAI function calling schema)
 # ═══════════════════════════════════════════════════════════════
 
 GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "platform_action",
+            "description": (
+                "Execute a registered action on an external platform through LeapFlow's "
+                "App Connector layer. Actions are addressed as domain.operation, e.g. "
+                "im.send_message or docs.create_markdown. Never pass raw CLI commands or URLs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "platform": {"type": "string", "description": "Platform ID, e.g. feishu"},
+                    "action": {"type": "string", "description": "Registered action, e.g. im.send_message"},
+                    "payload": {"type": "object", "description": "Action payload matching the registered schema"},
+                    "backend_kind": {"type": "string", "description": "Optional backend hint: cli/rest/mcp"},
+                },
+                "required": ["platform", "action", "payload"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "platform_connect",
+            "description": (
+                "List, guide, connect, disconnect, remove, or check status for external "
+                "platforms using the App Connector layer. Supports REST and CLI backends."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": [
+                        "list", "guide", "preflight", "connect", "disconnect", "remove", "status",
+                        "events_start", "events_stop", "events_status",
+                    ]},
+                    "platform": {"type": "string", "description": "Platform ID"},
+                    "credentials": {"type": "object", "description": "Optional credentials for REST-style backends"},
+                    "options": {"type": "object", "description": "Backend options such as profile, identity, or binary"},
+                    "checkpoint": {"type": "string", "description": "Optional event source resume checkpoint"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -418,6 +916,29 @@ GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
 
 GATEWAY_BRIDGE_TOOLS: List[Dict[str, Any]] = [
     {
+        "name": "gp_platform_connect",
+        "description": "Connect or manage external platform integrations via App Connector.",
+        "parameters": {
+            "action": "string (required) — list/guide/connect/disconnect/remove/status/events_start/events_stop/events_status",
+            "platform": "string (optional) — platform ID",
+            "credentials": "object (optional) — backend credentials",
+            "options": "object (optional) — backend options",
+            "checkpoint": "string (optional) — event source resume checkpoint",
+        },
+        "handler": platform_connect_handler,
+    },
+    {
+        "name": "gp_platform_action",
+        "description": "Execute a registered platform action via App Connector.",
+        "parameters": {
+            "platform": "string (required) — platform ID",
+            "action": "string (required) — domain.operation",
+            "payload": "object (required) — action payload",
+        },
+        "handler": platform_action_handler,
+        "mutates_state": True,
+    },
+    {
         "name": "gp_gateway_connect",
         "description": "Connect or manage external platform integrations.",
         "parameters": {
@@ -442,6 +963,10 @@ GATEWAY_BRIDGE_TOOLS: List[Dict[str, Any]] = [
 ]
 
 GATEWAY_TOOL_HANDLERS: Dict[str, Any] = {
+    "platform_connect": platform_connect_handler,
+    "gp_platform_connect": platform_connect_handler,
+    "platform_action": platform_action_handler,
+    "gp_platform_action": platform_action_handler,
     "gateway_connect": gateway_connect_handler,
     "gp_gateway_connect": gateway_connect_handler,
     "gateway_send": gateway_send_handler,

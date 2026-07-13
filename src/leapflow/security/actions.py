@@ -17,6 +17,7 @@ class ActionKind(str, Enum):
     FILE_WRITE = "file.write"
     FILE_DELETE = "file.delete"
     GATEWAY_SEND = "gateway.send"
+    PLATFORM_ACTION = "platform.action"
     SCHEDULER_ARM = "scheduler.arm"
     SKILL_EXECUTE = "skill.execute"
     SKILL_PROMOTE = "skill.promote"
@@ -128,6 +129,34 @@ class ActionDescriptor:
             metadata=merged,
         )
 
+    @classmethod
+    def platform_action(
+        cls,
+        platform: str,
+        action: str,
+        payload: dict[str, Any],
+        *,
+        backend_kind: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> "ActionDescriptor":
+        """Describe a platform action before backend execution."""
+        merged = dict(metadata or {})
+        merged.update({
+            "platform": platform,
+            "action": action,
+            "backend_kind": backend_kind,
+        })
+        effect = str(merged.get("effect") or _effect_for_platform_action(action))
+        detail = json.dumps(payload, ensure_ascii=False, sort_keys=True)[:1000]
+        return cls(
+            kind=ActionKind.PLATFORM_ACTION.value,
+            summary=f"Run {platform}.{action}",
+            detail=detail,
+            effect=effect,
+            resource=f"{platform}:{action}",
+            metadata=merged,
+        )
+
     def signature(self) -> str:
         """Return a stable signature suitable for session/profile grants."""
         payload = {
@@ -169,12 +198,23 @@ def _summarize_shell(command: str) -> str:
     return "Run shell command"
 
 
+def _effect_for_platform_action(action: str) -> str:
+    lowered = action.lower()
+    if any(token in lowered for token in ("send", "reply", "message")):
+        return ActionEffect.SEND.value
+    if any(token in lowered for token in ("delete", "remove")):
+        return ActionEffect.DELETE.value
+    if any(token in lowered for token in ("create", "update", "write", "append", "approve")):
+        return ActionEffect.WRITE.value
+    return ActionEffect.READ.value
+
+
 def _normalize_resource(resource: str) -> str:
     return resource.replace("\\", "/").strip().lower()
 
 
 def _normalize_detail(kind: str, detail: str) -> str:
     text = re.sub(r"\s+", " ", detail.strip())
-    if kind == ActionKind.GATEWAY_SEND.value:
-        return "<message>"
+    if kind in {ActionKind.GATEWAY_SEND.value, ActionKind.PLATFORM_ACTION.value}:
+        return "<platform-payload>"
     return text[:4000]

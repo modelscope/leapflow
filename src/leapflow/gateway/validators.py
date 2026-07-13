@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ async def validate_credentials(
 # Built-in validators (for bundled manifests)
 # ═══════════════════════════════════════════════════════════════
 
-def _make_client_timeout() -> "aiohttp.ClientTimeout":
+def _make_client_timeout() -> Any:
     """Create a strict per-request timeout for credential validation.
 
     Imported lazily to avoid top-level ``aiohttp`` dependency.

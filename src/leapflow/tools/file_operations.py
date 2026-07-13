@@ -142,6 +142,11 @@ def _is_device_path(path: Path) -> bool:
     return resolved.startswith("/dev/") or resolved.startswith("/proc/")
 
 
+def _is_unsupported_leapflow_config_probe(path: Path) -> bool:
+    parts = path.parts
+    return len(parts) >= 2 and parts[-2:] == (".leapflow", "config.json")
+
+
 async def file_list(params: Dict[str, Any]) -> Dict[str, Any]:
     """List directory contents with optional glob pattern."""
     path = params.get("path", ".")
@@ -190,6 +195,18 @@ async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": f"Device path reads are blocked: {path}"}
 
     if not target.exists():
+        if _is_unsupported_leapflow_config_probe(target):
+            return {
+                "ok": False,
+                "error": (
+                    "LeapFlow does not use <workspace>/.leapflow/config.json. "
+                    "Use ~/.leapflow/.env for global runtime config, or an existing ./.env "
+                    "for project overrides."
+                ),
+                "error_type": "unsupported_config_probe",
+                "retryable": False,
+                "config_locations": ["~/.leapflow/.env", "./.env"],
+            }
         return {"ok": False, "error": f"File not found: {path}"}
     if not target.is_file():
         return {"ok": False, "error": f"Not a file: {path}"}

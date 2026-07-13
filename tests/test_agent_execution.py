@@ -253,6 +253,131 @@ async def test_unknown_tool_triggers_single_self_healing_retry() -> None:
             lt.close()
 
 @pytest.mark.asyncio
+async def test_app_connector_context_is_injected_without_extra_llm_call() -> None:
+    class CaptureLLM(StubLLM):
+        def __init__(self) -> None:
+            super().__init__(["Use platform_connect for supported app onboarding."])
+            self.seen_messages: list[list[dict[str, object]]] = []
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, **kwargs):
+            self.seen_messages.append(list(messages))
+            return await super().achat(messages, stream=stream, enable_thinking=enable_thinking, **kwargs)
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.gateway.server import GatewayServer
+        from leapflow.platform.mock import MockBridge
+        from leapflow.tools.gateway_tool import set_gateway_approval_gate, set_gateway_server
+
+        rpc = MockBridge()
+        llm = CaptureLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        server = GatewayServer(settings.profile_dir)
+        server.discover_manifests()
+        set_gateway_server(server)
+        set_gateway_approval_gate(None)
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            out = await engine.run("接入飞书")
+
+            system_prompt = str(llm.seen_messages[0][0].get("content", ""))
+            assert out == "Use platform_connect for supported app onboarding."
+            assert "App Connector Capability Index" in system_prompt
+            assert "`feishu`" in system_prompt
+            assert "`telegram`" in system_prompt
+            assert "platform_connect" in system_prompt
+            assert llm.call_count == 1
+        finally:
+            await server.stop()
+            set_gateway_approval_gate(None)
+            set_gateway_server(None)
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_app_connector_llm_tool_call_uses_same_unified_loop() -> None:
+    tool_reply = '<tool_call>{"name": "platform_connect", "arguments": {"action": "guide", "platform": "telegram"}}</tool_call>'
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.gateway.server import GatewayServer
+        from leapflow.platform.mock import MockBridge
+        from leapflow.tools.gateway_tool import set_gateway_approval_gate, set_gateway_server
+
+        rpc = MockBridge()
+        llm = StubLLM([tool_reply, "Telegram guide ready"])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        server = GatewayServer(settings.profile_dir)
+        server.discover_manifests()
+        set_gateway_server(server)
+        set_gateway_approval_gate(None)
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            events = [event async for event in engine.run_stream("配置 Telegram")]
+
+            tool_events = [event for event in events if event.type in {"tool_start", "tool_complete"}]
+            assert [event.content for event in tool_events] == ["platform_connect", "platform_connect"]
+            assert tool_events[1].metadata["ok"] is True
+            assert events[-1].type == "final"
+            assert "Telegram guide ready" in events[-1].content
+            assert llm.call_count == 2
+        finally:
+            await server.stop()
+            set_gateway_approval_gate(None)
+            set_gateway_server(None)
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_app_connector_empty_final_uses_onboarding_recovery_state() -> None:
+    tool_reply = (
+        '<tool_call>{"name": "platform_connect", "arguments": '
+        '{"action": "guide", "platform": "feishu", '
+        '"options": {"binary": "definitely-missing-cli-for-onboarding-test"}}}</tool_call>'
+    )
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.gateway.server import GatewayServer
+        from leapflow.platform.mock import MockBridge
+        from leapflow.tools.gateway_tool import set_gateway_approval_gate, set_gateway_server
+
+        rpc = MockBridge()
+        llm = StubLLM([tool_reply, ""])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        server = GatewayServer(settings.profile_dir)
+        server.discover_manifests()
+        set_gateway_server(server)
+        set_gateway_approval_gate(None)
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            final = await engine.run("继续接入")
+        finally:
+            await server.stop()
+            set_gateway_approval_gate(None)
+            set_gateway_server(None)
+            lt.close()
+
+    assert llm.call_count == 2
+    assert "App onboarding is paused" in final
+    assert "cli_missing" in final
+    assert "definitely-missing-cli-for-onboarding-test" in final
+
+
+@pytest.mark.asyncio
 async def test_text_tool_alias_is_normalized_in_stream_events() -> None:
     """Text-mode tool calls should not leak common alias names as unknown tools."""
     tool_reply = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
@@ -464,6 +589,9 @@ async def test_progressive_disclosure_light_query_omits_tools_and_thinking() -> 
             assert "Original user request: hello" in system_prompt
             assert "Workspace root:" in system_prompt
             assert "never infer `.` as the project root" in system_prompt
+            assert "do not probe that path" in system_prompt
+            assert "~/.leapflow/.env" in system_prompt
+            assert "./.env" in system_prompt
             snapshot = engine.context_budget_snapshot
             assert snapshot["disclosure_level"] == "light"
             assert snapshot["disclosure"]["native_tools"] is False

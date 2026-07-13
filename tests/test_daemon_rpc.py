@@ -379,6 +379,14 @@ async def test_daemon_client_slash_metadata_rpc() -> None:
                 "env_var": "LEAPFLOW_LLM_MODEL",
             }
 
+        async def app_command(self, args: str = "") -> dict[str, Any]:
+            return {
+                "ok": True,
+                "view": "list",
+                "args": args,
+                "result": {"platforms": [{"id": "feishu", "name": "Feishu", "state": "available"}]},
+            }
+
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
         server, task, run_dir = await _start_server(Path(root) / "run", service=SlashMetadataService())
         client = DaemonClient(run_dir / "leapd.sock")
@@ -386,6 +394,7 @@ async def test_daemon_client_slash_metadata_rpc() -> None:
             tools = await client.tools_list()
             usage = await client.usage_summary()
             model = await client.model_info("next-model")
+            app_payload = await client.app_command("list")
         finally:
             task.cancel()
             await server.stop()
@@ -397,6 +406,8 @@ async def test_daemon_client_slash_metadata_rpc() -> None:
     assert tools["groups"] == {"core": ["chat"]}
     assert usage["total_tokens"] == 15
     assert model["requested_model"] == "next-model"
+    assert app_payload["view"] == "list"
+    assert app_payload["args"] == "list"
 
 
 @pytest.mark.asyncio
@@ -438,11 +449,21 @@ async def test_runtime_service_slash_metadata_payloads() -> None:
 
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
         settings = make_settings(root)
+        from leapflow.gateway.server import GatewayServer
+
+        gateway_server = GatewayServer(settings.profile_dir)
+        gateway_server.discover_manifests()
         service = RuntimeLeapService(settings, mock_host=True)
         service._ctx = FakeContext(settings)
-        tools = await service.tools_list()
-        usage = await service.usage_summary()
-        model = await service.model_info("other-model")
+        service._ctx.gateway_server = gateway_server
+        try:
+            tools = await service.tools_list()
+            usage = await service.usage_summary()
+            model = await service.model_info("other-model")
+            app_list = await service.app_command("list")
+            app_status = await service.app_command("status feishu")
+        finally:
+            await gateway_server.stop()
 
     assert tools["ok"] is True
     assert tools["total"] > 0
@@ -450,6 +471,12 @@ async def test_runtime_service_slash_metadata_payloads() -> None:
     assert usage["context_length"] == 4096
     assert model["model"] == settings.llm_model
     assert model["requested_model"] == "other-model"
+    assert app_list["ok"] is True
+    assert app_list["view"] == "list"
+    assert {entry["id"] for entry in app_list["result"]["platforms"]} >= {"feishu", "telegram", "dingtalk"}
+    assert app_status["ok"] is True
+    assert app_status["view"] == "status"
+    assert app_status["result"]["platform"] == "feishu"
 
 
 @pytest.mark.asyncio

@@ -178,6 +178,14 @@ def _tool_result_metadata(
                     value,
                     limit=_TOOL_RESULT_PREVIEW_LIMIT,
                 )
+        # App Connector recovery metadata for TUI transparency
+        recovery_hint = result.get("recovery_hint")
+        if recovery_hint:
+            metadata["recovery_hint"] = _single_line_preview(recovery_hint, limit=_TOOL_RESULT_PREVIEW_LIMIT)
+        onboarding_state = result.get("onboarding_state")
+        if isinstance(onboarding_state, dict) and onboarding_state.get("stage"):
+            metadata["onboarding_stage"] = str(onboarding_state["stage"])
+            metadata["onboarding_platform"] = str(onboarding_state.get("platform_id") or "")
         if not any(key.endswith("_preview") for key in metadata):
             metadata["result_preview"] = _single_line_preview(
                 result,
@@ -213,6 +221,40 @@ def _unknown_tool_retry_prompt(result: Dict[str, Any]) -> str:
         f"Available tools include: {available_text}. "
         "Retry once using an exact canonical tool name and valid arguments, or answer without a tool if no tool fits."
     )
+
+
+def _app_onboarding_recovery_message(messages: List[Dict[str, Any]]) -> str:
+    """Build a useful final answer from recent App Connector recovery state."""
+    for message in reversed(messages):
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        if content.startswith("Tool result (") and ":\n" in content:
+            content = content.split(":\n", 1)[1].strip()
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        state = payload.get("onboarding_state")
+        if not isinstance(state, dict):
+            continue
+        platform = str(state.get("platform") or state.get("platform_id") or "the app")
+        stage = str(state.get("stage") or "pending")
+        hint = str(payload.get("recovery_hint") or state.get("last_error") or "")
+        steps = payload.get("next_steps") or state.get("next_actions") or []
+        lines = [
+            f"App onboarding is paused for {platform} at stage `{stage}`.",
+        ]
+        if hint:
+            lines.append(f"Reason: {hint}")
+        if isinstance(steps, list) and steps:
+            lines.append("Next steps:")
+            lines.extend(f"- {step}" for step in steps[:4])
+        lines.append("After completing the missing step, continue the same onboarding flow; LeapFlow will reuse the pending App Connector state.")
+        return "\n".join(lines)
+    return ""
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -410,6 +452,11 @@ class TaskContract:
             (
                 "- Treat relative project paths as relative to the workspace root; never infer `.` "
                 "as the project root when a workspace root is provided."
+            ),
+            (
+                "- LeapFlow config is not stored at `<workspace>/.leapflow/config.json`; "
+                "do not probe that path. Runtime config is loaded from `~/.leapflow/.env` "
+                "with optional project override `./.env` only when that file exists."
             ),
             (
                 "- Preserve this task contract across summarization, compression, "
@@ -1060,8 +1107,10 @@ class AgentEngine:
         elif plan.memory in {MemoryDisclosure.QUERY_RETRIEVAL, MemoryDisclosure.TASK_RETRIEVAL}:
             memory_context = await self._prefetch_and_freeze_memory(user_text)
         skill_section = self._build_skill_section(include_skills=plan.level != DisclosureLevel.LIGHT)
+        app_connector_section = self._build_app_connector_section()
         system = UNIFIED_SYSTEM_TEMPLATE.format(
             tool_catalog=tool_catalog,
+            app_connector_section=app_connector_section,
             skill_section=skill_section,
             memory_context=memory_context,
         )
@@ -1322,6 +1371,16 @@ class AgentEngine:
             return
         async for chunk in self._unified_tool_loop_stream(user_text, enable_thinking=enable_thinking):
             yield chunk
+
+    def _build_app_connector_section(self) -> str:
+        """Return prompt-time app connector capabilities without classifying the user turn."""
+        try:
+            from leapflow.tools.gateway_tool import build_app_connector_prompt_section
+
+            return build_app_connector_prompt_section()
+        except Exception:
+            logger.debug("app connector prompt section unavailable", exc_info=True)
+            return ""
 
     # ── Complex Task Handling (DAG path) ─────────────────────────────
 
@@ -1931,7 +1990,12 @@ class AgentEngine:
 
         logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
-        return content if content else (fatal_error or "I've reached my processing limit.")
+        if content:
+            return content
+        if fatal_error:
+            return fatal_error
+        # Derive a recovery message from the last platform_connect failure if present
+        return _app_onboarding_recovery_message(messages) or "I've reached my processing limit."
 
     async def _post_turn_review(
         self, messages: List[Dict[str, Any]], final_content: str
@@ -2339,7 +2403,8 @@ class AgentEngine:
             if tool_call is None:
                 trace.record(ExecutionMode.COMPLETE)
                 if not content:
-                    yield StreamEvent(type="final", content="I processed your request but have no additional output.")
+                    fallback = _app_onboarding_recovery_message(messages)
+                    yield StreamEvent(type="final", content=fallback or "I processed your request but have no additional output.")
                 else:
                     yield StreamEvent(type="final", content=content)
                 return
@@ -2427,7 +2492,11 @@ class AgentEngine:
 
         logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
-        yield StreamEvent(type="final", content=content if content else (fatal_error or "I've reached my processing limit."))
+        if content:
+            yield StreamEvent(type="final", content=content)
+        else:
+            fallback = _app_onboarding_recovery_message(messages)
+            yield StreamEvent(type="final", content=fallback or (fatal_error or "I've reached my processing limit."))
 
 
     # ── Unified Loop Helpers ───────────────────────────────────────────────

@@ -154,6 +154,17 @@ def test_long_task_metadata_avoids_noise_for_uncompacted_tools() -> None:
     assert metadata == {}
 
 
+@pytest.mark.asyncio
+async def test_file_read_rejects_workspace_leapflow_config_probe(tmp_path) -> None:
+    result = await file_read({"path": str(tmp_path / ".leapflow" / "config.json")})
+
+    assert result["ok"] is False
+    assert result["error_type"] == "unsupported_config_probe"
+    assert result["retryable"] is False
+    assert result["config_locations"] == ["~/.leapflow/.env", "./.env"]
+    assert ".leapflow/config.json" in result["error"]
+
+
 def test_context_governance_controller_keeps_long_task_alias() -> None:
     controller = ContextGovernanceController(
         evidence_builder=ToolEvidenceBuilder(max_content_chars=240),

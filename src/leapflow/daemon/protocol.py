@@ -215,6 +215,10 @@ class LeapService(Protocol):
         """Return active model information and switch guidance."""
         ...
 
+    async def app_command(self, args: str = "") -> Dict[str, Any]:
+        """Return an App Connector slash-command payload."""
+        ...
+
     async def approval_status(self) -> Dict[str, Any]:
         """Return pending approval requests."""
         ...
@@ -289,6 +293,7 @@ METHOD_REGISTRY: Dict[str, str] = {
     "tools.list": "tools_list",
     "usage.summary": "usage_summary",
     "model.info": "model_info",
+    "app.command": "app_command",
     "approval.status": "approval_status",
     "approval.resolve": "approval_resolve",
     "approval.cancel": "approval_cancel",

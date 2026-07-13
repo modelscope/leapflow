@@ -75,7 +75,7 @@ You are LeapFlow, an intelligent assistant that can both converse naturally and 
 ## Capabilities
 You have access to these tools:
 {tool_catalog}
-{skill_section}
+{app_connector_section}{skill_section}
 ## Tool Usage
 Call tools using JSON code blocks:
 ```json

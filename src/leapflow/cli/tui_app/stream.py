@@ -368,6 +368,12 @@ class StreamRenderer:
                 line.append(result_detail, style="leap.tool" if ok else "leap.error")
             line.append(f" | {_format_elapsed(duration)}", style="leap.tool")
             self._console.print(line)
+            recovery_hint = _metadata_text(metadata, "recovery_hint")
+            if recovery_hint:
+                recovery_line = Text()
+                recovery_line.append("    ↳ recovery: ", style="leap.tool")
+                recovery_line.append(_truncate_detail(recovery_hint, limit=_TOOL_OUTPUT_LIMIT), style="leap.tool")
+                self._console.print(recovery_line)
         self._active_tool = ""
         self._active_tool_detail = ""
         self._tool_start_time = 0.0

@@ -176,9 +176,15 @@ class GatewayConfigStore:
         config = self.load()
         pc = config.platforms.get(platform_id)
 
-        if pc is None or not pc.credentials:
+        if pc is None:
             creds = self._load_from_env(platform_id, manifest)
             return creds if creds else None
+        if not pc.credentials:
+            creds = self._load_from_env(platform_id, manifest)
+            if creds:
+                return creds
+            has_required_credentials = any(c.required for c in manifest.credentials)
+            return None if has_required_credentials else {}
 
         secret_keys = frozenset(
             c.key for c in manifest.credentials if c.secret

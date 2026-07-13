@@ -24,12 +24,7 @@ import asyncio
 import logging
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence
 
-from leapflow.gateway.protocol import (
-    InboundMessage,
-    MessageSource,
-    OutboundContent,
-    SendTarget,
-)
+from leapflow.gateway.protocol import InboundMessage, MessageSource
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +36,7 @@ SAFE_TOOLS: frozenset[str] = frozenset({
     "skills_list", "skill_view",
     "text_search",
     "gateway_connect", "gateway_send",
+    "platform_connect", "platform_action",
 })
 
 
