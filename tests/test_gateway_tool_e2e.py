@@ -50,7 +50,10 @@ async def test_app_slash_payloads_reuse_platform_connect_and_manifests(tmp_path)
     assert status["ok"] is True
     assert status["result"]["platform"] == "feishu"
     assert actions["ok"] is True
-    assert actions["domains"] == ["im", "docs", "calendar", "drive", "sheets", "mail", "task"]
+    assert set(actions["actions"]) == {
+        "im.send_message", "docs.create_markdown", "calendar.create_event",
+        "drive.search", "sheets.append_row", "mail.search_unread", "task.create",
+    }
     assert telegram_connect["ok"] is True
     assert telegram_connect["view"] == "guide"
     assert telegram_connect["result"]["required_fields"][0]["key"] == "bot_token"
@@ -254,6 +257,80 @@ async def test_platform_action_distinguishes_registered_but_not_connected_action
     assert "platform_connect action=connect platform=feishu" in result["next_steps"]
 
 
+@pytest.mark.asyncio
+async def test_platform_action_reports_unknown_action_with_expanded_registry(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        result = await platform_action_handler({
+            "platform": "feishu",
+            "action": "im.list_chats",
+            "payload": {},
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "unknown_platform_action"
+    assert result["retryable"] is True
+    assert "im.send_message" in result["available_action_names"]
+    assert any(item["name"] == "im.send_message" for item in result["available_actions"])
+
+
+@pytest.mark.asyncio
+async def test_platform_action_reports_wrong_namespace_for_management_action(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        result = await platform_action_handler({
+            "platform": "feishu",
+            "action": "list",
+            "payload": {},
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "wrong_action_namespace"
+    assert result["correct_tool"] == "platform_connect"
+    assert result["retryable"] is True
+    assert "list" in result["available_management_actions"]
+
+
+@pytest.mark.asyncio
+async def test_platform_action_reports_unknown_platform_with_available_list(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        result = await platform_action_handler({
+            "platform": "gateway",
+            "action": "list_actions",
+            "payload": {"platform": "feishu"},
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "unknown_platform"
+    assert result["retryable"] is True
+    assert "feishu" in result["available_platforms"]
+
+
 class CaptureGate:
     def __init__(self) -> None:
         self.actions = []
@@ -417,6 +494,8 @@ async def test_app_connector_prompt_section_exposes_supported_apps_without_class
     assert "`dingtalk`" in section
     assert "platform_connect" in section
     assert "SDK/Webhook sample code" in section
+    assert "im.send_message" in section
+    assert "management namespace" in section
 
 
 @pytest.mark.asyncio

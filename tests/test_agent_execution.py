@@ -122,8 +122,8 @@ async def test_react_loop_tool_then_answer() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_aliases_are_normalized_before_execution() -> None:
-    """Common LLM tool-name drift should route through canonical tool handlers."""
+async def test_exact_canonical_tool_names_execute_without_guessing() -> None:
+    """Only exact canonical tool names (plus case/separator formatting) execute."""
     with tempfile.TemporaryDirectory() as td:
         settings = make_settings(td)
         from leapflow.platform.mock import MockBridge
@@ -146,36 +146,37 @@ async def test_tool_aliases_are_normalized_before_execution() -> None:
             engine._tool_bridge = None
 
             result = await engine._execute_general_tool(
-                {"name": "list_directory", "arguments": {"path": "."}},
+                {"name": "file_list", "arguments": {"path": "."}},
                 {"file_list": file_list_handler},
             )
             metadata = _tool_args_metadata(
                 "file_list",
                 {"path": "."},
-                original_tool_name="list_directory",
+                original_tool_name="File-List",
             )
 
             assert result["ok"] is True
             assert captured["args"] == {"path": "."}
-            assert _normalize_tool_name("list_directory") == "file_list"
-            assert _normalize_tool_name("List-Directory") == "file_list"
-            assert _normalize_tool_name("list files") == "file_list"
-            assert _normalize_tool_name("read_file") == "file_read"
-            assert _normalize_tool_name("write_file") == "file_write"
-            assert _normalize_tool_name("execute_command") == "shell_run"
-            assert _normalize_tool_name("execute shell command") == "shell_run"
-            assert _normalize_tool_name("terminal-command") == "shell_run"
+            # Case/separator formatting of the *same* canonical name still resolves.
+            assert _normalize_tool_name("File_List") == "file_list"
+            assert _normalize_tool_name("file-list") == "file_list"
+            # Common LLM tool-name drift is no longer silently rewritten to a
+            # different canonical tool: it must be reported as unknown.
+            assert _normalize_tool_name("list_directory") == "list_directory"
+            assert _normalize_tool_name("execute_command") == "execute_command"
+            assert _normalize_tool_name("run_terminal") == "run_terminal"
             directory_resolution = _resolve_tool_name("directory_scan", {"path": "."})
             risky_resolution = _resolve_tool_name("please_do", {"command": "ls -la"})
-            assert directory_resolution.normalized_name == "file_list"
-            assert directory_resolution.status == "parameter_match"
-            assert directory_resolution.auto_executable is True
-            assert risky_resolution.normalized_name == "shell_run"
-            assert risky_resolution.status == "parameter_match"
+            assert directory_resolution.normalized_name is None
+            assert directory_resolution.status == "unknown"
+            assert directory_resolution.auto_executable is False
+            assert risky_resolution.normalized_name is None
+            assert risky_resolution.status == "unknown"
             assert risky_resolution.auto_executable is False
-            assert metadata["original_tool_name"] == "list_directory"
+            assert metadata["original_tool_name"] == "File-List"
             assert metadata["normalized_tool_name"] == "file_list"
-            assert metadata["alias"] == "list_directory"
+            assert metadata["resolved_from"] == "File-List"
+            assert "alias" not in metadata
         finally:
             lt.close()
 
@@ -378,8 +379,8 @@ async def test_app_connector_empty_final_uses_onboarding_recovery_state() -> Non
 
 
 @pytest.mark.asyncio
-async def test_text_tool_alias_is_normalized_in_stream_events() -> None:
-    """Text-mode tool calls should not leak common alias names as unknown tools."""
+async def test_unknown_tool_in_stream_triggers_structured_retry_not_alias_guess() -> None:
+    """Text-mode tool calls with a drifted name must surface a structured unknown, never a silent alias rewrite."""
     tool_reply = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
     with tempfile.TemporaryDirectory() as td:
         settings = make_settings(td)
@@ -398,11 +399,12 @@ async def test_text_tool_alias_is_normalized_in_stream_events() -> None:
             events = [event async for event in engine.run_stream("List current directory")]
 
             tool_events = [event for event in events if event.type in {"tool_start", "tool_complete"}]
-            assert [event.content for event in tool_events] == ["file_list", "file_list"]
+            assert [event.content for event in tool_events] == ["list_directory", "list_directory"]
             assert tool_events[0].metadata["original_tool_name"] == "list_directory"
-            assert tool_events[0].metadata["normalized_tool_name"] == "file_list"
-            assert tool_events[1].metadata["ok"] is True
-            assert "Unknown tool" not in str(tool_events[1].metadata)
+            assert tool_events[0].metadata["tool_resolution_status"] == "unknown"
+            assert tool_events[1].metadata["ok"] is False
+            assert tool_events[1].metadata["error_type"] == "unknown_tool"
+            assert "resolved_from" not in tool_events[1].metadata
         finally:
             lt.close()
 

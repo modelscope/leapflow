@@ -511,7 +511,7 @@ async def build_app_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
         parsed.setdefault("available", _available_app_ids(gw))
         return parsed
 
-    from leapflow.tools.gateway_tool import platform_connect_handler, set_gateway_server
+    from leapflow.tools.gateway_tool import platform_action_capability_summary, platform_connect_handler, set_gateway_server
 
     set_gateway_server(gw)
     if parsed.get("view") == "actions":
@@ -522,13 +522,15 @@ async def build_app_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
         if manifest is None:
             return {"ok": False, "error": f"Unknown platform: {platform}", "available": _available_app_ids(gw)}
         actions = dict(getattr(manifest, "actions", {}) or {})
+        action_summaries = platform_action_capability_summary(platform)
         return {
             "ok": True,
             "view": "actions",
             "platform": platform,
             "name": getattr(manifest, "display_name", platform),
-            "actions": actions,
-            "domains": list(actions.get("initial_domains") or ()),
+            "action_pack": str(actions.get("pack") or ""),
+            "actions": [item["name"] for item in action_summaries if item.get("name")],
+            "action_details": action_summaries,
         }
 
     params = dict(parsed.get("params") or {})
@@ -690,13 +692,21 @@ def render_app_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
         return
 
     if view == "actions":
-        domains = payload.get("domains") or []
-        actions = dict(payload.get("actions") or {})
+        action_names = list(payload.get("actions") or [])
+        action_details = list(payload.get("action_details") or [])
         lines = [f"platform: {payload.get('name')}"]
-        if domains:
-            lines.append("domains: " + ", ".join(str(item) for item in domains))
-        if actions.get("pack"):
-            lines.append(f"action pack: {actions['pack']}")
+        if payload.get("action_pack"):
+            lines.append(f"action pack: {payload['action_pack']}")
+        if action_names:
+            lines.append("registered actions:")
+            details_by_name = {str(item.get("name")): item for item in action_details}
+            for name in action_names:
+                detail = details_by_name.get(name, {})
+                description = str(detail.get("description") or "").strip()
+                suffix = f" — {description}" if description else ""
+                lines.append(f"  - {name}{suffix}")
+        else:
+            lines.append("registered actions: none")
         console.print(Panel("\n".join(lines), title="[bold cyan]App Actions[/]", border_style="bright_black", padding=(0, 2)))
         return
 

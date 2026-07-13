@@ -141,7 +141,7 @@ def _tool_args_metadata(
     metadata["tool_name"] = tool_name
     metadata["normalized_tool_name"] = tool_name
     if original_name != tool_name:
-        metadata["alias"] = original_name
+        metadata["resolved_from"] = original_name
     for key in ("command", "cmd", "path", "pattern", "query", "url"):
         value = args.get(key)
         if value:
@@ -219,7 +219,8 @@ def _unknown_tool_retry_prompt(result: Dict[str, Any]) -> str:
         f"({result.get('resolution_reason', 'no match')}). "
         f"Suggested canonical tools: {suggestions_text}. "
         f"Available tools include: {available_text}. "
-        "Retry once using an exact canonical tool name and valid arguments, or answer without a tool if no tool fits."
+        "Retry once using an exact canonical tool name from the available list and valid arguments. "
+        "Do not invent tool names, use aliases, or infer a tool from argument shape; answer without a tool if no exact tool fits."
     )
 
 

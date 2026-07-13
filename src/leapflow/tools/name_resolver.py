@@ -1,8 +1,13 @@
 """Tool registry and name-resolution primitives.
 
-This module centralizes tool identity, safe aliases, risk metadata, and
-structured unknown-tool feedback. It is intentionally execution-free: callers
-resolve a tool name here, then execute through their existing dispatch path.
+This module centralizes the Tool Capability Contract: the set of canonical
+tool names the runtime can actually dispatch, plus structured unknown-tool
+feedback when a proposed name is not part of that contract. There is no
+alias table and no argument-shape guessing here — a proposed tool name is
+either the exact canonical name (optionally normalized for case/separator
+formatting or an internal bridge prefix), or it is reported as unknown with
+discovery suggestions. It is intentionally execution-free: callers resolve a
+tool name here, then execute through their existing dispatch path.
 """
 
 from __future__ import annotations
@@ -11,7 +16,7 @@ import difflib
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Mapping, Sequence
 
-ResolutionStatus = Literal["exact", "alias", "parameter_match", "unknown", "ambiguous"]
+ResolutionStatus = Literal["exact", "normalized", "unknown"]
 ResolutionConfidence = Literal["high", "medium", "low"]
 RiskLevel = Literal["read_only", "mutating", "external"]
 
@@ -40,36 +45,12 @@ _MUTATING_NAME_SIGNALS = (
     "delegate",
 )
 
-_DEFAULT_ALIASES: Mapping[str, str] = {
-    "list_dir": "file_list",
-    "list_directory": "file_list",
-    "list_files": "file_list",
-    "directory_list": "file_list",
-    "file_ls": "file_list",
-    "ls": "file_list",
-    "dir": "file_list",
-    "read_file": "file_read",
-    "open_file": "file_read",
-    "cat_file": "file_read",
-    "view_file": "file_read",
-    "write_file": "file_write",
-    "save_file": "file_write",
-    "search_text": "text_search",
-    "grep_text": "text_search",
-    "replace_text": "text_replace",
-    "execute_command": "shell_run",
-    "execute_shell": "shell_run",
-    "execute_shell_command": "shell_run",
-    "run_command": "shell_run",
-    "run_shell": "shell_run",
-    "shell": "shell_run",
-    "bash": "shell_run",
-    "terminal_command": "shell_run",
-}
+def tool_lookup_key(tool_name: str) -> str:
+    """Return a stable lookup key for exact tool-name identity matching.
 
-
-def tool_alias_key(tool_name: str) -> str:
-    """Return a stable lookup key for tool-name matching."""
+    This only normalizes formatting (case, hyphen/space vs underscore) of the
+    *same* canonical identifier. It never maps one tool name onto another.
+    """
     return tool_name.strip().lower().replace("-", "_").replace(" ", "_")
 
 
@@ -100,7 +81,7 @@ class ToolResolution:
     @property
     def is_resolved(self) -> bool:
         """Return whether the resolution has a canonical target."""
-        return self.normalized_name is not None and self.status not in {"unknown", "ambiguous"}
+        return self.normalized_name is not None and self.status != "unknown"
 
     def to_metadata(self) -> Dict[str, Any]:
         """Return compact metadata suitable for TUI logs and trace events."""
@@ -115,7 +96,7 @@ class ToolResolution:
         if self.normalized_name is not None:
             metadata["normalized_tool_name"] = self.normalized_name
             if self.normalized_name != self.original_name:
-                metadata["alias"] = self.original_name
+                metadata["resolved_from"] = self.original_name
         if self.suggestions:
             metadata["tool_suggestions"] = list(self.suggestions)
         return metadata
@@ -123,10 +104,17 @@ class ToolResolution:
 
 @dataclass(frozen=True)
 class ToolRegistry:
-    """Single source of truth for tool identity and resolution metadata."""
+    """Single source of truth for tool identity and resolution metadata.
+
+    The registry enforces a strict Tool Capability Contract: a proposed tool
+    name is only ever executed when it is the exact canonical name, or a
+    formatting-only variant of it (case, separators, or the internal ``gp_``
+    bridge prefix). There is no alias table and no argument-shape guessing;
+    anything else is reported as unknown so the caller can retry with an
+    exact name from the disclosed capability list.
+    """
 
     specs: Mapping[str, ToolSpec]
-    aliases: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_definitions(
@@ -135,7 +123,6 @@ class ToolRegistry:
         handlers: Mapping[str, Any],
         *,
         bridge_tools: Sequence[Mapping[str, Any]] = (),
-        aliases: Mapping[str, str] | None = None,
     ) -> "ToolRegistry":
         """Build a registry from OpenAI schemas, dispatch handlers, and bridge metadata."""
         bridge_mutates = {
@@ -165,13 +152,7 @@ class ToolRegistry:
                     name=canonical,
                     risk_level=_infer_risk_level(canonical, bridge_mutates.get(canonical, False)),
                 )
-        alias_source = aliases or _DEFAULT_ALIASES
-        normalized_aliases = {
-            tool_alias_key(alias): canonical
-            for alias, canonical in alias_source.items()
-            if canonical in specs
-        }
-        return cls(specs=specs, aliases=normalized_aliases)
+        return cls(specs=specs)
 
     @property
     def tool_names(self) -> tuple[str, ...]:
@@ -184,49 +165,16 @@ class ToolRegistry:
         return resolution.normalized_name if resolution.auto_executable and resolution.normalized_name else tool_name
 
     def resolve(self, tool_name: str, arguments: Mapping[str, Any] | None = None) -> ToolResolution:
-        """Resolve a proposed tool call against canonical tool metadata."""
+        """Resolve a proposed tool call against the canonical tool contract."""
         original_name = str(tool_name or "")
         args = dict(arguments or {})
-        key = tool_alias_key(original_name)
+        key = tool_lookup_key(original_name)
         if original_name in self.specs:
             return self._resolution(original_name, original_name, "exact", "high", "canonical tool name")
         if key in self.specs:
-            canonical = key
-            return self._resolution(original_name, canonical, "alias", "high", "case or separator normalization")
+            return self._resolution(original_name, key, "normalized", "high", "case or separator normalization")
         if key.startswith("gp_") and key[3:] in self.specs:
-            canonical = key[3:]
-            return self._resolution(original_name, canonical, "alias", "high", "gp-prefixed bridge alias")
-        alias_target = self.aliases.get(key)
-        if alias_target:
-            return self._resolution(original_name, alias_target, "alias", "high", "declared tool alias")
-
-        parameter_candidates = self._parameter_candidates(original_name, args)
-        if len(parameter_candidates) == 1:
-            canonical, confidence, reason = parameter_candidates[0]
-            spec = self.specs[canonical]
-            auto = spec.risk_level == "read_only" and confidence in {"high", "medium"}
-            return ToolResolution(
-                original_name=original_name,
-                normalized_name=canonical,
-                status="parameter_match",
-                confidence=confidence,
-                reason=reason,
-                suggestions=(canonical,),
-                auto_executable=auto,
-                risk_level=spec.risk_level,
-            )
-        if len(parameter_candidates) > 1:
-            suggestions = tuple(candidate[0] for candidate in parameter_candidates[:5])
-            return ToolResolution(
-                original_name=original_name,
-                normalized_name=None,
-                status="ambiguous",
-                confidence="low",
-                reason="arguments match multiple tool shapes",
-                suggestions=suggestions,
-                auto_executable=False,
-                risk_level="read_only",
-            )
+            return self._resolution(original_name, key[3:], "normalized", "high", "internal bridge prefix")
 
         suggestions = self._suggestions(original_name, args)
         return ToolResolution(
@@ -234,16 +182,23 @@ class ToolRegistry:
             normalized_name=None,
             status="unknown",
             confidence="low",
-            reason="no canonical tool, alias, or safe parameter match",
+            reason="no exact canonical tool name match",
             suggestions=suggestions,
             auto_executable=False,
             risk_level="read_only",
         )
 
     def unknown_result(self, resolution: ToolResolution) -> Dict[str, Any]:
-        """Build structured feedback for unknown or ambiguous tool names."""
+        """Build structured feedback for an unresolved tool name."""
         available = self.tool_names[:16]
         suggestions = resolution.suggestions or available[:5]
+        recovery_hint = (
+            f"'{resolution.original_name}' is not a registered tool. Retry once with an exact "
+            f"name from: {', '.join(suggestions)}."
+            if suggestions
+            else f"'{resolution.original_name}' is not a registered tool and no close match was found; "
+            "ask for clarification instead of guessing."
+        )
         return {
             "ok": False,
             "error_type": "unknown_tool",
@@ -255,6 +210,7 @@ class ToolRegistry:
             "resolution_reason": resolution.reason,
             "suggestions": list(suggestions),
             "available_tools": list(available),
+            "recovery_hint": recovery_hint,
             "retryable": True,
         }
 
@@ -267,7 +223,6 @@ class ToolRegistry:
         reason: str,
     ) -> ToolResolution:
         spec = self.specs[canonical]
-        auto = confidence == "high" or spec.risk_level == "read_only"
         return ToolResolution(
             original_name=original_name,
             normalized_name=canonical,
@@ -275,34 +230,18 @@ class ToolRegistry:
             confidence=confidence,
             reason=reason,
             suggestions=(canonical,) if canonical != original_name else (),
-            auto_executable=auto,
+            auto_executable=True,
             risk_level=spec.risk_level,
         )
 
-    def _parameter_candidates(
-        self, tool_name: str, arguments: Mapping[str, Any]) -> list[tuple[str, ResolutionConfidence, str]]:
-            keys = {str(key) for key in arguments.keys()}
-            name_key = tool_alias_key(tool_name)
-            candidates: list[tuple[str, ResolutionConfidence, str]] = []
-            if {"text", "old", "new"}.issubset(keys) and "text_replace" in self.specs:
-                candidates.append(("text_replace", "high", "text replacement argument shape"))
-            if {"text", "pattern"}.issubset(keys) and "text_search" in self.specs:
-                candidates.append(("text_search", "high", "text search argument shape"))
-            if "command" in keys and "shell_run" in self.specs:
-                confidence: ResolutionConfidence = "high" if any(token in name_key for token in ("shell", "command", "exec", "bash", "terminal")) else "medium"
-                candidates.append(("shell_run", confidence, "shell command argument shape"))
-            if "path" in keys:
-                if any(token in name_key for token in ("list", "dir", "directory", "ls", "files", "scan")) and "file_list" in self.specs:
-                    candidates.append(("file_list", "high", "directory listing argument shape"))
-                if any(token in name_key for token in ("read", "open", "view", "cat")) and "file_read" in self.specs:
-                    candidates.append(("file_read", "high", "file read argument shape"))
-                if "content" in keys and any(token in name_key for token in ("write", "save", "create")) and "file_write" in self.specs:
-                    candidates.append(("file_write", "high", "file write argument shape"))
-            return candidates
-
     def _suggestions(self, tool_name: str, arguments: Mapping[str, Any]) -> tuple[str, ...]:
+        """Return non-executing discovery hints for an unknown tool name.
+
+        These are surfaced to the caller for a retry with an exact name; they
+        are never used to auto-execute a different tool.
+        """
         names = list(self.tool_names)
-        close = difflib.get_close_matches(tool_alias_key(tool_name), names, n=5, cutoff=0.55)
+        close = difflib.get_close_matches(tool_lookup_key(tool_name), names, n=5, cutoff=0.55)
         if close:
             return tuple(close)
         keys = {str(key) for key in arguments.keys()}

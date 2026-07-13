@@ -11,13 +11,30 @@ Tool returns only status information back to LLM.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 logger = logging.getLogger(__name__)
 
 _gateway_server_ref: Any = None
 _approval_gate: Any = None
 _pending_app_onboarding: Dict[str, Any] | None = None
+
+# Single source of truth for the platform_connect management namespace. Both
+# the platform_connect tool schema enum and the platform_action namespace
+# guard below are generated from this tuple so the two never drift apart.
+PLATFORM_CONNECT_ACTIONS: tuple[str, ...] = (
+    "list",
+    "guide",
+    "preflight",
+    "connect",
+    "disconnect",
+    "remove",
+    "status",
+    "events_start",
+    "events_stop",
+    "events_status",
+)
+_PLATFORM_CONNECT_ACTIONS = frozenset(PLATFORM_CONNECT_ACTIONS)
 
 
 def set_gateway_server(server: Any) -> None:
@@ -49,20 +66,24 @@ def build_app_connector_prompt_section() -> str:
 
     lines = [
         "\n## App Connector Capability Index",
-        "LeapFlow can onboard and manage these external apps through `platform_connect`.",
+        "LeapFlow can onboard and manage external apps through `platform_connect` and execute exact registered business actions through `platform_action`.",
         "For requests about connecting, setting up, configuring, enabling, or managing a supported app, use `platform_connect` first instead of generating SDK/Webhook sample code.",
-        "Use `action='guide'` with the matching `platform` to start onboarding; use `action='list'` when the app is unclear.",
+        f"`platform_connect.action` is the management namespace: {', '.join(PLATFORM_CONNECT_ACTIONS)}.",
+        "`platform_action.action` is only for exact registered platform business actions listed below, such as `im.send_message`; never use management actions like `list` or `guide` there.",
+        "Do not invent platform IDs or platform action names. If the needed action is not listed, ask for discovery/clarification instead of guessing.",
+        "Use `platform_connect` with `action='guide'` and the matching `platform` to start onboarding; use `action='list'` when the app is unclear.",
         "When a pending onboarding state is present, continue from that state with `platform_connect` instead of asking the user to restate the app.",
         "Supported apps:",
     ]
     for platform_id, manifest in sorted(manifests.items()):
         backend = dict(getattr(manifest, "backend", {}) or {})
         backend_kind = str(backend.get("kind") or "adapter")
-        domains = dict(getattr(manifest, "actions", {}) or {}).get("initial_domains") or ()
-        domain_text = f"; domains={', '.join(str(item) for item in domains)}" if domains else ""
+        action_summaries = _platform_action_summaries(platform_id)
+        action_names = ", ".join(f"`{item['name']}`" for item in action_summaries[:12])
+        action_text = f"; platform_action actions={action_names}" if action_names else "; platform_action actions=none registered"
         lines.append(
             f"- `{platform_id}`: {getattr(manifest, 'display_name', platform_id)} "
-            f"(category={getattr(manifest, 'category', '')}; backend={backend_kind}{domain_text})"
+            f"(category={getattr(manifest, 'category', '')}; backend={backend_kind}{action_text})"
         )
     if _pending_app_onboarding:
         state = dict(_pending_app_onboarding)
@@ -78,6 +99,57 @@ def build_app_connector_prompt_section() -> str:
             "Use this state to continue app onboarding; do not ask the user to repeat known platform details.",
         ])
     return "\n".join(lines) + "\n"
+
+
+def _manifest_action_specs(platform: str) -> Mapping[str, Any]:
+    """Return action-pack specs declared by a platform manifest."""
+    manifest = _gateway_server_ref.manifests.get(platform) if _gateway_server_ref is not None else None
+    if manifest is None:
+        return {}
+    actions = dict(getattr(manifest, "actions", {}) or {})
+    pack = str(actions.get("pack") or "")
+    if not pack:
+        return {}
+    try:
+        from leapflow.gateway.connectors.action_registry import ActionRegistry
+
+        return ActionRegistry.from_module(pack).all()
+    except (ImportError, AttributeError, ValueError):
+        logger.debug("platform.action_pack_lookup_failed platform=%s", platform, exc_info=True)
+        return {}
+
+
+def _compact_action_summary(spec: Any) -> Dict[str, Any]:
+    """Return a compact, LLM-readable platform action contract entry."""
+    schema = getattr(spec, "schema", {}) or {}
+    required = schema.get("required") or () if isinstance(schema, Mapping) else ()
+    properties = schema.get("properties") or {} if isinstance(schema, Mapping) else {}
+    return {
+        "name": str(getattr(spec, "name", "") or ""),
+        "description": str(getattr(spec, "description", "") or ""),
+        "effect": str(getattr(spec, "effect", "") or ""),
+        "risk_level": str(getattr(spec, "risk_level", "") or ""),
+        "required": [str(item) for item in required],
+        "fields": [str(key) for key in properties.keys()] if isinstance(properties, Mapping) else [],
+    }
+
+
+def _platform_action_summaries(platform: str) -> List[Dict[str, Any]]:
+    """Return registered platform action summaries sorted by action name."""
+    specs = _manifest_action_specs(platform)
+    return [
+        _compact_action_summary(spec)
+        for _name, spec in sorted(specs.items())
+    ]
+
+
+def platform_action_capability_summary(platform: str) -> List[Dict[str, Any]]:
+    """Public accessor for registered platform action summaries.
+
+    Used by slash commands and other callers that need to display the exact
+    business action contract without reaching into module-private state.
+    """
+    return _platform_action_summaries(platform)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -571,33 +643,49 @@ def _manifest_preflight_checks(manifest: Any) -> list[Dict[str, Any]]:
 
 
 def _manifest_action_spec(platform: str, action: str) -> Any:
-    manifest = _gateway_server_ref.manifests.get(platform) if _gateway_server_ref is not None else None
-    if manifest is None:
-        return None
-    actions = dict(getattr(manifest, "actions", {}) or {})
-    pack = str(actions.get("pack") or "")
-    if not pack:
-        return None
-    try:
-        from leapflow.gateway.connectors.action_registry import ActionRegistry
-
-        return ActionRegistry.from_module(pack).get(action)
-    except (ImportError, AttributeError, ValueError):
-        logger.debug("platform.action_pack_lookup_failed platform=%s action=%s", platform, action, exc_info=True)
-        return None
+    return _manifest_action_specs(platform).get(action)
 
 
 def _platform_action_unavailable_response(platform: str, action: str) -> Dict[str, Any]:
     manifest = _gateway_server_ref.manifests.get(platform) if _gateway_server_ref is not None else None
+    available_platforms = sorted((_gateway_server_ref.manifests or {}).keys()) if _gateway_server_ref is not None else []
     if manifest is None:
-        return {"ok": False, "failure_code": "unknown_platform", "error": f"Unknown platform: {platform}"}
+        return {
+            "ok": False,
+            "failure_code": "unknown_platform",
+            "error": f"Unknown platform: {platform}",
+            "available_platforms": available_platforms,
+            "recovery_hint": "Use platform_connect action=list to inspect supported platform IDs before calling platform_action.",
+            "retryable": True,
+        }
+    action_summaries = _platform_action_summaries(platform)
+    action_names = [item["name"] for item in action_summaries if item.get("name")]
+    if action in _PLATFORM_CONNECT_ACTIONS:
+        return {
+            "ok": False,
+            "failure_code": "wrong_action_namespace",
+            "error": f"'{action}' is a platform_connect management action, not a platform_action business action.",
+            "platform": platform,
+            "requested_action": action,
+            "tool_namespace": "platform_action",
+            "correct_tool": "platform_connect",
+            "available_management_actions": sorted(_PLATFORM_CONNECT_ACTIONS),
+            "available_actions": action_summaries,
+            "available_action_names": action_names,
+            "recovery_hint": f"Call platform_connect with platform='{platform}' and action='{action}', or choose one exact business action from available_action_names for platform_action.",
+            "retryable": True,
+        }
     if _manifest_action_spec(platform, action) is None:
-        actions = dict(getattr(manifest, "actions", {}) or {})
         return {
             "ok": False,
             "failure_code": "unknown_platform_action",
             "error": f"Unknown platform action: {platform}.{action}",
-            "available_actions": actions,
+            "platform": platform,
+            "requested_action": action,
+            "available_actions": action_summaries,
+            "available_action_names": action_names,
+            "recovery_hint": "Use exactly one registered platform_action action name from available_action_names; do not infer or invent action names from domains.",
+            "retryable": True,
         }
     recovery_hint = "Connect the platform backend before running registered platform actions."
     next_steps = [
@@ -609,8 +697,13 @@ def _platform_action_unavailable_response(platform: str, action: str) -> Dict[st
         "ok": False,
         "failure_code": "platform_not_connected",
         "error": f"Platform '{platform}' is not connected; registered action '{action}' cannot run yet.",
+        "platform": platform,
+        "requested_action": action,
+        "available_actions": action_summaries,
+        "available_action_names": action_names,
         "recovery_hint": recovery_hint,
         "next_steps": next_steps,
+        "retryable": True,
     }
     if _pending_app_onboarding and _pending_app_onboarding.get("platform_id") == platform:
         response["onboarding_state"] = dict(_pending_app_onboarding)
@@ -786,15 +879,17 @@ GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "function": {
             "name": "platform_action",
             "description": (
-                "Execute a registered action on an external platform through LeapFlow's "
-                "App Connector layer. Actions are addressed as domain.operation, e.g. "
-                "im.send_message or docs.create_markdown. Never pass raw CLI commands or URLs."
+                "Execute an exact registered business action on an external platform through "
+                "LeapFlow's App Connector layer. Actions must be copied from the App Connector "
+                "Capability Index/available_action_names and are addressed as domain.operation, "
+                "e.g. im.send_message or docs.create_markdown. Do not invent action names, do not "
+                "use management actions such as list/guide/connect/status here, and never pass raw CLI commands or URLs."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "platform": {"type": "string", "description": "Platform ID, e.g. feishu"},
-                    "action": {"type": "string", "description": "Registered action, e.g. im.send_message"},
+                    "action": {"type": "string", "description": "Exact registered business action from available_action_names, e.g. im.send_message; never list/guide/connect/status"},
                     "payload": {"type": "object", "description": "Action payload matching the registered schema"},
                     "backend_kind": {"type": "string", "description": "Optional backend hint: cli/rest/mcp"},
                 },
@@ -808,15 +903,14 @@ GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "name": "platform_connect",
             "description": (
                 "List, guide, connect, disconnect, remove, or check status for external "
-                "platforms using the App Connector layer. Supports REST and CLI backends."
+                "platforms using the App Connector management namespace. Supports REST and CLI "
+                "backends. Use this for management actions such as list/guide/preflight/connect/status; "
+                "use platform_action only for exact registered business actions."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": [
-                        "list", "guide", "preflight", "connect", "disconnect", "remove", "status",
-                        "events_start", "events_stop", "events_status",
-                    ]},
+                    "action": {"type": "string", "enum": list(PLATFORM_CONNECT_ACTIONS)},
                     "platform": {"type": "string", "description": "Platform ID"},
                     "credentials": {"type": "object", "description": "Optional credentials for REST-style backends"},
                     "options": {"type": "object", "description": "Backend options such as profile, identity, or binary"},
