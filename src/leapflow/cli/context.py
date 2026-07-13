@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
@@ -61,7 +60,6 @@ from leapflow.engine.audit import AuditLogger
 from leapflow.learning.similarity import HeuristicSimilarityScorer, LLMSimilarityScorer
 from leapflow.platform.adapters.darwin import DarwinExecutionAdapter, DarwinPerceptionAdapter
 from leapflow.domain.platform import PlatformManifest
-from leapflow.engine.shortcuts import ShortcutStore
 from leapflow.engine.situational_assessor import LLMSituationalAssessor
 from leapflow.platform.facade import VirtualSystemInterface
 from leapflow.platform.normalizer import EventNormalizer
@@ -76,16 +74,14 @@ if TYPE_CHECKING:
 
 
 class _TUIApprovalGate:
-    """Rich-styled approval gate for the interactive TUI.
+    """Approval gate that delegates to the active TUI surface when available."""
 
-    Displays a styled panel with the action details and accepts:
-    - ``y``/``yes`` → allow this one time
-    - ``a``/``always`` → allow and skip future prompts for this category
-    - ``n``/``no``/Enter → deny
+    def __init__(self) -> None:
+        self._handler: Optional[Callable[["ApprovalRequest"], Any]] = None
 
-    Implements both ``ApprovalGate`` (unified) and ``CommandApprovalGate``
-    (backward-compatible with ``shell_tools.py``).
-    """
+    def set_handler(self, handler: Optional[Callable[["ApprovalRequest"], Any]]) -> None:
+        """Set the active TUI approval handler."""
+        self._handler = handler
 
     _CATEGORY_LABELS = {
         "shell_dangerous": ("Shell Command", "yellow"),
@@ -96,62 +92,34 @@ class _TUIApprovalGate:
     async def request_approval(
         self, request: "ApprovalRequest",
     ) -> "ApprovalDecision":
-        from leapflow.security.approval import ApprovalDecision
+        handler = self._handler
+        if handler is not None:
+            result = handler(request)
+            if hasattr(result, "__await__"):
+                return await result
+            return result
+        from leapflow.cli.approval_view import prompt_approval
 
-        if not sys.stdin.isatty():
-            return ApprovalDecision.DENY
-
-        label, color = self._CATEGORY_LABELS.get(
-            request.category, ("Action", "yellow"),
-        )
-
-        try:
-            from rich.console import Console
-            from rich.panel import Panel
-            from rich.text import Text
-
-            console = Console(stderr=True, highlight=False)
-            body = Text()
-            body.append(f"  {request.detail}\n\n", style="bold")
-            body.append("  [y]es  — allow once\n", style="dim")
-            body.append("  [a]lways — allow for this session\n", style="dim")
-            body.append("  [n]o / Enter — deny\n", style="dim")
-            console.print(Panel(
-                body,
-                title=f"[bold {color}]⚠ {label} Approval[/]",
-                border_style=color,
-                padding=(0, 1),
-            ))
-            sys.stderr.write("  → ")
-            sys.stderr.flush()
-        except ImportError:
-            sys.stderr.write(f"⚠ {label}: {request.detail}\n")
-            sys.stderr.write("Approve? [y/a(lways)/N]: ")
-            sys.stderr.flush()
-
-        try:
-            answer = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: input().strip().lower(),
-            )
-        except (EOFError, KeyboardInterrupt):
-            return ApprovalDecision.DENY
-
-        if answer in ("a", "always"):
-            return ApprovalDecision.ALLOW_SESSION
-        if answer in ("y", "yes"):
-            return ApprovalDecision.ALLOW
-        return ApprovalDecision.DENY
+        return await prompt_approval(request)
 
     async def check(self, command: str) -> bool:
         """``CommandApprovalGate`` compatibility — shell_tools calls this."""
         from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+        from leapflow.security.actions import ActionDescriptor
 
+        action = ActionDescriptor.shell(command)
         decision = await self.request_approval(ApprovalRequest(
-            category="shell_dangerous",
+            category=action.kind,
             detail=command,
             risk_hint=0.7,
+            action=action,
         ))
-        return decision in (ApprovalDecision.ALLOW, ApprovalDecision.ALLOW_SESSION)
+        return decision in {
+            ApprovalDecision.ALLOW,
+            ApprovalDecision.ALLOW_ONCE,
+            ApprovalDecision.ALLOW_SESSION,
+            ApprovalDecision.ALLOW_ALWAYS,
+        }
 
 
 def _default_recording_profile(settings: Settings) -> Optional["RecordingProfile"]:
@@ -440,7 +408,10 @@ class Context:
             privacy_filter=self.privacy_manager,
         )
         self.rpc: CuaDriverClient | MockBridge
-        if self.effective_mock:
+        if self.effective_mock or not settings.use_cua_driver:
+            if not self.effective_mock:
+                _emit_status("cua-driver disabled by LEAPFLOW_USE_CUA_DRIVER=false")
+                _emit_status("Running in degraded mode (no OS execution)")
             self.rpc = MockBridge()
             self.rpc.on_event(self.event_bus.handle_event)
         else:
@@ -459,7 +430,6 @@ class Context:
 
         self.audit = AuditLogger(settings.audit_log_path)
 
-        self.shortcuts = ShortcutStore(Path.cwd() / ".leapflow" / "shortcuts.yaml")
         self.assessor: Optional[LLMSituationalAssessor] = None
 
         self.perception_session: Optional[Any] = None
@@ -471,6 +441,10 @@ class Context:
         self.session_store: Optional[LearningSessionStore] = None
         self.engine: Optional[AgentEngine] = None
         self.intent_classifier: Optional[IntentClassifier] = None
+        self._platform_manifest: Optional[PlatformManifest] = None
+        self._platform_perception: Optional[Any] = None
+        self._platform_execution: Optional[Any] = None
+        self._platform_event_callback: Optional[Callable[[Any], None]] = None
 
         # World Model components (wired during initialize)
         self.learning_budget: Optional[Any] = None
@@ -493,9 +467,21 @@ class Context:
         # Unified approval gate is resource-free; create it in __init__ so all
         # initialize() wiring paths can safely reference the same session gate.
         from leapflow.security.approval import SessionAwareGate
+        from leapflow.security.grants import ApprovalAuditLog, JsonApprovalGrantStore
+        from leapflow.security.orchestrator import ApprovalOrchestrator
 
+        approval_dir = settings.profile_dir / "approval"
         self._tui_approval = _TUIApprovalGate()
         self._approval_gate = SessionAwareGate(self._tui_approval)
+        self._approval_orchestrator = ApprovalOrchestrator(
+            self._approval_gate,
+            grants=JsonApprovalGrantStore(approval_dir / "grants.json"),
+            audit=ApprovalAuditLog(approval_dir / "audit.jsonl"),
+        )
+
+    def set_approval_handler(self, handler: Optional[Callable[["ApprovalRequest"], Any]]) -> None:
+        """Bind the current interactive surface as the approval renderer."""
+        self._tui_approval.set_handler(handler)
 
     def _configure_llm_clients(self, settings: Settings) -> None:
         """Build LLM/VLM clients from a settings snapshot."""
@@ -733,6 +719,155 @@ class Context:
         logger.info("Runtime LLM configuration reloaded")
         return True
 
+    def _host_backend_snapshot(self) -> dict[str, Any]:
+        snapshot = getattr(self.rpc, "status_snapshot", None)
+        if callable(snapshot):
+            try:
+                return dict(snapshot())
+            except Exception as exc:
+                return {
+                    "backend": type(self.rpc).__name__,
+                    "started": False,
+                    "pid": None,
+                    "pid_source": "unavailable",
+                    "last_error": str(exc),
+                }
+        return {
+            "backend": type(self.rpc).__name__,
+            "started": bool(getattr(self.rpc, "connected", False)),
+            "pid": None,
+            "pid_source": "unavailable",
+        }
+
+    async def host_backend_status(self) -> dict[str, Any]:
+        """Return the current daemon-owned host backend status."""
+        return self._host_backend_snapshot()
+
+    async def host_backend_start(self) -> dict[str, Any]:
+        """Start CuaDriver and rewire runtime host adapters in-place."""
+        if self.effective_mock:
+            return {
+                "ok": False,
+                "backend": "mock",
+                "started": False,
+                "pid": None,
+                "pid_source": "unavailable",
+                "last_error": "host backend is disabled by mock mode",
+            }
+        if isinstance(self.rpc, CuaDriverClient) and self.rpc.connected:
+            status = self._host_backend_snapshot()
+            status.update({"ok": True, "changed": False})
+            return status
+
+        previous_rpc = self.rpc
+        next_rpc = CuaDriverClient()
+        try:
+            next_rpc.start()
+            manifest = await VirtualSystemInterface(next_rpc).handshake()
+            await self._rewire_host_backend(next_rpc, manifest, bridge_online=True)
+        except Exception as exc:
+            try:
+                next_rpc.stop()
+            except Exception:
+                logger.debug("CuaDriverClient cleanup failed after start error", exc_info=True)
+            return {
+                "ok": False,
+                "backend": "cua-driver",
+                "started": False,
+                "pid": None,
+                "pid_source": "unavailable",
+                "last_error": str(exc),
+            }
+
+        if isinstance(previous_rpc, CuaDriverClient) and previous_rpc is not next_rpc:
+            try:
+                previous_rpc.stop()
+            except Exception:
+                logger.debug("previous CuaDriverClient stop failed after host start", exc_info=True)
+        status = self._host_backend_snapshot()
+        status.update({"ok": True, "changed": True})
+        return status
+
+    async def host_backend_stop(self) -> dict[str, Any]:
+        """Stop CuaDriver while preserving chat, memory, and daemon runtime state."""
+        previous_rpc = self.rpc
+        stop_error = ""
+        if isinstance(previous_rpc, CuaDriverClient):
+            try:
+                previous_rpc.stop()
+            except Exception as exc:
+                stop_error = str(exc)
+                logger.debug("CuaDriverClient stop failed during host_backend_stop", exc_info=True)
+
+        mock_rpc = MockBridge()
+        mock_rpc.on_event(self.event_bus.handle_event)
+        manifest = PlatformManifest.default_darwin()
+        await self._rewire_host_backend(mock_rpc, manifest, bridge_online=False)
+        status = self._host_backend_snapshot()
+        status.update({"ok": not stop_error, "changed": True})
+        if stop_error:
+            status["last_error"] = stop_error
+        return status
+
+    async def host_backend_restart(self) -> dict[str, Any]:
+        """Restart CuaDriver and keep daemon/session state intact."""
+        await self.host_backend_stop()
+        return await self.host_backend_start()
+
+    async def _rewire_host_backend(
+        self,
+        rpc: CuaDriverClient | MockBridge,
+        manifest: PlatformManifest,
+        *,
+        bridge_online: bool,
+    ) -> None:
+        previous_callback = self._platform_event_callback
+        if previous_callback is not None:
+            self.event_bus.unsubscribe(previous_callback)
+            self._platform_event_callback = None
+
+        self.rpc = rpc
+        self.event_bus.set_normalizer(EventNormalizer(manifest))
+
+        perception: Any
+        execution_adapter: Any
+        if not self.effective_mock and bridge_online:
+            perception = DarwinPerceptionAdapter(rpc, manifest)
+            execution_adapter = DarwinExecutionAdapter(rpc, manifest)
+            self.event_bus.subscribe(perception.enqueue_event)
+            self._platform_event_callback = perception.enqueue_event
+            home = str(Path.home())
+            cwd = str(Path.cwd())
+            for watch_path in dict.fromkeys([home, cwd]):
+                try:
+                    result = await rpc.call("fs.subscribe", {"path": watch_path})
+                    logger.info("Subscribed to FS events after host switch: %s", watch_path)
+                    for evt in (result.get("recent") or []):
+                        await self.event_bus.handle_event("event.fs_change", dict(evt))
+                except Exception as exc:
+                    logger.warning("Failed to subscribe FS events for %s: %s", watch_path, exc)
+        else:
+            from leapflow.platform.adapters.mock import MockExecutionAdapter, MockPerceptionAdapter
+            perception = MockPerceptionAdapter()
+            execution_adapter = MockExecutionAdapter()
+
+        self._platform_manifest = manifest
+        self._platform_perception = perception
+        self._platform_execution = execution_adapter
+
+        if self.engine is not None:
+            from leapflow.skills.bridge_factory import build_tool_bridge
+            from leapflow.tools import bootstrap_tools
+
+            tool_bridge = build_tool_bridge(execution_adapter, perception)
+            bootstrap_tools(tool_bridge)
+            self.engine.reconfigure_host_backend(
+                rpc=rpc,
+                perception=perception,
+                execution=execution_adapter,
+                tool_bridge=tool_bridge,
+            )
+
     @property
     def storage_volatile(self) -> bool:
         """Return True when this process uses non-persistent fallback storage."""
@@ -776,6 +911,9 @@ class Context:
                         "  Check permissions (macOS TCC) or run: leap host doctor"
                     )
                 _emit_status("Running in degraded mode (no OS execution)")
+                self.rpc = MockBridge()
+                self.rpc.on_event(self.event_bus.handle_event)
+                vsi = VirtualSystemInterface(self.rpc)
                 manifest = PlatformManifest.default_darwin()
                 vsi._manifest = manifest
         else:
@@ -792,6 +930,7 @@ class Context:
             perception = DarwinPerceptionAdapter(self.rpc, manifest)
             execution_adapter = DarwinExecutionAdapter(self.rpc, manifest)
             self.event_bus.subscribe(perception.enqueue_event)
+            self._platform_event_callback = perception.enqueue_event
             home = str(Path.home())
             cwd = str(Path.cwd())
             for watch_path in dict.fromkeys([home, cwd]):
@@ -806,6 +945,11 @@ class Context:
             from leapflow.platform.adapters.mock import MockExecutionAdapter, MockPerceptionAdapter
             perception = MockPerceptionAdapter()
             execution_adapter = MockExecutionAdapter()
+            self._platform_event_callback = None
+
+        self._platform_manifest = manifest
+        self._platform_perception = perception
+        self._platform_execution = execution_adapter
 
         logger.info(
             "Platform: %s (v%s) | Capabilities: %d",
@@ -1410,7 +1554,7 @@ class Context:
         )
         self.gateway_server.discover_manifests()
         set_gateway_server(self.gateway_server)
-        set_gateway_approval_gate(self._approval_gate)
+        set_gateway_approval_gate(self._approval_orchestrator)
 
         async def _gateway_send(source: Any, text: str) -> None:
             await self.gateway_server.send_reply(source, text)
@@ -1517,8 +1661,8 @@ class Context:
         # ── Unified approval gate wiring (shell, file, gateway) ──
         try:
             from leapflow.tools.shell_tools import set_approval_gate
-            set_approval_gate(self._approval_gate)
-            logger.debug("Shell approval gate: unified TUI mode")
+            set_approval_gate(self._approval_orchestrator)
+            logger.debug("Shell approval gate: action orchestrator mode")
         except Exception:
             logger.debug("Shell approval gate setup skipped", exc_info=True)
 
@@ -1533,7 +1677,6 @@ class Context:
             execution=execution_adapter,
             skill_activator=activator,
             session=self.session,
-            shortcuts=self.shortcuts,
             vlm=self.vlm,
             memory_manager=self.memory,
             evolution=self._evolution,
@@ -1627,14 +1770,13 @@ class Context:
                 aux = self.auxiliary
 
                 class _SmartApprovalGate:
-                    """LLM-assisted approval that auto-approves low-risk commands.
+                    """LLM-assisted shell approval adapter that preserves policy authority."""
 
-                    Uses the auxiliary LLM to score risk (0.0–1.0).
-                    Low-risk (< 0.3) auto-approved; others prompt via TUI gate.
-                    Wraps the unified approval gate — session memory still works.
-                    """
                     def __init__(self, delegate: Any) -> None:
                         self._delegate = delegate
+
+                    async def evaluate(self, action: Any) -> Any:
+                        return await self._delegate.evaluate(action)
 
                     async def check(self, command: str) -> bool:
                         try:
@@ -1642,54 +1784,36 @@ class Context:
                         except Exception:
                             risk = 0.5
                         if risk < 0.3:
-                            logger.debug("smart_approval: auto-approved (risk=%.2f)", risk)
-                            return True
+                            logger.debug("smart_approval: low auxiliary risk hint (risk=%.2f)", risk)
                         return await self._delegate.check(command)
 
                 from leapflow.tools.shell_tools import set_approval_gate
-                set_approval_gate(_SmartApprovalGate(self._approval_gate))
+                set_approval_gate(_SmartApprovalGate(self._approval_orchestrator))
                 logger.debug("Smart approval gate enabled (auxiliary LLM)")
             except Exception:
                 logger.debug("Smart approval setup skipped", exc_info=True)
 
         # ── Wire File Write Approval Gate ──
         try:
+            from leapflow.security.actions import ActionDescriptor
             from leapflow.tools.registry_bootstrap import set_file_write_gate
-            from leapflow.security.approval import ApprovalDecision, ApprovalRequest
 
-            _SAFE_EXTENSIONS = frozenset({
-                ".tmp", ".log", ".txt", ".md", ".json", ".yaml", ".yml",
-                ".csv", ".tsv",
-            })
-            approval_gate = self._approval_gate
+            approval_orchestrator = self._approval_orchestrator
 
             class _FileWriteGate:
-                """File write approval via the unified gate.
+                """File write approval via the action approval orchestrator."""
 
-                Auto-approves safe extensions and small writes; delegates
-                everything else to the session-aware approval gate.
-                """
-                async def check(self, path: str, content: str) -> bool:
-                    from pathlib import Path as _P
-                    p = _P(path)
-                    if p.suffix.lower() in _SAFE_EXTENSIONS:
-                        return True
-                    if len(content) < 500:
-                        return True
-                    decision = await approval_gate.request_approval(
-                        ApprovalRequest(
-                            category="file_write",
-                            detail=f"{p.name} ({len(content)} chars)",
-                            risk_hint=0.4,
-                        ),
-                    )
-                    return decision in (
-                        ApprovalDecision.ALLOW,
-                        ApprovalDecision.ALLOW_SESSION,
-                    )
+                def __init__(self) -> None:
+                    self.denial_message = ""
+
+                async def check(self, path: str, content: str, mode: str = "overwrite") -> bool:
+                    action = ActionDescriptor.file_write(path, content, mode=mode)
+                    result = await approval_orchestrator.evaluate(action)
+                    self.denial_message = result.denial_message if not result.approved else ""
+                    return result.approved
 
             set_file_write_gate(_FileWriteGate())
-            logger.debug("File write approval gate: unified")
+            logger.debug("File write approval gate: action orchestrator")
         except Exception:
             logger.debug("File write gate setup skipped", exc_info=True)
 
@@ -2232,7 +2356,10 @@ class Context:
         # Shutdown all memory providers (stops GC, closes DB)
         await self.memory.shutdown_all()
         if isinstance(self.rpc, CuaDriverClient):
-            self.rpc.stop()
+            try:
+                self.rpc.stop()
+            except Exception:
+                logger.debug("CuaDriverClient stop failed during cleanup", exc_info=True)
         if self.skill_lib:
             self.skill_lib.close()
         if self.session_store:

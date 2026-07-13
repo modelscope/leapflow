@@ -10,12 +10,27 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
 
 from leapflow.platform.protocol import HostRpc, Methods
 from leapflow.config import Settings
 from leapflow.engine.budget import BudgetConfig, BudgetStatus, IterationBudget
 from leapflow.engine.context_compressor import CompressorConfig, ContextCompressor
+from leapflow.engine.context_control import (
+    ContextBudgetEstimator,
+    ContextGovernanceController,
+    ContextPostureConfig,
+    ContextWindowController,
+    ToolEvidenceBuilder,
+)
+from leapflow.engine.context_disclosure import (
+    DisclosureLevel,
+    DisclosurePlanner,
+    DisclosureRuntimeState,
+    MemoryDisclosure,
+    PromptAssemblyPlan,
+)
 from leapflow.engine.error_classifier import (
     ErrorCategory,
     ErrorClassifier,
@@ -35,7 +50,6 @@ from leapflow.engine.tool_concurrency import (
     ToolCall as ConcurrentToolCall,
     ToolConcurrencyPolicy,
 )
-from leapflow.engine.shortcuts import ShortcutStore
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.scheduler import TaskScheduler
 from leapflow.engine.session import SessionController
@@ -56,8 +70,149 @@ from leapflow.learning.active_learning import SkillMerger
 from leapflow.skills.builtin import app_launcher, clipboard_manager, file_organizer
 from leapflow.storage.skill_library import SkillLibraryStore
 from leapflow.skills.registry import Skill, SkillRegistry
+from leapflow.tools.name_resolver import ToolRegistry, ToolResolution
 
 logger = logging.getLogger(__name__)
+
+_TOOL_ARGS_PREVIEW_LIMIT = 160
+_TOOL_RESULT_PREVIEW_LIMIT = 240
+_TASK_CONTRACT_HEADING = "## Task Contract"
+
+
+def _default_tool_registry() -> ToolRegistry:
+    """Return the canonical runtime tool registry."""
+    from leapflow.tools.registry_bootstrap import TOOL_REGISTRY
+
+    return TOOL_REGISTRY
+
+
+def _resolve_tool_name(tool_name: str, arguments: Dict[str, Any] | None = None) -> ToolResolution:
+    """Resolve a tool name through the runtime registry."""
+    return _default_tool_registry().resolve(tool_name, arguments or {})
+
+
+def _normalize_tool_name(tool_name: str) -> str:
+    """Return the canonical executable tool name when resolution is safe."""
+    return _default_tool_registry().normalize_name(tool_name)
+
+
+def _normalize_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a resolved tool call while preserving the original tool name."""
+    original_name = str(tool_call.get("name", ""))
+    arguments = tool_call.get("arguments") or {}
+    resolution = _resolve_tool_name(original_name, arguments)
+    if not resolution.auto_executable or resolution.normalized_name is None:
+        return {**tool_call, **resolution.to_metadata()}
+    return {
+        **tool_call,
+        "name": resolution.normalized_name,
+        **resolution.to_metadata(),
+    }
+
+
+def _single_line_preview(value: Any, *, limit: int) -> str:
+    """Return a compact single-line preview for UI metadata."""
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else json.dumps(value, default=str, ensure_ascii=False)
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1] + "…"
+
+
+def _tool_args_metadata(
+    tool_name: str,
+    arguments: Dict[str, Any] | None,
+    *,
+    original_tool_name: str | None = None,
+) -> Dict[str, Any]:
+    """Build safe, compact tool-start metadata for streaming UIs."""
+    args = dict(arguments or {})
+    original_name = original_tool_name or tool_name
+    metadata: Dict[str, Any] = {
+        "tool_name": tool_name,
+        "original_tool_name": original_name,
+        "normalized_tool_name": tool_name,
+        "args_summary": _single_line_preview(args, limit=_TOOL_ARGS_PREVIEW_LIMIT),
+    }
+    resolution = _resolve_tool_name(original_name, args)
+    metadata.update(resolution.to_metadata())
+    metadata["tool_name"] = tool_name
+    metadata["normalized_tool_name"] = tool_name
+    if original_name != tool_name:
+        metadata["alias"] = original_name
+    for key in ("command", "cmd", "path", "pattern", "query", "url"):
+        value = args.get(key)
+        if value:
+            metadata[key] = _single_line_preview(value, limit=_TOOL_ARGS_PREVIEW_LIMIT)
+    return metadata
+
+
+def _tool_result_metadata(
+    tool_name: str,
+    arguments: Dict[str, Any] | None,
+    result: Any,
+    *,
+    original_tool_name: str | None = None,
+) -> Dict[str, Any]:
+    """Build safe, compact tool-completion metadata for streaming UIs."""
+    metadata = _tool_args_metadata(tool_name, arguments, original_tool_name=original_tool_name)
+    metadata["ok"] = True
+    if isinstance(result, dict):
+        metadata["ok"] = bool(result.get("ok", True))
+        for key in ("exit_code", "path", "lines", "truncated", "bytes_written"):
+            if key in result:
+                metadata[key] = result[key]
+        for key in ("error_type", "retryable", "resolution_status", "resolution_confidence"):
+            if key in result:
+                metadata[key] = result[key]
+        for key in ("suggestions", "available_tools"):
+            value = result.get(key)
+            if value:
+                metadata[key] = value
+        for key in ("stdout", "stderr", "content", "output", "error"):
+            value = result.get(key)
+            if value:
+                metadata[f"{key}_preview"] = _single_line_preview(
+                    value,
+                    limit=_TOOL_RESULT_PREVIEW_LIMIT,
+                )
+        if not any(key.endswith("_preview") for key in metadata):
+            metadata["result_preview"] = _single_line_preview(
+                result,
+                limit=_TOOL_RESULT_PREVIEW_LIMIT,
+            )
+    else:
+        metadata["result_preview"] = _single_line_preview(
+            result,
+            limit=_TOOL_RESULT_PREVIEW_LIMIT,
+        )
+    return metadata
+
+
+def _is_retryable_unknown_tool_result(result: Any) -> bool:
+    """Return whether a tool result can drive a one-shot name correction retry."""
+    return isinstance(result, dict) and result.get("error_type") == "unknown_tool" and bool(
+        result.get("retryable", False)
+    )
+
+
+def _unknown_tool_retry_prompt(result: Dict[str, Any]) -> str:
+    """Build a compact structured correction prompt for a bad tool name."""
+    suggestions = result.get("suggestions") or []
+    available = result.get("available_tools") or []
+    suggestions_text = ", ".join(str(item) for item in suggestions[:5]) or "none"
+    available_text = ", ".join(str(item) for item in available[:12])
+    return (
+        "SYSTEM: The previous tool call used an unavailable tool name. "
+        f"Original tool: {result.get('original_tool_name', '')}. "
+        f"Resolution: {result.get('resolution_status', 'unknown')} "
+        f"({result.get('resolution_reason', 'no match')}). "
+        f"Suggested canonical tools: {suggestions_text}. "
+        f"Available tools include: {available_text}. "
+        "Retry once using an exact canonical tool name and valid arguments, or answer without a tool if no tool fits."
+    )
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -199,12 +354,14 @@ class StreamEvent:
     - tool_complete: tool execution finished (content = brief result).
     - thinking: reasoning/thinking phase indicator.
     - status: lifecycle status update.
+    - approval_request: human approval request from a daemon-side action.
+    - approval_response: human approval resolution notification.
     - error: error notification.
     """
 
     type: Literal[
         "chunk", "final", "tool_start", "tool_complete",
-        "thinking", "status", "error",
+        "thinking", "status", "error", "approval_request", "approval_response",
     ]
     content: str
     metadata: Optional[Dict[str, Any]] = None
@@ -221,6 +378,48 @@ class _LoopContext:
     last_error: Optional[Exception] = None
     consecutive_failures: int = 0
     prefetch_done: bool = False  # track whether memory prefetch ran this loop
+
+
+@dataclass(frozen=True)
+class _PromptAssembly:
+    """Resolved prompt pieces for a unified-loop turn."""
+
+    system: str
+    plan: PromptAssemblyPlan
+    prior_turns: List[Dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class TaskContract:
+    """Stable per-turn task contract that survives compression and retrieval drift."""
+
+    task_id: str
+    original_request: str
+    workspace_root: str
+    allowed_roots: tuple[str, ...]
+    research_protocol: tuple[str, ...] = ()
+
+    def render(self) -> str:
+        """Render the contract as a compact system block."""
+        lines = [
+            "## Task Contract",
+            f"- Task ID: {self.task_id}",
+            f"- Original user request: {self.original_request}",
+            f"- Workspace root: {self.workspace_root}",
+            f"- Allowed roots: {', '.join(self.allowed_roots)}",
+            (
+                "- Treat relative project paths as relative to the workspace root; never infer `.` "
+                "as the project root when a workspace root is provided."
+            ),
+            (
+                "- Preserve this task contract across summarization, compression, "
+                "tool loops, and memory retrieval."
+            ),
+        ]
+        if self.research_protocol:
+            lines.append("- Research protocol:")
+            lines.extend(f"  - {item}" for item in self.research_protocol)
+        return "\n".join(lines)
 
 
 class AgentEngine:
@@ -244,7 +443,6 @@ class AgentEngine:
         execution: Optional[Any] = None,
         skill_activator: Optional[Any] = None,
         session: Optional[SessionController] = None,
-        shortcuts: Optional["ShortcutStore"] = None,
         vlm: Optional[Any] = None,
         memory_manager: Optional[MemoryManager] = None,
         evolution: Optional[EvolutionMemoryProvider] = None,
@@ -262,7 +460,6 @@ class AgentEngine:
         self._imm = imm
         self._registry = registry
         self._classifier = classifier
-        self._shortcuts = shortcuts
         self._imitation = imitation
         self._skill_library = skill_library
         self._skill_merger = SkillMerger(
@@ -351,10 +548,35 @@ class AgentEngine:
             )
         )
         self._compressor = ContextCompressor(CompressorConfig(
+            token_budget=max(1, int(settings.llm_context_length * settings.context_hard_limit_ratio)),
             threshold=settings.compress_threshold,
             keep_tail=settings.compress_keep_tail,
             max_output_chars=settings.max_tool_output_chars,
         ))
+        self._context_controller = ContextWindowController(
+            estimator=ContextBudgetEstimator(),
+            hard_limit_ratio=settings.context_hard_limit_ratio,
+            warning_ratio=settings.context_warning_ratio,
+        )
+        self._context_governance_controller = ContextGovernanceController(
+            evidence_builder=ToolEvidenceBuilder(
+                max_content_chars=settings.tool_evidence_max_chars,
+            ),
+            repeated_read_limit=settings.repeated_read_limit,
+            convergence_round=settings.long_task_convergence_round,
+            posture_config=ContextPostureConfig(
+                expanded_ratio=settings.context_expanded_ratio,
+                finalizing_ratio=settings.context_finalizing_ratio,
+                expanded_evidence_threshold=settings.context_expanded_evidence_threshold,
+                expanded_tool_call_threshold=settings.context_expanded_tool_call_threshold,
+                research_source_threshold=settings.context_research_source_threshold,
+                research_evidence_threshold=settings.context_research_evidence_threshold,
+            ),
+        )
+        self._last_context_snapshot: dict[str, Any] = {}
+        self._last_disclosure_metadata: dict[str, Any] = {}
+        self._current_task_contract: TaskContract | None = None
+        self._disclosure_planner = DisclosurePlanner()
         self._healer = MessageHealer()
 
         # B2: Prompt cache optimization (None = disabled)
@@ -373,6 +595,33 @@ class AgentEngine:
         """Configure output message sanitizer."""
         self._sanitizer = sanitizer
 
+    def reconfigure_host_backend(
+        self,
+        *,
+        rpc: HostRpc,
+        perception: Optional[Any],
+        execution: Optional[Any],
+        tool_bridge: Optional[Any],
+    ) -> None:
+        """Refresh host RPC and adapters without resetting chat/session state."""
+        self._rpc = rpc
+        self._perception = perception
+        self._execution = execution
+        self._tool_bridge = tool_bridge
+        self._skill_merger = SkillMerger(
+            registry=self._registry,
+            llm=self._llm,
+            execution=execution,
+        )
+        if self._settings.has_llm_credentials:
+            self._scheduler = TaskScheduler(
+                self._registry,
+                rpc,
+                graph_planner=self._graph_planner,
+            )
+        else:
+            self._scheduler = None
+
     def reconfigure_runtime(
         self,
         *,
@@ -386,6 +635,32 @@ class AgentEngine:
         self._llm = llm
         self._vlm = vlm
         self._classifier = classifier
+        self._compressor = ContextCompressor(CompressorConfig(
+            token_budget=max(1, int(settings.llm_context_length * settings.context_hard_limit_ratio)),
+            threshold=settings.compress_threshold,
+            keep_tail=settings.compress_keep_tail,
+            max_output_chars=settings.max_tool_output_chars,
+        ))
+        self._context_controller = ContextWindowController(
+            estimator=ContextBudgetEstimator(),
+            hard_limit_ratio=settings.context_hard_limit_ratio,
+            warning_ratio=settings.context_warning_ratio,
+        )
+        self._context_governance_controller = ContextGovernanceController(
+            evidence_builder=ToolEvidenceBuilder(
+                max_content_chars=settings.tool_evidence_max_chars,
+            ),
+            repeated_read_limit=settings.repeated_read_limit,
+            convergence_round=settings.long_task_convergence_round,
+            posture_config=ContextPostureConfig(
+                expanded_ratio=settings.context_expanded_ratio,
+                finalizing_ratio=settings.context_finalizing_ratio,
+                expanded_evidence_threshold=settings.context_expanded_evidence_threshold,
+                expanded_tool_call_threshold=settings.context_expanded_tool_call_threshold,
+                research_source_threshold=settings.context_research_source_threshold,
+                research_evidence_threshold=settings.context_research_evidence_threshold,
+            ),
+        )
         self._skill_merger = SkillMerger(
             registry=self._registry,
             llm=llm,
@@ -627,24 +902,363 @@ class AgentEngine:
 
     @property
     def context_token_count(self) -> int:
-        """Prompt tokens from the most recent API call (context utilization)."""
+        """Estimated provider-visible prompt tokens from the most recent API call."""
         return self._last_context_tokens
+
+    @property
+    def context_budget_snapshot(self) -> dict[str, Any]:
+        """Last prompt-budget snapshot for status/daemon metadata."""
+        return dict(self._last_context_snapshot)
+
+    def _active_context_length(self) -> int:
+        """Return the runtime context length for the active model/provider."""
+        if self._model_capabilities is not None:
+            try:
+                return max(1, int(self._model_capabilities.resolve(self._settings.llm_model).context_length))
+            except Exception:
+                logger.debug("model capability lookup failed", exc_info=True)
+        return max(1, int(self._settings.llm_context_length))
+
+    def _begin_turn_context(self, user_text: str) -> None:
+        """Reset turn-scoped state and build the stable task contract."""
+        self._memory_context_snapshot = None
+        self._last_context_snapshot = {}
+        self._last_disclosure_metadata = {}
+        self._context_governance_controller.reset_turn_scope()
+        self._current_task_contract = self._build_task_contract(user_text)
+
+    def _build_task_contract(self, user_text: str) -> TaskContract:
+        workspace_root = (
+            Path(getattr(self._settings, "workspace_root", Path.cwd()))
+            .expanduser()
+            .resolve()
+        )
+        protocol = self._research_protocol_for(user_text)
+        return TaskContract(
+            task_id=f"turn-{self._session_turn_count}",
+            original_request=user_text.strip(),
+            workspace_root=str(workspace_root),
+            allowed_roots=(str(workspace_root),),
+            research_protocol=protocol,
+        )
+
+    @staticmethod
+    def _research_protocol_for(user_text: str) -> tuple[str, ...]:
+        normalized = user_text.lower()
+        architecture_tokens = (
+            "architecture", "diagram", "design", "架构", "架构图", "系统设计", "框图",
+        )
+        if not any(token in normalized for token in architecture_tokens):
+            return ()
+        return (
+            "Identify the active project root before reading files.",
+            "Start from README, AGENTS, docs index, and top-level source layout.",
+            "Use outlines, symbols, and bounded ranges before raw full-file reads.",
+            "Cross-check entrypoints, core orchestration, representative modules, and tests.",
+            "Produce a concise subsystem map and Mermaid architecture diagram grounded in evidence.",
+        )
+
+    def _task_scope_keywords(self, user_text: str) -> list[str]:
+        keywords = _keywords_from_query(user_text)
+        contract = self._current_task_contract
+        if contract:
+            workspace_name = Path(contract.workspace_root).name
+            if workspace_name:
+                keywords.append(workspace_name)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for keyword in keywords:
+            key = keyword.lower()
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(keyword)
+        return deduped[:12]
+
+    def _task_contract_block(self) -> str:
+        if not self._current_task_contract:
+            return ""
+        return self._current_task_contract.render()
+
+    def _append_task_contract_to_system(self, system: str) -> str:
+        block = self._task_contract_block()
+        if not block:
+            return system
+        base = self._strip_task_contract_block(system)
+        return f"{base.rstrip()}\n\n{block}\n" if base.strip() else f"{block}\n"
+
+    @staticmethod
+    def _strip_task_contract_block(content: str) -> str:
+        marker = f"\n{_TASK_CONTRACT_HEADING}"
+        if content.startswith(_TASK_CONTRACT_HEADING):
+            return ""
+        marker_index = content.find(marker)
+        if marker_index == -1:
+            return content
+        return content[:marker_index].rstrip()
+
+    def _ensure_task_contract_message(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        block = self._task_contract_block()
+        if not block:
+            return messages
+        prepared: list[Dict[str, Any]] = []
+        inserted = False
+        for message in messages:
+            if message.get("role") != "system":
+                prepared.append(message)
+                continue
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                prepared.append(message)
+                continue
+            base = self._strip_task_contract_block(content)
+            if not inserted:
+                updated = dict(message)
+                updated["content"] = f"{base.rstrip()}\n\n{block}\n" if base.strip() else f"{block}\n"
+                prepared.append(updated)
+                inserted = True
+            elif base.strip():
+                updated = dict(message)
+                updated["content"] = base
+                prepared.append(updated)
+        if inserted:
+            return prepared
+        return [build_system_message(block), *prepared]
+
+    async def _assemble_unified_prompt(
+        self,
+        user_text: str,
+        *,
+        tool_definitions: List[Dict[str, Any]],
+        enable_thinking: bool,
+        slash_command: bool = False,
+    ) -> _PromptAssembly:
+        """Resolve progressive disclosure and build the system prompt."""
+        from leapflow.prompts.templates import UNIFIED_SYSTEM_TEMPLATE
+
+        runtime = DisclosureRuntimeState(
+            enable_thinking=enable_thinking,
+            native_tools_enabled=self._settings.native_tool_calling_enabled,
+            slash_command=slash_command,
+            context_posture=str(self._last_context_snapshot.get("context_posture") or "baseline"),
+            recent_failure=bool(self._last_context_snapshot.get("forced_final_answer")),
+        )
+        try:
+            plan = self._disclosure_planner.plan(user_text, tool_definitions, runtime)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            logger.warning("disclosure planning failed; falling back to full context: %s", exc)
+            plan = DisclosurePlanner().full_plan(
+                user_text,
+                tool_definitions,
+                runtime,
+                "planner fallback preserved unified-loop behavior",
+            )
+
+        tool_catalog = self._format_tool_catalog(list(plan.catalog_definitions))
+        memory_context = ""
+        if plan.memory == MemoryDisclosure.SESSION_SUMMARY:
+            memory_context = self._build_session_summary_context(max_messages=plan.max_prior_turns)
+        elif plan.memory in {MemoryDisclosure.QUERY_RETRIEVAL, MemoryDisclosure.TASK_RETRIEVAL}:
+            memory_context = await self._prefetch_and_freeze_memory(user_text)
+        skill_section = self._build_skill_section(include_skills=plan.level != DisclosureLevel.LIGHT)
+        system = UNIFIED_SYSTEM_TEMPLATE.format(
+            tool_catalog=tool_catalog,
+            skill_section=skill_section,
+            memory_context=memory_context,
+        )
+        system = self._append_task_contract_to_system(system)
+        self._last_disclosure_metadata = plan.metadata()
+        prior_turns = self._prior_turns_for_plan(plan)
+        return _PromptAssembly(system=system, plan=plan, prior_turns=prior_turns)
+
+    def _build_session_summary_context(self, *, max_messages: int) -> str:
+        """Return a compact local session summary without retrieval or extra LLM calls."""
+        messages = self._wm.as_chat_messages()
+        summary_lines: list[str] = []
+        for message in messages[-max(0, max_messages):]:
+            role = str(message.get("role") or "").strip()
+            if role not in {"user", "assistant"}:
+                continue
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(part.get("text", part)) if isinstance(part, dict) else str(part)
+                    for part in content
+                )
+            elif not isinstance(content, str):
+                content = str(content)
+            preview = _single_line_preview(content, limit=180)
+            if preview:
+                summary_lines.append(f"- {role}: {preview}")
+        if not summary_lines:
+            return ""
+        return "\n## Recent Session Summary\n" + "\n".join(summary_lines) + "\n"
+
+    def _build_skill_section(self, *, include_skills: bool) -> str:
+        """Return compact learned-skill prompt text when the plan allows it."""
+        if not include_skills or not self._skill_index:
+            return ""
+        entries = self._skill_index.get_entries()
+        if not entries:
+            return ""
+        skill_index_text = self._skill_index.compact_index_text(entries)
+        return (
+            "\n## Learned Skills\n"
+            "You have access to the following learned skills. "
+            "Use `gp_skills_list` to browse or `gp_skill_view` to read details:\n"
+            f"{skill_index_text}\n"
+        )
+
+    def _prior_turns_for_plan(self, plan: PromptAssemblyPlan) -> List[Dict[str, Any]]:
+        """Return bounded prior conversation turns according to the disclosure plan."""
+        wm_history = self._wm.as_chat_messages()
+        prior_turns: List[Dict[str, Any]] = [
+            message for message in wm_history
+            if isinstance(message.get("role"), str) and message["role"] in ("user", "assistant")
+        ]
+        return prior_turns[-max(0, plan.max_prior_turns):]
+
+    @staticmethod
+    def _planned_enable_thinking(plan: PromptAssemblyPlan, requested: bool) -> bool:
+        """Apply the plan-level reasoning gate to the provider request."""
+        return requested and plan.reasoning.value != "off"
+
+    def _planned_tools_kwarg(self, plan: PromptAssemblyPlan) -> Dict[str, Any]:
+        """Return provider tool schemas only when the plan discloses native tools."""
+        if plan.native_tools and plan.tool_definitions:
+            return {"tools": list(plan.tool_definitions)}
+        return {}
+
+    def _prepare_llm_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Any = None,
+        round_number: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Compress and hard-gate messages before sending them to the provider."""
+        context_length = self._active_context_length()
+        token_count = self._context_controller.estimator.estimate_messages(messages)
+        prepared = self._compressor.compress(messages, token_count=token_count)
+        prepared = self._ensure_task_contract_message(prepared)
+        compression_trace = self._compressor.last_trace.as_dict()
+        prepared = self._compressor.preflight_check(prepared, context_length=context_length)
+        prepared = self._ensure_task_contract_message(prepared)
+        if self._cache_strategy:
+            prepared = self._cache_strategy.optimize(prepared)
+            prepared = self._ensure_task_contract_message(prepared)
+        decision = self._context_controller.prepare(
+            prepared,
+            tools=tools,
+            context_length=context_length,
+            compressor=self._compressor,
+        )
+        prepared = self._ensure_task_contract_message(decision.messages)
+        compression_trace = self._compressor.last_trace.as_dict()
+        warning = self._context_controller.warning_notice(
+            decision.snapshot,
+            round_number=round_number,
+        )
+        convergence = self._context_governance_controller.convergence_notice(round_number)
+        for notice in (warning, convergence):
+            if notice:
+                prepared = [*prepared, build_user_message_text(notice)]
+        prepared = self._ensure_task_contract_message(prepared)
+        snapshot = self._context_controller.estimator.snapshot(
+            prepared,
+            tools=tools,
+            context_length=context_length,
+        )
+        governance = self._context_governance_controller.snapshot(
+            context_ratio=snapshot.ratio,
+            round_number=round_number,
+        ).as_dict()
+        compressed = decision.compressed or bool(compression_trace.get("stages_applied"))
+        self._last_context_tokens = snapshot.total_tokens
+        self._last_context_snapshot = {
+            "message_tokens": snapshot.message_tokens,
+            "tool_schema_tokens": snapshot.tool_schema_tokens,
+            "total_tokens": snapshot.total_tokens,
+            "context_length": snapshot.context_length,
+            "ratio": snapshot.ratio,
+            "compressed": compressed,
+            "forced_final_answer": decision.forced_final_answer,
+            "compression_trace": compression_trace,
+            "compression_reason": compression_trace.get("decision_reason", ""),
+            "compression_savings_ratio": compression_trace.get("savings_ratio", 0.0),
+            "compression_saved_tokens": compression_trace.get("saved_tokens", 0),
+            "context_governance": governance,
+            "context_posture": governance.get("posture", "baseline"),
+            "context_signal": governance.get("dominant_signal", ""),
+            "context_guidance": governance.get("guidance", ""),
+            "context_convergence_reason": governance.get("convergence_reason", ""),
+            "disclosure": dict(self._last_disclosure_metadata),
+            "disclosure_level": self._last_disclosure_metadata.get("level", ""),
+            "disclosure_reason": self._last_disclosure_metadata.get("reason", ""),
+        }
+        if compressed:
+            self._usage_tracker.mark_compression()
+        return prepared
+
+    def _record_provider_usage(self, model: str, usage: Dict[str, Any]) -> None:
+        """Prefer provider prompt usage when available and learn observed limits."""
+        provider_prompt = int(usage.get("prompt_tokens", 0) or 0)
+        if provider_prompt > 0:
+            self._last_context_tokens = provider_prompt
+            self._last_context_snapshot = {
+                **self._last_context_snapshot,
+                "provider_prompt_tokens": provider_prompt,
+                "total_tokens": provider_prompt,
+                "ratio": provider_prompt / max(1, int(self._last_context_snapshot.get("context_length") or 1)),
+            }
+        if self._model_capabilities and model and usage:
+            self._model_capabilities.update_from_usage(model, usage)
+
+    def _compact_tool_result(self, tool_name: str, arguments: Dict[str, Any] | None, result: Any) -> Any:
+        """Return compact tool evidence for LLM replay."""
+        return self._context_governance_controller.compact_tool_result(tool_name, arguments, result)
+
+    def _tool_context_metadata(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any] | None,
+        result: Any,
+    ) -> Dict[str, Any]:
+        """Return additional UI metadata from adaptive context handling."""
+        metadata = self._context_governance_controller.tool_metadata(tool_name, arguments, result)
+        snapshot = self._last_context_snapshot
+        if snapshot:
+            posture = snapshot.get("context_posture")
+            if posture and posture != "baseline":
+                metadata.setdefault("context_posture", posture)
+            signal = snapshot.get("context_signal")
+            if signal:
+                metadata.setdefault("context_signal", signal)
+            guidance = snapshot.get("context_guidance")
+            if guidance:
+                metadata.setdefault("context_guidance", guidance)
+            disclosure_level = snapshot.get("disclosure_level")
+            if disclosure_level:
+                metadata.setdefault("disclosure_level", disclosure_level)
+            disclosure_reason = snapshot.get("disclosure_reason")
+            if disclosure_reason:
+                metadata.setdefault("disclosure_reason", disclosure_reason)
+            trace = snapshot.get("compression_trace")
+            if isinstance(trace, dict) and trace.get("stages_applied"):
+                metadata.setdefault("compression_stages", trace.get("stages_applied"))
+                metadata.setdefault("compression_savings_ratio", trace.get("savings_ratio", 0.0))
+                metadata.setdefault("compression_saved_tokens", trace.get("saved_tokens", 0))
+                metadata.setdefault("compression_reason", trace.get("decision_reason", ""))
+            if snapshot.get("forced_final_answer"):
+                metadata.setdefault("context_posture", "finalizing")
+        return metadata
 
     async def run(self, user_text: str, *, enable_thinking: bool = False) -> str:
         """Entrypoint: simplified routing with unified tool loop as default path."""
         self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
-        self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
+        self._begin_turn_context(user_text)
 
-        # 1. Shortcut match (zero cost, exact keyword)
-        if self._shortcuts:
-            reply = self._shortcuts.match(user_text)
-            if reply:
-                self._wm.remember_chat(build_user_message_text(user_text))
-                self._wm.remember_chat(build_assistant_message(reply))
-                return reply
-
-        # 2. Slash command (skill injection — zero-ambiguity activation)
+        # 1. Slash command (skill injection — zero-ambiguity activation)
         if user_text.startswith("/") and self._skill_injector:
             self._inject_pending_skill_reminder()
             self._wm.remember_chat(build_user_message_text(user_text))
@@ -654,11 +1268,11 @@ class AgentEngine:
         self._inject_pending_skill_reminder()
         self._wm.remember_chat(build_user_message_text(user_text))
 
-        # 3. Teach command (special session mode switch)
+        # 2. Teach command (special session mode switch)
         if self._is_teach_command(user_text):
             return await self._handle_learn_command(user_text)
 
-        # 4. Everything else → unified tool loop (LLM decides tools vs direct response)
+        # 3. Everything else → unified tool loop (LLM decides tools vs direct response)
         logger.debug("route.unified user_text_len=%d", len(user_text))
         if not self._settings.has_llm_credentials:
             msg = self._error_classifier.friendly_message(ErrorCategory.AUTH_PERMANENT)
@@ -672,25 +1286,16 @@ class AgentEngine:
         """Like run(), but yields text chunks for streamable responses.
 
         Yields:
-            str: legacy plain-text chunks (shortcuts, teach commands).
+            str: legacy plain-text chunks (teach commands).
             StreamEvent(type="chunk"): real-time token fragments.
             StreamEvent(type="final"): complete assembled response.
             StreamEvent(type="tool_call"): internal tool invocation (suppress display).
         """
         self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
-        self._memory_context_snapshot = None  # reset per-turn for fresh prefetch
+        self._begin_turn_context(user_text)
 
-        # 1. Shortcut match (zero cost)
-        if self._shortcuts:
-            reply = self._shortcuts.match(user_text)
-            if reply:
-                self._wm.remember_chat(build_user_message_text(user_text))
-                self._wm.remember_chat(build_assistant_message(reply))
-                yield reply
-                return
-
-        # 2. Slash command (skill injection)
+        # 1. Slash command (skill injection)
         if user_text.startswith("/") and self._skill_injector:
             self._inject_pending_skill_reminder()
             self._wm.remember_chat(build_user_message_text(user_text))
@@ -702,13 +1307,13 @@ class AgentEngine:
         self._inject_pending_skill_reminder()
         self._wm.remember_chat(build_user_message_text(user_text))
 
-        # 3. Teach command (special session mode switch)
+        # 2. Teach command (special session mode switch)
         if self._is_teach_command(user_text):
             result = await self._handle_learn_command(user_text)
             yield result
             return
 
-        # 4. Everything else → unified tool loop (streaming)
+        # 3. Everything else → unified tool loop (streaming)
         logger.debug("route.unified user_text_len=%d", len(user_text))
         if not self._settings.has_llm_credentials:
             msg = self._error_classifier.friendly_message(ErrorCategory.AUTH_PERMANENT)
@@ -1109,63 +1714,33 @@ class AgentEngine:
                 if injection:
                     user_text = injection  # Replace user_text with skill injection
 
-        from leapflow.prompts.templates import UNIFIED_SYSTEM_TEMPLATE
         from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
 
         budget = IterationBudget.for_react(self._budget_config)
         trace = ExecutionTrace()
-
-        # Build tool catalog text (for system prompt readability)
-        tool_catalog = self._format_tool_catalog(TOOL_DEFINITIONS)
-
-        memory_context = await self._prefetch_and_freeze_memory(user_text)
-
-        skill_section = ""
-        if self._skill_index:
-            entries = self._skill_index.get_entries()
-            if entries:
-                skill_index_text = self._skill_index.compact_index_text(entries)
-                skill_section = (
-                    "\n## Learned Skills\n"
-                    "You have access to the following learned skills. "
-                    "Use `gp_skills_list` to browse or `gp_skill_view` to read details:\n"
-                    f"{skill_index_text}\n"
-                )
-
-        # Build system prompt
-        system = UNIFIED_SYSTEM_TEMPLATE.format(
-            tool_catalog=tool_catalog,
-            skill_section=skill_section,
-            memory_context=memory_context,
+        assembly = await self._assemble_unified_prompt(
+            user_text,
+            tool_definitions=TOOL_DEFINITIONS,
+            enable_thinking=enable_thinking,
+            slash_command=user_text.startswith("/"),
         )
-
-        # Inject prior conversation turns from working memory for multi-turn coherence
-        wm_history = self._wm.as_chat_messages()
-        # Filter to keep only recent user/assistant exchanges (skip system events)
-        prior_turns: List[Dict[str, Any]] = [
-            m for m in wm_history
-            if isinstance(m.get("role"), str) and m["role"] in ("user", "assistant")
-        ]
-        # Limit to last N turns to avoid overwhelming context
-        max_prior_turns = 10
-        prior_turns = prior_turns[-max_prior_turns:]
+        planned_enable_thinking = self._planned_enable_thinking(assembly.plan, enable_thinking)
 
         messages: List[Dict[str, Any]] = [
-            build_system_message(system),
-            *prior_turns,
+            build_system_message(assembly.system),
+            *assembly.prior_turns,
             build_user_message_text(user_text),
         ]
 
         content = ""
         fatal_error: Optional[str] = None
         recovery = TurnRecoveryState()
-        use_native_tools = self._settings.native_tool_calling_enabled
+        use_native_tools = assembly.plan.native_tools
         result_budget = self._effective_tool_result_budget()
+        unknown_tool_retry_used = False
         self._usage_tracker.reset()
 
-        tools_kwarg: Dict[str, Any] = {}
-        if use_native_tools and TOOL_DEFINITIONS:
-            tools_kwarg["tools"] = TOOL_DEFINITIONS
+        tools_kwarg: Dict[str, Any] = self._planned_tools_kwarg(assembly.plan)
 
         self._cancel_requested = False
         _signal_watermark = [time.time()]
@@ -1184,16 +1759,15 @@ class AgentEngine:
             self._inject_live_signals(messages, _signal_watermark)
 
             healed = self._healer.heal(messages)
-            compressed = self._compressor.compress(healed)
-            compressed = self._compressor.preflight_check(compressed)
-            if self._cache_strategy:
-                compressed = self._cache_strategy.optimize(compressed)
-            self._last_context_tokens = _estimate_prompt_tokens(compressed)
+            compressed = self._prepare_llm_messages(
+                healed,
+                tools=tools_kwarg.get("tools"),
+                round_number=budget.used,
+            )
 
-            _show_progress("thinking", f"round {budget.used}")
             try:
                 resp = await self._llm.achat(
-                    compressed, stream=False, enable_thinking=enable_thinking,
+                    compressed, stream=False, enable_thinking=planned_enable_thinking,
                     **tools_kwarg,
                 )
                 recovery.record_api_success()
@@ -1205,9 +1779,7 @@ class AgentEngine:
                 )
                 provider_prompt = usage.get("prompt_tokens", 0)
                 if provider_prompt > 0:
-                    self._last_context_tokens = provider_prompt
-                if self._model_capabilities and resp.model and usage:
-                    self._model_capabilities.update_from_usage(resp.model, usage)
+                    self._record_provider_usage(resp.model or '', usage)
             except Exception as exc:
                 _clear_indicator()
                 classified = self._error_classifier.classify(exc)
@@ -1258,9 +1830,22 @@ class AgentEngine:
                 messages.append(assistant_msg)
                 self._persist_message(session_id, "assistant", content, tool_calls=assistant_msg.get("tool_calls"))
 
-                await self._execute_tools_concurrent(
+                results = await self._execute_tools_concurrent(
                     native_calls, TOOL_HANDLERS, trace=trace, messages=messages,
                 )
+
+                retryable_unknown = next(
+                    (
+                        item.get("result")
+                        for item in results
+                        if _is_retryable_unknown_tool_result(item.get("result"))
+                    ),
+                    None,
+                )
+                if retryable_unknown and not unknown_tool_retry_used:
+                    unknown_tool_retry_used = True
+                    messages.append(build_user_message_text(_unknown_tool_retry_prompt(retryable_unknown)))
+                    continue
 
                 failures = self._count_consecutive_tool_failures(messages)
                 recovery.consecutive_tool_failures = failures
@@ -1291,31 +1876,40 @@ class AgentEngine:
                 break
 
             messages.append(build_assistant_message(content))
-            _show_progress("executing", tool_call['name'])
-            result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
+            normalized_tool_call = _normalize_tool_call(tool_call)
+            tool_name = str(normalized_tool_call["name"])
+            tool_arguments = normalized_tool_call.get("arguments")
+            _show_progress("executing", tool_name)
+            result = await self._execute_general_tool(normalized_tool_call, TOOL_HANDLERS)
             _clear_indicator()
-            _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
+            _print_tool_result(tool_name, result, enabled=self._settings.verbose_progress)
             trace.record(
                 ExecutionMode.ACTING,
-                action=tool_call,
+                action=normalized_tool_call,
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
 
             is_error = isinstance(result, dict) and not result.get("ok", True)
             if is_error:
                 recovery.record_tool_failure()
-                if recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
-                    logger.warning("unified_loop: %d consecutive tool failures, stopping",
-                                   recovery.consecutive_tool_failures)
-                    break
             else:
                 recovery.record_tool_success()
-
-            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+            result_payload = self._compact_tool_result(tool_name, tool_arguments, result)
+            result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
             messages.append(build_user_message_text(
-                f"Tool result ({tool_call['name']}):\n{result_text}"
+                f"Tool result ({tool_name}):\n{result_text}"
             ))
-            self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
+            self._persist_message(session_id, "tool", result_text, tool_name=tool_name)
+
+            if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
+                unknown_tool_retry_used = True
+                messages.append(build_user_message_text(_unknown_tool_retry_prompt(result)))
+                continue
+
+            if is_error and recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                logger.warning("unified_loop: %d consecutive tool failures, stopping",
+                               recovery.consecutive_tool_failures)
+                break
 
             if self._check_guardrail(messages) == "halt":
                 break
@@ -1470,58 +2064,33 @@ class AgentEngine:
                 if injection:
                     user_text = injection
 
-        from leapflow.prompts.templates import UNIFIED_SYSTEM_TEMPLATE
         from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
 
         budget = IterationBudget.for_react(self._budget_config)
         trace = ExecutionTrace()
-
-        tool_catalog = self._format_tool_catalog(TOOL_DEFINITIONS)
-
-        memory_context = await self._prefetch_and_freeze_memory(user_text)
-
-        skill_section = ""
-        if self._skill_index:
-            idx_entries = self._skill_index.get_entries()
-            if idx_entries:
-                skill_index_text = self._skill_index.compact_index_text(idx_entries)
-                skill_section = (
-                    "\n## Learned Skills\n"
-                    "You have access to the following learned skills. "
-                    "Use `gp_skills_list` to browse or `gp_skill_view` to read details:\n"
-                    f"{skill_index_text}\n"
-                )
-
-        system = UNIFIED_SYSTEM_TEMPLATE.format(
-            tool_catalog=tool_catalog,
-            skill_section=skill_section,
-            memory_context=memory_context,
+        assembly = await self._assemble_unified_prompt(
+            user_text,
+            tool_definitions=TOOL_DEFINITIONS,
+            enable_thinking=enable_thinking,
+            slash_command=user_text.startswith("/"),
         )
-
-        # Prior conversation context
-        wm_history = self._wm.as_chat_messages()
-        prior_turns: List[Dict[str, Any]] = [
-            m for m in wm_history
-            if isinstance(m.get("role"), str) and m["role"] in ("user", "assistant")
-        ]
-        prior_turns = prior_turns[-10:]
+        planned_enable_thinking = self._planned_enable_thinking(assembly.plan, enable_thinking)
 
         messages: List[Dict[str, Any]] = [
-            build_system_message(system),
-            *prior_turns,
+            build_system_message(assembly.system),
+            *assembly.prior_turns,
             build_user_message_text(user_text),
         ]
 
         content = ""
         fatal_error: Optional[str] = None
         turn_recovery = TurnRecoveryState()
-        use_native_tools = self._settings.native_tool_calling_enabled
+        use_native_tools = assembly.plan.native_tools
         result_budget = self._effective_tool_result_budget()
+        unknown_tool_retry_used = False
         self._usage_tracker.reset()
 
-        tools_kwarg: Dict[str, Any] = {}
-        if use_native_tools and TOOL_DEFINITIONS:
-            tools_kwarg["tools"] = TOOL_DEFINITIONS
+        tools_kwarg: Dict[str, Any] = self._planned_tools_kwarg(assembly.plan)
 
         session_id = self._ensure_session(user_text)
 
@@ -1540,20 +2109,18 @@ class AgentEngine:
             self._inject_live_signals(messages, _signal_watermark)
 
             healed = self._healer.heal(messages)
-            compressed = self._compressor.compress(healed)
-            compressed = self._compressor.preflight_check(compressed)
-            if self._cache_strategy:
-                compressed = self._cache_strategy.optimize(compressed)
-            self._last_context_tokens = _estimate_prompt_tokens(compressed)
-
-            yield StreamEvent(type="thinking", content=f"round {budget.used}")
+            compressed = self._prepare_llm_messages(
+                healed,
+                tools=tools_kwarg.get("tools") if use_native_tools else None,
+                round_number=budget.used,
+            )
 
             content = ""
 
             if use_native_tools and tools_kwarg:
                 try:
                     resp = await self._llm.achat(
-                        compressed, stream=False, enable_thinking=enable_thinking,
+                        compressed, stream=False, enable_thinking=planned_enable_thinking,
                         **tools_kwarg,
                     )
                     turn_recovery.record_api_success()
@@ -1565,7 +2132,7 @@ class AgentEngine:
                     )
                     provider_prompt = usage.get("prompt_tokens", 0)
                     if provider_prompt > 0:
-                        self._last_context_tokens = provider_prompt
+                        self._record_provider_usage(resp.model or '', usage)
                 except Exception as exc:
                     _clear_indicator()
                     classified = self._error_classifier.classify(exc)
@@ -1616,15 +2183,54 @@ class AgentEngine:
                     )
 
                     for tc in native_calls:
-                        yield StreamEvent(type="tool_start", content=tc.name)
-                    await self._execute_tools_concurrent(
+                        resolved_call = _normalize_tool_call({"name": tc.name, "arguments": tc.arguments})
+                        normalized_name = str(resolved_call["name"])
+                        original_name = str(resolved_call.get("original_tool_name") or tc.name)
+                        yield StreamEvent(
+                            type="tool_start",
+                            content=normalized_name,
+                            metadata=_tool_args_metadata(
+                                normalized_name,
+                                tc.arguments,
+                                original_tool_name=original_name,
+                            ),
+                        )
+                    results = await self._execute_tools_concurrent(
                         native_calls, TOOL_HANDLERS, trace=trace, messages=messages
                     )
+                    result_by_id = {str(item.get("id")): item for item in results}
+                    retryable_unknown = next(
+                        (
+                            item.get("result")
+                            for item in results
+                            if _is_retryable_unknown_tool_result(item.get("result"))
+                        ),
+                        None,
+                    )
                     for tc in native_calls:
-                        yield StreamEvent(type="tool_complete", content=tc.name)
+                        item = result_by_id.get(str(tc.id), {})
+                        normalized_name = str(item.get("name") or _normalize_tool_name(tc.name))
+                        original_name = str(item.get("original_tool_name") or tc.name)
+                        yield StreamEvent(
+                            type="tool_complete",
+                            content=normalized_name,
+                            metadata={
+                                **_tool_result_metadata(
+                                    normalized_name,
+                                    tc.arguments,
+                                    item.get("result"),
+                                    original_tool_name=original_name,
+                                ),
+                                **self._tool_context_metadata(normalized_name, tc.arguments, item.get("result")),
+                            },
+                        )
 
                     failures = self._count_consecutive_tool_failures(messages)
                     turn_recovery.consecutive_tool_failures = failures
+                    if retryable_unknown and not unknown_tool_retry_used:
+                        unknown_tool_retry_used = True
+                        messages.append(build_user_message_text(_unknown_tool_retry_prompt(retryable_unknown)))
+                        continue
                     if failures >= self._settings.max_consecutive_tool_failures:
                         logger.warning("unified_loop_stream: %d consecutive tool failures, stopping", failures)
                         break
@@ -1647,7 +2253,7 @@ class AgentEngine:
                     try:
                         _clear_indicator()
                         raw_stream = self._llm.achat_stream(
-                            compressed, enable_thinking=enable_thinking,
+                            compressed, enable_thinking=planned_enable_thinking,
                         )
                         guarded = stale_guarded_stream(
                             raw_stream, timeout_s=self._stale_stream_timeout_s,
@@ -1689,7 +2295,7 @@ class AgentEngine:
                 else:
                     try:
                         resp = await self._llm.achat(
-                            compressed, stream=False, enable_thinking=enable_thinking,
+                            compressed, stream=False, enable_thinking=planned_enable_thinking,
                         )
                         turn_recovery.record_api_success()
                         usage = resp.usage or {}
@@ -1739,32 +2345,67 @@ class AgentEngine:
                 return
 
             messages.append(build_assistant_message(content))
-            yield StreamEvent(type="tool_start", content=tool_call['name'])
-            result = await self._execute_general_tool(tool_call, TOOL_HANDLERS)
+            normalized_tool_call = _normalize_tool_call(tool_call)
+            tool_name = str(normalized_tool_call["name"])
+            original_tool_name = str(normalized_tool_call.get("original_tool_name", tool_name))
+            tool_arguments = normalized_tool_call.get("arguments")
+            yield StreamEvent(
+                type="tool_start",
+                content=tool_name,
+                metadata=_tool_args_metadata(
+                    tool_name,
+                    tool_arguments,
+                    original_tool_name=original_tool_name,
+                ),
+            )
+            result = await self._execute_general_tool(normalized_tool_call, TOOL_HANDLERS)
             _clear_indicator()
-            yield StreamEvent(type="tool_complete", content=tool_call['name'])
-            _print_tool_result(tool_call['name'], result, enabled=self._settings.verbose_progress)
+            yield StreamEvent(
+                type="tool_complete",
+                content=tool_name,
+                metadata={
+                    **_tool_result_metadata(
+                        tool_name,
+                        tool_arguments,
+                        result,
+                        original_tool_name=original_tool_name,
+                    ),
+                    **self._tool_context_metadata(
+                        tool_name,
+                        tool_arguments,
+                        result,
+                    ),
+                },
+            )
+            _print_tool_result(tool_name, result, enabled=self._settings.verbose_progress)
             trace.record(
                 ExecutionMode.ACTING,
-                action=tool_call,
+                action=normalized_tool_call,
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
 
             is_error = isinstance(result, dict) and not result.get("ok", True)
             if is_error:
                 turn_recovery.record_tool_failure()
-                if turn_recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
-                    logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
-                                   turn_recovery.consecutive_tool_failures)
-                    break
             else:
                 turn_recovery.record_tool_success()
 
-            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+            result_payload = self._compact_tool_result(tool_name, tool_arguments, result)
+            result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
             messages.append(build_user_message_text(
-                f"Tool result ({tool_call['name']}):\n{result_text}"
+                f"Tool result ({tool_name}):\n{result_text}"
             ))
-            self._persist_message(session_id, "tool", result_text, tool_name=tool_call['name'])
+            self._persist_message(session_id, "tool", result_text, tool_name=tool_name)
+
+            if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
+                unknown_tool_retry_used = True
+                messages.append(build_user_message_text(_unknown_tool_retry_prompt(result)))
+                continue
+
+            if is_error and turn_recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
+                logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
+                               turn_recovery.consecutive_tool_failures)
+                break
 
             if self._check_guardrail(messages) == "halt":
                 break
@@ -1825,33 +2466,50 @@ class AgentEngine:
         *,
         trace: ExecutionTrace,
         messages: List[Dict[str, Any]],
-    ) -> None:
+    ) -> list[Dict[str, Any]]:
         """Execute native tool calls respecting concurrency policy.
 
         Concurrent group runs via asyncio.gather; sequential group runs one-by-one.
-        Results are appended to messages in OpenAI tool-result format.
+        Results are appended to messages in OpenAI tool-result format and returned
+        for streaming UI metadata.
         """
         result_budget = self._effective_tool_result_budget()
+        executed: list[Dict[str, Any]] = []
+        original_names_by_id = {str(tc.id): str(tc.name) for tc in native_calls}
         tc_wrappers = [
-            ConcurrentToolCall(id=tc.id, name=tc.name, arguments=tc.arguments)
+            ConcurrentToolCall(
+                id=tc.id,
+                name=str(_normalize_tool_call({"name": tc.name, "arguments": tc.arguments})["name"]),
+                arguments=tc.arguments,
+            )
             for tc in native_calls
         ]
 
         if not self._concurrency_policy or len(tc_wrappers) <= 1:
             for i, tc in enumerate(native_calls):
-                _show_progress("executing", tc.name, step=i + 1, total=len(native_calls))
-                tool_call_dict = {"name": tc.name, "arguments": tc.arguments}
+                original_name = str(tc.name)
+                tool_call_dict = _normalize_tool_call({"name": original_name, "arguments": tc.arguments})
+                normalized_name = str(tool_call_dict["name"])
+                _show_progress("executing", normalized_name, step=i + 1, total=len(native_calls))
                 result = await self._execute_general_tool(tool_call_dict, handlers)
                 _clear_indicator()
-                _print_tool_result(tc.name, result, enabled=self._settings.verbose_progress)
+                _print_tool_result(normalized_name, result, enabled=self._settings.verbose_progress)
                 trace.record(
                     ExecutionMode.ACTING,
                     action=tool_call_dict,
                     observation=result if isinstance(result, dict) else {"result": str(result)},
                 )
-                result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+                result_payload = self._compact_tool_result(normalized_name, tc.arguments, result)
+                result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
-            return
+                executed.append({
+                    "id": tc.id,
+                    "name": normalized_name,
+                    "original_tool_name": str(tool_call_dict.get("original_tool_name") or original_name),
+                    "arguments": tc.arguments,
+                    "result": result,
+                })
+            return executed
 
         concurrent, sequential = self._concurrency_policy.partition(tc_wrappers)
         logger.info(
@@ -1863,7 +2521,13 @@ class AgentEngine:
         # Execute concurrent group via asyncio.gather
         if concurrent:
             async def _run_one(ctc: ConcurrentToolCall) -> Dict[str, Any]:
-                tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+                original_name = original_names_by_id.get(str(ctc.id), ctc.name)
+                tool_call_dict = {
+                    "name": ctc.name,
+                    "arguments": ctc.arguments,
+                    "original_tool_name": original_name,
+                    "normalized_tool_name": ctc.name,
+                }
                 return await self._execute_general_tool(tool_call_dict, handlers)
 
             gather_results = await asyncio.gather(
@@ -1871,7 +2535,13 @@ class AgentEngine:
                 return_exceptions=True,
             )
             for ctc, result in zip(concurrent, gather_results):
-                tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+                original_name = original_names_by_id.get(str(ctc.id), ctc.name)
+                tool_call_dict = {
+                    "name": ctc.name,
+                    "arguments": ctc.arguments,
+                    "original_tool_name": original_name,
+                    "normalized_tool_name": ctc.name,
+                }
                 if isinstance(result, Exception):
                     error_result: Dict[str, Any] = {
                         "ok": False,
@@ -1883,7 +2553,8 @@ class AgentEngine:
                         action=tool_call_dict,
                         observation=error_result,
                     )
-                    result_text = json.dumps(error_result, default=str, ensure_ascii=False)[:result_budget]
+                    result_payload = self._compact_tool_result(ctc.name, ctc.arguments, error_result)
+                    result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
                 else:
                     _print_tool_result(ctc.name, result, enabled=self._settings.verbose_progress)
                     trace.record(
@@ -1891,12 +2562,26 @@ class AgentEngine:
                         action=tool_call_dict,
                         observation=result if isinstance(result, dict) else {"result": str(result)},
                     )
-                    result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+                    result_payload = self._compact_tool_result(ctc.name, ctc.arguments, result)
+                    result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
+                executed.append({
+                    "id": ctc.id,
+                    "name": ctc.name,
+                    "original_tool_name": original_name,
+                    "arguments": ctc.arguments,
+                    "result": error_result if isinstance(result, Exception) else result,
+                })
 
         for i, ctc in enumerate(sequential):
+            original_name = original_names_by_id.get(str(ctc.id), ctc.name)
             _show_progress("executing", ctc.name, step=i + 1, total=len(sequential))
-            tool_call_dict = {"name": ctc.name, "arguments": ctc.arguments}
+            tool_call_dict = {
+                "name": ctc.name,
+                "arguments": ctc.arguments,
+                "original_tool_name": original_name,
+                "normalized_tool_name": ctc.name,
+            }
             result = await self._execute_general_tool(tool_call_dict, handlers)
             _clear_indicator()
             _print_tool_result(ctc.name, result, enabled=self._settings.verbose_progress)
@@ -1905,8 +2590,17 @@ class AgentEngine:
                 action=tool_call_dict,
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
-            result_text = json.dumps(result, default=str, ensure_ascii=False)[:result_budget]
+            result_payload = self._compact_tool_result(ctc.name, ctc.arguments, result)
+            result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
             messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
+            executed.append({
+                "id": ctc.id,
+                "name": ctc.name,
+                "original_tool_name": original_name,
+                "arguments": ctc.arguments,
+                "result": result,
+            })
+        return executed
 
     async def _execute_general_tool(
         self, tool_call: Dict[str, Any], handlers: Dict[str, Any]
@@ -1924,8 +2618,25 @@ class AgentEngine:
         from leapflow.skills.tool_executor import ToolCall as TC
         from leapflow.security.redact import redact_sensitive_text
 
-        name = tool_call.get("name", "")
+        original_name = str(tool_call.get("original_tool_name") or tool_call.get("name", ""))
+        proposed_name = str(tool_call.get("name", ""))
         args = tool_call.get("arguments", {})
+        registry = _default_tool_registry()
+        resolution = registry.resolve(proposed_name, args)
+        if not resolution.auto_executable or resolution.normalized_name is None:
+            return registry.unknown_result(
+                ToolResolution(
+                    original_name=original_name,
+                    normalized_name=resolution.normalized_name,
+                    status=resolution.status,
+                    confidence=resolution.confidence,
+                    reason=resolution.reason,
+                    suggestions=resolution.suggestions,
+                    auto_executable=False,
+                    risk_level=resolution.risk_level,
+                )
+            )
+        name = resolution.normalized_name
 
         result: Dict[str, Any]
 
@@ -1958,7 +2669,8 @@ class AgentEngine:
             # Fallback: direct handler dispatch
             handler = handlers.get(name)
             if handler is None:
-                return {"ok": False, "error": f"Unknown tool: {name}"}
+                missing_resolution = registry.resolve(original_name, args)
+                return registry.unknown_result(missing_resolution)
 
             result = await asyncio.wait_for(handler(args), timeout=timeout)
         except asyncio.TimeoutError:
@@ -2135,7 +2847,17 @@ class AgentEngine:
         try:
             entries = await asyncio.wait_for(
                 self._memory_manager.prefetch(
-                    user_text, limit=self._settings.memory_prefetch_limit,
+                    user_text,
+                    limit=self._settings.memory_prefetch_limit,
+                    workspace_root=(
+                        self._current_task_contract.workspace_root
+                        if self._current_task_contract else ""
+                    ),
+                    task_id=(
+                        self._current_task_contract.task_id
+                        if self._current_task_contract else ""
+                    ),
+                    scope_keywords=self._task_scope_keywords(user_text),
                 ),
                 timeout=self._settings.memory_prefetch_timeout_s,
             )

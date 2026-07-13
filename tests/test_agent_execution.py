@@ -9,7 +9,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from conftest import StubLLM, make_settings
-from leapflow.engine.engine import AgentEngine, build_default_registry
+from leapflow.engine.engine import (
+    AgentEngine,
+    _normalize_tool_name,
+    _resolve_tool_name,
+    _tool_args_metadata,
+    build_default_registry,
+)
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.intent_classifier import Intent
 from leapflow.engine.scheduler import TaskScheduler
@@ -111,6 +117,167 @@ async def test_react_loop_tool_then_answer() -> None:
             out = await engine.run("Observe the desktop and tell me what you see.")
             assert out == "UI observed successfully"
             assert llm.call_count >= 2
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_aliases_are_normalized_before_execution() -> None:
+    """Common LLM tool-name drift should route through canonical tool handlers."""
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.platform.mock import MockBridge
+
+        rpc = MockBridge()
+        llm = StubLLM([])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        captured: dict[str, object] = {}
+
+        async def file_list_handler(args):
+            captured["args"] = args
+            return {"ok": True, "path": args.get("path", ""), "entries": []}
+
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+            engine._tool_bridge = None
+
+            result = await engine._execute_general_tool(
+                {"name": "list_directory", "arguments": {"path": "."}},
+                {"file_list": file_list_handler},
+            )
+            metadata = _tool_args_metadata(
+                "file_list",
+                {"path": "."},
+                original_tool_name="list_directory",
+            )
+
+            assert result["ok"] is True
+            assert captured["args"] == {"path": "."}
+            assert _normalize_tool_name("list_directory") == "file_list"
+            assert _normalize_tool_name("List-Directory") == "file_list"
+            assert _normalize_tool_name("list files") == "file_list"
+            assert _normalize_tool_name("read_file") == "file_read"
+            assert _normalize_tool_name("write_file") == "file_write"
+            assert _normalize_tool_name("execute_command") == "shell_run"
+            assert _normalize_tool_name("execute shell command") == "shell_run"
+            assert _normalize_tool_name("terminal-command") == "shell_run"
+            directory_resolution = _resolve_tool_name("directory_scan", {"path": "."})
+            risky_resolution = _resolve_tool_name("please_do", {"command": "ls -la"})
+            assert directory_resolution.normalized_name == "file_list"
+            assert directory_resolution.status == "parameter_match"
+            assert directory_resolution.auto_executable is True
+            assert risky_resolution.normalized_name == "shell_run"
+            assert risky_resolution.status == "parameter_match"
+            assert risky_resolution.auto_executable is False
+            assert metadata["original_tool_name"] == "list_directory"
+            assert metadata["normalized_tool_name"] == "file_list"
+            assert metadata["alias"] == "list_directory"
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_returns_structured_retry_feedback() -> None:
+    """Unknown tools should produce structured feedback instead of a bare string."""
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.platform.mock import MockBridge
+
+        rpc = MockBridge()
+        llm = StubLLM([])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            result = await engine._execute_general_tool(
+                {"name": "missing_magic_tool", "arguments": {"foo": "bar"}},
+                {},
+            )
+
+            assert result["ok"] is False
+            assert result["error_type"] == "unknown_tool"
+            assert result["original_tool_name"] == "missing_magic_tool"
+            assert result["retryable"] is True
+            assert "available_tools" in result
+            assert "suggestions" in result
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_triggers_single_self_healing_retry() -> None:
+    """The loop should give the LLM one structured chance to retry an unknown tool."""
+    class CaptureLLM(StubLLM):
+        def __init__(self) -> None:
+            super().__init__([
+                '<tool_call>{"name": "missing_magic_tool", "arguments": {"foo": "bar"}}</tool_call>',
+                "recovered answer",
+            ])
+            self.seen_messages: list[list[dict[str, object]]] = []
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, **kwargs):
+            self.seen_messages.append(list(messages))
+            return await super().achat(messages, stream=stream, enable_thinking=enable_thinking, **kwargs)
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.platform.mock import MockBridge
+
+        rpc = MockBridge()
+        llm = CaptureLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            out = await engine.run("Use a missing tool then recover")
+
+            assert out == "recovered answer"
+            assert llm.call_count == 2
+            second_call_messages = "\n".join(str(message.get("content", "")) for message in llm.seen_messages[1])
+            assert "unavailable tool name" in second_call_messages
+            assert "missing_magic_tool" in second_call_messages
+            assert "Available tools include" in second_call_messages
+        finally:
+            lt.close()
+
+@pytest.mark.asyncio
+async def test_text_tool_alias_is_normalized_in_stream_events() -> None:
+    """Text-mode tool calls should not leak common alias names as unknown tools."""
+    tool_reply = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.platform.mock import MockBridge
+
+        rpc = MockBridge()
+        llm = StubLLM([tool_reply, "directory checked"])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            events = [event async for event in engine.run_stream("List current directory")]
+
+            tool_events = [event for event in events if event.type in {"tool_start", "tool_complete"}]
+            assert [event.content for event in tool_events] == ["file_list", "file_list"]
+            assert tool_events[0].metadata["original_tool_name"] == "list_directory"
+            assert tool_events[0].metadata["normalized_tool_name"] == "file_list"
+            assert tool_events[1].metadata["ok"] is True
+            assert "Unknown tool" not in str(tool_events[1].metadata)
         finally:
             lt.close()
 
@@ -233,6 +400,161 @@ async def test_streaming_engine_estimates_context_tokens_without_provider_usage(
 
             assert any(event.type == "final" for event in events)
             assert engine.context_token_count > 0
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_progressive_disclosure_light_query_omits_tools_and_thinking() -> None:
+    """Plain chat should stay on the light path even when thinking is requested."""
+    from leapflow.llm.base import LLMChatResponse, LLMProvider
+    from leapflow.platform.mock import MockBridge
+
+    class CaptureLLM(LLMProvider):
+        def __init__(self) -> None:
+            self.messages: list[dict] = []
+            self.kwargs: dict = {}
+            self.enable_thinking = True
+            self.call_count = 0
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, on_chunk=None, **kwargs):
+            self.call_count += 1
+            self.messages = list(messages)
+            self.kwargs = dict(kwargs)
+            self.enable_thinking = enable_thinking
+            return LLMChatResponse(content="I am LeapFlow.")
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            if False:
+                yield ""
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        settings = settings.__class__(
+            **{
+                **settings.__dict__,
+                "native_tool_calling_enabled": True,
+            }
+        )
+        rpc = MockBridge()
+        llm = CaptureLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("chat")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            out = await engine.run("hello", enable_thinking=True)
+
+            assert out == "I am LeapFlow."
+            assert llm.call_count == 1
+            assert "tools" not in llm.kwargs
+            assert llm.enable_thinking is False
+            assert "file_read" not in str(llm.messages[0].get("content", ""))
+            system_prompt = str(llm.messages[0].get("content", ""))
+            assert "## Presentation Style" in system_prompt
+            assert "Avoid redundant tool calls" in system_prompt
+            assert "same tool with the same arguments" in system_prompt
+            assert "existing tool result already answers" in system_prompt
+            assert "No leaked tool protocol" in system_prompt
+            assert "Theme-safe colors" in system_prompt
+            assert "## Task Contract" in system_prompt
+            assert "Original user request: hello" in system_prompt
+            assert "Workspace root:" in system_prompt
+            assert "never infer `.` as the project root" in system_prompt
+            snapshot = engine.context_budget_snapshot
+            assert snapshot["disclosure_level"] == "light"
+            assert snapshot["disclosure"]["native_tools"] is False
+        finally:
+            lt.close()
+
+
+def test_task_contract_replaces_stale_contract_block() -> None:
+    """Compression recovery should keep exactly one current task contract."""
+    from leapflow.platform.mock import MockBridge
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        rpc = MockBridge()
+        llm = StubLLM(["ok"])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("chat")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            engine._session_turn_count = 1
+            engine._begin_turn_context("first request")
+            stale_contract = engine._task_contract_block()
+            engine._session_turn_count = 2
+            engine._begin_turn_context("second request")
+
+            prepared = engine._ensure_task_contract_message([
+                {"role": "system", "content": f"base system\n\n{stale_contract}\n"},
+                {"role": "system", "content": stale_contract},
+                {"role": "user", "content": "second request"},
+            ])
+            system_text = "\n".join(
+                str(message.get("content", ""))
+                for message in prepared
+                if message.get("role") == "system"
+            )
+
+            assert system_text.count("## Task Contract") == 1
+            assert "Original user request: second request" in system_text
+            assert "Original user request: first request" not in system_text
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_progressive_disclosure_file_query_selects_file_schemas() -> None:
+    """File-oriented requests should disclose file schemas without the full catalog."""
+    from leapflow.llm.base import LLMChatResponse, LLMProvider
+    from leapflow.platform.mock import MockBridge
+
+    class CaptureLLM(LLMProvider):
+        def __init__(self) -> None:
+            self.kwargs: dict = {}
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, on_chunk=None, **kwargs):
+            self.kwargs = dict(kwargs)
+            return LLMChatResponse(content="Done")
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            if False:
+                yield ""
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        settings = settings.__class__(
+            **{
+                **settings.__dict__,
+                "native_tool_calling_enabled": True,
+            }
+        )
+        rpc = MockBridge()
+        llm = CaptureLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("file")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            await engine.run("Read src/leapflow/engine/engine.py")
+
+            tools = llm.kwargs.get("tools", [])
+            names = {tool.get("function", {}).get("name", "") for tool in tools}
+            assert "file_read" in names
+            assert "file_list" in names
+            assert "shell_run" not in names
+            assert engine.context_budget_snapshot["disclosure_level"] == "selected_tools"
         finally:
             lt.close()
 

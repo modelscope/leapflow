@@ -69,6 +69,10 @@ class EventBus:
         """Register a callback that receives every normalized SystemEvent."""
         self._subscribers.append(callback)
 
+    def unsubscribe(self, callback: EventCallback) -> None:
+        """Remove a previously registered callback if present."""
+        self._subscribers = [item for item in self._subscribers if item != callback]
+
     def enable_reorder(self, settle_s: float = 0.05) -> None:
         """Activate the reorder buffer (call at recording start)."""
         self._reorder_buffer = EventReorderBuffer(settle_s, self._process_event)

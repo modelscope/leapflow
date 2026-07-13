@@ -17,6 +17,7 @@ from leapflow.daemon.server import UnixRpcServer
 class _FakeService:
     def __init__(self) -> None:
         self._client_count = lambda: 0
+        self.cancelled = False
 
     def set_client_count_provider(self, provider) -> None:
         self._client_count = provider
@@ -33,6 +34,10 @@ class _FakeService:
     async def status(self) -> dict[str, Any]:
         return {"pid": 123, "active_clients": self._client_count(), "profile": "test"}
 
+    async def engine_cancel(self) -> bool:
+        self.cancelled = True
+        return True
+
 
 class _FailingStreamService(_FakeService):
     async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
@@ -40,11 +45,19 @@ class _FailingStreamService(_FakeService):
         raise RuntimeError("stream exploded")
 
 
-async def _start_server(run_dir: Path, service=None):
+class _SlowFirstChunkService(_FakeService):
+    async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+        await asyncio.sleep(0.08)
+        yield StreamChunk(request_id="", content=f"slow {message}", event_type="chunk")
+        yield StreamChunk(request_id="", content="done", event_type="final")
+
+
+async def _start_server(run_dir: Path, service=None, *, stream_heartbeat_s: float | None = None):
     server = UnixRpcServer(
         service or _FakeService(),
         sock_path=run_dir / "leapd.sock",
         run_dir=run_dir,
+        stream_heartbeat_s=stream_heartbeat_s,
     )
     task = asyncio.create_task(server.serve_forever())
     for _ in range(50):
@@ -76,6 +89,443 @@ async def test_daemon_client_receives_stream_events() -> None:
         ("final", "done"),
     ]
     assert events[0].metadata == {"session_id": "sess-1"}
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_can_cancel_engine_turn() -> None:
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        service = _FakeService()
+        server, task, run_dir = await _start_server(Path(root) / "run", service=service)
+        client = DaemonClient(run_dir / "leapd.sock")
+
+        try:
+            cancelled = await client.engine_cancel()
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert cancelled is True
+    assert service.cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_stream_heartbeat_prevents_idle_timeout() -> None:
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        server, task, run_dir = await _start_server(
+            Path(root) / "run",
+            service=_SlowFirstChunkService(),
+            stream_heartbeat_s=0.01,
+        )
+        client = DaemonClient(run_dir / "leapd.sock", timeout_s=0.03)
+
+        try:
+            events = [event async for event in client.engine_chat("world")]
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    heartbeat_events = [event for event in events if event.metadata == {"heartbeat": True}]
+    assert heartbeat_events
+    assert [(event.type, event.content) for event in events[-2:]] == [
+        ("chunk", "slow world"),
+        ("final", "done"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_client_lease_blocks_daemon_idle_shutdown(tmp_path) -> None:
+    from leapflow.daemon.lease import ClientLease, read_active_client_leases
+    from leapflow.daemon.server import _watch_idle_shutdown
+
+    class IdleServer:
+        active_connections = 0
+
+        def __init__(self, run_dir: Path) -> None:
+            self._run_dir = run_dir
+
+        @property
+        def run_dir(self) -> Path:
+            return self._run_dir
+
+    run_dir = tmp_path / "run"
+    lease = ClientLease(run_dir, kind="tui", session_id="sess-live", touch_interval_s=1.0)
+    await lease.start()
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        _watch_idle_shutdown(
+            IdleServer(run_dir),
+            stop_event,
+            idle_timeout_s=0.03,
+            lease_ttl_s=1.0,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await asyncio.sleep(0.08)
+        assert not stop_event.is_set()
+        snapshots = read_active_client_leases(run_dir, ttl_s=1.0)
+        assert [(item.kind, item.session_id, item.state) for item in snapshots] == [
+            ("tui", "sess-live", "idle")
+        ]
+
+        await lease.stop()
+        await asyncio.wait_for(stop_event.wait(), timeout=0.2)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_runtime_service_streams_pending_approval_and_resolves(tmp_path) -> None:
+    from conftest import make_settings
+    from leapflow.daemon.service import RuntimeLeapService
+    from leapflow.engine import StreamEvent
+    from leapflow.security.actions import ActionDescriptor
+    from leapflow.security.approval import ApprovalRequest
+
+    service = RuntimeLeapService(make_settings(str(tmp_path)), mock_host=True)
+
+    class ApprovalEngine:
+        context_token_count = 0
+        _current_session_id = "sess-approval"
+
+        async def run_stream(self, message: str, *, enable_thinking: bool = False):
+            request = ApprovalRequest(
+                category="shell.command",
+                detail="python << 'EOF'\nprint('ok')\nEOF",
+                action=ActionDescriptor.shell("python << 'EOF'\nprint('ok')\nEOF"),
+            )
+            decision = await service._request_approval(request)
+            yield StreamEvent(type="final", content=f"decision={decision}")
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.engine = ApprovalEngine()
+
+        def reload_runtime_config_if_changed(self) -> bool:
+            return False
+
+    service._ctx = FakeContext()
+    stream = service.engine_chat("needs approval")
+    try:
+        approval_event = await anext(stream)
+        payload = (approval_event.metadata or {}).get("approval")
+
+        assert approval_event.event_type == "approval_request"
+        assert isinstance(payload, dict)
+        assert payload["pending_id"]
+        status = await service.approval_status()
+        assert len(status["pending"]) == 1
+
+        resolved = await service.approval_resolve(payload["pending_id"], "definitely_not_valid")
+        final = await anext(stream)
+    finally:
+        await stream.aclose()
+
+    assert resolved == {"ok": True, "pending_id": payload["pending_id"], "decision": "deny"}
+    assert final.event_type == "final"
+    assert final.content == "decision=deny"
+    assert final.metadata["session_id"] == "sess-approval"
+    assert await service.approval_status() == {"pending": []}
+
+
+@pytest.mark.asyncio
+async def test_daemon_shutdown_rpc_triggers_server_stop() -> None:
+    class ShutdownService(_FakeService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.shutdown_called = False
+
+        async def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        run_dir = Path(root) / "run"
+        service = ShutdownService()
+        shutdown_event = asyncio.Event()
+        server = UnixRpcServer(
+            service,
+            sock_path=run_dir / "leapd.sock",
+            run_dir=run_dir,
+            on_shutdown=shutdown_event.set,
+        )
+        task = asyncio.create_task(server.serve_forever())
+        for _ in range(50):
+            if (run_dir / "leapd.sock").exists():
+                break
+            await asyncio.sleep(0.02)
+        else:
+            task.cancel()
+            raise AssertionError("server did not start")
+        client = DaemonClient(run_dir / "leapd.sock")
+        try:
+            await client.shutdown()
+            await asyncio.wait_for(shutdown_event.wait(), timeout=1.0)
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert service.shutdown_called is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_service_status_reports_host_backend() -> None:
+    from conftest import make_settings
+    from leapflow.daemon.service import RuntimeLeapService
+
+    class FakeRpc:
+        def status_snapshot(self) -> dict[str, Any]:
+            return {"backend": "cua-driver", "started": True, "tools_count": 2}
+
+    class FakeContext:
+        rpc = FakeRpc()
+        engine = None
+        storage_volatile = False
+
+        def __init__(self, settings) -> None:
+            self.settings = settings
+            self._db_holder = None
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        settings = make_settings(root)
+        service = RuntimeLeapService(settings, mock_host=True)
+        service._ctx = FakeContext(settings)
+        status = await service.status()
+
+    assert status["host_backend"] == {
+        "backend": "cua-driver",
+        "started": True,
+        "tools_count": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_host_lifecycle_rpc() -> None:
+    class HostRpcService(_FakeService):
+        async def host_status(self) -> dict[str, Any]:
+            return {"backend": "mock", "started": False}
+
+        async def host_start(self) -> dict[str, Any]:
+            return {"ok": True, "backend": "cua-driver", "started": True}
+
+        async def host_stop(self) -> dict[str, Any]:
+            return {"ok": True, "backend": "mock", "started": False}
+
+        async def host_restart(self) -> dict[str, Any]:
+            return {"ok": True, "backend": "cua-driver", "started": True, "changed": True}
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        server, task, run_dir = await _start_server(Path(root) / "run", service=HostRpcService())
+        client = DaemonClient(run_dir / "leapd.sock")
+        try:
+            status = await client.host_status()
+            started = await client.host_start()
+            stopped = await client.host_stop()
+            restarted = await client.host_restart()
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert status == {"backend": "mock", "started": False}
+    assert started["started"] is True
+    assert stopped["backend"] == "mock"
+    assert restarted["changed"] is True
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_slash_metadata_rpc() -> None:
+    class SlashMetadataService(_FakeService):
+        async def tools_list(self) -> dict[str, Any]:
+            return {"ok": True, "groups": {"core": ["chat"]}, "total": 1, "mcp_count": 0}
+
+        async def usage_summary(self) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "model": "test-model",
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "turn_count": 2,
+                "context_used": 15,
+                "context_length": 100,
+            }
+
+        async def model_info(self, model_name: str = "") -> dict[str, Any]:
+            return {
+                "ok": True,
+                "model": "test-model",
+                "context_length": 100,
+                "requested_model": model_name,
+                "switch_supported": False,
+                "env_var": "LEAPFLOW_LLM_MODEL",
+            }
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        server, task, run_dir = await _start_server(Path(root) / "run", service=SlashMetadataService())
+        client = DaemonClient(run_dir / "leapd.sock")
+        try:
+            tools = await client.tools_list()
+            usage = await client.usage_summary()
+            model = await client.model_info("next-model")
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert tools["groups"] == {"core": ["chat"]}
+    assert usage["total_tokens"] == 15
+    assert model["requested_model"] == "next-model"
+
+
+@pytest.mark.asyncio
+async def test_runtime_service_slash_metadata_payloads() -> None:
+    from conftest import make_settings
+    from leapflow.daemon.service import RuntimeLeapService
+
+    class FakeSummary:
+        prompt_tokens = 12
+        completion_tokens = 8
+        total_tokens = 20
+
+    class FakeUsageTracker:
+        def summary(self) -> FakeSummary:
+            return FakeSummary()
+
+    class FakeCapabilities:
+        context_length = 4096
+
+    class FakeCapabilityRegistry:
+        def resolve(self, model: str) -> FakeCapabilities:
+            return FakeCapabilities()
+
+    class FakeEngine:
+        usage_tracker = FakeUsageTracker()
+        model_capabilities = FakeCapabilityRegistry()
+        context_token_count = 20
+        turn_count = 3
+
+    class FakeRpc:
+        connected = False
+
+    class FakeContext:
+        def __init__(self, settings) -> None:
+            self.settings = settings
+            self.engine = FakeEngine()
+            self.rpc = FakeRpc()
+            self.platform_tools: list[Any] = []
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        settings = make_settings(root)
+        service = RuntimeLeapService(settings, mock_host=True)
+        service._ctx = FakeContext(settings)
+        tools = await service.tools_list()
+        usage = await service.usage_summary()
+        model = await service.model_info("other-model")
+
+    assert tools["ok"] is True
+    assert tools["total"] > 0
+    assert usage["total_tokens"] == 20
+    assert usage["context_length"] == 4096
+    assert model["model"] == settings.llm_model
+    assert model["requested_model"] == "other-model"
+
+
+@pytest.mark.asyncio
+async def test_runtime_service_host_lifecycle_delegates_to_context() -> None:
+    from conftest import make_settings
+    from leapflow.daemon.service import RuntimeLeapService
+
+    class FakeContext:
+        def __init__(self, settings) -> None:
+            self.settings = settings
+            self.calls: list[str] = []
+            self.rpc = object()
+
+        async def host_backend_status(self) -> dict[str, Any]:
+            self.calls.append("status")
+            return {"backend": "mock", "started": False}
+
+        async def host_backend_start(self) -> dict[str, Any]:
+            self.calls.append("start")
+            return {"ok": True, "backend": "cua-driver", "started": True}
+
+        async def host_backend_stop(self) -> dict[str, Any]:
+            self.calls.append("stop")
+            return {"ok": True, "backend": "mock", "started": False}
+
+        async def host_backend_restart(self) -> dict[str, Any]:
+            self.calls.append("restart")
+            return {"ok": True, "backend": "cua-driver", "started": True}
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        settings = make_settings(root)
+        service = RuntimeLeapService(settings, mock_host=True)
+        ctx = FakeContext(settings)
+        service._ctx = ctx
+        status = await service.host_status()
+        started = await service.host_start()
+        stopped = await service.host_stop()
+        restarted = await service.host_restart()
+
+    assert status["backend"] == "mock"
+    assert started["started"] is True
+    assert stopped["started"] is False
+    assert restarted["backend"] == "cua-driver"
+    assert ctx.calls == ["status", "start", "stop", "restart"]
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_approval_resolve_rpc() -> None:
+    class ApprovalRpcService(_FakeService):
+        async def approval_resolve(self, pending_id: str, decision: str, reason: str = "") -> dict[str, Any]:
+            return {"ok": True, "pending_id": pending_id, "decision": decision, "reason": reason}
+
+        async def approval_status(self) -> dict[str, Any]:
+            return {"pending": []}
+
+        async def approval_cancel(self, pending_id: str, reason: str = "cancelled") -> dict[str, Any]:
+            return {"ok": True, "pending_id": pending_id, "decision": "deny", "reason": reason}
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        server, task, run_dir = await _start_server(Path(root) / "run", service=ApprovalRpcService())
+        client = DaemonClient(run_dir / "leapd.sock")
+        try:
+            result = await client.approval_resolve("p1", "allow_once", reason="user")
+            status = await client.approval_status()
+            cancelled = await client.approval_cancel("p2")
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert result == {"ok": True, "pending_id": "p1", "decision": "allow_once", "reason": "user"}
+    assert status == {"pending": []}
+    assert cancelled["decision"] == "deny"
 
 
 @pytest.mark.asyncio
@@ -220,6 +670,20 @@ async def test_runtime_service_serializes_engine_chat_streams(tmp_path) -> None:
             self.active = 0
             self.max_active = 0
             self.context_token_count = 2_048
+            self.context_budget_snapshot = {
+                "message_tokens": 1_800,
+                "tool_schema_tokens": 248,
+                "total_tokens": 2_048,
+                "context_length": 16_000,
+                "ratio": 0.128,
+                "compressed": False,
+                "forced_final_answer": False,
+                "context_posture": "research",
+                "context_signal": "multi-source",
+                "context_guidance": "maintain research ledger and synthesize findings",
+                "compression_reason": "threshold-triggered",
+                "compression_savings_ratio": 0.25,
+            }
             self._current_session_id = "sess-daemon"
 
         async def run_stream(self, message: str, *, enable_thinking: bool = False):
@@ -253,9 +717,21 @@ async def test_runtime_service_serializes_engine_chat_streams(tmp_path) -> None:
     assert [event.content for event in first] == ["start:one", "done:one"]
     assert [event.content for event in second] == ["start:two", "done:two"]
     assert first[0].metadata["context_used"] == 2_048
+    assert first[0].metadata["context_budget_snapshot"]["total_tokens"] == 2_048
+    assert first[0].metadata["context_budget_snapshot"]["tool_schema_tokens"] == 248
+    assert first[0].metadata["llm_context_length"] == 16_000
+    assert first[0].metadata["context_posture"] == "research"
+    assert first[0].metadata["context_signal"] == "multi-source"
+    assert first[0].metadata["context_guidance"] == "maintain research ledger and synthesize findings"
+    assert first[0].metadata["compression_reason"] == "threshold-triggered"
+    assert first[0].metadata["compression_savings_ratio"] == 0.25
     assert first[0].metadata["session_id"] == "sess-daemon"
     assert second[0].metadata["context_used"] == 2_048
     assert status["context_used"] == 2_048
+    assert status["context_budget_snapshot"]["total_tokens"] == 2_048
+    assert status["context_posture"] == "research"
+    assert status["context_guidance"] == "maintain research ledger and synthesize findings"
+    assert status["compression_reason"] == "threshold-triggered"
     assert context.engine.max_active == 1
 
 
@@ -293,6 +769,7 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
     _print_runtime_status({
         "profile": "default",
         "active_clients": 1,
+        "connected_clients": 2,
         "volatile": False,
         "model": "qwen3.7-plus",
         "context_used": 256,
@@ -304,17 +781,96 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
         "config_path": "/home/.leapflow/.env",
         "project_env_path": "/repo/.env",
         "db_path": "/home/.leapflow/db/leap.duckdb",
+        "host_backend": {
+            "backend": "cua-driver",
+            "started": True,
+            "pid": None,
+            "command": "/tmp/cua-driver",
+            "args": ["mcp"],
+            "capability_version": "test-cap",
+        },
     })
 
     output = capsys.readouterr().out
-    assert "runtime: profile=default clients=1 volatile=False" in output
+    assert "runtime: profile=default clients=1 connected=2 volatile=False" in output
     assert "model: qwen3.7-plus context=256/256000" in output
     assert "version: 0.0.test" in output
     assert "source: /repo/src/leapflow/__init__.py" in output
     assert "python: /venv/bin/python" in output
+    assert "host: backend=cua-driver started=True pid=None" in output
+    assert "host_command: /tmp/cua-driver mcp" in output
+    assert "host_capability: test-cap" in output
 
 
-def test_daemon_restart_stops_waits_and_starts(monkeypatch, tmp_path) -> None:
+def test_stop_daemon_sends_sigterm_waits_and_cleans(monkeypatch, tmp_path) -> None:
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    running = lifecycle_module.DaemonInfo(
+        pid=1234,
+        sock_path=tmp_path / "run" / "leapd.sock",
+        start_time=None,
+        is_running=True,
+        is_healthy=True,
+    )
+    stopped = lifecycle_module.DaemonInfo(
+        pid=1234,
+        sock_path=None,
+        start_time=None,
+        is_running=False,
+        is_healthy=False,
+    )
+    states = [running, stopped]
+    signals: list[int] = []
+
+    def discover(run_dir):
+        return states.pop(0) if states else stopped
+
+    def send_signal(run_dir, sig):
+        signals.append(sig)
+        return True
+
+    monkeypatch.setattr(lifecycle_module.DaemonInfo, "discover", staticmethod(discover))
+    monkeypatch.setattr(lifecycle_module, "send_signal", send_signal)
+    monkeypatch.setattr(lifecycle_module, "cleanup_stale", lambda run_dir: True)
+
+    result = lifecycle_module.stop_daemon(tmp_path / "run", timeout_s=1.0)
+
+    assert result.stopped is True
+    assert result.signal_sent is True
+    assert result.stale_cleaned is True
+    assert signals == [lifecycle_module.signal.SIGTERM]
+
+
+def test_stop_daemon_force_escalates_after_timeout(monkeypatch, tmp_path) -> None:
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    running = lifecycle_module.DaemonInfo(
+        pid=1234,
+        sock_path=tmp_path / "run" / "leapd.sock",
+        start_time=None,
+        is_running=True,
+        is_healthy=False,
+    )
+    signals: list[int] = []
+
+    monkeypatch.setattr(lifecycle_module.DaemonInfo, "discover", staticmethod(lambda run_dir: running))
+    monkeypatch.setattr(lifecycle_module, "send_signal", lambda run_dir, sig: signals.append(sig) or True)
+
+    result = lifecycle_module.stop_daemon(
+        tmp_path / "run",
+        timeout_s=0.05,
+        force=True,
+        force_timeout_s=0.05,
+        poll_interval_s=0.01,
+    )
+
+    assert result.stopped is False
+    assert result.timed_out is True
+    assert result.forced is True
+    assert signals == [lifecycle_module.signal.SIGTERM, lifecycle_module.signal.SIGKILL]
+
+
+def test_daemon_restart_stops_and_starts(monkeypatch, tmp_path) -> None:
     from leapflow.cli.commands import daemon as daemon_module
 
     calls: list[str] = []
@@ -322,12 +878,34 @@ def test_daemon_restart_stops_waits_and_starts(monkeypatch, tmp_path) -> None:
     class Settings:
         profile_dir = tmp_path
 
-    monkeypatch.setattr(daemon_module, "_stop", lambda run_dir: calls.append("stop") or 0)
-    monkeypatch.setattr(daemon_module, "_wait_stopped", lambda run_dir: calls.append("wait") or True)
+    monkeypatch.setattr(
+        daemon_module,
+        "_stop",
+        lambda run_dir, **kwargs: calls.append(f"stop:{kwargs.get('force')}") or 0,
+    )
     monkeypatch.setattr(daemon_module, "_start", lambda settings, mock_host: calls.append("start") or 0)
 
-    assert daemon_module._restart(Settings(), mock_host=True) == 0
-    assert calls == ["stop", "wait", "start"]
+    assert daemon_module._restart(Settings(), mock_host=True, force=True) == 0
+    assert calls == ["stop:True", "start"]
+
+
+def test_daemon_restart_aborts_when_stop_fails(monkeypatch, tmp_path) -> None:
+    from leapflow.cli.commands import daemon as daemon_module
+
+    calls: list[str] = []
+
+    class Settings:
+        profile_dir = tmp_path
+
+    monkeypatch.setattr(
+        daemon_module,
+        "_stop",
+        lambda run_dir, **kwargs: calls.append("stop") or 1,
+    )
+    monkeypatch.setattr(daemon_module, "_start", lambda settings, mock_host: calls.append("start") or 0)
+
+    assert daemon_module._restart(Settings(), mock_host=True) == 1
+    assert calls == ["stop"]
 
 
 def test_stream_chunk_notification_preserves_event_shape() -> None:

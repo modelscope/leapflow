@@ -110,7 +110,15 @@ class StreamChunk:
     content: str
     done: bool = False
     event_type: Literal[
-        "chunk", "final", "tool_start", "tool_complete", "thinking", "status", "error"
+        "chunk",
+        "final",
+        "tool_start",
+        "tool_complete",
+        "thinking",
+        "status",
+        "error",
+        "approval_request",
+        "approval_response",
     ] = "chunk"
     metadata: Optional[Dict[str, Any]] = None
 
@@ -179,6 +187,51 @@ class LeapService(Protocol):
         """Return daemon status (uptime, connections, db path, etc.)."""
         ...
 
+    async def host_status(self) -> Dict[str, Any]:
+        """Return host backend status."""
+        ...
+
+    async def host_start(self) -> Dict[str, Any]:
+        """Start the host backend if available."""
+        ...
+
+    async def host_stop(self) -> Dict[str, Any]:
+        """Stop the host backend and keep the daemon runtime alive."""
+        ...
+
+    async def host_restart(self) -> Dict[str, Any]:
+        """Restart the host backend."""
+        ...
+
+    async def tools_list(self) -> Dict[str, Any]:
+        """Return available tool groups for slash-command rendering."""
+        ...
+
+    async def usage_summary(self) -> Dict[str, Any]:
+        """Return token usage for the current daemon session."""
+        ...
+
+    async def model_info(self, model_name: str = "") -> Dict[str, Any]:
+        """Return active model information and switch guidance."""
+        ...
+
+    async def approval_status(self) -> Dict[str, Any]:
+        """Return pending approval requests."""
+        ...
+
+    async def approval_resolve(
+        self,
+        pending_id: str,
+        decision: str,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Resolve a pending approval request."""
+        ...
+
+    async def approval_cancel(self, pending_id: str, reason: str = "cancelled") -> Dict[str, Any]:
+        """Cancel a pending approval request."""
+        ...
+
     async def shutdown(self) -> None:
         """Graceful shutdown."""
         ...
@@ -229,6 +282,16 @@ METHOD_REGISTRY: Dict[str, str] = {
     "scheduler.arm": "scheduler_arm",
     "daemon.status": "status",
     "daemon.shutdown": "shutdown",
+    "host.status": "host_status",
+    "host.start": "host_start",
+    "host.stop": "host_stop",
+    "host.restart": "host_restart",
+    "tools.list": "tools_list",
+    "usage.summary": "usage_summary",
+    "model.info": "model_info",
+    "approval.status": "approval_status",
+    "approval.resolve": "approval_resolve",
+    "approval.cancel": "approval_cancel",
     "gateway.connect": "gateway_connect",
     "gateway.disconnect": "gateway_disconnect",
     "gateway.status": "gateway_status",

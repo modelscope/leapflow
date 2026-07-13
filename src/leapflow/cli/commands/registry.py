@@ -11,8 +11,32 @@ Adding a new command = appending one ``CommandDef`` to ``COMMAND_REGISTRY``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Literal, Optional, Tuple
+
+
+class CommandEffect(str, Enum):
+    """User-visible impact level for a slash command."""
+
+    READ_ONLY = "read_only"
+    SESSION = "session"
+    HOST_CONTROL = "host_control"
+    EXTERNAL = "external"
+    DESTRUCTIVE = "destructive"
+
+
+class CommandExecution(str, Enum):
+    """Execution shape used by the TUI to explain command behavior."""
+
+    INSTANT = "instant"
+    SHORT_OPERATION = "short_operation"
+    STREAMING = "streaming"
+    LONG_RUNNING = "long_running"
+    BACKGROUND = "background"
+
+
+CommandRuntime = Literal["in_process", "daemon"]
 
 
 @dataclass(frozen=True)
@@ -24,50 +48,74 @@ class CommandDef:
     category: str
     aliases: Tuple[str, ...] = ()
     args_hint: str = ""
+    supports_in_process: bool = True
+    supports_daemon: bool = False
+    requires_host: bool = False
+    requires_llm: bool = False
+    effect: CommandEffect = CommandEffect.READ_ONLY
+    execution: CommandExecution = CommandExecution.INSTANT
+
+    def supports_runtime(self, runtime: CommandRuntime) -> bool:
+        """Return whether this command can execute in the requested runtime."""
+        if runtime == "daemon":
+            return self.supports_daemon
+        return self.supports_in_process
 
 
 # ── Registry (single source of truth) ────────────────────────────────
 
 COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     # Session
-    CommandDef("help", "Show available commands", "Session", aliases=("?", "帮助")),
-    CommandDef("clear", "Clear screen and reset display", "Session"),
-    CommandDef("status", "Show session info, model, context, and platform", "Session"),
-    CommandDef("exit", "Quit LeapFlow", "Session", aliases=("quit", "q", "退出")),
+    CommandDef("help", "Show available commands", "Session", aliases=("?", "帮助"), supports_daemon=True),
+    CommandDef("clear", "Clear screen and reset display", "Session", supports_daemon=True),
+    CommandDef("status", "Show session info, model, context, and platform", "Session", supports_daemon=True),
+    CommandDef(
+        "host",
+        "Start, stop, or inspect CuaDriver OS control",
+        "Session",
+        args_hint="[status|start|stop|restart]",
+        supports_daemon=True,
+        effect=CommandEffect.HOST_CONTROL,
+        execution=CommandExecution.SHORT_OPERATION,
+    ),
+    CommandDef("exit", "Quit LeapFlow", "Session", aliases=("quit", "q", "退出"), supports_daemon=True),
+
+    # Task Control
+    CommandDef("cancel", "Cancel the currently running task", "Task Control", aliases=("abort",), supports_daemon=True, effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("skip", "Skip the current running task and continue the queue", "Task Control", supports_daemon=True, effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("pause", "Pause starting queued tasks", "Task Control", supports_daemon=True, effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("resume", "Resume queued task execution", "Task Control", supports_daemon=True, effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("queue", "Show or clear queued tasks", "Task Control", args_hint="[clear]", supports_daemon=True, effect=CommandEffect.READ_ONLY),
+    CommandDef("drop", "Remove a queued task by id", "Task Control", args_hint="<id>", supports_daemon=True, effect=CommandEffect.SESSION),
 
     # Chat
-    CommandDef("model", "Show or switch active model", "Chat", args_hint="[model_name]"),
-    CommandDef("usage", "Show token usage for current session", "Chat"),
+    CommandDef("model", "Show or switch active model", "Chat", args_hint="[model_name]", supports_daemon=True, requires_llm=True),
+    CommandDef("usage", "Show token usage for current session", "Chat", supports_daemon=True, requires_llm=True),
 
     # Teaching
     CommandDef("teach start", "Start teaching mode", "Teaching", aliases=("teach",), args_hint="[goal]"),
-    CommandDef("teach stop", "Stop and distill skill", "Teaching", aliases=("stop", "done")),
+    CommandDef("teach stop", "Stop and distill skill", "Teaching"),
     CommandDef("teach pause", "Pause recording", "Teaching"),
     CommandDef("teach resume", "Resume recording", "Teaching"),
     CommandDef("teach discard", "Discard current recording", "Teaching"),
+    CommandDef("teach skip", "Mark last n steps as noise", "Teaching", args_hint="[n]"),
     CommandDef("annotate", "Add annotation during teaching", "Teaching", args_hint="<text>"),
-    CommandDef("skip", "Mark last n steps as noise", "Teaching", args_hint="[n]"),
 
     # Skills & Tools
     CommandDef("skills", "List all skills", "Skills & Tools", aliases=("skills list",)),
     CommandDef("skills show", "Show skill details", "Skills & Tools", args_hint="<name>"),
     CommandDef("skills disable", "Disable a skill", "Skills & Tools", args_hint="<name>"),
     CommandDef("skills delete", "Delete a skill", "Skills & Tools", args_hint="<name>"),
-    CommandDef("tools", "List available tools", "Skills & Tools"),
-    CommandDef("run", "Execute a skill by trigger", "Skills & Tools", args_hint="<trigger>"),
+    CommandDef("tools", "List available tools", "Skills & Tools", supports_daemon=True),
+    CommandDef("run", "Execute a skill by trigger", "Skills & Tools", args_hint="<trigger>", supports_daemon=True, requires_llm=True, execution=CommandExecution.STREAMING),
 
     # Hub
     CommandDef("hub push", "Push skill to hub", "Hub", args_hint="<skill>"),
     CommandDef("hub pull", "Pull skill from hub", "Hub", args_hint="<skill>"),
     CommandDef("hub search", "Search hub for skills", "Hub", args_hint="<query>"),
 
-    # Shortcuts
-    CommandDef("shortcut", "List shortcuts", "Shortcuts", aliases=("shortcut list",)),
-    CommandDef("shortcut add", "Add a quick-reply shortcut", "Shortcuts", args_hint="<pattern> = <reply>"),
-    CommandDef("shortcut remove", "Remove a shortcut", "Shortcuts", args_hint="<pattern>"),
-
     # Gateway
-    CommandDef("gateway", "Show connected platforms and gateway status", "Gateway"),
+    CommandDef("gateway", "Show connected platforms and gateway status", "Gateway", effect=CommandEffect.EXTERNAL),
 
     # Scheduler
     CommandDef("arm", "Schedule a skill for timed execution", "Scheduler", args_hint="<skill> <cron>"),
@@ -102,10 +150,16 @@ def resolve_command(text: str) -> Optional[CommandDef]:
     return None
 
 
-def commands_by_category() -> Dict[str, List[CommandDef]]:
+def commands_by_category(
+    runtime: CommandRuntime | None = None,
+    *,
+    include_unsupported: bool = True,
+) -> Dict[str, List[CommandDef]]:
     """Group commands by category for display."""
     groups: Dict[str, List[CommandDef]] = {}
     for cmd in COMMAND_REGISTRY:
+        if runtime is not None and not include_unsupported and not cmd.supports_runtime(runtime):
+            continue
         groups.setdefault(cmd.category, []).append(cmd)
     return groups
 
@@ -114,6 +168,5 @@ def completion_entries() -> List[Tuple[str, str]]:
     """Build the completion list for LeapApp's TextArea completer."""
     entries: List[Tuple[str, str]] = []
     for cmd in COMMAND_REGISTRY:
-        full = f"/{cmd.name}" if cmd.args_hint else f"/{cmd.name}"
         entries.append((cmd.name, cmd.description))
     return entries

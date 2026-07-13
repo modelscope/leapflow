@@ -139,6 +139,7 @@ class Settings:
     # ── Data Root & Profile ──
     data_dir: Path = Path("~/.leapflow")
     profile: str = "default"
+    workspace_root: Path = Path(".")
 
     # Audit
     audit_log_path: Path = Path("~/.leapflow/profiles/default/audit.jsonl")
@@ -340,6 +341,17 @@ class Settings:
     compress_keep_tail: int = 4
     max_tool_output_chars: int = 2000
     max_tool_result_chars: int = 3000  # Per-tool result truncation for LLM context
+    context_hard_limit_ratio: float = 0.92
+    context_warning_ratio: float = 0.75
+    tool_evidence_max_chars: int = 1200
+    repeated_read_limit: int = 2
+    long_task_convergence_round: int = 12
+    context_expanded_ratio: float = 0.60
+    context_finalizing_ratio: float = 0.90
+    context_expanded_evidence_threshold: int = 2
+    context_expanded_tool_call_threshold: int = 3
+    context_research_source_threshold: int = 3
+    context_research_evidence_threshold: int = 5
 
     # ── Error Recovery ──
     error_transient_max_retries: int = 3
@@ -559,6 +571,9 @@ def _build_settings_from_env() -> Settings:
 
     data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
     profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
+    workspace_root = _expand_path(
+        os.getenv("LEAPFLOW_WORKSPACE_ROOT", str(Path.cwd())).strip() or str(Path.cwd())
+    ).resolve()
     _profile_dir = data_dir / "profiles" / profile
 
     mock_host = os.getenv("LEAPFLOW_MOCK_HOST", "0").strip() in ("1", "true", "True", "yes")
@@ -763,6 +778,17 @@ def _build_settings_from_env() -> Settings:
     compress_keep_tail = int(os.getenv("LEAPFLOW_COMPRESS_KEEP_TAIL", "4"))
     max_tool_output_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_OUTPUT_CHARS", "2000"))
     max_tool_result_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_RESULT_CHARS", "3000"))
+    context_hard_limit_ratio = float(os.getenv("LEAPFLOW_CONTEXT_HARD_LIMIT_RATIO", "0.92"))
+    context_warning_ratio = float(os.getenv("LEAPFLOW_CONTEXT_WARNING_RATIO", "0.75"))
+    tool_evidence_max_chars = int(os.getenv("LEAPFLOW_TOOL_EVIDENCE_MAX_CHARS", "1200"))
+    repeated_read_limit = int(os.getenv("LEAPFLOW_REPEATED_READ_LIMIT", "2"))
+    long_task_convergence_round = int(os.getenv("LEAPFLOW_LONG_TASK_CONVERGENCE_ROUND", "12"))
+    context_expanded_ratio = float(os.getenv("LEAPFLOW_CONTEXT_EXPANDED_RATIO", "0.60"))
+    context_finalizing_ratio = float(os.getenv("LEAPFLOW_CONTEXT_FINALIZING_RATIO", "0.90"))
+    context_expanded_evidence_threshold = int(os.getenv("LEAPFLOW_CONTEXT_EXPANDED_EVIDENCE_THRESHOLD", "2"))
+    context_expanded_tool_call_threshold = int(os.getenv("LEAPFLOW_CONTEXT_EXPANDED_TOOL_CALL_THRESHOLD", "3"))
+    context_research_source_threshold = int(os.getenv("LEAPFLOW_CONTEXT_RESEARCH_SOURCE_THRESHOLD", "3"))
+    context_research_evidence_threshold = int(os.getenv("LEAPFLOW_CONTEXT_RESEARCH_EVIDENCE_THRESHOLD", "5"))
 
     # Error Recovery
     error_transient_max_retries = int(os.getenv("LEAPFLOW_ERROR_TRANSIENT_MAX_RETRIES", "3"))
@@ -871,6 +897,7 @@ def _build_settings_from_env() -> Settings:
         memory_prefetch_limit=memory_prefetch_limit,
         data_dir=data_dir,
         profile=profile,
+        workspace_root=workspace_root,
         audit_log_path=_expand_path(audit_log_path),
         skills_dir=_expand_path(skills_dir),
         skill_view_max_chars=skill_view_max_chars,
@@ -1011,6 +1038,17 @@ def _build_settings_from_env() -> Settings:
         compress_keep_tail=compress_keep_tail,
         max_tool_output_chars=max_tool_output_chars,
         max_tool_result_chars=max_tool_result_chars,
+        context_hard_limit_ratio=context_hard_limit_ratio,
+        context_warning_ratio=context_warning_ratio,
+        tool_evidence_max_chars=tool_evidence_max_chars,
+        repeated_read_limit=repeated_read_limit,
+        long_task_convergence_round=long_task_convergence_round,
+        context_expanded_ratio=context_expanded_ratio,
+        context_finalizing_ratio=context_finalizing_ratio,
+        context_expanded_evidence_threshold=context_expanded_evidence_threshold,
+        context_expanded_tool_call_threshold=context_expanded_tool_call_threshold,
+        context_research_source_threshold=context_research_source_threshold,
+        context_research_evidence_threshold=context_research_evidence_threshold,
         # Error Recovery
         error_transient_max_retries=error_transient_max_retries,
         error_rate_limit_base_delay=error_rate_limit_base_delay,

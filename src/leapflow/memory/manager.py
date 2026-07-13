@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import math
-import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from leapflow.memory.protocol import (
@@ -214,7 +214,6 @@ class MemoryManager:
         right after a clipboard event in domain CLIPBOARD" — cross-modal correlation.
         """
         keywords = query.split()[:8] if query else []
-        now = time.time()
 
         # Step 1: Gather entries from all providers (broad search)
         mq = MemoryQuery(
@@ -263,10 +262,89 @@ class MemoryManager:
         unique.sort(key=lambda e: e.score, reverse=True)
         return unique[:limit]
 
-    async def prefetch(self, query_text: str, *, limit: int = 10) -> List[MemoryEntry]:
-        """Quick search for LLM context injection."""
-        query = MemoryQuery(keywords=query_text.split()[:5], limit=limit)
-        return await self.search(query)
+    async def prefetch(
+        self,
+        query_text: str,
+        *,
+        limit: int = 10,
+        workspace_root: str = "",
+        task_id: str = "",
+        scope_keywords: List[str] | None = None,
+    ) -> List[MemoryEntry]:
+        """Quick search for LLM context injection with optional project/task scope."""
+        keywords = query_text.split()[:5]
+        scope_terms = [term for term in (scope_keywords or []) if term]
+        query = MemoryQuery(
+            keywords=[*keywords, *scope_terms[:5]],
+            limit=max(limit, limit * 3),
+            workspace_root=workspace_root,
+            task_id=task_id,
+            scope_keywords=scope_terms,
+        )
+        entries = await self.search(query)
+        if workspace_root or scope_terms or task_id:
+            entries = self._scope_entries(
+                entries,
+                workspace_root=workspace_root,
+                task_id=task_id,
+                scope_keywords=scope_terms,
+            )
+        return entries[:limit]
+
+    def _scope_entries(
+        self,
+        entries: List[MemoryEntry],
+        *,
+        workspace_root: str = "",
+        task_id: str = "",
+        scope_keywords: List[str] | None = None,
+    ) -> List[MemoryEntry]:
+        """Filter retrieved memories to the active project/task when scope is known."""
+        if not entries:
+            return []
+        root = str(Path(workspace_root).expanduser().resolve()) if workspace_root else ""
+        root_name = Path(root).name.lower() if root else ""
+        terms = {term.lower() for term in (scope_keywords or []) if len(term) >= 2}
+        if root_name:
+            terms.add(root_name)
+        if task_id:
+            terms.add(str(task_id).lower())
+        scoped: list[MemoryEntry] = []
+        for entry in entries:
+            if self._entry_matches_scope(entry, workspace_root=root, scope_terms=terms):
+                scoped.append(entry)
+        return scoped
+
+    @staticmethod
+    def _entry_matches_scope(entry: MemoryEntry, *, workspace_root: str, scope_terms: set[str]) -> bool:
+        metadata = entry.metadata or {}
+        path_values = [
+            metadata.get("path"),
+            metadata.get("file_path"),
+            metadata.get("workspace_root"),
+            metadata.get("project_root"),
+            metadata.get("cwd"),
+        ]
+        has_path_scope = False
+        for value in path_values:
+            if not value:
+                continue
+            has_path_scope = True
+            try:
+                candidate = str(Path(str(value)).expanduser().resolve())
+            except (OSError, RuntimeError, ValueError):
+                candidate = str(value)
+            if workspace_root and (
+                candidate == workspace_root or candidate.startswith(workspace_root + "/")
+            ):
+                return True
+        if workspace_root and has_path_scope:
+            return False
+        haystack = " ".join([
+            entry.content,
+            json.dumps(metadata, ensure_ascii=False, default=str),
+        ]).lower()
+        return bool(scope_terms and any(term in haystack for term in scope_terms))
 
     async def sync_turn(self, messages: List[Dict[str, Any]]) -> None:
         """Background sync of conversation turn (fire-and-forget safe)."""

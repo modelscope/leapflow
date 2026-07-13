@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import signal
 import sys
 import time
 from typing import TYPE_CHECKING, Any, Optional
@@ -47,18 +46,46 @@ async def _prompt_stop_daemon_on_exit(
         "leapd runs in the background; stop/restart it after reinstalling LeapFlow "
         "to load new code."
     )
-    stop = await _ask_yes_no_default_yes(f"Stop leapd now (pid={pid})? [Y/n]: ")
+    connected_clients = daemon_status.get("connected_clients")
+    other_clients = 0
+    try:
+        other_clients = max(0, int(connected_clients or 0))
+    except (TypeError, ValueError):
+        other_clients = 0
+    if other_clients > 0:
+        console.system(
+            f"Detected {other_clients} other Leap client(s); keeping leapd running by default."
+        )
+        stop = await _ask_yes_no_default_no(f"Stop leapd anyway (pid={pid})? [y/N]: ")
+    else:
+        stop = await _ask_yes_no_default_yes(f"Stop leapd now (pid={pid})? [Y/n]: ")
     if not stop:
         console.system("leapd kept running. Use `leap daemon restart` when needed.")
         return
 
-    from leapflow.daemon.lifecycle import send_signal
+    from leapflow.daemon.lifecycle import stop_daemon
 
     run_dir = settings.profile_dir / "run"
-    if send_signal(run_dir, signal.SIGTERM):
-        console.system(f"Sent SIGTERM to leapd (pid={pid}).")
+    console.system(f"Stopping leapd (pid={pid})...")
+    graceful_requested = False
+    try:
+        await asyncio.wait_for(client.shutdown(), timeout=2.0)
+        graceful_requested = True
+    except Exception:
+        graceful_requested = False
+    result = await asyncio.to_thread(
+        stop_daemon,
+        run_dir,
+        timeout_s=5.0,
+        grace_timeout_s=1.0 if graceful_requested else 0.0,
+    )
+    if result.stopped:
+        console.system("leapd stopped.")
     else:
-        console.warning("Could not stop leapd; run `leap daemon stop` manually.")
+        console.warning(
+            f"leapd did not stop within the exit window (pid={result.pid}). "
+            "Run `leap daemon stop --force` if it remains unhealthy."
+        )
 
 
 async def _ask_yes_no_default_yes(prompt: str) -> bool:
@@ -73,6 +100,133 @@ async def _ask_yes_no_default_yes(prompt: str) -> bool:
     except (EOFError, KeyboardInterrupt):
         return True
     return answer not in {"n", "no"}
+
+
+async def _ask_yes_no_default_no(prompt: str) -> bool:
+    """Return False by default, including non-interactive or interrupted prompts."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: input(prompt).strip().lower(),
+        )
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in {"y", "yes"}
+
+
+def _host_started(status: dict[str, Any]) -> bool:
+    return bool(status.get("started")) and str(status.get("backend") or "") != "mock"
+
+
+def _print_host_status(console: Any, host: dict[str, Any]) -> None:
+    backend = str(host.get("backend") or "unknown")
+    if _host_started(host):
+        console.success("Host is on — CuaDriver OS control is connected.")
+    else:
+        console.system("Host is off — CuaDriver is not running for this session.")
+    console.system(
+        "Host/CuaDriver lets LeapFlow see and control the desktop: screenshots, UI automation, "
+        "app/clipboard actions."
+    )
+    console.system(
+        "Stopping it releases the background CuaDriver process; chat, memory, approvals, "
+        "skills, and non-OS tools keep working."
+    )
+    tools = host.get("tools_count")
+    extra = f" tools={tools}" if tools is not None else ""
+    console.system(f"backend={backend} started={host.get('started')}{extra}")
+    if host.get("last_error"):
+        console.warning(f"host error: {host['last_error']}")
+
+
+def _host_action(args: str) -> str:
+    action = (args or "status").strip().lower()
+    if action in {"on", "up", "enable"}:
+        return "start"
+    if action in {"off", "down", "disable"}:
+        return "stop"
+    return action
+
+
+def _format_queue_elapsed(seconds: float) -> str:
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    return f"{minutes}m{seconds - minutes * 60:.0f}s"
+
+
+class _DaemonRuntimeBridge:
+    """Reconnectable bridge for daemon-backed TUI runtime calls."""
+
+    def __init__(
+        self,
+        client: "DaemonClient",
+        settings: Any,
+        console: Any,
+        *,
+        session_id_getter: Any,
+        session_id_setter: Any,
+        metadata_applier: Any,
+        lease: Any | None = None,
+        mock_host: bool = False,
+        client_factory: Any | None = None,
+    ) -> None:
+        self.client = client
+        self._settings = settings
+        self._console = console
+        self._session_id_getter = session_id_getter
+        self._session_id_setter = session_id_setter
+        self._metadata_applier = metadata_applier
+        self._lease = lease
+        self._mock_host = mock_host
+        self._client_factory = client_factory
+
+    async def call(self, operation: Any, *, description: str) -> Any:
+        """Run one RPC operation and recover the daemon once on connection failure."""
+        from leapflow.daemon.client import DaemonUnavailableError
+
+        try:
+            return await operation(self.client)
+        except DaemonUnavailableError as exc:
+            await self.recover(f"{description} failed: {exc}")
+            return await operation(self.client)
+
+    async def recover(self, reason: str) -> None:
+        """Reconnect or restart leapd, then restore runtime metadata and session."""
+        from leapflow.daemon.client import recover_daemon_client
+
+        self._console.warning(f"Lost connection to leapd; attempting recovery. {reason}")
+
+        def _status(message: str) -> None:
+            self._console.system(message)
+
+        factory = self._client_factory or recover_daemon_client
+        self.client = await factory(
+            self._settings,
+            mock_host=self._mock_host,
+            status_callback=_status,
+        )
+        status = await self.client.status()
+        self._metadata_applier(status)
+        session_id = str(self._session_id_getter() or "")
+        if session_id:
+            result = await self.client.session_resume(session_id)
+            if result.get("found"):
+                restored = str(result.get("session_id") or session_id)
+                self._session_id_setter(restored)
+                self._console.success(f"Reconnected to leapd and resumed session {restored}")
+            else:
+                self._console.warning(
+                    f"Reconnected to leapd, but session '{session_id}' was not found."
+                )
+        else:
+            self._console.success("Reconnected to leapd.")
+        if self._lease is not None:
+            await self._lease.touch(state="idle", session_id=str(self._session_id_getter() or ""))
 
 
 async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) -> int:
@@ -90,7 +244,8 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     )
     from leapflow.cli.tui_app.status import StatusBar
     from leapflow.cli.banner import display_rich_banner
-    from leapflow.cli.commands.registry import completion_entries, resolve_command
+    from leapflow.cli.commands.registry import completion_entries
+    from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
         handle_status,
         handle_tools,
@@ -108,6 +263,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     status = StatusBar(theme)
     io = TerminalIOProvider()
     exit_stats = SessionExitStats()
+    command_router = CommandRouter("in_process")
     active_resume_id = ""
     storage_volatile = bool(getattr(ctx, "storage_volatile", False))
 
@@ -158,9 +314,15 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     def _update_status() -> None:
         ctx_used = 0
         ctx_max = ctx.settings.llm_context_length
+        ctx_state = "baseline"
         engine = ctx.engine
         if engine is not None:
             ctx_used = getattr(engine, "context_token_count", 0)
+            snapshot = getattr(engine, "context_budget_snapshot", {})
+            if callable(snapshot):
+                snapshot = snapshot()
+            if isinstance(snapshot, dict):
+                ctx_state = str(snapshot.get("context_posture") or "baseline")
         mode = _mode_name()
         status.update(
             mode=mode,
@@ -170,6 +332,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
             session_turns=getattr(engine, "turn_count", 0) if engine else 0,
             context_used=ctx_used,
             context_max=ctx_max,
+            context_state=ctx_state,
         )
         app.prompt_mode = mode
 
@@ -277,9 +440,12 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                     elif event.type == "thinking":
                         renderer.feed_thinking(event.content)
                     elif event.type == "tool_start":
-                        app.spinner_text = renderer.tool_started(event.content)
+                        app.spinner_text = renderer.tool_started(
+                            event.content,
+                            metadata=event.metadata or {},
+                        )
                     elif event.type == "tool_complete":
-                        renderer.tool_finished(event.content)
+                        renderer.tool_finished(event.content, metadata=event.metadata or {})
                         app.spinner_text = "Thinking…"
                     elif event.type == "final":
                         if not renderer.text:
@@ -340,11 +506,16 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         console.rule()
 
         # ── Slash command dispatch ──
-        cmd_text = text.lstrip("/") if text.startswith("/") else text
-        cmd_def = resolve_command(cmd_text)
-        if cmd_def is not None:
+        invocation = command_router.parse(text)
+        if invocation is not None:
+            unsupported = command_router.unsupported_result(invocation)
+            if unsupported is not None:
+                render_command_result(console, unsupported)
+                return
+            cmd_text = invocation.text
+            cmd_def = invocation.command
             canonical = cmd_def.name
-            cmd_args = cmd_text[len(canonical):].strip()
+            cmd_args = invocation.args
 
             if canonical == "exit":
                 if ctx.session and ctx.session.mode == SessionMode.LEARNING:
@@ -359,11 +530,31 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 return
 
             if canonical == "help":
-                _show_help(console)
+                _show_help(console, runtime="in_process")
                 return
 
             if canonical == "status":
                 handle_status(ctx, console, cmd_args)
+                return
+
+            if canonical == "host":
+                action = _host_action(cmd_args)
+                if action == "status":
+                    result = await ctx.host_backend_status()
+                elif action == "start":
+                    console.system("Starting CuaDriver OS control for this session…")
+                    result = await ctx.host_backend_start()
+                elif action == "stop":
+                    console.system("Stopping CuaDriver OS control; chat and memory stay available…")
+                    result = await ctx.host_backend_stop()
+                elif action == "restart":
+                    console.system("Restarting CuaDriver OS control…")
+                    result = await ctx.host_backend_restart()
+                else:
+                    console.warning("Usage: /host [status|start|stop|restart]")
+                    return
+                _print_host_status(console, result)
+                _update_status()
                 return
 
             if canonical == "clear":
@@ -387,7 +578,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 handle_model(ctx, console, cmd_args)
                 return
 
-            if canonical.startswith("teach") or canonical in ("annotate", "skip"):
+            if canonical.startswith("teach") or canonical == "annotate":
                 if await _handle_teach(ctx, console, cmd_text, _learning):
                     await _after_dispatch(text)
                     return
@@ -422,10 +613,6 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                         return
                 _print_execution_result(result)
                 return
-
-            if canonical.startswith("shortcut"):
-                if _handle_shortcuts(ctx, console, cmd_text):
-                    return
 
             if canonical == "arm":
                 from leapflow.cli.commands.scheduler import cmd_arm
@@ -494,6 +681,76 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         else:
             _last_hint = None
 
+    def _render_queue_state() -> None:
+        active = app.active_command
+        queued = app.queued_commands()
+        if active is None and not queued:
+            console.system("Queue is empty.")
+            return
+        if active is not None:
+            console.system(f"{active.label} {active.status.value} {_format_queue_elapsed(active.elapsed_s)}  {active.summary()}")
+        for command in queued:
+            console.system(f"{command.label} {command.status.value}  {command.summary()}")
+        if app.queue_paused:
+            console.system("Queue is paused — use /resume to continue.")
+
+    def _handle_task_control(text: str) -> bool:
+        invocation = command_router.parse(text)
+        if invocation is None:
+            return False
+        canonical = invocation.command.name
+        args = invocation.args.strip()
+        if canonical not in {"cancel", "skip", "pause", "resume", "queue", "drop"}:
+            return False
+        if canonical == "cancel":
+            cancelled = app.request_cancel_active("cancelled by user")
+            if cancelled is None:
+                console.system("No running task to cancel.")
+            else:
+                engine = getattr(ctx, "engine", None)
+                if engine is not None and hasattr(engine, "cancel"):
+                    engine.cancel()
+                console.warning(f"Cancelled {cancelled.label}. Continuing queued work.")
+            return True
+        if canonical == "skip":
+            skipped = app.request_skip_active("skipped by user")
+            if skipped is None:
+                console.system("No running task to skip.")
+            else:
+                engine = getattr(ctx, "engine", None)
+                if engine is not None and hasattr(engine, "cancel"):
+                    engine.cancel()
+                console.warning(f"Skipped {skipped.label}. Continuing queued work.")
+            return True
+        if canonical == "pause":
+            changed = app.pause_queue()
+            console.system("Queue paused. Current running task continues; new queued tasks will wait." if changed else "Queue is already paused.")
+            return True
+        if canonical == "resume":
+            changed = app.resume_queue()
+            console.system("Queue resumed." if changed else "Queue is not paused.")
+            return True
+        if canonical == "queue":
+            if args.lower() == "clear":
+                dropped = app.clear_queued_commands("cleared by user")
+                console.system(f"Cleared {len(dropped)} queued task(s).")
+            else:
+                _render_queue_state()
+            return True
+        if canonical == "drop":
+            try:
+                command_id = int(args)
+            except ValueError:
+                console.warning("Usage: /drop <queued_task_id>")
+                return True
+            dropped = app.drop_queued_command(command_id, "dropped by user")
+            if dropped is None:
+                console.warning(f"No queued task #{command_id}.")
+            else:
+                console.system(f"Dropped {dropped.label}.")
+            return True
+        return False
+
     # ── Create and run the Application ───────────────────────────────
 
     app = LeapApp(
@@ -507,7 +764,9 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
             else None
         ),
         on_input=handle_input,
+        on_control=_handle_task_control,
     )
+    ctx.set_approval_handler(app.request_approval)
 
     # Auto-connect previously configured gateway platforms
     gw = getattr(ctx, "gateway_server", None)
@@ -532,6 +791,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     try:
         exit_code = await app.run()
     finally:
+        ctx.set_approval_handler(None)
         _print_exit_summary()
     return exit_code
 
@@ -541,10 +801,17 @@ async def cmd_interactive_daemon(
     settings: Any,
     *,
     resume_id: Optional[str] = None,
+    mock_host: bool = False,
 ) -> int:
     """Persistent REPL backed by leapd thin-client RPC."""
     from leapflow.cli.banner import display_rich_banner
-    from leapflow.cli.commands.registry import completion_entries, resolve_command
+    from leapflow.cli.commands.registry import completion_entries
+    from leapflow.cli.commands.router import CommandRouter, render_command_result
+    from leapflow.cli.commands.slash_handlers import (
+        render_model_payload,
+        render_tools_payload,
+        render_usage_payload,
+    )
     from leapflow.cli.tui_app import (
         LeapApp,
         LeapConsole,
@@ -554,22 +821,31 @@ async def cmd_interactive_daemon(
         detect_theme,
     )
     from leapflow.cli.tui_app.status import StatusBar
+    from leapflow.daemon.lease import ClientLease
     from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
 
     theme = detect_theme()
     console = LeapConsole(theme)
     status = StatusBar(theme)
     exit_stats = SessionExitStats()
+    command_router = CommandRouter("daemon")
     active_session_id = str(resume_id or "")
     turn_count = 0
     runtime_model_name = str(getattr(settings, "llm_model", ""))
     runtime_context_length = int(getattr(settings, "llm_context_length", 0) or 0)
     runtime_context_used = 0
+    runtime_context_state = "baseline"
     runtime_daemon_pid = ""
+    runtime_host_online = False
+    client_lease = ClientLease(
+        settings.profile_dir / "run",
+        kind="tui",
+        session_id=active_session_id,
+    )
 
     def _apply_daemon_runtime_metadata(metadata: dict[str, Any]) -> None:
         nonlocal active_session_id, runtime_model_name, runtime_context_length
-        nonlocal runtime_context_used, runtime_daemon_pid
+        nonlocal runtime_context_used, runtime_context_state, runtime_daemon_pid, runtime_host_online
         if metadata.get("pid"):
             runtime_daemon_pid = str(metadata["pid"])
         if metadata.get("session_id"):
@@ -588,16 +864,40 @@ async def cmd_interactive_daemon(
                 runtime_context_used = max(0, int(metadata["context_used"]))
             except (TypeError, ValueError):
                 pass
+        if metadata.get("context_posture"):
+            runtime_context_state = str(metadata["context_posture"])
+        elif isinstance(metadata.get("context_budget_snapshot"), dict):
+            snapshot = metadata["context_budget_snapshot"]
+            runtime_context_state = str(snapshot.get("context_posture") or runtime_context_state)
+        host = metadata.get("host_backend")
+        if isinstance(host, dict):
+            runtime_host_online = _host_started(host)
+
+    def _set_active_session_id(session_id: str) -> None:
+        nonlocal active_session_id
+        active_session_id = session_id
+
+    bridge = _DaemonRuntimeBridge(
+        client,
+        settings,
+        console,
+        session_id_getter=lambda: active_session_id,
+        session_id_setter=_set_active_session_id,
+        metadata_applier=_apply_daemon_runtime_metadata,
+        lease=client_lease,
+        mock_host=mock_host,
+    )
 
     def _update_status() -> None:
         status.update(
             mode="daemon",
             skill_count=0,
-            platform_online=True,
+            platform_online=runtime_host_online,
             model_name=runtime_model_name,
             session_turns=turn_count,
             context_used=runtime_context_used,
             context_max=runtime_context_length,
+            context_state=runtime_context_state,
         )
         app.prompt_mode = "daemon"
 
@@ -606,7 +906,7 @@ async def cmd_interactive_daemon(
             model=runtime_model_name,
             cwd=os.getcwd(),
             session_id=active_session_id,
-            platform_online=True,
+            platform_online=runtime_host_online,
             tool_defs=TOOL_DEFINITIONS,
             skills=[],
             context_length=runtime_context_length,
@@ -620,7 +920,10 @@ async def cmd_interactive_daemon(
 
     async def _print_daemon_status() -> None:
         try:
-            daemon_status = await client.status()
+            daemon_status = await bridge.call(
+                lambda current_client: current_client.status(),
+                description="daemon status",
+            )
         except Exception as exc:
             console.warning(f"Daemon status unavailable: {exc}")
             return
@@ -631,6 +934,7 @@ async def cmd_interactive_daemon(
             f"pid={daemon_status.get('pid')} "
             f"profile={daemon_status.get('profile')} "
             f"clients={daemon_status.get('active_clients')} "
+            f"connected={daemon_status.get('connected_clients', 0)} "
             f"volatile={daemon_status.get('volatile')}"
         )
         db_path = daemon_status.get("db_path")
@@ -657,70 +961,206 @@ async def cmd_interactive_daemon(
         context_used = daemon_status.get("context_used")
         if context_used is not None:
             console.system(f"Context used: {int(context_used):,} tokens")
+        host = daemon_status.get("host_backend")
+        if isinstance(host, dict):
+            _print_host_status(console, host)
 
-    async def _stream_response(prompt_text: str) -> None:
-        nonlocal active_session_id, turn_count, runtime_model_name
-        nonlocal runtime_context_length, runtime_context_used
-        exit_stats.record_user_message()
+    async def _handle_daemon_approval(event: StreamEvent) -> None:
+        from leapflow.security.approval import ApprovalDecision, ApprovalRequest
+
+        metadata = event.metadata or {}
+        payload = metadata.get("approval")
+        if not isinstance(payload, dict):
+            return
+        pending_id = str(payload.get("pending_id") or "")
+        if not pending_id:
+            return
+        app.spinner_text = "Waiting for approval…"
+        request = ApprovalRequest.from_dict(payload)
+        decision = await app.request_approval(request)
+        value = decision.value if isinstance(decision, ApprovalDecision) else str(decision)
+        await bridge.call(
+            lambda current_client: current_client.approval_resolve(pending_id, value),
+            description="approval resolve",
+        )
+        app.spinner_text = "Thinking…"
+
+    async def _stream_response(
+        prompt_text: str,
+        *,
+        allow_retry: bool = True,
+        record_user: bool = True,
+    ) -> None:
+        nonlocal turn_count
+        from leapflow.daemon.client import DaemonUnavailableError
+
+        if record_user:
+            exit_stats.record_user_message()
         status.mark_turn_start()
         app.agent_running = True
         app.spinner_text = "Thinking…"
+        await client_lease.touch(state="streaming", session_id=active_session_id)
 
         renderer = StreamRenderer(console)
         renderer.start()
+        retry_error: DaemonUnavailableError | None = None
+        saw_real_event = False
+        turn_completed = False
         try:
-            async for event in client.engine_chat(prompt_text):
+            async for event in bridge.client.engine_chat(prompt_text):
                 metadata = event.metadata or {}
+                is_heartbeat = event.type == "status" and metadata.get("heartbeat")
+                if not is_heartbeat:
+                    saw_real_event = True
                 _apply_daemon_runtime_metadata(metadata)
                 if event.type == "chunk":
                     renderer.feed(event.content)
                 elif event.type == "thinking":
                     renderer.feed_thinking(event.content)
                 elif event.type == "tool_start":
-                    app.spinner_text = renderer.tool_started(event.content)
+                    app.spinner_text = renderer.tool_started(
+                        event.content,
+                        metadata=metadata,
+                    )
                 elif event.type == "tool_complete":
-                    renderer.tool_finished(event.content)
+                    renderer.tool_finished(event.content, metadata=metadata)
                     app.spinner_text = "Thinking…"
                 elif event.type == "final":
                     if not renderer.text:
                         renderer.feed(event.content)
                 elif event.type == "error":
                     renderer.feed(event.content)
+                elif event.type == "approval_request":
+                    await client_lease.touch(state="approval", session_id=active_session_id)
+                    await _handle_daemon_approval(event)
+                    await client_lease.touch(state="streaming", session_id=active_session_id)
                 elif event.type == "status":
-                    console.system(event.content)
+                    if not metadata.get("heartbeat"):
+                        console.system(event.content)
+            turn_completed = True
+        except DaemonUnavailableError as exc:
+            if allow_retry and not saw_real_event:
+                retry_error = exc
+            else:
+                console.warning(
+                    "Lost connection to leapd after the turn started; "
+                    "the command was not replayed to avoid duplicate side effects."
+                )
+                raise
         finally:
             renderer.finish()
             if renderer.has_output:
                 exit_stats.record_assistant_message()
             exit_stats.record_tool_calls(renderer.tool_count)
-            turn_count += 1
+            if turn_completed:
+                turn_count += 1
             app.spinner_text = ""
             app.agent_running = False
             status.mark_turn_end()
+            await client_lease.touch(state="idle", session_id=active_session_id)
             _update_status()
 
+        if retry_error is not None:
+            await bridge.recover(f"chat stream failed before output: {retry_error}")
+            console.system("Retrying the interrupted request once after reconnecting to leapd.")
+            await _stream_response(prompt_text, allow_retry=False, record_user=False)
+
     async def handle_input(text: str) -> None:
-        cmd_text = text.lstrip("/") if text.startswith("/") else text
-        cmd_def = resolve_command(cmd_text)
-        if cmd_def is not None:
-            canonical = cmd_def.name
+        invocation = command_router.parse(text)
+        if invocation is not None:
+            unsupported = command_router.unsupported_result(invocation)
+            if unsupported is not None:
+                render_command_result(console, unsupported)
+                return
+            canonical = invocation.command.name
+            cmd_args = invocation.args
             if canonical == "exit":
                 app.exit()
                 return
             if canonical == "help":
-                _show_help(console)
+                _show_help(console, runtime="daemon")
                 return
             if canonical == "status":
                 await _print_daemon_status()
                 return
+            if canonical == "host":
+                action = _host_action(cmd_args)
+                try:
+                    if action == "status":
+                        result = await bridge.call(
+                            lambda current_client: current_client.host_status(),
+                            description="host status",
+                        )
+                    elif action == "start":
+                        console.system("Starting CuaDriver OS control for this session…")
+                        result = await bridge.call(
+                            lambda current_client: current_client.host_start(),
+                            description="host start",
+                        )
+                    elif action == "stop":
+                        console.system("Stopping CuaDriver OS control; chat and memory stay available…")
+                        result = await bridge.call(
+                            lambda current_client: current_client.host_stop(),
+                            description="host stop",
+                        )
+                    elif action == "restart":
+                        console.system("Restarting CuaDriver OS control…")
+                        result = await bridge.call(
+                            lambda current_client: current_client.host_restart(),
+                            description="host restart",
+                        )
+                    else:
+                        console.warning("Usage: /host [status|start|stop|restart]")
+                        return
+                except Exception as exc:
+                    console.warning(f"Host control failed: {exc}")
+                    return
+                _apply_daemon_runtime_metadata({"host_backend": result})
+                _print_host_status(console, result)
+                _update_status()
+                return
             if canonical == "clear":
                 _render_banner()
                 return
-            if canonical in {"tools", "usage", "model"}:
-                console.system(
-                    f"/{canonical} is not available in daemon mode yet; "
-                    "chat and resume are daemon-backed in this phase."
-                )
+            if canonical == "tools":
+                try:
+                    payload = await bridge.call(
+                        lambda current_client: current_client.tools_list(),
+                        description="tools list",
+                    )
+                except Exception as exc:
+                    console.warning(f"Tools unavailable: {exc}")
+                    return
+                render_tools_payload(console, payload)
+                return
+            if canonical == "usage":
+                try:
+                    payload = await bridge.call(
+                        lambda current_client: current_client.usage_summary(),
+                        description="usage summary",
+                    )
+                except Exception as exc:
+                    console.warning(f"Usage unavailable: {exc}")
+                    return
+                render_usage_payload(console, payload)
+                return
+            if canonical == "model":
+                try:
+                    payload = await bridge.call(
+                        lambda current_client: current_client.model_info(cmd_args),
+                        description="model info",
+                    )
+                except Exception as exc:
+                    console.warning(f"Model info unavailable: {exc}")
+                    return
+                render_model_payload(console, payload)
+                return
+            if canonical == "run":
+                if not cmd_args:
+                    console.warning("Usage: /run <trigger>")
+                    return
+                console.system("Running through daemon chat stream; approvals and host state stay visible.")
+                await _stream_response(cmd_args)
                 return
             console.warning(
                 f"/{canonical} is not available in daemon mode yet. "
@@ -745,6 +1185,83 @@ async def cmd_interactive_daemon(
         ):
             console.print(line)
 
+    def _render_queue_state() -> None:
+        active = app.active_command
+        queued = app.queued_commands()
+        if active is None and not queued:
+            console.system("Queue is empty.")
+            return
+        if active is not None:
+            console.system(f"{active.label} {active.status.value} {_format_queue_elapsed(active.elapsed_s)}  {active.summary()}")
+        for command in queued:
+            console.system(f"{command.label} {command.status.value}  {command.summary()}")
+        if app.queue_paused:
+            console.system("Queue is paused — use /resume to continue.")
+
+    def _request_daemon_cancel() -> None:
+        async def cancel_remote() -> None:
+            try:
+                await bridge.call(
+                    lambda current_client: current_client.engine_cancel(),
+                    description="engine cancel",
+                )
+            except Exception as exc:
+                console.warning(f"Daemon cancel failed: {exc}")
+        asyncio.create_task(cancel_remote())
+
+    def _handle_task_control(text: str) -> bool:
+        invocation = command_router.parse(text)
+        if invocation is None:
+            return False
+        canonical = invocation.command.name
+        args = invocation.args.strip()
+        if canonical not in {"cancel", "skip", "pause", "resume", "queue", "drop"}:
+            return False
+        if canonical == "cancel":
+            cancelled = app.request_cancel_active("cancelled by user")
+            if cancelled is None:
+                console.system("No running task to cancel.")
+            else:
+                _request_daemon_cancel()
+                console.warning(f"Cancelled {cancelled.label}. Continuing queued work.")
+            return True
+        if canonical == "skip":
+            skipped = app.request_skip_active("skipped by user")
+            if skipped is None:
+                console.system("No running task to skip.")
+            else:
+                _request_daemon_cancel()
+                console.warning(f"Skipped {skipped.label}. Continuing queued work.")
+            return True
+        if canonical == "pause":
+            changed = app.pause_queue()
+            console.system("Queue paused. Current running task continues; new queued tasks will wait." if changed else "Queue is already paused.")
+            return True
+        if canonical == "resume":
+            changed = app.resume_queue()
+            console.system("Queue resumed." if changed else "Queue is not paused.")
+            return True
+        if canonical == "queue":
+            if args.lower() == "clear":
+                dropped = app.clear_queued_commands("cleared by user")
+                console.system(f"Cleared {len(dropped)} queued task(s).")
+            else:
+                _render_queue_state()
+            return True
+        if canonical == "drop":
+            try:
+                command_id = int(args)
+            except ValueError:
+                console.warning("Usage: /drop <queued_task_id>")
+                return True
+            dropped = app.drop_queued_command(command_id, "dropped by user")
+            if dropped is None:
+                console.warning(f"No queued task #{command_id}.")
+            else:
+                console.system(f"Dropped {dropped.label}.")
+            return True
+        return False
+
     app = LeapApp(
         console=console,
         theme=theme,
@@ -752,10 +1269,14 @@ async def cmd_interactive_daemon(
         commands=completion_entries(),
         data_dir=getattr(settings, "data_dir", None),
         on_input=handle_input,
+        on_control=_handle_task_control,
     )
 
     if resume_id:
-        result = await client.session_resume(resume_id)
+        result = await bridge.call(
+            lambda current_client: current_client.session_resume(resume_id),
+            description="session resume",
+        )
         if result.get("found"):
             active_session_id = str(result.get("session_id") or resume_id)
             console.success(f"Resumed session {active_session_id}")
@@ -764,7 +1285,10 @@ async def cmd_interactive_daemon(
             active_session_id = ""
 
     try:
-        _apply_daemon_runtime_metadata(await client.status())
+        _apply_daemon_runtime_metadata(await bridge.call(
+            lambda current_client: current_client.status(),
+            description="daemon status",
+        ))
     except Exception as exc:
         console.warning(f"Daemon status unavailable: {exc}")
 
@@ -772,10 +1296,12 @@ async def cmd_interactive_daemon(
     _update_status()
     exit_code = 0
     try:
+        await client_lease.start()
         exit_code = await app.run()
     finally:
+        await client_lease.stop()
         _print_exit_summary()
-        await _prompt_stop_daemon_on_exit(client, settings, console)
+        await _prompt_stop_daemon_on_exit(bridge.client, settings, console)
     return exit_code
 
 
@@ -794,7 +1320,7 @@ async def _handle_teach(
         or line == "teach"
     ):
         if ctx.session and ctx.session.mode == SessionMode.LEARNING:
-            console.warning("Already in teaching mode. Say 'teach stop' to end.")
+            console.warning("Already in teaching mode. Say '/teach stop' to end.")
             return True
         goal = ""
         if line.startswith("teach start "):
@@ -807,13 +1333,14 @@ async def _handle_teach(
             if goal:
                 console.system(f"Goal: {goal}")
             console.system(
-                "Commands: stop │ discard │ pause │ resume │ annotate <text> │ skip [n]"
+                "Commands: /teach stop │ /teach discard │ /teach pause │ "
+                "/teach resume │ /teach skip [n] │ /annotate <text>"
             )
         except Exception as e:
             console.error(str(e))
         return True
 
-    if line in ("teach stop", "stop", "done", "教学结束", "结束"):
+    if line == "teach stop":
         if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
             if learning:
                 ctx.imitation.end_control_input()
@@ -877,14 +1404,7 @@ async def _handle_teach(
             console.error(str(e))
         return True
 
-    if line in (
-        "teach quit",
-        "teach discard",
-        "quit",
-        "discard",
-        "退出教学",
-        "放弃",
-    ):
+    if line in ("teach quit", "teach discard"):
         if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
             console.warning("Not in teaching mode.")
             return True
@@ -895,7 +1415,7 @@ async def _handle_teach(
             console.error(str(e))
         return True
 
-    if line in ("teach save", "save", "保存"):
+    if line == "teach save":
         if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
             console.warning("Not in teaching mode.")
             return True
@@ -905,32 +1425,32 @@ async def _handle_teach(
             console.success("Session saved for later resume.")
             if learning_session:
                 console.system(
-                    f"  Resume with: teach resume {learning_session.session_id}"
+                    f"  Resume with: /teach resume {learning_session.session_id}"
                 )
         except Exception as e:
             console.error(str(e))
         return True
 
-    if line in ("teach pause", "pause", "暂停"):
+    if line == "teach pause":
         if ctx.session:
             ctx.session.pause_learning()
             console.system("Recording paused.")
         return True
 
-    if line in ("teach resume", "resume", "继续"):
+    if line == "teach resume":
         from leapflow.engine.session import SessionMode as SM
 
         if ctx.session and ctx.session.mode == SM.LEARNING:
             ctx.session.resume_learning()
             console.system("Recording resumed.")
         else:
-            console.warning("Not in teaching mode. Use 'teach resume <id>'.")
+            console.warning("Not in teaching mode. Use '/teach resume <id>'.")
         return True
 
     if line.startswith("teach resume "):
         resume_id = line[len("teach resume "):].strip()
         if not resume_id:
-            console.warning("Usage: teach resume <session_id>")
+            console.warning("Usage: /teach resume <session_id>")
             return True
         if ctx.session and ctx.session.mode == SessionMode.LEARNING:
             console.warning("Already in teaching mode. Stop first.")
@@ -956,9 +1476,9 @@ async def _handle_teach(
             console.system("Annotation added.")
         return True
 
-    if line.startswith("skip") or line.startswith("跳过"):
+    if line.startswith("teach skip"):
         parts = line.split()
-        n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+        n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
         if ctx.session:
             count = ctx.session.mark_skip(n)
             console.system(f"Marked {count} step(s) as noise.")
@@ -1051,48 +1571,11 @@ def _handle_skills(ctx: "Context", console, line: str) -> bool:
     return False
 
 
-def _handle_shortcuts(ctx: "Context", console, line: str) -> bool:
-    """Handle shortcut commands. Returns True if handled."""
-    if line in ("shortcut list", "shortcut", "快捷短语"):
-        shortcuts = ctx.shortcuts.list_all()
-        if not shortcuts:
-            console.system("No shortcuts configured.")
-        else:
-            console.system(f"Shortcuts ({len(shortcuts)}):")
-            for pattern, reply in shortcuts.items():
-                console.system(f"  {pattern} → {reply}")
-        return True
-
-    if line.startswith("shortcut add ") or line.startswith("快捷短语 添加 "):
-        rest = line.split(" ", 2)[-1]
-        if "=" not in rest:
-            console.warning("Usage: shortcut add <pattern> = <reply>")
-            return True
-        pattern, reply = rest.split("=", 1)
-        pattern, reply = pattern.strip(), reply.strip()
-        if not pattern or not reply:
-            console.warning("Usage: shortcut add <pattern> = <reply>")
-            return True
-        ctx.shortcuts.add(pattern, reply)
-        console.success(f"Shortcut added: {pattern} → {reply}")
-        return True
-
-    if line.startswith("shortcut remove ") or line.startswith("快捷短语 删除 "):
-        pattern = line.split(" ", 2)[-1].strip()
-        if ctx.shortcuts.remove(pattern):
-            console.success(f"Shortcut removed: {pattern}")
-        else:
-            console.warning(f"Shortcut not found: {pattern}")
-        return True
-
-    return False
-
-
-def _show_help(console) -> None:
+def _show_help(console, runtime: str = "in_process") -> None:
     """Display categorized help using the command registry."""
     from leapflow.cli.commands.registry import commands_by_category
 
-    categories = commands_by_category()
+    categories = commands_by_category(runtime=runtime)  # type: ignore[arg-type]
 
     console.print()
     for category, cmds in categories.items():
@@ -1110,8 +1593,16 @@ def _show_help(console) -> None:
                 ]
                 if visible:
                     aliases = f" [dim]({', '.join(visible)})[/]"
+            support = ""
+            if not cmd.supports_runtime(runtime):  # type: ignore[arg-type]
+                support = " [dim]not in daemon[/]" if runtime == "daemon" else " [dim]not in this mode[/]"
+            effect = ""
+            if cmd.requires_host:
+                effect = " [dim]host[/]"
+            elif cmd.requires_llm:
+                effect = " [dim]llm[/]"
             console.print(
-                f"    [cyan]{name:<28}[/] {cmd.description}{aliases}"
+                f"    [cyan]{name:<28}[/] {cmd.description}{aliases}{effect}{support}"
             )
         console.print()
 

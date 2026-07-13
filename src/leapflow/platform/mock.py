@@ -38,6 +38,21 @@ class MockBridge(HostRpc):
         """Register an event handler (mirrors HostRpc interface)."""
         self._event_handlers.append(handler)
 
+    @property
+    def connected(self) -> bool:
+        """Mock backend never represents a live OS host connection."""
+        return False
+
+    def status_snapshot(self) -> Dict[str, Any]:
+        """Return a daemon-friendly host status snapshot for degraded mode."""
+        return {
+            "backend": "mock",
+            "started": False,
+            "pid": None,
+            "pid_source": "unavailable",
+            "reason": "host_backend_off",
+        }
+
     async def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
         p = params or {}
         if method == Methods.PING:

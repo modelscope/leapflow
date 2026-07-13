@@ -17,6 +17,15 @@ def test_context_constructs_approval_gate_before_initialize(tmp_path) -> None:
 
     assert hasattr(ctx, "_approval_gate")
     assert hasattr(ctx, "_tui_approval")
+    assert not hasattr(ctx, "shortcuts")
+
+
+def test_shortcut_commands_are_not_registered() -> None:
+    from leapflow.cli.commands.registry import commands_by_category, resolve_command
+
+    assert resolve_command("shortcut") is None
+    assert resolve_command("shortcut add hello = hi") is None
+    assert "Shortcuts" not in commands_by_category()
 
 
 @pytest.mark.asyncio
@@ -27,7 +36,8 @@ async def test_context_initialize_wires_gateway_approval_gate(tmp_path) -> None:
     ctx = Context(make_settings(str(tmp_path)), mock_host=True)
     await ctx.initialize()
     try:
-        assert gateway_tool._approval_gate is ctx._approval_gate
+        assert gateway_tool._approval_gate is ctx._approval_orchestrator
+        assert gateway_tool._approval_gate.grants is ctx._approval_orchestrator.grants
     finally:
         await ctx.cleanup()
 
@@ -368,6 +378,70 @@ async def test_daemon_fallback_initializes_local_interactive_with_real_config(
     assert (data_dir / ".env").exists()
 
 
+@pytest.mark.asyncio
+async def test_daemon_runtime_bridge_recovers_and_resumes_session() -> None:
+    from leapflow.cli.commands.interactive import _DaemonRuntimeBridge
+    from leapflow.daemon.client import DaemonUnavailableError
+
+    class Console:
+        def __init__(self) -> None:
+            self.warnings: list[str] = []
+            self.systems: list[str] = []
+            self.successes: list[str] = []
+
+        def warning(self, message: str) -> None:
+            self.warnings.append(message)
+
+        def system(self, message: str) -> None:
+            self.systems.append(message)
+
+        def success(self, message: str) -> None:
+            self.successes.append(message)
+
+    class BrokenClient:
+        async def status(self):
+            raise DaemonUnavailableError("socket disappeared")
+
+    class RecoveredClient:
+        def __init__(self) -> None:
+            self.resumed: list[str] = []
+
+        async def status(self):
+            return {"pid": 99, "session_id": "sess-1"}
+
+        async def session_resume(self, session_id: str):
+            self.resumed.append(session_id)
+            return {"found": True, "session_id": session_id}
+
+    class Settings:
+        pass
+
+    active_session_id = "sess-1"
+    metadata: list[dict] = []
+    recovered = RecoveredClient()
+
+    async def factory(settings, *, mock_host: bool = False, status_callback=None):
+        if status_callback is not None:
+            status_callback("Connected to recovered leapd.")
+        return recovered
+
+    bridge = _DaemonRuntimeBridge(
+        BrokenClient(),
+        Settings(),
+        Console(),
+        session_id_getter=lambda: active_session_id,
+        session_id_setter=lambda value: None,
+        metadata_applier=metadata.append,
+        client_factory=factory,
+    )
+
+    result = await bridge.call(lambda current_client: current_client.status(), description="status")
+
+    assert result == {"pid": 99, "session_id": "sess-1"}
+    assert recovered.resumed == ["sess-1"]
+    assert metadata == [{"pid": 99, "session_id": "sess-1"}]
+
+
 def test_leap_default_command_uses_daemon_client(monkeypatch) -> None:
     from leapflow.cli import cli
 
@@ -433,6 +507,193 @@ def test_leap_daemon_restart_routes_to_daemon_command(monkeypatch) -> None:
     assert captured == {"action": "restart"}
 
 
+def test_stdin_echo_guard_restores_and_flushes_tty(monkeypatch) -> None:
+    from leapflow.cli import cli
+
+    calls = []
+
+    class FakeStdin:
+        def isatty(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return 7
+
+    class FakeTermios:
+        ECHO = 8
+        TCSADRAIN = 1
+        TCIFLUSH = 2
+        error = OSError
+
+        @staticmethod
+        def tcgetattr(fd):
+            calls.append(("get", fd))
+            return [0, 0, 0, 15]
+
+        @staticmethod
+        def tcsetattr(fd, when, attrs):
+            calls.append(("set", fd, when, attrs[3]))
+
+        @staticmethod
+        def tcflush(fd, queue):
+            calls.append(("flush", fd, queue))
+
+    monkeypatch.setattr(cli.sys, "stdin", FakeStdin())
+    monkeypatch.setattr(cli, "termios", FakeTermios)
+
+    with cli._StdinEchoGuard():
+        pass
+
+    assert calls == [
+        ("get", 7),
+        ("set", 7, FakeTermios.TCSADRAIN, 7),
+        ("set", 7, FakeTermios.TCSADRAIN, 15),
+        ("flush", 7, FakeTermios.TCIFLUSH),
+    ]
+
+
+def test_context_uses_mock_bridge_when_cua_driver_disabled(tmp_path) -> None:
+    from leapflow.cli.context import Context
+    from leapflow.platform.mock import MockBridge
+
+    settings = replace(make_settings(str(tmp_path)), mock_host=False, use_cua_driver=False)
+    ctx = Context(settings, mock_host=False)
+
+    assert isinstance(ctx.rpc, MockBridge)
+
+
+@pytest.mark.asyncio
+async def test_context_initialize_replaces_failed_cua_driver_with_mock(monkeypatch, tmp_path) -> None:
+    import leapflow.cli.context as context_module
+    from leapflow.platform.mock import MockBridge
+
+    class FailingCuaDriverClient:
+        def start(self) -> None:
+            raise RuntimeError("cua-driver unavailable")
+
+        def stop(self) -> None:
+            raise AssertionError("failed driver should be replaced")
+
+    settings = replace(make_settings(str(tmp_path)), mock_host=False, use_cua_driver=True)
+    monkeypatch.setattr(context_module, "CuaDriverClient", FailingCuaDriverClient)
+
+    ctx = context_module.Context(settings, mock_host=False)
+    await ctx.initialize()
+    try:
+        assert isinstance(ctx.rpc, MockBridge)
+        assert ctx.engine is not None
+    finally:
+        await ctx.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_context_cleanup_continues_when_cua_driver_stop_fails(tmp_path) -> None:
+    from leapflow.cli.context import Context
+    from leapflow.platform.cua_client import CuaDriverClient
+
+    class FailingCuaDriverClient(CuaDriverClient):
+        def __init__(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            raise RuntimeError("stop failed")
+
+    class CloseTracker:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    ctx = Context(make_settings(str(tmp_path)), mock_host=True)
+    await ctx.initialize()
+    tracker = CloseTracker()
+    ctx.rpc = FailingCuaDriverClient()
+    ctx.skill_lib = tracker
+
+    await ctx.cleanup()
+
+    assert tracker.closed is True
+
+
+@pytest.mark.asyncio
+async def test_host_doctor_stops_client_when_probe_fails(monkeypatch) -> None:
+    from leapflow.cli.commands import host as host_module
+    import leapflow.platform.cua_client as cua_module
+
+    calls: list[str] = []
+
+    class FakeSession:
+        available_tools = {"list_apps": set()}
+        capability_version = "test-cap"
+
+        def call_tool_sync(self, name, args, timeout=5.0):
+            calls.append(f"probe:{name}")
+            raise RuntimeError("probe failed")
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self._session = FakeSession()
+
+        def start(self) -> None:
+            calls.append("start")
+
+        def stop(self) -> None:
+            calls.append("stop")
+
+    monkeypatch.setattr(host_module, "_cua_driver_installed", lambda: True)
+    monkeypatch.setattr(host_module, "_cua_driver_version", lambda: "test-version")
+    monkeypatch.setattr(host_module.shutil, "which", lambda command: "/tmp/cua-driver")
+    monkeypatch.setattr(cua_module, "CuaDriverClient", FakeClient)
+
+    result = await host_module._cmd_doctor()
+
+    assert result == 1
+    assert calls == ["start", "probe:list_apps", "stop"]
+
+
+@pytest.mark.asyncio
+async def test_host_status_reports_daemon_host_backend(monkeypatch, tmp_path, capsys) -> None:
+    from conftest import make_settings
+    from leapflow.cli.commands import host as host_module
+
+    class Info:
+        pid = 123
+        is_healthy = True
+        is_running = True
+        sock_path = tmp_path / "leapd.sock"
+
+    settings = replace(make_settings(str(tmp_path)), use_cua_driver=True)
+
+    async def fake_fetch(settings_obj):
+        return Info(), {
+            "host_backend": {
+                "backend": "cua-driver",
+                "started": True,
+                "pid": None,
+                "pid_source": "unavailable",
+                "command": "/tmp/cua-driver",
+                "args": ["mcp"],
+                "tools_count": 3,
+                "restart_count": 1,
+            }
+        }, ""
+
+    monkeypatch.setattr(host_module, "load_config", lambda: settings)
+    monkeypatch.setattr(host_module, "_fetch_leapd_status", fake_fetch)
+    monkeypatch.setattr(host_module, "_read_pid_file", lambda: None)
+    monkeypatch.setattr(host_module, "_cua_driver_installed", lambda: True)
+    monkeypatch.setattr(host_module, "_cua_driver_version", lambda: "test-version")
+    monkeypatch.setattr(host_module.shutil, "which", lambda command: "/tmp/cua-driver")
+
+    assert await host_module._cmd_status() == 0
+
+    output = capsys.readouterr().out
+    assert "leapd healthy" in output
+    assert "Backend: cua-driver started=True" in output
+    assert "Tools: 3 restarts=1" in output
+
+
 @pytest.mark.asyncio
 async def test_daemon_tui_exit_prompt_stops_by_default(monkeypatch, tmp_path) -> None:
     from leapflow.cli.commands import interactive as interactive_module
@@ -441,6 +702,9 @@ async def test_daemon_tui_exit_prompt_stops_by_default(monkeypatch, tmp_path) ->
     class Client:
         async def status(self):
             return {"pid": 1234}
+
+        async def shutdown(self):
+            calls.append("shutdown")
 
     class Console:
         def __init__(self) -> None:
@@ -459,19 +723,20 @@ async def test_daemon_tui_exit_prompt_stops_by_default(monkeypatch, tmp_path) ->
     async def yes(prompt: str) -> bool:
         return True
 
-    def record_signal(run_dir, sig):
-        calls.append((run_dir, sig))
-        return True
+    def record_stop(run_dir, **kwargs):
+        calls.append((run_dir, kwargs))
+        return lifecycle_module.StopDaemonResult(pid=1234, stopped=True)
 
     calls = []
     monkeypatch.setattr(interactive_module, "_ask_yes_no_default_yes", yes)
-    monkeypatch.setattr(lifecycle_module, "send_signal", record_signal)
+    monkeypatch.setattr(lifecycle_module, "stop_daemon", record_stop)
     console = Console()
 
     await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
 
-    assert calls
-    assert "Sent SIGTERM" in console.systems[-1]
+    assert "shutdown" in calls
+    assert any(isinstance(call, tuple) and call[0] == tmp_path / "run" for call in calls)
+    assert "leapd stopped" in console.systems[-1]
 
 
 @pytest.mark.asyncio
@@ -497,18 +762,64 @@ async def test_daemon_tui_exit_prompt_can_keep_daemon(monkeypatch, tmp_path) -> 
     class Settings:
         profile_dir = tmp_path
 
-    def fail_send_signal(*args, **kwargs):
+    def fail_stop(*args, **kwargs):
         raise AssertionError("daemon should be kept running")
 
     async def no(prompt: str) -> bool:
         return False
 
     monkeypatch.setattr(interactive_module, "_ask_yes_no_default_yes", no)
-    monkeypatch.setattr(lifecycle_module, "send_signal", fail_send_signal)
+    monkeypatch.setattr(lifecycle_module, "stop_daemon", fail_stop)
     console = Console()
 
     await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
 
+    assert any("kept running" in message for message in console.systems)
+
+
+@pytest.mark.asyncio
+async def test_daemon_tui_exit_prompt_keeps_daemon_by_default_for_other_clients(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from leapflow.cli.commands import interactive as interactive_module
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    class Client:
+        async def status(self):
+            return {"pid": 1234, "connected_clients": 2}
+
+    class Console:
+        def __init__(self) -> None:
+            self.systems: list[str] = []
+            self.warnings: list[str] = []
+
+        def system(self, message: str) -> None:
+            self.systems.append(message)
+
+        def warning(self, message: str) -> None:
+            self.warnings.append(message)
+
+    class Settings:
+        profile_dir = tmp_path
+
+    prompts: list[str] = []
+
+    async def default_no(prompt: str) -> bool:
+        prompts.append(prompt)
+        return False
+
+    def fail_stop(*args, **kwargs):
+        raise AssertionError("daemon should be kept running while other clients exist")
+
+    monkeypatch.setattr(interactive_module, "_ask_yes_no_default_no", default_no)
+    monkeypatch.setattr(lifecycle_module, "stop_daemon", fail_stop)
+    console = Console()
+
+    await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
+
+    assert prompts == ["Stop leapd anyway (pid=1234)? [y/N]: "]
+    assert any("other Leap client" in message for message in console.systems)
     assert any("kept running" in message for message in console.systems)
 
 

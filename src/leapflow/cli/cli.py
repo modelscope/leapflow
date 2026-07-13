@@ -16,6 +16,11 @@ import os
 import sys
 
 try:
+    import termios
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    termios = None
+
+try:
     import gnureadline as readline  # noqa: F401
 except ImportError:
     import readline  # noqa: F401
@@ -87,6 +92,37 @@ async def _async_host(args: argparse.Namespace) -> int:
     return await cmd_host(args)
 
 
+class _StdinEchoGuard:
+    """Temporarily hide pre-TUI stdin echo while leapd starts."""
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._attrs: list | None = None
+
+    def __enter__(self) -> "_StdinEchoGuard":
+        if termios is None or not sys.stdin.isatty():
+            return self
+        try:
+            self._fd = sys.stdin.fileno()
+            self._attrs = termios.tcgetattr(self._fd)
+            muted = list(self._attrs)
+            muted[3] = muted[3] & ~termios.ECHO
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, muted)
+        except termios.error:
+            self._fd = None
+            self._attrs = None
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if termios is None or self._fd is None or self._attrs is None:
+            return
+        try:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._attrs)
+            termios.tcflush(self._fd, termios.TCIFLUSH)
+        except termios.error:
+            return
+
+
 async def _async_daemon_main(args: argparse.Namespace) -> int:
     """Run chat/interactive through a shared leapd daemon."""
     from leapflow.daemon.client import DaemonUnavailableError, ensure_daemon_client
@@ -99,11 +135,12 @@ async def _async_daemon_main(args: argparse.Namespace) -> int:
         sys.stderr.flush()
 
     try:
-        client = await ensure_daemon_client(
-            settings,
-            mock_host=mock_host,
-            status_callback=_status,
-        )
+        with _StdinEchoGuard():
+            client = await ensure_daemon_client(
+                settings,
+                mock_host=mock_host,
+                status_callback=_status,
+            )
     except DaemonUnavailableError as exc:
         sys.stderr.write(
             "\033[33m→ leapd unavailable; falling back to local volatile-capable mode.\033[0m\n"
@@ -120,6 +157,7 @@ async def _async_daemon_main(args: argparse.Namespace) -> int:
             client,
             settings,
             resume_id=getattr(args, "resume", None),
+            mock_host=mock_host,
         )
     if cmd == "chat":
         from leapflow.cli.commands.chat import cmd_chat_daemon
@@ -210,8 +248,10 @@ def main(argv: list[str] | None = None) -> int:
     daemon_sub = daemon_parser.add_subparsers(dest="daemon_action")
     daemon_sub.add_parser("status", help="Show daemon status")
     daemon_sub.add_parser("start", help="Start daemon for the active profile")
-    daemon_sub.add_parser("stop", help="Stop running daemon")
-    daemon_sub.add_parser("restart", help="Restart daemon for the active profile")
+    stop_parser = daemon_sub.add_parser("stop", help="Stop running daemon")
+    stop_parser.add_argument("--force", action="store_true", help="Escalate to SIGKILL if graceful stop times out")
+    restart_parser = daemon_sub.add_parser("restart", help="Restart daemon for the active profile")
+    restart_parser.add_argument("--force", action="store_true", help="Force old daemon shutdown before restart")
     serve_parser = daemon_sub.add_parser("serve", help=argparse.SUPPRESS)
     serve_parser.add_argument("--internal", action="store_true", help=argparse.SUPPRESS)
 

@@ -40,4 +40,4 @@ validation:
 adapter:
   module: leapflow.gateway.adapters.api_server
   class: APIServerAdapter
-  dependencies: [aiohttp]
+  dependencies: []

@@ -12,7 +12,8 @@ import sys
 from typing import Optional
 
 from rich.console import Console
-from rich.markdown import Markdown
+from rich.markdown import CodeBlock, Markdown
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
@@ -24,6 +25,16 @@ from leapflow.cli.tui_app.theme import ResolvedTheme, Theme
 
 _COMMAND_CARD_MIN_SUMMARY = 32
 _COMMAND_CARD_PADDING = 24
+
+
+def _format_card_elapsed(seconds: float) -> str:
+    """Format command-card elapsed time without consuming a body line."""
+    if seconds < 1.0:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    return f"{minutes}m{seconds - minutes * 60:.0f}s"
 
 
 def _build_rich_theme(theme: Theme | ResolvedTheme) -> RichTheme:
@@ -40,8 +51,48 @@ def _build_rich_theme(theme: Theme | ResolvedTheme) -> RichTheme:
         "leap.recording": theme.recording,
         "leap.executing": theme.executing,
         "leap.panel_title": theme.panel_title,
+        "leap.answer_border": theme.statusbar_dim,
+        "leap.answer_title": f"bold {theme.statusbar_accent}",
+        "leap.tool": theme.text_muted,
+        "leap.tool_name": f"bold {theme.text_muted}",
+        "markdown.h1": f"bold {theme.text}",
+        "markdown.h2": f"bold {theme.accent_dim}",
+        "markdown.h3": f"bold {theme.text_dim}",
+        "markdown.h4": f"bold {theme.text_dim}",
+        "markdown.h5": theme.text_dim,
+        "markdown.h6": theme.text_dim,
+        "markdown.strong": f"bold {theme.text}",
+        "markdown.em": theme.text_dim,
+        "markdown.hr": theme.border_dim,
+        "markdown.item": theme.text,
+        "markdown.code": f"bold {theme.info}",
         "rule.line": theme.border,
     })
+
+
+class _TerminalBackgroundCodeBlock(CodeBlock):
+    """Markdown code block that keeps the user's terminal background."""
+
+    def __rich_console__(self, console, options):
+        code = str(self.text).rstrip()
+        yield Syntax(
+            code,
+            self.lexer_name,
+            theme=self.theme,
+            word_wrap=False,
+            background_color="default",
+            padding=1,
+        )
+
+
+class _TerminalBackgroundMarkdown(Markdown):
+    """Rich Markdown variant with transparent fenced code blocks."""
+
+    elements = {
+        **Markdown.elements,
+        "fence": _TerminalBackgroundCodeBlock,
+        "code_block": _TerminalBackgroundCodeBlock,
+    }
 
 
 class LeapConsole:
@@ -87,24 +138,27 @@ class LeapConsole:
             TuiCommandStatus.RUNNING: "leap.accent",
             TuiCommandStatus.DONE: "leap.success",
             TuiCommandStatus.FAILED: "leap.error",
+            TuiCommandStatus.CANCELLED: "leap.warning",
+            TuiCommandStatus.SKIPPED: "leap.warning",
         }
         title_styles = {
             TuiCommandStatus.QUEUED: "leap.muted",
             TuiCommandStatus.RUNNING: "leap.accent",
             TuiCommandStatus.DONE: "leap.success",
             TuiCommandStatus.FAILED: "leap.error",
+            TuiCommandStatus.CANCELLED: "leap.warning",
+            TuiCommandStatus.SKIPPED: "leap.warning",
         }
         summary_limit = max(_COMMAND_CARD_MIN_SUMMARY, self.width - _COMMAND_CARD_PADDING)
         body = Text(command.summary(limit=summary_limit), style="leap.muted")
         if command.error:
             body.append("\n")
             body.append(command.error, style="leap.error")
-        if command.elapsed_s > 0:
-            body.append("\n")
-            body.append(f"elapsed: {command.elapsed_s:.1f}s", style="leap.dim")
         title = Text()
         title.append(command.label, style="bold")
         title.append(f" {command.status.value}", style=title_styles[command.status])
+        if command.elapsed_s > 0:
+            title.append(f"  {_format_card_elapsed(command.elapsed_s)}", style="leap.dim")
         self._console.print(Panel(
             body,
             title=title,
@@ -113,15 +167,27 @@ class LeapConsole:
             padding=(0, 1),
         ))
 
-    def markdown(self, text: str, *, code_theme: str = "monokai") -> None:
-        """Render markdown content with syntax-highlighted code blocks."""
+    def markdown(
+        self,
+        text: str,
+        *,
+        code_theme: str = "monokai",
+        indent: int = 0,
+        margin_top: int = 0,
+        margin_bottom: int = 0,
+    ) -> None:
+        """Render markdown content with optional visual spacing."""
         if not text.strip():
             return
-        md = Markdown(
+        md = _TerminalBackgroundMarkdown(
             text,
             code_theme=code_theme if self._theme.name == "dark" else "default",
         )
-        self._console.print(md)
+        if indent > 0 or margin_top > 0 or margin_bottom > 0:
+            renderable = Padding(md, (margin_top, 0, margin_bottom, indent))
+        else:
+            renderable = md
+        self._console.print(renderable)
 
     def code(self, source: str, language: str = "python", *, title: str = "") -> None:
         """Render a standalone code block with syntax highlighting."""
@@ -130,6 +196,7 @@ class LeapConsole:
             language,
             theme="monokai" if self._theme.name == "dark" else "default",
             line_numbers=len(source.splitlines()) > 5,
+            background_color="default",
             padding=(0, 1),
         )
         if title:
@@ -137,9 +204,20 @@ class LeapConsole:
         else:
             self._console.print(syntax)
 
-    def system(self, message: str, *, style: str = "leap.dim") -> None:
-        """Print a system/info message in muted style."""
+    def system(
+        self,
+        message: str,
+        *,
+        style: str = "leap.dim",
+        margin_top: int = 0,
+        margin_bottom: int = 0,
+    ) -> None:
+        """Print a system/info message in muted style with optional spacing."""
+        for _ in range(max(0, margin_top)):
+            self._console.print()
         self._console.print(f"  {message}", style=style)
+        for _ in range(max(0, margin_bottom)):
+            self._console.print()
 
     def success(self, message: str) -> None:
         self._console.print(f"  ✓ {message}", style="leap.success")
@@ -186,7 +264,12 @@ class LeapConsole:
 
         style = "leap.error" if is_error else "leap.border"
         self._console.print(Panel(
-            Syntax(display, "text", theme="monokai" if self._theme.name == "dark" else "default")
+            Syntax(
+                display,
+                "text",
+                theme="monokai" if self._theme.name == "dark" else "default",
+                background_color="default",
+            )
             if not is_error else Text(display),
             title=f"{'✗' if is_error else '↳'} {name}",
             border_style=style,
@@ -204,6 +287,15 @@ class LeapConsole:
             title_align="left",
             border_style="leap.border",
             padding=(0, 1),
+        ))
+
+    def answer_label(self) -> None:
+        """Print a clear warm boundary before the user-facing final answer."""
+        title = Text(" LeapFlow ", style="leap.answer_title")
+        self._console.print(Rule(
+            title=title,
+            style="leap.answer_border",
+            align="left",
         ))
 
     def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:

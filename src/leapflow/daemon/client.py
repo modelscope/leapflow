@@ -14,6 +14,7 @@ from leapflow.daemon.lifecycle import (
     DaemonLock,
     cleanup_stale,
     spawn_daemon,
+    stop_daemon,
     wait_ready,
 )
 from leapflow.daemon.protocol import RpcRequest
@@ -86,6 +87,11 @@ class DaemonClient:
         finally:
             await _close_writer(writer)
 
+    async def engine_cancel(self) -> bool:
+        """Request cancellation of the daemon-owned active engine turn."""
+        result = await self.request("engine.cancel")
+        return bool(result)
+
     async def session_resume(self, session_id: str) -> dict[str, Any]:
         """Ask the daemon to load an existing conversation session."""
         result = await self.request("session.resume", {"session_id": session_id})
@@ -94,6 +100,69 @@ class DaemonClient:
     async def status(self) -> dict[str, Any]:
         """Return daemon status."""
         result = await self.request("daemon.status")
+        return dict(result or {})
+
+    async def host_status(self) -> dict[str, Any]:
+        """Return daemon-owned host backend status."""
+        result = await self.request("host.status")
+        return dict(result or {})
+
+    async def host_start(self) -> dict[str, Any]:
+        """Start the daemon-owned host backend."""
+        result = await self.request("host.start")
+        return dict(result or {})
+
+    async def host_stop(self) -> dict[str, Any]:
+        """Stop the daemon-owned host backend."""
+        result = await self.request("host.stop")
+        return dict(result or {})
+
+    async def host_restart(self) -> dict[str, Any]:
+        """Restart the daemon-owned host backend."""
+        result = await self.request("host.restart")
+        return dict(result or {})
+
+    async def tools_list(self) -> dict[str, Any]:
+        """Return daemon-owned tool summary for slash-command rendering."""
+        result = await self.request("tools.list")
+        return dict(result or {})
+
+    async def usage_summary(self) -> dict[str, Any]:
+        """Return token usage for the daemon-owned session."""
+        result = await self.request("usage.summary")
+        return dict(result or {})
+
+    async def model_info(self, model_name: str = "") -> dict[str, Any]:
+        """Return daemon-owned model information."""
+        params = {"model_name": model_name} if model_name else {}
+        result = await self.request("model.info", params)
+        return dict(result or {})
+
+    async def approval_status(self) -> dict[str, Any]:
+        """Return pending daemon approval requests."""
+        result = await self.request("approval.status")
+        return dict(result or {})
+
+    async def approval_resolve(
+        self,
+        pending_id: str,
+        decision: str,
+        *,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Resolve a pending daemon approval request."""
+        result = await self.request(
+            "approval.resolve",
+            {"pending_id": pending_id, "decision": decision, "reason": reason},
+        )
+        return dict(result or {})
+
+    async def approval_cancel(self, pending_id: str, *, reason: str = "cancelled") -> dict[str, Any]:
+        """Cancel a pending daemon approval request."""
+        result = await self.request(
+            "approval.cancel",
+            {"pending_id": pending_id, "reason": reason},
+        )
         return dict(result or {})
 
     async def shutdown(self) -> None:
@@ -168,6 +237,36 @@ async def ensure_daemon_client(
     return DaemonClient(sock_path)
 
 
+async def recover_daemon_client(
+    settings: Any,
+    *,
+    mock_host: bool = False,
+    status_callback: StatusCallback | None = None,
+) -> DaemonClient:
+    """Return a usable daemon client, restarting an unhealthy daemon once."""
+    try:
+        return await ensure_daemon_client(
+            settings,
+            mock_host=mock_host,
+            status_callback=status_callback,
+        )
+    except DaemonUnavailableError as exc:
+        run_dir = settings.profile_dir / "run"
+        info = DaemonInfo.discover(run_dir)
+        if not info.is_running:
+            raise
+        _emit(status_callback, f"Restarting unhealthy leapd (pid={info.pid})...")
+        result = await asyncio.to_thread(stop_daemon, run_dir, timeout_s=10.0)
+        if not result.stopped:
+            raise exc
+        return await ensure_daemon_client(
+            settings,
+            mock_host=mock_host,
+            status_callback=status_callback,
+        )
+
+
+
 def _event_from_params(params: dict[str, Any]) -> StreamEvent:
     event_type = str(params.get("event_type") or "chunk")
     if event_type not in {
@@ -178,6 +277,8 @@ def _event_from_params(params: dict[str, Any]) -> StreamEvent:
         "thinking",
         "status",
         "error",
+        "approval_request",
+        "approval_response",
     }:
         event_type = "chunk"
     metadata = params.get("metadata")

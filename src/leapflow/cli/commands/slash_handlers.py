@@ -7,11 +7,160 @@ All display logic uses ``LeapConsole`` for consistent theming.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from leapflow.cli.context import Context
     from leapflow.cli.tui_app.console import LeapConsole
+
+
+def build_tools_payload(ctx: "Context") -> dict[str, Any]:
+    """Build a serializable tools summary for local or daemon rendering."""
+    from leapflow.cli.banner import _categorize_tools
+    from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
+
+    tool_groups = _categorize_tools(TOOL_DEFINITIONS)
+    groups = {category: sorted(names) for category, names in tool_groups.items()}
+    mcp_count = 0
+    if hasattr(ctx.rpc, "connected") and ctx.rpc.connected:
+        mcp_count = len(getattr(ctx, "platform_tools", []))
+    return {
+        "ok": True,
+        "groups": groups,
+        "total": sum(len(names) for names in groups.values()),
+        "mcp_count": mcp_count,
+    }
+
+
+def render_tools_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    """Render a serializable tools summary."""
+    from rich.table import Table
+
+    if not payload.get("ok", True):
+        console.warning(str(payload.get("error") or "Tools are not available."))
+        return
+
+    groups = dict(payload.get("groups") or {})
+    table = Table(
+        title="Available Tools",
+        show_header=True,
+        header_style="bold",
+        border_style="bright_black",
+        title_style="bold cyan",
+        padding=(0, 1),
+    )
+    table.add_column("Category", style="cyan", no_wrap=True)
+    table.add_column("Tools")
+
+    for category, names in groups.items():
+        table.add_row(str(category), ", ".join(sorted(str(name) for name in names)))
+
+    mcp_count = int(payload.get("mcp_count") or 0)
+    if mcp_count > 0:
+        table.add_row("mcp", f"{mcp_count} platform tools")
+
+    console.print(table)
+    console.system(f"{int(payload.get('total') or 0)} tools available")
+
+
+def build_usage_payload(ctx: "Context") -> dict[str, Any]:
+    """Build a serializable token usage summary."""
+    engine = ctx.engine
+    if engine is None:
+        return {"ok": False, "error": "No active engine — send a message first."}
+
+    tracker = getattr(engine, "usage_tracker", None)
+    if tracker is None:
+        return {"ok": False, "error": "Usage tracking not available."}
+
+    summary = tracker.summary()
+    cap_registry = getattr(engine, "model_capabilities", None)
+    context_length = 0
+    if cap_registry is not None:
+        caps = cap_registry.resolve(ctx.settings.llm_model)
+        context_length = int(caps.context_length)
+
+    return {
+        "ok": True,
+        "model": ctx.settings.llm_model,
+        "prompt_tokens": int(summary.prompt_tokens),
+        "completion_tokens": int(summary.completion_tokens),
+        "total_tokens": int(summary.total_tokens),
+        "turn_count": int(getattr(engine, "turn_count", 0)),
+        "context_used": int(getattr(engine, "context_token_count", 0)),
+        "context_length": context_length,
+    }
+
+
+def render_usage_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    """Render a serializable token usage summary."""
+    from leapflow.cli.tui_app.status import _compact_tokens
+
+    if not payload.get("ok", True):
+        console.warning(str(payload.get("error") or "Usage tracking not available."))
+        return
+
+    console.print()
+    prompt_tokens = int(payload.get("prompt_tokens") or 0)
+    completion_tokens = int(payload.get("completion_tokens") or 0)
+    total_tokens = int(payload.get("total_tokens") or 0)
+    turn_count = int(payload.get("turn_count") or 0)
+    context_used = int(payload.get("context_used") or 0)
+    context_length = int(payload.get("context_length") or 0)
+    lines = [
+        f"  Model:           {payload.get('model') or ''}",
+        f"  Input tokens:    {_compact_tokens(prompt_tokens):>8}  ({prompt_tokens:,})",
+        f"  Output tokens:   {_compact_tokens(completion_tokens):>8}  ({completion_tokens:,})",
+        f"  Total tokens:    {_compact_tokens(total_tokens):>8}  ({total_tokens:,})",
+        f"  Turns:           {turn_count}",
+    ]
+    if context_length > 0:
+        pct = int(context_used * 100 / context_length)
+        lines.append(
+            f"  Context:         {_compact_tokens(context_used)}/{_compact_tokens(context_length)} ({pct}%)"
+        )
+    for line in lines:
+        console.system(line)
+    console.print()
+
+
+def build_model_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
+    """Build a serializable model summary."""
+    model_arg = args.strip()
+    engine = ctx.engine
+    context_length = 0
+    if engine is not None:
+        cap_registry = getattr(engine, "model_capabilities", None)
+        if cap_registry is not None:
+            caps = cap_registry.resolve(ctx.settings.llm_model)
+            context_length = int(caps.context_length)
+    return {
+        "ok": True,
+        "model": ctx.settings.llm_model,
+        "context_length": context_length,
+        "requested_model": model_arg,
+        "switch_supported": False,
+        "env_var": "LEAPFLOW_LLM_MODEL",
+    }
+
+
+def render_model_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    """Render a serializable model summary."""
+    if not payload.get("ok", True):
+        console.warning(str(payload.get("error") or "Model information is not available."))
+        return
+    requested = str(payload.get("requested_model") or "")
+    model = str(payload.get("model") or "")
+    if not requested:
+        console.system(f"Current model: {model}")
+        context_length = int(payload.get("context_length") or 0)
+        if context_length > 0:
+            console.system(f"Context length: {context_length:,}")
+        return
+
+    console.warning("Model switching requires restarting with LEAPFLOW_LLM_MODEL env var.")
+    console.system(f"  Current: {model}")
+    console.system(f"  Example: LEAPFLOW_LLM_MODEL={requested} leap")
 
 
 def handle_status(ctx: "Context", console: "LeapConsole", args: str) -> None:
@@ -99,99 +248,17 @@ def handle_status(ctx: "Context", console: "LeapConsole", args: str) -> None:
 
 def handle_tools(ctx: "Context", console: "LeapConsole", args: str) -> None:
     """Display available tools grouped by category."""
-    from rich.table import Table
-    from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
-    from leapflow.cli.banner import _categorize_tools
-
-    tool_groups = _categorize_tools(TOOL_DEFINITIONS)
-
-    table = Table(
-        title="Available Tools",
-        show_header=True,
-        header_style="bold",
-        border_style="bright_black",
-        title_style="bold cyan",
-        padding=(0, 1),
-    )
-    table.add_column("Category", style="cyan", no_wrap=True)
-    table.add_column("Tools")
-
-    for cat, names in tool_groups.items():
-        table.add_row(cat, ", ".join(sorted(names)))
-
-    mcp_count = 0
-    if hasattr(ctx.rpc, "connected") and ctx.rpc.connected:
-        mcp_count = len(getattr(ctx, "platform_tools", []))
-    if mcp_count > 0:
-        table.add_row("mcp", f"{mcp_count} platform tools")
-
-    console.print(table)
-    console.system(f"{sum(len(v) for v in tool_groups.values())} tools available")
+    render_tools_payload(console, build_tools_payload(ctx))
 
 
 def handle_usage(ctx: "Context", console: "LeapConsole", args: str) -> None:
     """Display token usage for the current session."""
-    from leapflow.cli.tui_app.status import _compact_tokens
-
-    engine = ctx.engine
-    if engine is None:
-        console.warning("No active engine — send a message first.")
-        return
-
-    tracker = getattr(engine, "usage_tracker", None)
-    if tracker is None:
-        console.warning("Usage tracking not available.")
-        return
-
-    console.print()
-
-    summary = tracker.summary()
-    turn_count = getattr(engine, "turn_count", 0)
-
-    cap_registry = getattr(engine, "model_capabilities", None)
-    ctx_len = 0
-    if cap_registry is not None:
-        caps = cap_registry.resolve(ctx.settings.llm_model)
-        ctx_len = caps.context_length
-    ctx_used = getattr(engine, "context_token_count", 0)
-
-    lines = [
-        f"  Model:           {ctx.settings.llm_model}",
-        f"  Input tokens:    {_compact_tokens(summary.prompt_tokens):>8}  ({summary.prompt_tokens:,})",
-        f"  Output tokens:   {_compact_tokens(summary.completion_tokens):>8}  ({summary.completion_tokens:,})",
-        f"  Total tokens:    {_compact_tokens(summary.total_tokens):>8}  ({summary.total_tokens:,})",
-        f"  Turns:           {turn_count}",
-    ]
-
-    if ctx_len > 0:
-        pct = int(ctx_used * 100 / ctx_len) if ctx_len else 0
-        lines.append(
-            f"  Context:         {_compact_tokens(ctx_used)}/{_compact_tokens(ctx_len)} ({pct}%)"
-        )
-
-    for line in lines:
-        console.system(line)
-    console.print()
+    render_usage_payload(console, build_usage_payload(ctx))
 
 
 def handle_model(ctx: "Context", console: "LeapConsole", args: str) -> None:
     """Show or switch the active model."""
-    model_arg = args.strip()
-    if not model_arg:
-        console.system(f"Current model: {ctx.settings.llm_model}")
-        engine = ctx.engine
-        if engine is not None:
-            cap_registry = getattr(engine, "model_capabilities", None)
-            if cap_registry is not None:
-                caps = cap_registry.resolve(ctx.settings.llm_model)
-                console.system(f"Context length: {caps.context_length:,}")
-        return
-
-    console.warning(
-        "Model switching requires restarting with LEAPFLOW_LLM_MODEL env var."
-    )
-    console.system(f"  Current: {ctx.settings.llm_model}")
-    console.system(f"  Example: LEAPFLOW_LLM_MODEL={model_arg} leap")
+    render_model_payload(console, build_model_payload(ctx, args))
 
 
 def handle_gateway(ctx: "Context", console: "LeapConsole", args: str) -> None:

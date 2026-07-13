@@ -32,6 +32,8 @@ class TuiCommandStatus(str, Enum):
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
 
 
 @dataclass(frozen=True)
@@ -98,4 +100,22 @@ class TuiCommand:
             status=TuiCommandStatus.FAILED,
             finished_at=time.monotonic(),
             error=_truncate(_single_line(error), _MAX_ERROR_LENGTH),
+        )
+
+    def mark_cancelled(self, reason: str = "cancelled by user") -> "TuiCommand":
+        """Return a copy marked as cancelled with a concise reason."""
+        return replace(
+            self,
+            status=TuiCommandStatus.CANCELLED,
+            finished_at=time.monotonic(),
+            error=_truncate(_single_line(reason), _MAX_ERROR_LENGTH),
+        )
+
+    def mark_skipped(self, reason: str = "skipped by user") -> "TuiCommand":
+        """Return a copy marked as skipped with a concise reason."""
+        return replace(
+            self,
+            status=TuiCommandStatus.SKIPPED,
+            finished_at=time.monotonic(),
+            error=_truncate(_single_line(reason), _MAX_ERROR_LENGTH),
         )

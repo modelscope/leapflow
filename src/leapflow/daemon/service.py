@@ -6,9 +6,11 @@ import logging
 import os
 import sys
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+from leapflow.daemon.lease import ClientLeaseSnapshot
 from leapflow.daemon.protocol import StreamChunk
 from leapflow.engine import StreamEvent
 from leapflow.memory.protocol import MemoryEntry, MemoryQuery
@@ -26,10 +28,17 @@ class RuntimeLeapService:
         self._engine_lock = asyncio.Lock()
         self._started_at = time.time()
         self._client_count: Callable[[], int] = lambda: 0
+        self._client_leases: Callable[[], list[ClientLeaseSnapshot]] = lambda: []
+        self._approval_pending: dict[str, dict[str, Any]] = {}
+        self._approval_event_queue: asyncio.Queue[StreamChunk] | None = None
 
     def set_client_count_provider(self, provider: Callable[[], int]) -> None:
         """Set a lightweight callback used by status reporting."""
         self._client_count = provider
+
+    def set_client_lease_provider(self, provider: Callable[[], list[ClientLeaseSnapshot]]) -> None:
+        """Set a callback used to report live client leases."""
+        self._client_leases = provider
 
     async def start(self) -> None:
         """Initialize the daemon-owned runtime once."""
@@ -39,6 +48,7 @@ class RuntimeLeapService:
 
         ctx = Context(self._settings, self._mock_host)
         await ctx.initialize()
+        self._install_daemon_approval(ctx)
         self._ctx = ctx
 
     @property
@@ -89,9 +99,8 @@ class RuntimeLeapService:
                     content="Configuration reloaded — LLM settings updated in leapd.",
                     event_type="status",
                     metadata={
+                        **self._engine_context_metadata(getattr(ctx, "engine", None), ctx.settings),
                         "llm_model": getattr(ctx.settings, "llm_model", ""),
-                        "llm_context_length": getattr(ctx.settings, "llm_context_length", 0),
-                        "context_used": getattr(getattr(ctx, "engine", None), "context_token_count", 0),
                     },
                 )
             engine = getattr(ctx, "engine", None)
@@ -99,9 +108,15 @@ class RuntimeLeapService:
                 raise RuntimeError("leapd engine is not initialized")
 
             enable_thinking = bool(kwargs.get("enable_thinking", False))
-            async for event in engine.run_stream(message, enable_thinking=enable_thinking):
-                stream_event = self._normalize_event(event)
-                yield self._chunk_from_event(stream_event)
+            approval_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
+            previous_queue = self._approval_event_queue
+            self._approval_event_queue = approval_queue
+            try:
+                stream = engine.run_stream(message, enable_thinking=enable_thinking)
+                async for chunk in self._stream_engine_events(stream, approval_queue):
+                    yield chunk
+            finally:
+                self._approval_event_queue = previous_queue
 
     async def engine_cancel(self) -> bool:
         ctx = self.context
@@ -126,6 +141,7 @@ class RuntimeLeapService:
         db_holder = getattr(ctx, "_db_holder", None) if ctx is not None else None
         config_path = os.path.join(str(getattr(settings, "data_dir", "")), ".env")
         project_env_path = os.path.join(os.getcwd(), ".env")
+        context_metadata = self._engine_context_metadata(engine, settings)
         return {
             "pid": os.getpid(),
             "profile": getattr(settings, "profile", "default"),
@@ -136,14 +152,101 @@ class RuntimeLeapService:
             "volatile": bool(getattr(ctx, "storage_volatile", False)) if ctx is not None else False,
             "uptime_s": max(0.0, time.time() - self._started_at),
             "active_clients": max(0, self._client_count()),
+            "active_connections": max(0, self._client_count()),
+            "connected_clients": len(self._client_leases()),
             "model": getattr(settings, "llm_model", ""),
-            "llm_context_length": getattr(settings, "llm_context_length", 0),
-            "context_used": getattr(engine, "context_token_count", 0) if engine is not None else 0,
+            "llm_context_length": context_metadata.get("llm_context_length", getattr(settings, "llm_context_length", 0)),
+            "context_used": context_metadata.get("context_used", 0),
+            "context_posture": context_metadata.get("context_posture", "baseline"),
+            "context_signal": context_metadata.get("context_signal", ""),
+            "context_guidance": context_metadata.get("context_guidance", ""),
+            "compression_reason": context_metadata.get("compression_reason", ""),
+            "compression_savings_ratio": context_metadata.get("compression_savings_ratio", 0.0),
+            "context_budget_snapshot": context_metadata.get("context_budget_snapshot", {}),
             "session_id": str(getattr(engine, "_current_session_id", "") or ""),
             "runtime_source": self._runtime_source(),
             "runtime_executable": sys.executable,
             "runtime_version": self._runtime_version(),
+            "pending_approvals": len(self._approval_pending),
+            "host_backend": self._host_backend_status(ctx),
         }
+
+    async def host_status(self) -> dict[str, Any]:
+        """Return daemon-owned host backend status."""
+        ctx = self.context
+        status = getattr(ctx, "host_backend_status", None)
+        if callable(status):
+            return dict(await status())
+        return self._host_backend_status(ctx)
+
+    async def host_start(self) -> dict[str, Any]:
+        """Start daemon-owned CuaDriver without resetting chat state."""
+        async with self._engine_lock:
+            ctx = self.context
+            start = getattr(ctx, "host_backend_start", None)
+            if not callable(start):
+                return {"ok": False, "started": False, "last_error": "host lifecycle is unavailable"}
+            return dict(await start())
+
+    async def host_stop(self) -> dict[str, Any]:
+        """Stop daemon-owned CuaDriver without shutting down leapd."""
+        async with self._engine_lock:
+            ctx = self.context
+            stop = getattr(ctx, "host_backend_stop", None)
+            if not callable(stop):
+                return {"ok": False, "started": False, "last_error": "host lifecycle is unavailable"}
+            return dict(await stop())
+
+    async def host_restart(self) -> dict[str, Any]:
+        """Restart daemon-owned CuaDriver without resetting chat state."""
+        async with self._engine_lock:
+            ctx = self.context
+            restart = getattr(ctx, "host_backend_restart", None)
+            if not callable(restart):
+                return {"ok": False, "started": False, "last_error": "host lifecycle is unavailable"}
+            return dict(await restart())
+
+    async def tools_list(self) -> dict[str, Any]:
+        """Return daemon-owned tool summary for slash-command rendering."""
+        from leapflow.cli.commands.slash_handlers import build_tools_payload
+
+        return build_tools_payload(self.context)
+
+    async def usage_summary(self) -> dict[str, Any]:
+        """Return token usage for the current daemon-owned session."""
+        from leapflow.cli.commands.slash_handlers import build_usage_payload
+
+        return build_usage_payload(self.context)
+
+    async def model_info(self, model_name: str = "") -> dict[str, Any]:
+        """Return active daemon model information and restart guidance."""
+        from leapflow.cli.commands.slash_handlers import build_model_payload
+
+        return build_model_payload(self.context, model_name)
+
+    async def approval_status(self) -> dict[str, Any]:
+        """Return currently pending daemon approval requests."""
+        return {"pending": self._pending_payloads()}
+
+    async def approval_resolve(
+        self,
+        pending_id: str,
+        decision: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Resolve a pending approval request from a thin client."""
+        pending = self._approval_pending.get(pending_id)
+        if pending is None:
+            return {"ok": False, "error": f"Unknown approval request: {pending_id}"}
+        future = pending.get("future")
+        if not isinstance(future, asyncio.Future) or future.done():
+            return {"ok": False, "error": f"Approval request is no longer pending: {pending_id}"}
+        future.set_result({"decision": self._normalize_approval_decision(decision), "reason": reason})
+        return {"ok": True, "pending_id": pending_id, "decision": self._normalize_approval_decision(decision)}
+
+    async def approval_cancel(self, pending_id: str, reason: str = "cancelled") -> dict[str, Any]:
+        """Cancel a pending approval request, causing the action to be denied."""
+        return await self.approval_resolve(pending_id, "deny", reason=reason)
 
     @staticmethod
     def _runtime_source() -> str:
@@ -158,6 +261,64 @@ class RuntimeLeapService:
         except ImportError:
             return "unknown"
         return str(__version__)
+
+    def _engine_context_metadata(self, engine: Any | None, settings: Any) -> dict[str, Any]:
+        """Return safe context-budget metadata for daemon status and stream events."""
+        context_length = max(0, int(getattr(settings, "llm_context_length", 0) or 0))
+        metadata: dict[str, Any] = {
+            "llm_context_length": context_length,
+            "context_used": 0,
+        }
+        if engine is None:
+            return metadata
+        metadata["context_used"] = max(0, int(getattr(engine, "context_token_count", 0) or 0))
+        snapshot = getattr(engine, "context_budget_snapshot", {})
+        if callable(snapshot):
+            snapshot = snapshot()
+        if isinstance(snapshot, dict) and snapshot:
+            safe_snapshot = dict(snapshot)
+            if safe_snapshot.get("context_length"):
+                metadata["llm_context_length"] = max(1, int(safe_snapshot["context_length"]))
+            if safe_snapshot.get("total_tokens") is not None:
+                metadata["context_used"] = max(0, int(safe_snapshot["total_tokens"]))
+            posture = safe_snapshot.get("context_posture")
+            if posture:
+                metadata["context_posture"] = str(posture)
+            signal = safe_snapshot.get("context_signal")
+            if signal:
+                metadata["context_signal"] = str(signal)
+            guidance = safe_snapshot.get("context_guidance")
+            if guidance:
+                metadata["context_guidance"] = str(guidance)
+            for key in (
+                "compression_reason",
+                "compression_savings_ratio",
+                "compression_saved_tokens",
+                "disclosure_level",
+                "disclosure_reason",
+                "disclosure",
+            ):
+                if safe_snapshot.get(key) is not None:
+                    metadata[key] = safe_snapshot[key]
+            metadata["context_budget_snapshot"] = safe_snapshot
+        return metadata
+
+    def _host_backend_status(self, ctx: Any | None) -> dict[str, Any]:
+        if ctx is None:
+            return {"backend": "none", "started": False, "reason": "runtime_not_initialized"}
+        rpc = getattr(ctx, "rpc", None)
+        snapshot = getattr(rpc, "status_snapshot", None)
+        if callable(snapshot):
+            try:
+                return dict(snapshot())
+            except Exception as exc:
+                return {"backend": type(rpc).__name__, "started": False, "last_error": str(exc)}
+        return {
+            "backend": type(rpc).__name__ if rpc is not None else "none",
+            "started": rpc is not None,
+            "pid": None,
+            "pid_source": "unavailable",
+        }
 
     async def shutdown(self) -> None:
         if self._ctx is None:
@@ -211,6 +372,139 @@ class RuntimeLeapService:
         except Exception:
             logger.debug("daemon: DuckDB checkpoint skipped", exc_info=True)
 
+    def _install_daemon_approval(self, ctx: Any) -> None:
+        try:
+            from leapflow.security.approval import SessionAwareGate
+            from leapflow.security.actions import ActionDescriptor
+            from leapflow.security.orchestrator import ApprovalOrchestrator
+            from leapflow.tools.gateway_tool import set_gateway_approval_gate
+            from leapflow.tools.registry_bootstrap import set_file_write_gate
+            from leapflow.tools.shell_tools import set_approval_gate
+
+            existing = getattr(ctx, "_approval_orchestrator", None)
+            gate = SessionAwareGate(_DaemonApprovalGate(self))
+            orchestrator = ApprovalOrchestrator(
+                gate,
+                grants=getattr(existing, "grants", None),
+                audit=getattr(existing, "audit", None),
+            )
+            ctx._approval_gate = gate
+            ctx._approval_orchestrator = orchestrator
+            set_approval_gate(orchestrator)
+            set_gateway_approval_gate(orchestrator)
+
+            class _FileWriteGate:
+                def __init__(self) -> None:
+                    self.denial_message = ""
+
+                async def check(self, path: str, content: str, mode: str = "overwrite") -> bool:
+                    result = await orchestrator.evaluate(ActionDescriptor.file_write(path, content, mode=mode))
+                    self.denial_message = result.denial_message if not result.approved else ""
+                    return result.approved
+
+            set_file_write_gate(_FileWriteGate())
+            logger.debug("daemon approval gate installed")
+        except Exception:
+            logger.debug("daemon approval gate installation skipped", exc_info=True)
+
+    async def _stream_engine_events(
+        self,
+        stream: AsyncIterator[object],
+        approval_queue: asyncio.Queue[StreamChunk],
+    ) -> AsyncIterator[StreamChunk]:
+        engine_task: asyncio.Task[Any] | None = asyncio.create_task(anext(stream))
+        approval_task: asyncio.Task[StreamChunk] | None = asyncio.create_task(approval_queue.get())
+        try:
+            while engine_task is not None:
+                wait_set = {task for task in (engine_task, approval_task) if task is not None}
+                done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+                if approval_task is not None and approval_task in done:
+                    yield approval_task.result()
+                    approval_task = asyncio.create_task(approval_queue.get())
+                    continue
+                if engine_task in done:
+                    try:
+                        event = engine_task.result()
+                    except StopAsyncIteration:
+                        engine_task = None
+                        break
+                    stream_event = self._normalize_event(event)
+                    yield self._chunk_from_event(stream_event)
+                    engine_task = asyncio.create_task(anext(stream))
+        finally:
+            for task in (engine_task, approval_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            self._deny_pending_for_queue(approval_queue, reason="stream_closed")
+            if hasattr(stream, "aclose"):
+                try:
+                    await stream.aclose()
+                except Exception:
+                    logger.debug("daemon: failed to close engine stream", exc_info=True)
+
+    def _pending_payloads(self) -> list[dict[str, Any]]:
+        return [dict(item.get("request") or {}) for item in self._approval_pending.values()]
+
+    async def _request_approval(self, request: Any) -> str:
+        queue = self._approval_event_queue
+        if queue is None:
+            return "deny"
+        pending_id = str(getattr(request, "request_id", "") or uuid.uuid4().hex)
+        payload = request.to_dict()
+        payload["pending_id"] = pending_id
+        payload.setdefault("request_id", pending_id)
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._approval_pending[pending_id] = {
+            "request": payload,
+            "future": future,
+            "queue": queue,
+            "created_at": time.time(),
+        }
+        await queue.put(StreamChunk(
+            request_id="",
+            content="Approval required",
+            event_type="approval_request",
+            metadata={"approval": payload},
+        ))
+        timeout_s = 120.0
+        if getattr(request, "expires_at", None):
+            timeout_s = max(1.0, float(request.expires_at) - time.time())
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout_s)
+            return str(result.get("decision") or "deny")
+        except TimeoutError:
+            return "deny"
+        finally:
+            self._approval_pending.pop(pending_id, None)
+
+    @staticmethod
+    def _normalize_approval_decision(decision: str) -> str:
+        allowed = {
+            "allow",
+            "allow_once",
+            "allow_session",
+            "allow_always",
+            "deny",
+            "deny_always",
+            "cancel_workflow",
+        }
+        value = str(decision or "deny").strip().lower()
+        return value if value in allowed else "deny"
+
+    def _deny_pending_for_queue(
+        self,
+        queue: asyncio.Queue[StreamChunk],
+        *,
+        reason: str,
+    ) -> None:
+        for pending_id, pending in list(self._approval_pending.items()):
+            if pending.get("queue") is not queue:
+                continue
+            future = pending.get("future")
+            if isinstance(future, asyncio.Future) and not future.done():
+                future.set_result({"decision": "deny", "reason": reason})
+            self._approval_pending.pop(pending_id, None)
+
     def _normalize_event(self, event: object) -> StreamEvent:
         if isinstance(event, StreamEvent):
             return event
@@ -224,7 +518,7 @@ class RuntimeLeapService:
         if session_id:
             metadata.setdefault("session_id", str(session_id))
         if engine is not None:
-            metadata.setdefault("context_used", getattr(engine, "context_token_count", 0))
+            metadata.update(self._engine_context_metadata(engine, getattr(ctx, "settings", self._settings)))
         return StreamChunk(
             request_id="",
             content=event.content,
@@ -232,3 +526,19 @@ class RuntimeLeapService:
             event_type=event.type,
             metadata=metadata,
         )
+
+
+class _DaemonApprovalGate:
+    """Approval gate that bridges daemon-side actions to thin clients."""
+
+    def __init__(self, service: RuntimeLeapService) -> None:
+        self._service = service
+
+    async def request_approval(self, request: Any) -> Any:
+        from leapflow.security.approval import ApprovalDecision
+
+        decision = await self._service._request_approval(request)
+        try:
+            return ApprovalDecision(decision)
+        except ValueError:
+            return ApprovalDecision.DENY

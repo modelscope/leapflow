@@ -91,6 +91,7 @@ class StatusBar:
         self.session_turns: int = 0
         self.context_used: int = 0
         self.context_max: int = 0
+        self.context_state: str = "baseline"
         self.running_tasks: int = 0
         self.queued_tasks: int = 0
         self.last_turn_elapsed: float = 0.0
@@ -160,6 +161,12 @@ class StatusBar:
                     bar = _progress_bar(pct)
                     parts.append((bar_cls, f"[{bar}] "))
                     parts.append(("class:status-bar", f"{pct_text} "))
+                if self.context_state and self.context_state not in {"baseline", "healthy"}:
+                    state_cls = "class:status-bar"
+                    if self.context_state in {"converging", "finalizing"}:
+                        state_cls = "class:status-bar.warn" if self.context_state == "converging" else "class:status-bar.bad"
+                    parts.append(("class:status-bar.dim", "· "))
+                    parts.append((state_cls, f"{_truncate(self.context_state, 12)} "))
             parts.append(("class:status-bar.dim", "│ "))
 
         elapsed = time.monotonic() - self._session_start
@@ -189,6 +196,7 @@ class StatusBar:
         session_turns: Optional[int] = None,
         context_used: Optional[int] = None,
         context_max: Optional[int] = None,
+        context_state: Optional[str] = None,
         running_tasks: Optional[int] = None,
         queued_tasks: Optional[int] = None,
     ) -> None:
@@ -207,6 +215,8 @@ class StatusBar:
             self.context_used = context_used
         if context_max is not None:
             self.context_max = context_max
+        if context_state is not None:
+            self.context_state = context_state
         if running_tasks is not None:
             self.running_tasks = running_tasks
         if queued_tasks is not None:
