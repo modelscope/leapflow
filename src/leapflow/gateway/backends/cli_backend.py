@@ -6,6 +6,7 @@ import json
 import shutil
 from typing import Any, Mapping, Sequence
 
+from leapflow.gateway.connectors.cli_discovery import CliDiscovery
 from leapflow.gateway.connectors.protocol import (
     ActionPreview,
     ActionResult,
@@ -17,7 +18,12 @@ from leapflow.security.redact import redact_sensitive_text
 
 
 class CliBackend:
-    """Execute registered platform actions through an official CLI binary."""
+    """Execute registered platform actions through an official CLI binary.
+
+    Implements :class:`ActionDiscovery` via an embedded :class:`CliDiscovery`
+    instance that can discover unregistered commands through ``--help``
+    introspection.
+    """
 
     kind = BackendKind.CLI.value
 
@@ -29,12 +35,21 @@ class CliBackend:
         identity: str = "",
         default_args: Sequence[str] = (),
         timeout_s: float = 30.0,
+        discovery_cache_ttl_s: float = 3600.0,
     ) -> None:
         self._binary = binary
         self._profile = profile
         self._identity = identity
         self._default_args = tuple(default_args)
         self._timeout_s = timeout_s
+        self._discovery = CliDiscovery(
+            binary=binary,
+            profile=profile,
+            identity=identity,
+            default_args=default_args,
+            timeout_s=min(timeout_s, 10.0),
+            cache_ttl_s=discovery_cache_ttl_s,
+        )
 
     @property
     def binary(self) -> str:
@@ -138,6 +153,29 @@ class CliBackend:
                 "binary": self._binary,
             },
         )
+
+    async def discover_actions(
+        self,
+        *,
+        groups: Sequence[str] = (),
+    ) -> list[ActionSpec]:
+        """Discover available CLI commands via ``--help`` introspection.
+
+        When *groups* is provided, only those command groups are explored.
+        Otherwise performs a full top-level discovery.
+        """
+        if groups:
+            all_commands = []
+            for group in groups:
+                all_commands.extend(await self._discovery.discover_group(group))
+        else:
+            all_commands = await self._discovery.discover_tree()
+        return [self._discovery.to_action_spec(cmd) for cmd in all_commands]
+
+    @property
+    def cli_discovery(self) -> CliDiscovery:
+        """Access the underlying discovery engine for advanced use."""
+        return self._discovery
 
     def _build_action_command(
         self,

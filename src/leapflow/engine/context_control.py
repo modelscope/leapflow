@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Protocol, Sequence, runtime_checkable
 
+from leapflow.engine.context_compressor import estimate_text_tokens as _estimate_text_tokens
+
 logger = logging.getLogger(__name__)
 
 _IMAGE_TOKEN_ESTIMATE = 1600
@@ -144,13 +146,7 @@ class ContextBudgetEstimator:
 
     @staticmethod
     def _estimate_text(text: str) -> int:
-        if not text:
-            return 0
-        cjk_count = sum(
-            1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u303f"
-        )
-        latin_chars = len(text) - cjk_count
-        return max(1, cjk_count + latin_chars // 4)
+        return _estimate_text_tokens(text)
 
 
 class ContextWindowController:
@@ -241,11 +237,32 @@ class ContextWindowController:
         return head + [notice] + tail
 
 
-class ToolEvidenceBuilder:
-    """Convert verbose tool outputs into compact evidence for LLM replay."""
+_EVIDENCE_CEILING_CHARS = 8_000
+_EVIDENCE_CONTEXT_DIVISOR = 32
 
-    def __init__(self, *, max_content_chars: int = 1200, max_items: int = 40) -> None:
-        self._max_content_chars = max(200, max_content_chars)
+
+class ToolEvidenceBuilder:
+    """Convert verbose tool outputs into compact evidence for LLM replay.
+
+    When ``context_length`` is provided, ``max_content_chars`` is raised
+    proportionally so that larger context windows retain richer tool evidence.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_content_chars: int = 1200,
+        max_items: int = 40,
+        context_length: int = 0,
+    ) -> None:
+        if context_length > 0:
+            adaptive = max(
+                max_content_chars,
+                min(_EVIDENCE_CEILING_CHARS, context_length // _EVIDENCE_CONTEXT_DIVISOR),
+            )
+            self._max_content_chars = max(200, adaptive)
+        else:
+            self._max_content_chars = max(200, max_content_chars)
         self._max_items = max(5, max_items)
 
     def build(self, tool_name: str, arguments: Dict[str, Any] | None, result: Any) -> Any:

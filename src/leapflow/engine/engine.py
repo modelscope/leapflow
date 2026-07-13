@@ -206,6 +206,22 @@ def _is_retryable_unknown_tool_result(result: Any) -> bool:
     )
 
 
+def _platform_action_fingerprint(tool_name: str, arguments: Mapping[str, Any]) -> str | None:
+    """Return a dedup fingerprint for platform_action calls; None for all other tools.
+
+    Used to prevent duplicate side-effect actions (send, write) within one turn.
+    Two calls are considered duplicates when platform, action name, and payload
+    are all identical.
+    """
+    if tool_name != "platform_action":
+        return None
+    platform = str(arguments.get("platform") or "")
+    action = str(arguments.get("action") or "")
+    payload = arguments.get("payload") or {}
+    payload_key = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return f"{platform}:{action}:{payload_key}"
+
+
 def _unknown_tool_retry_prompt(result: Dict[str, Any]) -> str:
     """Build a compact structured correction prompt for a bad tool name."""
     suggestions = result.get("suggestions") or []
@@ -222,6 +238,73 @@ def _unknown_tool_retry_prompt(result: Dict[str, Any]) -> str:
         "Retry once using an exact canonical tool name from the available list and valid arguments. "
         "Do not invent tool names, use aliases, or infer a tool from argument shape; answer without a tool if no exact tool fits."
     )
+
+
+def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
+    """Build a user-facing message from the last consecutive tool failures.
+
+    Called when the loop exits with no content due to hitting
+    max_consecutive_tool_failures.  Returns "" when no useful failure context
+    is available in the recent message history.
+    """
+    failures: List[Dict[str, Any]] = []
+    for msg in reversed(messages[-24:]):
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            continue
+        # Strip "Tool result (name):\n" prefix from text-mode tool messages
+        if content.startswith("Tool result (") and ":\n" in content:
+            content = content.split(":\n", 1)[1].strip()
+        try:
+            payload = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("ok", True):
+            continue
+        failures.append(payload)
+        if len(failures) >= 3:
+            break
+
+    if not failures:
+        return ""
+
+    last = failures[0]
+    failure_code = str(last.get("failure_code") or "")
+    error = str(last.get("error") or "")
+    recovery_hint = str(last.get("recovery_hint") or "")
+    available_actions: List[str] = list(last.get("available_action_names") or [])
+
+    lines: List[str] = []
+    if failure_code == "unknown_platform_action":
+        platform = str(last.get("platform") or "")
+        action = str(last.get("requested_action") or "")
+        lines.append(f"`{platform}.{action}` is not a registered platform action.")
+        if available_actions:
+            actions_str = ", ".join(f"`{a}`" for a in available_actions[:10])
+            lines.append(f"Registered actions for {platform}: {actions_str}.")
+    elif failure_code == "wrong_action_namespace":
+        action = str(last.get("requested_action") or "")
+        lines.append(
+            f"`{action}` is a platform management action — "
+            "use `platform_connect` (not `platform_action`) for this."
+        )
+    elif failure_code == "unknown_platform":
+        lines.append(error)
+        platforms: List[str] = list(last.get("available_platforms") or [])
+        if platforms:
+            lines.append(f"Available platforms: {', '.join(platforms)}.")
+    elif "Missing required fields" in error:
+        lines.append(f"Action parameter incomplete: {error}. Please provide the missing field(s) and retry.")
+    elif error:
+        lines.append(f"Action failed: {error}")
+
+    if recovery_hint and not any(recovery_hint[:50] in line for line in lines):
+        lines.append(f"Hint: {recovery_hint}")
+
+    if len(failures) > 1:
+        lines.append(f"({len(failures)} consecutive tool failures in this turn)")
+
+    return "\n".join(lines) if lines else ""
 
 
 def _app_onboarding_recovery_message(messages: List[Dict[str, Any]]) -> str:
@@ -595,8 +678,10 @@ class AgentEngine:
                 rate_limit_base_delay=settings.error_rate_limit_base_delay,
             )
         )
+        ctx_len = settings.llm_context_length
         self._compressor = ContextCompressor(CompressorConfig(
-            token_budget=max(1, int(settings.llm_context_length * settings.context_hard_limit_ratio)),
+            token_budget=max(1, int(ctx_len * settings.context_hard_limit_ratio)),
+            context_length=ctx_len,
             threshold=settings.compress_threshold,
             keep_tail=settings.compress_keep_tail,
             max_output_chars=settings.max_tool_output_chars,
@@ -609,6 +694,7 @@ class AgentEngine:
         self._context_governance_controller = ContextGovernanceController(
             evidence_builder=ToolEvidenceBuilder(
                 max_content_chars=settings.tool_evidence_max_chars,
+                context_length=ctx_len,
             ),
             repeated_read_limit=settings.repeated_read_limit,
             convergence_round=settings.long_task_convergence_round,
@@ -683,8 +769,10 @@ class AgentEngine:
         self._llm = llm
         self._vlm = vlm
         self._classifier = classifier
+        ctx_len = settings.llm_context_length
         self._compressor = ContextCompressor(CompressorConfig(
-            token_budget=max(1, int(settings.llm_context_length * settings.context_hard_limit_ratio)),
+            token_budget=max(1, int(ctx_len * settings.context_hard_limit_ratio)),
+            context_length=ctx_len,
             threshold=settings.compress_threshold,
             keep_tail=settings.compress_keep_tail,
             max_output_chars=settings.max_tool_output_chars,
@@ -697,6 +785,7 @@ class AgentEngine:
         self._context_governance_controller = ContextGovernanceController(
             evidence_builder=ToolEvidenceBuilder(
                 max_content_chars=settings.tool_evidence_max_chars,
+                context_length=ctx_len,
             ),
             repeated_read_limit=settings.repeated_read_limit,
             convergence_round=settings.long_task_convergence_round,
@@ -1996,7 +2085,11 @@ class AgentEngine:
         if fatal_error:
             return fatal_error
         # Derive a recovery message from the last platform_connect failure if present
-        return _app_onboarding_recovery_message(messages) or "I've reached my processing limit."
+        return (
+            _app_onboarding_recovery_message(messages)
+            or _last_tool_failures_recovery_message(messages)
+            or "I've reached my processing limit."
+        )
 
     async def _post_turn_review(
         self, messages: List[Dict[str, Any]], final_content: str
@@ -2496,8 +2589,13 @@ class AgentEngine:
         if content:
             yield StreamEvent(type="final", content=content)
         else:
-            fallback = _app_onboarding_recovery_message(messages)
-            yield StreamEvent(type="final", content=fallback or (fatal_error or "I've reached my processing limit."))
+            fallback = (
+                _app_onboarding_recovery_message(messages)
+                or _last_tool_failures_recovery_message(messages)
+                or fatal_error
+                or "I've reached my processing limit."
+            )
+            yield StreamEvent(type="final", content=fallback)
 
 
     # ── Unified Loop Helpers ───────────────────────────────────────────────
@@ -2546,6 +2644,48 @@ class AgentEngine:
         result_budget = self._effective_tool_result_budget()
         executed: list[Dict[str, Any]] = []
         original_names_by_id = {str(tc.id): str(tc.name) for tc in native_calls}
+
+        # Idempotency guard: skip duplicate platform_action calls within one turn.
+        # Prevents the model from accidentally repeating a side-effect action
+        # (e.g. im.send_message) when it copies the "first-try-failed → retry"
+        # pattern from a previous turn into the current turn's tool_calls list.
+        seen_action_fps: set[str] = set()
+        deduped: list = []
+        for tc in native_calls:
+            fp = _platform_action_fingerprint(str(tc.name), dict(tc.arguments or {}))
+            if fp is not None and fp in seen_action_fps:
+                action_name = str((tc.arguments or {}).get("action") or tc.name)
+                skip_result: Dict[str, Any] = {
+                    "ok": False,
+                    "error": "idempotency_guard: duplicate platform_action skipped",
+                    "reason": (
+                        f"'{action_name}' with identical payload was already queued "
+                        "in this turn; LeapFlow prevents duplicate side-effects."
+                    ),
+                    "retryable": False,
+                }
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(skip_result, ensure_ascii=False),
+                })
+                executed.append({
+                    "id": tc.id,
+                    "name": "platform_action",
+                    "original_tool_name": "platform_action",
+                    "arguments": dict(tc.arguments or {}),
+                    "result": skip_result,
+                })
+                logger.info(
+                    "idempotency_guard: skipped duplicate platform_action tc_id=%s action=%s",
+                    tc.id, action_name,
+                )
+                continue
+            if fp is not None:
+                seen_action_fps.add(fp)
+            deduped.append(tc)
+        native_calls = deduped
+
         tc_wrappers = [
             ConcurrentToolCall(
                 id=tc.id,

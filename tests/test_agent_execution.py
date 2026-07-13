@@ -834,3 +834,95 @@ def test_task_graph_retry_policy() -> None:
     assert node.status == TaskStatus.FAILED
     assert node.attempt_count == 3
     assert node.error == "permanent error"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Idempotency guard and failure recovery tests
+# ═══════════════════════════════════════════════════════════════════
+
+
+def test_platform_action_fingerprint_deduplicates_identical_calls() -> None:
+    """_platform_action_fingerprint returns the same key for identical calls."""
+    from leapflow.engine.engine import _platform_action_fingerprint
+
+    fp1 = _platform_action_fingerprint(
+        "platform_action",
+        {"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_1", "text": "hi"}},
+    )
+    fp2 = _platform_action_fingerprint(
+        "platform_action",
+        {"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_1", "text": "hi"}},
+    )
+    fp_different = _platform_action_fingerprint(
+        "platform_action",
+        {"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_2", "text": "hi"}},
+    )
+    fp_read = _platform_action_fingerprint(
+        "platform_action",
+        {"platform": "feishu", "action": "im.search_chats", "payload": {"query": "LeapFlow"}},
+    )
+    fp_other_tool = _platform_action_fingerprint(
+        "file_list",
+        {"path": "."},
+    )
+
+    assert fp1 is not None
+    assert fp1 == fp2, "Identical calls must produce the same fingerprint"
+    assert fp1 != fp_different, "Different payload must produce a different fingerprint"
+    assert fp_read is not None, "Read platform_actions are also fingerprinted (dedup applies)"
+    assert fp_other_tool is None, "Non-platform_action tools must return None"
+
+
+def test_last_tool_failures_recovery_message_from_unknown_action() -> None:
+    """_last_tool_failures_recovery_message extracts context from unknown_platform_action results."""
+    import json
+    from leapflow.engine.engine import _last_tool_failures_recovery_message
+
+    failure_payload = {
+        "ok": False,
+        "failure_code": "unknown_platform_action",
+        "error": "Unknown platform action: feishu.im.chat.list",
+        "platform": "feishu",
+        "requested_action": "im.chat.list",
+        "available_action_names": ["im.send_message", "im.list_chats", "im.search_chats"],
+        "recovery_hint": "Use exactly one registered action name from available_action_names.",
+        "retryable": True,
+    }
+    messages = [
+        {"role": "tool", "content": json.dumps(failure_payload)},
+    ]
+    result = _last_tool_failures_recovery_message(messages)
+
+    assert result, "Should produce non-empty recovery message"
+    assert "feishu.im.chat.list" in result or "im.chat.list" in result
+    assert "im.list_chats" in result
+    assert "im.send_message" in result
+
+
+def test_last_tool_failures_recovery_message_missing_fields() -> None:
+    """_last_tool_failures_recovery_message handles Missing required fields errors."""
+    import json
+    from leapflow.engine.engine import _last_tool_failures_recovery_message
+
+    failure_payload = {
+        "ok": False,
+        "error": "Missing required fields: text",
+    }
+    messages = [{"role": "tool", "content": json.dumps(failure_payload)}]
+    result = _last_tool_failures_recovery_message(messages)
+
+    assert result
+    assert "text" in result
+
+
+def test_last_tool_failures_recovery_message_returns_empty_when_no_failures() -> None:
+    """Returns empty string when there are no failed tool results in history."""
+    import json
+    from leapflow.engine.engine import _last_tool_failures_recovery_message
+
+    messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "sure"},
+        {"role": "tool", "content": json.dumps({"ok": True, "data": {}})},
+    ]
+    assert _last_tool_failures_recovery_message(messages) == ""

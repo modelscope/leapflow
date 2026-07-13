@@ -51,7 +51,8 @@ async def test_app_slash_payloads_reuse_platform_connect_and_manifests(tmp_path)
     assert status["result"]["platform"] == "feishu"
     assert actions["ok"] is True
     assert set(actions["actions"]) == {
-        "im.send_message", "docs.create_markdown", "calendar.create_event",
+        "im.send_message", "im.list_chats", "im.search_chats",
+        "docs.create_markdown", "calendar.create_event",
         "drive.search", "sheets.append_row", "mail.search_unread", "task.create",
     }
     assert telegram_connect["ok"] is True
@@ -265,9 +266,10 @@ async def test_platform_action_reports_unknown_action_with_expanded_registry(tmp
     set_gateway_approval_gate(None)
 
     try:
+        # im.fake_invented is NOT in the YAML registry
         result = await platform_action_handler({
             "platform": "feishu",
-            "action": "im.list_chats",
+            "action": "im.fake_invented",
             "payload": {},
         })
     finally:
@@ -278,8 +280,49 @@ async def test_platform_action_reports_unknown_action_with_expanded_registry(tmp
     assert result["ok"] is False
     assert result["failure_code"] == "unknown_platform_action"
     assert result["retryable"] is True
+    # All 9 registered actions should be in available_action_names
     assert "im.send_message" in result["available_action_names"]
+    assert "im.list_chats" in result["available_action_names"]
+    assert "im.search_chats" in result["available_action_names"]
     assert any(item["name"] == "im.send_message" for item in result["available_actions"])
+
+
+@pytest.mark.asyncio
+async def test_platform_action_list_chats_and_search_chats_are_registered(tmp_path) -> None:
+    """im.list_chats and im.search_chats are now registered discovery actions."""
+    from leapflow.gateway.action_packs.feishu import ACTION_SPECS
+
+    assert "im.list_chats" in ACTION_SPECS
+    assert "im.search_chats" in ACTION_SPECS
+    assert ACTION_SPECS["im.list_chats"].effect == "read"
+    assert ACTION_SPECS["im.search_chats"].effect == "read"
+    assert ACTION_SPECS["im.search_chats"].schema.get("required") == ["query"]
+
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        # These should be platform_not_connected (registered but not connected)
+        # rather than unknown_platform_action
+        result_list = await platform_action_handler({
+            "platform": "feishu",
+            "action": "im.list_chats",
+            "payload": {},
+        })
+        result_search = await platform_action_handler({
+            "platform": "feishu",
+            "action": "im.search_chats",
+            "payload": {"query": "LeapFlow"},
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result_list["failure_code"] == "platform_not_connected"
+    assert result_search["failure_code"] == "platform_not_connected"
 
 
 @pytest.mark.asyncio

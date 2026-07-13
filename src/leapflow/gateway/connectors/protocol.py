@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterator, Mapping, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Mapping, Protocol, Sequence, runtime_checkable
 
 
 class BackendKind(str, Enum):
@@ -138,6 +138,29 @@ class BackendEventSource(Protocol):
 
     async def status(self) -> EventSourceStatus:
         """Return current event source health."""
+        ...
+
+
+@runtime_checkable
+class ActionDiscovery(Protocol):
+    """Protocol for backends that support dynamic command discovery.
+
+    Implementations run ``--help`` or equivalent introspection to discover
+    available commands, converting them into draft :class:`ActionSpec`
+    objects with conservative safety defaults (``risk_level="high"``).
+    """
+
+    async def discover_actions(
+        self,
+        *,
+        groups: Sequence[str] = (),
+    ) -> list[ActionSpec]:
+        """Discover available actions, optionally scoped to command groups.
+
+        When *groups* is empty, performs a full top-level discovery.
+        When *groups* is provided, only discovers commands under those
+        specific command groups (e.g. ``["im", "calendar"]``).
+        """
         ...
 
 

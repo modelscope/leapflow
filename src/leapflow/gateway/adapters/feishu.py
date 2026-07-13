@@ -1,7 +1,7 @@
 """Feishu/Lark adapter backed by the official lark-cli."""
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from leapflow.gateway.action_packs.feishu import ACTION_SPECS
 from leapflow.gateway.adapters.common import AdapterLifecycle
@@ -9,6 +9,7 @@ from leapflow.gateway.backends.cli_backend import CliBackend
 from leapflow.gateway.connectors.action_registry import ActionRegistry
 from leapflow.gateway.connectors.event_sources import UnavailableEventSource
 from leapflow.gateway.connectors.protocol import (
+    ActionDiscovery,
     ActionPreview,
     ActionResult,
     ActionSpec,
@@ -52,7 +53,8 @@ class FeishuAdapter(AdapterLifecycle):
             profile=self._profile,
             identity=self._identity,
         )
-        self._registry = ActionRegistry(ACTION_SPECS)
+        discovery = self._backend if isinstance(self._backend, ActionDiscovery) else None
+        self._registry = ActionRegistry(ACTION_SPECS, discovery=discovery)
         self._event_source = UnavailableEventSource(
             platform_id=self.platform_id,
             backend_kind=self._backend.kind,
@@ -146,6 +148,13 @@ class FeishuAdapter(AdapterLifecycle):
     def event_source(self) -> BackendEventSource | None:
         """Return the configured inbound event source, if available."""
         return self._event_source
+
+    async def discover_actions(self, *, groups: Sequence[str] = ()) -> int:
+        """Discover additional actions via CLI --help introspection.
+
+        Returns the number of newly discovered actions.
+        """
+        return await self._registry.refresh_discovery(groups=groups)
 
     async def execute_action(
         self,
