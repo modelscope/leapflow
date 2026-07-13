@@ -117,6 +117,16 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     # Gateway
     CommandDef("gateway", "Show connected platforms and gateway status", "Gateway", effect=CommandEffect.EXTERNAL),
 
+    # App Connector
+    CommandDef("app", "List supported external apps or open an app setup guide", "App Connector", args_hint="[platform]", supports_daemon=True),
+    CommandDef("app list", "List supported external apps", "App Connector", supports_daemon=True),
+    CommandDef("app status", "Show App Connector status", "App Connector", args_hint="[platform]", supports_daemon=True),
+    CommandDef("app connect", "Connect a supported external app", "App Connector", args_hint="<platform> [--option value]", effect=CommandEffect.EXTERNAL, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("app disconnect", "Disconnect an external app but keep configuration", "App Connector", args_hint="<platform>", effect=CommandEffect.EXTERNAL, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("app remove", "Remove an app configuration", "App Connector", args_hint="<platform>", effect=CommandEffect.DESTRUCTIVE, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("app events", "Inspect or control an app event source", "App Connector", args_hint="[status|start|stop] <platform>", effect=CommandEffect.EXTERNAL, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("app actions", "List App Connector action domains", "App Connector", args_hint="<platform>", supports_daemon=True),
+
     # Scheduler
     CommandDef("arm", "Schedule a skill for timed execution", "Scheduler", args_hint="<skill> <cron>"),
     CommandDef("tasks", "List scheduled tasks", "Scheduler"),

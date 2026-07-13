@@ -583,6 +583,15 @@ class Context:
             )
         self.engine.set_tool_result_budget(dynamic_result_budget)
         self.engine.set_model_capabilities(self._build_model_capability_registry(settings))
+
+        compressor = getattr(self.engine, "_compressor", None)
+        if compressor is not None and hasattr(compressor, "reconfigure"):
+            token_budget = max(1, int(context_length * settings.context_hard_limit_ratio))
+            compressor.reconfigure(
+                token_budget=token_budget,
+                context_length=context_length,
+            )
+
         logger.debug("Model capability registry wired")
 
     @staticmethod
@@ -1587,12 +1596,14 @@ class Context:
             )
             return (resp.content or "").strip()
 
+        ctx_len = self._effective_llm_context_length(settings)
         compressor_config = CompressorConfig(
+            token_budget=max(1, int(ctx_len * settings.context_hard_limit_ratio)),
+            context_length=ctx_len,
             threshold=settings.compress_threshold,
             keep_tail=settings.compress_keep_tail,
             max_output_chars=settings.max_tool_output_chars,
             summarize_fn=_summarize_via_llm if settings.has_llm_credentials else None,
-            token_count_fn=lambda text: len(text) // 4,
         )
 
         # ── Initialize DuckDBConversationStore ──

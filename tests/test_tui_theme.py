@@ -157,12 +157,15 @@ def test_leap_app_layout_keeps_status_breathing_gap(tmp_path) -> None:
     root = app._app.layout.container.content
     children = root.children
 
-    assert len(children) == 4
-    assert children[1].style == "class:status-gap"
-    assert children[1].height == 1
+    assert len(children) == 5
+    status_gap = children[2].content
+    status_bar = children[3]
+    input_area = children[4].content
+    assert status_gap.style == "class:status-gap"
+    assert status_gap.height == 1
     assert app._build_style().get_attrs_for_style_str("class:status-gap").bgcolor == ""
-    assert children[2].style == "class:status-bar"
-    assert children[3] is app._input_area.window
+    assert status_bar.style == "class:status-bar"
+    assert input_area is app._input_area.window
 
 
 def test_console_system_supports_visual_spacing() -> None:

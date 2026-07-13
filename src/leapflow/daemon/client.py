@@ -138,6 +138,11 @@ class DaemonClient:
         result = await self.request("model.info", params)
         return dict(result or {})
 
+    async def app_command(self, args: str = "") -> dict[str, Any]:
+        """Return daemon-owned App Connector command payload."""
+        result = await self.request("app.command", {"args": args})
+        return dict(result or {})
+
     async def approval_status(self) -> dict[str, Any]:
         """Return pending daemon approval requests."""
         result = await self.request("approval.status")

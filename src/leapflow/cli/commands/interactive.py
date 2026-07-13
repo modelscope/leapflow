@@ -31,6 +31,11 @@ _CLI_EVENT_SOURCE = "interactive_repl"
 _last_hint: Optional["PredictionCandidate"] = None
 
 
+def _is_app_command(canonical: str) -> bool:
+    """Return true only for `/app` or `/app ...`, not `/apple`."""
+    return canonical == "app" or canonical.startswith("app ")
+
+
 async def _prompt_stop_daemon_on_exit(
     client: "DaemonClient",
     settings: Any,
@@ -253,6 +258,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         handle_model,
         handle_clear,
         handle_gateway,
+        handle_app,
     )
     from leapflow.utils.terminal_io import TerminalIOProvider
     from leapflow.engine.session import SessionMode
@@ -570,6 +576,12 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 handle_gateway(ctx, console, cmd_args)
                 return
 
+            if _is_app_command(canonical):
+                app_args = cmd_text[len("app"):].strip()
+                await handle_app(ctx, console, app_args)
+                _update_status()
+                return
+
             if canonical == "usage":
                 handle_usage(ctx, console, cmd_args)
                 return
@@ -808,6 +820,7 @@ async def cmd_interactive_daemon(
     from leapflow.cli.commands.registry import completion_entries
     from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
+        render_app_payload,
         render_model_payload,
         render_tools_payload,
         render_usage_payload,
@@ -1154,6 +1167,18 @@ async def cmd_interactive_daemon(
                     console.warning(f"Model info unavailable: {exc}")
                     return
                 render_model_payload(console, payload)
+                return
+            if _is_app_command(canonical):
+                app_args = invocation.text[len("app"):].strip()
+                try:
+                    payload = await bridge.call(
+                        lambda current_client: current_client.app_command(app_args),
+                        description="app command",
+                    )
+                except Exception as exc:
+                    console.warning(f"App Connector unavailable: {exc}")
+                    return
+                render_app_payload(console, payload)
                 return
             if canonical == "run":
                 if not cmd_args:

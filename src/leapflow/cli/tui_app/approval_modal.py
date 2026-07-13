@@ -3,6 +3,10 @@
 Renders a bordered panel with action summary, detail, risk reason,
 and selectable choices — fully within the prompt_toolkit layout.
 Keyboard: ↑/↓ navigate, Enter confirm, Esc deny, or type shortcut keys.
+
+Height adaptation: when ``max_lines`` is passed to :meth:`fragments` or
+:meth:`line_count`, the modal trims variable content (detail → reason →
+timeout → summary) while always preserving the frame and choices.
 """
 from __future__ import annotations
 
@@ -24,11 +28,13 @@ from leapflow.security.approval import ApprovalDecision, ApprovalRequest
 from leapflow.security.redact import redact_sensitive_text
 
 Fragment = tuple[str, str]
+_ContentLine = list[Fragment]
 
 _MIN_WIDTH = 58
 _MAX_WIDTH = 104
 _DETAIL_LINES = 3
 _REASON_LINES = 2
+_MIN_MODAL_HEIGHT = 8
 
 
 @dataclass
@@ -83,31 +89,18 @@ class ApprovalModal:
         if not self.future.done():
             self.future.set_result(decision)
 
-    def fragments(self) -> list[Fragment]:
-        """Build all fragments for the modal — no height truncation.
+    # ── Content section builders ──────────────────────────────────────
 
-        The prompt_toolkit Window handles clipping/scrolling.
-        Content lines are limited by static caps (_DETAIL_LINES,
-        _REASON_LINES) to keep the panel concise.
-        """
-        width = _modal_width()
-        inner = width - 4
-        title = f"⚠ {title_for_approval(self.request)}"
-
-        lines: list[list[Fragment]] = []
-
-        # ── Top border ──
-        lines.append(_border_top(width, title))
-
-        # ── Summary ──
+    def _summary_lines(self, inner: int) -> list[_ContentLine]:
         summary = str(self.request.display.get("summary") or self.request.category)
-        for text in _wrap(summary, inner)[:2]:
-            lines.append(_content_line(text, inner, "class:approval.summary"))
-
-        # ── Blank separator ──
+        lines: list[_ContentLine] = [
+            _content_line(t, inner, "class:approval.summary")
+            for t in _wrap(summary, inner)[:2]
+        ]
         lines.append(_content_line("", inner, ""))
+        return lines
 
-        # ── Detail ──
+    def _detail_lines(self, inner: int) -> list[_ContentLine]:
         detail_raw = redact_sensitive_text(self.request.detail, force=True)
         if not self.show_details:
             detail_raw = truncate_detail(
@@ -116,66 +109,119 @@ class ApprovalModal:
         detail_wrapped: list[str] = []
         for raw_line in detail_raw.splitlines() or [""]:
             detail_wrapped.extend(_wrap(raw_line, inner - 4))
-        detail_limit = 50 if self.show_details else _DETAIL_LINES
-        for text in detail_wrapped[:detail_limit]:
-            lines.append(_content_line(f"  {text}", inner, "class:approval.detail"))
+        limit = 50 if self.show_details else _DETAIL_LINES
+        return [
+            _content_line(f"  {t}", inner, "class:approval.detail")
+            for t in detail_wrapped[:limit]
+        ]
 
-        # ── Risk reason ──
+    def _reason_lines(self, inner: int) -> list[_ContentLine]:
         reason = str(self.request.display.get("reason") or risk_reason(self.request))
-        if reason:
-            lines.append(_content_line("", inner, ""))
-            lines.append(_content_line(
-                "Why approval is needed:", inner, "class:approval.label",
-            ))
-            for text in _wrap(reason, inner - 4)[:_REASON_LINES]:
-                lines.append(_content_line(f"  {text}", inner, "class:approval.dim"))
+        if not reason:
+            return []
+        lines: list[_ContentLine] = [
+            _content_line("", inner, ""),
+            _content_line("Why approval is needed:", inner, "class:approval.label"),
+        ]
+        for t in _wrap(reason, inner - 4)[:_REASON_LINES]:
+            lines.append(_content_line(f"  {t}", inner, "class:approval.dim"))
+        return lines
 
-        # ── Timeout ──
+    def _timeout_lines(self, inner: int) -> list[_ContentLine]:
         remaining = remaining_seconds(self.request)
-        if remaining is not None:
-            lines.append(_content_line(
-                f"  Auto-deny in {int(remaining)}s",
-                inner,
-                "class:approval.dim",
-            ))
+        if remaining is None:
+            return []
+        return [_content_line(
+            f"  Auto-deny in {int(remaining)}s", inner, "class:approval.dim",
+        )]
 
-        # ── Separator + keyboard hint ──
-        lines.append(_content_line("", inner, ""))
-        lines.append(_content_line(
-            "  ↑↓ navigate · Enter confirm · Esc deny",
-            inner,
-            "class:approval.dim",
-        ))
-
-        # ── Choices ──
+    def _choices_lines(self, inner: int) -> list[_ContentLine]:
+        lines: list[_ContentLine] = [
+            _content_line("", inner, ""),
+            _content_line(
+                "  ↑↓ navigate · Enter confirm · Esc deny",
+                inner, "class:approval.dim",
+            ),
+        ]
         for idx, choice in enumerate(self.choices):
             selected = idx == self.selected_index
             marker = "▸" if selected else " "
             label = f"  {marker} {idx + 1}. {choice.label}"
             style = "class:approval.selected" if selected else "class:approval.option"
             lines.append(_content_line(label, inner, style))
+        return lines
 
-        # ── Bottom border ──
-        lines.append(_border_bottom(width))
+    # ── Public rendering API ──────────────────────────────────────────
 
-        # ── Flatten to fragment list ──
+    def fragments(self, *, max_lines: int = 0) -> list[Fragment]:
+        """Build fragments for the modal, adapting to height constraints.
+
+        When *max_lines* > 0, variable content (summary, detail, reason,
+        timeout) is progressively trimmed — in ascending priority order —
+        to fit.  Frame borders and choices are never trimmed.
+        """
+        width = _modal_width()
+        inner = width - 4
+        title = f"⚠ {title_for_approval(self.request)}"
+
+        fixed_top = [_border_top(width, title)]
+        fixed_bottom_content = self._choices_lines(inner)
+        fixed_bottom_border = [_border_bottom(width)]
+        fixed_count = len(fixed_top) + len(fixed_bottom_content) + len(fixed_bottom_border)
+
+        variable_sections = [
+            self._summary_lines(inner),
+            self._detail_lines(inner),
+            self._reason_lines(inner),
+            self._timeout_lines(inner),
+        ]
+
+        budget = (
+            max(0, max_lines - fixed_count)
+            if max_lines > 0
+            else sum(len(s) for s in variable_sections)
+        )
+
+        variable_lines: list[_ContentLine] = []
+        for section in variable_sections:
+            if budget <= 0:
+                break
+            take = section[:budget]
+            variable_lines.extend(take)
+            budget -= len(take)
+
+        all_lines = fixed_top + variable_lines + fixed_bottom_content + fixed_bottom_border
+
         result: list[Fragment] = []
-        for line in lines:
+        for line in all_lines:
             result.extend(line)
             result.append(("", "\n"))
         return result
 
-    def line_count(self) -> int:
-        """Return the number of content lines (for Window height sizing)."""
-        count = 1 + 2 + 1  # top border, summary(+blank), blank
-        count += min(_DETAIL_LINES, 3)
-        reason = str(self.request.display.get("reason") or risk_reason(self.request))
-        if reason:
-            count += 1 + 1 + min(_REASON_LINES, 2)
-        if self.request.expires_at is not None:
-            count += 1
-        count += 1 + 1 + len(self.choices) + 1  # blank, hint, choices, bottom
-        return count
+    def line_count(self, *, max_lines: int = 0) -> int:
+        """Return the number of content lines (for Window height sizing).
+
+        When *max_lines* > 0, the count is clamped to that budget while
+        guaranteeing the frame and choices are always accounted for.
+        """
+        inner = _modal_width() - 4
+        fixed = (
+            1  # top border
+            + len(self._choices_lines(inner))
+            + 1  # bottom border
+        )
+        variable = sum(
+            len(s) for s in (
+                self._summary_lines(inner),
+                self._detail_lines(inner),
+                self._reason_lines(inner),
+                self._timeout_lines(inner),
+            )
+        )
+        total = fixed + variable
+        if max_lines > 0:
+            return min(total, max(fixed, max_lines))
+        return total
 
     def _choose(self, choice: ApprovalChoice) -> None:
         if choice.key == "show_details":

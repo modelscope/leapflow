@@ -138,6 +138,7 @@ def test_causal_graph_connected_components() -> None:
 def test_unified_system_template_escapes_literal_tool_protocol_json() -> None:
     rendered = UNIFIED_SYSTEM_TEMPLATE.format(
         tool_catalog="- **skills_list**(): List installed skills",
+        app_connector_section="",
         skill_section="",
         memory_context="",
     )

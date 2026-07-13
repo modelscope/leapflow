@@ -122,8 +122,8 @@ async def test_react_loop_tool_then_answer() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_aliases_are_normalized_before_execution() -> None:
-    """Common LLM tool-name drift should route through canonical tool handlers."""
+async def test_exact_canonical_tool_names_execute_without_guessing() -> None:
+    """Only exact canonical tool names (plus case/separator formatting) execute."""
     with tempfile.TemporaryDirectory() as td:
         settings = make_settings(td)
         from leapflow.platform.mock import MockBridge
@@ -146,36 +146,37 @@ async def test_tool_aliases_are_normalized_before_execution() -> None:
             engine._tool_bridge = None
 
             result = await engine._execute_general_tool(
-                {"name": "list_directory", "arguments": {"path": "."}},
+                {"name": "file_list", "arguments": {"path": "."}},
                 {"file_list": file_list_handler},
             )
             metadata = _tool_args_metadata(
                 "file_list",
                 {"path": "."},
-                original_tool_name="list_directory",
+                original_tool_name="File-List",
             )
 
             assert result["ok"] is True
             assert captured["args"] == {"path": "."}
-            assert _normalize_tool_name("list_directory") == "file_list"
-            assert _normalize_tool_name("List-Directory") == "file_list"
-            assert _normalize_tool_name("list files") == "file_list"
-            assert _normalize_tool_name("read_file") == "file_read"
-            assert _normalize_tool_name("write_file") == "file_write"
-            assert _normalize_tool_name("execute_command") == "shell_run"
-            assert _normalize_tool_name("execute shell command") == "shell_run"
-            assert _normalize_tool_name("terminal-command") == "shell_run"
+            # Case/separator formatting of the *same* canonical name still resolves.
+            assert _normalize_tool_name("File_List") == "file_list"
+            assert _normalize_tool_name("file-list") == "file_list"
+            # Common LLM tool-name drift is no longer silently rewritten to a
+            # different canonical tool: it must be reported as unknown.
+            assert _normalize_tool_name("list_directory") == "list_directory"
+            assert _normalize_tool_name("execute_command") == "execute_command"
+            assert _normalize_tool_name("run_terminal") == "run_terminal"
             directory_resolution = _resolve_tool_name("directory_scan", {"path": "."})
             risky_resolution = _resolve_tool_name("please_do", {"command": "ls -la"})
-            assert directory_resolution.normalized_name == "file_list"
-            assert directory_resolution.status == "parameter_match"
-            assert directory_resolution.auto_executable is True
-            assert risky_resolution.normalized_name == "shell_run"
-            assert risky_resolution.status == "parameter_match"
+            assert directory_resolution.normalized_name is None
+            assert directory_resolution.status == "unknown"
+            assert directory_resolution.auto_executable is False
+            assert risky_resolution.normalized_name is None
+            assert risky_resolution.status == "unknown"
             assert risky_resolution.auto_executable is False
-            assert metadata["original_tool_name"] == "list_directory"
+            assert metadata["original_tool_name"] == "File-List"
             assert metadata["normalized_tool_name"] == "file_list"
-            assert metadata["alias"] == "list_directory"
+            assert metadata["resolved_from"] == "File-List"
+            assert "alias" not in metadata
         finally:
             lt.close()
 
@@ -253,8 +254,133 @@ async def test_unknown_tool_triggers_single_self_healing_retry() -> None:
             lt.close()
 
 @pytest.mark.asyncio
-async def test_text_tool_alias_is_normalized_in_stream_events() -> None:
-    """Text-mode tool calls should not leak common alias names as unknown tools."""
+async def test_app_connector_context_is_injected_without_extra_llm_call() -> None:
+    class CaptureLLM(StubLLM):
+        def __init__(self) -> None:
+            super().__init__(["Use platform_connect for supported app onboarding."])
+            self.seen_messages: list[list[dict[str, object]]] = []
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, **kwargs):
+            self.seen_messages.append(list(messages))
+            return await super().achat(messages, stream=stream, enable_thinking=enable_thinking, **kwargs)
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.gateway.server import GatewayServer
+        from leapflow.platform.mock import MockBridge
+        from leapflow.tools.gateway_tool import set_gateway_approval_gate, set_gateway_server
+
+        rpc = MockBridge()
+        llm = CaptureLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        server = GatewayServer(settings.profile_dir)
+        server.discover_manifests()
+        set_gateway_server(server)
+        set_gateway_approval_gate(None)
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            out = await engine.run("接入飞书")
+
+            system_prompt = str(llm.seen_messages[0][0].get("content", ""))
+            assert out == "Use platform_connect for supported app onboarding."
+            assert "App Connector Capability Index" in system_prompt
+            assert "`feishu`" in system_prompt
+            assert "`telegram`" in system_prompt
+            assert "platform_connect" in system_prompt
+            assert llm.call_count == 1
+        finally:
+            await server.stop()
+            set_gateway_approval_gate(None)
+            set_gateway_server(None)
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_app_connector_llm_tool_call_uses_same_unified_loop() -> None:
+    tool_reply = '<tool_call>{"name": "platform_connect", "arguments": {"action": "guide", "platform": "telegram"}}</tool_call>'
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.gateway.server import GatewayServer
+        from leapflow.platform.mock import MockBridge
+        from leapflow.tools.gateway_tool import set_gateway_approval_gate, set_gateway_server
+
+        rpc = MockBridge()
+        llm = StubLLM([tool_reply, "Telegram guide ready"])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        server = GatewayServer(settings.profile_dir)
+        server.discover_manifests()
+        set_gateway_server(server)
+        set_gateway_approval_gate(None)
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            events = [event async for event in engine.run_stream("配置 Telegram")]
+
+            tool_events = [event for event in events if event.type in {"tool_start", "tool_complete"}]
+            assert [event.content for event in tool_events] == ["platform_connect", "platform_connect"]
+            assert tool_events[1].metadata["ok"] is True
+            assert events[-1].type == "final"
+            assert "Telegram guide ready" in events[-1].content
+            assert llm.call_count == 2
+        finally:
+            await server.stop()
+            set_gateway_approval_gate(None)
+            set_gateway_server(None)
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_app_connector_empty_final_uses_onboarding_recovery_state() -> None:
+    tool_reply = (
+        '<tool_call>{"name": "platform_connect", "arguments": '
+        '{"action": "guide", "platform": "feishu", '
+        '"options": {"binary": "definitely-missing-cli-for-onboarding-test"}}}</tool_call>'
+    )
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.gateway.server import GatewayServer
+        from leapflow.platform.mock import MockBridge
+        from leapflow.tools.gateway_tool import set_gateway_approval_gate, set_gateway_server
+
+        rpc = MockBridge()
+        llm = StubLLM([tool_reply, ""])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        server = GatewayServer(settings.profile_dir)
+        server.discover_manifests()
+        set_gateway_server(server)
+        set_gateway_approval_gate(None)
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            final = await engine.run("继续接入")
+        finally:
+            await server.stop()
+            set_gateway_approval_gate(None)
+            set_gateway_server(None)
+            lt.close()
+
+    assert llm.call_count == 2
+    assert "App onboarding is paused" in final
+    assert "cli_missing" in final
+    assert "definitely-missing-cli-for-onboarding-test" in final
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_in_stream_triggers_structured_retry_not_alias_guess() -> None:
+    """Text-mode tool calls with a drifted name must surface a structured unknown, never a silent alias rewrite."""
     tool_reply = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
     with tempfile.TemporaryDirectory() as td:
         settings = make_settings(td)
@@ -273,11 +399,12 @@ async def test_text_tool_alias_is_normalized_in_stream_events() -> None:
             events = [event async for event in engine.run_stream("List current directory")]
 
             tool_events = [event for event in events if event.type in {"tool_start", "tool_complete"}]
-            assert [event.content for event in tool_events] == ["file_list", "file_list"]
+            assert [event.content for event in tool_events] == ["list_directory", "list_directory"]
             assert tool_events[0].metadata["original_tool_name"] == "list_directory"
-            assert tool_events[0].metadata["normalized_tool_name"] == "file_list"
-            assert tool_events[1].metadata["ok"] is True
-            assert "Unknown tool" not in str(tool_events[1].metadata)
+            assert tool_events[0].metadata["tool_resolution_status"] == "unknown"
+            assert tool_events[1].metadata["ok"] is False
+            assert tool_events[1].metadata["error_type"] == "unknown_tool"
+            assert "resolved_from" not in tool_events[1].metadata
         finally:
             lt.close()
 
@@ -464,6 +591,9 @@ async def test_progressive_disclosure_light_query_omits_tools_and_thinking() -> 
             assert "Original user request: hello" in system_prompt
             assert "Workspace root:" in system_prompt
             assert "never infer `.` as the project root" in system_prompt
+            assert "do not probe that path" in system_prompt
+            assert "~/.leapflow/.env" in system_prompt
+            assert "./.env" in system_prompt
             snapshot = engine.context_budget_snapshot
             assert snapshot["disclosure_level"] == "light"
             assert snapshot["disclosure"]["native_tools"] is False
@@ -704,3 +834,95 @@ def test_task_graph_retry_policy() -> None:
     assert node.status == TaskStatus.FAILED
     assert node.attempt_count == 3
     assert node.error == "permanent error"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Idempotency guard and failure recovery tests
+# ═══════════════════════════════════════════════════════════════════
+
+
+def test_platform_action_fingerprint_deduplicates_identical_calls() -> None:
+    """_platform_action_fingerprint returns the same key for identical calls."""
+    from leapflow.engine.engine import _platform_action_fingerprint
+
+    fp1 = _platform_action_fingerprint(
+        "platform_action",
+        {"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_1", "text": "hi"}},
+    )
+    fp2 = _platform_action_fingerprint(
+        "platform_action",
+        {"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_1", "text": "hi"}},
+    )
+    fp_different = _platform_action_fingerprint(
+        "platform_action",
+        {"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_2", "text": "hi"}},
+    )
+    fp_read = _platform_action_fingerprint(
+        "platform_action",
+        {"platform": "feishu", "action": "im.search_chats", "payload": {"query": "LeapFlow"}},
+    )
+    fp_other_tool = _platform_action_fingerprint(
+        "file_list",
+        {"path": "."},
+    )
+
+    assert fp1 is not None
+    assert fp1 == fp2, "Identical calls must produce the same fingerprint"
+    assert fp1 != fp_different, "Different payload must produce a different fingerprint"
+    assert fp_read is not None, "Read platform_actions are also fingerprinted (dedup applies)"
+    assert fp_other_tool is None, "Non-platform_action tools must return None"
+
+
+def test_last_tool_failures_recovery_message_from_unknown_action() -> None:
+    """_last_tool_failures_recovery_message extracts context from unknown_platform_action results."""
+    import json
+    from leapflow.engine.engine import _last_tool_failures_recovery_message
+
+    failure_payload = {
+        "ok": False,
+        "failure_code": "unknown_platform_action",
+        "error": "Unknown platform action: feishu.im.chat.list",
+        "platform": "feishu",
+        "requested_action": "im.chat.list",
+        "available_action_names": ["im.send_message", "im.list_chats", "im.search_chats"],
+        "recovery_hint": "Use exactly one registered action name from available_action_names.",
+        "retryable": True,
+    }
+    messages = [
+        {"role": "tool", "content": json.dumps(failure_payload)},
+    ]
+    result = _last_tool_failures_recovery_message(messages)
+
+    assert result, "Should produce non-empty recovery message"
+    assert "feishu.im.chat.list" in result or "im.chat.list" in result
+    assert "im.list_chats" in result
+    assert "im.send_message" in result
+
+
+def test_last_tool_failures_recovery_message_missing_fields() -> None:
+    """_last_tool_failures_recovery_message handles Missing required fields errors."""
+    import json
+    from leapflow.engine.engine import _last_tool_failures_recovery_message
+
+    failure_payload = {
+        "ok": False,
+        "error": "Missing required fields: text",
+    }
+    messages = [{"role": "tool", "content": json.dumps(failure_payload)}]
+    result = _last_tool_failures_recovery_message(messages)
+
+    assert result
+    assert "text" in result
+
+
+def test_last_tool_failures_recovery_message_returns_empty_when_no_failures() -> None:
+    """Returns empty string when there are no failed tool results in history."""
+    import json
+    from leapflow.engine.engine import _last_tool_failures_recovery_message
+
+    messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "sure"},
+        {"role": "tool", "content": json.dumps({"ok": True, "data": {}})},
+    ]
+    assert _last_tool_failures_recovery_message(messages) == ""

@@ -87,6 +87,9 @@ class PlatformManifest:
     validation_method: str = ""
     validation_timeout_s: float = 10.0
     adapter: Optional[AdapterSpec] = None
+    backend: Dict[str, Any] = field(default_factory=dict)
+    actions: Dict[str, Any] = field(default_factory=dict)
+    extra_fields: Dict[str, Any] = field(default_factory=dict)
     source_path: str = ""
 
 
@@ -180,6 +183,11 @@ class ManifestLoader:
             )
 
         validation_raw = raw.get("validation", {})
+        known_keys = {
+            "platform_id", "display_name", "description", "category",
+            "credentials", "options", "setup_guide", "validation",
+            "adapter", "backend", "actions",
+        }
         return PlatformManifest(
             platform_id=raw["platform_id"],
             display_name=raw.get("display_name", raw["platform_id"]),
@@ -191,5 +199,8 @@ class ManifestLoader:
             validation_method=validation_raw.get("method", ""),
             validation_timeout_s=float(validation_raw.get("timeout_s", 10)),
             adapter=adapter,
+            backend=dict(raw.get("backend") or {}),
+            actions=dict(raw.get("actions") or {}),
+            extra_fields={key: value for key, value in raw.items() if key not in known_keys},
             source_path=str(path),
         )

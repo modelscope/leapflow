@@ -1,15 +1,66 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from leapflow.gateway.connectors.protocol import ActionPreview, ActionResult, ActionSpec, BackendKind
 from leapflow.gateway.protocol import OutboundContent, SendResult, SendTarget
 from leapflow.gateway.server import GatewayServer
 from leapflow.tools.gateway_tool import (
+    build_app_connector_prompt_section,
     gateway_connect_handler,
     gateway_send_handler,
+    platform_action_handler,
+    platform_connect_handler,
     set_gateway_approval_gate,
     set_gateway_server,
 )
+
+
+@pytest.mark.asyncio
+async def test_app_slash_payloads_reuse_platform_connect_and_manifests(tmp_path) -> None:
+    from leapflow.cli.commands.slash_handlers import build_app_payload
+
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    ctx = SimpleNamespace(gateway_server=server)
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        listed = await build_app_payload(ctx, "")
+        guide = await build_app_payload(ctx, "FeiShu")
+        status = await build_app_payload(ctx, "status feishu")
+        actions = await build_app_payload(ctx, "actions feishu")
+        telegram_connect = await build_app_payload(ctx, "connect telegram")
+        invalid_option = await build_app_payload(ctx, "connect feishu --unknown value")
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert listed["ok"] is True
+    assert listed["view"] == "list"
+    assert {entry["id"] for entry in listed["result"]["platforms"]} >= {"feishu", "telegram", "dingtalk"}
+    assert guide["ok"] is True
+    assert guide["view"] == "guide"
+    assert guide["result"]["platform"] == "飞书 (Feishu/Lark)"
+    assert guide["result"]["setup_form"]["backend"]["kind"] == "cli"
+    assert status["ok"] is True
+    assert status["result"]["platform"] == "feishu"
+    assert actions["ok"] is True
+    assert set(actions["actions"]) == {
+        "im.send_message", "im.list_chats", "im.search_chats",
+        "docs.create_markdown", "calendar.create_event",
+        "drive.search", "sheets.append_row", "mail.search_unread", "task.create",
+    }
+    assert telegram_connect["ok"] is True
+    assert telegram_connect["view"] == "guide"
+    assert telegram_connect["result"]["required_fields"][0]["key"] == "bot_token"
+    assert invalid_option["ok"] is False
+    assert "Unknown option" in invalid_option["error"]
+    assert "feishu" in invalid_option["available"]
 
 
 @pytest.mark.asyncio
@@ -54,6 +105,17 @@ class FakeSendAdapter:
 
     def __init__(self) -> None:
         self.sent: list[tuple[SendTarget, OutboundContent]] = []
+        self.spec = ActionSpec(
+            name="im.send_message",
+            backend_kind=BackendKind.CLI.value,
+            effect="send",
+            schema={
+                "type": "object",
+                "required": ["chat_id", "text"],
+                "properties": {"chat_id": {"type": "string"}, "text": {"type": "string"}},
+            },
+            risk_level="high",
+        )
 
     async def connect(self, *, is_reconnect: bool = False) -> None:
         pass
@@ -64,6 +126,28 @@ class FakeSendAdapter:
     async def send(self, target: SendTarget, content: OutboundContent) -> SendResult:
         self.sent.append((target, content))
         return SendResult(ok=True, message_id="fake-1")
+
+    def action_spec(self, action: str) -> ActionSpec | None:
+        return self.spec if action == self.spec.name else None
+
+    def action_specs(self) -> dict[str, ActionSpec]:
+        return {self.spec.name: self.spec}
+
+    async def preview_action(self, action: str, payload: dict) -> ActionPreview:
+        if action != self.spec.name:
+            return ActionPreview(ok=False, error="unknown action")
+        return ActionPreview(ok=True, summary=f"preview {action}")
+
+    async def execute_action(self, action: str, payload: dict) -> ActionResult:
+        self.sent.append((
+            SendTarget(
+                platform="fake",
+                chat_id=str(payload.get("chat_id", "")),
+                thread_id=str(payload.get("thread_id", "")),
+            ),
+            OutboundContent(text=str(payload.get("text", ""))),
+        ))
+        return ActionResult(ok=True, resource_id="fake-action-1")
 
 
 class DenyGate:
@@ -94,7 +178,10 @@ async def test_gateway_send_tool_dispatches_to_connected_adapter(tmp_path) -> No
         set_gateway_approval_gate(None)
         set_gateway_server(None)
 
-    assert result == {"ok": True, "message_id": "fake-1"}
+    assert result["ok"] is True
+    assert result["resource_id"] == "fake-action-1"
+    assert result["message_id"] == "fake-action-1"
+    assert result["source_tool"] == "gateway_send"
     target, content = adapter.sent[0]
     assert target.chat_id == "chat-1"
     assert target.thread_id == "thread-1"
@@ -114,6 +201,449 @@ async def test_gateway_send_tool_honors_approval_denial(tmp_path) -> None:
             "platform": "fake",
             "chat_id": "chat-1",
             "text": "blocked outbound",
+        })
+    finally:
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result == {"ok": False, "error": "denied for test"}
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_send_returns_onboarding_hint_when_registered_action_is_not_connected(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        result = await gateway_send_handler({
+            "platform": "feishu",
+            "chat_id": "oc_1",
+            "text": "hello",
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "platform_not_connected"
+    assert "registered action 'im.send_message'" in result["error"]
+    assert "platform_connect action=preflight platform=feishu" in result["next_steps"]
+
+
+@pytest.mark.asyncio
+async def test_platform_action_distinguishes_registered_but_not_connected_action(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        result = await platform_action_handler({
+            "platform": "feishu",
+            "action": "im.send_message",
+            "payload": {"chat_id": "oc_1", "text": "hello"},
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "platform_not_connected"
+    assert result["recovery_hint"]
+    assert "platform_connect action=connect platform=feishu" in result["next_steps"]
+
+
+@pytest.mark.asyncio
+async def test_platform_action_reports_unknown_action_with_expanded_registry(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        # im.fake_invented is NOT in the YAML registry
+        result = await platform_action_handler({
+            "platform": "feishu",
+            "action": "im.fake_invented",
+            "payload": {},
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "unknown_platform_action"
+    assert result["retryable"] is True
+    # All 9 registered actions should be in available_action_names
+    assert "im.send_message" in result["available_action_names"]
+    assert "im.list_chats" in result["available_action_names"]
+    assert "im.search_chats" in result["available_action_names"]
+    assert any(item["name"] == "im.send_message" for item in result["available_actions"])
+
+
+@pytest.mark.asyncio
+async def test_platform_action_list_chats_and_search_chats_are_registered(tmp_path) -> None:
+    """im.list_chats and im.search_chats are now registered discovery actions."""
+    from leapflow.gateway.action_packs.feishu import ACTION_SPECS
+
+    assert "im.list_chats" in ACTION_SPECS
+    assert "im.search_chats" in ACTION_SPECS
+    assert ACTION_SPECS["im.list_chats"].effect == "read"
+    assert ACTION_SPECS["im.search_chats"].effect == "read"
+    assert ACTION_SPECS["im.search_chats"].schema.get("required") == ["query"]
+
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        # These should be platform_not_connected (registered but not connected)
+        # rather than unknown_platform_action
+        result_list = await platform_action_handler({
+            "platform": "feishu",
+            "action": "im.list_chats",
+            "payload": {},
+        })
+        result_search = await platform_action_handler({
+            "platform": "feishu",
+            "action": "im.search_chats",
+            "payload": {"query": "LeapFlow"},
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result_list["failure_code"] == "platform_not_connected"
+    assert result_search["failure_code"] == "platform_not_connected"
+
+
+@pytest.mark.asyncio
+async def test_platform_action_reports_wrong_namespace_for_management_action(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        result = await platform_action_handler({
+            "platform": "feishu",
+            "action": "list",
+            "payload": {},
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "wrong_action_namespace"
+    assert result["correct_tool"] == "platform_connect"
+    assert result["retryable"] is True
+    assert "list" in result["available_management_actions"]
+
+
+@pytest.mark.asyncio
+async def test_platform_action_reports_unknown_platform_with_available_list(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        result = await platform_action_handler({
+            "platform": "gateway",
+            "action": "list_actions",
+            "payload": {"platform": "feishu"},
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "unknown_platform"
+    assert result["retryable"] is True
+    assert "feishu" in result["available_platforms"]
+
+
+class CaptureGate:
+    def __init__(self) -> None:
+        self.actions = []
+
+    async def evaluate(self, action):
+        self.actions.append(action)
+
+        class Result:
+            approved = True
+            denial_message = ""
+
+        return Result()
+
+
+@pytest.mark.asyncio
+async def test_platform_action_uses_registered_spec_for_approval_and_summary(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    adapter = FakeSendAdapter()
+    gate = CaptureGate()
+    server._adapters["fake"] = adapter
+    set_gateway_server(server)
+    set_gateway_approval_gate(gate)
+
+    try:
+        result = await platform_action_handler({
+            "platform": "fake",
+            "action": "im.send_message",
+            "payload": {"chat_id": "chat-1", "text": "hello"},
+        })
+    finally:
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result["ok"] is True
+    assert result["platform"] == "fake"
+    assert result["action"] == "im.send_message"
+    assert result["output_policy"] == "summary"
+    assert gate.actions[0].effect == "send"
+    assert gate.actions[0].metadata["backend_kind"] == "cli"
+    assert gate.actions[0].metadata["risk_level"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_platform_events_report_unavailable_for_feishu(tmp_path) -> None:
+    from leapflow.gateway.adapters.feishu import FeishuAdapter
+    from leapflow.gateway.connectors.protocol import BackendStatus
+
+    class ReadyBackend:
+        kind = "cli"
+
+        async def status(self) -> BackendStatus:
+            return BackendStatus(ok=True, backend_kind=self.kind)
+
+        async def authenticate(self, payload):
+            return BackendStatus(ok=True, backend_kind=self.kind)
+
+        async def execute(self, spec, payload):
+            return ActionResult(ok=True)
+
+    server = GatewayServer(tmp_path)
+    adapter = FeishuAdapter(backend=ReadyBackend())
+    server._adapters["feishu"] = adapter
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        status = await platform_connect_handler({"action": "events_status", "platform": "feishu"})
+        started = await platform_connect_handler({"action": "events_start", "platform": "feishu"})
+    finally:
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert status["ok"] is False
+    assert started["ok"] is False
+    assert status["metadata"]["available"] is False
+    assert status["metadata"]["configuration_hint"]
+    assert "inbound events are not enabled" in status["detail"]
+
+
+@pytest.mark.asyncio
+async def test_platform_connect_can_configure_credentialless_platform(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        guide = await platform_connect_handler({"action": "guide", "platform": "feishu"})
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert guide["ok"] is True
+    assert guide["required_fields"] == []
+    assert guide["setup_form"]["backend"]["kind"] == "cli"
+    assert guide["setup_form"]["actions"]["pack"] == "leapflow.gateway.action_packs.feishu"
+    assert guide["preflight_checks"][0]["command"] == "lark-cli --version"
+    assert guide["preflight_checks"][0]["kind"] == "check"
+    assert guide["preflight_checks"][1]["command"] == "lark-cli auth login --json"
+    assert guide["preflight_checks"][1]["kind"] == "interactive_auth"
+    assert guide["preflight_checks"][2]["command"] == "lark-cli auth status --json"
+    assert guide["preflight_result"]["backend_kind"] == "cli"
+    assert guide["onboarding_state"]["platform_id"] == "feishu"
+    assert guide["recovery_hint"]
+    assert "lark-cli" in guide["setup_guide"]
+
+
+@pytest.mark.asyncio
+async def test_platform_connect_records_pending_onboarding_state_for_cli_preflight(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        guide = await platform_connect_handler({
+            "action": "guide",
+            "platform": "feishu",
+            "options": {"binary": "definitely-missing-cli-for-onboarding-test"},
+        })
+        section = build_app_connector_prompt_section()
+        preflight = await platform_connect_handler({
+            "action": "preflight",
+            "platform": "feishu",
+            "options": {"binary": "definitely-missing-cli-for-onboarding-test"},
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert guide["ok"] is True
+    assert guide["preflight_result"]["ready"] is False
+    assert guide["onboarding_state"]["stage"] == "cli_missing"
+    assert guide["preflight_result"]["checks"][0]["status"] == "failed"
+    assert guide["preflight_result"]["checks"][1]["status"] == "blocked"
+    assert "Pending App Onboarding State" in section
+    assert "platform=`feishu`" in section
+    assert preflight["ok"] is False
+    assert preflight["onboarding_state"]["stage"] == "cli_missing"
+
+
+@pytest.mark.asyncio
+async def test_app_connector_prompt_section_exposes_supported_apps_without_classifying_text(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        section = build_app_connector_prompt_section()
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert "App Connector Capability Index" in section
+    assert "`feishu`" in section
+    assert "`telegram`" in section
+    assert "`dingtalk`" in section
+    assert "platform_connect" in section
+    assert "SDK/Webhook sample code" in section
+    assert "im.send_message" in section
+    assert "management namespace" in section
+
+
+@pytest.mark.asyncio
+async def test_platform_connect_prompt_contract_still_uses_gateway_handler(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        guide = await platform_connect_handler({"action": "guide", "platform": "telegram"})
+        connect_without_secret = await platform_connect_handler({"action": "connect", "platform": "telegram"})
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert guide["ok"] is True
+    assert guide["platform"] == "Telegram"
+    assert guide["required_fields"][0]["key"] == "bot_token"
+    assert connect_without_secret["ok"] is True
+    assert connect_without_secret["setup_form"]["fields"][0]["type"] == "password"
+
+
+@pytest.mark.asyncio
+async def test_platform_connect_failure_returns_feishu_recovery_hint(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        result = await platform_connect_handler({
+            "action": "connect",
+            "platform": "feishu",
+            "options": {"binary": "definitely-missing-lark-cli-for-test"},
+        })
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert result["ok"] is False
+    assert "Connection failed" in result["error"]
+    assert "Install 'definitely-missing-lark-cli-for-test'" in result["recovery_hint"]
+    assert result["next_steps"]
+    assert result["diagnostics"]["profile"] == "default"
+
+
+@pytest.mark.asyncio
+async def test_platform_status_exposes_feishu_connector_diagnostics(tmp_path) -> None:
+    from leapflow.gateway.adapters.feishu import FeishuAdapter
+    from leapflow.gateway.connectors.protocol import BackendStatus
+
+    class ReadyBackend:
+        kind = "cli"
+        binary = "lark-cli"
+        profile = "work"
+        identity = "bot"
+
+        async def status(self) -> BackendStatus:
+            return BackendStatus(ok=True, backend_kind=self.kind)
+
+        async def authenticate(self, payload):
+            return BackendStatus(ok=True, backend_kind=self.kind)
+
+        async def execute(self, spec, payload):
+            return ActionResult(ok=True)
+
+    server = GatewayServer(tmp_path)
+    server.discover_manifests()
+    server._adapters["feishu"] = FeishuAdapter(backend=ReadyBackend())
+    server._connected_since["feishu"] = 1.0
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+
+    try:
+        status = await platform_connect_handler({"action": "status", "platform": "feishu"})
+        listed = await platform_connect_handler({"action": "list"})
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert status["ok"] is True
+    assert status["diagnostics"]["backend_kind"] == "cli"
+    assert status["diagnostics"]["profile"] == "work"
+    assert status["diagnostics"]["event_source"]["mode"] == "outbound_actions_only"
+    feishu_entry = next(entry for entry in listed["platforms"] if entry["id"] == "feishu")
+    assert feishu_entry["diagnostics"]["identity"] == "bot"
+
+
+@pytest.mark.asyncio
+async def test_platform_action_honors_approval_denial(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    adapter = FakeSendAdapter()
+    server._adapters["fake"] = adapter
+    set_gateway_server(server)
+    set_gateway_approval_gate(DenyGate())
+
+    try:
+        result = await platform_action_handler({
+            "platform": "fake",
+            "action": "im.send_message",
+            "payload": {"chat_id": "chat-1", "text": "blocked outbound"},
         })
     finally:
         set_gateway_approval_gate(None)

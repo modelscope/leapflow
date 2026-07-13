@@ -108,6 +108,26 @@ class DefaultRiskClassifier:
                 explanation="This sends content to an external platform conversation.",
                 allow_permanent=False,
             )
+        if action.kind == ActionKind.PLATFORM_ACTION.value:
+            explicit_level = self._platform_risk_level(action)
+            if explicit_level is not None:
+                return explicit_level
+            if action.effect == "read":
+                return RiskAssessment(
+                    level=RiskLevel.MEDIUM,
+                    score=0.5,
+                    reasons=("platform_data_access",),
+                    explanation="This reads data from an external platform.",
+                    metadata={"backend_kind": action.metadata.get("backend_kind", "")},
+                )
+            return RiskAssessment(
+                level=RiskLevel.HIGH,
+                score=0.74,
+                reasons=("external_platform_action",),
+                explanation="This performs an action through an external platform backend.",
+                allow_permanent=False,
+                metadata={"backend_kind": action.metadata.get("backend_kind", "")},
+            )
         if action.kind in {
             ActionKind.SCHEDULER_ARM.value,
             ActionKind.SKILL_PROMOTE.value,
@@ -122,6 +142,36 @@ class DefaultRiskClassifier:
                 allow_permanent=False,
             )
         return RiskAssessment(level=RiskLevel.MEDIUM, score=0.5, reasons=("external_action",))
+
+    @staticmethod
+    def _platform_risk_level(action: ActionDescriptor) -> RiskAssessment | None:
+        raw = str(action.metadata.get("risk_level") or "").lower()
+        if not raw:
+            return None
+        try:
+            level = RiskLevel(raw)
+        except ValueError:
+            return None
+        score_by_level = {
+            RiskLevel.SAFE: 0.05,
+            RiskLevel.LOW: 0.2,
+            RiskLevel.MEDIUM: 0.5,
+            RiskLevel.HIGH: 0.78,
+            RiskLevel.CRITICAL: 0.95,
+        }
+        return RiskAssessment(
+            level=level,
+            score=score_by_level[level],
+            reasons=("registered_platform_action",),
+            explanation="This risk level comes from the registered platform action spec.",
+            hardline=level == RiskLevel.CRITICAL,
+            allow_permanent=level not in {RiskLevel.HIGH, RiskLevel.CRITICAL},
+            metadata={
+                "backend_kind": action.metadata.get("backend_kind", ""),
+                "platform": action.metadata.get("platform", ""),
+                "action": action.metadata.get("action", ""),
+            },
+        )
 
     def _assess_shell(self, action: ActionDescriptor) -> RiskAssessment:
         command = action.detail

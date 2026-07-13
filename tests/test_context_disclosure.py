@@ -132,3 +132,15 @@ def test_capability_manifest_prefers_explicit_tool_metadata() -> None:
     assert manifest.input_signals == ("alert", "notify")
     assert manifest.requires_approval is True
     assert manifest.schema_cost == "high"
+
+
+def test_file_read_schema_discourages_workspace_config_probe() -> None:
+    file_read_def = next(
+        item for item in TOOL_DEFINITIONS
+        if item.get("function", {}).get("name") == "file_read"
+    )
+    description = str(file_read_def["function"].get("description", ""))
+
+    assert "Do not probe `<workspace>/.leapflow/config.json`" in description
+    assert "~/.leapflow/.env" in description
+    assert "./.env" in description

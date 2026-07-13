@@ -133,6 +133,57 @@ async def test_tui_approval_modal_preserves_frame_and_choices_in_small_height() 
 
 
 @pytest.mark.asyncio
+async def test_tui_approval_modal_constrained_height_preserves_choices() -> None:
+    request = ApprovalRequest(
+        category="shell.command",
+        detail="python3 -m pip install aiohttp requests --user --quiet 2>&1\n" * 10,
+        choices=("allow_once", "allow_session", "deny"),
+        display={
+            "summary": "Run a potentially dangerous shell command",
+            "reason": "This shell command has side effects or reaches external systems.",
+        },
+    )
+    modal = app_module.ApprovalModal.create(request)
+
+    unconstrained = modal.line_count()
+    constrained_limit = 12
+    assert unconstrained > constrained_limit
+
+    rendered = "".join(text for _style, text in modal.fragments(max_lines=constrained_limit))
+    lines = [line for line in rendered.splitlines() if line]
+
+    assert lines[0].startswith("╭") and lines[0].endswith("╮")
+    assert lines[-1].startswith("╰") and lines[-1].endswith("╯")
+    assert "1. Allow once" in rendered
+    assert "2. Allow for this session" in rendered
+    assert "3. Deny" in rendered
+    assert len(lines) <= constrained_limit
+
+    constrained_count = modal.line_count(max_lines=constrained_limit)
+    assert constrained_count <= constrained_limit
+    assert constrained_count == len(lines)
+
+
+@pytest.mark.asyncio
+async def test_tui_approval_modal_extremely_tight_height_still_shows_choices() -> None:
+    request = ApprovalRequest(
+        category="shell.command",
+        detail="rm -rf /important",
+        choices=("allow_once", "deny"),
+        display={"summary": "Run shell command", "reason": "Dangerous command"},
+    )
+    modal = app_module.ApprovalModal.create(request)
+
+    rendered = "".join(text for _style, text in modal.fragments(max_lines=7))
+    lines = [line for line in rendered.splitlines() if line]
+
+    assert lines[0].startswith("╭") and lines[0].endswith("╮")
+    assert lines[-1].startswith("╰") and lines[-1].endswith("╯")
+    assert "1. Allow once" in rendered
+    assert "2. Deny" in rendered
+
+
+@pytest.mark.asyncio
 async def test_tui_approval_modal_shortcuts_and_details() -> None:
     app, _console, _status = _make_app()
     request = ApprovalRequest(

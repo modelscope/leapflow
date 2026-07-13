@@ -21,15 +21,12 @@ is the sole point that wires all dependencies.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence
 
-from leapflow.gateway.protocol import (
-    InboundMessage,
-    MessageSource,
-    OutboundContent,
-    SendTarget,
-)
+from leapflow.gateway.protocol import InboundMessage, MessageSource
+from leapflow.tools.name_resolver import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +38,7 @@ SAFE_TOOLS: frozenset[str] = frozenset({
     "skills_list", "skill_view",
     "text_search",
     "gateway_connect", "gateway_send",
+    "platform_connect", "platform_action",
 })
 
 
@@ -97,6 +95,7 @@ class GatewayRouter:
         self._tool_handlers = {
             k: v for k, v in all_handlers.items() if k in allowed_tools
         }
+        self._tool_registry = ToolRegistry.from_definitions(self._tool_defs, self._tool_handlers)
 
     async def handle_message(
         self,
@@ -161,21 +160,32 @@ class GatewayRouter:
                 return (resp.content or "").strip()
 
             for tc in tool_calls:
-                handler = self._tool_handlers.get(tc.name)
+                tool_args = getattr(tc, "arguments", {})
+                if isinstance(tool_args, str):
+                    try:
+                        tool_args = json.loads(tool_args)
+                    except json.JSONDecodeError:
+                        tool_args = {}
+                if not isinstance(tool_args, dict):
+                    tool_args = {}
+
+                resolution = self._tool_registry.resolve(tc.name, tool_args)
+                handler = (
+                    self._tool_handlers.get(resolution.normalized_name)
+                    if resolution.auto_executable and resolution.normalized_name
+                    else None
+                )
                 if handler is None:
+                    unknown = self._tool_registry.unknown_result(resolution)
                     history.append({
                         "role": "tool",
                         "tool_call_id": getattr(tc, "id", ""),
-                        "content": f"Unknown tool: {tc.name}",
+                        "content": json.dumps(unknown, default=str, ensure_ascii=False),
                     })
                     continue
                 try:
-                    tool_args = getattr(tc, "arguments", {})
-                    if isinstance(tool_args, str):
-                        import json
-                        tool_args = json.loads(tool_args)
                     result = await asyncio.wait_for(handler(tool_args), timeout=30)
-                    result_text = str(result)[:2000]
+                    result_text = json.dumps(result, default=str, ensure_ascii=False)[:2000]
                 except asyncio.TimeoutError:
                     result_text = f"Tool '{tc.name}' timed out"
                 except Exception as exc:

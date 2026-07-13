@@ -12,11 +12,13 @@ Design principles:
 - Progressive: lighter stages first, heavier stages only if needed
 - Message-pair integrity: tool-call/tool-result pairs are never split
 - Summarization uses structured prompts with iterative updates
+- All character/token thresholds adapt to the model's context window size
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable
@@ -26,6 +28,46 @@ logger = logging.getLogger(__name__)
 SummarizeFn = Callable[[str], Awaitable[str]]
 ArchiveFn = Callable[[List[Dict[str, Any]]], Awaitable[None]]
 TokenCountFn = Callable[[str], int]
+
+# ── Adaptive scaling constants ────────────────────────────────────────
+# These define how thresholds scale with context_length. They are NOT
+# per-model magic numbers — the formulas produce smooth curves that
+# work across 32K → 2M+ context windows.
+
+_TRIM_CEILING_CHARS = 50_000
+_TRIM_CONTEXT_DIVISOR = 50
+_TRIM_BUDGET_ACTIVATION_RATIO = 0.15
+
+
+def estimate_text_tokens(text: str) -> int:
+    """CJK-aware token estimate for a single text string.
+
+    CJK characters map roughly 1:1 to tokens; Latin text uses the
+    standard ~4 characters per token heuristic.  Shared across the
+    compression pipeline and budget estimator for consistency.
+    """
+    if not text:
+        return 0
+    cjk = sum(
+        1 for ch in text
+        if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u303f"
+    )
+    latin = len(text) - cjk
+    return max(1, cjk + latin // 4)
+
+
+def adaptive_trim_chars(base: int, context_length: int) -> int:
+    """Compute context-adaptive trim threshold in characters.
+
+    Returns *at least* ``base`` chars, scaling up proportionally to the
+    model's context window so that larger windows tolerate longer tool
+    outputs without unnecessary truncation.
+    """
+    if context_length <= 0:
+        return base
+    context_chars = context_length * 4
+    adaptive = min(_TRIM_CEILING_CHARS, context_chars // _TRIM_CONTEXT_DIVISOR)
+    return max(base, adaptive)
 
 
 @runtime_checkable
@@ -50,14 +92,19 @@ class CompressionStage(Protocol):
 class CompressorConfig:
     """Configuration for the multi-stage compressor.
 
-    Backward-compatible: accepts legacy field names (threshold, keep_tail,
-    max_output_chars) and maps them to new semantics.
+    Accepts legacy field names (threshold, keep_tail, max_output_chars) and
+    maps them to current semantics.  When ``context_length`` is set, trim
+    thresholds are scaled adaptively so that larger context windows tolerate
+    bigger tool outputs without premature truncation.
     """
 
     token_budget: int = 128_000
+    context_length: int = 0
     trim_threshold_chars: int = 2000
     trim_head_ratio: float = 0.25
     trim_tail_ratio: float = 0.1
+    trim_ceiling_chars: int = _TRIM_CEILING_CHARS
+    trim_budget_activation_ratio: float = _TRIM_BUDGET_ACTIVATION_RATIO
     summarize_threshold_messages: int = 16
     summarize_keep_recent: int = 6
     archive_threshold_messages: int = 24
@@ -80,7 +127,7 @@ class CompressorConfig:
     max_output_chars: int = 2000
 
     def __post_init__(self) -> None:
-        """Map legacy fields into new config semantics."""
+        """Map legacy fields and apply adaptive scaling."""
         if self.max_output_chars != 2000 or self.trim_threshold_chars == 2000:
             self.trim_threshold_chars = self.max_output_chars
         if self.threshold != 16 or self.summarize_threshold_messages == 16:
@@ -89,17 +136,27 @@ class CompressorConfig:
             self.summarize_keep_recent = max(self.keep_tail, 4)
             self.drop_keep_recent = self.keep_tail
 
+        self._base_trim_threshold = self.trim_threshold_chars
+        self._apply_adaptive_scaling()
+
+    def _apply_adaptive_scaling(self) -> None:
+        """Scale thresholds proportionally to context window size."""
+        self.trim_threshold_chars = adaptive_trim_chars(
+            self._base_trim_threshold, self.context_length,
+        )
+
 
 class TrimStage:
     """Stage 1: Truncate oversized tool outputs + dedup identical results (zero LLM cost).
 
-    Three passes (inspired by hermes context_compressor):
+    Three passes:
     1. Dedup: collapse identical tool results (MD5, >dedup_min_chars)
     2. Truncate: head/tail trim for remaining oversized outputs
     3. Strip tool_call arguments over threshold
 
-    Preserves head/tail of long outputs for context.
-    Only targets tool/function/assistant messages — never system.
+    Budget-aware: when context utilization is below ``budget_activation_ratio``
+    only messages exceeding ``ceiling_chars`` are trimmed, preserving full tool
+    output when the context window has plenty of room.
     """
 
     def __init__(
@@ -109,8 +166,12 @@ class TrimStage:
         head_ratio: float = 0.25,
         tail_ratio: float = 0.1,
         dedup_min_chars: int = 200,
+        ceiling_chars: int = _TRIM_CEILING_CHARS,
+        budget_activation_ratio: float = _TRIM_BUDGET_ACTIVATION_RATIO,
     ) -> None:
         self._max_chars = max_chars
+        self._ceiling_chars = ceiling_chars
+        self._budget_activation_ratio = budget_activation_ratio
         self._head_size = max(100, int(max_chars * head_ratio))
         self._tail_size = max(50, int(max_chars * tail_ratio))
         self._dedup_min = dedup_min_chars
@@ -120,11 +181,16 @@ class TrimStage:
         return "trim"
 
     def should_apply(self, messages: List[Dict[str, Any]], token_count: int, budget: int) -> bool:
-        return any(
-            isinstance(msg.get("content"), str) and len(msg["content"]) > self._max_chars
-            for msg in messages
+        target = [
+            msg for msg in messages
             if msg.get("role") in ("tool", "function", "assistant")
-        )
+            and isinstance(msg.get("content"), str)
+        ]
+        if any(len(msg["content"]) > self._ceiling_chars for msg in target):
+            return True
+        if budget > 0 and token_count < budget * self._budget_activation_ratio:
+            return False
+        return any(len(msg["content"]) > self._max_chars for msg in target)
 
     def apply(self, messages: List[Dict[str, Any]], budget: int) -> List[Dict[str, Any]]:
         result = self._dedup_tool_results(messages)
@@ -156,6 +222,7 @@ class TrimStage:
 
     def _truncate_outputs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Truncate oversized tool/assistant outputs with head+tail preservation."""
+        effective_limit = min(self._max_chars, self._ceiling_chars)
         result: List[Dict[str, Any]] = []
         trimmed_count = 0
         for msg in messages:
@@ -163,7 +230,7 @@ class TrimStage:
             role = msg.get("role", "")
             if (
                 isinstance(content, str)
-                and len(content) > self._max_chars
+                and len(content) > effective_limit
                 and role in ("tool", "function", "assistant")
             ):
                 head = content[: self._head_size]
@@ -230,6 +297,71 @@ NEW TURNS TO INCORPORATE:
 Merge the new information into the existing summary structure. \
 Move completed tasks from "Active State" to "Completed Actions". \
 Update all sections as needed. Preserve the same output format."""
+
+
+def _log_archive_result(task: asyncio.Task[None]) -> None:
+    """Callback for archive tasks — log failures instead of silencing them."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning(
+            "ArchiveStage: background archive failed (%s: %s)",
+            type(exc).__name__, exc,
+        )
+
+
+# ── Deterministic summary helpers ─────────────────────────────────────
+
+_KEY_ARG_NAMES = (
+    "path", "file", "command", "query", "action", "url", "chat_id", "pattern", "text",
+)
+
+
+def _compact_tool_args(args_str: str, limit: int = 120) -> str:
+    """Extract key argument values from tool call JSON arguments."""
+    if not args_str:
+        return ""
+    try:
+        args = json.loads(args_str)
+    except (json.JSONDecodeError, TypeError):
+        return args_str[:limit]
+    if not isinstance(args, dict):
+        return str(args)[:limit]
+    parts: list[str] = []
+    for key in _KEY_ARG_NAMES:
+        if key in args:
+            parts.append(f"{key}={str(args[key])[:60]}")
+    if not parts:
+        for key, val in list(args.items())[:2]:
+            parts.append(f"{key}={str(val)[:40]}")
+    return ", ".join(parts[:3])
+
+
+_KEY_RESULT_FIELDS = (
+    "ok", "error", "path", "kind", "message_id", "resource_id", "id", "exit_code",
+)
+
+
+def _compact_tool_result(content: str, limit: int = 150) -> str:
+    """Extract key information from a tool result for summaries."""
+    if not content or content == "null":
+        return "completed"
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict):
+            parts: list[str] = []
+            for key in _KEY_RESULT_FIELDS:
+                if key in data:
+                    parts.append(f"{key}={str(data[key])[:60]}")
+            if parts:
+                return "; ".join(parts[:4])
+    except (json.JSONDecodeError, TypeError):
+        pass
+    first_line = content.split("\n", 1)[0].strip()
+    if first_line:
+        return first_line[:limit]
+    return content[:limit]
 
 
 class SummarizeStage:
@@ -363,7 +495,7 @@ class SummarizeStage:
         for i, msg in enumerate(messages):
             role = msg.get("role", "unknown")
             content = str(msg.get("content", ""))
-            tool_calls = msg.get("tool_calls", [])
+            tool_calls = msg.get("tool_calls") or []
             if role == "assistant" and tool_calls:
                 tool_names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
                 lines.append(f"[Turn {i+1}] ASSISTANT: called tools: {', '.join(tool_names)}")
@@ -378,24 +510,38 @@ class SummarizeStage:
 
     @staticmethod
     def _deterministic_summary(middle: List[Dict[str, Any]]) -> str:
-        """Zero-LLM-cost summary as fallback."""
+        """Zero-LLM-cost summary as fallback.
+
+        Preserves tool names with key arguments, structured fields from
+        tool results (paths, error codes, resource ids), and the full
+        breadth of user messages so that the agent retains enough context
+        to continue its task after compression.
+        """
         summary_lines: List[str] = []
         for msg in middle:
             role = msg.get("role", "")
-            content = str(msg.get("content", ""))[:80]
-            tool_calls = msg.get("tool_calls", [])
+            content = str(msg.get("content", ""))
+            tool_calls = msg.get("tool_calls") or []
             if role == "assistant" and tool_calls:
-                tool_names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
-                summary_lines.append(f"[assistant] called: {', '.join(tool_names)}")
+                parts = []
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    name = func.get("name", "?")
+                    args_summary = _compact_tool_args(func.get("arguments", ""))
+                    parts.append(f"{name}({args_summary})" if args_summary else name)
+                summary_lines.append(f"[assistant] called: {', '.join(parts)}")
+                if content:
+                    summary_lines.append(f"  → {content[:120]}")
             elif role in ("tool", "function"):
-                summary_lines.append("[tool_result] executed")
+                excerpt = _compact_tool_result(content)
+                summary_lines.append(f"[tool] {excerpt}")
             elif role == "user":
-                summary_lines.append(f"[user] {content[:50]}...")
+                summary_lines.append(f"[user] {content[:200]}")
             else:
-                summary_lines.append(f"[{role}] {content[:50]}...")
+                summary_lines.append(f"[{role}] {content[:120]}")
         return (
             f"## Historical Context ({len(middle)} messages)\n"
-            + "\n".join(summary_lines[-20:])
+            + "\n".join(summary_lines[-30:])
         )
 
     @staticmethod
@@ -419,7 +565,7 @@ class SummarizeStage:
         """Remove orphaned tool results and strip orphaned tool_calls."""
         available_call_ids: set[str] = set()
         for msg in messages:
-            for tc in msg.get("tool_calls", []):
+            for tc in msg.get("tool_calls") or []:
                 call_id = tc.get("id", "") or tc.get("call_id", "")
                 if call_id:
                     available_call_ids.add(call_id)
@@ -489,7 +635,8 @@ class ArchiveStage:
             try:
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                    asyncio.create_task(self._archive_fn(archived))
+                    task = asyncio.create_task(self._archive_fn(archived))
+                    task.add_done_callback(_log_archive_result)
                 else:
                     loop.run_until_complete(self._archive_fn(archived))
             except Exception as exc:
@@ -594,6 +741,41 @@ class ContextCompressor:
         """Return the most recent compression trace."""
         return self._last_trace
 
+    def reconfigure(self, *, token_budget: int = 0, context_length: int = 0) -> None:
+        """Update runtime budget/context and rebuild affected stages.
+
+        Only TrimStage is rebuilt — SummarizeStage and other stateful stages
+        retain their iterative summary history and compression counters so
+        that a hot-reload mid-session does not break summary continuity.
+        """
+        changed = False
+        if token_budget > 0 and token_budget != self._config.token_budget:
+            self._config.token_budget = token_budget
+            changed = True
+        if context_length > 0 and context_length != self._config.context_length:
+            self._config.context_length = context_length
+            self._config._apply_adaptive_scaling()
+            changed = True
+        if changed:
+            new_trim = TrimStage(
+                max_chars=self._config.trim_threshold_chars,
+                head_ratio=self._config.trim_head_ratio,
+                tail_ratio=self._config.trim_tail_ratio,
+                dedup_min_chars=self._config.dedup_min_chars,
+                ceiling_chars=self._config.trim_ceiling_chars,
+                budget_activation_ratio=self._config.trim_budget_activation_ratio,
+            )
+            self._stages = [
+                new_trim if stage.name == "trim" else stage
+                for stage in self._stages
+            ]
+            logger.debug(
+                "ContextCompressor reconfigured: budget=%d, context_length=%d, trim_chars=%d",
+                self._config.token_budget,
+                self._config.context_length,
+                self._config.trim_threshold_chars,
+            )
+
     def _build_stages(self, config: CompressorConfig) -> List[CompressionStage]:
         """Build stage chain from config."""
         stage_map: Dict[str, CompressionStage] = {
@@ -602,6 +784,8 @@ class ContextCompressor:
                 head_ratio=config.trim_head_ratio,
                 tail_ratio=config.trim_tail_ratio,
                 dedup_min_chars=config.dedup_min_chars,
+                ceiling_chars=config.trim_ceiling_chars,
+                budget_activation_ratio=config.trim_budget_activation_ratio,
             ),
             "summarize": SummarizeStage(
                 threshold_messages=config.summarize_threshold_messages,
@@ -727,18 +911,30 @@ class ContextCompressor:
         )
 
     def _count_tokens(self, messages: List[Dict[str, Any]]) -> int:
-        """Count tokens using external tokenizer if available, else estimate."""
+        """Count tokens using external tokenizer if available, else estimate.
+
+        Always handles multimodal content parts and images regardless
+        of whether a custom ``token_count_fn`` is set.
+        """
+        _IMAGE_TOKEN_ESTIMATE = 1600
         if self._config.token_count_fn is not None:
+            fn = self._config.token_count_fn
             total = 0
             for msg in messages:
                 content = msg.get("content", "")
                 if isinstance(content, str):
-                    total += self._config.token_count_fn(content)
-                tool_calls = msg.get("tool_calls", [])
-                for tc in tool_calls:
+                    total += fn(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            if part.get("type") == "text":
+                                total += fn(part.get("text", ""))
+                            elif part.get("type") in ("image_url", "input_image", "image"):
+                                total += _IMAGE_TOKEN_ESTIMATE
+                for tc in msg.get("tool_calls") or []:
                     args = tc.get("function", {}).get("arguments", "")
                     if isinstance(args, str):
-                        total += self._config.token_count_fn(args)
+                        total += fn(args)
             return total
         return self._estimate_tokens(messages)
 
@@ -835,33 +1031,32 @@ class ContextCompressor:
 
     @staticmethod
     def _estimate_tokens(messages: List[Dict[str, Any]]) -> int:
-        """Token estimation: ~4 chars/token for text, ~1600 tokens per image part.
+        """CJK-aware token estimation with multimodal support.
 
-        Multimodal-aware: detects image_url and input_image content parts
-        and adds a flat token estimate per image (inspired by hermes
-        _IMAGE_TOKEN_ESTIMATE = 1600).
+        Uses ``estimate_text_tokens`` for consistent CJK-aware counting
+        and adds ~1600 tokens per image part.
         """
         _IMAGE_TOKEN_ESTIMATE = 1600
-        total_chars = 0
+        total_tokens = 0
         image_count = 0
 
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
-                total_chars += len(content)
+                total_tokens += estimate_text_tokens(content)
             elif isinstance(content, list):
                 for part in content:
                     if not isinstance(part, dict):
                         continue
                     part_type = part.get("type", "")
                     if part_type == "text":
-                        total_chars += len(part.get("text", ""))
+                        total_tokens += estimate_text_tokens(part.get("text", ""))
                     elif part_type in ("image_url", "input_image", "image"):
                         image_count += 1
 
-            for tc in msg.get("tool_calls", []):
+            for tc in msg.get("tool_calls") or []:
                 args = tc.get("function", {}).get("arguments", "")
                 if isinstance(args, str):
-                    total_chars += len(args)
+                    total_tokens += estimate_text_tokens(args)
 
-        return (total_chars // 4) + (image_count * _IMAGE_TOKEN_ESTIMATE)
+        return total_tokens + (image_count * _IMAGE_TOKEN_ESTIMATE)

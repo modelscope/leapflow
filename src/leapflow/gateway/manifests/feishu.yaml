@@ -1,66 +1,75 @@
 platform_id: feishu
 display_name: "飞书 (Feishu/Lark)"
-description: "飞书企业即时通讯平台"
+description: "飞书企业协作平台（官方 lark-cli 后端）"
 category: im
 
-credentials:
-  - key: app_id
-    label: App ID
-    required: true
-    secret: false
-    help_zh: "登录 open.feishu.cn → 创建企业自建应用 → 凭证与基础信息 → 复制 App ID"
-    help_en: "Login open.feishu.cn → Create App → Credentials → Copy App ID"
-  - key: app_secret
-    label: App Secret
-    required: true
-    secret: true
-    help_zh: "同页面 → 复制 App Secret"
-    help_en: "Same page → Copy App Secret"
+credentials: []
 
 options:
-  - key: connection_mode
-    label: 连接模式
+  - key: profile
+    label: CLI Profile
+    type: string
+    default: ""
+    help_zh: "lark-cli profile 名称；为空时使用 lark-cli 当前默认 profile"
+    help_en: "lark-cli profile name; empty means the current default profile"
+  - key: identity
+    label: 执行身份
     type: choice
-    choices: [webhook]
-    default: webhook
-    help_zh: "当前内置适配器使用本地 HTTP Webhook 接收事件；WebSocket SDK 模式将作为后续增强"
-    help_en: "The built-in adapter currently receives events through a local HTTP webhook; SDK WebSocket mode is a later enhancement"
-  - key: host
-    label: 绑定地址
+    choices: [bot, user]
+    default: bot
+    help_zh: "通过 lark-cli --as 指定 bot 或 user 身份"
+    help_en: "Identity passed through lark-cli --as"
+  - key: binary
+    label: CLI 命令
     type: string
-    default: "127.0.0.1"
-    help_zh: "Webhook 服务绑定地址（默认仅本机访问）"
-    help_en: "Webhook server bind address (default: localhost only)"
-  - key: port
-    label: 端口
-    type: string
-    default: "9091"
-    help_zh: "Webhook 服务端口"
-    help_en: "Webhook server port"
-  - key: path
-    label: 路径
-    type: string
-    default: "/feishu/events"
-    help_zh: "飞书事件回调路径"
-    help_en: "Feishu event callback path"
+    default: "lark-cli"
+    advanced: true
+    help_zh: "飞书官方 CLI 可执行文件名或路径"
+    help_en: "Official lark-cli executable name or path"
+  - key: max_message_length
+    label: 最大消息长度
+    type: integer
+    default: 8000
+    advanced: true
+    help_zh: "发送 IM 文本前在 LeapFlow 侧保留的最大字符数"
+    help_en: "Maximum text characters retained by LeapFlow before sending IM messages"
 
 setup_guide:
   summary_zh: |
-    接入飞书需要在飞书开放平台创建一个企业自建应用并开启机器人能力。
-    完成后请提供 App ID 和 App Secret。
+    LeapFlow 使用飞书官方 lark-cli 接入飞书能力。请先安装并完成一次 CLI 应用配置与授权。
   summary_en: |
-    To connect Feishu, create an enterprise app on open.feishu.cn
-    with bot capability enabled. Then provide your App ID and App Secret.
+    LeapFlow uses the official lark-cli backend for Feishu/Lark. Install and authorize lark-cli first.
   steps_zh:
-    - "打开 https://open.feishu.cn/app → 点击「创建企业自建应用」"
-    - "在「应用能力」中启用「机器人」"
-    - "在「凭证与基础信息」页面复制 App ID 和 App Secret"
-    - "在「权限管理」中添加：im:message、im:message.group_at_msg"
-  console_url: "https://open.feishu.cn/app"
+    - "安装：npx @larksuite/cli@latest install"
+    - "初始化应用配置：lark-cli config init --new"
+    - "登录授权：lark-cli auth login --recommend"
+    - "验证状态：lark-cli auth status"
+  steps_en:
+    - "Install: npx @larksuite/cli@latest install"
+    - "Initialize app config: lark-cli config init --new"
+    - "Authorize: lark-cli auth login --recommend"
+    - "Verify: lark-cli auth status"
+  console_url: "https://github.com/larksuite/cli"
 
 validation:
-  method: feishu_token_check
+  method: ""
   timeout_s: 10
+
+backend:
+  kind: cli
+  binary: lark-cli
+  format: json
+
+actions:
+  pack: leapflow.gateway.action_packs.feishu
+  initial_domains: [im, docs, calendar, drive, sheets, mail, task]
+
+events:
+  kind: cli
+  status: unavailable
+  command: lark-event
+  checkpoint: profile
+  note: "Enable after lark-event/WebSocket is configured; no legacy webhook fallback."
 
 adapter:
   module: leapflow.gateway.adapters.feishu

@@ -224,6 +224,12 @@ class RuntimeLeapService:
 
         return build_model_payload(self.context, model_name)
 
+    async def app_command(self, args: str = "") -> dict[str, Any]:
+        """Return daemon-owned App Connector slash-command payload."""
+        from leapflow.cli.commands.slash_handlers import build_app_payload
+
+        return await build_app_payload(self.context, args)
+
     async def approval_status(self) -> dict[str, Any]:
         """Return currently pending daemon approval requests."""
         return {"pending": self._pending_payloads()}
