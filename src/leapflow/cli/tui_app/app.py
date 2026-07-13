@@ -747,8 +747,9 @@ class LeapApp:
         approval_overlay = ConditionalContainer(
             Window(
                 content=FormattedTextControl(self._approval_fragments),
-                height=Dimension(min=10, max=24, preferred=24),
+                height=self._approval_height,
                 wrap_lines=False,
+                dont_extend_height=True,
                 style="class:approval.modal",
             ),
             filter=Condition(lambda: self._approval_modal is not None),
@@ -767,7 +768,8 @@ class LeapApp:
                         ),
                     ),
                     Float(
-                        top=1,
+                        top=0,
+                        bottom=2,
                         left=2,
                         right=2,
                         content=approval_overlay,
@@ -996,6 +998,12 @@ class LeapApp:
         if modal is None:
             return []
         return modal.fragments()
+
+    def _approval_height(self) -> int:
+        modal = self._approval_modal
+        if modal is None:
+            return 0
+        return modal.line_count()
 
     def _spinner_fragments(self) -> list[tuple[str, str]]:
         if not self._spinner_text:

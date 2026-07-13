@@ -101,7 +101,7 @@ async def test_tui_approval_modal_is_keyboard_selectable() -> None:
     assert "→" not in rendered
     assert "╭" in rendered and "╮" in rendered
     assert "╰" in rendered and "╯" in rendered
-    assert "▶ 2. Allow for this session" in rendered
+    assert "▸ 2. Allow for this session" in rendered
 
     modal.choose_selected()
     assert await task == ApprovalDecision.ALLOW_SESSION
@@ -121,10 +121,9 @@ async def test_tui_approval_modal_preserves_frame_and_choices_in_small_height() 
     )
     modal = app_module.ApprovalModal.create(request)
 
-    rendered = "".join(text for _style, text in modal.fragments(max_height=14))
+    rendered = "".join(text for _style, text in modal.fragments())
     lines = [line for line in rendered.splitlines() if line]
 
-    assert len(lines) <= 14
     assert lines[0].startswith("╭") and lines[0].endswith("╮")
     assert lines[-1].startswith("╰") and lines[-1].endswith("╯")
     assert "1. Allow once" in rendered

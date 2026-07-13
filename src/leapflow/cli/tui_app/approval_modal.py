@@ -1,4 +1,9 @@
-"""Prompt-toolkit native approval modal for LeapFlow TUI."""
+"""Prompt-toolkit native approval modal for LeapFlow TUI.
+
+Renders a bordered panel with action summary, detail, risk reason,
+and selectable choices — fully within the prompt_toolkit layout.
+Keyboard: ↑/↓ navigate, Enter confirm, Esc deny, or type shortcut keys.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -22,10 +27,8 @@ Fragment = tuple[str, str]
 
 _MIN_WIDTH = 58
 _MAX_WIDTH = 104
-_MIN_HEIGHT = 10
-_MAX_HEIGHT = 24
-_MAX_DETAIL_LINES = 3
-_MAX_REASON_LINES = 2
+_DETAIL_LINES = 3
+_REASON_LINES = 2
 
 
 @dataclass
@@ -39,7 +42,7 @@ class ApprovalModal:
     future: asyncio.Future[ApprovalDecision]
 
     @classmethod
-    def create(cls, request: ApprovalRequest) -> "ApprovalModal":
+    def create(cls, request: ApprovalRequest) -> ApprovalModal:
         choices = build_approval_choices(request)
         selected_index = _default_index(choices, request.default_choice)
         future = asyncio.get_running_loop().create_future()
@@ -53,24 +56,20 @@ class ApprovalModal:
 
     @property
     def done(self) -> bool:
-        """Return whether the user has already made a decision."""
         return self.future.done()
 
     def move(self, delta: int) -> None:
-        """Move the selected option by ``delta`` rows."""
         if not self.choices:
             return
         self.selected_index = (self.selected_index + delta) % len(self.choices)
 
     def choose_selected(self) -> None:
-        """Accept the currently selected option."""
         if not self.choices:
             self.resolve(ApprovalDecision.DENY)
             return
         self._choose(self.choices[self.selected_index])
 
     def choose_text(self, text: str) -> bool:
-        """Resolve a typed shortcut or numeric choice."""
         choice = resolve_approval_choice(text.strip().lower(), self.choices)
         if choice is None:
             return False
@@ -78,94 +77,105 @@ class ApprovalModal:
         return True
 
     def deny(self) -> None:
-        """Fail closed when the user cancels or the request expires."""
         self.resolve(ApprovalDecision.DENY)
 
     def resolve(self, decision: ApprovalDecision) -> None:
-        """Resolve the modal future once."""
         if not self.future.done():
             self.future.set_result(decision)
 
-    def fragments(self, *, max_height: int | None = None) -> list[Fragment]:
-        """Render the modal as a complete bordered component."""
+    def fragments(self) -> list[Fragment]:
+        """Build all fragments for the modal — no height truncation.
+
+        The prompt_toolkit Window handles clipping/scrolling.
+        Content lines are limited by static caps (_DETAIL_LINES,
+        _REASON_LINES) to keep the panel concise.
+        """
         width = _modal_width()
-        height = _modal_height(max_height)
-        inner_width = width - 4
+        inner = width - 4
         title = f"⚠ {title_for_approval(self.request)}"
+
         lines: list[list[Fragment]] = []
+
+        # ── Top border ──
         lines.append(_border_top(width, title))
 
+        # ── Summary ──
         summary = str(self.request.display.get("summary") or self.request.category)
-        lines.extend(_limited_content_lines(
-            _wrap(summary, inner_width),
-            inner_width,
-            "class:approval.summary",
-            limit=1,
-        ))
+        for text in _wrap(summary, inner)[:2]:
+            lines.append(_content_line(text, inner, "class:approval.summary"))
 
-        reason = str(self.request.display.get("reason") or risk_reason(self.request))
-        remaining = remaining_seconds(self.request)
-        fixed_count = (
-            1  # top border
-            + 1  # summary
-            + 1  # action detail label
-            + (1 if reason else 0)  # reason label
-            + (1 if remaining is not None else 0)
-            + 1  # keyboard hint
-            + len(self.choices)
-            + 1  # bottom border
-        )
-        content_budget = max(2, height - fixed_count)
-        detail_budget = min(_MAX_DETAIL_LINES, max(1, content_budget // 2))
-        reason_budget = min(_MAX_REASON_LINES, max(0, content_budget - detail_budget))
+        # ── Blank separator ──
+        lines.append(_content_line("", inner, ""))
 
-        lines.append(_content_line("Action detail:", inner_width, "class:approval.label"))
-        detail = redact_sensitive_text(self.request.detail, force=True)
+        # ── Detail ──
+        detail_raw = redact_sensitive_text(self.request.detail, force=True)
         if not self.show_details:
-            detail = truncate_detail(detail, max_lines=detail_budget, width=inner_width - 2)
-        detail_lines: list[str] = []
-        for raw_line in detail.splitlines() or [""]:
-            detail_lines.extend(_wrap(raw_line, inner_width - 2))
-        lines.extend(_limited_content_lines(
-            [f"  {line}" for line in detail_lines],
-            inner_width,
-            "class:approval.detail",
-            limit=detail_budget,
-        ))
+            detail_raw = truncate_detail(
+                detail_raw, max_lines=_DETAIL_LINES, width=inner - 4,
+            )
+        detail_wrapped: list[str] = []
+        for raw_line in detail_raw.splitlines() or [""]:
+            detail_wrapped.extend(_wrap(raw_line, inner - 4))
+        detail_limit = 50 if self.show_details else _DETAIL_LINES
+        for text in detail_wrapped[:detail_limit]:
+            lines.append(_content_line(f"  {text}", inner, "class:approval.detail"))
 
+        # ── Risk reason ──
+        reason = str(self.request.display.get("reason") or risk_reason(self.request))
         if reason:
-            lines.append(_content_line("Why approval is needed:", inner_width, "class:approval.label"))
-            reason_lines = [f"- {line}" for line in _wrap(reason, inner_width - 2)]
-            lines.extend(_limited_content_lines(
-                reason_lines,
-                inner_width,
-                "class:approval.dim",
-                limit=reason_budget,
+            lines.append(_content_line("", inner, ""))
+            lines.append(_content_line(
+                "Why approval is needed:", inner, "class:approval.label",
             ))
+            for text in _wrap(reason, inner - 4)[:_REASON_LINES]:
+                lines.append(_content_line(f"  {text}", inner, "class:approval.dim"))
 
+        # ── Timeout ──
+        remaining = remaining_seconds(self.request)
         if remaining is not None:
             lines.append(_content_line(
-                f"Defaults to Deny in {int(remaining)}s.",
-                inner_width,
+                f"  Auto-deny in {int(remaining)}s",
+                inner,
                 "class:approval.dim",
             ))
 
-        lines.append(_content_line("↑/↓ choose · Enter confirm · Esc deny", inner_width, "class:approval.dim"))
-        for idx, choice in enumerate(self.choices, start=1):
-            selected = idx - 1 == self.selected_index
-            marker = "▶" if selected else " "
-            text = f" {marker} {idx}. {choice.label}"
-            style = "class:approval.selected" if selected else "class:approval.option"
-            lines.append(_content_line(text, inner_width, style))
+        # ── Separator + keyboard hint ──
+        lines.append(_content_line("", inner, ""))
+        lines.append(_content_line(
+            "  ↑↓ navigate · Enter confirm · Esc deny",
+            inner,
+            "class:approval.dim",
+        ))
 
+        # ── Choices ──
+        for idx, choice in enumerate(self.choices):
+            selected = idx == self.selected_index
+            marker = "▸" if selected else " "
+            label = f"  {marker} {idx + 1}. {choice.label}"
+            style = "class:approval.selected" if selected else "class:approval.option"
+            lines.append(_content_line(label, inner, style))
+
+        # ── Bottom border ──
         lines.append(_border_bottom(width))
-        if len(lines) > height:
-            lines = _preserve_frame_and_choices(lines, height, len(self.choices))
-        fragments: list[Fragment] = []
+
+        # ── Flatten to fragment list ──
+        result: list[Fragment] = []
         for line in lines:
-            fragments.extend(line)
-            fragments.append(("", "\n"))
-        return fragments
+            result.extend(line)
+            result.append(("", "\n"))
+        return result
+
+    def line_count(self) -> int:
+        """Return the number of content lines (for Window height sizing)."""
+        count = 1 + 2 + 1  # top border, summary(+blank), blank
+        count += min(_DETAIL_LINES, 3)
+        reason = str(self.request.display.get("reason") or risk_reason(self.request))
+        if reason:
+            count += 1 + 1 + min(_REASON_LINES, 2)
+        if self.request.expires_at is not None:
+            count += 1
+        count += 1 + 1 + len(self.choices) + 1  # blank, hint, choices, bottom
+        return count
 
     def _choose(self, choice: ApprovalChoice) -> None:
         if choice.key == "show_details":
@@ -186,13 +196,6 @@ def _modal_width() -> int:
     return min(_MAX_WIDTH, max(_MIN_WIDTH, columns - 6))
 
 
-def _modal_height(max_height: int | None = None) -> int:
-    if max_height is not None:
-        return max(_MIN_HEIGHT, max_height)
-    rows = shutil.get_terminal_size((100, 24)).lines
-    return min(_MAX_HEIGHT, max(_MIN_HEIGHT, rows - 5))
-
-
 def _wrap(text: str, width: int) -> list[str]:
     return textwrap.wrap(
         text,
@@ -202,49 +205,15 @@ def _wrap(text: str, width: int) -> list[str]:
     ) or [""]
 
 
-def _limited_content_lines(
-    lines: list[str],
-    width: int,
-    style: str,
-    *,
-    limit: int,
-) -> list[list[Fragment]]:
-    if limit <= 0:
-        return []
-    visible = list(lines[:limit]) or [""]
-    if len(lines) > limit:
-        visible[-1] = _with_ellipsis(visible[-1], width)
-    return [_content_line(line, width, style) for line in visible]
-
-
-def _with_ellipsis(text: str, width: int) -> str:
-    if width <= 1:
-        return "…"
-    if len(text) >= width:
-        return text[: width - 1] + "…"
-    return f"{text} …"
-
-
-def _preserve_frame_and_choices(
-    lines: list[list[Fragment]],
-    height: int,
-    choice_count: int,
-) -> list[list[Fragment]]:
-    if len(lines) <= height:
-        return lines
-    tail_count = choice_count + 1
-    head_budget = max(1, height - tail_count)
-    return [*lines[:head_budget], *lines[-tail_count:]]
-
-
 def _border_top(width: int, title: str) -> list[Fragment]:
     label = f" {title} "
+    label = label[: max(0, width - 4)]
     available = max(0, width - 2 - len(label))
     left = available // 2
     right = available - left
     return [
         ("class:approval.border", "╭" + "─" * left),
-        ("class:approval.title", label[: max(0, width - 2)]),
+        ("class:approval.title", label),
         ("class:approval.border", "─" * right + "╮"),
     ]
 
@@ -258,13 +227,11 @@ def _content_line(text: str, width: int, style: str = "") -> list[Fragment]:
     padding = " " * max(0, width - len(clipped))
     return [
         ("class:approval.border", "│ "),
-        (style, clipped),
-        ("", padding),
+        (style, clipped + padding),
         ("class:approval.border", " │"),
     ]
 
 
 def request_is_expired(request: ApprovalRequest) -> bool:
-    """Return True when an approval request is past its deadline."""
     remaining = remaining_seconds(request)
     return remaining is not None and remaining <= 0.0
