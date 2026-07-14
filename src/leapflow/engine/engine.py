@@ -222,6 +222,17 @@ def _platform_action_fingerprint(tool_name: str, arguments: Mapping[str, Any]) -
     return f"{platform}:{action}:{payload_key}"
 
 
+def _has_completed_side_effect(results: List[Dict[str, Any]]) -> bool:
+    """Return True if any result is a completed side-effect platform_action."""
+    for item in results:
+        result = item.get("result")
+        if not isinstance(result, dict):
+            continue
+        if result.get("ok") and result.get("completed"):
+            return True
+    return False
+
+
 def _unknown_tool_retry_prompt(result: Dict[str, Any]) -> str:
     """Build a compact structured correction prompt for a bad tool name."""
     suggestions = result.get("suggestions") or []
@@ -1063,6 +1074,11 @@ class AgentEngine:
         self._last_disclosure_metadata = {}
         self._context_governance_controller.reset_turn_scope()
         self._current_task_contract = self._build_task_contract(user_text)
+        try:
+            from leapflow.tools.gateway_tool import reset_platform_action_scope
+            reset_platform_action_scope()
+        except ImportError:
+            pass
 
     def _build_task_contract(self, user_text: str) -> TaskContract:
         workspace_root = (
@@ -2014,6 +2030,12 @@ class AgentEngine:
                     messages.append(build_user_message_text(
                         "SYSTEM: Approaching limit. Provide final answer now."
                     ))
+                elif _has_completed_side_effect(results):
+                    messages.append(build_user_message_text(
+                        "SYSTEM: Side-effect action completed (result has completed:true). "
+                        "Do not re-invoke it with the same parameters. "
+                        "If all user-requested actions are done, provide the final answer."
+                    ))
                 continue
 
             self._wm.remember_chat(build_assistant_message(content))
@@ -2402,6 +2424,12 @@ class AgentEngine:
                     if status == BudgetStatus.SOFT_LIMIT:
                         messages.append(build_user_message_text(
                             "SYSTEM: Approaching limit. Provide final answer now."
+                        ))
+                    elif _has_completed_side_effect(results):
+                        messages.append(build_user_message_text(
+                            "SYSTEM: Side-effect action completed (result has completed:true). "
+                            "Do not re-invoke it with the same parameters. "
+                            "If all user-requested actions are done, provide the final answer."
                         ))
                     continue
 

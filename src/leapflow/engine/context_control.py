@@ -271,6 +271,8 @@ class ToolEvidenceBuilder:
             return self._compact_value(result)
         if tool_name == "platform_connect":
             return self._app_connector_evidence(result)
+        if tool_name in {"platform_action", "gp_platform_action"}:
+            return self._platform_action_evidence(arguments or {}, result)
         if result.get("ok") is False:
             return self._compact_error(result)
         if tool_name in {"file_read", "gp_file_read"}:
@@ -318,6 +320,36 @@ class ToolEvidenceBuilder:
             "stdout": self._head_tail(str(result.get("stdout", "")), self._max_content_chars),
             "stderr": self._head_tail(str(result.get("stderr", "")), self._max_content_chars // 2),
         }
+
+    def _platform_action_evidence(self, arguments: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+        """Compact evidence for platform_action with strong completion markers."""
+        if result.get("ok") is False:
+            evidence = self._compact_error(result)
+            for key in ("failure_code", "missing_fields", "recovery_hint", "expected_schema", "retryable"):
+                if key in result:
+                    evidence[key] = result[key]
+            return evidence
+
+        evidence: Dict[str, Any] = {
+            "ok": True,
+            "kind": "platform_action_evidence",
+            "action": result.get("action") or arguments.get("action", ""),
+            "platform": result.get("platform") or arguments.get("platform", ""),
+        }
+        if result.get("resource_id"):
+            evidence["resource_id"] = str(result["resource_id"])
+        if result.get("completed"):
+            evidence["status"] = "COMPLETED"
+            evidence["execution_note"] = str(result.get("execution_note") or "Done. Do not repeat.")
+        if result.get("already_executed"):
+            evidence["status"] = "ALREADY_EXECUTED"
+            evidence["execution_note"] = str(result.get("execution_note") or "")
+            original = result.get("original_result")
+            if isinstance(original, dict) and original.get("resource_id"):
+                evidence["resource_id"] = str(original["resource_id"])
+        if isinstance(result.get("data"), dict):
+            evidence["data"] = self._compact_mapping(result["data"])
+        return evidence
 
     def _compact_error(self, result: Dict[str, Any]) -> Dict[str, Any]:
         return {
