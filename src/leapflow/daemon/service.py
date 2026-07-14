@@ -32,6 +32,9 @@ class RuntimeLeapService:
         self._approval_pending: dict[str, dict[str, Any]] = {}
         self._approval_event_queue: asyncio.Queue[StreamChunk] | None = None
 
+        from leapflow.daemon.notifications import NotificationBus
+        self.notification_bus = NotificationBus()
+
     def set_client_count_provider(self, provider: Callable[[], int]) -> None:
         """Set a lightweight callback used by status reporting."""
         self._client_count = provider
@@ -49,6 +52,7 @@ class RuntimeLeapService:
         ctx = Context(self._settings, self._mock_host)
         await ctx.initialize()
         self._install_daemon_approval(ctx)
+        self._install_learn_notifications(ctx)
         self._ctx = ctx
 
     @property
@@ -383,6 +387,64 @@ class RuntimeLeapService:
             conn.execute("CHECKPOINT")
         except Exception:
             logger.debug("daemon: DuckDB checkpoint skipped", exc_info=True)
+
+    async def subscribe_notifications(self) -> AsyncIterator[StreamChunk]:
+        """Long-lived streaming RPC: yield notifications until client disconnects."""
+        subscriber_id = str(uuid.uuid4())
+        queue = self.notification_bus.subscribe(subscriber_id)
+        try:
+            while True:
+                notification = await queue.get()
+                if notification is None:
+                    break
+                yield StreamChunk(
+                    request_id="",
+                    content="",
+                    event_type="status",
+                    metadata=notification.to_dict(),
+                )
+        finally:
+            self.notification_bus.unsubscribe(subscriber_id)
+
+    def _install_learn_notifications(self, ctx: Any) -> None:
+        """Wire session progress/completion callbacks to the notification bus."""
+        bus = self.notification_bus
+
+        def _on_progress(stage: str, current: int, total: int) -> None:
+            bus.emit_event(
+                "teach.progress",
+                phase=stage,
+                current=current,
+                total=total,
+                progress=current / total if total > 0 else 0.0,
+            )
+
+        def _on_complete(result: Any) -> None:
+            payload: dict[str, Any] = {"phase": "done"}
+            if result:
+                payload["step_count"] = getattr(result, "step_count", 0)
+                payload["duration"] = getattr(result, "duration", 0.0)
+                candidates = getattr(result, "candidates", None) or []
+                payload["candidate_count"] = len(candidates)
+                activated = getattr(result, "activated_skill_names", None) or set()
+                payload["activated_skills"] = list(activated)
+                new = getattr(result, "new_skills", None) or []
+                payload["new_skills"] = list(new)
+            bus.emit_event("teach.complete", **payload)
+
+        if ctx.session:
+            ctx.session.set_on_learn_progress(_on_progress)
+            if hasattr(ctx.session, "set_on_learn_complete"):
+                ctx.session.set_on_learn_complete(_on_complete)
+
+            # Monitor mode changes to notify TUI of idle-watchdog stops
+            original_on_idle = ctx.session._on_idle_timeout
+
+            def _on_idle_with_notification() -> None:
+                bus.emit_event("teach.stopped", reason="idle_timeout")
+                original_on_idle()
+
+            ctx.session._on_idle_timeout = _on_idle_with_notification
 
     def _install_daemon_approval(self, ctx: Any) -> None:
         try:

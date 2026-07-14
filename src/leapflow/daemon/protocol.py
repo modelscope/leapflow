@@ -306,4 +306,5 @@ METHOD_REGISTRY: Dict[str, str] = {
     "gateway.disconnect": "gateway_disconnect",
     "gateway.status": "gateway_status",
     "gateway.send": "gateway_send",
+    "events.subscribe": "subscribe_notifications",
 }

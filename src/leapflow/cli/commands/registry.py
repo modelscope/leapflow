@@ -95,6 +95,7 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     # Teaching
     CommandDef("teach start", "Start teaching mode", "Teaching", aliases=("teach",), args_hint="[goal]"),
     CommandDef("teach stop", "Stop and distill skill", "Teaching"),
+    CommandDef("teach status", "Show distillation progress", "Teaching"),
     CommandDef("teach pause", "Pause recording", "Teaching"),
     CommandDef("teach resume", "Resume recording", "Teaching"),
     CommandDef("teach discard", "Discard current recording", "Teaching"),

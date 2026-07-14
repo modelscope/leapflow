@@ -1010,7 +1010,7 @@ class LeapApp:
     def _placeholder_text(self) -> str:
         """Return contextual input guidance for an empty buffer."""
         if self._prompt_mode == "learning":
-            return "/teach stop · /teach discard · /teach pause · /teach resume · /teach skip · /annotate <text>"
+            return "/teach stop · /teach status · /teach pause · /teach skip · /annotate <text>"
         if self._queue_paused:
             return "Queue paused · /resume continue · /drop <id> remove · /queue view"
         if self._active_command is not None:

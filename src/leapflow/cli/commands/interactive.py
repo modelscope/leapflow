@@ -911,8 +911,9 @@ async def cmd_interactive_daemon(
     )
 
     def _update_status() -> None:
+        effective_mode = daemon_session_mode if daemon_session_mode in ("learning", "paused") else "daemon"
         status.update(
-            mode="daemon",
+            mode=effective_mode,
             skill_count=0,
             platform_online=runtime_host_online,
             model_name=runtime_model_name,
@@ -921,7 +922,7 @@ async def cmd_interactive_daemon(
             context_max=runtime_context_length,
             context_state=runtime_context_state,
         )
-        app.prompt_mode = "daemon"
+        app.prompt_mode = effective_mode
 
     def _render_banner() -> None:
         display_rich_banner(
@@ -1307,11 +1308,73 @@ async def cmd_interactive_daemon(
 
     _render_banner()
     _update_status()
+
+    # Background notification subscription for push events (distillation progress, etc.)
+    _notification_task: asyncio.Task[None] | None = None
+
+    async def _notification_listener() -> None:
+        """Subscribe to daemon notifications and render them in TUI."""
+        nonlocal daemon_session_mode
+        from leapflow.daemon.client import DaemonUnavailableError
+        while True:
+            try:
+                # Reset stale state on each (re)connection attempt
+                status.distill_phase = ""
+                status.distill_progress = 0.0
+                async for event in bridge.client.subscribe_notifications():
+                    event_type = event.get("event_type", "")
+                    payload = event.get("payload") or {}
+                    if event_type == "teach.progress":
+                        status.distill_phase = str(payload.get("phase", ""))
+                        status.distill_progress = float(payload.get("progress", 0.0))
+                        app.invalidate()
+                    elif event_type == "teach.stopped":
+                        daemon_session_mode = "idle"
+                        app.prompt_mode = "daemon"
+                        reason = payload.get("reason", "")
+                        if reason == "idle_timeout":
+                            console.warning("Recording stopped automatically (idle timeout).")
+                        else:
+                            console.system("Recording stopped.")
+                        _update_status()
+                    elif event_type == "teach.complete":
+                        status.distill_phase = ""
+                        status.distill_progress = 0.0
+                        new_skills = payload.get("new_skills") or []
+                        candidate_count = payload.get("candidate_count", 0)
+                        if new_skills:
+                            console.success(
+                                f"Distillation complete — {len(new_skills)} new skill(s)"
+                            )
+                            for name in new_skills:
+                                console.system(f"  → {name}")
+                        elif candidate_count > 0:
+                            console.system(
+                                f"Distillation complete — {candidate_count} candidate(s), none activated"
+                            )
+                        else:
+                            console.system("Distillation complete — no skills produced (insufficient signal)")
+                        app.invalidate()
+            except (DaemonUnavailableError, OSError, asyncio.IncompleteReadError):
+                await asyncio.sleep(3.0)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.debug("notification_listener: unexpected error", exc_info=True)
+                await asyncio.sleep(5.0)
+
     exit_code = 0
     try:
         await client_lease.start()
+        _notification_task = asyncio.create_task(_notification_listener())
         exit_code = await app.run()
     finally:
+        if _notification_task is not None:
+            _notification_task.cancel()
+            try:
+                await _notification_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await client_lease.stop()
         _print_exit_summary()
         await _prompt_stop_daemon_on_exit(bridge.client, settings, console)

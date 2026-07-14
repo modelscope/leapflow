@@ -936,12 +936,18 @@ async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]
         try:
             result = await ctx.session.exit_learning()
             msg = f"Recording stopped — {result.step_count} steps, {result.duration:.1f}s"
-            if result.step_count > 0 and getattr(ctx.settings, "has_llm_credentials", False):
+            if result.step_count == 0:
+                msg += "\nNo steps recorded — nothing to distill."
+            elif not getattr(ctx.settings, "has_llm_credentials", False):
+                msg += "\nNo LLM credentials — distillation skipped."
+            elif ctx.session.has_pending_distillation:
                 import asyncio
                 asyncio.create_task(_distill_background(ctx.session))
                 msg += "\nDistillation started in background."
-            elif result.step_count == 0:
-                msg += "\nNo steps recorded — nothing to distill."
+            else:
+                report = getattr(result, "learnability_report", None)
+                reason = getattr(report, "reason", "assessment decided to skip") if report else "auto-learn disabled"
+                msg += f"\nDistillation skipped: {reason}"
             return {
                 "ok": True,
                 "message": msg,
@@ -986,6 +992,32 @@ async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]
             return {"ok": False, "message": "Usage: /annotate <text>"}
         ctx.session.annotate(args.strip())
         return {"ok": True, "message": f"Annotation recorded: {args.strip()}", "session_mode": "learning"}
+
+    if name == "teach status":
+        if not ctx.session:
+            return {"ok": True, "message": "No active session.", "session_mode": "idle"}
+        mode = ctx.session.mode.value
+        result_payload: dict[str, Any] = {"ok": True, "session_mode": mode}
+        if mode == "evolving" or ctx.session.is_distilling:
+            result_payload["message"] = "Distillation in progress…"
+            result_payload["distilling"] = True
+        elif mode == "learning":
+            step_count = ctx.session.recording_step_count
+            result_payload["message"] = f"Recording — {step_count} steps captured."
+            result_payload["step_count"] = step_count
+        else:
+            last = ctx.session.last_result
+            if last:
+                candidates = getattr(last, "candidates", None) or []
+                new_skills = getattr(last, "new_skills", None) or []
+                result_payload["message"] = (
+                    f"Idle. Last result: {last.step_count} steps, "
+                    f"{len(candidates)} candidates, "
+                    f"{len(new_skills)} activated."
+                )
+            else:
+                result_payload["message"] = "Idle. No previous distillation results."
+        return result_payload
 
     return {"ok": False, "message": f"Unknown teach command: /{full_cmd}"}
 

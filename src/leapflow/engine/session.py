@@ -132,6 +132,27 @@ class SessionController:
         self._pending_learn_deferred: Optional[tuple[Trajectory, LearningSession]] = None
 
     @property
+    def has_pending_distillation(self) -> bool:
+        """Whether exit_learning queued a trajectory for background distillation."""
+        return self._pending_learn is not None
+
+    @property
+    def is_distilling(self) -> bool:
+        """Whether a background distillation task is currently running."""
+        return self._learn_task is not None and not self._learn_task.done()
+
+    @property
+    def recording_step_count(self) -> int:
+        """Number of steps captured so far in the active recording."""
+        recorder = getattr(self._pipeline, "recorder", None)
+        return recorder.step_count if recorder else 0
+
+    @property
+    def last_result(self) -> Optional["LearnResult"]:
+        """Most recent distillation result, if any."""
+        return self._last_learn_result
+
+    @property
     def idle_timeout(self) -> float:
         return self._idle_timeout
 

@@ -97,6 +97,8 @@ class StatusBar:
         self.last_turn_elapsed: float = 0.0
         self._turn_start: float = 0.0
         self._session_start: float = time.monotonic()
+        self.distill_phase: str = ""
+        self.distill_progress: float = 0.0
 
     def mark_turn_start(self) -> None:
         """Record start of a new agent turn."""
@@ -167,6 +169,21 @@ class StatusBar:
                         state_cls = "class:status-bar.warn" if self.context_state == "converging" else "class:status-bar.bad"
                     parts.append(("class:status-bar.dim", "· "))
                     parts.append((state_cls, f"{_truncate(self.context_state, 12)} "))
+            parts.append(("class:status-bar.dim", "│ "))
+
+        if self.distill_phase:
+            _phase_icons = {
+                "segment": "⚗ segment",
+                "abstract": "⚗ abstract",
+                "intent": "⚗ intent",
+                "distill": "⚗ distill",
+                "activate": "⚗ activate",
+            }
+            phase_label = _phase_icons.get(self.distill_phase, f"⚗ {self.distill_phase}")
+            parts.append(("class:status-bar.warn", f"{phase_label} "))
+            if self.distill_progress > 0:
+                pct = int(self.distill_progress * 100)
+                parts.append(("class:status-bar", f"{pct}% "))
             parts.append(("class:status-bar.dim", "│ "))
 
         elapsed = time.monotonic() - self._session_start
