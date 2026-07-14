@@ -191,10 +191,10 @@ def test_capability_health_ledger_degrades_platform_for_side_effects() -> None:
     blocked_read = ledger.check_feasibility("feishu", read_spec)
     blocked_send = ledger.check_feasibility("feishu", send_spec)
 
-    # Direct capability failure blocks the read action
-    assert blocked_read["ok"] is False
-    assert blocked_read["skip_approval"] is True
-    assert blocked_read["failure_code"] == "missing_scope"
+    # Read actions pass through so they can revalidate external permission changes.
+    assert blocked_read["ok"] is True
+    assert blocked_read["permission_revalidation"] is True
+    assert blocked_read["previous_failure_code"] == "missing_scope"
     assert blocked_read["capability"] == "im.message.read"
 
     # Platform degradation blocks the side-effect action
@@ -653,7 +653,7 @@ def test_platform_degradation_blocks_side_effects() -> None:
 
 
 def test_platform_degradation_allows_read_retry() -> None:
-    """A read action that already failed is blocked directly, not via degradation."""
+    """A read action with a previous auth failure can revalidate live permissions."""
     from leapflow.gateway.capability_health import CapabilityHealthLedger
 
     ledger = CapabilityHealthLedger()
@@ -674,8 +674,30 @@ def test_platform_degradation_allows_read_retry() -> None:
         capability="im.chat.read",
     )
     result = ledger.check_feasibility("feishu", read_spec)
-    assert result["ok"] is False
-    assert result["failure_code"] == "missing_scope"
+    assert result["ok"] is True
+    assert result["permission_revalidation"] is True
+    assert result["previous_failure_code"] == "missing_scope"
+
+
+def test_platform_degradation_record_success_restores_matching_capability() -> None:
+    """Successful revalidation removes the matching capability failure."""
+    from leapflow.gateway.capability_health import CapabilityHealthLedger
+
+    ledger = CapabilityHealthLedger()
+    failure = ActionFailure(
+        failure_class="authorization",
+        failure_code="missing_scope",
+        message="Missing scope",
+        recoverability="admin_required",
+        retryable=False,
+        blocks_approval=True,
+    )
+    ledger.record_failure("feishu", "im.chat.read", failure)
+    assert ledger.is_platform_degraded("feishu")
+
+    assert ledger.record_success("feishu", "im.chat.read") is True
+    assert not ledger.is_platform_degraded("feishu")
+    assert ledger.summary() == []
 
 
 def test_platform_degradation_clear_restores_access() -> None:

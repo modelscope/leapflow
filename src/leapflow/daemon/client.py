@@ -143,6 +143,11 @@ class DaemonClient:
         result = await self.request("app.command", {"args": args})
         return dict(result or {})
 
+    async def command_execute(self, name: str, args: str = "") -> dict[str, Any]:
+        """Execute any engine-routed slash command via daemon."""
+        result = await self.request("command.execute", {"name": name, "args": args})
+        return dict(result or {})
+
     async def approval_status(self) -> dict[str, Any]:
         """Return pending daemon approval requests."""
         result = await self.request("approval.status")

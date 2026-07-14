@@ -732,7 +732,515 @@ async def handle_app(ctx: "Context", console: "LeapConsole", args: str) -> None:
     render_app_payload(console, await build_app_payload(ctx, args))
 
 
-
 def handle_clear(ctx: "Context", console: "LeapConsole", args: str) -> None:
     """Clear the terminal screen."""
     os.system("cls" if os.name == "nt" else "clear")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Unified command_execute: dispatches any engine-routed slash command
+# ══════════════════════════════════════════════════════════════════════
+
+
+async def command_execute(ctx: "Context", name: str, args: str = "") -> dict[str, Any]:
+    """Execute a slash command and return a serializable result payload.
+
+    This is the unified entry point for daemon-mode command execution.
+    Returns a dict with at minimum ``ok`` and ``message`` keys, plus
+    optional structured data for rich TUI rendering.
+    """
+    if name == "status":
+        return build_status_payload(ctx)
+    if name == "tools":
+        return build_tools_payload(ctx)
+    if name == "usage":
+        return build_usage_payload(ctx)
+    if name == "model":
+        return build_model_payload(ctx, args)
+    if name == "gateway":
+        return build_gateway_payload(ctx)
+    if name == "host":
+        return await _execute_host(ctx, args)
+    if _is_app_command_name(name):
+        app_args = name[len("app"):].strip()
+        if app_args:
+            app_args = app_args + (" " + args if args else "")
+        else:
+            app_args = args
+        return await build_app_payload(ctx, app_args)
+    if name.startswith("teach") or name == "annotate":
+        return await _execute_teach(ctx, name, args)
+    if name.startswith("skills"):
+        return _execute_skills(ctx, name, args)
+    if name.startswith("hub"):
+        return await _execute_hub(ctx, name, args)
+    if name == "run":
+        return {"ok": True, "stream": True, "prompt": args}
+    if name == "arm":
+        return await _execute_scheduler_arm(ctx, args)
+    if name == "tasks":
+        return _execute_scheduler_tasks(ctx)
+    return {"ok": False, "message": f"Unknown command: /{name}"}
+
+
+def _is_app_command_name(name: str) -> bool:
+    return name == "app" or name.startswith("app ")
+
+
+def build_status_payload(ctx: "Context") -> dict[str, Any]:
+    """Build a serializable status summary."""
+    engine = ctx.engine
+    context_length = 0
+    context_used = 0
+    turn_count = 0
+    if engine is not None:
+        cap_registry = getattr(engine, "model_capabilities", None)
+        if cap_registry is not None:
+            caps = cap_registry.resolve(ctx.settings.llm_model)
+            context_length = int(caps.context_length)
+        context_used = int(getattr(engine, "context_token_count", 0))
+        turn_count = int(getattr(engine, "turn_count", 0))
+
+    platform_status = "connected" if (hasattr(ctx.rpc, "connected") and ctx.rpc.connected) else "mock"
+    cwd = os.getcwd().replace(os.path.expanduser("~"), "~")
+
+    from leapflow.engine.session import SessionMode
+    mode = "idle"
+    if ctx.session:
+        if ctx.session.mode == SessionMode.LEARNING:
+            mode = "learning"
+        elif ctx.session.mode == SessionMode.EXECUTING:
+            mode = "executing"
+
+    gateway_connected: list[str] = []
+    gw = getattr(ctx, "gateway_server", None)
+    if gw is not None:
+        statuses = gw.platform_status()
+        for s in statuses:
+            if s.connected:
+                m = gw.manifests.get(s.platform_id)
+                gateway_connected.append(m.display_name if m else s.platform_id)
+
+    return {
+        "ok": True,
+        "view": "status",
+        "model": ctx.settings.llm_model,
+        "context_length": context_length,
+        "context_used": context_used,
+        "turn_count": turn_count,
+        "platform": platform_status,
+        "cwd": cwd,
+        "config_path": str(ctx.settings.data_dir / ".env").replace(os.path.expanduser("~"), "~"),
+        "session_id": getattr(ctx.session, "session_id", "") if ctx.session else "",
+        "mode": mode,
+        "gateway_connected": gateway_connected,
+    }
+
+
+def build_gateway_payload(ctx: "Context") -> dict[str, Any]:
+    """Build a serializable gateway status payload."""
+    import time as _time
+
+    gw = getattr(ctx, "gateway_server", None)
+    if gw is None:
+        return {"ok": False, "message": "Gateway not initialised."}
+
+    statuses = gw.platform_status()
+    if not statuses:
+        return {"ok": True, "view": "gateway", "connected": [], "configured": [], "available": []}
+
+    connected = []
+    configured = []
+    available = []
+    for s in statuses:
+        m = gw.manifests.get(s.platform_id)
+        name = m.display_name if m else s.platform_id
+        if s.connected:
+            uptime = ""
+            if s.connected_since > 0:
+                secs = int(_time.time() - s.connected_since)
+                if secs < 60:
+                    uptime = f"{secs}s"
+                elif secs < 3600:
+                    uptime = f"{secs // 60}m"
+                else:
+                    uptime = f"{secs // 3600}h {(secs % 3600) // 60}m"
+            connected.append({"name": name, "id": s.platform_id, "uptime": uptime})
+        elif s.error:
+            configured.append({"name": name, "id": s.platform_id})
+        else:
+            available.append({"name": name, "id": s.platform_id})
+    return {"ok": True, "view": "gateway", "connected": connected, "configured": configured, "available": available}
+
+
+async def _execute_host(ctx: "Context", args: str) -> dict[str, Any]:
+    """Execute /host command."""
+    action = args.strip().lower() if args.strip() else "status"
+    if action not in {"status", "start", "stop", "restart"}:
+        return {"ok": False, "message": "Usage: /host [status|start|stop|restart]"}
+    if action == "status":
+        result = await ctx.host_backend_status()
+    elif action == "start":
+        result = await ctx.host_backend_start()
+    elif action == "stop":
+        result = await ctx.host_backend_stop()
+    else:
+        result = await ctx.host_backend_restart()
+    return {"ok": True, "view": "host", "action": action, "result": result}
+
+
+async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]:
+    """Execute teach commands.
+
+    Returns ``session_mode`` in the payload so the TUI client can track
+    whether it should route subsequent inputs as annotations.
+    """
+    from leapflow.engine.session import SessionMode
+
+    full_cmd = name + (" " + args if args else "")
+    if full_cmd in ("teach start", "teach") or full_cmd.startswith("teach start "):
+        if ctx.session and ctx.session.mode == SessionMode.LEARNING:
+            return {"ok": False, "message": "Already in teaching mode. Say '/teach stop' to end.", "session_mode": "learning"}
+        goal = args if name == "teach start" else ""
+        try:
+            session = await ctx.session.enter_learning(goal=goal)
+            msg = f"Teaching started — session {session.session_id}"
+            if goal:
+                msg += f"\nGoal: {goal}"
+            msg += "\nCommands: /teach stop │ /teach discard │ /teach pause │ /teach resume │ /teach skip [n] │ /annotate <text>"
+            return {"ok": True, "message": msg, "session_mode": "learning"}
+        except Exception as e:
+            return {"ok": False, "message": str(e)}
+
+    if name == "teach stop":
+        if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
+            return {"ok": False, "message": "Not in teaching mode.", "session_mode": "idle"}
+        try:
+            result = await ctx.session.exit_learning()
+            return {
+                "ok": True,
+                "message": f"Recording stopped — {result.step_count} steps, {result.duration:.1f}s",
+                "step_count": result.step_count,
+                "duration": result.duration,
+                "session_mode": "idle",
+            }
+        except Exception as e:
+            return {"ok": False, "message": str(e), "session_mode": "idle"}
+
+    if name == "teach pause":
+        if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
+            return {"ok": False, "message": "Not in teaching mode."}
+        ctx.session.pause_learning()
+        return {"ok": True, "message": "Teaching paused.", "session_mode": "learning"}
+
+    if name == "teach resume":
+        if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
+            return {"ok": False, "message": "Not in teaching mode."}
+        ctx.session.resume_learning()
+        return {"ok": True, "message": "Teaching resumed.", "session_mode": "learning"}
+
+    if name == "teach discard":
+        if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
+            return {"ok": False, "message": "Not in teaching mode."}
+        ctx.session.discard_learning()
+        return {"ok": True, "message": "Recording discarded.", "session_mode": "idle"}
+
+    if name == "teach skip":
+        if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
+            return {"ok": False, "message": "Not in teaching mode."}
+        n = 1
+        if args.strip().isdigit():
+            n = int(args.strip())
+        ctx.session.skip_steps(n)
+        return {"ok": True, "message": f"Marked last {n} step(s) as noise.", "session_mode": "learning"}
+
+    if name == "annotate":
+        if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
+            return {"ok": False, "message": "Not in teaching mode."}
+        if not args.strip():
+            return {"ok": False, "message": "Usage: /annotate <text>"}
+        ctx.session.annotate(args.strip())
+        return {"ok": True, "message": f"Annotation recorded: {args.strip()}", "session_mode": "learning"}
+
+    return {"ok": False, "message": f"Unknown teach command: /{full_cmd}"}
+
+
+def _execute_skills(ctx: "Context", name: str, args: str) -> dict[str, Any]:
+    """Execute skills commands."""
+    full_cmd = name + (" " + args if args else "")
+    if full_cmd in ("skills", "skills list"):
+        skills = ctx.registry.list_all() if ctx.registry else []
+        if not skills:
+            return {"ok": True, "view": "skills_list", "skills": []}
+        entries = []
+        for s in skills:
+            m = s.metadata
+            entries.append({
+                "name": s.name,
+                "version": m.version,
+                "confidence": m.confidence,
+                "description": s.description[:80],
+            })
+        return {"ok": True, "view": "skills_list", "skills": entries}
+
+    if name == "skills show":
+        skill_name = args.strip()
+        if not skill_name:
+            return {"ok": False, "message": "Usage: /skills show <name>"}
+        skill = ctx.registry.get(skill_name) if ctx.registry else None
+        if skill is None:
+            return {"ok": False, "message": f"Skill '{skill_name}' not found."}
+        m = skill.metadata
+        return {
+            "ok": True,
+            "view": "skills_show",
+            "name": skill.name,
+            "description": skill.description,
+            "version": m.version,
+            "confidence": m.confidence,
+            "triggers": list(skill.triggers) if skill.triggers else [],
+        }
+
+    if name == "skills disable":
+        skill_name = args.strip()
+        if not skill_name:
+            return {"ok": False, "message": "Usage: /skills disable <name>"}
+        found = False
+        if ctx.skill_lib and ctx.skill_lib.deactivate_parameterized(skill_name):
+            found = True
+        if ctx.registry and ctx.registry.unregister(skill_name):
+            found = True
+        if found:
+            return {"ok": True, "message": f"Skill '{skill_name}' disabled."}
+        return {"ok": False, "message": f"Skill '{skill_name}' not found."}
+
+    if name == "skills delete":
+        skill_name = args.strip()
+        if not skill_name:
+            return {"ok": False, "message": "Usage: /skills delete <name>"}
+        found = False
+        if ctx.skill_lib:
+            stored = ctx.skill_lib.load_skill_by_title(skill_name)
+            if stored:
+                stored.status = "deleted"
+                ctx.skill_lib.update_skill(stored)
+                found = True
+        if ctx.registry and ctx.registry.unregister(skill_name):
+            found = True
+        if found:
+            return {"ok": True, "message": f"Skill '{skill_name}' deleted."}
+        return {"ok": False, "message": f"Skill '{skill_name}' not found."}
+
+    return {"ok": False, "message": f"Unknown skills command: /{full_cmd}"}
+
+
+async def _execute_hub(ctx: "Context", name: str, args: str) -> dict[str, Any]:
+    """Execute hub commands."""
+    try:
+        from leapflow.cli.commands.hub import cmd_hub_payload
+        return await cmd_hub_payload(ctx, name, args)
+    except ImportError:
+        pass
+    # Fallback: basic hub dispatch
+    sub = name[len("hub"):].strip() if name.startswith("hub") else ""
+    if not sub:
+        sub = args.split()[0] if args.split() else ""
+        args = " ".join(args.split()[1:])
+    return {"ok": False, "message": f"Hub command '/{name} {args}'.strip() is not yet implemented in this runtime."}
+
+
+def _execute_scheduler_tasks(ctx: "Context") -> dict[str, Any]:
+    """Execute /tasks command."""
+    scheduler = getattr(ctx, "scheduler", None)
+    if scheduler is None:
+        return {"ok": True, "view": "tasks", "tasks": [], "message": "No scheduler active."}
+    tasks = scheduler.list_tasks() if hasattr(scheduler, "list_tasks") else []
+    entries = [
+        {"name": t.name, "schedule": t.schedule, "next_run": str(getattr(t, "next_run", ""))}
+        for t in tasks
+    ]
+    return {"ok": True, "view": "tasks", "tasks": entries}
+
+
+async def _execute_scheduler_arm(ctx: "Context", args: str) -> dict[str, Any]:
+    """Execute /arm command."""
+    scheduler = getattr(ctx, "scheduler", None)
+    if scheduler is None:
+        return {"ok": False, "message": "Scheduler not active in this session."}
+    tokens = args.strip().split(None, 1)
+    if len(tokens) < 2:
+        return {"ok": False, "message": "Usage: /arm <skill> <cron>"}
+    skill_name, cron_expr = tokens
+    try:
+        task_id = await scheduler.arm(skill_name, cron_expr)
+        return {"ok": True, "message": f"Armed: {skill_name} → {cron_expr} (id={task_id})"}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+
+def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    """Render a generic command_execute result payload in the TUI."""
+    if not payload.get("ok"):
+        console.warning(str(payload.get("message") or payload.get("error") or "Command failed."))
+        return
+
+    view = str(payload.get("view") or "")
+
+    if view == "status":
+        _render_status_view(console, payload)
+        return
+    if view == "gateway":
+        _render_gateway_view(console, payload)
+        return
+    if view == "host":
+        _render_host_view(console, payload)
+        return
+    if view == "skills_list":
+        _render_skills_list_view(console, payload)
+        return
+    if view == "skills_show":
+        _render_skills_show_view(console, payload)
+        return
+    if view == "tasks":
+        _render_tasks_view(console, payload)
+        return
+
+    msg = payload.get("message")
+    if msg:
+        console.success(str(msg))
+
+
+def _render_status_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    from rich.panel import Panel
+    from rich.text import Text
+
+    info = Text()
+    info.append("Model:     ", style="dim")
+    info.append(f"{payload.get('model')}\n", style="bold")
+
+    ctx_len = int(payload.get("context_length") or 0)
+    ctx_used = int(payload.get("context_used") or 0)
+    turn_count = int(payload.get("turn_count") or 0)
+    if ctx_len:
+        pct = int(ctx_used * 100 / ctx_len) if ctx_len else 0
+        info.append("Context:   ", style="dim")
+        pct_style = "bold red" if pct >= 90 else ("yellow" if pct >= 75 else "")
+        info.append(f"{ctx_used:,} / {ctx_len:,} ({pct}%)\n", style=pct_style)
+    info.append("Turns:     ", style="dim")
+    info.append(f"{turn_count}\n")
+    info.append("Platform:  ", style="dim")
+    p_status = str(payload.get("platform") or "")
+    p_style = "green" if p_status == "connected" else "dim"
+    info.append(f"{p_status}\n", style=p_style)
+    info.append("CWD:       ", style="dim")
+    info.append(f"{payload.get('cwd')}\n")
+    info.append("Config:    ", style="dim")
+    info.append(f"{payload.get('config_path')}\n")
+    session_id = payload.get("session_id")
+    if session_id:
+        info.append("Session:   ", style="dim")
+        info.append(f"{session_id}\n")
+    info.append("Mode:      ", style="dim")
+    info.append(f"{payload.get('mode')}\n")
+    gw = payload.get("gateway_connected") or []
+    if gw:
+        info.append("Gateway:   ", style="dim")
+        info.append(f"{', '.join(gw)}\n", style="green")
+
+    console.print(Panel(info, title="[bold cyan]LeapFlow Status[/]", border_style="bright_black", padding=(0, 2)))
+
+
+def _render_gateway_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    from rich.panel import Panel
+    from rich.text import Text
+
+    info = Text()
+    connected = payload.get("connected") or []
+    configured = payload.get("configured") or []
+    available = payload.get("available") or []
+
+    if connected:
+        info.append("Connected\n", style="bold green")
+        for entry in connected:
+            uptime = f" ({entry['uptime']})" if entry.get("uptime") else ""
+            info.append(f"  ● {entry['name']}{uptime}\n", style="green")
+    if configured:
+        info.append("Configured (not connected)\n", style="bold yellow")
+        for entry in configured:
+            info.append(f"  ○ {entry['name']}\n", style="yellow")
+    if available:
+        info.append("Available\n", style="bold dim")
+        names = [entry["name"] for entry in available]
+        info.append(f"  {', '.join(names)}\n", style="dim")
+    info.append("\n", style="dim")
+    info.append('Say "connect to <platform>" to set up a new integration.', style="dim italic")
+    console.print(Panel(info, title="[bold cyan]Gateway[/]", border_style="bright_black", padding=(0, 2)))
+
+
+def _render_host_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    result = payload.get("result") or {}
+    action = payload.get("action") or "status"
+    if action != "status":
+        console.success(f"Host {action} completed.")
+    lines = []
+    for key in ("status", "backend", "pid", "session_id"):
+        if key in result:
+            lines.append(f"  {key}: {result[key]}")
+    if lines:
+        console.system("\n".join(lines))
+
+
+def _render_skills_list_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    from rich.table import Table
+
+    skills = payload.get("skills") or []
+    if not skills:
+        console.system("No skills registered.")
+        return
+    table = Table(show_header=True, header_style="bold", border_style="dim")
+    table.add_column("Name", style="cyan", max_width=30)
+    table.add_column("Version", justify="center")
+    table.add_column("Confidence", justify="center")
+    table.add_column("Description", max_width=40)
+    for s in skills:
+        table.add_row(
+            str(s.get("name") or ""),
+            f"v{s.get('version', 0)}",
+            f"{float(s.get('confidence') or 0):.0%}",
+            str(s.get("description") or "")[:40],
+        )
+    console.print(table)
+
+
+def _render_skills_show_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    from rich.panel import Panel
+    from rich.text import Text
+
+    info = Text()
+    info.append(f"Name:        {payload.get('name')}\n")
+    info.append(f"Description: {payload.get('description')}\n")
+    info.append(f"Version:     v{payload.get('version', 0)}\n")
+    info.append(f"Confidence:  {float(payload.get('confidence') or 0):.0%}\n")
+    triggers = payload.get("triggers") or []
+    if triggers:
+        info.append(f"Triggers:    {', '.join(triggers)}")
+    console.print(Panel(info, title=str(payload.get("name") or "Skill"), border_style="cyan"))
+
+
+def _render_tasks_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    tasks = payload.get("tasks") or []
+    msg = payload.get("message")
+    if msg:
+        console.system(str(msg))
+        return
+    if not tasks:
+        console.system("No scheduled tasks.")
+        return
+    from rich.table import Table
+    table = Table(show_header=True, header_style="bold", border_style="dim")
+    table.add_column("Name", style="cyan")
+    table.add_column("Schedule")
+    table.add_column("Next Run")
+    for t in tasks:
+        table.add_row(str(t.get("name") or ""), str(t.get("schedule") or ""), str(t.get("next_run") or ""))
+    console.print(table)

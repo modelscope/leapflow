@@ -423,6 +423,10 @@ async def _action_preflight(
     if manifest is None:
         return {"ok": False, "error": f"Unknown platform: {platform}"}
     preflight = await _run_manifest_preflight(platform, manifest, params)
+    if preflight.get("ready"):
+        clear_health = getattr(_gateway_server_ref, "clear_platform_capability_health", None)
+        if clear_health is not None:
+            clear_health(platform)
     state = _remember_app_onboarding(platform, manifest, preflight)
     return {
         "ok": bool(preflight.get("ready")),
@@ -629,6 +633,11 @@ async def _action_status(
                 result = _status_entry(s)
                 result["ok"] = True
                 result["platform"] = result.pop("id")
+                if result.get("connected"):
+                    clear_health = getattr(_gateway_server_ref, "clear_platform_capability_health", None)
+                    if clear_health is not None:
+                        clear_health(platform)
+                    result["capability_health_refreshed"] = True
                 return result
         return {"ok": False, "error": f"Platform not found: {platform}"}
     return {"ok": True, "platforms": [_status_entry(s) for s in statuses]}

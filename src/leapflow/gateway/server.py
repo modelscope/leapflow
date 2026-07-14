@@ -540,6 +540,15 @@ class GatewayServer:
             return {"ok": True}
         return self._capability_health.check_feasibility(platform_id, spec)
 
+    def clear_platform_capability_health(self, platform_id: str) -> None:
+        """Forget stale authorization failures for a platform.
+
+        Management flows such as status/preflight use this as an explicit
+        refresh boundary. The next business action revalidates against the live
+        backend and records a fresh failure if authorization is still missing.
+        """
+        self._capability_health.clear(platform_id)
+
     def capability_health_summary(self) -> List[Dict[str, Any]]:
         """Return compact non-secret capability health diagnostics."""
         return self._capability_health.summary()
@@ -592,6 +601,10 @@ class GatewayServer:
                         result.failure,
                     )
                 elif result.ok:
+                    self._capability_health.record_success(
+                        platform_id,
+                        spec.capability or spec.name,
+                    )
                     resource_fields = self._collect_all_resource_fields(platform_id)
                     if resource_fields and result.data:
                         self._resource_provenance.register_from_result(

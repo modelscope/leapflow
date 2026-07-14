@@ -829,6 +829,7 @@ async def cmd_interactive_daemon(
     from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
         render_app_payload,
+        render_command_payload,
         render_model_payload,
         render_tools_payload,
         render_usage_payload,
@@ -1092,119 +1093,92 @@ async def cmd_interactive_daemon(
             console.system("Retrying the interrupted request once after reconnecting to leapd.")
             await _stream_response(prompt_text, allow_retry=False, record_user=False)
 
+    # Session mode tracking for teaching — daemon-side state mirrored here
+    daemon_session_mode = "idle"
+
     async def handle_input(text: str) -> None:
+        nonlocal daemon_session_mode
+
         invocation = command_router.parse(text)
         if invocation is not None:
-            unsupported = command_router.unsupported_result(invocation)
-            if unsupported is not None:
-                render_command_result(console, unsupported)
-                return
             canonical = invocation.command.name
             cmd_args = invocation.args
-            if canonical == "exit":
-                app.exit()
-                return
-            if canonical == "help":
-                _show_help(console, runtime="daemon")
-                return
-            if canonical == "status":
-                await _print_daemon_status()
-                return
-            if canonical == "host":
-                action = _host_action(cmd_args)
-                try:
-                    if action == "status":
-                        result = await bridge.call(
-                            lambda current_client: current_client.host_status(),
-                            description="host status",
-                        )
-                    elif action == "start":
-                        console.system("Starting CuaDriver OS control for this session…")
-                        result = await bridge.call(
-                            lambda current_client: current_client.host_start(),
-                            description="host start",
-                        )
-                    elif action == "stop":
-                        console.system("Stopping CuaDriver OS control; chat and memory stay available…")
-                        result = await bridge.call(
-                            lambda current_client: current_client.host_stop(),
-                            description="host stop",
-                        )
-                    elif action == "restart":
-                        console.system("Restarting CuaDriver OS control…")
-                        result = await bridge.call(
-                            lambda current_client: current_client.host_restart(),
-                            description="host restart",
-                        )
-                    else:
-                        console.warning("Usage: /host [status|start|stop|restart]")
-                        return
-                except Exception as exc:
-                    console.warning(f"Host control failed: {exc}")
+
+            # Client-local commands: handled directly by the TUI
+            if invocation.command.client_local:
+                if canonical == "exit":
+                    if daemon_session_mode == "learning":
+                        try:
+                            await bridge.call(
+                                lambda c: c.command_execute("teach stop", ""),
+                                description="/teach stop",
+                            )
+                        except Exception:
+                            pass
+                    app.exit()
                     return
-                _apply_daemon_runtime_metadata({"host_backend": result})
-                _print_host_status(console, result)
-                _update_status()
-                return
-            if canonical == "clear":
-                _render_banner()
-                return
-            if canonical == "tools":
-                try:
-                    payload = await bridge.call(
-                        lambda current_client: current_client.tools_list(),
-                        description="tools list",
-                    )
-                except Exception as exc:
-                    console.warning(f"Tools unavailable: {exc}")
+                if canonical == "help":
+                    _show_help(console, runtime="daemon")
                     return
-                render_tools_payload(console, payload)
-                return
-            if canonical == "usage":
-                try:
-                    payload = await bridge.call(
-                        lambda current_client: current_client.usage_summary(),
-                        description="usage summary",
-                    )
-                except Exception as exc:
-                    console.warning(f"Usage unavailable: {exc}")
+                if canonical == "clear":
+                    _render_banner()
                     return
-                render_usage_payload(console, payload)
+                # Task control commands are handled by the existing _handle_task_control
+                _handle_task_control(text)
                 return
-            if canonical == "model":
-                try:
-                    payload = await bridge.call(
-                        lambda current_client: current_client.model_info(cmd_args),
-                        description="model info",
-                    )
-                except Exception as exc:
-                    console.warning(f"Model info unavailable: {exc}")
-                    return
-                render_model_payload(console, payload)
+
+            # Engine-routed commands: dispatch through daemon RPC
+            try:
+                payload = await bridge.call(
+                    lambda current_client: current_client.command_execute(canonical, cmd_args),
+                    description=f"/{canonical}",
+                )
+            except Exception as exc:
+                console.warning(f"/{canonical} failed: {exc}")
                 return
-            if _is_app_command(canonical):
-                app_args = invocation.text[len("app"):].strip()
-                try:
-                    payload = await bridge.call(
-                        lambda current_client: current_client.app_command(app_args),
-                        description="app command",
-                    )
-                except Exception as exc:
-                    console.warning(f"App Connector unavailable: {exc}")
-                    return
-                render_app_payload(console, payload)
-                return
-            if canonical == "run":
-                if not cmd_args:
-                    console.warning("Usage: /run <trigger>")
-                    return
+
+            # Track session mode changes (teach start/stop/discard)
+            new_mode = payload.get("session_mode")
+            if isinstance(new_mode, str):
+                daemon_session_mode = new_mode
+
+            # Special case: streaming commands (like /run) need chat stream
+            if payload.get("stream") and payload.get("prompt"):
                 console.system("Running through daemon chat stream; approvals and host state stay visible.")
-                await _stream_response(cmd_args)
+                await _stream_response(str(payload["prompt"]))
                 return
-            console.warning(
-                f"/{canonical} is not available in daemon mode yet. "
-                "Use --no-daemon for legacy in-process commands."
-            )
+
+            # Special case: /host with runtime metadata
+            if payload.get("view") == "host" and payload.get("result"):
+                _apply_daemon_runtime_metadata({"host_backend": payload["result"]})
+                _update_status()
+
+            # Render: app-specific views use app renderer, others use generic
+            view = str(payload.get("view") or "")
+            if view in ("list", "guide", "connect", "disconnect", "remove", "events", "actions") and "result" in payload:
+                render_app_payload(console, payload)
+            else:
+                render_command_payload(console, payload)
+            return
+
+        # Learning mode: route non-command text as annotation
+        if daemon_session_mode == "learning":
+            try:
+                payload = await bridge.call(
+                    lambda current_client: current_client.command_execute("annotate", text),
+                    description="annotate",
+                )
+            except Exception as exc:
+                console.warning(f"Annotation failed: {exc}")
+                return
+            # If session ended unexpectedly, track it
+            new_mode = payload.get("session_mode")
+            if isinstance(new_mode, str):
+                daemon_session_mode = new_mode
+            if payload.get("ok"):
+                console.system(f"(Noted as annotation during learning)")
+            else:
+                console.warning(str(payload.get("message") or "Annotation failed."))
             return
 
         console.rule()
@@ -1632,16 +1606,13 @@ def _show_help(console, runtime: str = "in_process") -> None:
                 ]
                 if visible:
                     aliases = f" [dim]({', '.join(visible)})[/]"
-            support = ""
-            if not cmd.supports_runtime(runtime):  # type: ignore[arg-type]
-                support = " [dim]not in daemon[/]" if runtime == "daemon" else " [dim]not in this mode[/]"
             effect = ""
             if cmd.requires_host:
                 effect = " [dim]host[/]"
             elif cmd.requires_llm:
                 effect = " [dim]llm[/]"
             console.print(
-                f"    [cyan]{name:<28}[/] {cmd.description}{aliases}{effect}{support}"
+                f"    [cyan]{name:<28}[/] {cmd.description}{aliases}{effect}"
             )
         console.print()
 

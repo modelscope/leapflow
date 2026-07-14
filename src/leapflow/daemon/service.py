@@ -230,6 +230,12 @@ class RuntimeLeapService:
 
         return await build_app_payload(self.context, args)
 
+    async def command_execute(self, name: str, args: str = "") -> dict[str, Any]:
+        """Execute any engine-routed slash command via unified dispatch."""
+        from leapflow.cli.commands.slash_handlers import command_execute
+
+        return await command_execute(self.context, name, args)
+
     async def approval_status(self) -> dict[str, Any]:
         """Return currently pending daemon approval requests."""
         return {"pending": self._pending_payloads()}

@@ -83,13 +83,9 @@ class CommandRouter:
         )
 
     def unsupported_result(self, invocation: CommandInvocation) -> CommandResult | None:
-        """Return a standard unsupported-runtime result when needed."""
-        if invocation.command.supports_runtime(invocation.runtime):
-            return None
-        mode = "daemon" if invocation.runtime == "daemon" else "in-process"
-        return CommandResult(
-            ok=False,
-            title=f"/{invocation.command.name} is not available in {mode} mode yet.",
-            summary="The command is registered, but its execution backend has not reached parity in this runtime.",
-            next_actions=("Use /help to see runtime support", "Try --no-daemon if this is a legacy command"),
-        )
+        """Return None — all commands now support all runtimes.
+
+        Client-local commands are handled directly by the TUI.
+        Engine-routed commands are dispatched through daemon RPC.
+        """
+        return None
