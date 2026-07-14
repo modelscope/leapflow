@@ -14,6 +14,7 @@ class ActionKind(str, Enum):
     """High-level action families that may require approval."""
 
     SHELL_COMMAND = "shell.command"
+    FILE_READ = "file.read"
     FILE_WRITE = "file.write"
     FILE_DELETE = "file.delete"
     GATEWAY_SEND = "gateway.send"
@@ -85,6 +86,25 @@ class ActionDescriptor:
             effect=ActionEffect.EXECUTE.value,
             resource=str(cwd or "shell"),
             origin=origin,
+            metadata=merged,
+        )
+
+    @classmethod
+    def file_read(
+        cls,
+        path: str,
+        *,
+        mode: str = "raw",
+        metadata: dict[str, Any] | None = None,
+    ) -> "ActionDescriptor":
+        merged = dict(metadata or {})
+        merged.update({"mode": mode})
+        return cls(
+            kind=ActionKind.FILE_READ.value,
+            summary=f"Read file: {path}",
+            detail=f"Read local file content from {path}",
+            effect=ActionEffect.READ.value,
+            resource=path,
             metadata=merged,
         )
 

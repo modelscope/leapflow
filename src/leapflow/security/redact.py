@@ -88,7 +88,8 @@ def _mask_token(token: str, *, preserve_prefix: int = 6, preserve_suffix: int = 
     """Mask a secret token, preserving prefix/suffix for identification."""
     if len(token) < 18:
         return "***"
-    return f"{token[:preserve_prefix]}...{token[-preserve_suffix:]}"
+    suffix = token[-preserve_suffix:] if preserve_suffix > 0 else ""
+    return f"{token[:preserve_prefix]}...{suffix}"
 
 
 def redact_sensitive_text(

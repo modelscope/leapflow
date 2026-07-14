@@ -3,22 +3,40 @@
 This module decides how much runtime context a turn should disclose before the
 provider call. It does not answer the user, execute tools, or split the agent
 runtime into multiple loops.
+
+Design contract (do not regress): disclosure decisions are derived *only* from
+structural, deterministic runtime facts — capability manifests (static tool
+metadata) and stable runtime gates (slash commands, context posture, recent
+failures, prior-turn tool-category continuity). Reading the user's free-form
+text to guess which tools "sound relevant" is explicitly forbidden here: that
+approach has unbounded coverage gaps and was the root cause of LLMs inventing
+non-existent tool names when their real need fell outside a keyword table.
+The compact tool index (Tier 0) is therefore always disclosed in full, and a
+static low-risk tool whitelist (Tier 0.5) is always native-callable, so a turn
+never presents an empty or contradictory tool contract to the model.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
 
 
 class DisclosureLevel(str, Enum):
-    """Stable disclosure levels understood by the unified loop."""
+    """Stable disclosure levels understood by the unified loop.
 
-    LIGHT = "light"
-    INDEXED_CAPABILITIES = "indexed_capabilities"
-    SELECTED_TOOLS = "selected_tools"
-    PROJECT_RESEARCH = "project_research"
+    CORE: Tier 0 compact index + Tier 0.5 static low-risk tool whitelist.
+        This is the floor — it is never empty and never omitted.
+    EXPANDED: CORE plus Tier 1 categories opened by a structural gate
+        (prior-turn continuity, or a model-initiated capability_expand call
+        already reflected in this turn's native tool schema).
+    FULL: All registered tool schemas, for high-stakes/broad-context turns
+        (slash commands, research/converging/finalizing posture, recent
+        failure recovery).
+    """
+
+    CORE = "core"
+    EXPANDED = "expanded"
     FULL = "full"
 
 
@@ -49,7 +67,13 @@ class ReasoningDisclosure(str, Enum):
 
 @dataclass(frozen=True)
 class CapabilityManifest:
-    """Compact runtime-facing capability metadata derived from tool schemas."""
+    """Compact runtime-facing capability metadata derived from tool schemas.
+
+    All fields here are *static* tool properties, declared once at tool
+    registration time (via the optional ``x_leapflow`` schema extension) or
+    inferred from the tool's own name/description. None of them are derived
+    from a given turn's user text.
+    """
 
     name: str
     category: str
@@ -74,7 +98,7 @@ class CapabilityManifest:
         )
         metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
         category = str(metadata.get("category") or _infer_category(name, description))
-        signals = _metadata_signals(metadata.get("input_signals")) or _signals_for_category(category)
+        signals = _metadata_signals(metadata.get("input_signals"))
         risk_level = str(metadata.get("risk_level") or _risk_for_category(category))
         requires_approval = bool(metadata.get("requires_approval", category in {"write", "shell", "gateway"}))
         schema_cost = str(metadata.get("schema_cost") or ("high" if category in {"hub", "gateway", "delegate"} else "medium"))
@@ -87,6 +111,15 @@ class CapabilityManifest:
             requires_approval=requires_approval,
             schema_cost=schema_cost,
         )
+
+    @property
+    def is_core(self) -> bool:
+        """Return whether this tool belongs in the always-on Tier 0.5 whitelist.
+
+        Core tools are read-only and cheap to disclose (small schema). This is
+        a static property of the tool, evaluated once — never a per-turn guess.
+        """
+        return self.risk_level == "read_only" and self.schema_cost != "high"
 
 
 @dataclass(frozen=True)
@@ -104,6 +137,7 @@ class PromptAssemblyPlan:
     risk_level: str = "none"
     reason: str = ""
     selected_tool_names: tuple[str, ...] = ()
+    expanded_categories: tuple[str, ...] = ()
     max_prior_turns: int = 2
 
     def metadata(self) -> dict[str, Any]:
@@ -113,6 +147,7 @@ class PromptAssemblyPlan:
             "reason": self.reason,
             "tools": list(self.selected_tool_names),
             "tool_count": len(self.selected_tool_names),
+            "expanded_categories": list(self.expanded_categories),
             "memory": self.memory.value,
             "history": self.history.value,
             "reasoning": self.reasoning.value,
@@ -124,128 +159,103 @@ class PromptAssemblyPlan:
 
 @dataclass(frozen=True)
 class DisclosureRuntimeState:
-    """Low-cost signals available before assembling the provider payload."""
+    """Low-cost, structural signals available before assembling the provider payload.
+
+    Every field here is a deterministic runtime fact, never a text-matching
+    verdict: enable_thinking is a user/runtime toggle, native_tools_enabled is
+    a settings flag, slash_command/context_posture/recent_failure are
+    structured session state, and last_turn_tool_categories is derived from
+    the prior turn's actual tool_calls (not from re-reading its text).
+    """
 
     enable_thinking: bool = False
     native_tools_enabled: bool = False
     slash_command: bool = False
     context_posture: str = "baseline"
     recent_failure: bool = False
+    last_turn_tool_categories: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
 class DisclosurePlanner:
-    """Manifest-driven planner for progressive context disclosure."""
+    """Manifest-driven planner for progressive context disclosure.
+
+    No natural-language fitting of any kind is performed here. Every branch
+    decides purely from ``DisclosureRuntimeState`` (structural facts) and
+    ``CapabilityManifest`` (static tool metadata).
+    """
 
     manifests: tuple[CapabilityManifest, ...] = field(default_factory=tuple)
 
     def plan(
         self,
-        user_text: str,
         tool_definitions: Sequence[Mapping[str, Any]],
         runtime: DisclosureRuntimeState,
     ) -> PromptAssemblyPlan:
-        """Build a prompt assembly plan without invoking another LLM."""
-        manifests = self.manifests or tuple(CapabilityManifest.from_tool_definition(td) for td in tool_definitions)
-        if runtime.slash_command or runtime.context_posture in {"research", "finalizing"}:
-            return self.full_plan(user_text, tool_definitions, runtime, "runtime posture requires full agent context")
+        """Build a prompt assembly plan from structural runtime facts only."""
+        manifests = self.manifests or build_capability_manifests(tool_definitions)
+        manifest_by_name = {m.name: m for m in manifests if m.name}
 
-        if _asks_about_capabilities(user_text):
-            return PromptAssemblyPlan(
-                level=DisclosureLevel.INDEXED_CAPABILITIES,
-                catalog_definitions=tuple(tool_definitions),
-                memory=MemoryDisclosure.SESSION_SUMMARY,
-                history=HistoryDisclosure.SHORT,
-                reasoning=ReasoningDisclosure.OFF,
-                native_tools=False,
-                stream_mode="direct",
-                risk_level="none",
-                reason="capability question needs compact index but no executable schemas",
-                selected_tool_names=tuple(_tool_name(td) for td in tool_definitions if _tool_name(td)),
-                max_prior_turns=2,
-            )
+        if runtime.slash_command or runtime.context_posture in {"research", "converging", "finalizing"} or runtime.recent_failure:
+            return self.full_plan(tool_definitions, runtime, _full_reason(runtime))
 
-        selected = self._select_capabilities(user_text, manifests)
-        if _needs_project_research(user_text):
-            return self.project_research_plan(
-                user_text,
-                tool_definitions,
-                runtime,
-                "project research task needs scoped file/document evidence without full catalog",
-            )
-        if self._needs_full_context(user_text, selected, runtime):
-            return self.full_plan(user_text, tool_definitions, runtime, "task requires broad execution context")
+        core_defs, core_names = _core_whitelist(tool_definitions, manifest_by_name)
+        expanded_defs: list[Mapping[str, Any]] = list(core_defs)
+        expanded_names: set[str] = set(core_names)
+        expanded_categories: list[str] = []
 
-        if selected:
-            selected_names = {manifest.name for manifest in selected}
-            selected_defs = tuple(td for td in tool_definitions if _tool_name(td) in selected_names)
-            risk = _highest_risk(selected)
-            return PromptAssemblyPlan(
-                level=DisclosureLevel.SELECTED_TOOLS,
-                tool_definitions=selected_defs,
-                catalog_definitions=selected_defs,
-                memory=MemoryDisclosure.QUERY_RETRIEVAL if _needs_memory(user_text, selected) else MemoryDisclosure.NONE,
-                history=HistoryDisclosure.RECENT,
-                reasoning=ReasoningDisclosure.AUTO if runtime.enable_thinking else ReasoningDisclosure.OFF,
-                native_tools=runtime.native_tools_enabled and bool(selected_defs),
-                stream_mode="tool_aware",
-                risk_level=risk,
-                reason="selected capabilities matched observable task signals",
-                selected_tool_names=tuple(sorted(selected_names)),
-                max_prior_turns=6,
-            )
+        for category in sorted(runtime.last_turn_tool_categories):
+            if not category:
+                continue
+            matched = False
+            for tool_definition in tool_definitions:
+                name = _tool_name(tool_definition)
+                manifest = manifest_by_name.get(name)
+                if manifest and manifest.category == category and name not in expanded_names:
+                    expanded_defs.append(tool_definition)
+                    expanded_names.add(name)
+                    matched = True
+            if matched:
+                expanded_categories.append(category)
 
-        return PromptAssemblyPlan(
-            level=DisclosureLevel.LIGHT,
-            memory=MemoryDisclosure.NONE,
-            history=HistoryDisclosure.SHORT,
-            reasoning=ReasoningDisclosure.OFF,
-            native_tools=False,
-            stream_mode="direct",
-            risk_level="none",
-            reason="no external capability signal detected",
-            max_prior_turns=2,
+        level = DisclosureLevel.EXPANDED if expanded_categories else DisclosureLevel.CORE
+        reason = (
+            f"tier1: continuity({', '.join(expanded_categories)})"
+            if expanded_categories
+            else "tier0/0.5: static core whitelist"
         )
-
-    def project_research_plan(
-        self,
-        user_text: str,
-        tool_definitions: Sequence[Mapping[str, Any]],
-        runtime: DisclosureRuntimeState,
-        reason: str,
-    ) -> PromptAssemblyPlan:
-        """Build a scoped research plan for code/doc exploration tasks."""
-        selected_defs: list[Mapping[str, Any]] = []
-        selected_names: list[str] = []
-        for tool_definition in tool_definitions:
-            manifest = CapabilityManifest.from_tool_definition(tool_definition)
-            if manifest.category in {"file", "memory", "system"} and not manifest.requires_approval:
-                selected_defs.append(tool_definition)
-                if manifest.name:
-                    selected_names.append(manifest.name)
+        scoped_manifests = [manifest_by_name[name] for name in expanded_names if name in manifest_by_name]
         return PromptAssemblyPlan(
-            level=DisclosureLevel.PROJECT_RESEARCH,
-            tool_definitions=tuple(selected_defs),
-            catalog_definitions=tuple(selected_defs),
-            memory=MemoryDisclosure.TASK_RETRIEVAL,
-            history=HistoryDisclosure.RECENT,
-            reasoning=ReasoningDisclosure.AUTO if runtime.enable_thinking else ReasoningDisclosure.OFF,
-            native_tools=runtime.native_tools_enabled and bool(selected_defs),
-            stream_mode="tool_aware",
-            risk_level="read_only",
+            level=level,
+            tool_definitions=tuple(expanded_defs),
+            catalog_definitions=tuple(tool_definitions),
+            memory=MemoryDisclosure.QUERY_RETRIEVAL if expanded_categories else MemoryDisclosure.NONE,
+            history=HistoryDisclosure.RECENT if expanded_categories else HistoryDisclosure.SHORT,
+            # At the CORE floor (no Tier 1 category opened) skip reasoning entirely: a
+            # turn that only needs the static low-risk whitelist is, by construction, not
+            # complex enough to justify the added latency of provider-side reasoning.
+            reasoning=(
+                ReasoningDisclosure.AUTO
+                if runtime.enable_thinking and expanded_categories
+                else ReasoningDisclosure.OFF
+            ),
+            native_tools=runtime.native_tools_enabled and bool(expanded_defs),
+            stream_mode="tool_aware" if expanded_categories else "direct",
+            risk_level=_highest_risk(scoped_manifests),
             reason=reason,
-            selected_tool_names=tuple(sorted(set(selected_names))),
-            max_prior_turns=6,
+            selected_tool_names=tuple(sorted(expanded_names)),
+            expanded_categories=tuple(expanded_categories),
+            max_prior_turns=6 if expanded_categories else 2,
         )
 
     def full_plan(
         self,
-        user_text: str,
         tool_definitions: Sequence[Mapping[str, Any]],
         runtime: DisclosureRuntimeState,
         reason: str,
     ) -> PromptAssemblyPlan:
         """Build a full-disclosure fallback plan for safety and compatibility."""
+        manifests = self.manifests or build_capability_manifests(tool_definitions)
         names = tuple(_tool_name(td) for td in tool_definitions if _tool_name(td))
         return PromptAssemblyPlan(
             level=DisclosureLevel.FULL,
@@ -256,61 +266,41 @@ class DisclosurePlanner:
             reasoning=ReasoningDisclosure.AUTO if runtime.enable_thinking else ReasoningDisclosure.OFF,
             native_tools=runtime.native_tools_enabled and bool(tool_definitions),
             stream_mode="tool_aware",
-            risk_level="high" if _has_mutation_signal(user_text) else "medium",
+            risk_level=_highest_risk(manifests),
             reason=reason,
             selected_tool_names=names,
+            expanded_categories=tuple(sorted({m.category for m in manifests if m.category})),
             max_prior_turns=10,
         )
-
-    def _select_capabilities(
-        self,
-        user_text: str,
-        manifests: Sequence[CapabilityManifest],
-    ) -> tuple[CapabilityManifest, ...]:
-        normalized = _normalize(user_text)
-        selected: list[CapabilityManifest] = []
-        for manifest in manifests:
-            haystack = " ".join((manifest.name, manifest.category, manifest.summary, *manifest.input_signals)).lower()
-            if any(signal and signal in normalized for signal in manifest.input_signals):
-                selected.append(manifest)
-                continue
-            if any(token and token in normalized for token in _name_tokens(manifest.name)):
-                selected.append(manifest)
-                continue
-            if (
-                manifest.category in {"hub", "gateway"}
-                and any(token in normalized for token in ("hub", "gateway", "message", "send"))
-            ):
-                selected.append(manifest)
-                continue
-            if (
-                manifest.category == "delegate"
-                and any(token in normalized for token in ("delegate", "subagent", "parallel", "子任务"))
-            ):
-                selected.append(manifest)
-                continue
-            if any(token in normalized for token in _description_tokens(haystack)):
-                selected.append(manifest)
-        return tuple(_dedupe_by_name(selected))
-
-    def _needs_full_context(
-        self,
-        user_text: str,
-        selected: Sequence[CapabilityManifest],
-        runtime: DisclosureRuntimeState,
-    ) -> bool:
-        normalized = _normalize(user_text)
-        if runtime.recent_failure:
-            return True
-        if _has_complexity_signal(normalized):
-            return True
-        risky_selected = any(item.requires_approval for item in selected)
-        return risky_selected and _has_mutation_signal(normalized)
 
 
 def build_capability_manifests(tool_definitions: Sequence[Mapping[str, Any]]) -> tuple[CapabilityManifest, ...]:
     """Build manifests for all known tools."""
     return tuple(CapabilityManifest.from_tool_definition(tool) for tool in tool_definitions)
+
+
+def _core_whitelist(
+    tool_definitions: Sequence[Mapping[str, Any]],
+    manifest_by_name: Mapping[str, CapabilityManifest],
+) -> tuple[list[Mapping[str, Any]], list[str]]:
+    """Return the static Tier 0.5 whitelist: always-on, low-risk, cheap-schema tools."""
+    defs: list[Mapping[str, Any]] = []
+    names: list[str] = []
+    for tool_definition in tool_definitions:
+        name = _tool_name(tool_definition)
+        manifest = manifest_by_name.get(name)
+        if manifest is not None and manifest.is_core:
+            defs.append(tool_definition)
+            names.append(name)
+    return defs, names
+
+
+def _full_reason(runtime: DisclosureRuntimeState) -> str:
+    if runtime.slash_command:
+        return "gate: slash_command"
+    if runtime.recent_failure:
+        return "gate: recent_failure"
+    return f"gate: posture({runtime.context_posture})"
 
 
 def _tool_name(tool_definition: Mapping[str, Any]) -> str:
@@ -325,6 +315,16 @@ def _metadata_signals(value: Any) -> tuple[str, ...]:
 
 
 def _infer_category(name: str, description: str) -> str:
+    """Best-effort category guess for tools that declare no explicit x_leapflow.
+
+    This is purely a *bootstrap convenience* for a handful of well-known,
+    already-audited built-in tools — it must never be the mechanism that
+    grants a brand-new, unaudited tool core-whitelist eligibility. Anything
+    that does not match one of the recognized safe keyword patterns below
+    falls through to "unclassified", which `_risk_for_category` deliberately
+    treats as non-core by default (fail-closed): a future tool added without
+    explicit metadata must be reviewed and opted in, not silently trusted.
+    """
     text = f"{name} {description}".lower()
     if any(token in text for token in ("write", "replace", "delete", "store", "add")):
         return "write"
@@ -344,42 +344,23 @@ def _infer_category(name: str, description: str) -> str:
         return "gateway"
     if "time" in text or "environment" in text or "date" in text:
         return "system"
-    return "general"
-
-
-def _signals_for_category(category: str) -> tuple[str, ...]:
-    signals = {
-        "file": ("file", "path", "read", "list", "文件", "目录", "路径", ".py", ".md"),
-        "write": ("write", "edit", "modify", "replace", "save", "store", "写", "改", "保存", "记住"),
-        "shell": ("run", "command", "terminal", "execute", "pytest", "命令", "执行", "测试"),
-        "memory": ("memory", "remember", "recall", "history", "记忆", "回忆"),
-        "skill": ("skill", "capability", "能力", "技能"),
-        "system": ("time", "date", "env", "environment", "时间", "环境"),
-        "delegate": ("delegate", "subagent", "parallel", "子任务", "并行"),
-        "hub": ("hub", "publish", "install", "marketplace"),
-        "gateway": ("gateway", "message", "send", "notify", "发送", "通知"),
-    }
-    return signals.get(category, ())
+    return "unclassified"
 
 
 def _risk_for_category(category: str) -> str:
+    """Map a category to its default risk level.
+
+    ``unclassified`` deliberately does *not* fall through to "read_only": a
+    tool that could not be matched against any recognized safe keyword
+    pattern (and declared no explicit ``x_leapflow`` metadata) must not be
+    silently granted Tier 0.5 core-whitelist eligibility. Only categories
+    that have been explicitly reviewed as safe reach "read_only" here.
+    """
     if category in {"write", "shell", "gateway"}:
         return "high"
-    if category in {"delegate", "hub"}:
+    if category in {"delegate", "hub", "unclassified"}:
         return "medium"
     return "read_only"
-
-
-def _normalize(text: str) -> str:
-    return text.lower().strip()
-
-
-def _name_tokens(name: str) -> tuple[str, ...]:
-    return tuple(token for token in re.split(r"[_\W]+", name.lower()) if len(token) >= 3)
-
-
-def _description_tokens(text: str) -> tuple[str, ...]:
-    return tuple(token for token in re.split(r"\W+", text.lower()) if len(token) >= 8)
 
 
 def _dedupe_by_name(manifests: Iterable[CapabilityManifest]) -> list[CapabilityManifest]:
@@ -399,65 +380,3 @@ def _highest_risk(manifests: Sequence[CapabilityManifest]) -> str:
         if order.get(manifest.risk_level, 0) > order.get(highest, 0):
             highest = manifest.risk_level
     return highest
-
-
-def _asks_about_capabilities(text: str) -> bool:
-    normalized = _normalize(text)
-    return any(token in normalized for token in ("what can you do", "capabilities", "skills", "tools", "你能做", "有哪些能力", "技能", "工具"))
-
-
-def _needs_memory(text: str, manifests: Sequence[CapabilityManifest]) -> bool:
-    normalized = _normalize(text)
-    return any(manifest.category == "memory" for manifest in manifests) or any(
-        token in normalized for token in ("memory", "remember", "recall", "history", "记忆", "之前")
-    )
-
-
-def _needs_project_research(text: str) -> bool:
-    normalized = _normalize(text)
-    architecture_signals = (
-        "architecture", "diagram", "mermaid", "system design", "dependency map",
-        "架构", "框图", "架构图", "系统设计", "依赖图",
-    )
-    project_scope_signals = (
-        "project", "repo", "repository", "codebase", "docs", "documentation",
-        "项目", "仓库", "代码库", "文档",
-    )
-    code_scope_signals = (
-        "source", "src", "module", "package", "readme", "源码", "模块",
-    )
-    strong_research_verbs = (
-        "study", "research", "analyze", "inspect", "review", "summarize", "map",
-        "generate", "draw", "trace", "梳理", "研究", "分析", "总结", "生成",
-    )
-    weak_research_verbs = ("read", "give", "读取", "给出")
-    has_explicit_file = bool(re.search(r"[\w./-]+\.[a-z0-9]{1,8}\b", normalized))
-    has_architecture = any(signal in normalized for signal in architecture_signals)
-    has_project_scope = any(signal in normalized for signal in project_scope_signals)
-    has_code_scope = any(signal in normalized for signal in code_scope_signals)
-    has_strong_verb = any(verb in normalized for verb in strong_research_verbs)
-    has_weak_verb = any(verb in normalized for verb in weak_research_verbs)
-
-    if has_explicit_file and not (has_architecture or has_project_scope):
-        return False
-    if has_architecture and (has_strong_verb or has_weak_verb or has_project_scope):
-        return True
-    if has_project_scope and (has_strong_verb or (has_weak_verb and has_code_scope)):
-        return True
-    return has_strong_verb and has_project_scope and has_code_scope
-
-
-def _has_complexity_signal(normalized_text: str) -> bool:
-    return any(
-        token in normalized_text
-        for token in (
-            "implement", "refactor", "debug", "root cause", "architecture", "design",
-            "analyze", "test", "实现", "重构", "调试", "根因", "架构", "设计",
-            "深入分析", "执行", "代码", "测试",
-        )
-    )
-
-
-def _has_mutation_signal(text: str) -> bool:
-    normalized = _normalize(text)
-    return any(token in normalized for token in ("write", "edit", "modify", "delete", "send", "execute", "写", "改", "删", "发送", "执行"))

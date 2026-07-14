@@ -87,6 +87,32 @@ class DaemonClient:
         finally:
             await _close_writer(writer)
 
+    async def subscribe_notifications(self) -> AsyncIterator[dict[str, Any]]:
+        """Long-lived subscription stream for daemon push notifications.
+
+        Yields notification dicts with keys: event_type, payload, timestamp.
+        Runs until the server closes the stream or connection is lost.
+        """
+        request = RpcRequest(method="events.subscribe", params={})
+        reader, writer = await self._open()
+        try:
+            await _send(writer, request.to_json())
+            while True:
+                payload = await self._read_payload(reader)
+                method = payload.get("method")
+                params = dict(payload.get("params") or {})
+                if method == "stream.chunk" and params.get("id") == request.id:
+                    if params.get("done"):
+                        break
+                    metadata = params.get("metadata") or {}
+                    if metadata.get("event_type"):
+                        yield metadata
+                    continue
+                if payload.get("id") == request.id:
+                    break
+        finally:
+            await _close_writer(writer)
+
     async def engine_cancel(self) -> bool:
         """Request cancellation of the daemon-owned active engine turn."""
         result = await self.request("engine.cancel")
@@ -141,6 +167,11 @@ class DaemonClient:
     async def app_command(self, args: str = "") -> dict[str, Any]:
         """Return daemon-owned App Connector command payload."""
         result = await self.request("app.command", {"args": args})
+        return dict(result or {})
+
+    async def command_execute(self, name: str, args: str = "") -> dict[str, Any]:
+        """Execute any engine-routed slash command via daemon."""
+        result = await self.request("command.execute", {"name": name, "args": args})
         return dict(result or {})
 
     async def approval_status(self) -> dict[str, Any]:

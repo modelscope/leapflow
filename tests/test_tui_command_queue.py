@@ -16,7 +16,7 @@ from leapflow.cli.tui_app.app import LeapApp, _DynamicPlaceholderProcessor
 from leapflow.cli.tui_app.console import LeapConsole
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
 from leapflow.cli.tui_app.input import SlashCommandCompleter
-from leapflow.cli.tui_app.stream import StreamRenderer
+from leapflow.cli.tui_app.stream import StreamRenderer, _sanitize_final_response
 from leapflow.cli.tui_app.theme import _LIGHT, resolve_theme
 
 
@@ -419,6 +419,52 @@ def test_command_card_keeps_elapsed_in_title_not_body(monkeypatch) -> None:
     assert "summarize the current project layout" in body
 
 
+def test_response_label_merges_done_command_status(monkeypatch) -> None:
+    class CapturingConsole:
+        width = 100
+
+        def __init__(self) -> None:
+            self.rendered = []
+
+        def print(self, renderable) -> None:
+            self.rendered.append(renderable)
+
+    capture = CapturingConsole()
+    leap_console = LeapConsole(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    monkeypatch.setattr(leap_console, "_console", capture)
+
+    command = TuiCommand.create(command_id=1, text="连接飞书并查看可用的群组")
+    command = command.mark_running().mark_done()
+
+    leap_console.response_label(16.5, tool_count=3, command=command)
+
+    assert len(capture.rendered) == 1
+    assert capture.rendered[0].plain == " |--  LEAP  #1 done  16.5s  3 tools"
+
+
+def test_response_label_merges_blocked_command_status(monkeypatch) -> None:
+    class CapturingConsole:
+        width = 100
+
+        def __init__(self) -> None:
+            self.rendered = []
+
+        def print(self, renderable) -> None:
+            self.rendered.append(renderable)
+
+    capture = CapturingConsole()
+    leap_console = LeapConsole(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    monkeypatch.setattr(leap_console, "_console", capture)
+
+    command = TuiCommand.create(command_id=2, text="发送消息到飞书")
+    command = command.mark_running().mark_blocked("missing_scope: im.message.send")
+
+    leap_console.response_label(9.4, tool_count=1, command=command)
+
+    assert len(capture.rendered) == 1
+    assert capture.rendered[0].plain == " |--  LEAP  #2 blocked  9.4s  1 tool"
+
+
 def test_stream_renderer_prints_tool_command_and_success_preview() -> None:
     class CaptureConsole:
         def __init__(self) -> None:
@@ -433,7 +479,7 @@ def test_stream_renderer_prints_tool_command_and_success_preview() -> None:
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -468,7 +514,7 @@ def test_stream_renderer_prints_normalized_tool_name_with_alias_hint() -> None:
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -509,7 +555,7 @@ def test_stream_renderer_prints_tool_failure_exit_and_stderr() -> None:
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -527,7 +573,7 @@ def test_stream_renderer_prints_tool_failure_exit_and_stderr() -> None:
 
     assert len(console.lines) == 1
     line = console.lines[0]
-    assert "❌ shell_run" in line
+    assert "✗ shell_run" in line
     assert "$ false" in line
     assert "→ exit=1 permission denied" in line
     assert " | " in line
@@ -547,7 +593,7 @@ def test_stream_renderer_prints_context_evidence_metadata() -> None:
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -597,7 +643,7 @@ def test_stream_renderer_prints_compression_and_posture_metadata() -> None:
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -619,8 +665,8 @@ def test_stream_renderer_prints_compression_and_posture_metadata() -> None:
             "compression_reason": "threshold-triggered",
             "context_posture": "research",
             "context_guidance": "maintain research ledger and synthesize findings",
-            "disclosure_level": "selected_tools",
-            "disclosure_reason": "selected capabilities matched observable task signals",
+            "disclosure_level": "expanded",
+            "disclosure_reason": "tier1: continuity(shell)",
         },
     )
 
@@ -653,7 +699,7 @@ def test_stream_renderer_suppresses_structured_tool_blobs_and_compacts_paths() -
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -688,6 +734,128 @@ def test_stream_renderer_suppresses_structured_tool_blobs_and_compacts_paths() -
     assert "evidence" not in line
     assert "entries" not in line
     assert "task requires broad" not in line
+
+
+def test_final_response_adds_copyable_url_for_markdown_links() -> None:
+    answer = _sanitize_final_response(
+        "请打开 [点击申请权限](https://open.feishu.cn/app/cli_xxx/auth) 后继续。"
+    )
+
+    assert "[点击申请权限](https://open.feishu.cn/app/cli_xxx/auth)" in answer
+    assert "复制链接：https://open.feishu.cn/app/cli_xxx/auth" in answer
+
+
+def test_stream_renderer_prints_permission_recovery_card() -> None:
+    class CaptureConsole:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+            self.cards: list[dict[str, object]] = []
+
+        def print(self, renderable) -> None:
+            self.lines.append(getattr(renderable, "plain", str(renderable)))
+
+        def permission_recovery_card(self, metadata: dict[str, object]) -> None:
+            self.cards.append(metadata)
+
+        def thinking(self, text: str) -> None:
+            pass
+
+        def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
+            pass
+
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
+            pass
+
+        def newline(self) -> None:
+            pass
+
+    console = CaptureConsole()
+    renderer = StreamRenderer(console)  # type: ignore[arg-type]
+    renderer.start()
+    metadata = {
+        "ok": False,
+        "platform": "feishu",
+        "action": "im.list_chats",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "missing_scope",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "scope_source": "authoritative",
+        "console_url": "https://open.feishu.cn/app/cli_xxx/auth",
+        "recovery_hint": "Grant the missing scope in the developer console.",
+    }
+
+    renderer.tool_started("platform_action", metadata={"platform": "feishu", "action": "im.list_chats"})
+    renderer.tool_finished("platform_action", metadata=metadata)
+
+    assert len(console.lines) == 1
+    assert "✗ platform_action" in console.lines[0]
+    assert len(console.cards) == 1
+    assert console.cards[0]["console_url"] == "https://open.feishu.cn/app/cli_xxx/auth"
+    assert console.cards[0]["missing_scopes"] == ["im:chat:read"]
+    assert renderer.permission_blocked is True
+    assert renderer.permission_block_reason == "missing_scope: im.chat.read"
+
+
+def test_permission_recovery_card_renders_non_none_panel_body(monkeypatch) -> None:
+    class CapturingConsole:
+        width = 100
+
+        def __init__(self) -> None:
+            self.rendered = []
+
+        def print(self, renderable) -> None:
+            self.rendered.append(renderable)
+
+    capture = CapturingConsole()
+    leap_console = LeapConsole(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    monkeypatch.setattr(leap_console, "_console", capture)
+
+    leap_console.permission_recovery_card({
+        "ok": False,
+        "platform": "feishu",
+        "action": "im.list_chats",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "access_denied",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "scope_source": "authoritative",
+    })
+
+    assert len(capture.rendered) == 1
+    panel = capture.rendered[0]
+    assert panel.renderable is not None
+    assert "im:chat:read" in panel.renderable.plain
+
+
+@pytest.mark.asyncio
+async def test_process_loop_does_not_duplicate_done_card_when_response_label_owns_status() -> None:
+    holder: dict[str, LeapApp] = {}
+
+    async def on_input(_text: str) -> None:
+        completed = holder["app"].complete_active_command_in_response()
+        assert completed is not None
+        assert completed.status is TuiCommandStatus.DONE
+
+    app, console, status = _make_app(on_input=on_input)
+    holder["app"] = app
+    app.submit_text("successful command")
+
+    worker = asyncio.create_task(app._process_loop())
+    try:
+        await _wait_for(lambda: app.active_command is None and app._pending_input.qsize() == 0)
+    finally:
+        app._should_exit = True
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+
+    assert [(card.id, card.status) for card in console.cards] == [
+        (1, TuiCommandStatus.RUNNING),
+    ]
+    assert status.counts[-1] == (0, 0)
 
 
 @pytest.mark.asyncio
@@ -728,11 +896,12 @@ def test_failed_command_error_is_single_line_and_truncated() -> None:
     assert failed.error.endswith("…")
 
 
-def test_cancelled_and_skipped_commands_are_terminal() -> None:
+def test_cancelled_skipped_and_blocked_commands_are_terminal() -> None:
     command = TuiCommand.create(command_id=1, text="long task").mark_running()
 
     cancelled = command.mark_cancelled("user pressed cancel")
     skipped = command.mark_skipped("user skipped")
+    blocked = command.mark_blocked("missing_scope: im.chat.read")
 
     assert cancelled.status is TuiCommandStatus.CANCELLED
     assert cancelled.error == "user pressed cancel"
@@ -740,6 +909,9 @@ def test_cancelled_and_skipped_commands_are_terminal() -> None:
     assert skipped.status is TuiCommandStatus.SKIPPED
     assert skipped.error == "user skipped"
     assert skipped.finished_at > 0
+    assert blocked.status is TuiCommandStatus.BLOCKED
+    assert blocked.error == "missing_scope: im.chat.read"
+    assert blocked.finished_at > 0
 
 
 def test_placeholder_processor_indents_hint_after_prompt_space() -> None:

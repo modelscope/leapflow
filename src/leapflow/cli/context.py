@@ -85,8 +85,12 @@ class _TUIApprovalGate:
 
     _CATEGORY_LABELS = {
         "shell_dangerous": ("Shell Command", "yellow"),
+        "shell.command": ("Shell Command", "yellow"),
+        "file.read": ("Sensitive File Read", "yellow"),
+        "file.write": ("File Write", "yellow"),
         "file_write": ("File Write", "yellow"),
         "gateway_send": ("External Message", "cyan"),
+        "gateway.send": ("External Message", "cyan"),
     }
 
     async def request_approval(
@@ -123,9 +127,11 @@ class _TUIApprovalGate:
 
 
 def _default_recording_profile(settings: Settings) -> Optional["RecordingProfile"]:
-    """Build a RecordingProfile if the recording mode supports video."""
-    if not settings.recording_mode.uses_video:
-        return None
+    """Build a RecordingProfile for high-fidelity recording during teach.
+
+    Always returns a profile so that teach sessions activate InputTapObserver
+    and tighten FS debounce regardless of recording mode.
+    """
     from leapflow.platform.observers import RecordingProfile
     return RecordingProfile()
 
@@ -1521,6 +1527,7 @@ class Context:
             GatewaySessionCreated,
             GatewaySessionEnded,
         )
+        from leapflow.gateway.connectors.protocol import BackendEvent
         from leapflow.tools.registry_bootstrap import set_gateway_server
         from leapflow.tools.gateway_tool import set_gateway_approval_gate
 
@@ -1530,7 +1537,7 @@ class Context:
                 logger.info(
                     "gateway.inbound platform=%s session=%s len=%d",
                     event.source.platform,
-                    event.session_key,
+                    event.session_key or "(filtered)",
                     len(event.text),
                 )
                 episodic = self.memory.get_provider("episodic")
@@ -1555,18 +1562,109 @@ class Context:
                 router = getattr(self, "_gateway_router", None)
                 if router is not None:
                     router.clear_session(event.session_key)
+            elif isinstance(event, BackendEvent):
+                logger.debug(
+                    "gateway.signal platform=%s type=%s",
+                    event.platform_id, event.event_type,
+                )
+                episodic = self.memory.get_provider("episodic")
+                if episodic is not None and hasattr(episodic, "ingest"):
+                    episodic.ingest(
+                        "gateway.signal",
+                        f"[{event.platform_id}] {event.event_type}",
+                        metadata={
+                            "platform": event.platform_id,
+                            "event_type": event.event_type,
+                            "event_id": event.event_id,
+                        },
+                    )
+
+        from leapflow.gateway.checkpoint_store import DuckDBCheckpointStore, DuckDBDeduplicationStore
+        from leapflow.gateway.event_bridge import GatewayEventBridge
+
+        _checkpoint_store = DuckDBCheckpointStore(self._db_holder)
+        _dedup_store = DuckDBDeduplicationStore(self._db_holder)
+        self._gateway_event_bridge = GatewayEventBridge(self.event_bus)
+
+        async def _on_gateway_event_with_bridge(event: object) -> None:
+            await _on_gateway_event(event)
+            await self._gateway_event_bridge.on_gateway_event(event)
 
         self.gateway_server = GatewayServer(
             settings.profile_dir,
             extra_manifest_dirs=[settings.profile_dir / "gateway" / "manifests"],
-            on_event=_on_gateway_event,
+            on_event=_on_gateway_event_with_bridge,
+            checkpoint_store=_checkpoint_store,
+            dedup_store=_dedup_store,
         )
         self.gateway_server.discover_manifests()
         set_gateway_server(self.gateway_server)
         set_gateway_approval_gate(self._approval_orchestrator)
 
+        self._register_gateway_normalizers(settings)
+
         async def _gateway_send(source: Any, text: str) -> None:
             await self.gateway_server.send_reply(source, text)
+
+        async def _gateway_indicator(
+            source: Any, message_id: str, phase: str,
+        ) -> None:
+            """Processing indicator via platform reactions (fire-and-forget)."""
+            platform = getattr(source, "platform", "")
+            if not platform or not message_id:
+                return
+            gw = self.gateway_server
+            if phase == "start":
+                await gw.execute_platform_action(
+                    platform, "im.add_reaction",
+                    {"message_id": message_id, "emoji_type": "OnIt"},
+                )
+            elif phase in ("done", "error"):
+                await gw.execute_platform_action(
+                    platform, "im.remove_reaction",
+                    {"message_id": message_id, "emoji_type": "OnIt"},
+                )
+
+        async def _gateway_stream_send(
+            source: Any, text: str, message_id: str,
+        ) -> str:
+            """Send or update a message for streaming replies.
+
+            When *message_id* is empty, sends a new message and returns its ID.
+            When *message_id* is provided, updates the existing message in place.
+            """
+            platform = getattr(source, "platform", "")
+            chat_id = getattr(source, "chat_id", "")
+            gw = self.gateway_server
+            if not message_id:
+                result = await gw.send_message(platform, chat_id, text)
+                return str(result.get("message_id", ""))
+            else:
+                await gw.execute_platform_action(
+                    platform, "im.update_message",
+                    {"message_id": message_id, "text": text},
+                )
+                return message_id
+
+        async def _gateway_context_fetch(
+            platform: str, message_id: str, field: str,
+        ) -> str:
+            """Fetch parent message text via platform action for thread context."""
+            if not platform or not message_id:
+                return ""
+            gw = self.gateway_server
+            result = await gw.execute_platform_action(
+                platform, "im.get_messages",
+                {"message_ids": message_id},
+            )
+            if not result.get("ok"):
+                return ""
+            data = result.get("data", {})
+            items = data.get("items") or data.get("messages") or []
+            if isinstance(items, list) and items:
+                msg = items[0] if isinstance(items[0], dict) else {}
+                return str(msg.get("content") or msg.get("text") or "")
+            return ""
 
         from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
 
@@ -1580,12 +1678,20 @@ class Context:
             send_fn=_gateway_send,
             tool_definitions=TOOL_DEFINITIONS,
             tool_handlers=TOOL_HANDLERS,
+            persistence=getattr(self, "_conversation_store", None),
+            indicator_fn=_gateway_indicator,
+            stream_send_fn=_gateway_stream_send,
+            context_fetch_fn=_gateway_context_fetch,
         )
         self.gateway_server.set_message_handler(
             self._gateway_router.handle_message,
         )
+        self.gateway_server.set_callback_handler(
+            self._gateway_router.handle_callback,
+        )
 
         # ── Build CompressorConfig with LLM callbacks ──
+
         from leapflow.engine.context_compressor import CompressorConfig
 
         async def _summarize_via_llm(prompt: str) -> str:
@@ -1614,6 +1720,9 @@ class Context:
             logger.info("ConversationStore initialized")
         except Exception:
             logger.warning("ConversationStore initialization failed", exc_info=True)
+
+        if self._conversation_store and hasattr(self, "_gateway_router"):
+            self._gateway_router._persistence = self._conversation_store
 
         # ── Initialize MCP Manager + register tools into agent surface ──
         self._mcp_manager = None
@@ -1804,6 +1913,36 @@ class Context:
             except Exception:
                 logger.debug("Smart approval setup skipped", exc_info=True)
 
+        # ── Wire File Read Approval Gate ──
+        try:
+            from leapflow.security.actions import ActionDescriptor
+            from leapflow.tools.registry_bootstrap import set_file_read_gate
+
+            approval_orchestrator = self._approval_orchestrator
+
+            class _FileReadGate:
+                """File read approval via the action approval orchestrator."""
+
+                def __init__(self) -> None:
+                    self.denial_message = ""
+
+                async def check(
+                    self,
+                    path: str,
+                    mode: str = "raw",
+                    sensitivity_meta: dict | None = None,
+                ) -> bool:
+                    meta = dict(sensitivity_meta or {})
+                    action = ActionDescriptor.file_read(path, mode=mode, metadata=meta)
+                    result = await approval_orchestrator.evaluate(action)
+                    self.denial_message = result.denial_message if not result.approved else ""
+                    return result.approved
+
+            set_file_read_gate(_FileReadGate())
+            logger.debug("File read approval gate: action orchestrator")
+        except Exception:
+            logger.debug("File read gate setup skipped", exc_info=True)
+
         # ── Wire File Write Approval Gate ──
         try:
             from leapflow.security.actions import ActionDescriptor
@@ -1817,8 +1956,15 @@ class Context:
                 def __init__(self) -> None:
                     self.denial_message = ""
 
-                async def check(self, path: str, content: str, mode: str = "overwrite") -> bool:
-                    action = ActionDescriptor.file_write(path, content, mode=mode)
+                async def check(
+                    self,
+                    path: str,
+                    content: str,
+                    mode: str = "overwrite",
+                    sensitivity_meta: dict | None = None,
+                ) -> bool:
+                    meta = dict(sensitivity_meta or {})
+                    action = ActionDescriptor.file_write(path, content, mode=mode, metadata=meta)
                     result = await approval_orchestrator.evaluate(action)
                     self.denial_message = result.denial_message if not result.approved else ""
                     return result.approved
@@ -2285,6 +2431,67 @@ class Context:
         observer.on_pipeline_complete(
             time.perf_counter() - pipeline_start, phases_ok, phases_failed,
         )
+
+    _NORMALIZER_FACTORIES: dict[str, type] = {}
+
+    @staticmethod
+    def _get_normalizer_factories() -> dict[str, type]:
+        """Lazily load normalizer classes for known platforms."""
+        if not Context._NORMALIZER_FACTORIES:
+            from leapflow.gateway.normalizers.dingtalk import DingTalkEventNormalizer
+            from leapflow.gateway.normalizers.feishu import FeishuEventNormalizer
+            from leapflow.gateway.normalizers.telegram import TelegramEventNormalizer
+
+            Context._NORMALIZER_FACTORIES = {
+                "feishu": FeishuEventNormalizer,
+                "telegram": TelegramEventNormalizer,
+                "dingtalk": DingTalkEventNormalizer,
+            }
+        return Context._NORMALIZER_FACTORIES
+
+    def _register_gateway_normalizers(self, settings: Any) -> None:
+        """Register event normalizers and trigger policies for all known platforms."""
+        from leapflow.gateway.trigger_policy import TriggerMode, TriggerPolicy
+
+        gw = self.gateway_server
+        profile = getattr(settings, "active_profile", "default")
+        factories = self._get_normalizer_factories()
+
+        for platform_id, factory in factories.items():
+            normalizer = factory(profile=profile)
+            gw.register_normalizer(platform_id, normalizer)
+
+            opts = gw.platform_options(platform_id)
+            raw_mode = str(opts.get("trigger_mode", "mention_only"))
+            try:
+                trigger_mode = TriggerMode(raw_mode)
+            except ValueError:
+                logger.warning(
+                    "Unknown trigger_mode '%s' for %s, defaulting to mention_only",
+                    raw_mode, platform_id,
+                )
+                trigger_mode = TriggerMode.MENTION_ONLY
+
+            def _to_frozenset(val: Any) -> frozenset[str]:
+                if isinstance(val, str):
+                    return frozenset(v.strip() for v in val.split(",") if v.strip())
+                if isinstance(val, (list, tuple, set, frozenset)):
+                    return frozenset(str(v) for v in val)
+                return frozenset()
+
+            policy = TriggerPolicy(
+                mode=trigger_mode,
+                allowed_chats=_to_frozenset(opts.get("allowed_chats")),
+                blocked_chats=_to_frozenset(opts.get("blocked_chats")),
+                allowed_users=_to_frozenset(opts.get("allowed_users")),
+                blocked_users=_to_frozenset(opts.get("blocked_users")),
+                keywords=tuple(
+                    str(k) for k in (opts.get("keywords") or [])
+                ) if opts.get("keywords") else (),
+                max_events_per_minute=int(opts.get("max_events_per_minute", 30)),
+                cooldown_per_chat_s=float(opts.get("cooldown_per_chat_s", 1.0)),
+            )
+            gw.register_trigger_policy(platform_id, policy)
 
     async def cleanup(self) -> None:
         # Persist evolution episodes to DuckDB before shutdown

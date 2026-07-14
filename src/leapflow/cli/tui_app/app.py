@@ -303,6 +303,30 @@ class LeapApp:
         """Return the currently running command, if any."""
         return self._active_command
 
+    def complete_active_command_in_response(self) -> Optional[TuiCommand]:
+        """Mark the active command done when its status is rendered with the response label."""
+        if self._active_command is None:
+            return None
+        completed = self._active_command.mark_done()
+        self._active_command = completed
+        self._active_terminal_status = TuiCommandStatus.DONE
+        self._active_terminal_reason = ""
+        self._sync_task_counts()
+        self._invalidate()
+        return completed
+
+    def block_active_command_in_response(self, reason: str) -> Optional[TuiCommand]:
+        """Mark the active command blocked when recovery guidance is rendered inline."""
+        if self._active_command is None:
+            return None
+        blocked = self._active_command.mark_blocked(reason)
+        self._active_command = blocked
+        self._active_terminal_status = TuiCommandStatus.BLOCKED
+        self._active_terminal_reason = reason
+        self._sync_task_counts()
+        self._invalidate()
+        return blocked
+
     def queued_commands(self) -> list[TuiCommand]:
         """Return a snapshot of pending commands in queue order."""
         return self._pending_input.snapshot()
@@ -395,6 +419,8 @@ class LeapApp:
             return command.mark_cancelled(reason)
         if status == TuiCommandStatus.SKIPPED:
             return command.mark_skipped(reason)
+        if status == TuiCommandStatus.BLOCKED:
+            return command.mark_blocked(reason)
         return command.mark_failed(reason)
 
     def _dispatch_control_text(self, text: str) -> bool:
@@ -983,6 +1009,8 @@ class LeapApp:
 
     def _placeholder_text(self) -> str:
         """Return contextual input guidance for an empty buffer."""
+        if self._prompt_mode == "learning":
+            return "/teach stop · /teach status · /teach pause · /teach skip · /annotate <text>"
         if self._queue_paused:
             return "Queue paused · /resume continue · /drop <id> remove · /queue view"
         if self._active_command is not None:

@@ -837,3 +837,28 @@ def test_leap_prompt_uses_daemon_chat_route(monkeypatch) -> None:
 
     assert cli.main(["hello", "world"]) == 0
     assert captured == {"command": "chat", "prompt": "hello world"}
+
+
+@pytest.mark.asyncio
+async def test_teach_start_without_session_returns_structured_error() -> None:
+    from types import SimpleNamespace
+
+    from leapflow.cli.commands.slash_handlers import command_execute
+
+    result = await command_execute(SimpleNamespace(session=None), "teach start", "")
+
+    assert result == {"ok": False, "message": "No active session.", "session_mode": "idle"}
+
+
+@pytest.mark.asyncio
+async def test_hub_fallback_message_formats_command_without_literal_strip(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import leapflow.cli.commands.slash_handlers as slash_handlers
+
+    monkeypatch.setitem(__import__("sys").modules, "leapflow.cli.commands.hub", None)
+    result = await slash_handlers._execute_hub(SimpleNamespace(), "hub", "search demo")
+
+    assert result["ok"] is False
+    assert "'.strip()'" not in result["message"]
+    assert "Hub command '/hub search demo'" in result["message"]

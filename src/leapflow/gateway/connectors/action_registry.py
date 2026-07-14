@@ -16,7 +16,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from leapflow.gateway.connectors.protocol import ActionResult, ActionSpec
+from leapflow.gateway.connectors.protocol import ActionAuthSpec, ActionResult, ActionSpec
 from leapflow.security.redact import redact_sensitive_text
 
 if TYPE_CHECKING:
@@ -27,10 +27,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ValidationResult:
-    """Result of validating an action payload against a compact JSON schema subset."""
+    """Result of validating an action payload against a compact JSON schema subset.
+
+    When validation fails, structured metadata enables machine-driven recovery
+    rather than relying on the LLM to parse error strings.
+    """
 
     ok: bool
     error: str = ""
+    failure_code: str = ""
+    missing_fields: tuple[str, ...] = ()
+    type_errors: tuple[str, ...] = ()
+    recovery_hint: str = ""
 
 
 class ActionRegistry:
@@ -118,6 +126,8 @@ class ActionRegistry:
                 backend_config["output_args"] = list(str(a) for a in (backend["output_args"] or []))
 
             schema = action_data.get("schema") or {}
+            auth_data = action_data.get("auth") or {}
+            recovery_data = action_data.get("recovery") or {}
             specs[str(name)] = ActionSpec(
                 name=str(name),
                 backend_kind=str((backend.get("kind") or "cli")),
@@ -127,6 +137,9 @@ class ActionRegistry:
                 backend_config=backend_config,
                 risk_level=str(action_data.get("risk_level") or "medium"),
                 output_policy=str(action_data.get("output_policy") or "summary"),
+                capability=str(action_data.get("capability") or name),
+                auth=_parse_auth_spec(auth_data),
+                recovery=dict(recovery_data) if isinstance(recovery_data, Mapping) else {},
             )
         return cls(specs)
 
@@ -195,17 +208,68 @@ class ActionRegistry:
         return self.merge_discovered(specs)
 
 
+def normalize_payload(
+    spec: ActionSpec,
+    raw_params: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize raw tool-call params into a well-formed payload dict.
+
+    Applies schema-aware heuristics to fix common LLM structural mistakes:
+    1. Lifts business fields placed at the top level into ``payload``.
+    2. Preserves explicit ``payload`` contents when present.
+    3. Never fabricates values — only relocates fields already present.
+
+    Returns the normalized payload ready for validation and execution.
+    """
+    schema = spec.schema or {}
+    properties = schema.get("properties") or {}
+    if not isinstance(properties, Mapping):
+        properties = {}
+    known_fields = frozenset(str(k) for k in properties.keys())
+    meta_keys = frozenset({"platform", "action", "payload", "backend_kind", "source_tool"})
+
+    explicit_payload = raw_params.get("payload")
+    base: dict[str, Any] = dict(explicit_payload) if isinstance(explicit_payload, Mapping) else {}
+
+    for key in known_fields:
+        if key in base and not _is_missing(base[key]):
+            continue
+        top_value = raw_params.get(key)
+        if top_value is not None and key not in meta_keys:
+            base[key] = top_value
+
+    return base
+
+
 def validate_payload(spec: ActionSpec, payload: Mapping[str, Any]) -> ValidationResult:
     """Validate a payload against the compact schema subset used by action packs."""
     schema = spec.schema or {}
     required = schema.get("required") or ()
     missing = [str(key) for key in required if _is_missing(payload.get(str(key)))]
     if missing:
-        return ValidationResult(ok=False, error=f"Missing required fields: {', '.join(missing)}")
+        field_paths = tuple(f"payload.{f}" for f in missing)
+        hint_parts = [f"Provide {', '.join(field_paths)} in the payload object."]
+        properties = schema.get("properties") or {}
+        for f in missing:
+            desc = ""
+            if isinstance(properties, Mapping):
+                prop = properties.get(f)
+                if isinstance(prop, Mapping):
+                    desc = str(prop.get("description") or "")
+            if desc:
+                hint_parts.append(f"  {f}: {desc}")
+        return ValidationResult(
+            ok=False,
+            error=f"Missing required fields: {', '.join(missing)}",
+            failure_code="missing_required_fields",
+            missing_fields=tuple(missing),
+            recovery_hint="\n".join(hint_parts),
+        )
 
     properties = schema.get("properties") or {}
     if not isinstance(properties, Mapping):
         return ValidationResult(ok=True)
+    type_errors: list[str] = []
     for key, rule in properties.items():
         if key not in payload or payload[key] is None:
             continue
@@ -213,24 +277,72 @@ def validate_payload(spec: ActionSpec, payload: Mapping[str, Any]) -> Validation
             continue
         expected = str(rule.get("type") or "")
         if expected and not _matches_type(payload[key], expected):
-            return ValidationResult(ok=False, error=f"Field '{key}' must be {expected}")
+            type_errors.append(f"Field '{key}' must be {expected}")
+    if type_errors:
+        return ValidationResult(
+            ok=False,
+            error="; ".join(type_errors),
+            failure_code="type_mismatch",
+            type_errors=tuple(type_errors),
+            recovery_hint="Check field types against the action schema.",
+        )
     return ValidationResult(ok=True)
+
+
+def _parse_auth_spec(data: Any) -> ActionAuthSpec:
+    if not isinstance(data, Mapping):
+        return ActionAuthSpec()
+    scopes_raw = data.get("scopes") or {}
+    scopes: dict[str, tuple[str, ...]] = {}
+    if isinstance(scopes_raw, Mapping):
+        for key, value in scopes_raw.items():
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                scopes[str(key)] = tuple(str(item) for item in value if str(item))
+            elif value:
+                scopes[str(key)] = (str(value),)
+    elif isinstance(scopes_raw, Sequence) and not isinstance(scopes_raw, (str, bytes)):
+        scopes["common"] = tuple(str(item) for item in scopes_raw if str(item))
+    identities = data.get("identities") or ()
+    resource_fields = data.get("resource_fields") or ()
+    recovery = data.get("recovery") or {}
+    return ActionAuthSpec(
+        identities=tuple(str(item) for item in identities) if isinstance(identities, Sequence) and not isinstance(identities, (str, bytes)) else (),
+        scopes=scopes,
+        resource_fields=tuple(str(item) for item in resource_fields) if isinstance(resource_fields, Sequence) and not isinstance(resource_fields, (str, bytes)) else (),
+        recovery=dict(recovery) if isinstance(recovery, Mapping) else {},
+    )
+
+
+_SIDE_EFFECT_KINDS = frozenset({"send", "write", "execute"})
 
 
 def summarize_action_result(spec: ActionSpec, result: ActionResult) -> dict[str, Any]:
     """Apply the action output policy before returning data to the LLM context."""
     if not result.ok:
-        return {
+        response: dict[str, Any] = {
             "ok": False,
             "error": redact_sensitive_text(result.error, force=True),
             "output_policy": spec.output_policy,
+            "capability": spec.capability or spec.name,
         }
+        if result.failure is not None:
+            response.update(result.failure.as_dict())
+        return response
 
     summary: dict[str, Any] = {
         "ok": True,
         "resource_id": result.resource_id,
         "output_policy": spec.output_policy,
+        "capability": spec.capability or spec.name,
     }
+
+    if spec.effect in _SIDE_EFFECT_KINDS:
+        summary["completed"] = True
+        summary["execution_note"] = (
+            "Action executed successfully. Do not re-invoke with the same parameters. "
+            "Report this result to the user."
+        )
+
     if spec.output_policy == "raw":
         summary["data"] = dict(result.data)
         return summary

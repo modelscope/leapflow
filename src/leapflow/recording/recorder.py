@@ -374,6 +374,17 @@ class DemonstrationRecorder:
             if window_title:
                 params["window_title"] = str(window_title)
 
+        elif event.event_type == "chat.interaction":
+            target = str(event.payload.get("tool_name", ""))
+            target_label = str(event.payload.get("content", ""))[:200]
+            target_role = sub_action
+            app_bundle_id = "leapflow.engine"
+            app_name = "LeapFlow"
+            params = {
+                k: v for k, v in event.payload.items()
+                if k not in ("action",) and isinstance(v, (str, int, float, bool, list))
+            }
+
         elif event.event_type == "ui.action":
             target = str(event.payload.get("node_id", ""))
             target_label = str(event.payload.get("label", ""))

@@ -32,6 +32,9 @@ class RuntimeLeapService:
         self._approval_pending: dict[str, dict[str, Any]] = {}
         self._approval_event_queue: asyncio.Queue[StreamChunk] | None = None
 
+        from leapflow.daemon.notifications import NotificationBus
+        self.notification_bus = NotificationBus()
+
     def set_client_count_provider(self, provider: Callable[[], int]) -> None:
         """Set a lightweight callback used by status reporting."""
         self._client_count = provider
@@ -49,6 +52,7 @@ class RuntimeLeapService:
         ctx = Context(self._settings, self._mock_host)
         await ctx.initialize()
         self._install_daemon_approval(ctx)
+        self._install_learn_notifications(ctx)
         self._ctx = ctx
 
     @property
@@ -230,6 +234,12 @@ class RuntimeLeapService:
 
         return await build_app_payload(self.context, args)
 
+    async def command_execute(self, name: str, args: str = "") -> dict[str, Any]:
+        """Execute any engine-routed slash command via unified dispatch."""
+        from leapflow.cli.commands.slash_handlers import command_execute
+
+        return await command_execute(self.context, name, args)
+
     async def approval_status(self) -> dict[str, Any]:
         """Return currently pending daemon approval requests."""
         return {"pending": self._pending_payloads()}
@@ -378,13 +388,71 @@ class RuntimeLeapService:
         except Exception:
             logger.debug("daemon: DuckDB checkpoint skipped", exc_info=True)
 
+    async def subscribe_notifications(self) -> AsyncIterator[StreamChunk]:
+        """Long-lived streaming RPC: yield notifications until client disconnects."""
+        subscriber_id = str(uuid.uuid4())
+        queue = self.notification_bus.subscribe(subscriber_id)
+        try:
+            while True:
+                notification = await queue.get()
+                if notification is None:
+                    break
+                yield StreamChunk(
+                    request_id="",
+                    content="",
+                    event_type="status",
+                    metadata=notification.to_dict(),
+                )
+        finally:
+            self.notification_bus.unsubscribe(subscriber_id)
+
+    def _install_learn_notifications(self, ctx: Any) -> None:
+        """Wire session progress/completion callbacks to the notification bus."""
+        bus = self.notification_bus
+
+        def _on_progress(stage: str, current: int, total: int) -> None:
+            bus.emit_event(
+                "teach.progress",
+                phase=stage,
+                current=current,
+                total=total,
+                progress=current / total if total > 0 else 0.0,
+            )
+
+        def _on_complete(result: Any) -> None:
+            payload: dict[str, Any] = {"phase": "done"}
+            if result:
+                payload["step_count"] = getattr(result, "step_count", 0)
+                payload["duration"] = getattr(result, "duration", 0.0)
+                candidates = getattr(result, "candidates", None) or []
+                payload["candidate_count"] = len(candidates)
+                activated = getattr(result, "activated_skill_names", None) or set()
+                payload["activated_skills"] = list(activated)
+                new = getattr(result, "new_skills", None) or []
+                payload["new_skills"] = list(new)
+            bus.emit_event("teach.complete", **payload)
+
+        if ctx.session:
+            ctx.session.set_on_learn_progress(_on_progress)
+            if hasattr(ctx.session, "set_on_learn_complete"):
+                ctx.session.set_on_learn_complete(_on_complete)
+
+            # Monitor mode changes to notify TUI of idle-watchdog stops
+            original_on_idle = ctx.session._on_idle_timeout
+
+            def _on_idle_with_notification() -> None:
+                bus.emit_event("teach.stopped", reason="idle_timeout")
+                original_on_idle()
+
+            ctx.session._on_idle_timeout = _on_idle_with_notification
+
     def _install_daemon_approval(self, ctx: Any) -> None:
         try:
             from leapflow.security.approval import SessionAwareGate
             from leapflow.security.actions import ActionDescriptor
             from leapflow.security.orchestrator import ApprovalOrchestrator
             from leapflow.tools.gateway_tool import set_gateway_approval_gate
-            from leapflow.tools.registry_bootstrap import set_file_write_gate
+            from leapflow.tools.registry_bootstrap import set_file_read_gate, set_file_write_gate
             from leapflow.tools.shell_tools import set_approval_gate
 
             existing = getattr(ctx, "_approval_orchestrator", None)
@@ -399,15 +467,40 @@ class RuntimeLeapService:
             set_approval_gate(orchestrator)
             set_gateway_approval_gate(orchestrator)
 
+            class _FileReadGate:
+                def __init__(self) -> None:
+                    self.denial_message = ""
+
+                async def check(
+                    self,
+                    path: str,
+                    mode: str = "raw",
+                    sensitivity_meta: dict | None = None,
+                ) -> bool:
+                    result = await orchestrator.evaluate(
+                        ActionDescriptor.file_read(path, mode=mode, metadata=dict(sensitivity_meta or {}))
+                    )
+                    self.denial_message = result.denial_message if not result.approved else ""
+                    return result.approved
+
             class _FileWriteGate:
                 def __init__(self) -> None:
                     self.denial_message = ""
 
-                async def check(self, path: str, content: str, mode: str = "overwrite") -> bool:
-                    result = await orchestrator.evaluate(ActionDescriptor.file_write(path, content, mode=mode))
+                async def check(
+                    self,
+                    path: str,
+                    content: str,
+                    mode: str = "overwrite",
+                    sensitivity_meta: dict | None = None,
+                ) -> bool:
+                    result = await orchestrator.evaluate(
+                        ActionDescriptor.file_write(path, content, mode=mode, metadata=dict(sensitivity_meta or {}))
+                    )
                     self.denial_message = result.denial_message if not result.approved else ""
                     return result.approved
 
+            set_file_read_gate(_FileReadGate())
             set_file_write_gate(_FileWriteGate())
             logger.debug("daemon approval gate installed")
         except Exception:

@@ -93,6 +93,10 @@ class ActionType(Enum):
     UI_MOVE = "ui.move"
     UI_RESIZE = "ui.resize"
     UI_DRAG = "ui.drag"
+    CHAT_USER_MESSAGE = "chat.user_message"
+    CHAT_TOOL_CALL = "chat.tool_call"
+    CHAT_TOOL_RESULT = "chat.tool_result"
+    CHAT_ASSISTANT_RESPONSE = "chat.assistant_response"
     UNKNOWN = "unknown"
 
 
@@ -112,6 +116,10 @@ _EVENT_TO_ACTION: Dict[Tuple[str, str], ActionType] = {
     ("ui.action", "move"): ActionType.UI_MOVE,
     ("ui.action", "resize"): ActionType.UI_RESIZE,
     ("ui.action", "drag"): ActionType.UI_DRAG,
+    ("chat.interaction", "user_message"): ActionType.CHAT_USER_MESSAGE,
+    ("chat.interaction", "tool_call"): ActionType.CHAT_TOOL_CALL,
+    ("chat.interaction", "tool_result"): ActionType.CHAT_TOOL_RESULT,
+    ("chat.interaction", "response"): ActionType.CHAT_ASSISTANT_RESPONSE,
 }
 
 

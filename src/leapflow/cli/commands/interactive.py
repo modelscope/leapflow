@@ -438,6 +438,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
 
         renderer = StreamRenderer(console)
         renderer.start()
+        turn_completed = False
         try:
             async for event in ctx.engine.run_stream(prompt_text):
                 if isinstance(event, StreamEvent):
@@ -458,8 +459,15 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                             renderer.feed(event.content)
                 else:
                     renderer.feed(str(event))
+            turn_completed = True
         finally:
-            renderer.finish()
+            if turn_completed and renderer.permission_blocked:
+                command = app.block_active_command_in_response(renderer.permission_block_reason)
+            elif turn_completed:
+                command = app.complete_active_command_in_response()
+            else:
+                command = None
+            renderer.finish(command=command)
             if renderer.has_output:
                 exit_stats.record_assistant_message()
             exit_stats.record_tool_calls(renderer.tool_count)
@@ -821,6 +829,7 @@ async def cmd_interactive_daemon(
     from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
         render_app_payload,
+        render_command_payload,
         render_model_payload,
         render_tools_payload,
         render_usage_payload,
@@ -902,8 +911,9 @@ async def cmd_interactive_daemon(
     )
 
     def _update_status() -> None:
+        effective_mode = daemon_session_mode if daemon_session_mode in ("learning", "paused") else "daemon"
         status.update(
-            mode="daemon",
+            mode=effective_mode,
             skill_count=0,
             platform_online=runtime_host_online,
             model_name=runtime_model_name,
@@ -912,7 +922,7 @@ async def cmd_interactive_daemon(
             context_max=runtime_context_length,
             context_state=runtime_context_state,
         )
-        app.prompt_mode = "daemon"
+        app.prompt_mode = effective_mode
 
     def _render_banner() -> None:
         display_rich_banner(
@@ -1061,7 +1071,13 @@ async def cmd_interactive_daemon(
                 )
                 raise
         finally:
-            renderer.finish()
+            if turn_completed and renderer.permission_blocked:
+                command = app.block_active_command_in_response(renderer.permission_block_reason)
+            elif turn_completed:
+                command = app.complete_active_command_in_response()
+            else:
+                command = None
+            renderer.finish(command=command)
             if renderer.has_output:
                 exit_stats.record_assistant_message()
             exit_stats.record_tool_calls(renderer.tool_count)
@@ -1078,119 +1094,92 @@ async def cmd_interactive_daemon(
             console.system("Retrying the interrupted request once after reconnecting to leapd.")
             await _stream_response(prompt_text, allow_retry=False, record_user=False)
 
+    # Session mode tracking for teaching — daemon-side state mirrored here
+    daemon_session_mode = "idle"
+
     async def handle_input(text: str) -> None:
+        nonlocal daemon_session_mode
+
         invocation = command_router.parse(text)
         if invocation is not None:
-            unsupported = command_router.unsupported_result(invocation)
-            if unsupported is not None:
-                render_command_result(console, unsupported)
-                return
             canonical = invocation.command.name
             cmd_args = invocation.args
-            if canonical == "exit":
-                app.exit()
-                return
-            if canonical == "help":
-                _show_help(console, runtime="daemon")
-                return
-            if canonical == "status":
-                await _print_daemon_status()
-                return
-            if canonical == "host":
-                action = _host_action(cmd_args)
-                try:
-                    if action == "status":
-                        result = await bridge.call(
-                            lambda current_client: current_client.host_status(),
-                            description="host status",
-                        )
-                    elif action == "start":
-                        console.system("Starting CuaDriver OS control for this session…")
-                        result = await bridge.call(
-                            lambda current_client: current_client.host_start(),
-                            description="host start",
-                        )
-                    elif action == "stop":
-                        console.system("Stopping CuaDriver OS control; chat and memory stay available…")
-                        result = await bridge.call(
-                            lambda current_client: current_client.host_stop(),
-                            description="host stop",
-                        )
-                    elif action == "restart":
-                        console.system("Restarting CuaDriver OS control…")
-                        result = await bridge.call(
-                            lambda current_client: current_client.host_restart(),
-                            description="host restart",
-                        )
-                    else:
-                        console.warning("Usage: /host [status|start|stop|restart]")
-                        return
-                except Exception as exc:
-                    console.warning(f"Host control failed: {exc}")
+
+            # Client-local commands: handled directly by the TUI
+            if invocation.command.client_local:
+                if canonical == "exit":
+                    if daemon_session_mode == "learning":
+                        try:
+                            await bridge.call(
+                                lambda c: c.command_execute("teach stop", ""),
+                                description="/teach stop",
+                            )
+                        except Exception:
+                            pass
+                    app.exit()
                     return
-                _apply_daemon_runtime_metadata({"host_backend": result})
-                _print_host_status(console, result)
-                _update_status()
-                return
-            if canonical == "clear":
-                _render_banner()
-                return
-            if canonical == "tools":
-                try:
-                    payload = await bridge.call(
-                        lambda current_client: current_client.tools_list(),
-                        description="tools list",
-                    )
-                except Exception as exc:
-                    console.warning(f"Tools unavailable: {exc}")
+                if canonical == "help":
+                    _show_help(console, runtime="daemon")
                     return
-                render_tools_payload(console, payload)
-                return
-            if canonical == "usage":
-                try:
-                    payload = await bridge.call(
-                        lambda current_client: current_client.usage_summary(),
-                        description="usage summary",
-                    )
-                except Exception as exc:
-                    console.warning(f"Usage unavailable: {exc}")
+                if canonical == "clear":
+                    _render_banner()
                     return
-                render_usage_payload(console, payload)
+                # Task control commands are handled by the existing _handle_task_control
+                _handle_task_control(text)
                 return
-            if canonical == "model":
-                try:
-                    payload = await bridge.call(
-                        lambda current_client: current_client.model_info(cmd_args),
-                        description="model info",
-                    )
-                except Exception as exc:
-                    console.warning(f"Model info unavailable: {exc}")
-                    return
-                render_model_payload(console, payload)
+
+            # Engine-routed commands: dispatch through daemon RPC
+            try:
+                payload = await bridge.call(
+                    lambda current_client: current_client.command_execute(canonical, cmd_args),
+                    description=f"/{canonical}",
+                )
+            except Exception as exc:
+                console.warning(f"/{canonical} failed: {exc}")
                 return
-            if _is_app_command(canonical):
-                app_args = invocation.text[len("app"):].strip()
-                try:
-                    payload = await bridge.call(
-                        lambda current_client: current_client.app_command(app_args),
-                        description="app command",
-                    )
-                except Exception as exc:
-                    console.warning(f"App Connector unavailable: {exc}")
-                    return
-                render_app_payload(console, payload)
-                return
-            if canonical == "run":
-                if not cmd_args:
-                    console.warning("Usage: /run <trigger>")
-                    return
+
+            # Track session mode changes (teach start/stop/discard)
+            new_mode = payload.get("session_mode")
+            if isinstance(new_mode, str):
+                daemon_session_mode = new_mode
+                if new_mode == "learning":
+                    app.prompt_mode = "learning"
+                elif new_mode == "paused":
+                    app.prompt_mode = "paused"
+                else:
+                    app.prompt_mode = "daemon"
+
+            # Special case: streaming commands (like /run) need chat stream
+            if payload.get("stream") and payload.get("prompt"):
                 console.system("Running through daemon chat stream; approvals and host state stay visible.")
-                await _stream_response(cmd_args)
+                await _stream_response(str(payload["prompt"]))
                 return
-            console.warning(
-                f"/{canonical} is not available in daemon mode yet. "
-                "Use --no-daemon for legacy in-process commands."
-            )
+
+            # Special case: /host with runtime metadata
+            if payload.get("view") == "host" and payload.get("result"):
+                _apply_daemon_runtime_metadata({"host_backend": payload["result"]})
+                _update_status()
+
+            # Render: app-specific views use app renderer, others use generic
+            view = str(payload.get("view") or "")
+            if view in ("list", "guide", "connect", "disconnect", "remove", "events", "actions") and "result" in payload:
+                render_app_payload(console, payload)
+            else:
+                render_command_payload(console, payload)
+            return
+
+        # Learning mode: route through engine (chat-demonstration recording)
+        # and also annotate for distillation context.
+        if daemon_session_mode == "learning":
+            try:
+                await bridge.call(
+                    lambda current_client: current_client.command_execute("annotate", text),
+                    description="annotate",
+                )
+            except Exception:
+                pass
+            console.rule()
+            await _stream_response(text)
             return
 
         console.rule()
@@ -1319,11 +1308,73 @@ async def cmd_interactive_daemon(
 
     _render_banner()
     _update_status()
+
+    # Background notification subscription for push events (distillation progress, etc.)
+    _notification_task: asyncio.Task[None] | None = None
+
+    async def _notification_listener() -> None:
+        """Subscribe to daemon notifications and render them in TUI."""
+        nonlocal daemon_session_mode
+        from leapflow.daemon.client import DaemonUnavailableError
+        while True:
+            try:
+                # Reset stale state on each (re)connection attempt
+                status.distill_phase = ""
+                status.distill_progress = 0.0
+                async for event in bridge.client.subscribe_notifications():
+                    event_type = event.get("event_type", "")
+                    payload = event.get("payload") or {}
+                    if event_type == "teach.progress":
+                        status.distill_phase = str(payload.get("phase", ""))
+                        status.distill_progress = float(payload.get("progress", 0.0))
+                        app.invalidate()
+                    elif event_type == "teach.stopped":
+                        daemon_session_mode = "idle"
+                        app.prompt_mode = "daemon"
+                        reason = payload.get("reason", "")
+                        if reason == "idle_timeout":
+                            console.warning("Recording stopped automatically (idle timeout).")
+                        else:
+                            console.system("Recording stopped.")
+                        _update_status()
+                    elif event_type == "teach.complete":
+                        status.distill_phase = ""
+                        status.distill_progress = 0.0
+                        new_skills = payload.get("new_skills") or []
+                        candidate_count = payload.get("candidate_count", 0)
+                        if new_skills:
+                            console.success(
+                                f"Distillation complete — {len(new_skills)} new skill(s)"
+                            )
+                            for name in new_skills:
+                                console.system(f"  → {name}")
+                        elif candidate_count > 0:
+                            console.system(
+                                f"Distillation complete — {candidate_count} candidate(s), none activated"
+                            )
+                        else:
+                            console.system("Distillation complete — no skills produced (insufficient signal)")
+                        app.invalidate()
+            except (DaemonUnavailableError, OSError, asyncio.IncompleteReadError):
+                await asyncio.sleep(3.0)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.debug("notification_listener: unexpected error", exc_info=True)
+                await asyncio.sleep(5.0)
+
     exit_code = 0
     try:
         await client_lease.start()
+        _notification_task = asyncio.create_task(_notification_listener())
         exit_code = await app.run()
     finally:
+        if _notification_task is not None:
+            _notification_task.cancel()
+            try:
+                await _notification_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await client_lease.stop()
         _print_exit_summary()
         await _prompt_stop_daemon_on_exit(bridge.client, settings, console)
@@ -1618,16 +1669,13 @@ def _show_help(console, runtime: str = "in_process") -> None:
                 ]
                 if visible:
                     aliases = f" [dim]({', '.join(visible)})[/]"
-            support = ""
-            if not cmd.supports_runtime(runtime):  # type: ignore[arg-type]
-                support = " [dim]not in daemon[/]" if runtime == "daemon" else " [dim]not in this mode[/]"
             effect = ""
             if cmd.requires_host:
                 effect = " [dim]host[/]"
             elif cmd.requires_llm:
                 effect = " [dim]llm[/]"
             console.print(
-                f"    [cyan]{name:<28}[/] {cmd.description}{aliases}{effect}{support}"
+                f"    [cyan]{name:<28}[/] {cmd.description}{aliases}{effect}"
             )
         console.print()
 

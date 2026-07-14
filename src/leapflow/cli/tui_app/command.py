@@ -31,6 +31,7 @@ class TuiCommandStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
     DONE = "done"
+    BLOCKED = "blocked"
     FAILED = "failed"
     CANCELLED = "cancelled"
     SKIPPED = "skipped"
@@ -100,6 +101,15 @@ class TuiCommand:
             status=TuiCommandStatus.FAILED,
             finished_at=time.monotonic(),
             error=_truncate(_single_line(error), _MAX_ERROR_LENGTH),
+        )
+
+    def mark_blocked(self, reason: str) -> "TuiCommand":
+        """Return a copy marked as blocked by an external action requirement."""
+        return replace(
+            self,
+            status=TuiCommandStatus.BLOCKED,
+            finished_at=time.monotonic(),
+            error=_truncate(_single_line(reason), _MAX_ERROR_LENGTH),
         )
 
     def mark_cancelled(self, reason: str = "cancelled by user") -> "TuiCommand":

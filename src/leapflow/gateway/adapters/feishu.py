@@ -1,13 +1,15 @@
 """Feishu/Lark adapter backed by the official lark-cli."""
 from __future__ import annotations
 
+import logging
 from typing import Any, Mapping, Sequence
 
 from leapflow.gateway.action_packs.feishu import ACTION_SPECS
-from leapflow.gateway.adapters.common import AdapterLifecycle
+from leapflow.gateway.adapters.common import AdapterLifecycle, bool_option
 from leapflow.gateway.backends.cli_backend import CliBackend
 from leapflow.gateway.connectors.action_registry import ActionRegistry
 from leapflow.gateway.connectors.event_sources import UnavailableEventSource
+from leapflow.gateway.connectors.lark_event_source import BotIdentity, LarkCliEventSource
 from leapflow.gateway.connectors.protocol import (
     ActionDiscovery,
     ActionPreview,
@@ -18,6 +20,8 @@ from leapflow.gateway.connectors.protocol import (
     ExecutionBackend,
 )
 from leapflow.gateway.protocol import OutboundContent, SendResult, SendTarget
+
+logger = logging.getLogger(__name__)
 
 
 class BackendNotReadyError(RuntimeError):
@@ -42,45 +46,79 @@ class FeishuAdapter(AdapterLifecycle):
         binary: str = "lark-cli",
         max_message_length: int = 8000,
         backend: ExecutionBackend | None = None,
+        events_enabled: Any = False,
+        event_keys: Sequence[str] | str | None = None,
+        event_key: str = "",
         **_: Any,
     ) -> None:
         super().__init__(profile=profile or "default")
         self._profile = profile or ""
         self._identity = identity or "bot"
+        self._binary = binary or "lark-cli"
         self.max_message_length = max(1, int(max_message_length or 8000))
         self._backend = backend or CliBackend(
-            binary=binary or "lark-cli",
+            binary=self._binary,
             profile=self._profile,
             identity=self._identity,
         )
         discovery = self._backend if isinstance(self._backend, ActionDiscovery) else None
         self._registry = ActionRegistry(ACTION_SPECS, discovery=discovery)
-        self._event_source = UnavailableEventSource(
-            platform_id=self.platform_id,
-            backend_kind=self._backend.kind,
-            detail=(
-                "Feishu inbound events are not enabled yet. Outbound actions can still work; "
-                "configure lark-event/WebSocket before enabling real-time message intake."
-            ),
-            metadata={
-                "available": False,
-                "configuration_hint": "Configure lark-event/WebSocket for the selected CLI profile.",
-                "current_mode": "outbound_actions_only",
-            },
-        )
+        self._bot_id = ""
+        self._bot_name = ""
+
+        self._events_enabled = bool_option(events_enabled, default=False)
+        if self._events_enabled:
+            resolved_keys: Sequence[str]
+            if event_keys:
+                resolved_keys = [event_keys] if isinstance(event_keys, str) else list(event_keys)
+            elif event_key:
+                resolved_keys = [event_key]
+            else:
+                from leapflow.gateway.connectors.lark_event_source import _DEFAULT_EVENT_KEYS
+                resolved_keys = list(_DEFAULT_EVENT_KEYS)
+            self._event_source: BackendEventSource = LarkCliEventSource(
+                event_keys=resolved_keys,
+                binary=self._binary,
+                profile=self._profile,
+                identity=self._identity,
+            )
+        else:
+            self._event_source = UnavailableEventSource(
+                platform_id=self.platform_id,
+                backend_kind=self._backend.kind,
+                detail=(
+                    "Feishu inbound events are not enabled. "
+                    "Set events_enabled=true in platform options to receive messages."
+                ),
+                metadata={
+                    "available": False,
+                    "current_mode": "outbound_actions_only",
+                },
+            )
 
     async def connect(self, *, is_reconnect: bool = False) -> None:
         status = await self._backend.status()
         if not status.ok:
             metadata = {**self.status_metadata(), **dict(status.metadata)}
             raise BackendNotReadyError(status.detail or "Feishu CLI backend is not ready", metadata)
+
+        if isinstance(self._event_source, LarkCliEventSource):
+            identity = await self._event_source.fetch_bot_identity()
+            self._bot_id = identity.open_id
+            self._bot_name = identity.app_name
         await super().connect(is_reconnect=is_reconnect)
+
+    @property
+    def bot_identity(self) -> BotIdentity:
+        """Return the resolved bot identity (open_id + app_name)."""
+        return BotIdentity(open_id=self._bot_id, app_name=self._bot_name)
 
     def status_metadata(self) -> dict[str, Any]:
         """Return non-secret connector diagnostics for status/list UX."""
         binary = getattr(self._backend, "binary", "")
         profile = getattr(self._backend, "profile", self._profile) or "default"
         identity = getattr(self._backend, "identity", self._identity)
+        events_available = self._events_enabled
         return {
             "backend_kind": self._backend.kind,
             "binary": binary,
@@ -88,9 +126,8 @@ class FeishuAdapter(AdapterLifecycle):
             "identity": identity,
             "actions": sorted(self._registry.all().keys()),
             "event_source": {
-                "available": False,
-                "mode": "outbound_actions_only",
-                "hint": "Configure lark-event/WebSocket to receive Feishu events in real time.",
+                "available": events_available,
+                "mode": "bidirectional" if events_available else "outbound_actions_only",
             },
         }
 
@@ -108,14 +145,20 @@ class FeishuAdapter(AdapterLifecycle):
         await super().disconnect()
 
     async def send(self, target: SendTarget, content: OutboundContent) -> SendResult:
-        result = await self.execute_action(
-            "im.send_message",
-            {
-                "chat_id": target.chat_id,
-                "thread_id": target.thread_id,
-                "text": content.text[:self.max_message_length],
-            },
-        )
+        payload: dict[str, Any] = {
+            "chat_id": target.chat_id,
+            "text": content.text[:self.max_message_length],
+        }
+        if target.thread_id:
+            payload["thread_id"] = target.thread_id
+
+        action = "im.send_message"
+        if target.reply_to_id:
+            action = "im.reply_message"
+            payload["message_id"] = target.reply_to_id
+            payload.pop("chat_id", None)
+
+        result = await self.execute_action(action, payload)
         if not result.ok:
             return SendResult(ok=False, error=result.error)
         return SendResult(ok=True, message_id=result.resource_id)

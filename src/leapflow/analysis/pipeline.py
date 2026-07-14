@@ -129,6 +129,7 @@ class ImitationPipeline:
         self._signal_timeline = signal_timeline
         self._observation_daemon = observation_daemon
         self._recording_profile = recording_profile
+        self._daemon_started_for_recording: bool = False
         self._extracted_video_actions: List[Any] = []
         self._video_available: bool = False
         self._current_goal = ""
@@ -184,6 +185,7 @@ class ImitationPipeline:
         tid = self._recorder.start(user_id=user_id)
         if goal:
             self._recorder.attention_context.seed_from_goal(goal)
+        await self._ensure_observation_daemon()
         await self._apply_recording_profile()
 
         if self._recording_mode.uses_video and self._video_recorder:
@@ -327,6 +329,27 @@ class ImitationPipeline:
         if self._video_recorder and self._video_recorder.paused:
             fire_and_forget(self._video_recorder.resume())
 
+    async def _ensure_observation_daemon(self) -> None:
+        """Start ObservationDaemon on-demand if not already running.
+
+        Enables OS-level signal capture (FS, focus, clipboard, input tap)
+        even when observer_auto_start was disabled at init time.
+        """
+        if self._observation_daemon is not None:
+            return
+        if self._event_bus is None:
+            return
+        try:
+            from leapflow.platform.observers import ObserverConfig
+            from leapflow.platform.observers.daemon import ObservationDaemon
+            daemon = ObservationDaemon(bus=self._event_bus, config=ObserverConfig())
+            await daemon.start()
+            self._observation_daemon = daemon
+            self._daemon_started_for_recording = True
+            logger.info("ObservationDaemon started on-demand for teach recording")
+        except Exception:
+            logger.debug("on-demand ObservationDaemon start failed", exc_info=True)
+
     async def _apply_recording_profile(self) -> None:
         """Switch observation daemon to high-fidelity recording mode."""
         if self._observation_daemon is None or self._recording_profile is None:
@@ -344,6 +367,13 @@ class ImitationPipeline:
             await self._observation_daemon.reset_profile()
         except Exception as e:
             logger.warning("reset_recording_profile failed: %s", e)
+        if self._daemon_started_for_recording:
+            try:
+                await self._observation_daemon.stop()
+            except Exception:
+                logger.debug("on-demand ObservationDaemon stop failed", exc_info=True)
+            self._observation_daemon = None
+            self._daemon_started_for_recording = False
 
     # ── Video enrichment ──
 

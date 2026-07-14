@@ -16,43 +16,42 @@ def test_command_router_parses_command_args_and_runtime_support() -> None:
     assert router.unsupported_result(invocation) is None
 
 
-def test_command_router_parses_app_subcommands_without_daemon_parity() -> None:
-    in_process_router = CommandRouter("in_process")
+def test_command_router_all_commands_supported_in_daemon() -> None:
+    """All commands are now supported in both runtimes."""
     daemon_router = CommandRouter("daemon")
 
-    invocation = in_process_router.parse("/app status feishu")
-    daemon_invocation = daemon_router.parse("/app connect feishu")
-
-    assert invocation is not None
-    assert invocation.command.name == "app status"
-    assert invocation.args == "feishu"
-    assert in_process_router.unsupported_result(invocation) is None
-    assert daemon_invocation is not None
-    assert daemon_invocation.command.name == "app connect"
-    unsupported = daemon_router.unsupported_result(daemon_invocation)
-    assert unsupported is not None
-    assert "/app connect" in unsupported.title
-
-
-def test_app_commands_daemon_parity_boundary() -> None:
-    """Read-only /app commands are available in daemon; write commands are not."""
-    daemon_router = CommandRouter("daemon")
-
-    # Commands that MUST be supported in daemon mode
-    for cmd_text in ("/app", "/app list", "/app status feishu", "/app actions feishu"):
+    for cmd_text in (
+        "/app status feishu",
+        "/app connect feishu",
+        "/teach start",
+        "/skills show demo",
+        "/hub search test",
+        "/gateway",
+        "/arm test_skill 0 * * * *",
+        "/tasks",
+    ):
         inv = daemon_router.parse(cmd_text)
         assert inv is not None, f"parse failed for {cmd_text}"
         assert daemon_router.unsupported_result(inv) is None, (
             f"{cmd_text} should be supported in daemon mode"
         )
 
-    # Commands that must NOT be supported in daemon mode
-    for cmd_text in ("/app connect feishu", "/app disconnect feishu", "/app remove feishu"):
-        inv = daemon_router.parse(cmd_text)
+
+def test_command_router_client_local_commands() -> None:
+    """Client-local commands are marked for direct TUI handling."""
+    router = CommandRouter("daemon")
+
+    # Client-local commands
+    for cmd_text in ("/exit", "/clear", "/help", "/cancel", "/pause", "/resume", "/queue"):
+        inv = router.parse(cmd_text)
         assert inv is not None, f"parse failed for {cmd_text}"
-        unsupported = daemon_router.unsupported_result(inv)
-        assert unsupported is not None, f"{cmd_text} should be blocked in daemon mode"
-        assert unsupported.ok is False
+        assert inv.command.client_local is True, f"{cmd_text} should be client_local"
+
+    # Engine-routed commands
+    for cmd_text in ("/teach start", "/skills", "/gateway", "/tools", "/model"):
+        inv = router.parse(cmd_text)
+        assert inv is not None, f"parse failed for {cmd_text}"
+        assert inv.command.client_local is False, f"{cmd_text} should NOT be client_local"
 
 
 def test_app_commands_are_registered_for_completion() -> None:
@@ -74,14 +73,12 @@ def test_interactive_app_command_boundary_rejects_prefix_collisions() -> None:
     assert _is_app_command("application status") is False
 
 
-def test_command_router_returns_standard_unsupported_result() -> None:
+def test_command_router_unsupported_always_returns_none() -> None:
+    """unsupported_result always returns None — all commands are supported."""
     router = CommandRouter("daemon")
 
     invocation = router.parse("/skills show demo")
 
     assert invocation is not None
     assert invocation.command.name == "skills show"
-    result = router.unsupported_result(invocation)
-    assert result is not None
-    assert result.ok is False
-    assert "daemon" in result.title
+    assert router.unsupported_result(invocation) is None

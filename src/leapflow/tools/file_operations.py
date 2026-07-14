@@ -13,47 +13,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterable
+from typing import Any, Dict, Iterable
+
+from leapflow.security.path_sensitivity import PathSensitivity, classify_path_sensitivity
 
 logger = logging.getLogger(__name__)
-
-_BLOCKED_WRITE_PREFIXES = (
-    "/System", "/usr", "/bin", "/sbin", "/etc",
-    "/var/root", "/Library/System",
-)
-
-# Sensitive paths that should NEVER be read and returned to an LLM
-_SENSITIVE_READ_PATTERNS: FrozenSet[str] = frozenset({
-    ".ssh/id_rsa", ".ssh/id_ed25519", ".ssh/id_ecdsa", ".ssh/id_dsa",
-    ".ssh/authorized_keys", ".ssh/known_hosts",
-    ".gnupg/", ".gpg",
-    ".aws/credentials", ".aws/config",
-    ".env", ".env.local", ".env.production",
-    "credentials.json", "service_account.json",
-    ".netrc", ".npmrc", ".pypirc",
-    "token.json", "secrets.yaml", "secrets.yml",
-    ".kube/config",
-    "id_rsa", "id_ed25519",
-    "gateway.yaml", ".credential_key",
-})
-
-_SENSITIVE_EXACT_NAMES: FrozenSet[str] = frozenset({
-    ".env", ".env.local", ".env.production", ".env.staging",
-    "credentials.json", "service_account.json", "token.json",
-    "secrets.yaml", "secrets.yml", ".netrc", ".npmrc", ".pypirc",
-    "gateway.yaml", ".credential_key",
-})
-
-# Binary extensions that should not be read as text
-_BINARY_EXTENSIONS: FrozenSet[str] = frozenset({
-    ".exe", ".dll", ".so", ".dylib", ".bin", ".dat",
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
-    ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav", ".flac",
-    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".pyc", ".pyo", ".class", ".o", ".obj",
-    ".wasm", ".sqlite", ".db", ".duckdb",
-})
 
 _MAX_READ_CHARS = 100_000
 _FILE_LIST_LIMIT = 100
@@ -119,27 +83,37 @@ def _read_text_window(path: Path, *, max_chars: int) -> tuple[str, bool]:
     return raw[:max_chars], True
 
 
-def _is_write_blocked(path: Path) -> bool:
-    resolved = str(path)
-    return any(resolved.startswith(prefix) for prefix in _BLOCKED_WRITE_PREFIXES)
+def _read_block_message(path: Path, sensitivity: PathSensitivity) -> str:
+    if sensitivity.category == "binary_file":
+        return f"Binary file cannot be read as text: {path.name}"
+    if sensitivity.category == "runtime_database":
+        return f"Runtime database files cannot be read as text: {path.name}"
+    if sensitivity.category == "runtime_control":
+        return f"Runtime control files cannot be read through file_read: {path.name}"
+    if sensitivity.category == "device_path":
+        return f"Device path reads are blocked: {path}"
+    return f"File read blocked by safety policy: {path}"
 
 
-def _is_sensitive_read(path: Path) -> bool:
-    """Check if reading the file would expose credentials or secrets."""
-    resolved = str(path)
-    name = path.name
-    if name in _SENSITIVE_EXACT_NAMES:
-        return True
-    return any(pattern in resolved for pattern in _SENSITIVE_READ_PATTERNS)
+def _write_block_message(path: Path, sensitivity: PathSensitivity) -> str:
+    if sensitivity.category == "system_path":
+        return f"Write blocked by safety policy: {path}"
+    if sensitivity.category == "runtime_database":
+        return f"Runtime database files cannot be written through file_write: {path.name}"
+    if sensitivity.category == "runtime_control":
+        return f"Runtime control files cannot be written through file_write: {path.name}"
+    if sensitivity.category == "audit_log":
+        return f"Audit logs cannot be modified through file_write: {path.name}"
+    return f"File write blocked by safety policy: {path}"
 
 
-def _is_binary(path: Path) -> bool:
-    return path.suffix.lower() in _BINARY_EXTENSIONS
-
-
-def _is_device_path(path: Path) -> bool:
-    resolved = str(path)
-    return resolved.startswith("/dev/") or resolved.startswith("/proc/")
+def _sensitivity_metadata(sensitivity: PathSensitivity) -> dict[str, Any]:
+    return {
+        "sensitivity_category": sensitivity.category,
+        "sensitivity_level": sensitivity.level,
+        "sensitivity_reason": sensitivity.reason,
+        "redact_on_read": sensitivity.redact_on_read,
+    }
 
 
 def _is_unsupported_leapflow_config_probe(path: Path) -> bool:
@@ -190,9 +164,10 @@ async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "Missing required parameter: path"}
 
     target = Path(path).expanduser().resolve()
+    sensitivity = classify_path_sensitivity(target)
 
-    if _is_device_path(target):
-        return {"ok": False, "error": f"Device path reads are blocked: {path}"}
+    if not sensitivity.readable:
+        return {"ok": False, "error": _read_block_message(target, sensitivity)}
 
     if not target.exists():
         if _is_unsupported_leapflow_config_probe(target):
@@ -211,11 +186,31 @@ async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
     if not target.is_file():
         return {"ok": False, "error": f"Not a file: {path}"}
 
-    if _is_sensitive_read(target):
-        return {"ok": False, "error": f"Sensitive file blocked by security policy: {target.name}"}
-
-    if _is_binary(target):
-        return {"ok": False, "error": f"Binary file cannot be read as text: {target.name}"}
+    if sensitivity.requires_approval:
+        try:
+            from leapflow.tools.registry_bootstrap import get_file_read_gate
+            gate = get_file_read_gate()
+            if gate is None:
+                return {
+                    "ok": False,
+                    "error": f"Sensitive file read requires approval: {target.name}",
+                    "requires_approval": True,
+                    **_sensitivity_metadata(sensitivity),
+                }
+            try:
+                approved = await gate.check(str(target), mode, _sensitivity_metadata(sensitivity))
+            except TypeError:
+                approved = await gate.check(str(target), mode)
+            if not approved:
+                message = str(getattr(gate, "denial_message", "") or f"File read denied by approval gate: {target.name}")
+                return {"ok": False, "error": message}
+        except ImportError:
+            return {
+                "ok": False,
+                "error": f"Sensitive file read requires approval: {target.name}",
+                "requires_approval": True,
+                **_sensitivity_metadata(sensitivity),
+            }
 
     try:
         raw, raw_truncated = _read_text_window(target, max_chars=max_chars)
@@ -245,7 +240,7 @@ async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
 
         try:
             from leapflow.security.redact import redact_sensitive_text
-            content = redact_sensitive_text(content)
+            content = redact_sensitive_text(content, file_read=sensitivity.redact_on_read)
         except ImportError:
             pass
 
@@ -268,6 +263,7 @@ async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
             "selected_lines": len(content.splitlines()) if content else 0,
             "mode": mode,
             "truncated": raw_truncated or line_truncated,
+            **_sensitivity_metadata(sensitivity),
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -283,23 +279,37 @@ async def file_write(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "Missing required parameter: path"}
 
     target = Path(path).expanduser().resolve()
+    sensitivity = classify_path_sensitivity(target)
 
-    if _is_write_blocked(target):
-        return {"ok": False, "error": f"Write blocked by safety policy: {target}"}
-
-    if _is_sensitive_read(target):
-        return {"ok": False, "error": f"Sensitive file write blocked by security policy: {target.name}"}
+    if sensitivity.hardline or not sensitivity.writable:
+        return {"ok": False, "error": _write_block_message(target, sensitivity)}
 
     try:
         from leapflow.tools.registry_bootstrap import get_file_write_gate
         gate = get_file_write_gate()
         if gate is not None:
-            approved = await gate.check(str(target), content, mode)
+            try:
+                approved = await gate.check(str(target), content, mode, _sensitivity_metadata(sensitivity))
+            except TypeError:
+                approved = await gate.check(str(target), content, mode)
             if not approved:
                 message = str(getattr(gate, "denial_message", "") or f"File write denied by approval gate: {target.name}")
                 return {"ok": False, "error": message}
+        elif sensitivity.requires_approval:
+            return {
+                "ok": False,
+                "error": f"Sensitive file write requires approval: {target.name}",
+                "requires_approval": True,
+                **_sensitivity_metadata(sensitivity),
+            }
     except ImportError:
-        pass
+        if sensitivity.requires_approval:
+            return {
+                "ok": False,
+                "error": f"Sensitive file write requires approval: {target.name}",
+                "requires_approval": True,
+                **_sensitivity_metadata(sensitivity),
+            }
 
     try:
         from leapflow.security.threat_patterns import scan_for_threats, ThreatScope
@@ -318,6 +328,11 @@ async def file_write(params: Dict[str, Any]) -> Dict[str, Any]:
                 f.write(content)
         else:
             target.write_text(content)
-        return {"ok": True, "path": str(target), "bytes_written": len(content.encode())}
+        return {
+            "ok": True,
+            "path": str(target),
+            "bytes_written": len(content.encode()),
+            **_sensitivity_metadata(sensitivity),
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}

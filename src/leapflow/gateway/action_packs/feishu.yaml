@@ -29,6 +29,20 @@ actions:
     effect: send
     risk_level: high
     output_policy: summary
+    capability: im.message.send
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:send_as_bot]
+        user: [im:message.send_as_user, im:message]
+        bot: [im:message:send_as_bot]
+      resource_fields: [chat_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: >-
+            Grant im:message:send_as_bot (bot) or im:message.send_as_user (user)
+            in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [chat_id, text]
       properties:
@@ -75,6 +89,15 @@ actions:
     effect: read
     risk_level: low
     output_policy: raw
+    capability: im.chat.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:chat:read]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:chat:read in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       properties:
         page_size:
@@ -95,6 +118,15 @@ actions:
     effect: read
     risk_level: low
     output_policy: raw
+    capability: im.chat.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:chat:read]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:chat:read in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [query]
       properties:
@@ -113,6 +145,386 @@ actions:
         - "{query}"
       timeout_s: 30
 
+  im.list_messages:
+    description: >-
+      List messages in a Feishu/Lark chat or P2P conversation.
+      Returns messages in reverse chronological order by default.
+      Requires chat_id (oc_xxx format); use im.search_chats or im.list_chats
+      to resolve a group name to chat_id first.
+      CLI: lark-cli im +chat-messages-list (supports --start, --end, --order, --page-size flags for advanced use).
+    effect: read
+    risk_level: low
+    output_policy: raw
+    capability: im.message.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+        user: [im:message.group_msg:get_as_user, im:message.p2p_msg:get_as_user, im:message.reactions:read, contact:user.base:readonly]
+        bot: [im:message.group_msg, im:message.p2p_msg:readonly, im:message.reactions:read]
+      resource_fields: [chat_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: >-
+            Grant im:message:readonly (plus identity-specific scopes) in the Feishu developer console,
+            then re-publish and reinstall the app.
+    schema:
+      required: [chat_id]
+      properties:
+        chat_id:
+          type: string
+          description: "Target chat ID (oc_xxx format)."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +chat-messages-list
+        - --chat-id
+        - "{chat_id}"
+      timeout_s: 30
+
+  im.get_messages:
+    description: >-
+      Batch-fetch Feishu/Lark messages by their IDs.
+      Returns full message content with sender names and reactions.
+      Accepts up to 50 message IDs (om_xxx format), comma-separated.
+    effect: read
+    risk_level: low
+    output_policy: raw
+    capability: im.message.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+        user: [im:message.group_msg:get_as_user, im:message.p2p_msg:get_as_user, im:message.reactions:read, contact:user.basic_profile:readonly]
+        bot: [im:message.group_msg, im:message.p2p_msg:readonly, im:message.reactions:read, contact:user.base:readonly]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:readonly in the Feishu developer console, then re-publish and reinstall the app.
+    schema:
+      required: [message_ids]
+      properties:
+        message_ids:
+          type: string
+          description: "Comma-separated message IDs (om_xxx format, max 50)."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-mget
+        - --message-ids
+        - "{message_ids}"
+      timeout_s: 30
+
+  im.search_messages:
+    description: >-
+      Search Feishu/Lark messages across chats by keyword.
+      Returns matching messages with sender names, chat context, and reactions.
+      Supports filters: chat_id (limit to specific chat), sender, time range.
+      Note: requires user identity (--as user); does not work with bot identity.
+      CLI: lark-cli im +messages-search (supports --chat-id, --sender, --start, --end,
+      --chat-type, --is-at-me flags for advanced use).
+    effect: read
+    risk_level: medium
+    output_policy: raw
+    capability: im.message.search
+    auth:
+      identities: [user]
+      scopes:
+        user: [search:message, im:message.reactions:read, contact:user.basic_profile:readonly]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: >-
+            Grant search:message and contact:user.basic_profile:readonly (user identity only)
+            in the Feishu developer console, then re-publish and reinstall the app.
+    schema:
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: "Search keyword or phrase."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-search
+        - --query
+        - "{query}"
+      timeout_s: 60
+
+  im.list_thread_messages:
+    description: >-
+      List messages in a Feishu/Lark thread (reply chain).
+      Accepts a thread ID (omt_xxx) or a message ID (om_xxx) that belongs to a thread.
+      Returns thread replies in chronological order by default.
+    effect: read
+    risk_level: low
+    output_policy: raw
+    capability: im.message.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+        user: [im:message.group_msg:get_as_user, im:message.p2p_msg:get_as_user, im:message.reactions:read, contact:user.basic_profile:readonly]
+        bot: [im:message.group_msg, im:message.p2p_msg:readonly, im:message.reactions:read, contact:user.base:readonly]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:readonly in the Feishu developer console, then re-publish and reinstall the app.
+    schema:
+      required: [thread]
+      properties:
+        thread:
+          type: string
+          description: "Thread ID (omt_xxx) or message ID (om_xxx) within the thread."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +threads-messages-list
+        - --thread
+        - "{thread}"
+      timeout_s: 30
+
+  im.reply_message:
+    description: >-
+      Reply to a specific message in a Feishu/Lark chat.
+      Creates a threaded reply linked to the original message.
+      Requires message_id (om_xxx format) of the message to reply to.
+    effect: send
+    risk_level: high
+    output_policy: summary
+    capability: im.message.send
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:send_as_bot]
+        user: [im:message.send_as_user, im:message]
+        bot: [im:message:send_as_bot]
+      resource_fields: [message_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:send_as_bot (bot) or im:message.send_as_user (user) in the developer console.
+    schema:
+      required: [message_id, text]
+      properties:
+        message_id:
+          type: string
+          description: "Message ID (om_xxx) to reply to."
+        text:
+          type: string
+          description: "Reply text content."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-reply
+        - --message-id
+        - "{message_id}"
+        - --text
+        - "{text}"
+      timeout_s: 30
+
+  im.update_message:
+    description: >-
+      Update (edit) an existing message sent by the bot.
+      Use for progressive streaming replies or correcting bot responses.
+      Only works on messages sent by the current bot identity.
+      Requires message_id (om_xxx format).
+    effect: write
+    risk_level: medium
+    output_policy: summary
+    capability: im.message.write
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:send_as_bot]
+        user: [im:message.send_as_user, im:message]
+        bot: [im:message:send_as_bot]
+      resource_fields: [message_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:send_as_bot (bot) or im:message.send_as_user (user) in the developer console.
+    schema:
+      required: [message_id, text]
+      properties:
+        message_id:
+          type: string
+          description: "Message ID (om_xxx) to update."
+        text:
+          type: string
+          description: "New message text content."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-update
+        - --message-id
+        - "{message_id}"
+        - --text
+        - "{text}"
+      timeout_s: 30
+
+  im.add_reaction:
+    description: >-
+      Add an emoji reaction to a message. Use for processing indicators
+      (e.g. add ⏳ when starting, ✅ when done).
+      Requires message_id and emoji_type.
+    effect: write
+    risk_level: low
+    output_policy: summary
+    capability: im.message.reaction
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+      resource_fields: [message_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:readonly in the Feishu developer console, then re-publish and reinstall the app.
+    schema:
+      required: [message_id, emoji_type]
+      properties:
+        message_id:
+          type: string
+          description: "Message ID (om_xxx) to react to."
+        emoji_type:
+          type: string
+          description: "Emoji type string (e.g. 'THUMBSUP', 'DONE', 'OnIt', 'JIAYI')."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-reaction-add
+        - --message-id
+        - "{message_id}"
+        - --emoji-type
+        - "{emoji_type}"
+      timeout_s: 15
+
+  im.remove_reaction:
+    description: >-
+      Remove an emoji reaction from a message.
+      Use to clear processing indicators after completion.
+    effect: write
+    risk_level: low
+    output_policy: summary
+    capability: im.message.reaction
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+      resource_fields: [message_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:readonly in the Feishu developer console, then re-publish and reinstall the app.
+    schema:
+      required: [message_id, emoji_type]
+      properties:
+        message_id:
+          type: string
+          description: "Message ID (om_xxx) to remove reaction from."
+        emoji_type:
+          type: string
+          description: "Emoji type string to remove."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-reaction-delete
+        - --message-id
+        - "{message_id}"
+        - --emoji-type
+        - "{emoji_type}"
+      timeout_s: 15
+
+  im.update_card:
+    description: >-
+      Update an interactive card message using a reply token from a card action callback.
+      Reply tokens expire after 30 minutes and can be used at most 2 times.
+      Use this to update card content in response to user button clicks or form submissions.
+    effect: write
+    risk_level: medium
+    output_policy: summary
+    capability: im.message.write
+    auth:
+      identities: [bot]
+      scopes:
+        bot: [im:message:send_as_bot]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:send_as_bot in the Feishu developer console, then re-publish and reinstall the app.
+    schema:
+      required: [token, card]
+      properties:
+        token:
+          type: string
+          description: "Reply token from card.action.trigger callback."
+        card:
+          type: string
+          description: "Card template JSON string or card builder output."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +card-update
+        - --token
+        - "{token}"
+        - --card
+        - "{card}"
+      timeout_s: 30
+
+  im.download_resource:
+    description: >-
+      Download a file or image resource from a Feishu message.
+      Returns the local file path after download.
+      Used for processing image/file/audio attachments from inbound messages.
+    effect: read
+    risk_level: low
+    output_policy: raw
+    capability: im.message.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+      resource_fields: [message_id, file_key]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:readonly in the Feishu developer console, then re-publish and reinstall the app.
+    schema:
+      required: [message_id, file_key, type]
+      properties:
+        message_id:
+          type: string
+          description: "Message ID (om_xxx) containing the resource."
+        file_key:
+          type: string
+          description: "Resource file key from the message payload."
+        type:
+          type: string
+          description: "Resource type: image, file, audio, video, media."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-resource-download
+        - --message-id
+        - "{message_id}"
+        - --file-key
+        - "{file_key}"
+        - --type
+        - "{type}"
+      timeout_s: 60
+
   # ── Docs ───────────────────────────────────────────────────────────────────
 
   docs.create_markdown:
@@ -120,6 +532,15 @@ actions:
     effect: write
     risk_level: medium
     output_policy: summary
+    capability: docs.create
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [docs:doc:create, drive:drive:write]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant docs:doc:create and drive:drive:write in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [title, markdown]
       properties:
@@ -158,6 +579,15 @@ actions:
     effect: write
     risk_level: high
     output_policy: summary
+    capability: calendar.event.write
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [calendar:calendar:write]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant calendar:calendar:write in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [summary, start_time, end_time]
       properties:
@@ -203,6 +633,15 @@ actions:
     effect: read
     risk_level: medium
     output_policy: summary
+    capability: drive.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [drive:drive]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant drive:drive in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [query]
       properties:
@@ -228,6 +667,15 @@ actions:
     effect: write
     risk_level: medium
     output_policy: summary
+    capability: sheets.write
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [sheets:spreadsheet, drive:drive]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant sheets:spreadsheet and drive:drive in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [spreadsheet_token, sheet_id, values]
       properties:
@@ -270,6 +718,15 @@ actions:
     effect: read
     risk_level: high
     output_policy: summary
+    capability: mail.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [mail:mail.read]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant mail:mail.read in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       properties:
         query:
@@ -293,6 +750,15 @@ actions:
     effect: write
     risk_level: medium
     output_policy: summary
+    capability: task.write
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [task:task:write]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant task:task:write in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [title]
       properties:

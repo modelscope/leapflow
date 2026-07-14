@@ -30,6 +30,7 @@ from leapflow.engine.context_disclosure import (
     DisclosureRuntimeState,
     MemoryDisclosure,
     PromptAssemblyPlan,
+    build_capability_manifests,
 )
 from leapflow.engine.error_classifier import (
     ErrorCategory,
@@ -52,7 +53,7 @@ from leapflow.engine.tool_concurrency import (
 )
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.scheduler import TaskScheduler
-from leapflow.engine.session import SessionController
+from leapflow.engine.session import SessionController, SessionMode
 from leapflow.analysis.pipeline import ImitationPipeline
 from leapflow.llm.base import LLMProvider
 from leapflow.llm.message_builder import (
@@ -68,6 +69,10 @@ from leapflow.memory.manager import MemoryManager
 from leapflow.prompts.templates import REACT_SYSTEM_TEMPLATE
 from leapflow.learning.active_learning import SkillMerger
 from leapflow.skills.builtin import app_launcher, clipboard_manager, file_organizer
+from leapflow.security.permission_failures import (
+    is_permission_failure_payload,
+    is_permission_hard_stop_payload,
+)
 from leapflow.storage.skill_library import SkillLibraryStore
 from leapflow.skills.registry import Skill, SkillRegistry
 from leapflow.tools.name_resolver import ToolRegistry, ToolResolution
@@ -158,6 +163,11 @@ def _tool_result_metadata(
 ) -> Dict[str, Any]:
     """Build safe, compact tool-completion metadata for streaming UIs."""
     metadata = _tool_args_metadata(tool_name, arguments, original_tool_name=original_tool_name)
+    if tool_name in {"platform_action", "gp_platform_action"} and arguments:
+        for key in ("platform", "action"):
+            value = arguments.get(key)
+            if value:
+                metadata[key] = _single_line_preview(value, limit=_TOOL_ARGS_PREVIEW_LIMIT)
     metadata["ok"] = True
     if isinstance(result, dict):
         metadata["ok"] = bool(result.get("ok", True))
@@ -165,6 +175,14 @@ def _tool_result_metadata(
             if key in result:
                 metadata[key] = result[key]
         for key in ("error_type", "retryable", "resolution_status", "resolution_confidence"):
+            if key in result:
+                metadata[key] = result[key]
+        # App Connector authorization failure metadata
+        for key in (
+            "failure_class", "failure_code", "recoverability", "blocks_approval",
+            "platform", "action", "capability", "missing_scopes", "required_scopes",
+            "scope_relation", "scope_source", "console_url", "next_steps", "skip_approval",
+        ):
             if key in result:
                 metadata[key] = result[key]
         for key in ("suggestions", "available_tools"):
@@ -222,6 +240,17 @@ def _platform_action_fingerprint(tool_name: str, arguments: Mapping[str, Any]) -
     return f"{platform}:{action}:{payload_key}"
 
 
+def _has_completed_side_effect(results: List[Dict[str, Any]]) -> bool:
+    """Return True if any result is a completed side-effect platform_action."""
+    for item in results:
+        result = item.get("result")
+        if not isinstance(result, dict):
+            continue
+        if result.get("ok") and result.get("completed"):
+            return True
+    return False
+
+
 def _unknown_tool_retry_prompt(result: Dict[str, Any]) -> str:
     """Build a compact structured correction prompt for a bad tool name."""
     suggestions = result.get("suggestions") or []
@@ -240,13 +269,78 @@ def _unknown_tool_retry_prompt(result: Dict[str, Any]) -> str:
     )
 
 
-def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
-    """Build a user-facing message from the last consecutive tool failures.
+def _is_permission_failure_payload(payload: Dict[str, Any]) -> bool:
+    """Return whether a tool-result payload represents an unresolved permission failure."""
+    return is_permission_failure_payload(payload)
 
-    Called when the loop exits with no content due to hitting
-    max_consecutive_tool_failures.  Returns "" when no useful failure context
-    is available in the recent message history.
+
+def _is_permission_hard_stop_payload(payload: Dict[str, Any]) -> bool:
+    """Return whether a failed tool result must stop the current agent turn."""
+    return is_permission_hard_stop_payload(payload)
+
+
+def _permission_hard_stop_from_results(results: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    """Return the first hard-stop permission failure from native tool results."""
+    for item in results:
+        result = item.get("result") if isinstance(item, dict) else None
+        if isinstance(result, dict) and _is_permission_hard_stop_payload(result):
+            return result
+    return None
+
+
+def _build_permission_recovery_text(failure: Dict[str, Any]) -> str:
+    """Render a deterministic permission-recovery message from a failure payload.
+
+    This is the single authoritative renderer for authorization failures: it
+    only cites scopes and links that are literally present in ``failure``,
+    never invents, infers, or expands scope names, and only uses "one of"
+    phrasing when ``scope_relation`` explicitly says so. Used both for the
+    end-of-loop fallback and to override any free-text LLM answer that
+    follows an unresolved permission failure.
     """
+    platform = str(failure.get("platform") or "")
+    capability = str(failure.get("capability") or "")
+    where = f"`{platform}.{capability}`" if platform and capability else (capability or platform or "this action")
+    missing_scopes: List[str] = [str(s) for s in (failure.get("missing_scopes") or []) if s]
+    required_scopes: List[str] = [str(s) for s in (failure.get("required_scopes") or []) if s]
+    scope_relation = str(failure.get("scope_relation") or "all_required")
+    recovery_hint = str(failure.get("recovery_hint") or "")
+    recoverability = str(failure.get("recoverability") or "")
+    console_url = str(failure.get("console_url") or "")
+    failure_code = str(failure.get("failure_code") or "")
+
+    scopes = missing_scopes or required_scopes
+    label = "Missing scope(s)" if missing_scopes else "Required scope(s)"
+
+    lines: List[str] = [
+        f"Authorization failed for {where}. "
+        "The platform has denied access — this cannot be resolved by retrying."
+    ]
+    if scopes:
+        quoted = ", ".join(f"`{s}`" for s in scopes)
+        if scope_relation == "one_of" and len(scopes) > 1:
+            lines.append(f"{label} (granting ANY ONE of the following is sufficient): {quoted}.")
+        else:
+            lines.append(f"{label}: {quoted}.")
+    if recovery_hint and failure_code not in ("rate_limited",):
+        lines.append(f"To fix: {recovery_hint}")
+    elif recoverability == "admin_required":
+        lines.append(
+            "An administrator must grant the required permissions in the platform developer console "
+            "and republish or reinstall the application."
+        )
+    if console_url:
+        lines.append(f"Developer console: {console_url}")
+    lines.append(
+        "Do NOT retry this action. When informing the user, quote ONLY the scope name(s) listed above — "
+        "never invent, guess, or add other scope names, and never claim they are interchangeable unless "
+        "explicitly told they are."
+    )
+    return "\n".join(lines)
+
+
+def _extract_recent_tool_failures(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return recent consecutive tool failure payloads, most recent first."""
     failures: List[Dict[str, Any]] = []
     for msg in reversed(messages[-24:]):
         content = str(msg.get("content") or "").strip()
@@ -264,7 +358,66 @@ def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
         failures.append(payload)
         if len(failures) >= 3:
             break
+    return failures
 
+
+def _latest_turn_tool_result(messages: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    """Return the most recent tool-result payload within the current user turn.
+
+    Scans backwards from the tail across both native (``role=="tool"``) and
+    text-mode (``"Tool result (...):"``-prefixed user messages) tool-call
+    conventions. Stops and returns ``None`` at the first genuine user message
+    (the current turn's boundary) or non-JSON tool content.
+    """
+    for msg in reversed(messages):
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "tool":
+            if not isinstance(content, str):
+                return None
+            try:
+                payload = json.loads(content)
+            except (json.JSONDecodeError, ValueError):
+                return None
+            return payload if isinstance(payload, dict) else None
+        if role == "user":
+            text = str(content or "")
+            if text.startswith("Tool result (") and ":\n" in text:
+                body = text.split(":\n", 1)[1].strip()
+                try:
+                    payload = json.loads(body)
+                except (json.JSONDecodeError, ValueError):
+                    return None
+                return payload if isinstance(payload, dict) else None
+            # Reached the current turn's real user message boundary.
+            return None
+        # Skip interleaved assistant messages (preamble / tool_calls).
+        continue
+    return None
+
+
+def _permission_override_message(messages: List[Dict[str, Any]]) -> str:
+    """Return a deterministic override when the turn's last tool signal is an
+    unresolved permission failure.
+
+    Prevents the LLM's free-text final answer from paraphrasing, expanding,
+    or fabricating scope names when the most recent tool call in this turn
+    failed on authorization and was never followed by a successful retry.
+    """
+    payload = _latest_turn_tool_result(messages)
+    if payload is None or not _is_permission_failure_payload(payload):
+        return ""
+    return _build_permission_recovery_text(payload)
+
+
+def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
+    """Build a user-facing message from the last consecutive tool failures.
+
+    Called when the loop exits with no content due to hitting
+    max_consecutive_tool_failures.  Returns "" when no useful failure context
+    is available in the recent message history.
+    """
+    failures = _extract_recent_tool_failures(messages)
     if not failures:
         return ""
 
@@ -275,7 +428,11 @@ def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
     available_actions: List[str] = list(last.get("available_action_names") or [])
 
     lines: List[str] = []
-    if failure_code == "unknown_platform_action":
+
+    # Authorization / permission failures — deterministic, no retry via LLM
+    if _is_permission_failure_payload(last):
+        lines.append(_build_permission_recovery_text(last))
+    elif failure_code == "unknown_platform_action":
         platform = str(last.get("platform") or "")
         action = str(last.get("requested_action") or "")
         lines.append(f"`{platform}.{action}` is not a registered platform action.")
@@ -711,6 +868,13 @@ class AgentEngine:
         self._last_disclosure_metadata: dict[str, Any] = {}
         self._current_task_contract: TaskContract | None = None
         self._disclosure_planner = DisclosurePlanner()
+        # Tier 1 structural continuity gate: capability categories used by native
+        # tool_calls in the most recently completed turn. Working memory only
+        # stores a synthetic "[Called: ...]" summary (no structured tool_calls),
+        # so this dedicated, reset-per-turn attribute is the actual source of
+        # truth — never derived from re-parsing text.
+        self._last_turn_tool_categories: frozenset[str] = frozenset()
+        self._manifests_by_name: Dict[str, Any] | None = None
         self._healer = MessageHealer()
 
         # B2: Prompt cache optimization (None = disabled)
@@ -974,6 +1138,32 @@ class AgentEngine:
         """Inject EventBus for emitting learning signals (episode events)."""
         self._event_bus = event_bus
 
+    def _emit_chat_event(self, sub_action: str, payload: Dict[str, Any]) -> None:
+        """Emit a chat interaction event for trajectory recording during LEARNING.
+
+        Only fires when the session is in LEARNING mode and an EventBus is available.
+        The recorder's state machine ensures these events are only persisted as
+        trajectory steps when recording is active.
+        """
+        if self._event_bus is None:
+            return
+        if self._session is None or self._session.mode != SessionMode.LEARNING:
+            return
+        from leapflow.domain.events import SystemEvent
+        event = SystemEvent(
+            event_type="chat.interaction",
+            source="leapflow.engine",
+            payload={"action": sub_action, **payload},
+            timestamp=time.time(),
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._event_bus.handle_event(
+                event.event_type, event.payload,
+            ))
+        except RuntimeError:
+            pass
+
     def set_experience_store(self, store: Any) -> None:
         """Inject ExperienceStore for world-model trajectory bridge."""
         self._experience_store = store
@@ -1063,6 +1253,11 @@ class AgentEngine:
         self._last_disclosure_metadata = {}
         self._context_governance_controller.reset_turn_scope()
         self._current_task_contract = self._build_task_contract(user_text)
+        try:
+            from leapflow.tools.gateway_tool import reset_platform_action_scope
+            reset_platform_action_scope()
+        except ImportError:
+            pass
 
     def _build_task_contract(self, user_text: str) -> TaskContract:
         workspace_root = (
@@ -1178,13 +1373,13 @@ class AgentEngine:
             slash_command=slash_command,
             context_posture=str(self._last_context_snapshot.get("context_posture") or "baseline"),
             recent_failure=bool(self._last_context_snapshot.get("forced_final_answer")),
+            last_turn_tool_categories=self._recent_tool_categories(),
         )
         try:
-            plan = self._disclosure_planner.plan(user_text, tool_definitions, runtime)
+            plan = self._disclosure_planner.plan(tool_definitions, runtime)
         except (TypeError, ValueError, RuntimeError) as exc:
             logger.warning("disclosure planning failed; falling back to full context: %s", exc)
             plan = DisclosurePlanner().full_plan(
-                user_text,
                 tool_definitions,
                 runtime,
                 "planner fallback preserved unified-loop behavior",
@@ -1196,7 +1391,7 @@ class AgentEngine:
             memory_context = self._build_session_summary_context(max_messages=plan.max_prior_turns)
         elif plan.memory in {MemoryDisclosure.QUERY_RETRIEVAL, MemoryDisclosure.TASK_RETRIEVAL}:
             memory_context = await self._prefetch_and_freeze_memory(user_text)
-        skill_section = self._build_skill_section(include_skills=plan.level != DisclosureLevel.LIGHT)
+        skill_section = self._build_skill_section(include_skills=plan.level != DisclosureLevel.CORE)
         app_connector_section = self._build_app_connector_section()
         system = UNIFIED_SYSTEM_TEMPLATE.format(
             tool_catalog=tool_catalog,
@@ -1208,6 +1403,74 @@ class AgentEngine:
         self._last_disclosure_metadata = plan.metadata()
         prior_turns = self._prior_turns_for_plan(plan)
         return _PromptAssembly(system=system, plan=plan, prior_turns=prior_turns)
+
+    def _recent_tool_categories(self) -> frozenset[str]:
+        """Return capability categories used by native tool_calls in the prior turn.
+
+        This is the Tier 1 continuity gate. It reads ``self._last_turn_tool_categories``,
+        a dedicated attribute updated at the end of each completed turn by
+        ``_record_tool_call_categories`` — never a re-reading of the user's free
+        text, and never derived from working memory (which only stores a
+        synthetic "[Called: ...]" summary string with no structured tool_calls).
+        """
+        return self._last_turn_tool_categories
+
+    def _record_tool_call_categories(self, native_calls: list) -> None:
+        """Update the Tier 1 continuity state from this turn's executed tool_calls.
+
+        Accumulates into ``self._last_turn_tool_categories`` so a turn that makes
+        several rounds of tool calls keeps every category it touched, not just
+        the last round. Reset once per turn by the caller before the first round.
+        """
+        if self._manifests_by_name is None:
+            from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
+
+            self._manifests_by_name = {
+                m.name: m for m in build_capability_manifests(TOOL_DEFINITIONS)
+            }
+        categories = set(self._last_turn_tool_categories)
+        for call in native_calls:
+            name = str(getattr(call, "name", "") or "")
+            manifest = self._manifests_by_name.get(name)
+            if manifest and manifest.category not in {"system", "general"}:
+                categories.add(manifest.category)
+        self._last_turn_tool_categories = frozenset(categories)
+
+    @staticmethod
+    def _expand_tools_kwarg_full(tools_kwarg: Dict[str, Any], tool_definitions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Expand this turn's native tool schema to the full catalog.
+
+        Structural failure-recovery gate: once an unknown_tool result proves
+        that this turn's disclosed subset was insufficient, escalate to the
+        full catalog immediately rather than guessing a smaller subset again.
+        """
+        return {"tools": list(tool_definitions)}
+
+    @staticmethod
+    def _merge_expanded_tool_schemas(
+        tools_kwarg: Dict[str, Any], results: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Merge capability_expand results into this turn's native tool schema.
+
+        Tier 1 model-initiated discovery gate: when the model calls
+        capability_expand and it succeeds, the returned tool schemas become
+        callable for the rest of this turn.
+        """
+        additions: List[Dict[str, Any]] = []
+        for item in results:
+            result = item.get("result")
+            if isinstance(result, dict) and result.get("ok") and result.get("expanded_tools"):
+                additions.extend(result["expanded_tools"])
+        if not additions:
+            return tools_kwarg
+        existing = list(tools_kwarg.get("tools") or [])
+        existing_names = {td.get("function", {}).get("name") for td in existing}
+        for td in additions:
+            name = td.get("function", {}).get("name")
+            if name and name not in existing_names:
+                existing.append(td)
+                existing_names.add(name)
+        return {"tools": existing}
 
     def _build_session_summary_context(self, *, max_messages: int) -> str:
         """Return a compact local session summary without retrieval or extra LLM calls."""
@@ -1396,6 +1659,7 @@ class AgentEngine:
         self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
         self._begin_turn_context(user_text)
+        self._emit_chat_event("user_message", {"content": user_text[:500]})
 
         # 1. Slash command (skill injection — zero-ambiguity activation)
         if user_text.startswith("/") and self._skill_injector:
@@ -1433,6 +1697,7 @@ class AgentEngine:
         self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
         self._begin_turn_context(user_text)
+        self._emit_chat_event("user_message", {"content": user_text[:500]})
 
         # 1. Slash command (skill injection)
         if user_text.startswith("/") and self._skill_injector:
@@ -1874,6 +2139,10 @@ class AgentEngine:
             slash_command=user_text.startswith("/"),
         )
         planned_enable_thinking = self._planned_enable_thinking(assembly.plan, enable_thinking)
+        # Reset the Tier 1 continuity state now that this turn's plan has been
+        # assembled from the *previous* turn's value; it accumulates fresh from
+        # this turn's own tool_calls for the *next* turn's plan.
+        self._last_turn_tool_categories = frozenset()
 
         messages: List[Dict[str, Any]] = [
             build_system_message(assembly.system),
@@ -1967,7 +2236,10 @@ class AgentEngine:
 
             native_calls = getattr(resp, "tool_calls", None) or []
             if native_calls:
-                assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
+                # Preamble exclusion: content alongside tool_calls is ephemeral
+                # reasoning — exclude it from the message context to prevent
+                # the next LLM turn from repeating it in the final answer.
+                assistant_msg: Dict[str, Any] = {"role": "assistant", "content": ""}
                 assistant_msg["tool_calls"] = [
                     {
                         "id": tc.id,
@@ -1977,11 +2249,22 @@ class AgentEngine:
                     for tc in native_calls
                 ]
                 messages.append(assistant_msg)
-                self._persist_message(session_id, "assistant", content, tool_calls=assistant_msg.get("tool_calls"))
+                self._persist_message(session_id, "assistant", "", tool_calls=assistant_msg.get("tool_calls"))
 
                 results = await self._execute_tools_concurrent(
                     native_calls, TOOL_HANDLERS, trace=trace, messages=messages,
                 )
+                self._record_tool_call_categories(native_calls)
+                tools_kwarg = self._merge_expanded_tool_schemas(tools_kwarg, results)
+
+                permission_hard_stop = _permission_hard_stop_from_results(results)
+                if permission_hard_stop:
+                    logger.info(
+                        "unified_loop: permission hard-stop after %s/%s",
+                        permission_hard_stop.get("platform", "platform"),
+                        permission_hard_stop.get("capability") or permission_hard_stop.get("action") or "action",
+                    )
+                    break
 
                 retryable_unknown = next(
                     (
@@ -1993,6 +2276,8 @@ class AgentEngine:
                 )
                 if retryable_unknown and not unknown_tool_retry_used:
                     unknown_tool_retry_used = True
+                    tools_kwarg = self._expand_tools_kwarg_full(tools_kwarg, TOOL_DEFINITIONS)
+                    use_native_tools = bool(tools_kwarg)
                     messages.append(build_user_message_text(_unknown_tool_retry_prompt(retryable_unknown)))
                     continue
 
@@ -2007,30 +2292,49 @@ class AgentEngine:
                     break
 
                 self._wm.remember_chat(build_assistant_message(
-                    content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
+                    f"[Called: {', '.join(tc.name for tc in native_calls)}]"
                 ))
 
                 if status == BudgetStatus.SOFT_LIMIT:
                     messages.append(build_user_message_text(
                         "SYSTEM: Approaching limit. Provide final answer now."
                     ))
+                elif _has_completed_side_effect(results):
+                    messages.append(build_user_message_text(
+                        "SYSTEM: Side-effect action completed (result has completed:true). "
+                        "Do not re-invoke it with the same parameters. "
+                        "If all user-requested actions are done, provide the final answer."
+                    ))
                 continue
 
-            self._wm.remember_chat(build_assistant_message(content))
             self._persist_message(session_id, "assistant", content)
             tool_call = self._parse_tool_call_from_content(content)
 
             if tool_call is None:
+                self._wm.remember_chat(build_assistant_message(content))
                 trace.record(ExecutionMode.COMPLETE)
                 break
 
-            messages.append(build_assistant_message(content))
+            # Text-mode preamble exclusion: only store call summary in WM,
+            # not the natural language preamble that surrounds the tool_call tag.
             normalized_tool_call = _normalize_tool_call(tool_call)
             tool_name = str(normalized_tool_call["name"])
+            self._wm.remember_chat(build_assistant_message(f"[Called: {tool_name}]"))
+
+            messages.append(build_assistant_message(content))
             tool_arguments = normalized_tool_call.get("arguments")
+            self._emit_chat_event("tool_call", {
+                "tool_name": tool_name,
+                "arguments_summary": json.dumps(tool_arguments, default=str, ensure_ascii=False)[:300] if tool_arguments else "",
+            })
             _show_progress("executing", tool_name)
             result = await self._execute_general_tool(normalized_tool_call, TOOL_HANDLERS)
             _clear_indicator()
+            self._emit_chat_event("tool_result", {
+                "tool_name": tool_name,
+                "ok": bool(result.get("ok")) if isinstance(result, dict) else True,
+                "summary": json.dumps(result, default=str, ensure_ascii=False)[:300] if isinstance(result, dict) else str(result)[:300],
+            })
             _print_tool_result(tool_name, result, enabled=self._settings.verbose_progress)
             trace.record(
                 ExecutionMode.ACTING,
@@ -2049,6 +2353,14 @@ class AgentEngine:
                 f"Tool result ({tool_name}):\n{result_text}"
             ))
             self._persist_message(session_id, "tool", result_text, tool_name=tool_name)
+
+            if _is_permission_hard_stop_payload(result):
+                logger.info(
+                    "unified_loop: permission hard-stop after %s/%s",
+                    result.get("platform", "platform"),
+                    result.get("capability") or result.get("action") or tool_name,
+                )
+                break
 
             if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
                 unknown_tool_retry_used = True
@@ -2081,15 +2393,20 @@ class AgentEngine:
         logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
         if content:
-            return content
+            permission_override = _permission_override_message(messages)
+            final = permission_override or content
+            self._emit_chat_event("response", {"content": final[:500]})
+            return final
         if fatal_error:
+            self._emit_chat_event("response", {"content": fatal_error[:500]})
             return fatal_error
-        # Derive a recovery message from the last platform_connect failure if present
-        return (
+        fallback = (
             _app_onboarding_recovery_message(messages)
             or _last_tool_failures_recovery_message(messages)
             or "I've reached my processing limit."
         )
+        self._emit_chat_event("response", {"content": fallback[:500]})
+        return fallback
 
     async def _post_turn_review(
         self, messages: List[Dict[str, Any]], final_content: str
@@ -2233,6 +2550,10 @@ class AgentEngine:
             slash_command=user_text.startswith("/"),
         )
         planned_enable_thinking = self._planned_enable_thinking(assembly.plan, enable_thinking)
+        # Reset the Tier 1 continuity state now that this turn's plan has been
+        # assembled from the *previous* turn's value; it accumulates fresh from
+        # this turn's own tool_calls for the *next* turn's plan.
+        self._last_turn_tool_categories = frozenset()
 
         messages: List[Dict[str, Any]] = [
             build_system_message(assembly.system),
@@ -2325,7 +2646,9 @@ class AgentEngine:
 
                 native_calls = getattr(resp, "tool_calls", None) or []
                 if native_calls:
-                    assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
+                    # Preamble exclusion: content alongside tool_calls is ephemeral
+                    # reasoning — exclude from context to prevent final-answer repetition.
+                    assistant_msg: Dict[str, Any] = {"role": "assistant", "content": ""}
                     assistant_msg["tool_calls"] = [
                         {
                             "id": tc.id,
@@ -2336,7 +2659,7 @@ class AgentEngine:
                     ]
                     messages.append(assistant_msg)
                     self._persist_message(
-                        session_id, "assistant", content,
+                        session_id, "assistant", "",
                         tool_calls=assistant_msg.get("tool_calls"),
                     )
 
@@ -2356,6 +2679,8 @@ class AgentEngine:
                     results = await self._execute_tools_concurrent(
                         native_calls, TOOL_HANDLERS, trace=trace, messages=messages
                     )
+                    self._record_tool_call_categories(native_calls)
+                    tools_kwarg = self._merge_expanded_tool_schemas(tools_kwarg, results)
                     result_by_id = {str(item.get("id")): item for item in results}
                     retryable_unknown = next(
                         (
@@ -2383,10 +2708,21 @@ class AgentEngine:
                             },
                         )
 
+                    permission_hard_stop = _permission_hard_stop_from_results(results)
+                    if permission_hard_stop:
+                        logger.info(
+                            "unified_loop_stream: permission hard-stop after %s/%s",
+                            permission_hard_stop.get("platform", "platform"),
+                            permission_hard_stop.get("capability") or permission_hard_stop.get("action") or "action",
+                        )
+                        break
+
                     failures = self._count_consecutive_tool_failures(messages)
                     turn_recovery.consecutive_tool_failures = failures
                     if retryable_unknown and not unknown_tool_retry_used:
                         unknown_tool_retry_used = True
+                        tools_kwarg = self._expand_tools_kwarg_full(tools_kwarg, TOOL_DEFINITIONS)
+                        use_native_tools = bool(tools_kwarg)
                         messages.append(build_user_message_text(_unknown_tool_retry_prompt(retryable_unknown)))
                         continue
                     if failures >= self._settings.max_consecutive_tool_failures:
@@ -2397,11 +2733,17 @@ class AgentEngine:
                         break
 
                     self._wm.remember_chat(build_assistant_message(
-                        content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
+                        f"[Called: {', '.join(tc.name for tc in native_calls)}]"
                     ))
                     if status == BudgetStatus.SOFT_LIMIT:
                         messages.append(build_user_message_text(
                             "SYSTEM: Approaching limit. Provide final answer now."
+                        ))
+                    elif _has_completed_side_effect(results):
+                        messages.append(build_user_message_text(
+                            "SYSTEM: Side-effect action completed (result has completed:true). "
+                            "Do not re-invoke it with the same parameters. "
+                            "If all user-requested actions are done, provide the final answer."
                         ))
                     continue
 
@@ -2490,24 +2832,35 @@ class AgentEngine:
                         messages.append(build_user_message_text(build_continuation_prompt(content)))
                         continue
 
-            self._wm.remember_chat(build_assistant_message(content))
             self._persist_message(session_id, "assistant", content)
             tool_call = self._parse_tool_call_from_content(content)
 
             if tool_call is None:
+                self._wm.remember_chat(build_assistant_message(content))
                 trace.record(ExecutionMode.COMPLETE)
                 if not content:
                     fallback = _app_onboarding_recovery_message(messages)
-                    yield StreamEvent(type="final", content=fallback or "I processed your request but have no additional output.")
+                    final_text = fallback or "I processed your request but have no additional output."
+                    self._emit_chat_event("response", {"content": final_text[:500]})
+                    yield StreamEvent(type="final", content=final_text)
                 else:
-                    yield StreamEvent(type="final", content=content)
+                    permission_override = _permission_override_message(messages)
+                    final_text = permission_override or content
+                    self._emit_chat_event("response", {"content": final_text[:500]})
+                    yield StreamEvent(type="final", content=final_text)
                 return
 
-            messages.append(build_assistant_message(content))
             normalized_tool_call = _normalize_tool_call(tool_call)
             tool_name = str(normalized_tool_call["name"])
             original_tool_name = str(normalized_tool_call.get("original_tool_name", tool_name))
+            self._wm.remember_chat(build_assistant_message(f"[Called: {tool_name}]"))
+
+            messages.append(build_assistant_message(content))
             tool_arguments = normalized_tool_call.get("arguments")
+            self._emit_chat_event("tool_call", {
+                "tool_name": tool_name,
+                "arguments_summary": json.dumps(tool_arguments, default=str, ensure_ascii=False)[:300] if tool_arguments else "",
+            })
             yield StreamEvent(
                 type="tool_start",
                 content=tool_name,
@@ -2519,6 +2872,11 @@ class AgentEngine:
             )
             result = await self._execute_general_tool(normalized_tool_call, TOOL_HANDLERS)
             _clear_indicator()
+            self._emit_chat_event("tool_result", {
+                "tool_name": tool_name,
+                "ok": bool(result.get("ok")) if isinstance(result, dict) else True,
+                "summary": json.dumps(result, default=str, ensure_ascii=False)[:300] if isinstance(result, dict) else str(result)[:300],
+            })
             yield StreamEvent(
                 type="tool_complete",
                 content=tool_name,
@@ -2556,6 +2914,14 @@ class AgentEngine:
             ))
             self._persist_message(session_id, "tool", result_text, tool_name=tool_name)
 
+            if _is_permission_hard_stop_payload(result):
+                logger.info(
+                    "unified_loop_stream: permission hard-stop after %s/%s",
+                    result.get("platform", "platform"),
+                    result.get("capability") or result.get("action") or tool_name,
+                )
+                break
+
             if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
                 unknown_tool_retry_used = True
                 messages.append(build_user_message_text(_unknown_tool_retry_prompt(result)))
@@ -2587,7 +2953,10 @@ class AgentEngine:
         logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
         if content:
-            yield StreamEvent(type="final", content=content)
+            permission_override = _permission_override_message(messages)
+            final = permission_override or content
+            self._emit_chat_event("response", {"content": final[:500]})
+            yield StreamEvent(type="final", content=final)
         else:
             fallback = (
                 _app_onboarding_recovery_message(messages)
@@ -2595,6 +2964,7 @@ class AgentEngine:
                 or fatal_error
                 or "I've reached my processing limit."
             )
+            self._emit_chat_event("response", {"content": fallback[:500]})
             yield StreamEvent(type="final", content=fallback)
 
 
@@ -2602,7 +2972,13 @@ class AgentEngine:
 
     @staticmethod
     def _format_tool_catalog(tool_definitions: List[Dict[str, Any]]) -> str:
-        """Format available tools for the unified system prompt."""
+        """Format available tools for the unified system prompt.
+
+        Each non-core tool is annotated with its exact capability_expand category
+        so the model never has to guess the category string — it reads it directly
+        from the index, matching this turn's real manifest classification.
+        """
+        manifests = {m.name: m for m in build_capability_manifests(tool_definitions)}
         lines: List[str] = []
         for td in tool_definitions:
             func = td.get("function", {})
@@ -2611,7 +2987,13 @@ class AgentEngine:
             params = ", ".join(
                 func.get("parameters", {}).get("properties", {}).keys()
             )
-            lines.append(f"- **{name}**({params}): {desc}")
+            manifest = manifests.get(name)
+            tag = (
+                f" [capability_expand category: {manifest.category}]"
+                if manifest is not None and not manifest.is_core
+                else ""
+            )
+            lines.append(f"- **{name}**({params}){tag}: {desc}")
         return "\n".join(lines)
 
     @staticmethod
@@ -2700,9 +3082,18 @@ class AgentEngine:
                 original_name = str(tc.name)
                 tool_call_dict = _normalize_tool_call({"name": original_name, "arguments": tc.arguments})
                 normalized_name = str(tool_call_dict["name"])
+                self._emit_chat_event("tool_call", {
+                    "tool_name": normalized_name,
+                    "arguments_summary": json.dumps(tc.arguments, default=str, ensure_ascii=False)[:300],
+                })
                 _show_progress("executing", normalized_name, step=i + 1, total=len(native_calls))
                 result = await self._execute_general_tool(tool_call_dict, handlers)
                 _clear_indicator()
+                self._emit_chat_event("tool_result", {
+                    "tool_name": normalized_name,
+                    "ok": bool(result.get("ok")) if isinstance(result, dict) else True,
+                    "summary": json.dumps(result, default=str, ensure_ascii=False)[:300] if isinstance(result, dict) else str(result)[:300],
+                })
                 _print_tool_result(normalized_name, result, enabled=self._settings.verbose_progress)
                 trace.record(
                     ExecutionMode.ACTING,
@@ -2719,6 +3110,12 @@ class AgentEngine:
                     "arguments": tc.arguments,
                     "result": result,
                 })
+                if isinstance(result, dict) and _is_permission_hard_stop_payload(result):
+                    logger.info(
+                        "tool_concurrency: stopping remaining native tool calls after permission blocker from %s",
+                        normalized_name,
+                    )
+                    break
             return executed
 
         concurrent, sequential = self._concurrency_policy.partition(tc_wrappers)
@@ -2775,13 +3172,20 @@ class AgentEngine:
                     result_payload = self._compact_tool_result(ctc.name, ctc.arguments, result)
                     result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
+                effective_result = error_result if isinstance(result, Exception) else result
                 executed.append({
                     "id": ctc.id,
                     "name": ctc.name,
                     "original_tool_name": original_name,
                     "arguments": ctc.arguments,
-                    "result": error_result if isinstance(result, Exception) else result,
+                    "result": effective_result,
                 })
+                if isinstance(effective_result, dict) and _is_permission_hard_stop_payload(effective_result):
+                    logger.info(
+                        "tool_concurrency: permission blocker returned from concurrent tool %s; skipping sequential group",
+                        ctc.name,
+                    )
+                    return executed
 
         for i, ctc in enumerate(sequential):
             original_name = original_names_by_id.get(str(ctc.id), ctc.name)
@@ -2810,6 +3214,12 @@ class AgentEngine:
                 "arguments": ctc.arguments,
                 "result": result,
             })
+            if isinstance(result, dict) and _is_permission_hard_stop_payload(result):
+                logger.info(
+                    "tool_concurrency: stopping sequential native tool calls after permission blocker from %s",
+                    ctc.name,
+                )
+                break
         return executed
 
     async def _execute_general_tool(

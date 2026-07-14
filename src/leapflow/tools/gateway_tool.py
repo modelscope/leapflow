@@ -10,6 +10,8 @@ Tool returns only status information back to LLM.
 """
 from __future__ import annotations
 
+import hashlib
+import json as _json
 import logging
 from typing import Any, Dict, List, Mapping
 
@@ -18,6 +20,25 @@ logger = logging.getLogger(__name__)
 _gateway_server_ref: Any = None
 _approval_gate: Any = None
 _pending_app_onboarding: Dict[str, Any] | None = None
+
+# Task-scoped side-effect dedup: tracks completed (platform, action, payload)
+# fingerprints within the current user turn. Reset at each engine.run() via
+# reset_platform_action_scope(). Prevents cross-turn duplicate execution of
+# send/write/execute actions regardless of LLM behavior.
+_task_completed_actions: Dict[str, Dict[str, Any]] = {}
+
+_SIDE_EFFECT_KINDS = frozenset({"send", "write", "execute"})
+
+
+def reset_platform_action_scope() -> None:
+    """Reset the task-scoped action dedup state. Called at each turn boundary."""
+    _task_completed_actions.clear()
+
+
+def _action_fingerprint(platform: str, action: str, payload: Mapping[str, Any]) -> str:
+    """Stable fingerprint for dedup: hash of (platform, action, sorted payload)."""
+    raw = f"{platform}:{action}:{_json.dumps(payload, sort_keys=True, ensure_ascii=False)}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 # Single source of truth for the platform_connect management namespace. Both
 # the platform_connect tool schema enum and the platform_action namespace
@@ -70,6 +91,7 @@ def build_app_connector_prompt_section() -> str:
         "For requests about connecting, setting up, configuring, enabling, or managing a supported app, use `platform_connect` first instead of generating SDK/Webhook sample code.",
         f"`platform_connect.action` is the management namespace: {', '.join(PLATFORM_CONNECT_ACTIONS)}.",
         "`platform_action.action` is only for exact registered platform business actions listed below, such as `im.send_message`; never use management actions like `list` or `guide` there.",
+        "All business fields MUST go inside `payload`; top-level keys are only `platform`, `action`, and `payload`.",
         "Do not invent platform IDs or platform action names. If the needed action is not listed, ask for discovery/clarification instead of guessing.",
         "Use `platform_connect` with `action='guide'` and the matching `platform` to start onboarding; use `action='list'` when the app is unclear.",
         "When a pending onboarding state is present, continue from that state with `platform_connect` instead of asking the user to restate the app.",
@@ -79,12 +101,19 @@ def build_app_connector_prompt_section() -> str:
         backend = dict(getattr(manifest, "backend", {}) or {})
         backend_kind = str(backend.get("kind") or "adapter")
         action_summaries = _platform_action_summaries(platform_id)
-        action_names = ", ".join(f"`{item['name']}`" for item in action_summaries[:12])
-        action_text = f"; platform_action actions={action_names}" if action_names else "; platform_action actions=none registered"
-        lines.append(
-            f"- `{platform_id}`: {getattr(manifest, 'display_name', platform_id)} "
-            f"(category={getattr(manifest, 'category', '')}; backend={backend_kind}{action_text})"
-        )
+        if action_summaries:
+            lines.append(
+                f"- `{platform_id}`: {getattr(manifest, 'display_name', platform_id)} "
+                f"(category={getattr(manifest, 'category', '')}; backend={backend_kind})"
+            )
+            for item in action_summaries:
+                payload_sig = _format_payload_signature(item)
+                lines.append(f"  - `{item['name']}` {payload_sig}")
+        else:
+            lines.append(
+                f"- `{platform_id}`: {getattr(manifest, 'display_name', platform_id)} "
+                f"(category={getattr(manifest, 'category', '')}; backend={backend_kind}; platform_action actions=none registered)"
+            )
     if _pending_app_onboarding:
         state = dict(_pending_app_onboarding)
         next_actions = state.get("next_actions") or []
@@ -99,6 +128,23 @@ def build_app_connector_prompt_section() -> str:
             "Use this state to continue app onboarding; do not ask the user to repeat known platform details.",
         ])
     return "\n".join(lines) + "\n"
+
+
+def _format_payload_signature(summary: Dict[str, Any]) -> str:
+    """Format a compact payload signature for the capability index.
+
+    Example output: ``payload={chat_id*, text*} [send/high]``
+    """
+    required_set = frozenset(summary.get("required") or ())
+    fields = summary.get("fields") or []
+    parts: list[str] = []
+    for f in fields:
+        parts.append(f"{f}*" if f in required_set else f)
+    payload_str = f"payload={{{', '.join(parts)}}}" if parts else "payload={}"
+    effect = summary.get("effect") or ""
+    risk = summary.get("risk_level") or ""
+    meta = "/".join(filter(None, [effect, risk]))
+    return f"{payload_str} [{meta}]" if meta else payload_str
 
 
 def _manifest_action_specs(platform: str) -> Mapping[str, Any]:
@@ -338,21 +384,6 @@ async def _action_guide(
         "actions": dict(manifest.actions),
     }
 
-    required = [c for c in manifest.credentials if c.required]
-    if required:
-        labels = " / ".join(c.label for c in required)
-        result["prompt_hint"] = (
-            f"Present the setup steps above, then ask the user to provide "
-            f"{labels} in a single reply.  Do NOT repeat credential values "
-            f"in your response."
-        )
-    else:
-        result["prompt_hint"] = (
-            "Present the setup steps and current preflight result. If all safe checks are ready, "
-            "call platform_connect with action='connect'. If a preflight step requires installation, "
-            "authorization, or credentials, ask only for that missing user action and avoid repeating known details."
-        )
-
     return result
 
 
@@ -392,6 +423,10 @@ async def _action_preflight(
     if manifest is None:
         return {"ok": False, "error": f"Unknown platform: {platform}"}
     preflight = await _run_manifest_preflight(platform, manifest, params)
+    if preflight.get("ready"):
+        clear_health = getattr(_gateway_server_ref, "clear_platform_capability_health", None)
+        if clear_health is not None:
+            clear_health(platform)
     state = _remember_app_onboarding(platform, manifest, preflight)
     return {
         "ok": bool(preflight.get("ready")),
@@ -598,6 +633,11 @@ async def _action_status(
                 result = _status_entry(s)
                 result["ok"] = True
                 result["platform"] = result.pop("id")
+                if result.get("connected"):
+                    clear_health = getattr(_gateway_server_ref, "clear_platform_capability_health", None)
+                    if clear_health is not None:
+                        clear_health(platform)
+                    result["capability_health_refreshed"] = True
                 return result
         return {"ok": False, "error": f"Platform not found: {platform}"}
     return {"ok": True, "platforms": [_status_entry(s) for s in statuses]}
@@ -710,6 +750,51 @@ def _platform_action_unavailable_response(platform: str, action: str) -> Dict[st
     return response
 
 
+def _structured_validation_error(
+    spec: Any,
+    validation: Any,
+    raw_params: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Build a machine-readable validation error response with recovery metadata."""
+    schema = getattr(spec, "schema", {}) or {}
+    required = schema.get("required") or ()
+    properties = schema.get("properties") or {}
+    response: Dict[str, Any] = {
+        "ok": False,
+        "failure_code": validation.failure_code or "validation_failed",
+        "error": validation.error,
+        "action": getattr(spec, "name", ""),
+        "retryable": True,
+        "recovery_hint": validation.recovery_hint,
+    }
+    if validation.missing_fields:
+        response["missing_fields"] = list(validation.missing_fields)
+        response["field_paths"] = [f"payload.{f}" for f in validation.missing_fields]
+    if validation.type_errors:
+        response["type_errors"] = list(validation.type_errors)
+    response["expected_schema"] = {
+        "required": [str(f) for f in required],
+        "fields": {
+            str(k): str((v.get("description") or v.get("type") or ""))
+            for k, v in properties.items()
+            if isinstance(v, Mapping)
+        },
+    }
+    return response
+
+
+def _required_scopes_for_identity(spec: Any) -> List[str]:
+    auth = getattr(spec, "auth", None)
+    scopes = dict(getattr(auth, "scopes", {}) or {}) if auth is not None else {}
+    result: list[str] = []
+    for key in ("common", "user", "bot"):
+        for scope in scopes.get(key, ()):
+            scope_text = str(scope)
+            if scope_text and scope_text not in result:
+                result.append(scope_text)
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════
 # gateway_send handler — proactive outbound messaging
 # ═══════════════════════════════════════════════════════════════
@@ -805,9 +890,6 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "Gateway not initialised"}
     platform = str(params.get("platform") or "")
     action_name = str(params.get("action") or "")
-    payload = params.get("payload") or {}
-    if not isinstance(payload, dict):
-        return {"ok": False, "error": "payload must be an object"}
     if not platform:
         return {"ok": False, "error": "platform is required"}
     if not action_name:
@@ -816,9 +898,75 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
     spec = _gateway_server_ref.get_platform_action_spec(platform, action_name)
     if spec is None:
         return _platform_action_unavailable_response(platform, action_name)
+
+    from leapflow.gateway.connectors.action_registry import normalize_payload, validate_payload
+
+    payload = normalize_payload(spec, params)
+    validation = validate_payload(spec, payload)
+    if not validation.ok:
+        return _structured_validation_error(spec, validation, params)
+
+    # Task-scoped side-effect dedup: block re-execution of identical
+    # send/write/execute actions within the same user turn.
+    fp = _action_fingerprint(platform, action_name, payload)
+    if spec.effect in _SIDE_EFFECT_KINDS and fp in _task_completed_actions:
+        logger.info(
+            "side_effect_dedup: blocked duplicate %s.%s fp=%s",
+            platform, action_name, fp,
+        )
+        original = _task_completed_actions[fp]
+        return {
+            "ok": True,
+            "already_executed": True,
+            "execution_note": (
+                f"This exact action ({platform}.{action_name}) was already executed "
+                "successfully in this task. Do not re-invoke. Report the original "
+                "result to the user."
+            ),
+            "original_result": original,
+            "retryable": False,
+        }
+
+    feasibility = _gateway_server_ref.check_platform_action_feasibility(
+        platform, action_name, payload
+    )
+    if not feasibility.get("ok"):
+        return feasibility
+
+    # Resource provenance check: for side-effect actions, verify that
+    # referenced resource IDs have been observed from a previous successful
+    # API call. Blocks hallucinated IDs before they reach approval.
+    provenance_warnings: List[str] = []
+    if spec.effect in _SIDE_EFFECT_KINDS and spec.auth.resource_fields:
+        from leapflow.gateway.resource_provenance import ProvenanceStatus
+
+        provenance_pool = _gateway_server_ref.resource_provenance
+        results = provenance_pool.check_payload(
+            platform, spec.auth.resource_fields, payload,
+        )
+        for pr in results:
+            if pr.status == ProvenanceStatus.UNVERIFIED:
+                provenance_warnings.append(
+                    f"⚠ {pr.field_name}='{pr.value}' was NOT found in any "
+                    f"previous API response ({pr.known_values_count} known values). "
+                    "This may be a hallucinated identifier."
+                )
+                logger.warning(
+                    "resource_provenance.unverified platform=%s field=%s value=%s known=%d",
+                    platform, pr.field_name, pr.value, pr.known_values_count,
+                )
+
     preview = await _gateway_server_ref.preview_platform_action(platform, action_name, payload)
     if not preview.get("ok"):
-        return {"ok": False, "error": str(preview.get("error") or "Platform action preview failed")}
+        failure_info = {k: v for k, v in preview.items() if k not in ("ok",)}
+        base_err = str(preview.get("error") or "Platform action preview failed")
+        if preview.get("blocks_approval"):
+            feasibility_check = _gateway_server_ref.check_platform_action_feasibility(
+                platform, action_name, payload
+            )
+            if not feasibility_check.get("ok"):
+                return feasibility_check
+        return {"ok": False, "error": base_err, **{k: v for k, v in failure_info.items() if k != "error"}}
 
     if _approval_gate is not None:
         try:
@@ -834,9 +982,23 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
                     "effect": spec.effect,
                     "risk_level": spec.risk_level,
                     "output_policy": spec.output_policy,
+                    "capability": spec.capability or spec.name,
+                    "required_scopes": _required_scopes_for_identity(spec),
                     "preview": preview.get("summary", ""),
+                    **({"provenance_warnings": provenance_warnings} if provenance_warnings else {}),
                 },
             )
+            # Build enriched approval detail with provenance context.
+            approval_detail = str(preview.get("summary") or approval_action.summary)
+            if provenance_warnings:
+                approval_detail = (
+                    approval_detail + "\n\n"
+                    + "\n".join(provenance_warnings)
+                )
+            risk_hint = 0.6
+            if provenance_warnings:
+                risk_hint = 0.9  # Elevate risk when provenance is unverified
+
             if hasattr(_approval_gate, "evaluate"):
                 result = await _approval_gate.evaluate(approval_action)
                 if not getattr(result, "approved", False):
@@ -845,13 +1007,16 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 decision = await _approval_gate.request_approval(ApprovalRequest(
                     category=approval_action.kind,
-                    detail=str(preview.get("summary") or approval_action.summary),
-                    risk_hint=0.6,
+                    detail=approval_detail,
+                    risk_hint=risk_hint,
                     metadata={
                         "platform": platform,
                         "action": action_name,
                         "backend_kind": spec.backend_kind,
                         "risk_level": spec.risk_level,
+                        "capability": spec.capability or spec.name,
+                        "required_scopes": _required_scopes_for_identity(spec),
+                        **({"provenance_warnings": provenance_warnings} if provenance_warnings else {}),
                     },
                     action=approval_action,
                 ))
@@ -866,7 +1031,16 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
             logger.debug("platform_action approval check failed", exc_info=True)
             return {"ok": False, "error": "Platform action approval check failed"}
 
-    return await _gateway_server_ref.execute_platform_action(platform, action_name, payload)
+    result = await _gateway_server_ref.execute_platform_action(platform, action_name, payload)
+
+    # Register successful side-effect actions for dedup.
+    if result.get("ok") and spec.effect in _SIDE_EFFECT_KINDS:
+        _task_completed_actions[fp] = {
+            k: v for k, v in result.items()
+            if k in ("ok", "resource_id", "data", "action", "platform")
+        }
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -881,19 +1055,27 @@ GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "description": (
                 "Execute an exact registered business action on an external platform through "
                 "LeapFlow's App Connector layer. Actions must be copied from the App Connector "
-                "Capability Index/available_action_names and are addressed as domain.operation, "
-                "e.g. im.send_message or docs.create_markdown. Do not invent action names, do not "
-                "use management actions such as list/guide/connect/status here, and never pass raw CLI commands or URLs."
+                "Capability Index and are addressed as domain.operation, "
+                "e.g. im.send_message or docs.create_markdown. All business fields (chat_id, text, query, etc.) "
+                "MUST be placed inside `payload`, never at the top level. "
+                "Example: {\"platform\":\"feishu\",\"action\":\"im.send_message\",\"payload\":{\"chat_id\":\"oc_xxx\",\"text\":\"hello\"}}. "
+                "Do not invent action names, do not use management actions such as list/guide/connect/status here."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "platform": {"type": "string", "description": "Platform ID, e.g. feishu"},
-                    "action": {"type": "string", "description": "Exact registered business action from available_action_names, e.g. im.send_message; never list/guide/connect/status"},
-                    "payload": {"type": "object", "description": "Action payload matching the registered schema"},
+                    "action": {"type": "string", "description": "Exact registered business action from the Capability Index, e.g. im.send_message"},
+                    "payload": {"type": "object", "description": "Action payload — all business fields go here (e.g. chat_id, text, query). See Capability Index for required/optional fields per action."},
                     "backend_kind": {"type": "string", "description": "Optional backend hint: cli/rest/mcp"},
                 },
                 "required": ["platform", "action", "payload"],
+            },
+            "x_leapflow": {
+                "category": "gateway",
+                "risk_level": "high",
+                "schema_cost": "high",
+                "requires_approval": True,
             },
         },
     },
@@ -917,6 +1099,12 @@ GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "checkpoint": {"type": "string", "description": "Optional event source resume checkpoint"},
                 },
                 "required": ["action"],
+            },
+            "x_leapflow": {
+                "category": "gateway",
+                "risk_level": "medium",
+                "schema_cost": "high",
+                "requires_approval": True,
             },
         },
     },
@@ -952,6 +1140,12 @@ GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["platform", "chat_id", "text"],
+            },
+            "x_leapflow": {
+                "category": "gateway",
+                "risk_level": "high",
+                "schema_cost": "high",
+                "requires_approval": True,
             },
         },
     },
@@ -1003,6 +1197,12 @@ GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["action"],
+            },
+            "x_leapflow": {
+                "category": "gateway",
+                "risk_level": "medium",
+                "schema_cost": "high",
+                "requires_approval": True,
             },
         },
     },

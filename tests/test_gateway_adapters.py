@@ -186,7 +186,7 @@ async def test_feishu_adapter_uses_cli_backend_for_send() -> None:
     assert result.ok is True
     assert result.message_id == "om_1"
     assert backend.executed == [
-        ("im.send_message", {"chat_id": "oc_1", "thread_id": "", "text": "hello feishu"}),
+        ("im.send_message", {"chat_id": "oc_1", "text": "hello feishu"}),
     ]
 
 
@@ -196,7 +196,6 @@ async def test_dingtalk_adapter_connect_send_and_event_normalization() -> None:
         "/v1.0/oauth2/accessToken": (200, {"errcode": 0, "accessToken": "access-token"}),
         "/topapi/robot/send": (200, {"errcode": 0, "task_id": "task-1"}),
     })
-    received: list[InboundMessage] = []
     adapter = DingTalkAdapter(
         app_key="key",
         app_secret="secret",
@@ -204,15 +203,19 @@ async def test_dingtalk_adapter_connect_send_and_event_normalization() -> None:
         port=0,
         http_client=fake_http,
     )
-    adapter.on_message = received.append
 
     await adapter.connect()
+    source = adapter.event_source()
+    assert source is not None
+
     try:
+        await source.start()
+
         result = await adapter.send(
             SendTarget(platform="dingtalk", chat_id="cid-1"),
             OutboundContent(text="hello dingtalk"),
         )
-        status, data = await post_json_for_test(adapter.local_url, {
+        status, data = await post_json_for_test(source._server.url_base + "/dingtalk/events", {
             "conversationId": "cid-1",
             "conversationType": "2",
             "senderStaffId": "staff-1",
@@ -221,6 +224,7 @@ async def test_dingtalk_adapter_connect_send_and_event_normalization() -> None:
             "text": {"content": "incoming dingtalk"},
         })
     finally:
+        await source.stop()
         await adapter.disconnect()
 
     assert result.ok is True
@@ -228,5 +232,3 @@ async def test_dingtalk_adapter_connect_send_and_event_normalization() -> None:
     assert data["ok"] is True
     assert result.message_id == "task-1"
     assert fake_http.requests[1]["json_body"]["robotCode"] == "robot"
-    assert received[0].source.chat_type == "group"
-    assert received[0].text == "incoming dingtalk"

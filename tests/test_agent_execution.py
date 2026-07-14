@@ -160,11 +160,15 @@ async def test_exact_canonical_tool_names_execute_without_guessing() -> None:
             # Case/separator formatting of the *same* canonical name still resolves.
             assert _normalize_tool_name("File_List") == "file_list"
             assert _normalize_tool_name("file-list") == "file_list"
-            # Common LLM tool-name drift is no longer silently rewritten to a
-            # different canonical tool: it must be reported as unknown.
-            assert _normalize_tool_name("list_directory") == "list_directory"
-            assert _normalize_tool_name("execute_command") == "execute_command"
-            assert _normalize_tool_name("run_terminal") == "run_terminal"
+            # Known LLM drift patterns resolve via static alias table.
+            assert _normalize_tool_name("list_directory") == "file_list"
+            assert _normalize_tool_name("execute_command") == "shell_run"
+            assert _normalize_tool_name("run_terminal") == "shell_run"
+            alias_resolution = _resolve_tool_name("list_directory", {"path": "."})
+            assert alias_resolution.normalized_name == "file_list"
+            assert alias_resolution.status == "aliased"
+            assert alias_resolution.auto_executable is True
+            # Names NOT in alias table remain unknown.
             directory_resolution = _resolve_tool_name("directory_scan", {"path": "."})
             risky_resolution = _resolve_tool_name("please_do", {"command": "ls -la"})
             assert directory_resolution.normalized_name is None
@@ -176,7 +180,6 @@ async def test_exact_canonical_tool_names_execute_without_guessing() -> None:
             assert metadata["original_tool_name"] == "File-List"
             assert metadata["normalized_tool_name"] == "file_list"
             assert metadata["resolved_from"] == "File-List"
-            assert "alias" not in metadata
         finally:
             lt.close()
 
@@ -379,8 +382,8 @@ async def test_app_connector_empty_final_uses_onboarding_recovery_state() -> Non
 
 
 @pytest.mark.asyncio
-async def test_unknown_tool_in_stream_triggers_structured_retry_not_alias_guess() -> None:
-    """Text-mode tool calls with a drifted name must surface a structured unknown, never a silent alias rewrite."""
+async def test_aliased_tool_in_stream_resolves_and_executes() -> None:
+    """Text-mode tool calls with a known drifted name resolve via alias and execute normally."""
     tool_reply = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
     with tempfile.TemporaryDirectory() as td:
         settings = make_settings(td)
@@ -399,8 +402,36 @@ async def test_unknown_tool_in_stream_triggers_structured_retry_not_alias_guess(
             events = [event async for event in engine.run_stream("List current directory")]
 
             tool_events = [event for event in events if event.type in {"tool_start", "tool_complete"}]
-            assert [event.content for event in tool_events] == ["list_directory", "list_directory"]
             assert tool_events[0].metadata["original_tool_name"] == "list_directory"
+            assert tool_events[0].metadata["tool_resolution_status"] == "aliased"
+            assert tool_events[0].metadata["normalized_tool_name"] == "file_list"
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_in_stream_triggers_structured_retry() -> None:
+    """Text-mode tool calls with a truly unknown name surface a structured unknown with suggestions."""
+    tool_reply = '<tool_call>{"name": "directory_scan", "arguments": {"path": "."}}</tool_call>'
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.platform.mock import MockBridge
+
+        rpc = MockBridge()
+        llm = StubLLM([tool_reply, "directory checked"])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            events = [event async for event in engine.run_stream("List current directory")]
+
+            tool_events = [event for event in events if event.type in {"tool_start", "tool_complete"}]
+            assert [event.content for event in tool_events] == ["directory_scan", "directory_scan"]
+            assert tool_events[0].metadata["original_tool_name"] == "directory_scan"
             assert tool_events[0].metadata["tool_resolution_status"] == "unknown"
             assert tool_events[1].metadata["ok"] is False
             assert tool_events[1].metadata["error_type"] == "unknown_tool"
@@ -577,9 +608,15 @@ async def test_progressive_disclosure_light_query_omits_tools_and_thinking() -> 
 
             assert out == "I am LeapFlow."
             assert llm.call_count == 1
-            assert "tools" not in llm.kwargs
+            # CORE disclosure keeps a static low-risk tool whitelist always callable
+            # (never an empty/contradictory tool contract), but excludes heavy/mutating tools.
+            core_names = {
+                tool.get("function", {}).get("name", "")
+                for tool in llm.kwargs.get("tools", [])
+            }
+            assert "shell_run" not in core_names
+            assert "hub_push" not in core_names
             assert llm.enable_thinking is False
-            assert "file_read" not in str(llm.messages[0].get("content", ""))
             system_prompt = str(llm.messages[0].get("content", ""))
             assert "## Presentation Style" in system_prompt
             assert "Avoid redundant tool calls" in system_prompt
@@ -595,8 +632,8 @@ async def test_progressive_disclosure_light_query_omits_tools_and_thinking() -> 
             assert "~/.leapflow/.env" in system_prompt
             assert "./.env" in system_prompt
             snapshot = engine.context_budget_snapshot
-            assert snapshot["disclosure_level"] == "light"
-            assert snapshot["disclosure"]["native_tools"] is False
+            assert snapshot["disclosure_level"] == "core"
+            assert snapshot["disclosure"]["native_tools"] is True
         finally:
             lt.close()
 
@@ -684,7 +721,92 @@ async def test_progressive_disclosure_file_query_selects_file_schemas() -> None:
             assert "file_read" in names
             assert "file_list" in names
             assert "shell_run" not in names
-            assert engine.context_budget_snapshot["disclosure_level"] == "selected_tools"
+            # file_read/file_list are part of the static Tier 0.5 core whitelist, so a
+            # plain file-oriented turn (no prior-turn tool-category continuity, no
+            # slash command / escalation signal) stays at the CORE floor level.
+            assert engine.context_budget_snapshot["disclosure_level"] == "core"
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_progressive_disclosure_expands_write_category_after_prior_turn_tool_use() -> None:
+    """Tier 1 continuity: a native tool_call executed in turn N structurally
+    opens its capability category for turn N+1 — a purely structural signal,
+    never a re-reading of user text. Regression guard for the dedicated
+    ``AgentEngine._last_turn_tool_categories`` state: working memory only
+    stores a synthetic "[Called: ...]" summary with no structured tool_calls,
+    so continuity must not be derived from ``wm.as_chat_messages()``.
+    """
+    from leapflow.llm.base import LLMChatResponse, LLMProvider, ToolCallInfo
+    from leapflow.platform.mock import MockBridge
+
+    class CaptureLLM(LLMProvider):
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, on_chunk=None, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return LLMChatResponse(
+                    content="",
+                    tool_calls=[
+                        ToolCallInfo(
+                            id="tc1",
+                            name="text_replace",
+                            arguments={"text": "a", "old": "a", "new": "b"},
+                        )
+                    ],
+                )
+            return LLMChatResponse(content="Turn done")
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            if False:
+                yield ""
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        settings = settings.__class__(
+            **{**settings.__dict__, "native_tool_calling_enabled": True}
+        )
+        rpc = MockBridge()
+        llm = CaptureLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("chat")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            await engine.run("Replace a with b in some text")
+            first_turn_names = {
+                t.get("function", {}).get("name") for t in llm.calls[0].get("tools", [])
+            }
+            # text_replace is not in the static core whitelist and nothing opened
+            # its category yet, so the model's own tools schema does not include it
+            # (the mock LLM here bypasses that constraint only to exercise the
+            # engine's post-execution bookkeeping, not provider-side enforcement).
+            assert "text_replace" not in first_turn_names
+
+            await engine.run("hi again")
+            second_turn_names = {
+                t.get("function", {}).get("name") for t in llm.calls[-1].get("tools", [])
+            }
+            assert "text_replace" in second_turn_names
+            assert "file_write" in second_turn_names  # same "write" category opened
+            assert "memory_add" in second_turn_names
+            assert engine.context_budget_snapshot["disclosure_level"] == "expanded"
+            assert "write" in engine.context_budget_snapshot["disclosure"]["expanded_categories"]
+
+            # A third turn with no tool use must not carry the category forever —
+            # continuity is exactly one turn, not a sticky escalation.
+            await engine.run("just chatting, no tools needed")
+            third_turn_names = {
+                t.get("function", {}).get("name") for t in llm.calls[-1].get("tools", [])
+            }
+            assert "text_replace" not in third_turn_names
+            assert engine.context_budget_snapshot["disclosure_level"] == "core"
         finally:
             lt.close()
 
@@ -926,3 +1048,235 @@ def test_last_tool_failures_recovery_message_returns_empty_when_no_failures() ->
         {"role": "tool", "content": json.dumps({"ok": True, "data": {}})},
     ]
     assert _last_tool_failures_recovery_message(messages) == ""
+
+
+@pytest.mark.asyncio
+async def test_permission_failure_hard_stops_text_tool_loop() -> None:
+    """Authorization failures are terminal business blockers, not retry prompts."""
+    tool_reply = '<tool_call>{"name": "platform_action", "arguments": {"platform": "feishu", "action": "im.list_chats", "payload": {}}}</tool_call>'
+    failure_payload = {
+        "ok": False,
+        "platform": "feishu",
+        "action": "im.list_chats",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "access_denied",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "scope_source": "authoritative",
+        "recoverability": "admin_required",
+        "retryable": False,
+        "blocks_approval": True,
+    }
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.platform.mock import MockBridge
+
+        rpc = MockBridge()
+        llm = StubLLM([tool_reply, "SHOULD NOT BE CALLED"])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+            engine._execute_general_tool = AsyncMock(return_value=failure_payload)  # type: ignore[method-assign]
+
+            out = await engine.run("列出飞书群聊")
+
+            assert llm.call_count == 1
+            engine._execute_general_tool.assert_awaited_once()  # type: ignore[attr-defined]
+            assert "Authorization failed" in out
+            assert "im:chat:read" in out
+            assert "Do NOT retry" in out
+            assert "SHOULD NOT BE CALLED" not in out
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_failure_hard_stops_native_tool_loop() -> None:
+    """Native tool-calling must also stop immediately on authorization blockers."""
+    from leapflow.llm.base import LLMChatResponse, LLMProvider, ToolCallInfo
+    from leapflow.platform.mock import MockBridge
+
+    failure_payload = {
+        "ok": False,
+        "platform": "feishu",
+        "action": "im.list_chats",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "access_denied",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "scope_source": "authoritative",
+        "recoverability": "admin_required",
+        "retryable": False,
+        "blocks_approval": True,
+    }
+
+    class PermissionLLM(LLMProvider):
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, on_chunk=None, **kwargs):
+            self.call_count += 1
+            if self.call_count == 1:
+                return LLMChatResponse(
+                    content="",
+                    tool_calls=[
+                        ToolCallInfo(
+                            id="tc1",
+                            name="platform_action",
+                            arguments={"platform": "feishu", "action": "im.list_chats", "payload": {}},
+                        ),
+                        ToolCallInfo(
+                            id="tc2",
+                            name="platform_action",
+                            arguments={
+                                "platform": "feishu",
+                                "action": "im.send_message",
+                                "payload": {"chat_id": "chat-1", "text": "should-not-send"},
+                            },
+                        ),
+                    ],
+                )
+            return LLMChatResponse(content="SHOULD NOT BE CALLED")
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            if False:
+                yield ""
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        settings = settings.__class__(**{**settings.__dict__, "native_tool_calling_enabled": True})
+        rpc = MockBridge()
+        llm = PermissionLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+            engine._execute_general_tool = AsyncMock(return_value=failure_payload)  # type: ignore[method-assign]
+
+            out = await engine.run("列出飞书群聊")
+
+            assert llm.call_count == 1
+            engine._execute_general_tool.assert_awaited_once()  # type: ignore[attr-defined]
+            assert "Authorization failed" in out
+            assert "im:chat:read" in out
+            assert "SHOULD NOT BE CALLED" not in out
+        finally:
+            lt.close()
+
+
+def test_permission_recovery_text_quotes_only_listed_scopes() -> None:
+    """The deterministic renderer must never invent or expand scope names."""
+    from leapflow.engine.engine import _build_permission_recovery_text
+
+    text = _build_permission_recovery_text({
+        "platform": "feishu",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "missing_scope",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "recoverability": "admin_required",
+        "console_url": "https://open.feishu.cn/app/cli_xxx/auth",
+    })
+
+    assert "im:chat:read" in text
+    assert "one of" not in text.lower()
+    assert "https://open.feishu.cn/app/cli_xxx/auth" in text
+    assert "Do NOT retry" in text
+
+
+def test_permission_recovery_text_uses_one_of_only_when_declared() -> None:
+    """"one of" phrasing only appears when scope_relation explicitly says so."""
+    from leapflow.engine.engine import _build_permission_recovery_text
+
+    text = _build_permission_recovery_text({
+        "platform": "feishu",
+        "capability": "im.message.send",
+        "failure_class": "authorization",
+        "failure_code": "missing_scope",
+        "required_scopes": ["im:message.send_as_user", "im:message:send_as_bot"],
+        "scope_relation": "one_of",
+        "recoverability": "admin_required",
+    })
+
+    assert "ANY ONE" in text
+    assert "im:message.send_as_user" in text
+    assert "im:message:send_as_bot" in text
+
+
+def test_permission_override_message_replaces_free_text_after_unresolved_failure() -> None:
+    """An unresolved permission failure as the turn's last tool signal must
+    override any free-text LLM answer, preventing scope hallucination."""
+    import json
+    from leapflow.engine.engine import _permission_override_message
+
+    failure_payload = {
+        "ok": False,
+        "platform": "feishu",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "missing_scope",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "console_url": "https://open.feishu.cn/app/cli_xxx/auth",
+    }
+    messages = [
+        {"role": "user", "content": "list my groups"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "platform_action", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "1", "content": json.dumps(failure_payload)},
+    ]
+
+    override = _permission_override_message(messages)
+
+    assert override
+    assert "im:chat:read" in override
+    assert "im:chat.group_info" not in override
+
+
+def test_permission_override_message_empty_after_successful_followup() -> None:
+    """No override once a later tool call in the same turn succeeded."""
+    import json
+    from leapflow.engine.engine import _permission_override_message
+
+    messages = [
+        {"role": "user", "content": "list my groups"},
+        {"role": "tool", "content": json.dumps({"ok": False, "failure_class": "authorization", "failure_code": "missing_scope"})},
+        {"role": "tool", "content": json.dumps({"ok": True, "data": {}})},
+    ]
+
+    assert _permission_override_message(messages) == ""
+
+
+def test_record_tool_call_categories_caches_capability_manifests(monkeypatch) -> None:
+    """Capability manifests are cached instead of rebuilt on every tool-call round."""
+    from types import SimpleNamespace
+
+    import leapflow.engine.engine as engine_module
+
+    calls = 0
+
+    def fake_build_capability_manifests(tool_definitions):
+        nonlocal calls
+        calls += 1
+        return [SimpleNamespace(name="text_replace", category="write")]
+
+    monkeypatch.setattr(engine_module, "build_capability_manifests", fake_build_capability_manifests)
+    engine = object.__new__(AgentEngine)
+    engine._last_turn_tool_categories = frozenset()
+    engine._manifests_by_name = None
+
+    engine._record_tool_call_categories([SimpleNamespace(name="text_replace")])
+    engine._record_tool_call_categories([SimpleNamespace(name="text_replace")])
+
+    assert calls == 1
+    assert engine._last_turn_tool_categories == frozenset({"write"})
