@@ -63,12 +63,21 @@ _DEFAULT_PATH_SCOPED: FrozenSet[str] = frozenset({
     "file_write", "text_replace",
 })
 
-# Tools that must never run in parallel (side effects, user interaction, shell)
+# Tools that must never run in parallel (side effects, user interaction, shell,
+# or external platform authorization boundaries where one failure can block the
+# rest of the turn).
 _DEFAULT_NEVER_PARALLEL: FrozenSet[str] = frozenset({
     "gp_shell_run", "shell_run",
     "clarify", "gp_clarify",
     "delegate_task", "gp_delegate_task",
     "memory_add", "gp_memory_add",
+    "platform_action", "gp_platform_action",
+    "platform_connect", "gp_platform_connect",
+    "gateway_send", "gp_gateway_send",
+    "gateway_connect", "gp_gateway_connect",
+    "hub_push", "gp_hub_push",
+    "hub_pull", "gp_hub_pull",
+    "hub_sync", "gp_hub_sync",
 })
 
 

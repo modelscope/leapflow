@@ -461,7 +461,12 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                     renderer.feed(str(event))
             turn_completed = True
         finally:
-            command = app.complete_active_command_in_response() if turn_completed else None
+            if turn_completed and renderer.permission_blocked:
+                command = app.block_active_command_in_response(renderer.permission_block_reason)
+            elif turn_completed:
+                command = app.complete_active_command_in_response()
+            else:
+                command = None
             renderer.finish(command=command)
             if renderer.has_output:
                 exit_stats.record_assistant_message()
@@ -1064,7 +1069,12 @@ async def cmd_interactive_daemon(
                 )
                 raise
         finally:
-            command = app.complete_active_command_in_response() if turn_completed else None
+            if turn_completed and renderer.permission_blocked:
+                command = app.block_active_command_in_response(renderer.permission_block_reason)
+            elif turn_completed:
+                command = app.complete_active_command_in_response()
+            else:
+                command = None
             renderer.finish(command=command)
             if renderer.has_output:
                 exit_stats.record_assistant_message()

@@ -442,6 +442,29 @@ def test_response_label_merges_done_command_status(monkeypatch) -> None:
     assert capture.rendered[0].plain == " |--  LEAP  #1 done  16.5s  3 tools"
 
 
+def test_response_label_merges_blocked_command_status(monkeypatch) -> None:
+    class CapturingConsole:
+        width = 100
+
+        def __init__(self) -> None:
+            self.rendered = []
+
+        def print(self, renderable) -> None:
+            self.rendered.append(renderable)
+
+    capture = CapturingConsole()
+    leap_console = LeapConsole(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    monkeypatch.setattr(leap_console, "_console", capture)
+
+    command = TuiCommand.create(command_id=2, text="发送消息到飞书")
+    command = command.mark_running().mark_blocked("missing_scope: im.message.send")
+
+    leap_console.response_label(9.4, tool_count=1, command=command)
+
+    assert len(capture.rendered) == 1
+    assert capture.rendered[0].plain == " |--  LEAP  #2 blocked  9.4s  1 tool"
+
+
 def test_stream_renderer_prints_tool_command_and_success_preview() -> None:
     class CaptureConsole:
         def __init__(self) -> None:
@@ -771,6 +794,40 @@ def test_stream_renderer_prints_permission_recovery_card() -> None:
     assert len(console.cards) == 1
     assert console.cards[0]["console_url"] == "https://open.feishu.cn/app/cli_xxx/auth"
     assert console.cards[0]["missing_scopes"] == ["im:chat:read"]
+    assert renderer.permission_blocked is True
+    assert renderer.permission_block_reason == "missing_scope: im.chat.read"
+
+
+def test_permission_recovery_card_renders_non_none_panel_body(monkeypatch) -> None:
+    class CapturingConsole:
+        width = 100
+
+        def __init__(self) -> None:
+            self.rendered = []
+
+        def print(self, renderable) -> None:
+            self.rendered.append(renderable)
+
+    capture = CapturingConsole()
+    leap_console = LeapConsole(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    monkeypatch.setattr(leap_console, "_console", capture)
+
+    leap_console.permission_recovery_card({
+        "ok": False,
+        "platform": "feishu",
+        "action": "im.list_chats",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "access_denied",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "scope_source": "authoritative",
+    })
+
+    assert len(capture.rendered) == 1
+    panel = capture.rendered[0]
+    assert panel.renderable is not None
+    assert "im:chat:read" in panel.renderable.plain
 
 
 @pytest.mark.asyncio
@@ -839,11 +896,12 @@ def test_failed_command_error_is_single_line_and_truncated() -> None:
     assert failed.error.endswith("…")
 
 
-def test_cancelled_and_skipped_commands_are_terminal() -> None:
+def test_cancelled_skipped_and_blocked_commands_are_terminal() -> None:
     command = TuiCommand.create(command_id=1, text="long task").mark_running()
 
     cancelled = command.mark_cancelled("user pressed cancel")
     skipped = command.mark_skipped("user skipped")
+    blocked = command.mark_blocked("missing_scope: im.chat.read")
 
     assert cancelled.status is TuiCommandStatus.CANCELLED
     assert cancelled.error == "user pressed cancel"
@@ -851,6 +909,9 @@ def test_cancelled_and_skipped_commands_are_terminal() -> None:
     assert skipped.status is TuiCommandStatus.SKIPPED
     assert skipped.error == "user skipped"
     assert skipped.finished_at > 0
+    assert blocked.status is TuiCommandStatus.BLOCKED
+    assert blocked.error == "missing_scope: im.chat.read"
+    assert blocked.finished_at > 0
 
 
 def test_placeholder_processor_indents_hint_after_prompt_space() -> None:

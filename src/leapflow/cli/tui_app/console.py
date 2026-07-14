@@ -151,6 +151,7 @@ class LeapConsole:
             TuiCommandStatus.QUEUED: "leap.border",
             TuiCommandStatus.RUNNING: "leap.accent",
             TuiCommandStatus.DONE: "leap.success",
+            TuiCommandStatus.BLOCKED: "leap.warning",
             TuiCommandStatus.FAILED: "leap.error",
             TuiCommandStatus.CANCELLED: "leap.warning",
             TuiCommandStatus.SKIPPED: "leap.warning",
@@ -159,6 +160,7 @@ class LeapConsole:
             TuiCommandStatus.QUEUED: "leap.muted",
             TuiCommandStatus.RUNNING: "leap.accent",
             TuiCommandStatus.DONE: "leap.success",
+            TuiCommandStatus.BLOCKED: "leap.warning",
             TuiCommandStatus.FAILED: "leap.error",
             TuiCommandStatus.CANCELLED: "leap.warning",
             TuiCommandStatus.SKIPPED: "leap.warning",
@@ -303,8 +305,12 @@ class LeapConsole:
         if not console_url:
             body.append("请在平台开发者后台补齐权限后重新发布/安装应用。\n", style="leap.muted")
 
+        body.rstrip()
+        if not body.plain.strip():
+            body = Text("请在平台开发者后台补齐权限后重新发布/安装应用。", style="leap.muted")
+
         self._console.print(Panel(
-            body.rstrip(),
+            body,
             title=Text("🔐 权限恢复", style="bold"),
             title_align="left",
             border_style="leap.warning",
@@ -386,7 +392,14 @@ class LeapConsole:
         label.append(" |--  ", style="leap.border")
         label.append("LEAP", style="leap.accent")
         if command is not None:
-            command_style = "leap.success" if command.status == TuiCommandStatus.DONE else "leap.dim"
+            command_styles = {
+                TuiCommandStatus.DONE: "leap.success",
+                TuiCommandStatus.BLOCKED: "leap.warning",
+                TuiCommandStatus.FAILED: "leap.error",
+                TuiCommandStatus.CANCELLED: "leap.warning",
+                TuiCommandStatus.SKIPPED: "leap.warning",
+            }
+            command_style = command_styles.get(command.status, "leap.dim")
             label.append(f"  {command.label} {command.status.value}", style=command_style)
         elapsed_str = _format_elapsed(elapsed_s)
         label.append(f"  {elapsed_str}", style="leap.dim")

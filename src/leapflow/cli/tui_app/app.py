@@ -315,6 +315,18 @@ class LeapApp:
         self._invalidate()
         return completed
 
+    def block_active_command_in_response(self, reason: str) -> Optional[TuiCommand]:
+        """Mark the active command blocked when recovery guidance is rendered inline."""
+        if self._active_command is None:
+            return None
+        blocked = self._active_command.mark_blocked(reason)
+        self._active_command = blocked
+        self._active_terminal_status = TuiCommandStatus.BLOCKED
+        self._active_terminal_reason = reason
+        self._sync_task_counts()
+        self._invalidate()
+        return blocked
+
     def queued_commands(self) -> list[TuiCommand]:
         """Return a snapshot of pending commands in queue order."""
         return self._pending_input.snapshot()
@@ -407,6 +419,8 @@ class LeapApp:
             return command.mark_cancelled(reason)
         if status == TuiCommandStatus.SKIPPED:
             return command.mark_skipped(reason)
+        if status == TuiCommandStatus.BLOCKED:
+            return command.mark_blocked(reason)
         return command.mark_failed(reason)
 
     def _dispatch_control_text(self, text: str) -> bool:

@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any
 
 from rich.text import Text
 
+from leapflow.security.permission_failures import is_permission_failure_payload
+
 _FINAL_RESPONSE_INDENT_SPACES = 4
 _FINAL_RESPONSE_MARGIN_TOP = 1
 _FINAL_RESPONSE_MARGIN_BOTTOM = 1
@@ -35,8 +37,6 @@ _TOOL_AUDIT_LINE_RE = re.compile(
     re.MULTILINE,
 )
 _MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
-_PERMISSION_FAILURE_CLASSES = frozenset({"authorization", "scope_denied"})
-_PERMISSION_FAILURE_CODES = frozenset({"access_denied", "missing_scope", "platform_degraded"})
 _JSON_DECODER = json.JSONDecoder()
 
 
@@ -145,9 +145,7 @@ def _is_permission_recovery_metadata(metadata: dict[str, Any] | None) -> bool:
     """Return whether metadata represents a manual authorization recovery case."""
     if not metadata or metadata.get("ok", True) is not False:
         return False
-    failure_class = _metadata_text(metadata, "failure_class")
-    failure_code = _metadata_text(metadata, "failure_code")
-    if failure_class in _PERMISSION_FAILURE_CLASSES or failure_code in _PERMISSION_FAILURE_CODES:
+    if is_permission_failure_payload(metadata):
         return True
     return bool(
         _metadata_text(metadata, "console_url")
@@ -323,21 +321,23 @@ class StreamRenderer:
     def __init__(self, console: "LeapConsole") -> None:
         self._console = console
         self._buffer: str = ""
+        self._pending: str = ""
         self._thinking_buffer: str = ""
         self._start_time: float = 0.0
         self._tool_start_time: float = 0.0
         self._active_tool: str = ""
         self._active_tool_detail: str = ""
         self._tool_history: list[tuple[str, float]] = []
+        self._permission_block_reason: str = ""
 
     @property
     def text(self) -> str:
-        """Full accumulated response text."""
-        return self._buffer
+        """Full accumulated response text (committed + pending)."""
+        return self._buffer + self._pending
 
     @property
     def has_output(self) -> bool:
-        return bool(self._buffer.strip() or self._thinking_buffer.strip())
+        return bool(self._buffer.strip() or self._pending.strip() or self._thinking_buffer.strip())
 
     @property
     def elapsed(self) -> float:
@@ -348,19 +348,35 @@ class StreamRenderer:
     def tool_count(self) -> int:
         return len(self._tool_history)
 
+    @property
+    def permission_blocked(self) -> bool:
+        return bool(self._permission_block_reason)
+
+    @property
+    def permission_block_reason(self) -> str:
+        return self._permission_block_reason
+
     def start(self) -> None:
         """Begin a new streaming session."""
         self._buffer = ""
+        self._pending = ""
         self._thinking_buffer = ""
         self._active_tool = ""
         self._active_tool_detail = ""
         self._tool_history = []
+        self._permission_block_reason = ""
         self._start_time = time.monotonic()
         self._tool_start_time = 0.0
 
     def feed(self, chunk: str) -> None:
-        """Append a text chunk to the response buffer."""
-        self._buffer += chunk
+        """Append a text chunk to the pending buffer.
+
+        Content is staged in _pending until we know whether this turn
+        produces a tool call. If it does, the pending content is discarded
+        (it was just preamble). If it's the final turn, pending is flushed
+        to _buffer in finish().
+        """
+        self._pending += chunk
 
     def feed_thinking(self, chunk: str) -> None:
         """Append meaningful thinking/reasoning text."""
@@ -372,7 +388,12 @@ class StreamRenderer:
         self._thinking_buffer += text
 
     def tool_started(self, name: str, metadata: dict[str, Any] | None = None) -> str:
-        """Mark a tool call as started. Returns spinner text for LeapApp."""
+        """Mark a tool call as started. Returns spinner text for LeapApp.
+
+        Discards any pending content — it was preamble preceding the tool call
+        and should not appear in the final answer.
+        """
+        self._pending = ""
         metadata = metadata or {}
         tool_name = _metadata_text(metadata, "normalized_tool_name") or name
         self._active_tool = tool_name
@@ -415,8 +436,12 @@ class StreamRenderer:
             self._console.print(line)
             recovery_hint = _metadata_text(metadata, "recovery_hint")
             recovery_card = getattr(self._console, "permission_recovery_card", None)
-            if _is_permission_recovery_metadata(metadata) and callable(recovery_card):
-                recovery_card(metadata)
+            if _is_permission_recovery_metadata(metadata):
+                failure_code = _metadata_text(metadata, "failure_code") or "authorization_required"
+                capability = _metadata_text(metadata, "capability") or _metadata_text(metadata, "action") or tool_name
+                self._permission_block_reason = f"{failure_code}: {capability}"
+                if callable(recovery_card):
+                    recovery_card(metadata)
             elif recovery_hint:
                 recovery_line = Text()
                 recovery_line.append("    ↳ recovery: ", style="leap.tool")
@@ -428,6 +453,11 @@ class StreamRenderer:
 
     def finish(self, *, command: Any | None = None) -> None:
         """Render all accumulated content to the console."""
+        # Flush pending content — if we reached finish() without a tool_start
+        # discarding it, the pending content is the final answer.
+        self._buffer += self._pending
+        self._pending = ""
+
         if self._thinking_buffer.strip():
             self._console.thinking(self._thinking_buffer)
 

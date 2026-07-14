@@ -69,6 +69,10 @@ from leapflow.memory.manager import MemoryManager
 from leapflow.prompts.templates import REACT_SYSTEM_TEMPLATE
 from leapflow.learning.active_learning import SkillMerger
 from leapflow.skills.builtin import app_launcher, clipboard_manager, file_organizer
+from leapflow.security.permission_failures import (
+    is_permission_failure_payload,
+    is_permission_hard_stop_payload,
+)
 from leapflow.storage.skill_library import SkillLibraryStore
 from leapflow.skills.registry import Skill, SkillRegistry
 from leapflow.tools.name_resolver import ToolRegistry, ToolResolution
@@ -265,17 +269,23 @@ def _unknown_tool_retry_prompt(result: Dict[str, Any]) -> str:
     )
 
 
-_PERMISSION_FAILURE_CLASSES = frozenset({"authorization", "scope_denied"})
-_PERMISSION_FAILURE_CODES = frozenset({"access_denied", "missing_scope"})
-
-
 def _is_permission_failure_payload(payload: Dict[str, Any]) -> bool:
     """Return whether a tool-result payload represents an unresolved permission failure."""
-    if not isinstance(payload, dict) or payload.get("ok", True) is not False:
-        return False
-    failure_class = str(payload.get("failure_class") or "")
-    failure_code = str(payload.get("failure_code") or "")
-    return failure_class in _PERMISSION_FAILURE_CLASSES or failure_code in _PERMISSION_FAILURE_CODES
+    return is_permission_failure_payload(payload)
+
+
+def _is_permission_hard_stop_payload(payload: Dict[str, Any]) -> bool:
+    """Return whether a failed tool result must stop the current agent turn."""
+    return is_permission_hard_stop_payload(payload)
+
+
+def _permission_hard_stop_from_results(results: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    """Return the first hard-stop permission failure from native tool results."""
+    for item in results:
+        result = item.get("result") if isinstance(item, dict) else None
+        if isinstance(result, dict) and _is_permission_hard_stop_payload(result):
+            return result
+    return None
 
 
 def _build_permission_recovery_text(failure: Dict[str, Any]) -> str:
@@ -2215,6 +2225,15 @@ class AgentEngine:
                 self._record_tool_call_categories(native_calls)
                 tools_kwarg = self._merge_expanded_tool_schemas(tools_kwarg, results)
 
+                permission_hard_stop = _permission_hard_stop_from_results(results)
+                if permission_hard_stop:
+                    logger.info(
+                        "unified_loop: permission hard-stop after %s/%s",
+                        permission_hard_stop.get("platform", "platform"),
+                        permission_hard_stop.get("capability") or permission_hard_stop.get("action") or "action",
+                    )
+                    break
+
                 retryable_unknown = next(
                     (
                         item.get("result")
@@ -2293,6 +2312,14 @@ class AgentEngine:
                 f"Tool result ({tool_name}):\n{result_text}"
             ))
             self._persist_message(session_id, "tool", result_text, tool_name=tool_name)
+
+            if _is_permission_hard_stop_payload(result):
+                logger.info(
+                    "unified_loop: permission hard-stop after %s/%s",
+                    result.get("platform", "platform"),
+                    result.get("capability") or result.get("action") or tool_name,
+                )
+                break
 
             if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
                 unknown_tool_retry_used = True
@@ -2639,6 +2666,15 @@ class AgentEngine:
                             },
                         )
 
+                    permission_hard_stop = _permission_hard_stop_from_results(results)
+                    if permission_hard_stop:
+                        logger.info(
+                            "unified_loop_stream: permission hard-stop after %s/%s",
+                            permission_hard_stop.get("platform", "platform"),
+                            permission_hard_stop.get("capability") or permission_hard_stop.get("action") or "action",
+                        )
+                        break
+
                     failures = self._count_consecutive_tool_failures(messages)
                     turn_recovery.consecutive_tool_failures = failures
                     if retryable_unknown and not unknown_tool_retry_used:
@@ -2824,6 +2860,14 @@ class AgentEngine:
             ))
             self._persist_message(session_id, "tool", result_text, tool_name=tool_name)
 
+            if _is_permission_hard_stop_payload(result):
+                logger.info(
+                    "unified_loop_stream: permission hard-stop after %s/%s",
+                    result.get("platform", "platform"),
+                    result.get("capability") or result.get("action") or tool_name,
+                )
+                break
+
             if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
                 unknown_tool_retry_used = True
                 messages.append(build_user_message_text(_unknown_tool_retry_prompt(result)))
@@ -3000,6 +3044,12 @@ class AgentEngine:
                     "arguments": tc.arguments,
                     "result": result,
                 })
+                if isinstance(result, dict) and _is_permission_hard_stop_payload(result):
+                    logger.info(
+                        "tool_concurrency: stopping remaining native tool calls after permission blocker from %s",
+                        normalized_name,
+                    )
+                    break
             return executed
 
         concurrent, sequential = self._concurrency_policy.partition(tc_wrappers)
@@ -3056,13 +3106,20 @@ class AgentEngine:
                     result_payload = self._compact_tool_result(ctc.name, ctc.arguments, result)
                     result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
+                effective_result = error_result if isinstance(result, Exception) else result
                 executed.append({
                     "id": ctc.id,
                     "name": ctc.name,
                     "original_tool_name": original_name,
                     "arguments": ctc.arguments,
-                    "result": error_result if isinstance(result, Exception) else result,
+                    "result": effective_result,
                 })
+                if isinstance(effective_result, dict) and _is_permission_hard_stop_payload(effective_result):
+                    logger.info(
+                        "tool_concurrency: permission blocker returned from concurrent tool %s; skipping sequential group",
+                        ctc.name,
+                    )
+                    return executed
 
         for i, ctc in enumerate(sequential):
             original_name = original_names_by_id.get(str(ctc.id), ctc.name)
@@ -3091,6 +3148,12 @@ class AgentEngine:
                 "arguments": ctc.arguments,
                 "result": result,
             })
+            if isinstance(result, dict) and _is_permission_hard_stop_payload(result):
+                logger.info(
+                    "tool_concurrency: stopping sequential native tool calls after permission blocker from %s",
+                    ctc.name,
+                )
+                break
         return executed
 
     async def _execute_general_tool(

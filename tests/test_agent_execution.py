@@ -1050,6 +1050,130 @@ def test_last_tool_failures_recovery_message_returns_empty_when_no_failures() ->
     assert _last_tool_failures_recovery_message(messages) == ""
 
 
+@pytest.mark.asyncio
+async def test_permission_failure_hard_stops_text_tool_loop() -> None:
+    """Authorization failures are terminal business blockers, not retry prompts."""
+    tool_reply = '<tool_call>{"name": "platform_action", "arguments": {"platform": "feishu", "action": "im.list_chats", "payload": {}}}</tool_call>'
+    failure_payload = {
+        "ok": False,
+        "platform": "feishu",
+        "action": "im.list_chats",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "access_denied",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "scope_source": "authoritative",
+        "recoverability": "admin_required",
+        "retryable": False,
+        "blocks_approval": True,
+    }
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.platform.mock import MockBridge
+
+        rpc = MockBridge()
+        llm = StubLLM([tool_reply, "SHOULD NOT BE CALLED"])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+            engine._execute_general_tool = AsyncMock(return_value=failure_payload)  # type: ignore[method-assign]
+
+            out = await engine.run("列出飞书群聊")
+
+            assert llm.call_count == 1
+            engine._execute_general_tool.assert_awaited_once()  # type: ignore[attr-defined]
+            assert "Authorization failed" in out
+            assert "im:chat:read" in out
+            assert "Do NOT retry" in out
+            assert "SHOULD NOT BE CALLED" not in out
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_failure_hard_stops_native_tool_loop() -> None:
+    """Native tool-calling must also stop immediately on authorization blockers."""
+    from leapflow.llm.base import LLMChatResponse, LLMProvider, ToolCallInfo
+    from leapflow.platform.mock import MockBridge
+
+    failure_payload = {
+        "ok": False,
+        "platform": "feishu",
+        "action": "im.list_chats",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "access_denied",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "scope_source": "authoritative",
+        "recoverability": "admin_required",
+        "retryable": False,
+        "blocks_approval": True,
+    }
+
+    class PermissionLLM(LLMProvider):
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, on_chunk=None, **kwargs):
+            self.call_count += 1
+            if self.call_count == 1:
+                return LLMChatResponse(
+                    content="",
+                    tool_calls=[
+                        ToolCallInfo(
+                            id="tc1",
+                            name="platform_action",
+                            arguments={"platform": "feishu", "action": "im.list_chats", "payload": {}},
+                        ),
+                        ToolCallInfo(
+                            id="tc2",
+                            name="platform_action",
+                            arguments={
+                                "platform": "feishu",
+                                "action": "im.send_message",
+                                "payload": {"chat_id": "chat-1", "text": "should-not-send"},
+                            },
+                        ),
+                    ],
+                )
+            return LLMChatResponse(content="SHOULD NOT BE CALLED")
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            if False:
+                yield ""
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        settings = settings.__class__(**{**settings.__dict__, "native_tool_calling_enabled": True})
+        rpc = MockBridge()
+        llm = PermissionLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+            engine._execute_general_tool = AsyncMock(return_value=failure_payload)  # type: ignore[method-assign]
+
+            out = await engine.run("列出飞书群聊")
+
+            assert llm.call_count == 1
+            engine._execute_general_tool.assert_awaited_once()  # type: ignore[attr-defined]
+            assert "Authorization failed" in out
+            assert "im:chat:read" in out
+            assert "SHOULD NOT BE CALLED" not in out
+        finally:
+            lt.close()
+
+
 def test_permission_recovery_text_quotes_only_listed_scopes() -> None:
     """The deterministic renderer must never invent or expand scope names."""
     from leapflow.engine.engine import _build_permission_recovery_text
