@@ -608,9 +608,15 @@ async def test_progressive_disclosure_light_query_omits_tools_and_thinking() -> 
 
             assert out == "I am LeapFlow."
             assert llm.call_count == 1
-            assert "tools" not in llm.kwargs
+            # CORE disclosure keeps a static low-risk tool whitelist always callable
+            # (never an empty/contradictory tool contract), but excludes heavy/mutating tools.
+            core_names = {
+                tool.get("function", {}).get("name", "")
+                for tool in llm.kwargs.get("tools", [])
+            }
+            assert "shell_run" not in core_names
+            assert "hub_push" not in core_names
             assert llm.enable_thinking is False
-            assert "file_read" not in str(llm.messages[0].get("content", ""))
             system_prompt = str(llm.messages[0].get("content", ""))
             assert "## Presentation Style" in system_prompt
             assert "Avoid redundant tool calls" in system_prompt
@@ -626,8 +632,8 @@ async def test_progressive_disclosure_light_query_omits_tools_and_thinking() -> 
             assert "~/.leapflow/.env" in system_prompt
             assert "./.env" in system_prompt
             snapshot = engine.context_budget_snapshot
-            assert snapshot["disclosure_level"] == "light"
-            assert snapshot["disclosure"]["native_tools"] is False
+            assert snapshot["disclosure_level"] == "core"
+            assert snapshot["disclosure"]["native_tools"] is True
         finally:
             lt.close()
 
@@ -715,7 +721,92 @@ async def test_progressive_disclosure_file_query_selects_file_schemas() -> None:
             assert "file_read" in names
             assert "file_list" in names
             assert "shell_run" not in names
-            assert engine.context_budget_snapshot["disclosure_level"] == "selected_tools"
+            # file_read/file_list are part of the static Tier 0.5 core whitelist, so a
+            # plain file-oriented turn (no prior-turn tool-category continuity, no
+            # slash command / escalation signal) stays at the CORE floor level.
+            assert engine.context_budget_snapshot["disclosure_level"] == "core"
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_progressive_disclosure_expands_write_category_after_prior_turn_tool_use() -> None:
+    """Tier 1 continuity: a native tool_call executed in turn N structurally
+    opens its capability category for turn N+1 — a purely structural signal,
+    never a re-reading of user text. Regression guard for the dedicated
+    ``AgentEngine._last_turn_tool_categories`` state: working memory only
+    stores a synthetic "[Called: ...]" summary with no structured tool_calls,
+    so continuity must not be derived from ``wm.as_chat_messages()``.
+    """
+    from leapflow.llm.base import LLMChatResponse, LLMProvider, ToolCallInfo
+    from leapflow.platform.mock import MockBridge
+
+    class CaptureLLM(LLMProvider):
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, on_chunk=None, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return LLMChatResponse(
+                    content="",
+                    tool_calls=[
+                        ToolCallInfo(
+                            id="tc1",
+                            name="text_replace",
+                            arguments={"text": "a", "old": "a", "new": "b"},
+                        )
+                    ],
+                )
+            return LLMChatResponse(content="Turn done")
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            if False:
+                yield ""
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        settings = settings.__class__(
+            **{**settings.__dict__, "native_tool_calling_enabled": True}
+        )
+        rpc = MockBridge()
+        llm = CaptureLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("chat")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            await engine.run("Replace a with b in some text")
+            first_turn_names = {
+                t.get("function", {}).get("name") for t in llm.calls[0].get("tools", [])
+            }
+            # text_replace is not in the static core whitelist and nothing opened
+            # its category yet, so the model's own tools schema does not include it
+            # (the mock LLM here bypasses that constraint only to exercise the
+            # engine's post-execution bookkeeping, not provider-side enforcement).
+            assert "text_replace" not in first_turn_names
+
+            await engine.run("hi again")
+            second_turn_names = {
+                t.get("function", {}).get("name") for t in llm.calls[-1].get("tools", [])
+            }
+            assert "text_replace" in second_turn_names
+            assert "file_write" in second_turn_names  # same "write" category opened
+            assert "memory_add" in second_turn_names
+            assert engine.context_budget_snapshot["disclosure_level"] == "expanded"
+            assert "write" in engine.context_budget_snapshot["disclosure"]["expanded_categories"]
+
+            # A third turn with no tool use must not carry the category forever —
+            # continuity is exactly one turn, not a sticky escalation.
+            await engine.run("just chatting, no tools needed")
+            third_turn_names = {
+                t.get("function", {}).get("name") for t in llm.calls[-1].get("tools", [])
+            }
+            assert "text_replace" not in third_turn_names
+            assert engine.context_budget_snapshot["disclosure_level"] == "core"
         finally:
             lt.close()
 
@@ -957,3 +1048,86 @@ def test_last_tool_failures_recovery_message_returns_empty_when_no_failures() ->
         {"role": "tool", "content": json.dumps({"ok": True, "data": {}})},
     ]
     assert _last_tool_failures_recovery_message(messages) == ""
+
+
+def test_permission_recovery_text_quotes_only_listed_scopes() -> None:
+    """The deterministic renderer must never invent or expand scope names."""
+    from leapflow.engine.engine import _build_permission_recovery_text
+
+    text = _build_permission_recovery_text({
+        "platform": "feishu",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "missing_scope",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "recoverability": "admin_required",
+        "console_url": "https://open.feishu.cn/app/cli_xxx/auth",
+    })
+
+    assert "im:chat:read" in text
+    assert "one of" not in text.lower()
+    assert "https://open.feishu.cn/app/cli_xxx/auth" in text
+    assert "Do NOT retry" in text
+
+
+def test_permission_recovery_text_uses_one_of_only_when_declared() -> None:
+    """"one of" phrasing only appears when scope_relation explicitly says so."""
+    from leapflow.engine.engine import _build_permission_recovery_text
+
+    text = _build_permission_recovery_text({
+        "platform": "feishu",
+        "capability": "im.message.send",
+        "failure_class": "authorization",
+        "failure_code": "missing_scope",
+        "required_scopes": ["im:message.send_as_user", "im:message:send_as_bot"],
+        "scope_relation": "one_of",
+        "recoverability": "admin_required",
+    })
+
+    assert "ANY ONE" in text
+    assert "im:message.send_as_user" in text
+    assert "im:message:send_as_bot" in text
+
+
+def test_permission_override_message_replaces_free_text_after_unresolved_failure() -> None:
+    """An unresolved permission failure as the turn's last tool signal must
+    override any free-text LLM answer, preventing scope hallucination."""
+    import json
+    from leapflow.engine.engine import _permission_override_message
+
+    failure_payload = {
+        "ok": False,
+        "platform": "feishu",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "missing_scope",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "console_url": "https://open.feishu.cn/app/cli_xxx/auth",
+    }
+    messages = [
+        {"role": "user", "content": "list my groups"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "platform_action", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "1", "content": json.dumps(failure_payload)},
+    ]
+
+    override = _permission_override_message(messages)
+
+    assert override
+    assert "im:chat:read" in override
+    assert "im:chat.group_info" not in override
+
+
+def test_permission_override_message_empty_after_successful_followup() -> None:
+    """No override once a later tool call in the same turn succeeded."""
+    import json
+    from leapflow.engine.engine import _permission_override_message
+
+    messages = [
+        {"role": "user", "content": "list my groups"},
+        {"role": "tool", "content": json.dumps({"ok": False, "failure_class": "authorization", "failure_code": "missing_scope"})},
+        {"role": "tool", "content": json.dumps({"ok": True, "data": {}})},
+    ]
+
+    assert _permission_override_message(messages) == ""

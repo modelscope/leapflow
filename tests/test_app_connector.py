@@ -228,6 +228,64 @@ def test_lark_cli_error_classifier_from_plain_access_denied() -> None:
     assert failure.capability == "docs.create"
 
 
+def test_lark_cli_error_classifier_declares_scopes_from_action_spec() -> None:
+    """When no authoritative missing_scopes are available, the classifier must
+    fall back to the action's OWN declared auth.scopes contract — never a
+    global CLI scope registry or a guessed scope name."""
+    spec = ActionSpec(
+        name="im.list_chats",
+        backend_kind="cli",
+        capability="im.chat.read",
+        auth=ActionAuthSpec(scopes={"common": ("im:chat:read",)}),
+    )
+
+    failure = classify_lark_cli_failure(
+        spec,
+        "missing scope for this operation",
+        {},
+        binary="lark-cli",
+        profile="work",
+        identity="bot",
+    )
+
+    assert failure.required_scopes == ("im:chat:read",)
+    assert failure.scope_source == "declared"
+    assert failure.scope_relation == "all_required"
+    assert "im:chat:read" in failure.recovery_hint
+
+
+def test_lark_cli_error_classifier_typed_error_marks_authoritative_scopes() -> None:
+    """missing_scopes from the upstream typed error is authoritative and must
+    take priority over the action's declared contract."""
+    spec = ActionSpec(
+        name="im.list_chats",
+        backend_kind="cli",
+        capability="im.chat.read",
+        auth=ActionAuthSpec(scopes={"common": ("im:chat:read",)}),
+    )
+
+    failure = classify_lark_cli_failure(
+        spec,
+        "",
+        {
+            "error": {
+                "type": "authorization",
+                "subtype": "missing_scope",
+                "message": "access denied",
+                "missing_scopes": ["im:chat:read"],
+                "console_url": "https://open.feishu.cn/app/cli_xxx/auth",
+            }
+        },
+        binary="lark-cli",
+        profile="work",
+        identity="bot",
+    )
+
+    assert failure.missing_scopes == ("im:chat:read",)
+    assert failure.scope_source == "authoritative"
+    assert failure.console_url == "https://open.feishu.cn/app/cli_xxx/auth"
+
+
 # ═══════════════════════════════════════════════════════════════
 # Payload normalization tests
 # ═══════════════════════════════════════════════════════════════

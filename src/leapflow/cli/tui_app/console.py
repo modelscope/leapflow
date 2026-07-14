@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 from rich.console import Console
 from rich.markdown import CodeBlock, Markdown
@@ -35,6 +35,20 @@ def _format_card_elapsed(seconds: float) -> str:
         return f"{seconds:.1f}s"
     minutes = int(seconds // 60)
     return f"{minutes}m{seconds - minutes * 60:.0f}s"
+
+
+def _metadata_list(value: Any) -> list[str]:
+    """Return compact string items from a metadata scalar or sequence."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if item]
+    return [str(value)]
+
+
+def _metadata_text(metadata: Mapping[str, Any], key: str) -> str:
+    value = metadata.get(key)
+    return "" if value is None else str(value)
 
 
 def _build_rich_theme(theme: Theme | ResolvedTheme) -> RichTheme:
@@ -234,6 +248,66 @@ class LeapConsole:
             Text(body),
             title=title,
             border_style="leap.error",
+            padding=(0, 1),
+        ))
+
+    def permission_recovery_card(self, metadata: Mapping[str, Any]) -> None:
+        """Render a copy-safe permission recovery card for App Connector failures."""
+        platform = _metadata_text(metadata, "platform") or _metadata_text(metadata, "onboarding_platform")
+        action = _metadata_text(metadata, "action")
+        capability = _metadata_text(metadata, "capability")
+        failure_code = _metadata_text(metadata, "failure_code")
+        recoverability = _metadata_text(metadata, "recoverability")
+        console_url = _metadata_text(metadata, "console_url")
+        recovery_hint = _metadata_text(metadata, "recovery_hint")
+        missing_scopes = _metadata_list(metadata.get("missing_scopes"))
+        required_scopes = _metadata_list(metadata.get("required_scopes"))
+        scope_relation = _metadata_text(metadata, "scope_relation") or "all_required"
+        next_steps = _metadata_list(metadata.get("next_steps"))
+
+        body = Text()
+        if platform or action or capability:
+            target = ".".join(part for part in (platform, action) if part)
+            body.append("目标: ", style="leap.muted")
+            body.append(target or capability or "平台能力", style="leap.error")
+            if capability and capability != target:
+                body.append(f"  capability={capability}", style="leap.muted")
+            body.append("\n")
+        if failure_code or recoverability:
+            body.append("原因: ", style="leap.muted")
+            body.append(failure_code or "authorization_required", style="leap.error")
+            if recoverability:
+                body.append(f"  recoverability={recoverability}", style="leap.muted")
+            body.append("\n")
+        scopes = missing_scopes or required_scopes
+        if scopes:
+            label = "缺失权限" if missing_scopes else "需要权限"
+            if scope_relation == "one_of" and len(scopes) > 1:
+                body.append(f"{label}（任选其中一项即可）:\n", style="leap.muted")
+            else:
+                body.append(f"{label}:\n", style="leap.muted")
+            scope_style = "leap.error" if missing_scopes else "leap.warning"
+            for scope in scopes:
+                body.append(f"  - {scope}\n", style=scope_style)
+        if console_url:
+            body.append("开发者后台链接（可复制）:\n", style="leap.muted")
+            body.append(f"  {console_url}\n", style="leap.info")
+        if next_steps:
+            body.append("下一步:\n", style="leap.muted")
+            for step in next_steps[:5]:
+                body.append(f"  {step}\n", style="leap.muted")
+        elif recovery_hint:
+            body.append("恢复提示: ", style="leap.muted")
+            body.append(recovery_hint, style="leap.muted")
+            body.append("\n")
+        if not console_url:
+            body.append("请在平台开发者后台补齐权限后重新发布/安装应用。\n", style="leap.muted")
+
+        self._console.print(Panel(
+            body.rstrip(),
+            title=Text("🔐 权限恢复", style="bold"),
+            title_align="left",
+            border_style="leap.warning",
             padding=(0, 1),
         ))
 

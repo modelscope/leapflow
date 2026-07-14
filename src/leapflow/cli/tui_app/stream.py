@@ -34,6 +34,9 @@ _TOOL_AUDIT_LINE_RE = re.compile(
     r"[A-Za-z_][\w.-]*(?:\s|$).*",
     re.MULTILINE,
 )
+_MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
+_PERMISSION_FAILURE_CLASSES = frozenset({"authorization", "scope_denied"})
+_PERMISSION_FAILURE_CODES = frozenset({"access_denied", "missing_scope", "platform_degraded"})
 _JSON_DECODER = json.JSONDecoder()
 
 
@@ -100,12 +103,29 @@ def _collapse_blank_lines(text: str) -> str:
     return "\n".join(collapsed).strip()
 
 
+def _ensure_copyable_markdown_links(text: str) -> str:
+    """Append visible bare URLs for Markdown links that terminals may not expose."""
+    lines: list[str] = []
+    for line in text.splitlines():
+        lines.append(line)
+        visible_line = _MARKDOWN_LINK_RE.sub(lambda match: match.group(1), line)
+        appended: set[str] = set()
+        for match in _MARKDOWN_LINK_RE.finditer(line):
+            url = match.group(2)
+            if url in visible_line or url in appended:
+                continue
+            lines.append(f"复制链接：{url}")
+            appended.add(url)
+    return "\n".join(lines)
+
+
 def _sanitize_final_response(text: str) -> str:
-    """Remove leaked tool protocol artifacts from user-facing final answers."""
+    """Remove leaked tool protocol artifacts and keep critical links copyable."""
     without_fences = _strip_tool_protocol_fences(text)
     without_objects = _strip_tool_protocol_json_objects(without_fences)
     without_audit_lines = _TOOL_AUDIT_LINE_RE.sub("", without_objects)
-    return _collapse_blank_lines(without_audit_lines)
+    with_copyable_links = _ensure_copyable_markdown_links(without_audit_lines)
+    return _collapse_blank_lines(with_copyable_links)
 
 
 def _normalize_thinking_text(text: str) -> str:
@@ -119,6 +139,24 @@ def _metadata_text(metadata: dict[str, Any] | None, key: str) -> str:
         return ""
     value = metadata.get(key)
     return value if isinstance(value, str) else ("" if value is None else str(value))
+
+
+def _is_permission_recovery_metadata(metadata: dict[str, Any] | None) -> bool:
+    """Return whether metadata represents a manual authorization recovery case."""
+    if not metadata or metadata.get("ok", True) is not False:
+        return False
+    failure_class = _metadata_text(metadata, "failure_class")
+    failure_code = _metadata_text(metadata, "failure_code")
+    if failure_class in _PERMISSION_FAILURE_CLASSES or failure_code in _PERMISSION_FAILURE_CODES:
+        return True
+    return bool(
+        _metadata_text(metadata, "console_url")
+        and (
+            metadata.get("missing_scopes")
+            or metadata.get("required_scopes")
+            or _metadata_text(metadata, "recovery_hint")
+        )
+    )
 
 
 def _truncate_detail(text: str, *, limit: int = _TOOL_OUTPUT_LIMIT) -> str:
@@ -157,7 +195,10 @@ def _context_tags(metadata: dict[str, Any] | None) -> list[str]:
     if mode and mode not in {"raw", posture}:
         tags.append(mode)
     disclosure = _metadata_text(metadata, "disclosure_level")
-    if disclosure and disclosure not in {"selected_tools", "minimal"}:
+    # CORE is the routine, always-on floor level (static low-risk whitelist);
+    # surfacing it on every single turn would be visual noise, so only tag
+    # the meaningful escalations (expanded/full) plus any unrecognized value.
+    if disclosure and disclosure not in {"core", "minimal"}:
         tags.append(f"disclosure={disclosure}")
     if metadata.get("tool_truncated"):
         tags.append("truncated")
@@ -203,7 +244,11 @@ def _tool_context_detail(metadata: dict[str, Any] | None) -> str:
 
 def _tool_icon(name: str, *, ok: bool = True) -> str:
     if not ok:
-        return "❌"
+        # Use the same subdued "✗" glyph as console.error()/tool_result() instead
+        # of the full-color "❌" emoji: it still reads as a clear failure marker
+        # but renders in the theme's error color rather than a fixed bright red,
+        # so a single tool failure doesn't visually dominate the whole line.
+        return "✗"
     if name.startswith("file_list"):
         return "📁"
     if name.startswith("file_read"):
@@ -369,7 +414,10 @@ class StreamRenderer:
             line.append(f" | {_format_elapsed(duration)}", style="leap.tool")
             self._console.print(line)
             recovery_hint = _metadata_text(metadata, "recovery_hint")
-            if recovery_hint:
+            recovery_card = getattr(self._console, "permission_recovery_card", None)
+            if _is_permission_recovery_metadata(metadata) and callable(recovery_card):
+                recovery_card(metadata)
+            elif recovery_hint:
                 recovery_line = Text()
                 recovery_line.append("    ↳ recovery: ", style="leap.tool")
                 recovery_line.append(_truncate_detail(recovery_hint, limit=_TOOL_OUTPUT_LIMIT), style="leap.tool")

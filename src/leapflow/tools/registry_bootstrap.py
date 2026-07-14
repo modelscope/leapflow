@@ -135,6 +135,16 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "required": ["text", "pattern"],
             },
+            # Explicit metadata: pure in-memory regex search over caller-supplied
+            # text, no I/O or state mutation. Declared explicitly rather than
+            # relying on the "general" keyword fallback, which is intentionally
+            # non-core by default (fail-closed) for anything not reviewed.
+            "x_leapflow": {
+                "category": "general",
+                "risk_level": "read_only",
+                "schema_cost": "low",
+                "requires_approval": False,
+            },
         },
     },
     {
@@ -211,6 +221,38 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "kind": {"type": "string", "enum": ["observation", "insight", "fact"], "description": "Memory type (default: observation)"},
                 },
                 "required": ["content"],
+            },
+        },
+    },
+    # ── Capability discovery (Tier 1 structural gate) ──
+    # Lets the model expand a heavier tool category (hub/gateway/delegate) into
+    # full native schemas on demand, instead of the runtime guessing from text
+    # which categories are "probably" relevant to the current request.
+    {
+        "type": "function",
+        "function": {
+            "name": "capability_expand",
+            "description": (
+                "Fetch the full callable schema for every tool in a capability category "
+                "(e.g. 'hub', 'gateway', 'delegate', 'file', 'memory', 'skill'). The compact "
+                "tool index always lists every registered tool by name and a one-line summary, "
+                "but only a static low-risk subset is directly callable each turn. If you need a "
+                "tool from the index that is not yet callable, call capability_expand with its "
+                "category first; the matching tools become callable in this turn. Never invent a "
+                "tool name — expand the category instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "description": "Capability category name, e.g. hub, gateway, delegate"},
+                },
+                "required": ["category"],
+            },
+            "x_leapflow": {
+                "category": "system",
+                "risk_level": "read_only",
+                "schema_cost": "low",
+                "requires_approval": False,
             },
         },
     },
@@ -445,6 +487,69 @@ async def _delegate_task_handler(params: Dict[str, Any]) -> Dict[str, Any]:
 
 TOOL_HANDLERS["delegate_task"] = _delegate_task_handler
 TOOL_HANDLERS["gp_delegate_task"] = _delegate_task_handler
+
+
+# ────────────────────────────────────────────────────────────────
+# Capability discovery (Tier 1 structural gate): expand a category's tools
+# into full native schemas on request, so the caller (engine.py) can merge
+# them into the current turn's tools_kwarg instead of leaving the model to
+# guess a tool name that was never disclosed.
+# ────────────────────────────────────────────────────────────────
+
+async def _capability_expand_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    from leapflow.engine.context_disclosure import build_capability_manifests
+
+    category = str(params.get("category") or "").strip().lower()
+    if not category:
+        return {"ok": False, "error": "category is required"}
+    manifests = build_capability_manifests(TOOL_DEFINITIONS)
+    matched_names = {m.name for m in manifests if m.category == category}
+    if not matched_names:
+        available = sorted({m.category for m in manifests if m.category})
+        return {
+            "ok": False,
+            "error": f"Unknown capability category: {category}",
+            "available_categories": available,
+        }
+    expanded_tools = [
+        td for td in TOOL_DEFINITIONS
+        if td.get("function", {}).get("name") in matched_names
+    ]
+    return {"ok": True, "category": category, "expanded_tools": expanded_tools}
+
+
+def _patch_capability_expand_categories() -> None:
+    """Inject the real, current non-core category list into capability_expand's
+    own description, computed from the live tool registry instead of a static
+    hardcoded example list that would silently drift out of sync.
+    """
+    from leapflow.engine.context_disclosure import build_capability_manifests
+
+    manifests = build_capability_manifests(TOOL_DEFINITIONS)
+    non_core_categories = sorted({m.category for m in manifests if m.category and not m.is_core})
+    for td in TOOL_DEFINITIONS:
+        func = td.get("function", {})
+        if func.get("name") != "capability_expand":
+            continue
+        categories_text = ", ".join(non_core_categories) or "none"
+        func["description"] = (
+            "Fetch the full callable schema for every tool in a capability category. "
+            f"Current non-core categories that require expansion: {categories_text}. "
+            "The compact tool index always lists every registered tool by name and a "
+            "one-line summary tagged with its exact capability_expand category, but "
+            "only a static low-risk subset is directly callable each turn. If you need "
+            "a tool from the index that is not yet callable, call capability_expand "
+            "with the exact category shown next to it; the matching tools become "
+            "callable in this turn. Never invent a tool name — expand the category instead."
+        )
+        break
+
+
+_patch_capability_expand_categories()
+
+
+TOOL_HANDLERS["capability_expand"] = _capability_expand_handler
+TOOL_HANDLERS["gp_capability_expand"] = _capability_expand_handler
 
 
 TOOL_REGISTRY = ToolRegistry.from_definitions(

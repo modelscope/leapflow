@@ -12,6 +12,36 @@ from leapflow.gateway.connectors.protocol import ActionFailure, ActionSpec
 from leapflow.security.redact import redact_sensitive_text
 
 
+def _declared_required_scopes(spec: ActionSpec, identity: str = "") -> tuple[tuple[str, ...], str]:
+    """Derive the action's declared scope requirement from its auth contract.
+
+    This is the only scope source permitted when the upstream API did not
+    return an authoritative missing-scope list (e.g. free-text CLI failures).
+    Returns ``(scopes, scope_relation)``. When ``identity`` is known, the
+    identity-specific scopes are combined with ``common`` (conjunction).
+    When identity is unknown and only identity-specific scopes exist without
+    a shared ``common`` scope, the identity paths are mutually exclusive
+    alternatives (``one_of``) — granting either identity's scope is enough.
+    """
+    scopes_map = dict(getattr(spec.auth, "scopes", {}) or {})
+    common = tuple(str(s) for s in scopes_map.get("common", ()) if s)
+    if identity and scopes_map.get(identity):
+        identity_scopes = tuple(str(s) for s in scopes_map.get(identity, ()) if s)
+        combined = tuple(dict.fromkeys(common + identity_scopes))
+        return combined, "all_required"
+    if common:
+        return common, "all_required"
+    alternatives: list[str] = []
+    for key in ("user", "bot"):
+        for scope in scopes_map.get(key, ()):
+            scope_text = str(scope)
+            if scope_text and scope_text not in alternatives:
+                alternatives.append(scope_text)
+    if len(alternatives) > 1 and scopes_map.get("user") and scopes_map.get("bot"):
+        return tuple(alternatives), "one_of"
+    return tuple(alternatives), "all_required"
+
+
 def classify_lark_cli_failure(
     spec: ActionSpec,
     error: str,
@@ -56,6 +86,11 @@ def classify_lark_cli_failure(
     if any(kw in lowered for kw in ("access denied", "access_denied", "permission denied")):
         login_cmd = _auth_cmd(binary, profile, "login")
         status_cmd = _auth_cmd(binary, profile, "status")
+        declared_scopes, scope_relation = _declared_required_scopes(spec, identity)
+        scope_line = (
+            f" Declared required scope(s) for this action: {', '.join(declared_scopes)}."
+            if declared_scopes else ""
+        )
         return ActionFailure(
             failure_class="authorization",
             failure_code="access_denied",
@@ -66,7 +101,7 @@ def classify_lark_cli_failure(
                 "Access denied for this operation. Possible causes: missing scope, "
                 "missing user authorization, or tenant policy restriction. "
                 "Grant the required permissions in the developer console and reinstall/republish "
-                f"the application, then retry. {capability_hint}"
+                f"the application, then retry. {capability_hint}{scope_line}"
             ),
             next_steps=(
                 f"Open the developer console and grant the required scopes for capability '{capability}'.",
@@ -74,6 +109,9 @@ def classify_lark_cli_failure(
                 f"Run: {status_cmd}",
                 f"Retry after authorization: {login_cmd}",
             ),
+            required_scopes=declared_scopes,
+            scope_relation=scope_relation,
+            scope_source="declared",
             identity=identity,
             capability=capability,
             blocks_approval=True,
@@ -81,6 +119,11 @@ def classify_lark_cli_failure(
 
     if any(kw in lowered for kw in ("missing scope", "insufficient scope", "scope", "permission")):
         status_cmd = _auth_cmd(binary, profile, "status")
+        declared_scopes, scope_relation = _declared_required_scopes(spec, identity)
+        scope_line = (
+            f" Declared required scope(s): {', '.join(declared_scopes)}."
+            if declared_scopes else ""
+        )
         return ActionFailure(
             failure_class="authorization",
             failure_code="missing_scope",
@@ -88,7 +131,7 @@ def classify_lark_cli_failure(
             recoverability="admin_required",
             retryable=False,
             recovery_hint=(
-                f"Missing required scope to execute '{spec.name}'. "
+                f"Missing required scope to execute '{spec.name}'.{scope_line} "
                 "Grant the missing scope in the developer console and re-publish the app."
             ),
             next_steps=(
@@ -96,6 +139,9 @@ def classify_lark_cli_failure(
                 "Re-publish or reinstall the application.",
                 f"Run: {status_cmd}",
             ),
+            required_scopes=declared_scopes,
+            scope_relation=scope_relation,
+            scope_source="declared",
             identity=identity,
             capability=capability,
             blocks_approval=True,
@@ -192,6 +238,18 @@ def _classify_problem_error(
     if err_type == "authorization":
         failure_code = subtype or "access_denied"
         is_scope = subtype in ("missing_scope", "insufficient_scope") or bool(missing_scopes)
+        # Authoritative missing_scopes come straight from the upstream API's
+        # own error payload (lark-cli typed PermissionError). When absent but
+        # the failure is scope-related, fall back to this action's declared
+        # contract instead of guessing — never fabricate scope names.
+        declared_scopes: tuple[str, ...] = ()
+        scope_relation = "all_required"
+        scope_source = "authoritative"
+        effective_scopes = missing_scopes
+        if not effective_scopes and is_scope:
+            declared_scopes, scope_relation = _declared_required_scopes(spec, err_identity)
+            effective_scopes = declared_scopes
+            scope_source = "declared"
         recovery_hint_parts = [safe_message]
         if hint:
             recovery_hint_parts.append(hint)
@@ -199,6 +257,11 @@ def _classify_problem_error(
             recovery_hint_parts.append(
                 f"Missing scopes: {', '.join(missing_scopes)}. "
                 "Grant these in the developer console, then re-publish/reinstall the app."
+            )
+        elif effective_scopes:
+            recovery_hint_parts.append(
+                f"Declared required scope(s): {', '.join(effective_scopes)}. "
+                "Grant the scope in the developer console and re-publish the app."
             )
         elif is_scope:
             recovery_hint_parts.append(
@@ -211,8 +274,8 @@ def _classify_problem_error(
             recovery_hint_parts.append(f"Log ID: {log_id}")
         next_steps: tuple[str, ...] = (
             *(
-                (f"Grant missing scopes {list(missing_scopes)} in the developer console.",)
-                if missing_scopes else (f"Grant the required scope for '{capability}' in the developer console.",)
+                (f"Grant missing scopes {list(effective_scopes)} in the developer console.",)
+                if effective_scopes else (f"Grant the required scope for '{capability}' in the developer console.",)
             ),
             "Re-publish or reinstall the application after granting scopes.",
             f"Verify authorization: {status_cmd}",
@@ -228,6 +291,7 @@ def _classify_problem_error(
             recovery_hint=" ".join(recovery_hint_parts),
             next_steps=next_steps,
             missing_scopes=missing_scopes,
+            required_scopes=declared_scopes,
             requested_scopes=requested_scopes,
             granted_scopes=granted_scopes,
             identity=err_identity,
@@ -235,6 +299,8 @@ def _classify_problem_error(
             capability=capability,
             blocks_approval=True,
             raw=dict(error_obj),
+            scope_relation=scope_relation,
+            scope_source=scope_source,
         )
 
     if err_type == "authentication":

@@ -54,6 +54,20 @@ class ActionFailure:
     capability: str = ""
     blocks_approval: bool = False
     raw: Mapping[str, Any] = field(default_factory=dict)
+    # ── Scope authority metadata (permission recovery contract) ──────────
+    # scope_relation describes how the listed scopes combine:
+    #   "all_required" — every listed scope must be granted (conjunction)
+    #   "one_of"        — any single listed scope is sufficient (disjunction)
+    # scope_source describes where the scope list came from, in descending
+    # trust order:
+    #   "authoritative" — extracted from the upstream API's own error payload
+    #                      (e.g. lark-cli typed PermissionError.MissingScopes)
+    #   "declared"       — derived from this action's own manifest/action-pack
+    #                      auth.scopes contract (feishu.yaml, etc.)
+    #   "unverified"     — inferred from free-text/heuristic matching; must
+    #                      never be surfaced as a concrete scope list to users
+    scope_relation: str = "all_required"
+    scope_source: str = "declared"
 
     def as_dict(self) -> dict[str, Any]:
         """Return safe non-empty fields for tool results and UI metadata."""
@@ -78,6 +92,9 @@ class ActionFailure:
         for key, value in optional.items():
             if value:
                 data[key] = value
+        if data.get("required_scopes") or data.get("missing_scopes"):
+            data["scope_relation"] = self.scope_relation
+            data["scope_source"] = self.scope_source
         return data
 
 

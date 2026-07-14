@@ -311,6 +311,12 @@ HUB_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "required": ["skill_name"],
             },
+            "x_leapflow": {
+                "category": "hub",
+                "risk_level": "medium",
+                "schema_cost": "high",
+                "requires_approval": True,
+            },
         },
     },
     {
@@ -332,6 +338,12 @@ HUB_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "required": ["repo_id"],
             },
+            "x_leapflow": {
+                "category": "hub",
+                "risk_level": "medium",
+                "schema_cost": "high",
+                "requires_approval": True,
+            },
         },
     },
     {
@@ -348,6 +360,12 @@ HUB_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["query"],
+            },
+            "x_leapflow": {
+                "category": "hub",
+                "risk_level": "read_only",
+                "schema_cost": "high",
+                "requires_approval": False,
             },
         },
     },
@@ -369,6 +387,12 @@ HUB_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                         "description": "If true, only shows the plan (default: true)",
                     },
                 },
+            },
+            "x_leapflow": {
+                "category": "hub",
+                "risk_level": "medium",
+                "schema_cost": "high",
+                "requires_approval": True,
             },
         },
     },

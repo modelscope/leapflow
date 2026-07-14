@@ -325,9 +325,17 @@ class ToolEvidenceBuilder:
         """Compact evidence for platform_action with strong completion markers."""
         if result.get("ok") is False:
             evidence = self._compact_error(result)
-            for key in ("failure_code", "missing_fields", "recovery_hint", "expected_schema", "retryable"):
+            for key in (
+                "failure_class", "failure_code", "recoverability", "blocks_approval",
+                "platform", "action", "capability", "missing_fields", "missing_scopes",
+                "required_scopes", "scope_relation", "scope_source", "console_url",
+                "next_steps", "recovery_hint", "expected_schema", "retryable", "skip_approval",
+            ):
                 if key in result:
-                    evidence[key] = result[key]
+                    evidence[key] = self._compact_value(result[key])
+            for key in ("platform", "action"):
+                if key not in evidence and arguments.get(key):
+                    evidence[key] = self._compact_value(arguments[key])
             if result.get("llm_instruction"):
                 evidence["llm_instruction"] = str(result["llm_instruction"])
             if result.get("platform_degraded"):
@@ -363,26 +371,43 @@ class ToolEvidenceBuilder:
         }
 
     def _app_connector_evidence(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        ok = bool(result.get("ok", True))
         evidence: Dict[str, Any] = {
-            "ok": bool(result.get("ok", True)),
+            "ok": ok,
             "kind": "app_connector_evidence",
         }
-        for key in (
-            "platform",
-            "stage",
-            "onboarding_state",
-            "recovery_hint",
-            "next_steps",
-            "error",
-            "status",
-            "connected",
-        ):
-            if key in result:
-                evidence[key] = self._compact_value(result[key])
-        if isinstance(result.get("preflight_result"), dict):
-            evidence["preflight_result"] = self._app_preflight_evidence(result["preflight_result"])
-        if "required_fields" in result:
-            evidence["required_fields"] = self._compact_value(result["required_fields"])
+        if ok:
+            # Success path: expose user-facing facts and onboarding state
+            # (needed for empty-response recovery), but strip process noise
+            # like setup_steps, setup_form, setup_guide, optional_settings.
+            for key in ("platform", "status", "connected"):
+                if key in result:
+                    evidence[key] = self._compact_value(result[key])
+            # Onboarding state is structural (used by recovery fallback),
+            # not conversational noise — preserve it.
+            for key in ("onboarding_state", "recovery_hint", "next_steps"):
+                if key in result:
+                    evidence[key] = self._compact_value(result[key])
+            if isinstance(result.get("preflight_result"), dict):
+                evidence["preflight_result"] = self._app_preflight_evidence(result["preflight_result"])
+        else:
+            # Failure path: retain recovery information for LLM retry logic.
+            for key in (
+                "platform",
+                "stage",
+                "onboarding_state",
+                "recovery_hint",
+                "next_steps",
+                "error",
+                "status",
+                "connected",
+            ):
+                if key in result:
+                    evidence[key] = self._compact_value(result[key])
+            if isinstance(result.get("preflight_result"), dict):
+                evidence["preflight_result"] = self._app_preflight_evidence(result["preflight_result"])
+            if "required_fields" in result:
+                evidence["required_fields"] = self._compact_value(result["required_fields"])
         return evidence
 
     def _app_check_evidence(self, checks: List[Any]) -> List[Dict[str, Any]]:

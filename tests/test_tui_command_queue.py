@@ -16,7 +16,7 @@ from leapflow.cli.tui_app.app import LeapApp, _DynamicPlaceholderProcessor
 from leapflow.cli.tui_app.console import LeapConsole
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
 from leapflow.cli.tui_app.input import SlashCommandCompleter
-from leapflow.cli.tui_app.stream import StreamRenderer
+from leapflow.cli.tui_app.stream import StreamRenderer, _sanitize_final_response
 from leapflow.cli.tui_app.theme import _LIGHT, resolve_theme
 
 
@@ -550,7 +550,7 @@ def test_stream_renderer_prints_tool_failure_exit_and_stderr() -> None:
 
     assert len(console.lines) == 1
     line = console.lines[0]
-    assert "❌ shell_run" in line
+    assert "✗ shell_run" in line
     assert "$ false" in line
     assert "→ exit=1 permission denied" in line
     assert " | " in line
@@ -642,8 +642,8 @@ def test_stream_renderer_prints_compression_and_posture_metadata() -> None:
             "compression_reason": "threshold-triggered",
             "context_posture": "research",
             "context_guidance": "maintain research ledger and synthesize findings",
-            "disclosure_level": "selected_tools",
-            "disclosure_reason": "selected capabilities matched observable task signals",
+            "disclosure_level": "expanded",
+            "disclosure_reason": "tier1: continuity(shell)",
         },
     )
 
@@ -711,6 +711,66 @@ def test_stream_renderer_suppresses_structured_tool_blobs_and_compacts_paths() -
     assert "evidence" not in line
     assert "entries" not in line
     assert "task requires broad" not in line
+
+
+def test_final_response_adds_copyable_url_for_markdown_links() -> None:
+    answer = _sanitize_final_response(
+        "请打开 [点击申请权限](https://open.feishu.cn/app/cli_xxx/auth) 后继续。"
+    )
+
+    assert "[点击申请权限](https://open.feishu.cn/app/cli_xxx/auth)" in answer
+    assert "复制链接：https://open.feishu.cn/app/cli_xxx/auth" in answer
+
+
+def test_stream_renderer_prints_permission_recovery_card() -> None:
+    class CaptureConsole:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+            self.cards: list[dict[str, object]] = []
+
+        def print(self, renderable) -> None:
+            self.lines.append(getattr(renderable, "plain", str(renderable)))
+
+        def permission_recovery_card(self, metadata: dict[str, object]) -> None:
+            self.cards.append(metadata)
+
+        def thinking(self, text: str) -> None:
+            pass
+
+        def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
+            pass
+
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
+            pass
+
+        def newline(self) -> None:
+            pass
+
+    console = CaptureConsole()
+    renderer = StreamRenderer(console)  # type: ignore[arg-type]
+    renderer.start()
+    metadata = {
+        "ok": False,
+        "platform": "feishu",
+        "action": "im.list_chats",
+        "capability": "im.chat.read",
+        "failure_class": "authorization",
+        "failure_code": "missing_scope",
+        "missing_scopes": ["im:chat:read"],
+        "scope_relation": "all_required",
+        "scope_source": "authoritative",
+        "console_url": "https://open.feishu.cn/app/cli_xxx/auth",
+        "recovery_hint": "Grant the missing scope in the developer console.",
+    }
+
+    renderer.tool_started("platform_action", metadata={"platform": "feishu", "action": "im.list_chats"})
+    renderer.tool_finished("platform_action", metadata=metadata)
+
+    assert len(console.lines) == 1
+    assert "✗ platform_action" in console.lines[0]
+    assert len(console.cards) == 1
+    assert console.cards[0]["console_url"] == "https://open.feishu.cn/app/cli_xxx/auth"
+    assert console.cards[0]["missing_scopes"] == ["im:chat:read"]
 
 
 @pytest.mark.asyncio

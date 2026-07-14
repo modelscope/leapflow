@@ -30,6 +30,7 @@ from leapflow.engine.context_disclosure import (
     DisclosureRuntimeState,
     MemoryDisclosure,
     PromptAssemblyPlan,
+    build_capability_manifests,
 )
 from leapflow.engine.error_classifier import (
     ErrorCategory,
@@ -158,6 +159,11 @@ def _tool_result_metadata(
 ) -> Dict[str, Any]:
     """Build safe, compact tool-completion metadata for streaming UIs."""
     metadata = _tool_args_metadata(tool_name, arguments, original_tool_name=original_tool_name)
+    if tool_name in {"platform_action", "gp_platform_action"} and arguments:
+        for key in ("platform", "action"):
+            value = arguments.get(key)
+            if value:
+                metadata[key] = _single_line_preview(value, limit=_TOOL_ARGS_PREVIEW_LIMIT)
     metadata["ok"] = True
     if isinstance(result, dict):
         metadata["ok"] = bool(result.get("ok", True))
@@ -168,8 +174,11 @@ def _tool_result_metadata(
             if key in result:
                 metadata[key] = result[key]
         # App Connector authorization failure metadata
-        for key in ("failure_class", "failure_code", "recoverability", "blocks_approval",
-                    "capability", "missing_scopes", "required_scopes", "skip_approval"):
+        for key in (
+            "failure_class", "failure_code", "recoverability", "blocks_approval",
+            "platform", "action", "capability", "missing_scopes", "required_scopes",
+            "scope_relation", "scope_source", "console_url", "next_steps", "skip_approval",
+        ):
             if key in result:
                 metadata[key] = result[key]
         for key in ("suggestions", "available_tools"):
@@ -256,13 +265,72 @@ def _unknown_tool_retry_prompt(result: Dict[str, Any]) -> str:
     )
 
 
-def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
-    """Build a user-facing message from the last consecutive tool failures.
+_PERMISSION_FAILURE_CLASSES = frozenset({"authorization", "scope_denied"})
+_PERMISSION_FAILURE_CODES = frozenset({"access_denied", "missing_scope"})
 
-    Called when the loop exits with no content due to hitting
-    max_consecutive_tool_failures.  Returns "" when no useful failure context
-    is available in the recent message history.
+
+def _is_permission_failure_payload(payload: Dict[str, Any]) -> bool:
+    """Return whether a tool-result payload represents an unresolved permission failure."""
+    if not isinstance(payload, dict) or payload.get("ok", True) is not False:
+        return False
+    failure_class = str(payload.get("failure_class") or "")
+    failure_code = str(payload.get("failure_code") or "")
+    return failure_class in _PERMISSION_FAILURE_CLASSES or failure_code in _PERMISSION_FAILURE_CODES
+
+
+def _build_permission_recovery_text(failure: Dict[str, Any]) -> str:
+    """Render a deterministic permission-recovery message from a failure payload.
+
+    This is the single authoritative renderer for authorization failures: it
+    only cites scopes and links that are literally present in ``failure``,
+    never invents, infers, or expands scope names, and only uses "one of"
+    phrasing when ``scope_relation`` explicitly says so. Used both for the
+    end-of-loop fallback and to override any free-text LLM answer that
+    follows an unresolved permission failure.
     """
+    platform = str(failure.get("platform") or "")
+    capability = str(failure.get("capability") or "")
+    where = f"`{platform}.{capability}`" if platform and capability else (capability or platform or "this action")
+    missing_scopes: List[str] = [str(s) for s in (failure.get("missing_scopes") or []) if s]
+    required_scopes: List[str] = [str(s) for s in (failure.get("required_scopes") or []) if s]
+    scope_relation = str(failure.get("scope_relation") or "all_required")
+    recovery_hint = str(failure.get("recovery_hint") or "")
+    recoverability = str(failure.get("recoverability") or "")
+    console_url = str(failure.get("console_url") or "")
+    failure_code = str(failure.get("failure_code") or "")
+
+    scopes = missing_scopes or required_scopes
+    label = "Missing scope(s)" if missing_scopes else "Required scope(s)"
+
+    lines: List[str] = [
+        f"Authorization failed for {where}. "
+        "The platform has denied access — this cannot be resolved by retrying."
+    ]
+    if scopes:
+        quoted = ", ".join(f"`{s}`" for s in scopes)
+        if scope_relation == "one_of" and len(scopes) > 1:
+            lines.append(f"{label} (granting ANY ONE of the following is sufficient): {quoted}.")
+        else:
+            lines.append(f"{label}: {quoted}.")
+    if recovery_hint and failure_code not in ("rate_limited",):
+        lines.append(f"To fix: {recovery_hint}")
+    elif recoverability == "admin_required":
+        lines.append(
+            "An administrator must grant the required permissions in the platform developer console "
+            "and republish or reinstall the application."
+        )
+    if console_url:
+        lines.append(f"Developer console: {console_url}")
+    lines.append(
+        "Do NOT retry this action. When informing the user, quote ONLY the scope name(s) listed above — "
+        "never invent, guess, or add other scope names, and never claim they are interchangeable unless "
+        "explicitly told they are."
+    )
+    return "\n".join(lines)
+
+
+def _extract_recent_tool_failures(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return recent consecutive tool failure payloads, most recent first."""
     failures: List[Dict[str, Any]] = []
     for msg in reversed(messages[-24:]):
         content = str(msg.get("content") or "").strip()
@@ -280,48 +348,80 @@ def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
         failures.append(payload)
         if len(failures) >= 3:
             break
+    return failures
 
+
+def _latest_turn_tool_result(messages: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    """Return the most recent tool-result payload within the current user turn.
+
+    Scans backwards from the tail across both native (``role=="tool"``) and
+    text-mode (``"Tool result (...):"``-prefixed user messages) tool-call
+    conventions. Stops and returns ``None`` at the first genuine user message
+    (the current turn's boundary) or non-JSON tool content.
+    """
+    for msg in reversed(messages):
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "tool":
+            if not isinstance(content, str):
+                return None
+            try:
+                payload = json.loads(content)
+            except (json.JSONDecodeError, ValueError):
+                return None
+            return payload if isinstance(payload, dict) else None
+        if role == "user":
+            text = str(content or "")
+            if text.startswith("Tool result (") and ":\n" in text:
+                body = text.split(":\n", 1)[1].strip()
+                try:
+                    payload = json.loads(body)
+                except (json.JSONDecodeError, ValueError):
+                    return None
+                return payload if isinstance(payload, dict) else None
+            # Reached the current turn's real user message boundary.
+            return None
+        # Skip interleaved assistant messages (preamble / tool_calls).
+        continue
+    return None
+
+
+def _permission_override_message(messages: List[Dict[str, Any]]) -> str:
+    """Return a deterministic override when the turn's last tool signal is an
+    unresolved permission failure.
+
+    Prevents the LLM's free-text final answer from paraphrasing, expanding,
+    or fabricating scope names when the most recent tool call in this turn
+    failed on authorization and was never followed by a successful retry.
+    """
+    payload = _latest_turn_tool_result(messages)
+    if payload is None or not _is_permission_failure_payload(payload):
+        return ""
+    return _build_permission_recovery_text(payload)
+
+
+def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
+    """Build a user-facing message from the last consecutive tool failures.
+
+    Called when the loop exits with no content due to hitting
+    max_consecutive_tool_failures.  Returns "" when no useful failure context
+    is available in the recent message history.
+    """
+    failures = _extract_recent_tool_failures(messages)
     if not failures:
         return ""
 
     last = failures[0]
     failure_code = str(last.get("failure_code") or "")
-    failure_class = str(last.get("failure_class") or "")
     error = str(last.get("error") or "")
     recovery_hint = str(last.get("recovery_hint") or "")
-    recoverability = str(last.get("recoverability") or "")
     available_actions: List[str] = list(last.get("available_action_names") or [])
-    platform = str(last.get("platform") or "")
-    capability = str(last.get("capability") or "")
-    missing_scopes: List[str] = list(last.get("missing_scopes") or [])
-    required_scopes: List[str] = list(last.get("required_scopes") or [])
-    console_url = str(last.get("console_url") or "")
-    blocks_approval = bool(last.get("blocks_approval", False))
 
     lines: List[str] = []
 
     # Authorization / permission failures — deterministic, no retry via LLM
-    if failure_class in ("authorization", "scope_denied") or failure_code in ("access_denied", "missing_scope"):
-        where = f"`{platform}.{capability}`" if platform and capability else (capability or platform or "this action")
-        scope_detail = ""
-        if missing_scopes:
-            scope_detail = f" Missing scopes: {', '.join(missing_scopes)}."
-        elif required_scopes:
-            scope_detail = f" Required scopes: {', '.join(required_scopes)}."
-        lines.append(
-            f"Authorization failed for {where}. "
-            f"The platform has denied access — this cannot be resolved by retrying.{scope_detail}"
-        )
-        if recovery_hint and failure_code not in ("rate_limited",):
-            lines.append(f"To fix: {recovery_hint}")
-        elif recoverability == "admin_required":
-            lines.append(
-                "An administrator must grant the required permissions in the platform developer console "
-                "and republish or reinstall the application."
-            )
-        if console_url:
-            lines.append(f"Developer console: {console_url}")
-        lines.append("Do NOT retry this action — inform the user that manual authorization is required.")
+    if _is_permission_failure_payload(last):
+        lines.append(_build_permission_recovery_text(last))
     elif failure_code == "unknown_platform_action":
         platform = str(last.get("platform") or "")
         action = str(last.get("requested_action") or "")
@@ -758,6 +858,12 @@ class AgentEngine:
         self._last_disclosure_metadata: dict[str, Any] = {}
         self._current_task_contract: TaskContract | None = None
         self._disclosure_planner = DisclosurePlanner()
+        # Tier 1 structural continuity gate: capability categories used by native
+        # tool_calls in the most recently completed turn. Working memory only
+        # stores a synthetic "[Called: ...]" summary (no structured tool_calls),
+        # so this dedicated, reset-per-turn attribute is the actual source of
+        # truth — never derived from re-parsing text.
+        self._last_turn_tool_categories: frozenset[str] = frozenset()
         self._healer = MessageHealer()
 
         # B2: Prompt cache optimization (None = disabled)
@@ -1230,13 +1336,13 @@ class AgentEngine:
             slash_command=slash_command,
             context_posture=str(self._last_context_snapshot.get("context_posture") or "baseline"),
             recent_failure=bool(self._last_context_snapshot.get("forced_final_answer")),
+            last_turn_tool_categories=self._recent_tool_categories(),
         )
         try:
-            plan = self._disclosure_planner.plan(user_text, tool_definitions, runtime)
+            plan = self._disclosure_planner.plan(tool_definitions, runtime)
         except (TypeError, ValueError, RuntimeError) as exc:
             logger.warning("disclosure planning failed; falling back to full context: %s", exc)
             plan = DisclosurePlanner().full_plan(
-                user_text,
                 tool_definitions,
                 runtime,
                 "planner fallback preserved unified-loop behavior",
@@ -1248,7 +1354,7 @@ class AgentEngine:
             memory_context = self._build_session_summary_context(max_messages=plan.max_prior_turns)
         elif plan.memory in {MemoryDisclosure.QUERY_RETRIEVAL, MemoryDisclosure.TASK_RETRIEVAL}:
             memory_context = await self._prefetch_and_freeze_memory(user_text)
-        skill_section = self._build_skill_section(include_skills=plan.level != DisclosureLevel.LIGHT)
+        skill_section = self._build_skill_section(include_skills=plan.level != DisclosureLevel.CORE)
         app_connector_section = self._build_app_connector_section()
         system = UNIFIED_SYSTEM_TEMPLATE.format(
             tool_catalog=tool_catalog,
@@ -1260,6 +1366,71 @@ class AgentEngine:
         self._last_disclosure_metadata = plan.metadata()
         prior_turns = self._prior_turns_for_plan(plan)
         return _PromptAssembly(system=system, plan=plan, prior_turns=prior_turns)
+
+    def _recent_tool_categories(self) -> frozenset[str]:
+        """Return capability categories used by native tool_calls in the prior turn.
+
+        This is the Tier 1 continuity gate. It reads ``self._last_turn_tool_categories``,
+        a dedicated attribute updated at the end of each completed turn by
+        ``_record_tool_call_categories`` — never a re-reading of the user's free
+        text, and never derived from working memory (which only stores a
+        synthetic "[Called: ...]" summary string with no structured tool_calls).
+        """
+        return self._last_turn_tool_categories
+
+    def _record_tool_call_categories(self, native_calls: list) -> None:
+        """Update the Tier 1 continuity state from this turn's executed tool_calls.
+
+        Accumulates into ``self._last_turn_tool_categories`` so a turn that makes
+        several rounds of tool calls keeps every category it touched, not just
+        the last round. Reset once per turn by the caller before the first round.
+        """
+        from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
+
+        manifests_by_name = {m.name: m for m in build_capability_manifests(TOOL_DEFINITIONS)}
+        categories = set(self._last_turn_tool_categories)
+        for call in native_calls:
+            name = str(getattr(call, "name", "") or "")
+            manifest = manifests_by_name.get(name)
+            if manifest and manifest.category not in {"system", "general"}:
+                categories.add(manifest.category)
+        self._last_turn_tool_categories = frozenset(categories)
+
+    @staticmethod
+    def _expand_tools_kwarg_full(tools_kwarg: Dict[str, Any], tool_definitions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Expand this turn's native tool schema to the full catalog.
+
+        Structural failure-recovery gate: once an unknown_tool result proves
+        that this turn's disclosed subset was insufficient, escalate to the
+        full catalog immediately rather than guessing a smaller subset again.
+        """
+        return {"tools": list(tool_definitions)}
+
+    @staticmethod
+    def _merge_expanded_tool_schemas(
+        tools_kwarg: Dict[str, Any], results: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Merge capability_expand results into this turn's native tool schema.
+
+        Tier 1 model-initiated discovery gate: when the model calls
+        capability_expand and it succeeds, the returned tool schemas become
+        callable for the rest of this turn.
+        """
+        additions: List[Dict[str, Any]] = []
+        for item in results:
+            result = item.get("result")
+            if isinstance(result, dict) and result.get("ok") and result.get("expanded_tools"):
+                additions.extend(result["expanded_tools"])
+        if not additions:
+            return tools_kwarg
+        existing = list(tools_kwarg.get("tools") or [])
+        existing_names = {td.get("function", {}).get("name") for td in existing}
+        for td in additions:
+            name = td.get("function", {}).get("name")
+            if name and name not in existing_names:
+                existing.append(td)
+                existing_names.add(name)
+        return {"tools": existing}
 
     def _build_session_summary_context(self, *, max_messages: int) -> str:
         """Return a compact local session summary without retrieval or extra LLM calls."""
@@ -1926,6 +2097,10 @@ class AgentEngine:
             slash_command=user_text.startswith("/"),
         )
         planned_enable_thinking = self._planned_enable_thinking(assembly.plan, enable_thinking)
+        # Reset the Tier 1 continuity state now that this turn's plan has been
+        # assembled from the *previous* turn's value; it accumulates fresh from
+        # this turn's own tool_calls for the *next* turn's plan.
+        self._last_turn_tool_categories = frozenset()
 
         messages: List[Dict[str, Any]] = [
             build_system_message(assembly.system),
@@ -2019,7 +2194,10 @@ class AgentEngine:
 
             native_calls = getattr(resp, "tool_calls", None) or []
             if native_calls:
-                assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
+                # Preamble exclusion: content alongside tool_calls is ephemeral
+                # reasoning — exclude it from the message context to prevent
+                # the next LLM turn from repeating it in the final answer.
+                assistant_msg: Dict[str, Any] = {"role": "assistant", "content": ""}
                 assistant_msg["tool_calls"] = [
                     {
                         "id": tc.id,
@@ -2029,11 +2207,13 @@ class AgentEngine:
                     for tc in native_calls
                 ]
                 messages.append(assistant_msg)
-                self._persist_message(session_id, "assistant", content, tool_calls=assistant_msg.get("tool_calls"))
+                self._persist_message(session_id, "assistant", "", tool_calls=assistant_msg.get("tool_calls"))
 
                 results = await self._execute_tools_concurrent(
                     native_calls, TOOL_HANDLERS, trace=trace, messages=messages,
                 )
+                self._record_tool_call_categories(native_calls)
+                tools_kwarg = self._merge_expanded_tool_schemas(tools_kwarg, results)
 
                 retryable_unknown = next(
                     (
@@ -2045,6 +2225,8 @@ class AgentEngine:
                 )
                 if retryable_unknown and not unknown_tool_retry_used:
                     unknown_tool_retry_used = True
+                    tools_kwarg = self._expand_tools_kwarg_full(tools_kwarg, TOOL_DEFINITIONS)
+                    use_native_tools = bool(tools_kwarg)
                     messages.append(build_user_message_text(_unknown_tool_retry_prompt(retryable_unknown)))
                     continue
 
@@ -2059,7 +2241,7 @@ class AgentEngine:
                     break
 
                 self._wm.remember_chat(build_assistant_message(
-                    content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
+                    f"[Called: {', '.join(tc.name for tc in native_calls)}]"
                 ))
 
                 if status == BudgetStatus.SOFT_LIMIT:
@@ -2074,17 +2256,21 @@ class AgentEngine:
                     ))
                 continue
 
-            self._wm.remember_chat(build_assistant_message(content))
             self._persist_message(session_id, "assistant", content)
             tool_call = self._parse_tool_call_from_content(content)
 
             if tool_call is None:
+                self._wm.remember_chat(build_assistant_message(content))
                 trace.record(ExecutionMode.COMPLETE)
                 break
 
-            messages.append(build_assistant_message(content))
+            # Text-mode preamble exclusion: only store call summary in WM,
+            # not the natural language preamble that surrounds the tool_call tag.
             normalized_tool_call = _normalize_tool_call(tool_call)
             tool_name = str(normalized_tool_call["name"])
+            self._wm.remember_chat(build_assistant_message(f"[Called: {tool_name}]"))
+
+            messages.append(build_assistant_message(content))
             tool_arguments = normalized_tool_call.get("arguments")
             _show_progress("executing", tool_name)
             result = await self._execute_general_tool(normalized_tool_call, TOOL_HANDLERS)
@@ -2139,7 +2325,11 @@ class AgentEngine:
         logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
         if content:
-            return content
+            # Never let a free-text LLM answer paraphrase or expand scope names
+            # after an unresolved permission failure — force the deterministic
+            # recovery message instead.
+            permission_override = _permission_override_message(messages)
+            return permission_override or content
         if fatal_error:
             return fatal_error
         # Derive a recovery message from the last platform_connect failure if present
@@ -2291,6 +2481,10 @@ class AgentEngine:
             slash_command=user_text.startswith("/"),
         )
         planned_enable_thinking = self._planned_enable_thinking(assembly.plan, enable_thinking)
+        # Reset the Tier 1 continuity state now that this turn's plan has been
+        # assembled from the *previous* turn's value; it accumulates fresh from
+        # this turn's own tool_calls for the *next* turn's plan.
+        self._last_turn_tool_categories = frozenset()
 
         messages: List[Dict[str, Any]] = [
             build_system_message(assembly.system),
@@ -2383,7 +2577,9 @@ class AgentEngine:
 
                 native_calls = getattr(resp, "tool_calls", None) or []
                 if native_calls:
-                    assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content}
+                    # Preamble exclusion: content alongside tool_calls is ephemeral
+                    # reasoning — exclude from context to prevent final-answer repetition.
+                    assistant_msg: Dict[str, Any] = {"role": "assistant", "content": ""}
                     assistant_msg["tool_calls"] = [
                         {
                             "id": tc.id,
@@ -2394,7 +2590,7 @@ class AgentEngine:
                     ]
                     messages.append(assistant_msg)
                     self._persist_message(
-                        session_id, "assistant", content,
+                        session_id, "assistant", "",
                         tool_calls=assistant_msg.get("tool_calls"),
                     )
 
@@ -2414,6 +2610,8 @@ class AgentEngine:
                     results = await self._execute_tools_concurrent(
                         native_calls, TOOL_HANDLERS, trace=trace, messages=messages
                     )
+                    self._record_tool_call_categories(native_calls)
+                    tools_kwarg = self._merge_expanded_tool_schemas(tools_kwarg, results)
                     result_by_id = {str(item.get("id")): item for item in results}
                     retryable_unknown = next(
                         (
@@ -2445,6 +2643,8 @@ class AgentEngine:
                     turn_recovery.consecutive_tool_failures = failures
                     if retryable_unknown and not unknown_tool_retry_used:
                         unknown_tool_retry_used = True
+                        tools_kwarg = self._expand_tools_kwarg_full(tools_kwarg, TOOL_DEFINITIONS)
+                        use_native_tools = bool(tools_kwarg)
                         messages.append(build_user_message_text(_unknown_tool_retry_prompt(retryable_unknown)))
                         continue
                     if failures >= self._settings.max_consecutive_tool_failures:
@@ -2455,7 +2655,7 @@ class AgentEngine:
                         break
 
                     self._wm.remember_chat(build_assistant_message(
-                        content or f"[Called: {', '.join(tc.name for tc in native_calls)}]"
+                        f"[Called: {', '.join(tc.name for tc in native_calls)}]"
                     ))
                     if status == BudgetStatus.SOFT_LIMIT:
                         messages.append(build_user_message_text(
@@ -2554,23 +2754,27 @@ class AgentEngine:
                         messages.append(build_user_message_text(build_continuation_prompt(content)))
                         continue
 
-            self._wm.remember_chat(build_assistant_message(content))
             self._persist_message(session_id, "assistant", content)
             tool_call = self._parse_tool_call_from_content(content)
 
             if tool_call is None:
+                self._wm.remember_chat(build_assistant_message(content))
                 trace.record(ExecutionMode.COMPLETE)
                 if not content:
                     fallback = _app_onboarding_recovery_message(messages)
                     yield StreamEvent(type="final", content=fallback or "I processed your request but have no additional output.")
                 else:
-                    yield StreamEvent(type="final", content=content)
+                    permission_override = _permission_override_message(messages)
+                    yield StreamEvent(type="final", content=permission_override or content)
                 return
 
-            messages.append(build_assistant_message(content))
+            # Text-mode preamble exclusion: only store call summary in WM.
             normalized_tool_call = _normalize_tool_call(tool_call)
             tool_name = str(normalized_tool_call["name"])
             original_tool_name = str(normalized_tool_call.get("original_tool_name", tool_name))
+            self._wm.remember_chat(build_assistant_message(f"[Called: {tool_name}]"))
+
+            messages.append(build_assistant_message(content))
             tool_arguments = normalized_tool_call.get("arguments")
             yield StreamEvent(
                 type="tool_start",
@@ -2651,7 +2855,8 @@ class AgentEngine:
         logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
         if content:
-            yield StreamEvent(type="final", content=content)
+            permission_override = _permission_override_message(messages)
+            yield StreamEvent(type="final", content=permission_override or content)
         else:
             fallback = (
                 _app_onboarding_recovery_message(messages)
@@ -2666,7 +2871,13 @@ class AgentEngine:
 
     @staticmethod
     def _format_tool_catalog(tool_definitions: List[Dict[str, Any]]) -> str:
-        """Format available tools for the unified system prompt."""
+        """Format available tools for the unified system prompt.
+
+        Each non-core tool is annotated with its exact capability_expand category
+        so the model never has to guess the category string — it reads it directly
+        from the index, matching this turn's real manifest classification.
+        """
+        manifests = {m.name: m for m in build_capability_manifests(tool_definitions)}
         lines: List[str] = []
         for td in tool_definitions:
             func = td.get("function", {})
@@ -2675,7 +2886,13 @@ class AgentEngine:
             params = ", ".join(
                 func.get("parameters", {}).get("properties", {}).keys()
             )
-            lines.append(f"- **{name}**({params}): {desc}")
+            manifest = manifests.get(name)
+            tag = (
+                f" [capability_expand category: {manifest.category}]"
+                if manifest is not None and not manifest.is_core
+                else ""
+            )
+            lines.append(f"- **{name}**({params}){tag}: {desc}")
         return "\n".join(lines)
 
     @staticmethod

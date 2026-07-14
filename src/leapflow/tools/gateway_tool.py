@@ -384,21 +384,6 @@ async def _action_guide(
         "actions": dict(manifest.actions),
     }
 
-    required = [c for c in manifest.credentials if c.required]
-    if required:
-        labels = " / ".join(c.label for c in required)
-        result["prompt_hint"] = (
-            f"Present the setup steps above, then ask the user to provide "
-            f"{labels} in a single reply.  Do NOT repeat credential values "
-            f"in your response."
-        )
-    else:
-        result["prompt_hint"] = (
-            "Present the setup steps and current preflight result. If all safe checks are ready, "
-            "call platform_connect with action='connect'. If a preflight step requires installation, "
-            "authorization, or credentials, ask only for that missing user action and avoid repeating known details."
-        )
-
     return result
 
 
@@ -1077,6 +1062,12 @@ GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "required": ["platform", "action", "payload"],
             },
+            "x_leapflow": {
+                "category": "gateway",
+                "risk_level": "high",
+                "schema_cost": "high",
+                "requires_approval": True,
+            },
         },
     },
     {
@@ -1099,6 +1090,12 @@ GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "checkpoint": {"type": "string", "description": "Optional event source resume checkpoint"},
                 },
                 "required": ["action"],
+            },
+            "x_leapflow": {
+                "category": "gateway",
+                "risk_level": "medium",
+                "schema_cost": "high",
+                "requires_approval": True,
             },
         },
     },
@@ -1134,6 +1131,12 @@ GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["platform", "chat_id", "text"],
+            },
+            "x_leapflow": {
+                "category": "gateway",
+                "risk_level": "high",
+                "schema_cost": "high",
+                "requires_approval": True,
             },
         },
     },
@@ -1185,6 +1188,12 @@ GATEWAY_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["action"],
+            },
+            "x_leapflow": {
+                "category": "gateway",
+                "risk_level": "medium",
+                "schema_cost": "high",
+                "requires_approval": True,
             },
         },
     },

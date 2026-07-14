@@ -483,6 +483,43 @@ def test_evidence_builder_ceiling() -> None:
     assert huge._max_content_chars <= 8_000
 
 
+def test_evidence_builder_preserves_platform_permission_recovery_fields() -> None:
+    builder = ToolEvidenceBuilder(max_content_chars=240)
+
+    evidence = builder.build(
+        "platform_action",
+        {"platform": "feishu", "action": "im.list_chats"},
+        {
+            "ok": False,
+            "error": "access denied",
+            "failure_class": "authorization",
+            "failure_code": "missing_scope",
+            "recoverability": "admin_required",
+            "capability": "im.chat.read",
+            "missing_scopes": ["im:chat:read"],
+            "required_scopes": ["im:chat:read"],
+            "scope_relation": "all_required",
+            "scope_source": "authoritative",
+            "console_url": "https://open.feishu.cn/app/cli_xxx/auth",
+            "next_steps": ["Grant missing scopes", "Re-publish the app"],
+            "recovery_hint": "Grant the missing scope in the developer console.",
+            "retryable": False,
+        },
+    )
+
+    assert evidence["ok"] is False
+    assert evidence["platform"] == "feishu"
+    assert evidence["action"] == "im.list_chats"
+    assert evidence["failure_class"] == "authorization"
+    assert evidence["failure_code"] == "missing_scope"
+    assert evidence["missing_scopes"] == ["im:chat:read"]
+    assert evidence["required_scopes"] == ["im:chat:read"]
+    assert evidence["scope_relation"] == "all_required"
+    assert evidence["scope_source"] == "authoritative"
+    assert evidence["console_url"] == "https://open.feishu.cn/app/cli_xxx/auth"
+    assert evidence["next_steps"] == ["Grant missing scopes", "Re-publish the app"]
+
+
 # ── CJK-aware _estimate_tokens in compressor ─────────────────────────
 
 
