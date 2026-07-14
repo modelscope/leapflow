@@ -145,14 +145,20 @@ class FeishuAdapter(AdapterLifecycle):
         await super().disconnect()
 
     async def send(self, target: SendTarget, content: OutboundContent) -> SendResult:
-        result = await self.execute_action(
-            "im.send_message",
-            {
-                "chat_id": target.chat_id,
-                "thread_id": target.thread_id,
-                "text": content.text[:self.max_message_length],
-            },
-        )
+        payload: dict[str, Any] = {
+            "chat_id": target.chat_id,
+            "text": content.text[:self.max_message_length],
+        }
+        if target.thread_id:
+            payload["thread_id"] = target.thread_id
+
+        action = "im.send_message"
+        if target.reply_to_id:
+            action = "im.reply_message"
+            payload["message_id"] = target.reply_to_id
+            payload.pop("chat_id", None)
+
+        result = await self.execute_action(action, payload)
         if not result.ok:
             return SendResult(ok=False, error=result.error)
         return SendResult(ok=True, message_id=result.resource_id)

@@ -23,7 +23,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from leapflow.gateway.checkpoint_store import CheckpointStore
+from leapflow.gateway.checkpoint_store import CheckpointStore, DeduplicationStore
 from leapflow.gateway.config_store import GatewayConfigStore
 from leapflow.gateway.connectors.action_registry import summarize_action_result
 from leapflow.gateway.connectors.event_sources import UnavailableEventSource
@@ -62,7 +62,58 @@ logger = logging.getLogger(__name__)
 
 EventCallback = Callable[..., Any]
 
+import re as _re
+
+_MARKDOWN_PATTERNS = (
+    _re.compile(r"```"),
+    _re.compile(r"^#{1,6}\s", _re.MULTILINE),
+    _re.compile(r"^\s*[-*+]\s", _re.MULTILINE),
+    _re.compile(r"^\s*\d+\.\s", _re.MULTILINE),
+    _re.compile(r"\*\*.+?\*\*"),
+    _re.compile(r"`.+?`"),
+    _re.compile(r"\[.+?\]\(.+?\)"),
+)
+
+
+def _has_rich_formatting(text: str) -> bool:
+    """Detect markdown-like formatting in text."""
+    if not text or len(text) < 10:
+        return False
+    matches = sum(1 for p in _MARKDOWN_PATTERNS if p.search(text))
+    return matches >= 2
+
+
 _DEFAULT_DEDUP_CAPACITY = 10_000
+
+
+def _chunk_text(text: str, max_len: int) -> list[str]:
+    """Split text into chunks respecting paragraph/line boundaries.
+
+    Prefers splitting at paragraph boundaries (double newline), then
+    single newlines, then sentence endings, then at max_len as fallback.
+    """
+    if not text or max_len <= 0:
+        return [text] if text else []
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_len:
+            chunks.append(remaining)
+            break
+        split_at = max_len
+        for sep in ("\n\n", "\n", "。", ". ", "！", "! ", "？", "? "):
+            pos = remaining.rfind(sep, 0, max_len)
+            if pos > max_len // 4:
+                split_at = pos + len(sep)
+                break
+        chunk = remaining[:split_at].rstrip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+    return chunks or [text]
 
 
 class EventDeduplicator:
@@ -91,6 +142,26 @@ class EventDeduplicator:
             self._seen.popitem(last=False)
         return False
 
+    def load_from_store(
+        self, platform_id: str, store: DeduplicationStore,
+    ) -> int:
+        """Pre-seed the cache from persistent storage."""
+        ids = store.load_recent(platform_id, limit=self._capacity)
+        for eid in reversed(ids):
+            if eid not in self._seen:
+                self._seen[eid] = None
+                if len(self._seen) > self._capacity:
+                    self._seen.popitem(last=False)
+        return len(ids)
+
+    def save_to_store(
+        self, platform_id: str, store: DeduplicationStore,
+    ) -> None:
+        """Persist current cache to the dedup store."""
+        ids = list(self._seen.keys())
+        if ids:
+            store.save_batch(platform_id, ids)
+
 
 class GatewayServer:
     """Manages platform adapter lifecycle and message routing."""
@@ -102,10 +173,12 @@ class GatewayServer:
         extra_manifest_dirs: Optional[List[Path]] = None,
         on_event: Optional[EventCallback] = None,
         checkpoint_store: Optional[CheckpointStore] = None,
+        dedup_store: Optional[DeduplicationStore] = None,
     ) -> None:
         self._profile_dir = profile_dir
         self._vault = CredentialVault(profile_dir)
         self._checkpoint_store = checkpoint_store
+        self._dedup_store = dedup_store
         self._config_store = GatewayConfigStore(profile_dir, self._vault)
         self._manifest_loader = ManifestLoader(extra_dirs=extra_manifest_dirs)
         self._manifests: Dict[str, PlatformManifest] = {}
@@ -598,6 +671,7 @@ class GatewayServer:
         """Send a reply back to the originating conversation.
 
         Convenience wrapper around ``send_message`` for ``GatewayRouter``.
+        Automatically chunks text that exceeds the adapter's max_message_length.
         """
         adapter = self._adapters.get(source.platform)
         if adapter is None:
@@ -610,8 +684,18 @@ class GatewayServer:
             chat_id=source.chat_id,
             thread_id=source.thread_id,
         )
-        content = OutboundContent(text=text)
-        return await adapter.send(target, content)
+        max_len = getattr(adapter, "max_message_length", 0) or 8000
+        chunks = _chunk_text(text, max_len)
+        last_result: Optional[SendResult] = None
+        for chunk in chunks:
+            metadata: Dict[str, Any] = {}
+            if _has_rich_formatting(chunk):
+                metadata["format_hint"] = "markdown"
+            content = OutboundContent(text=chunk, metadata=metadata)
+            last_result = await adapter.send(target, content)
+            if last_result and not last_result.ok:
+                return last_result
+        return last_result
 
     def remove_platform_config(self, platform_id: str) -> None:
         """Remove a platform's saved configuration from disk.
@@ -695,6 +779,11 @@ class GatewayServer:
         rate_tracker = self._rate_trackers.get(platform_id)
         dedup = self._deduplicators.setdefault(platform_id, EventDeduplicator())
 
+        if self._dedup_store is not None:
+            loaded = dedup.load_from_store(platform_id, self._dedup_store)
+            if loaded:
+                logger.info("Loaded %d dedup entries for %s", loaded, platform_id)
+
         self._inject_bot_identity(platform_id, normalizer)
         try:
             async for event in source.events():
@@ -715,6 +804,7 @@ class GatewayServer:
         except asyncio.CancelledError:
             logger.info("Consumer task cancelled for %s", platform_id)
             self._save_checkpoint(platform_id)
+            self._save_dedup_state(platform_id)
         except Exception:
             logger.error(
                 "Consumer loop crashed for %s", platform_id, exc_info=True,
@@ -785,6 +875,15 @@ class GatewayServer:
             logger.debug("Injected bot_id=%s… for %s", open_id[:10], platform_id)
         if app_name and hasattr(normalizer, "bot_name"):
             normalizer.bot_name = app_name
+
+    def _save_dedup_state(self, platform_id: str) -> None:
+        """Persist dedup cache for a platform to the store."""
+        if self._dedup_store is None:
+            return
+        dedup = self._deduplicators.get(platform_id)
+        if dedup is not None:
+            dedup.save_to_store(platform_id, self._dedup_store)
+            logger.debug("Saved dedup state for %s", platform_id)
 
     def _save_checkpoint(self, platform_id: str) -> None:
         """Persist the last-consumed event_id for a platform."""

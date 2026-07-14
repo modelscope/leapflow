@@ -210,6 +210,179 @@ actions:
         - "{thread}"
       timeout_s: 30
 
+  im.reply_message:
+    description: >-
+      Reply to a specific message in a Feishu/Lark chat.
+      Creates a threaded reply linked to the original message.
+      Requires message_id (om_xxx format) of the message to reply to.
+    effect: send
+    risk_level: high
+    output_policy: summary
+    schema:
+      required: [message_id, text]
+      properties:
+        message_id:
+          type: string
+          description: "Message ID (om_xxx) to reply to."
+        text:
+          type: string
+          description: "Reply text content."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-reply
+        - --message-id
+        - "{message_id}"
+        - --text
+        - "{text}"
+      timeout_s: 30
+
+  im.update_message:
+    description: >-
+      Update (edit) an existing message sent by the bot.
+      Use for progressive streaming replies or correcting bot responses.
+      Only works on messages sent by the current bot identity.
+      Requires message_id (om_xxx format).
+    effect: write
+    risk_level: medium
+    output_policy: summary
+    schema:
+      required: [message_id, text]
+      properties:
+        message_id:
+          type: string
+          description: "Message ID (om_xxx) to update."
+        text:
+          type: string
+          description: "New message text content."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-update
+        - --message-id
+        - "{message_id}"
+        - --text
+        - "{text}"
+      timeout_s: 30
+
+  im.add_reaction:
+    description: >-
+      Add an emoji reaction to a message. Use for processing indicators
+      (e.g. add ⏳ when starting, ✅ when done).
+      Requires message_id and emoji_type.
+    effect: write
+    risk_level: low
+    output_policy: summary
+    schema:
+      required: [message_id, emoji_type]
+      properties:
+        message_id:
+          type: string
+          description: "Message ID (om_xxx) to react to."
+        emoji_type:
+          type: string
+          description: "Emoji type string (e.g. 'THUMBSUP', 'DONE', 'OnIt', 'JIAYI')."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-reaction-add
+        - --message-id
+        - "{message_id}"
+        - --emoji-type
+        - "{emoji_type}"
+      timeout_s: 15
+
+  im.remove_reaction:
+    description: >-
+      Remove an emoji reaction from a message.
+      Use to clear processing indicators after completion.
+    effect: write
+    risk_level: low
+    output_policy: summary
+    schema:
+      required: [message_id, emoji_type]
+      properties:
+        message_id:
+          type: string
+          description: "Message ID (om_xxx) to remove reaction from."
+        emoji_type:
+          type: string
+          description: "Emoji type string to remove."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-reaction-delete
+        - --message-id
+        - "{message_id}"
+        - --emoji-type
+        - "{emoji_type}"
+      timeout_s: 15
+
+  im.update_card:
+    description: >-
+      Update an interactive card message using a reply token from a card action callback.
+      Reply tokens expire after 30 minutes and can be used at most 2 times.
+      Use this to update card content in response to user button clicks or form submissions.
+    effect: write
+    risk_level: medium
+    output_policy: summary
+    schema:
+      required: [token, card]
+      properties:
+        token:
+          type: string
+          description: "Reply token from card.action.trigger callback."
+        card:
+          type: string
+          description: "Card template JSON string or card builder output."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +card-update
+        - --token
+        - "{token}"
+        - --card
+        - "{card}"
+      timeout_s: 30
+
+  im.download_resource:
+    description: >-
+      Download a file or image resource from a Feishu message.
+      Returns the local file path after download.
+      Used for processing image/file/audio attachments from inbound messages.
+    effect: read
+    risk_level: low
+    output_policy: raw
+    schema:
+      required: [message_id, file_key, type]
+      properties:
+        message_id:
+          type: string
+          description: "Message ID (om_xxx) containing the resource."
+        file_key:
+          type: string
+          description: "Resource file key from the message payload."
+        type:
+          type: string
+          description: "Resource type: image, file, audio, video, media."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-resource-download
+        - --message-id
+        - "{message_id}"
+        - --file-key
+        - "{file_key}"
+        - --type
+        - "{type}"
+      timeout_s: 60
+
   # ── Docs ───────────────────────────────────────────────────────────────────
 
   docs.create_markdown:

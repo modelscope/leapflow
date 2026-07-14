@@ -13,6 +13,7 @@ NDJSON fields (lark-cli ``ImMessageReceiveOutput``):
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any, Mapping
 
@@ -22,9 +23,11 @@ from leapflow.gateway.connectors.protocol import (
     EventKind,
     InboundCallback,
 )
-from leapflow.gateway.protocol import InboundMessage, MessageSource
+from leapflow.gateway.protocol import InboundMessage, MediaAttachment, MessageSource
 
 logger = logging.getLogger(__name__)
+
+_AT_ALL_PATTERN = re.compile(r"@(?:all|所有人|All)\b", re.IGNORECASE)
 
 _MESSAGE_EVENT_TYPES = frozenset({
     "im.message.receive_v1",
@@ -123,13 +126,17 @@ class FeishuEventNormalizer:
         """
         payload = event.payload
         content = str(payload.get("content", ""))
-        if not content:
+        message_type = str(payload.get("message_type", "text"))
+
+        media = self._extract_media(payload, message_type)
+
+        if not content and not media:
             return None
 
         chat_type_raw = str(payload.get("chat_type", ""))
         chat_type = "dm" if chat_type_raw in ("p2p", "private", "") else "group"
 
-        bot_mentioned = self._detect_bot_mention(content)
+        bot_mentioned = self._detect_bot_mention(content) if content else False
 
         source = MessageSource(
             platform="feishu",
@@ -145,20 +152,65 @@ class FeishuEventNormalizer:
         except (ValueError, TypeError):
             timestamp = time.time()
 
+        if not content and media:
+            content = f"[{message_type}]"
+
         metadata: dict[str, Any] = {
             "event_id": event.event_id,
-            "message_type": str(payload.get("message_type", "text")),
+            "message_type": message_type,
         }
         if bot_mentioned:
             metadata["bot_mentioned"] = True
 
+        message_id = str(payload.get("message_id") or payload.get("id", ""))
+        parent_id = str(payload.get("parent_id") or payload.get("root_id") or "")
+
         return InboundMessage(
             source=source,
             text=content,
-            message_id=str(payload.get("message_id") or payload.get("id", "")),
+            message_id=message_id,
+            reply_to_id=parent_id or None,
+            media=tuple(media),
             metadata=metadata,
             timestamp=timestamp,
         )
+
+    @staticmethod
+    def _extract_media(
+        payload: Mapping[str, Any], message_type: str,
+    ) -> list[MediaAttachment]:
+        """Extract media attachments from non-text message types.
+
+        Returns attachment metadata with ``file_key`` for deferred
+        download via ``im.download_resource``.
+        """
+        if message_type == "text":
+            return []
+
+        attachments: list[MediaAttachment] = []
+        message_id = str(payload.get("message_id") or payload.get("id", ""))
+
+        _MEDIA_TYPES = {"image", "file", "audio", "video", "media", "sticker"}
+        if message_type not in _MEDIA_TYPES:
+            return []
+
+        file_key = str(payload.get("file_key") or payload.get("image_key") or "")
+        filename = str(payload.get("file_name") or payload.get("filename") or "")
+        size = 0
+        try:
+            size = int(payload.get("file_size") or payload.get("size") or 0)
+        except (ValueError, TypeError):
+            pass
+
+        if file_key:
+            attachments.append(MediaAttachment(
+                url=f"feishu://resource/{message_id}/{file_key}",
+                media_type=message_type,
+                filename=filename,
+                size_bytes=size,
+            ))
+
+        return attachments
 
     def _to_inbound_callback(self, event: BackendEvent) -> InboundCallback:
         """Parse a card.action.trigger payload into InboundCallback.
@@ -205,12 +257,14 @@ class FeishuEventNormalizer:
         )
 
     def _detect_bot_mention(self, content: str) -> bool:
-        """Detect bot @-mention in pre-rendered content text.
+        """Detect bot @-mention or @all in pre-rendered content text.
 
         lark-cli resolves mentions inline as ``@DisplayName``.
-        Without raw mention data, we check for the bot's configured
-        display name.
+        ``@all`` / ``@所有人`` are treated as a bot mention since
+        they address everyone in the chat including the bot.
         """
+        if _AT_ALL_PATTERN.search(content):
+            return True
         if not self._bot_name:
             return False
         return f"@{self._bot_name}" in content

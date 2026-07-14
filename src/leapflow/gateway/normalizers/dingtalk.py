@@ -5,6 +5,7 @@ into the shared ``EventClassification`` types.
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Mapping
 
@@ -14,6 +15,9 @@ from leapflow.gateway.connectors.protocol import (
     EventKind,
 )
 from leapflow.gateway.protocol import InboundMessage, MessageSource
+
+
+_AT_ALL_PATTERN = re.compile(r"@(?:all|所有人|All)\b", re.IGNORECASE)
 
 
 class DingTalkEventNormalizer:
@@ -94,7 +98,11 @@ class DingTalkEventNormalizer:
         user_name = str(payload.get("senderNick") or payload.get("senderName") or "")
         message_id = str(payload.get("msgId") or payload.get("message_id") or "")
 
-        bot_mentioned = bool(payload.get("isInAtList")) or self._detect_bot_mention(text)
+        bot_mentioned = (
+            bool(payload.get("isInAtList"))
+            or bool(payload.get("isAtAll"))
+            or self._detect_bot_mention(text)
+        )
 
         metadata: dict[str, Any] = {
             "robot_code": self._robot_code,
@@ -124,6 +132,8 @@ class DingTalkEventNormalizer:
         )
 
     def _detect_bot_mention(self, content: str) -> bool:
+        if _AT_ALL_PATTERN.search(content):
+            return True
         if not self._bot_name:
             return False
         return f"@{self._bot_name}" in content

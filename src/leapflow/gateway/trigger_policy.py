@@ -32,6 +32,7 @@ class TriggerPolicy:
     mode: TriggerMode = TriggerMode.MENTION_ONLY
     allowed_chats: frozenset[str] = frozenset()
     blocked_chats: frozenset[str] = frozenset()
+    allowed_users: frozenset[str] = frozenset()
     blocked_users: frozenset[str] = frozenset()
     keywords: tuple[str, ...] = ()
     max_events_per_minute: int = 30
@@ -51,6 +52,8 @@ class TriggerPolicy:
         if source.user_id in self.blocked_users:
             return False
         if self.allowed_chats and source.chat_id not in self.allowed_chats:
+            return False
+        if self.allowed_users and source.user_id not in self.allowed_users:
             return False
 
         if rate_tracker is not None and not rate_tracker.allow(

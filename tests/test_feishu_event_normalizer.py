@@ -207,6 +207,102 @@ def test_is_self_message_standalone() -> None:
     assert normalizer.is_self_message(event, "") is False
 
 
+def test_at_all_mention_detected() -> None:
+    """@all / @所有人 is treated as a bot mention."""
+    normalizer = FeishuEventNormalizer(bot_id="ou_bot1")
+    for content in ("@all 紧急通知", "@所有人 开会了", "@All please check"):
+        result = normalizer.classify(_make_message_event(content=content))
+        assert result.kind == EventKind.MESSAGE, f"Failed for: {content}"
+        assert result.message is not None
+        assert result.message.metadata.get("bot_mentioned") is True, f"@all not detected in: {content}"
+
+
+def test_at_all_without_bot_name() -> None:
+    """@all detection works even without bot_name configured."""
+    normalizer = FeishuEventNormalizer(bot_id="ou_bot1", bot_name="")
+    result = normalizer.classify(_make_message_event(content="@all 快看"))
+    assert result.message is not None
+    assert result.message.metadata.get("bot_mentioned") is True
+
+
+def test_image_message_produces_media_attachment() -> None:
+    """Image message type populates MediaAttachment with file_key."""
+    event = BackendEvent(
+        event_id="ev_img",
+        event_type="im.message.receive_v1",
+        platform_id="feishu",
+        payload={
+            "type": "im.message.receive_v1",
+            "message_id": "om_img1",
+            "chat_id": "oc_1",
+            "chat_type": "group",
+            "message_type": "image",
+            "sender_id": "ou_user1",
+            "content": "",
+            "image_key": "img_v2_abcdef",
+        },
+    )
+    normalizer = FeishuEventNormalizer(bot_id="ou_bot1")
+    result = normalizer.classify(event)
+    assert result.kind == EventKind.MESSAGE
+    assert result.message is not None
+    assert len(result.message.media) == 1
+    assert result.message.media[0].media_type == "image"
+    assert "img_v2_abcdef" in result.message.media[0].url
+    assert result.message.text == "[image]"
+
+
+def test_file_message_produces_media_attachment() -> None:
+    """File message type populates MediaAttachment."""
+    event = BackendEvent(
+        event_id="ev_file",
+        event_type="im.message.receive_v1",
+        platform_id="feishu",
+        payload={
+            "type": "im.message.receive_v1",
+            "message_id": "om_f1",
+            "chat_id": "oc_1",
+            "chat_type": "p2p",
+            "message_type": "file",
+            "sender_id": "ou_user1",
+            "content": "",
+            "file_key": "file_xyz",
+            "file_name": "report.pdf",
+            "file_size": "12345",
+        },
+    )
+    normalizer = FeishuEventNormalizer(bot_id="ou_bot1")
+    result = normalizer.classify(event)
+    assert result.kind == EventKind.MESSAGE
+    assert result.message is not None
+    assert len(result.message.media) == 1
+    assert result.message.media[0].filename == "report.pdf"
+    assert result.message.media[0].size_bytes == 12345
+
+
+def test_reply_to_id_extracted() -> None:
+    """parent_id from payload is set as reply_to_id."""
+    event = BackendEvent(
+        event_id="ev_reply",
+        event_type="im.message.receive_v1",
+        platform_id="feishu",
+        payload={
+            "type": "im.message.receive_v1",
+            "message_id": "om_reply1",
+            "chat_id": "oc_1",
+            "chat_type": "group",
+            "message_type": "text",
+            "sender_id": "ou_user1",
+            "content": "this is a reply",
+            "parent_id": "om_parent1",
+        },
+    )
+    normalizer = FeishuEventNormalizer(bot_id="ou_bot1")
+    result = normalizer.classify(event)
+    assert result.message is not None
+    assert result.message.reply_to_id == "om_parent1"
+
+
 def test_nested_sender_id_extraction() -> None:
     """Nested sender_id structures (V2 envelope fallback) are handled."""
     event = BackendEvent(

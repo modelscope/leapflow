@@ -1573,10 +1573,11 @@ class Context:
                         },
                     )
 
-        from leapflow.gateway.checkpoint_store import DuckDBCheckpointStore
+        from leapflow.gateway.checkpoint_store import DuckDBCheckpointStore, DuckDBDeduplicationStore
         from leapflow.gateway.event_bridge import GatewayEventBridge
 
         _checkpoint_store = DuckDBCheckpointStore(self._db_holder)
+        _dedup_store = DuckDBDeduplicationStore(self._db_holder)
         self._gateway_event_bridge = GatewayEventBridge(self.event_bus)
 
         async def _on_gateway_event_with_bridge(event: object) -> None:
@@ -1588,6 +1589,7 @@ class Context:
             extra_manifest_dirs=[settings.profile_dir / "gateway" / "manifests"],
             on_event=_on_gateway_event_with_bridge,
             checkpoint_store=_checkpoint_store,
+            dedup_store=_dedup_store,
         )
         self.gateway_server.discover_manifests()
         set_gateway_server(self.gateway_server)
@@ -1597,6 +1599,71 @@ class Context:
 
         async def _gateway_send(source: Any, text: str) -> None:
             await self.gateway_server.send_reply(source, text)
+
+        async def _gateway_indicator(
+            source: Any, message_id: str, phase: str,
+        ) -> None:
+            """Processing indicator via platform reactions (fire-and-forget)."""
+            platform = getattr(source, "platform", "")
+            if not platform or not message_id:
+                return
+            gw = self.gateway_server
+            if phase == "start":
+                await gw.execute_platform_action(
+                    platform, "im.add_reaction",
+                    {"message_id": message_id, "emoji_type": "OnIt"},
+                )
+            elif phase == "done":
+                await gw.execute_platform_action(
+                    platform, "im.remove_reaction",
+                    {"message_id": message_id, "emoji_type": "OnIt"},
+                )
+            elif phase == "error":
+                await gw.execute_platform_action(
+                    platform, "im.remove_reaction",
+                    {"message_id": message_id, "emoji_type": "OnIt"},
+                )
+
+        async def _gateway_stream_send(
+            source: Any, text: str, message_id: str,
+        ) -> str:
+            """Send or update a message for streaming replies.
+
+            When *message_id* is empty, sends a new message and returns its ID.
+            When *message_id* is provided, updates the existing message in place.
+            """
+            platform = getattr(source, "platform", "")
+            chat_id = getattr(source, "chat_id", "")
+            gw = self.gateway_server
+            if not message_id:
+                result = await gw.send_message(platform, chat_id, text)
+                return str(result.get("message_id", ""))
+            else:
+                await gw.execute_platform_action(
+                    platform, "im.update_message",
+                    {"message_id": message_id, "text": text},
+                )
+                return message_id
+
+        async def _gateway_context_fetch(
+            platform: str, message_id: str, field: str,
+        ) -> str:
+            """Fetch parent message text via platform action for thread context."""
+            if not platform or not message_id:
+                return ""
+            gw = self.gateway_server
+            result = await gw.execute_platform_action(
+                platform, "im.get_messages",
+                {"message_ids": message_id},
+            )
+            if not result.get("ok"):
+                return ""
+            data = result.get("data", {})
+            items = data.get("items") or data.get("messages") or []
+            if isinstance(items, list) and items:
+                msg = items[0] if isinstance(items[0], dict) else {}
+                return str(msg.get("content") or msg.get("text") or "")
+            return ""
 
         from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
 
@@ -1611,6 +1678,9 @@ class Context:
             tool_definitions=TOOL_DEFINITIONS,
             tool_handlers=TOOL_HANDLERS,
             persistence=getattr(self, "_conversation_store", None),
+            indicator_fn=_gateway_indicator,
+            stream_send_fn=_gateway_stream_send,
+            context_fetch_fn=_gateway_context_fetch,
         )
         self.gateway_server.set_message_handler(
             self._gateway_router.handle_message,
@@ -2363,7 +2433,27 @@ class Context:
                     raw_mode, platform_id,
                 )
                 trigger_mode = TriggerMode.MENTION_ONLY
-            gw.register_trigger_policy(platform_id, TriggerPolicy(mode=trigger_mode))
+
+            def _to_frozenset(val: Any) -> frozenset[str]:
+                if isinstance(val, str):
+                    return frozenset(v.strip() for v in val.split(",") if v.strip())
+                if isinstance(val, (list, tuple, set, frozenset)):
+                    return frozenset(str(v) for v in val)
+                return frozenset()
+
+            policy = TriggerPolicy(
+                mode=trigger_mode,
+                allowed_chats=_to_frozenset(opts.get("allowed_chats")),
+                blocked_chats=_to_frozenset(opts.get("blocked_chats")),
+                allowed_users=_to_frozenset(opts.get("allowed_users")),
+                blocked_users=_to_frozenset(opts.get("blocked_users")),
+                keywords=tuple(
+                    str(k) for k in (opts.get("keywords") or [])
+                ) if opts.get("keywords") else (),
+                max_events_per_minute=int(opts.get("max_events_per_minute", 30)),
+                cooldown_per_chat_s=float(opts.get("cooldown_per_chat_s", 1.0)),
+            )
+            gw.register_trigger_policy(platform_id, policy)
 
     async def cleanup(self) -> None:
         # Persist evolution episodes to DuckDB before shutdown

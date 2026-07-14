@@ -186,7 +186,7 @@ async def test_feishu_adapter_uses_cli_backend_for_send() -> None:
     assert result.ok is True
     assert result.message_id == "om_1"
     assert backend.executed == [
-        ("im.send_message", {"chat_id": "oc_1", "thread_id": "", "text": "hello feishu"}),
+        ("im.send_message", {"chat_id": "oc_1", "text": "hello feishu"}),
     ]
 
 

@@ -51,7 +51,10 @@ async def test_app_slash_payloads_reuse_platform_connect_and_manifests(tmp_path)
     assert status["result"]["platform"] == "feishu"
     assert actions["ok"] is True
     assert set(actions["actions"]) == {
-        "im.send_message", "im.list_chats", "im.search_chats",
+        "im.send_message", "im.reply_message", "im.update_message",
+        "im.add_reaction", "im.remove_reaction", "im.update_card",
+        "im.download_resource",
+        "im.list_chats", "im.search_chats",
         "im.list_messages", "im.get_messages", "im.search_messages",
         "im.list_thread_messages",
         "docs.create_markdown", "calendar.create_event",

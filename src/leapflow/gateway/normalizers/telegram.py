@@ -13,7 +13,7 @@ from leapflow.gateway.connectors.protocol import (
     EventClassification,
     EventKind,
 )
-from leapflow.gateway.protocol import InboundMessage, MessageSource
+from leapflow.gateway.protocol import InboundMessage, MediaAttachment, MessageSource
 
 
 class TelegramEventNormalizer:
@@ -84,7 +84,9 @@ class TelegramEventNormalizer:
             return None
 
         text = str(raw_message.get("text") or raw_message.get("caption") or "")
-        if not text:
+        media = self._extract_media(raw_message)
+
+        if not text and not media:
             return None
 
         chat = raw_message.get("chat", {})
@@ -101,6 +103,9 @@ class TelegramEventNormalizer:
         user_name = str(user.get("username") or user.get("first_name") or "")
 
         bot_mentioned = self._detect_bot_mention(raw_message)
+
+        if not text and media:
+            text = f"[{media[0].media_type}]"
 
         metadata: dict[str, Any] = {
             "update_id": str(payload.get("update_id", "")),
@@ -119,14 +124,45 @@ class TelegramEventNormalizer:
             ),
             text=text,
             message_id=str(raw_message.get("message_id", "")),
+            media=tuple(media),
             metadata=metadata,
             timestamp=float(raw_message.get("date", time.time())),
         )
 
+    @staticmethod
+    def _extract_media(raw_message: Mapping[str, Any]) -> list[MediaAttachment]:
+        """Extract media attachments from a Telegram message."""
+        attachments: list[MediaAttachment] = []
+        for media_key, media_type in (
+            ("photo", "image"), ("document", "file"),
+            ("audio", "audio"), ("video", "video"),
+            ("voice", "audio"), ("sticker", "sticker"),
+        ):
+            media_data = raw_message.get(media_key)
+            if media_data is None:
+                continue
+            if media_key == "photo" and isinstance(media_data, list) and media_data:
+                best = media_data[-1] if media_data else {}
+                file_id = str(best.get("file_id", "")) if isinstance(best, dict) else ""
+                if file_id:
+                    attachments.append(MediaAttachment(
+                        url=f"telegram://file/{file_id}",
+                        media_type=media_type,
+                        size_bytes=int(best.get("file_size", 0)) if isinstance(best, dict) else 0,
+                    ))
+            elif isinstance(media_data, dict):
+                file_id = str(media_data.get("file_id", ""))
+                if file_id:
+                    attachments.append(MediaAttachment(
+                        url=f"telegram://file/{file_id}",
+                        media_type=media_type,
+                        filename=str(media_data.get("file_name", "")),
+                        size_bytes=int(media_data.get("file_size", 0)),
+                    ))
+        return attachments
+
     def _detect_bot_mention(self, raw_message: Mapping[str, Any]) -> bool:
-        """Detect @bot mention in Telegram message entities."""
-        if not self._bot_name:
-            return False
+        """Detect @bot mention or @all-equivalent in Telegram message entities."""
         entities = raw_message.get("entities", [])
         if not isinstance(entities, list):
             return False
@@ -138,6 +174,14 @@ class TelegramEventNormalizer:
                 offset = int(ent.get("offset", 0))
                 length = int(ent.get("length", 0))
                 mentioned = text[offset:offset + length].lstrip("@")
-                if mentioned.lower() == self._bot_name.lower():
+                if mentioned.lower() in ("all", "everyone"):
                     return True
+                if self._bot_name and mentioned.lower() == self._bot_name.lower():
+                    return True
+            if ent.get("type") == "text_mention":
+                user = ent.get("user", {})
+                if isinstance(user, dict):
+                    uid = str(user.get("id", ""))
+                    if self._bot_id and uid == self._bot_id:
+                        return True
         return False

@@ -100,6 +100,19 @@ def test_allowed_chats_whitelist() -> None:
     assert policy.should_activate(_msg(chat_id="oc_other")) is False
 
 
+def test_allowed_users_whitelist() -> None:
+    """When allowed_users is set, only those users pass."""
+    policy = TriggerPolicy(mode=TriggerMode.ALL, allowed_users=frozenset({"ou_vip"}))
+    assert policy.should_activate(_msg(user_id="ou_vip")) is True
+    assert policy.should_activate(_msg(user_id="ou_other")) is False
+
+
+def test_allowed_users_empty_means_all_allowed() -> None:
+    """Empty allowed_users means no user filtering."""
+    policy = TriggerPolicy(mode=TriggerMode.ALL, allowed_users=frozenset())
+    assert policy.should_activate(_msg(user_id="ou_anyone")) is True
+
+
 def test_string_mode_via_enum_value() -> None:
     """TriggerMode can be created from string value."""
     assert TriggerMode("mention_only") is TriggerMode.MENTION_ONLY

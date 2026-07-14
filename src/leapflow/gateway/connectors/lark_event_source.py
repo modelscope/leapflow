@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 _DEFAULT_EVENT_KEYS: tuple[str, ...] = (
     "im.message.receive_v1",
     "card.action.trigger",
+    "im.message.reaction.created_v1",
+    "im.message.read_v1",
+    "im.chat.member.bot.added_v1",
+    "im.chat.member.bot.deleted_v1",
 )
 
 

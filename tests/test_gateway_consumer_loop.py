@@ -331,3 +331,51 @@ async def test_all_events_pass_with_zero_cooldown(tmp_path: Any) -> None:
 
     assert len(received) == 3
     assert [m.text for m in received] == ["msg1", "msg2", "msg3"]
+
+
+# ── Text chunking and formatting tests ────────────────────────
+
+
+def test_chunk_text_short_message() -> None:
+    """Short messages are returned as a single chunk."""
+    from leapflow.gateway.server import _chunk_text
+
+    assert _chunk_text("hello", 100) == ["hello"]
+    assert _chunk_text("", 100) == []
+
+
+def test_chunk_text_long_message() -> None:
+    """Long messages are split at paragraph boundaries."""
+    from leapflow.gateway.server import _chunk_text
+
+    text = "Paragraph one.\n\nParagraph two.\n\nParagraph three."
+    chunks = _chunk_text(text, 30)
+    assert len(chunks) >= 2
+    assert "".join(chunks) == text.replace("\n\n", "")  # stripped whitespace
+
+
+def test_chunk_text_respects_max_len() -> None:
+    """Every chunk respects max_len boundary."""
+    from leapflow.gateway.server import _chunk_text
+
+    text = "A" * 500
+    chunks = _chunk_text(text, 100)
+    assert all(len(c) <= 100 for c in chunks)
+    assert "".join(chunks) == text
+
+
+def test_has_rich_formatting_detects_code() -> None:
+    """Code blocks and inline code trigger rich format detection."""
+    from leapflow.gateway.server import _has_rich_formatting
+
+    assert _has_rich_formatting("```python\nprint(1)\n```") is True
+    assert _has_rich_formatting("Use `foo` and **bar** to do things") is True
+    assert _has_rich_formatting("just plain text here") is False
+
+
+def test_has_rich_formatting_detects_headers_and_lists() -> None:
+    """Headers + lists trigger rich format detection."""
+    from leapflow.gateway.server import _has_rich_formatting
+
+    md = "# Title\n\n- item one\n- item two"
+    assert _has_rich_formatting(md) is True
