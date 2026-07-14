@@ -3,13 +3,23 @@ from __future__ import annotations
 import pytest
 
 from leapflow.gateway.adapters.feishu import FeishuAdapter
+from leapflow.gateway.capability_health import CapabilityHealthLedger
+from leapflow.gateway.backends.lark_cli_errors import classify_lark_cli_failure
 from leapflow.gateway.connectors.action_registry import (
     ActionRegistry,
     ValidationResult,
     normalize_payload,
+    summarize_action_result,
     validate_payload,
 )
-from leapflow.gateway.connectors.protocol import ActionPreview, ActionResult, ActionSpec, BackendStatus
+from leapflow.gateway.connectors.protocol import (
+    ActionAuthSpec,
+    ActionFailure,
+    ActionPreview,
+    ActionResult,
+    ActionSpec,
+    BackendStatus,
+)
 
 
 class FakeBackend:
@@ -90,6 +100,119 @@ def test_action_registry_loads_standard_action_pack_export() -> None:
 
     assert registry.get("im.send_message") is not None
     assert registry.get("task.create") is not None
+
+
+def test_yaml_action_pack_loads_auth_contract() -> None:
+    registry = ActionRegistry.from_module("leapflow.gateway.action_packs.feishu")
+
+    list_messages = registry.get("im.list_messages")
+    send_message = registry.get("im.send_message")
+    search_messages = registry.get("im.search_messages")
+
+    assert list_messages is not None
+    assert list_messages.capability == "im.message.read"
+    assert list_messages.auth.identities == ("user", "bot")
+    assert "im:message:readonly" in list_messages.auth.scopes["common"]
+    assert "im:message.group_msg:get_as_user" in list_messages.auth.scopes["user"]
+    assert "im:message.group_msg" in list_messages.auth.scopes["bot"]
+    assert list_messages.auth.resource_fields == ("chat_id",)
+
+    assert send_message is not None
+    assert send_message.capability == "im.message.send"
+    assert "im:message:send_as_bot" in send_message.auth.scopes["bot"]
+
+    assert search_messages is not None
+    assert search_messages.auth.identities == ("user",)
+    assert "search:message" in search_messages.auth.scopes["user"]
+
+
+def test_summarize_action_result_preserves_structured_failure() -> None:
+    spec = ActionSpec(
+        name="im.list_messages",
+        backend_kind="cli",
+        capability="im.message.read",
+        output_policy="raw",
+    )
+    failure = ActionFailure(
+        failure_class="authorization",
+        failure_code="missing_scope",
+        message="access denied",
+        recoverability="admin_required",
+        retryable=False,
+        missing_scopes=("im:message.group_msg",),
+        capability="im.message.read",
+        blocks_approval=True,
+    )
+
+    summary = summarize_action_result(
+        spec,
+        ActionResult(ok=False, error="access denied", failure=failure),
+    )
+
+    assert summary["ok"] is False
+    assert summary["failure_class"] == "authorization"
+    assert summary["failure_code"] == "missing_scope"
+    assert summary["recoverability"] == "admin_required"
+    assert summary["blocks_approval"] is True
+    assert summary["missing_scopes"] == ["im:message.group_msg"]
+    assert summary["capability"] == "im.message.read"
+
+
+def test_capability_health_ledger_blocks_only_matching_capability() -> None:
+    ledger = CapabilityHealthLedger()
+    read_spec = ActionSpec(
+        name="im.list_messages",
+        backend_kind="cli",
+        capability="im.message.read",
+        auth=ActionAuthSpec(scopes={"common": ("im:message:readonly",)}),
+    )
+    send_spec = ActionSpec(
+        name="im.send_message",
+        backend_kind="cli",
+        capability="im.message.send",
+        auth=ActionAuthSpec(scopes={"common": ("im:message:send_as_bot",)}),
+    )
+    failure = ActionFailure(
+        failure_class="authorization",
+        failure_code="missing_scope",
+        message="access denied",
+        recoverability="admin_required",
+        retryable=False,
+        missing_scopes=("im:message.group_msg",),
+        capability="im.message.read",
+        blocks_approval=True,
+    )
+
+    ledger.record_failure("feishu", read_spec.capability, failure)
+
+    blocked = ledger.check_feasibility("feishu", read_spec)
+    allowed = ledger.check_feasibility("feishu", send_spec)
+
+    assert blocked["ok"] is False
+    assert blocked["skip_approval"] is True
+    assert blocked["failure_code"] == "missing_scope"
+    assert blocked["capability"] == "im.message.read"
+    assert allowed == {"ok": True}
+
+
+def test_lark_cli_error_classifier_from_plain_access_denied() -> None:
+    spec = ActionSpec(name="docs.create_markdown", backend_kind="cli", capability="docs.create")
+
+    failure = classify_lark_cli_failure(
+        spec,
+        "access denied for this operation; possible causes: missing scope",
+        {},
+        binary="lark-cli",
+        profile="work",
+        identity="bot",
+    )
+
+    assert failure.failure_class == "authorization"
+    assert failure.failure_code == "access_denied"
+    assert failure.recoverability == "admin_required"
+    assert failure.retryable is False
+    assert failure.blocks_approval is True
+    assert failure.capability == "docs.create"
 
 
 # ═══════════════════════════════════════════════════════════════

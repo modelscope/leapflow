@@ -85,6 +85,7 @@ async def test_cli_backend_normalizes_error(monkeypatch) -> None:
     spec = ActionSpec(
         name="im.send_message",
         backend_kind=BackendKind.CLI.value,
+        capability="im.message.send",
         backend_config={"argv": ("im", "+messages-send")},
     )
 
@@ -92,6 +93,53 @@ async def test_cli_backend_normalizes_error(monkeypatch) -> None:
 
     assert result.ok is False
     assert result.error == "missing scope"
+    assert result.failure is not None
+    assert result.failure.failure_code == "missing_scope"
+    assert result.failure.failure_class == "authorization"
+    assert result.failure.blocks_approval is True
+
+
+@pytest.mark.asyncio
+async def test_cli_backend_preserves_lark_cli_permission_problem(monkeypatch) -> None:
+    payload = (
+        b'{"ok": false, "error": {'
+        b'"type":"authorization",'
+        b'"subtype":"missing_scope",'
+        b'"message":"access denied for this operation",'
+        b'"hint":"grant scope",'
+        b'"missing_scopes":["im:message.group_msg"],'
+        b'"requested_scopes":["im:message:readonly"],'
+        b'"granted_scopes":[], '
+        b'"identity":"bot",'
+        b'"console_url":"https://console.example"'
+        b'}}'
+    )
+
+    async def fake_exec(*_argv, **_kwargs):
+        return FakeProcess(1, b"", payload)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+    backend = CliBackend(binary="lark-cli", profile="work", identity="bot")
+    spec = ActionSpec(
+        name="im.list_messages",
+        backend_kind=BackendKind.CLI.value,
+        capability="im.message.read",
+        backend_config={"argv": ("im", "+chat-messages-list")},
+    )
+
+    result = await backend.execute(spec, {})
+
+    assert result.ok is False
+    assert result.failure is not None
+    assert result.failure.failure_class == "authorization"
+    assert result.failure.failure_code == "missing_scope"
+    assert result.failure.recoverability == "admin_required"
+    assert result.failure.retryable is False
+    assert result.failure.blocks_approval is True
+    assert result.failure.missing_scopes == ("im:message.group_msg",)
+    assert result.failure.requested_scopes == ("im:message:readonly",)
+    assert result.failure.identity == "bot"
+    assert result.failure.console_url == "https://console.example"
 
 
 @pytest.mark.asyncio

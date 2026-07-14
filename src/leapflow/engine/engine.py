@@ -167,6 +167,11 @@ def _tool_result_metadata(
         for key in ("error_type", "retryable", "resolution_status", "resolution_confidence"):
             if key in result:
                 metadata[key] = result[key]
+        # App Connector authorization failure metadata
+        for key in ("failure_class", "failure_code", "recoverability", "blocks_approval",
+                    "capability", "missing_scopes", "required_scopes", "skip_approval"):
+            if key in result:
+                metadata[key] = result[key]
         for key in ("suggestions", "available_tools"):
             value = result.get(key)
             if value:
@@ -281,12 +286,43 @@ def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
 
     last = failures[0]
     failure_code = str(last.get("failure_code") or "")
+    failure_class = str(last.get("failure_class") or "")
     error = str(last.get("error") or "")
     recovery_hint = str(last.get("recovery_hint") or "")
+    recoverability = str(last.get("recoverability") or "")
     available_actions: List[str] = list(last.get("available_action_names") or [])
+    platform = str(last.get("platform") or "")
+    capability = str(last.get("capability") or "")
+    missing_scopes: List[str] = list(last.get("missing_scopes") or [])
+    required_scopes: List[str] = list(last.get("required_scopes") or [])
+    console_url = str(last.get("console_url") or "")
+    blocks_approval = bool(last.get("blocks_approval", False))
 
     lines: List[str] = []
-    if failure_code == "unknown_platform_action":
+
+    # Authorization / permission failures — deterministic, no retry via LLM
+    if failure_class in ("authorization", "scope_denied") or failure_code in ("access_denied", "missing_scope"):
+        where = f"`{platform}.{capability}`" if platform and capability else (capability or platform or "this action")
+        scope_detail = ""
+        if missing_scopes:
+            scope_detail = f" Missing scopes: {', '.join(missing_scopes)}."
+        elif required_scopes:
+            scope_detail = f" Required scopes: {', '.join(required_scopes)}."
+        lines.append(
+            f"Authorization failed for {where}. "
+            f"The platform has denied access — this cannot be resolved by retrying.{scope_detail}"
+        )
+        if recovery_hint and failure_code not in ("rate_limited",):
+            lines.append(f"To fix: {recovery_hint}")
+        elif recoverability == "admin_required":
+            lines.append(
+                "An administrator must grant the required permissions in the platform developer console "
+                "and republish or reinstall the application."
+            )
+        if console_url:
+            lines.append(f"Developer console: {console_url}")
+        lines.append("Do NOT retry this action — inform the user that manual authorization is required.")
+    elif failure_code == "unknown_platform_action":
         platform = str(last.get("platform") or "")
         action = str(last.get("requested_action") or "")
         lines.append(f"`{platform}.{action}` is not a registered platform action.")

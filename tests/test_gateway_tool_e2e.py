@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from leapflow.gateway.connectors.protocol import ActionPreview, ActionResult, ActionSpec, BackendKind
+from leapflow.gateway.connectors.protocol import ActionFailure, ActionPreview, ActionResult, ActionSpec, BackendKind
 from leapflow.gateway.protocol import OutboundContent, SendResult, SendTarget
 from leapflow.gateway.server import GatewayServer
 from leapflow.tools.gateway_tool import (
@@ -391,6 +391,105 @@ class CaptureGate:
             denial_message = ""
 
         return Result()
+
+
+class PermissionFailingAdapter(FakeSendAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_spec = ActionSpec(
+            name="im.list_messages",
+            backend_kind=BackendKind.CLI.value,
+            effect="read",
+            capability="im.message.read",
+            schema={
+                "type": "object",
+                "required": ["chat_id"],
+                "properties": {"chat_id": {"type": "string"}},
+            },
+            risk_level="low",
+            output_policy="raw",
+        )
+        self.execute_calls: list[str] = []
+
+    def action_spec(self, action: str) -> ActionSpec | None:
+        if action == self.spec.name:
+            return self.spec
+        if action == self.read_spec.name:
+            return self.read_spec
+        return None
+
+    def action_specs(self) -> dict[str, ActionSpec]:
+        return {self.spec.name: self.spec, self.read_spec.name: self.read_spec}
+
+    async def preview_action(self, action: str, payload: dict) -> ActionPreview:
+        spec = self.action_spec(action)
+        if spec is None:
+            return ActionPreview(ok=False, error="unknown action")
+        return ActionPreview(ok=True, summary=f"preview {action}")
+
+    async def execute_action(self, action: str, payload: dict) -> ActionResult:
+        self.execute_calls.append(action)
+        if action == "im.list_messages":
+            failure = ActionFailure(
+                failure_class="authorization",
+                failure_code="missing_scope",
+                message="access denied for this operation",
+                recoverability="admin_required",
+                retryable=False,
+                missing_scopes=("im:message.group_msg",),
+                capability="im.message.read",
+                blocks_approval=True,
+            )
+            return ActionResult(
+                ok=False,
+                error="access denied for this operation",
+                failure=failure,
+            )
+        return await super().execute_action(action, payload)
+
+
+@pytest.mark.asyncio
+async def test_platform_action_blocks_known_permission_failure_before_approval(tmp_path) -> None:
+    server = GatewayServer(tmp_path)
+    adapter = PermissionFailingAdapter()
+    gate = CaptureGate()
+    server._adapters["fake"] = adapter
+    set_gateway_server(server)
+    set_gateway_approval_gate(gate)
+
+    try:
+        first = await platform_action_handler({
+            "platform": "fake",
+            "action": "im.list_messages",
+            "payload": {"chat_id": "chat-1"},
+        })
+        second = await platform_action_handler({
+            "platform": "fake",
+            "action": "im.list_messages",
+            "payload": {"chat_id": "chat-1"},
+        })
+        send = await platform_action_handler({
+            "platform": "fake",
+            "action": "im.send_message",
+            "payload": {"chat_id": "chat-1", "text": "still allowed"},
+        })
+    finally:
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+
+    assert first["ok"] is False
+    assert first["failure_class"] == "authorization"
+    assert first["blocks_approval"] is True
+    assert len(gate.actions) == 2
+    assert adapter.execute_calls == ["im.list_messages", "im.send_message"]
+
+    assert second["ok"] is False
+    assert second["skip_approval"] is True
+    assert second["failure_code"] == "missing_scope"
+    assert second["capability"] == "im.message.read"
+
+    assert send["ok"] is True
+    assert send["capability"] == "im.send_message"
 
 
 @pytest.mark.asyncio

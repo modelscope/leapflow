@@ -24,6 +24,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from leapflow.gateway.capability_health import CapabilityHealthLedger
 from leapflow.gateway.checkpoint_store import CheckpointStore, DeduplicationStore
 from leapflow.gateway.config_store import GatewayConfigStore
 from leapflow.gateway.connectors.action_registry import summarize_action_result
@@ -195,6 +196,7 @@ class GatewayServer:
         self._callback_handler: Optional[Callable[..., Any]] = None
         self._on_event = on_event
         self._started = False
+        self._capability_health = CapabilityHealthLedger()
 
     # ── Manifest discovery ───────────────────────────────────
 
@@ -301,6 +303,7 @@ class GatewayServer:
                 return response
 
         display = manifest.display_name
+        self._capability_health.clear(platform_id)
         response = {
             "ok": True,
             "status": "connected",
@@ -325,6 +328,7 @@ class GatewayServer:
             except Exception:
                 logger.debug("Error stopping event source for %s", platform_id, exc_info=True)
         self._connected_since.pop(platform_id, None)
+        self._capability_health.clear(platform_id)
 
         affected = {k for k in self._known_sessions if k.platform == platform_id}
         self._known_sessions -= affected
@@ -512,12 +516,31 @@ class GatewayServer:
                 return {"ok": False, "error": f"Unknown platform action: {action}"}
             return {"ok": True, "summary": f"Run {platform_id}.{action}"}
         result: ActionPreview = await preview(action, payload)
-        return {
+        response = {
             "ok": result.ok,
             "summary": result.summary,
             "data": dict(result.data),
             **({"error": result.error} if result.error else {}),
         }
+        if result.failure is not None:
+            response.update(result.failure.as_dict())
+        return response
+
+    def check_platform_action_feasibility(
+        self,
+        platform_id: str,
+        action: str,
+        payload: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Check whether an action is known to be executable before approval."""
+        spec = self.get_platform_action_spec(platform_id, action)
+        if spec is None:
+            return {"ok": True}
+        return self._capability_health.check_feasibility(platform_id, spec)
+
+    def capability_health_summary(self) -> List[Dict[str, Any]]:
+        """Return compact non-secret capability health diagnostics."""
+        return self._capability_health.summary()
 
     async def execute_platform_action(
         self,
@@ -536,6 +559,12 @@ class GatewayServer:
             spec = self.get_platform_action_spec(platform_id, action)
             result = await execute(action, payload)
             if spec is not None:
+                if not result.ok and result.failure is not None:
+                    self._capability_health.record_failure(
+                        platform_id,
+                        spec.capability or spec.name,
+                        result.failure,
+                    )
                 summary = summarize_action_result(spec, result)
                 summary.update({"platform": platform_id, "action": action})
                 return summary

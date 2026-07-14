@@ -29,6 +29,20 @@ actions:
     effect: send
     risk_level: high
     output_policy: summary
+    capability: im.message.send
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:send_as_bot]
+        user: [im:message.send_as_user, im:message]
+        bot: [im:message:send_as_bot]
+      resource_fields: [chat_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: >-
+            Grant im:message:send_as_bot (bot) or im:message.send_as_user (user)
+            in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [chat_id, text]
       properties:
@@ -75,6 +89,15 @@ actions:
     effect: read
     risk_level: low
     output_policy: raw
+    capability: im.chat.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:chat:read]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:chat:read in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       properties:
         page_size:
@@ -95,6 +118,15 @@ actions:
     effect: read
     risk_level: low
     output_policy: raw
+    capability: im.chat.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:chat:read]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:chat:read in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [query]
       properties:
@@ -123,6 +155,20 @@ actions:
     effect: read
     risk_level: low
     output_policy: raw
+    capability: im.message.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+        user: [im:message.group_msg:get_as_user, im:message.p2p_msg:get_as_user, im:message.reactions:read, contact:user.base:readonly]
+        bot: [im:message.group_msg, im:message.p2p_msg:readonly, im:message.reactions:read]
+      resource_fields: [chat_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: >-
+            Grant im:message:readonly (plus identity-specific scopes) in the Feishu developer console,
+            then re-publish and reinstall the app.
     schema:
       required: [chat_id]
       properties:
@@ -146,6 +192,17 @@ actions:
     effect: read
     risk_level: low
     output_policy: raw
+    capability: im.message.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+        user: [im:message.group_msg:get_as_user, im:message.p2p_msg:get_as_user, im:message.reactions:read, contact:user.basic_profile:readonly]
+        bot: [im:message.group_msg, im:message.p2p_msg:readonly, im:message.reactions:read, contact:user.base:readonly]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:readonly in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [message_ids]
       properties:
@@ -172,6 +229,17 @@ actions:
     effect: read
     risk_level: medium
     output_policy: raw
+    capability: im.message.search
+    auth:
+      identities: [user]
+      scopes:
+        user: [search:message, im:message.reactions:read, contact:user.basic_profile:readonly]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: >-
+            Grant search:message and contact:user.basic_profile:readonly (user identity only)
+            in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [query]
       properties:
@@ -195,6 +263,17 @@ actions:
     effect: read
     risk_level: low
     output_policy: raw
+    capability: im.message.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+        user: [im:message.group_msg:get_as_user, im:message.p2p_msg:get_as_user, im:message.reactions:read, contact:user.basic_profile:readonly]
+        bot: [im:message.group_msg, im:message.p2p_msg:readonly, im:message.reactions:read, contact:user.base:readonly]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:readonly in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [thread]
       properties:
@@ -218,6 +297,18 @@ actions:
     effect: send
     risk_level: high
     output_policy: summary
+    capability: im.message.send
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:send_as_bot]
+        user: [im:message.send_as_user, im:message]
+        bot: [im:message:send_as_bot]
+      resource_fields: [message_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:send_as_bot (bot) or im:message.send_as_user (user) in the developer console.
     schema:
       required: [message_id, text]
       properties:
@@ -247,6 +338,18 @@ actions:
     effect: write
     risk_level: medium
     output_policy: summary
+    capability: im.message.write
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:send_as_bot]
+        user: [im:message.send_as_user, im:message]
+        bot: [im:message:send_as_bot]
+      resource_fields: [message_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:send_as_bot (bot) or im:message.send_as_user (user) in the developer console.
     schema:
       required: [message_id, text]
       properties:
@@ -275,6 +378,16 @@ actions:
     effect: write
     risk_level: low
     output_policy: summary
+    capability: im.message.reaction
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+      resource_fields: [message_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:readonly in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [message_id, emoji_type]
       properties:
@@ -302,6 +415,16 @@ actions:
     effect: write
     risk_level: low
     output_policy: summary
+    capability: im.message.reaction
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+      resource_fields: [message_id]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:readonly in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [message_id, emoji_type]
       properties:
@@ -330,6 +453,15 @@ actions:
     effect: write
     risk_level: medium
     output_policy: summary
+    capability: im.message.write
+    auth:
+      identities: [bot]
+      scopes:
+        bot: [im:message:send_as_bot]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:send_as_bot in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [token, card]
       properties:
@@ -358,6 +490,16 @@ actions:
     effect: read
     risk_level: low
     output_policy: raw
+    capability: im.message.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [im:message:readonly]
+      resource_fields: [message_id, file_key]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant im:message:readonly in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [message_id, file_key, type]
       properties:
@@ -390,6 +532,15 @@ actions:
     effect: write
     risk_level: medium
     output_policy: summary
+    capability: docs.create
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [docs:doc:create, drive:drive:write]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant docs:doc:create and drive:drive:write in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [title, markdown]
       properties:
@@ -428,6 +579,15 @@ actions:
     effect: write
     risk_level: high
     output_policy: summary
+    capability: calendar.event.write
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [calendar:calendar:write]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant calendar:calendar:write in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [summary, start_time, end_time]
       properties:
@@ -473,6 +633,15 @@ actions:
     effect: read
     risk_level: medium
     output_policy: summary
+    capability: drive.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [drive:drive]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant drive:drive in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [query]
       properties:
@@ -498,6 +667,15 @@ actions:
     effect: write
     risk_level: medium
     output_policy: summary
+    capability: sheets.write
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [sheets:spreadsheet, drive:drive]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant sheets:spreadsheet and drive:drive in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [spreadsheet_token, sheet_id, values]
       properties:
@@ -540,6 +718,15 @@ actions:
     effect: read
     risk_level: high
     output_policy: summary
+    capability: mail.read
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [mail:mail.read]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant mail:mail.read in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       properties:
         query:
@@ -563,6 +750,15 @@ actions:
     effect: write
     risk_level: medium
     output_policy: summary
+    capability: task.write
+    auth:
+      identities: [user, bot]
+      scopes:
+        common: [task:task:write]
+      recovery:
+        missing_scope:
+          recoverability: admin_required
+          hint: Grant task:task:write in the Feishu developer console, then re-publish and reinstall the app.
     schema:
       required: [title]
       properties:

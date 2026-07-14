@@ -789,6 +789,18 @@ def _structured_validation_error(
     return response
 
 
+def _required_scopes_for_identity(spec: Any) -> List[str]:
+    auth = getattr(spec, "auth", None)
+    scopes = dict(getattr(auth, "scopes", {}) or {}) if auth is not None else {}
+    result: list[str] = []
+    for key in ("common", "user", "bot"):
+        for scope in scopes.get(key, ()):
+            scope_text = str(scope)
+            if scope_text and scope_text not in result:
+                result.append(scope_text)
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════
 # gateway_send handler — proactive outbound messaging
 # ═══════════════════════════════════════════════════════════════
@@ -921,9 +933,23 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
             "retryable": False,
         }
 
+    feasibility = _gateway_server_ref.check_platform_action_feasibility(
+        platform, action_name, payload
+    )
+    if not feasibility.get("ok"):
+        return feasibility
+
     preview = await _gateway_server_ref.preview_platform_action(platform, action_name, payload)
     if not preview.get("ok"):
-        return {"ok": False, "error": str(preview.get("error") or "Platform action preview failed")}
+        failure_info = {k: v for k, v in preview.items() if k not in ("ok",)}
+        base_err = str(preview.get("error") or "Platform action preview failed")
+        if preview.get("blocks_approval"):
+            feasibility_check = _gateway_server_ref.check_platform_action_feasibility(
+                platform, action_name, payload
+            )
+            if not feasibility_check.get("ok"):
+                return feasibility_check
+        return {"ok": False, "error": base_err, **{k: v for k, v in failure_info.items() if k != "error"}}
 
     if _approval_gate is not None:
         try:
@@ -939,6 +965,8 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
                     "effect": spec.effect,
                     "risk_level": spec.risk_level,
                     "output_policy": spec.output_policy,
+                    "capability": spec.capability or spec.name,
+                    "required_scopes": _required_scopes_for_identity(spec),
                     "preview": preview.get("summary", ""),
                 },
             )
@@ -957,6 +985,8 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
                         "action": action_name,
                         "backend_kind": spec.backend_kind,
                         "risk_level": spec.risk_level,
+                        "capability": spec.capability or spec.name,
+                        "required_scopes": _required_scopes_for_identity(spec),
                     },
                     action=approval_action,
                 ))

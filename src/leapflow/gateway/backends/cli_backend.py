@@ -126,10 +126,19 @@ class CliBackend:
         argv_result = self._build_action_command(spec, payload)
         if isinstance(argv_result, ActionResult):
             return argv_result
-        return await self._run_json(
+        result = await self._run_json(
             argv_result,
             timeout_s=float(spec.backend_config.get("timeout_s") or self._timeout_s),
         )
+        if not result.ok and result.failure is None:
+            failure = self._classify_failure(spec, result.error, result.raw)
+            return ActionResult(
+                ok=False,
+                error=result.error,
+                raw=result.raw,
+                failure=failure,
+            )
+        return result
 
     async def preview(
         self,
@@ -213,6 +222,24 @@ class CliBackend:
             "identity": self._identity,
             "backend_kind": self.kind,
         }
+
+    def _classify_failure(
+        self,
+        spec: ActionSpec,
+        error: str,
+        raw: Mapping[str, Any],
+    ) -> "ActionFailure":
+        """Classify lark-cli backend errors into ActionFailure."""
+        from leapflow.gateway.backends.lark_cli_errors import classify_lark_cli_failure
+
+        return classify_lark_cli_failure(
+            spec,
+            error,
+            raw,
+            binary=self._binary,
+            profile=self._profile,
+            identity=self._identity,
+        )
 
     def _recovery_metadata(self, error: str) -> dict[str, Any]:
         status_command = " ".join([self._binary, *self._profile_args(), "auth", "status", "--json"])

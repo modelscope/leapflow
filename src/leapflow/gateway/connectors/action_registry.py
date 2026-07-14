@@ -16,7 +16,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from leapflow.gateway.connectors.protocol import ActionResult, ActionSpec
+from leapflow.gateway.connectors.protocol import ActionAuthSpec, ActionResult, ActionSpec
 from leapflow.security.redact import redact_sensitive_text
 
 if TYPE_CHECKING:
@@ -126,6 +126,8 @@ class ActionRegistry:
                 backend_config["output_args"] = list(str(a) for a in (backend["output_args"] or []))
 
             schema = action_data.get("schema") or {}
+            auth_data = action_data.get("auth") or {}
+            recovery_data = action_data.get("recovery") or {}
             specs[str(name)] = ActionSpec(
                 name=str(name),
                 backend_kind=str((backend.get("kind") or "cli")),
@@ -135,6 +137,9 @@ class ActionRegistry:
                 backend_config=backend_config,
                 risk_level=str(action_data.get("risk_level") or "medium"),
                 output_policy=str(action_data.get("output_policy") or "summary"),
+                capability=str(action_data.get("capability") or name),
+                auth=_parse_auth_spec(auth_data),
+                recovery=dict(recovery_data) if isinstance(recovery_data, Mapping) else {},
             )
         return cls(specs)
 
@@ -284,22 +289,51 @@ def validate_payload(spec: ActionSpec, payload: Mapping[str, Any]) -> Validation
     return ValidationResult(ok=True)
 
 
+def _parse_auth_spec(data: Any) -> ActionAuthSpec:
+    if not isinstance(data, Mapping):
+        return ActionAuthSpec()
+    scopes_raw = data.get("scopes") or {}
+    scopes: dict[str, tuple[str, ...]] = {}
+    if isinstance(scopes_raw, Mapping):
+        for key, value in scopes_raw.items():
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                scopes[str(key)] = tuple(str(item) for item in value if str(item))
+            elif value:
+                scopes[str(key)] = (str(value),)
+    elif isinstance(scopes_raw, Sequence) and not isinstance(scopes_raw, (str, bytes)):
+        scopes["common"] = tuple(str(item) for item in scopes_raw if str(item))
+    identities = data.get("identities") or ()
+    resource_fields = data.get("resource_fields") or ()
+    recovery = data.get("recovery") or {}
+    return ActionAuthSpec(
+        identities=tuple(str(item) for item in identities) if isinstance(identities, Sequence) and not isinstance(identities, (str, bytes)) else (),
+        scopes=scopes,
+        resource_fields=tuple(str(item) for item in resource_fields) if isinstance(resource_fields, Sequence) and not isinstance(resource_fields, (str, bytes)) else (),
+        recovery=dict(recovery) if isinstance(recovery, Mapping) else {},
+    )
+
+
 _SIDE_EFFECT_KINDS = frozenset({"send", "write", "execute"})
 
 
 def summarize_action_result(spec: ActionSpec, result: ActionResult) -> dict[str, Any]:
     """Apply the action output policy before returning data to the LLM context."""
     if not result.ok:
-        return {
+        response: dict[str, Any] = {
             "ok": False,
             "error": redact_sensitive_text(result.error, force=True),
             "output_policy": spec.output_policy,
+            "capability": spec.capability or spec.name,
         }
+        if result.failure is not None:
+            response.update(result.failure.as_dict())
+        return response
 
     summary: dict[str, Any] = {
         "ok": True,
         "resource_id": result.resource_id,
         "output_policy": spec.output_policy,
+        "capability": spec.capability or spec.name,
     }
 
     if spec.effect in _SIDE_EFFECT_KINDS:

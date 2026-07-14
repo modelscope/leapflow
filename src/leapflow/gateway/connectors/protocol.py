@@ -25,6 +25,63 @@ class BackendKind(str, Enum):
 
 
 @dataclass(frozen=True)
+class ActionAuthSpec:
+    """Platform-neutral authorization contract for an action."""
+
+    identities: tuple[str, ...] = ()
+    scopes: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    resource_fields: tuple[str, ...] = ()
+    recovery: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ActionFailure:
+    """Structured action failure used for recovery and approval gating."""
+
+    failure_class: str
+    failure_code: str
+    message: str
+    recoverability: str = "retryable"
+    retryable: bool = True
+    recovery_hint: str = ""
+    next_steps: tuple[str, ...] = ()
+    required_scopes: tuple[str, ...] = ()
+    missing_scopes: tuple[str, ...] = ()
+    requested_scopes: tuple[str, ...] = ()
+    granted_scopes: tuple[str, ...] = ()
+    identity: str = ""
+    console_url: str = ""
+    capability: str = ""
+    blocks_approval: bool = False
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return safe non-empty fields for tool results and UI metadata."""
+        data: dict[str, Any] = {
+            "failure_class": self.failure_class,
+            "failure_code": self.failure_code,
+            "recoverability": self.recoverability,
+            "retryable": self.retryable,
+            "blocks_approval": self.blocks_approval,
+        }
+        optional: dict[str, Any] = {
+            "recovery_hint": self.recovery_hint,
+            "next_steps": list(self.next_steps),
+            "required_scopes": list(self.required_scopes),
+            "missing_scopes": list(self.missing_scopes),
+            "requested_scopes": list(self.requested_scopes),
+            "granted_scopes": list(self.granted_scopes),
+            "identity": self.identity,
+            "console_url": self.console_url,
+            "capability": self.capability,
+        }
+        for key, value in optional.items():
+            if value:
+                data[key] = value
+        return data
+
+
+@dataclass(frozen=True)
 class ActionSpec:
     """Declarative description of one platform action."""
 
@@ -36,6 +93,9 @@ class ActionSpec:
     backend_config: Mapping[str, Any] = field(default_factory=dict)
     risk_level: str = "medium"
     output_policy: str = "summary"
+    capability: str = ""
+    auth: ActionAuthSpec = field(default_factory=ActionAuthSpec)
+    recovery: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -47,6 +107,7 @@ class ActionResult:
     error: str = ""
     resource_id: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict)
+    failure: ActionFailure | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +118,7 @@ class ActionPreview:
     summary: str = ""
     data: Mapping[str, Any] = field(default_factory=dict)
     error: str = ""
+    failure: ActionFailure | None = None
 
 
 @dataclass(frozen=True)
