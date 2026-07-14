@@ -53,7 +53,7 @@ from leapflow.engine.tool_concurrency import (
 )
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.scheduler import TaskScheduler
-from leapflow.engine.session import SessionController
+from leapflow.engine.session import SessionController, SessionMode
 from leapflow.analysis.pipeline import ImitationPipeline
 from leapflow.llm.base import LLMProvider
 from leapflow.llm.message_builder import (
@@ -1137,6 +1137,32 @@ class AgentEngine:
         """Inject EventBus for emitting learning signals (episode events)."""
         self._event_bus = event_bus
 
+    def _emit_chat_event(self, sub_action: str, payload: Dict[str, Any]) -> None:
+        """Emit a chat interaction event for trajectory recording during LEARNING.
+
+        Only fires when the session is in LEARNING mode and an EventBus is available.
+        The recorder's state machine ensures these events are only persisted as
+        trajectory steps when recording is active.
+        """
+        if self._event_bus is None:
+            return
+        if self._session is None or self._session.mode != SessionMode.LEARNING:
+            return
+        from leapflow.domain.events import SystemEvent
+        event = SystemEvent(
+            event_type="chat.interaction",
+            source="leapflow.engine",
+            payload={"action": sub_action, **payload},
+            timestamp=time.time(),
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._event_bus.handle_event(
+                event.event_type, event.payload,
+            ))
+        except RuntimeError:
+            pass
+
     def set_experience_store(self, store: Any) -> None:
         """Inject ExperienceStore for world-model trajectory bridge."""
         self._experience_store = store
@@ -1629,6 +1655,7 @@ class AgentEngine:
         self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
         self._begin_turn_context(user_text)
+        self._emit_chat_event("user_message", {"content": user_text[:500]})
 
         # 1. Slash command (skill injection — zero-ambiguity activation)
         if user_text.startswith("/") and self._skill_injector:
@@ -1666,6 +1693,7 @@ class AgentEngine:
         self._session_turn_count += 1
         logger.info("audit.user_input chars=%s", len(user_text))
         self._begin_turn_context(user_text)
+        self._emit_chat_event("user_message", {"content": user_text[:500]})
 
         # 1. Slash command (skill injection)
         if user_text.startswith("/") and self._skill_injector:
@@ -2291,9 +2319,18 @@ class AgentEngine:
 
             messages.append(build_assistant_message(content))
             tool_arguments = normalized_tool_call.get("arguments")
+            self._emit_chat_event("tool_call", {
+                "tool_name": tool_name,
+                "arguments_summary": json.dumps(tool_arguments, default=str, ensure_ascii=False)[:300] if tool_arguments else "",
+            })
             _show_progress("executing", tool_name)
             result = await self._execute_general_tool(normalized_tool_call, TOOL_HANDLERS)
             _clear_indicator()
+            self._emit_chat_event("tool_result", {
+                "tool_name": tool_name,
+                "ok": bool(result.get("ok")) if isinstance(result, dict) else True,
+                "summary": json.dumps(result, default=str, ensure_ascii=False)[:300] if isinstance(result, dict) else str(result)[:300],
+            })
             _print_tool_result(tool_name, result, enabled=self._settings.verbose_progress)
             trace.record(
                 ExecutionMode.ACTING,
@@ -2352,19 +2389,20 @@ class AgentEngine:
         logger.info("turn_usage: %s", self._usage_tracker.format_log_line())
 
         if content:
-            # Never let a free-text LLM answer paraphrase or expand scope names
-            # after an unresolved permission failure — force the deterministic
-            # recovery message instead.
             permission_override = _permission_override_message(messages)
-            return permission_override or content
+            final = permission_override or content
+            self._emit_chat_event("response", {"content": final[:500]})
+            return final
         if fatal_error:
+            self._emit_chat_event("response", {"content": fatal_error[:500]})
             return fatal_error
-        # Derive a recovery message from the last platform_connect failure if present
-        return (
+        fallback = (
             _app_onboarding_recovery_message(messages)
             or _last_tool_failures_recovery_message(messages)
             or "I've reached my processing limit."
         )
+        self._emit_chat_event("response", {"content": fallback[:500]})
+        return fallback
 
     async def _post_turn_review(
         self, messages: List[Dict[str, Any]], final_content: str
@@ -2798,13 +2836,16 @@ class AgentEngine:
                 trace.record(ExecutionMode.COMPLETE)
                 if not content:
                     fallback = _app_onboarding_recovery_message(messages)
-                    yield StreamEvent(type="final", content=fallback or "I processed your request but have no additional output.")
+                    final_text = fallback or "I processed your request but have no additional output."
+                    self._emit_chat_event("response", {"content": final_text[:500]})
+                    yield StreamEvent(type="final", content=final_text)
                 else:
                     permission_override = _permission_override_message(messages)
-                    yield StreamEvent(type="final", content=permission_override or content)
+                    final_text = permission_override or content
+                    self._emit_chat_event("response", {"content": final_text[:500]})
+                    yield StreamEvent(type="final", content=final_text)
                 return
 
-            # Text-mode preamble exclusion: only store call summary in WM.
             normalized_tool_call = _normalize_tool_call(tool_call)
             tool_name = str(normalized_tool_call["name"])
             original_tool_name = str(normalized_tool_call.get("original_tool_name", tool_name))
@@ -2812,6 +2853,10 @@ class AgentEngine:
 
             messages.append(build_assistant_message(content))
             tool_arguments = normalized_tool_call.get("arguments")
+            self._emit_chat_event("tool_call", {
+                "tool_name": tool_name,
+                "arguments_summary": json.dumps(tool_arguments, default=str, ensure_ascii=False)[:300] if tool_arguments else "",
+            })
             yield StreamEvent(
                 type="tool_start",
                 content=tool_name,
@@ -2823,6 +2868,11 @@ class AgentEngine:
             )
             result = await self._execute_general_tool(normalized_tool_call, TOOL_HANDLERS)
             _clear_indicator()
+            self._emit_chat_event("tool_result", {
+                "tool_name": tool_name,
+                "ok": bool(result.get("ok")) if isinstance(result, dict) else True,
+                "summary": json.dumps(result, default=str, ensure_ascii=False)[:300] if isinstance(result, dict) else str(result)[:300],
+            })
             yield StreamEvent(
                 type="tool_complete",
                 content=tool_name,
@@ -2900,7 +2950,9 @@ class AgentEngine:
 
         if content:
             permission_override = _permission_override_message(messages)
-            yield StreamEvent(type="final", content=permission_override or content)
+            final = permission_override or content
+            self._emit_chat_event("response", {"content": final[:500]})
+            yield StreamEvent(type="final", content=final)
         else:
             fallback = (
                 _app_onboarding_recovery_message(messages)
@@ -2908,6 +2960,7 @@ class AgentEngine:
                 or fatal_error
                 or "I've reached my processing limit."
             )
+            self._emit_chat_event("response", {"content": fallback[:500]})
             yield StreamEvent(type="final", content=fallback)
 
 
@@ -3025,9 +3078,18 @@ class AgentEngine:
                 original_name = str(tc.name)
                 tool_call_dict = _normalize_tool_call({"name": original_name, "arguments": tc.arguments})
                 normalized_name = str(tool_call_dict["name"])
+                self._emit_chat_event("tool_call", {
+                    "tool_name": normalized_name,
+                    "arguments_summary": json.dumps(tc.arguments, default=str, ensure_ascii=False)[:300],
+                })
                 _show_progress("executing", normalized_name, step=i + 1, total=len(native_calls))
                 result = await self._execute_general_tool(tool_call_dict, handlers)
                 _clear_indicator()
+                self._emit_chat_event("tool_result", {
+                    "tool_name": normalized_name,
+                    "ok": bool(result.get("ok")) if isinstance(result, dict) else True,
+                    "summary": json.dumps(result, default=str, ensure_ascii=False)[:300] if isinstance(result, dict) else str(result)[:300],
+                })
                 _print_tool_result(normalized_name, result, enabled=self._settings.verbose_progress)
                 trace.record(
                     ExecutionMode.ACTING,

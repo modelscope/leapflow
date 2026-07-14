@@ -1141,6 +1141,12 @@ async def cmd_interactive_daemon(
             new_mode = payload.get("session_mode")
             if isinstance(new_mode, str):
                 daemon_session_mode = new_mode
+                if new_mode == "learning":
+                    app.prompt_mode = "learning"
+                elif new_mode == "paused":
+                    app.prompt_mode = "paused"
+                else:
+                    app.prompt_mode = "daemon"
 
             # Special case: streaming commands (like /run) need chat stream
             if payload.get("stream") and payload.get("prompt"):
@@ -1161,24 +1167,18 @@ async def cmd_interactive_daemon(
                 render_command_payload(console, payload)
             return
 
-        # Learning mode: route non-command text as annotation
+        # Learning mode: route through engine (chat-demonstration recording)
+        # and also annotate for distillation context.
         if daemon_session_mode == "learning":
             try:
-                payload = await bridge.call(
+                await bridge.call(
                     lambda current_client: current_client.command_execute("annotate", text),
                     description="annotate",
                 )
-            except Exception as exc:
-                console.warning(f"Annotation failed: {exc}")
-                return
-            # If session ended unexpectedly, track it
-            new_mode = payload.get("session_mode")
-            if isinstance(new_mode, str):
-                daemon_session_mode = new_mode
-            if payload.get("ok"):
-                console.system(f"(Noted as annotation during learning)")
-            else:
-                console.warning(str(payload.get("message") or "Annotation failed."))
+            except Exception:
+                pass
+            console.rule()
+            await _stream_response(text)
             return
 
         console.rule()

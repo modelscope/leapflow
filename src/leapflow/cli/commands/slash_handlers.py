@@ -889,6 +889,24 @@ async def _execute_host(ctx: "Context", args: str) -> dict[str, Any]:
     return {"ok": True, "view": "host", "action": action, "result": result}
 
 
+async def _distill_background(session) -> None:
+    """Run distillation in background without blocking the RPC response."""
+    import logging
+    _log = logging.getLogger(__name__)
+    try:
+        final = await session.await_learning()
+        if final and final.candidates:
+            _log.info(
+                "background_distill: %d candidates, activated=%s",
+                len(final.candidates),
+                final.activated_skill_names or [],
+            )
+        else:
+            _log.info("background_distill: no candidates produced")
+    except Exception:
+        _log.warning("background_distill failed", exc_info=True)
+
+
 async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]:
     """Execute teach commands.
 
@@ -917,9 +935,16 @@ async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]
             return {"ok": False, "message": "Not in teaching mode.", "session_mode": "idle"}
         try:
             result = await ctx.session.exit_learning()
+            msg = f"Recording stopped — {result.step_count} steps, {result.duration:.1f}s"
+            if result.step_count > 0 and getattr(ctx.settings, "has_llm_credentials", False):
+                import asyncio
+                asyncio.create_task(_distill_background(ctx.session))
+                msg += "\nDistillation started in background."
+            elif result.step_count == 0:
+                msg += "\nNo steps recorded — nothing to distill."
             return {
                 "ok": True,
-                "message": f"Recording stopped — {result.step_count} steps, {result.duration:.1f}s",
+                "message": msg,
                 "step_count": result.step_count,
                 "duration": result.duration,
                 "session_mode": "idle",
@@ -931,7 +956,7 @@ async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]
         if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
             return {"ok": False, "message": "Not in teaching mode."}
         ctx.session.pause_learning()
-        return {"ok": True, "message": "Teaching paused.", "session_mode": "learning"}
+        return {"ok": True, "message": "Teaching paused.", "session_mode": "paused"}
 
     if name == "teach resume":
         if not ctx.session or ctx.session.mode != SessionMode.LEARNING:

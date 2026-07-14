@@ -127,9 +127,11 @@ class _TUIApprovalGate:
 
 
 def _default_recording_profile(settings: Settings) -> Optional["RecordingProfile"]:
-    """Build a RecordingProfile if the recording mode supports video."""
-    if not settings.recording_mode.uses_video:
-        return None
+    """Build a RecordingProfile for high-fidelity recording during teach.
+
+    Always returns a profile so that teach sessions activate InputTapObserver
+    and tighten FS debounce regardless of recording mode.
+    """
     from leapflow.platform.observers import RecordingProfile
     return RecordingProfile()
 
