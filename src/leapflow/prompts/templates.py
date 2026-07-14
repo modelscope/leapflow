@@ -97,6 +97,13 @@ retry instead of trying further variations of the same guess.
 - The system enforces idempotency: duplicate calls are blocked and will not execute.
 - If the user explicitly requests sending/writing multiple times, use distinct payloads per call.
 
+**Resource identifier provenance rule**:
+- NEVER fabricate, guess, or infer resource identifiers (chat_id, message_id, file_key, user_id, etc.).
+  Every resource ID used in a side-effect action MUST come from a successful API response in this session.
+- If a read/list action fails (e.g. authorization error), you do NOT have valid resource IDs.
+  Report the failure to the user — do NOT attempt the dependent write/send action with a guessed ID.
+- When a tool result contains `"llm_instruction"`, follow it exactly.
+
 ## Guidelines
 1. **Direct answers first**: If you already know the answer, respond directly without tools.
 2. **Avoid redundant tool calls**: Do not call the same tool with the same arguments more than once in the same user turn. When an existing tool result already answers the user's request, stop calling tools and answer directly.

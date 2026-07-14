@@ -939,6 +939,29 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
     if not feasibility.get("ok"):
         return feasibility
 
+    # Resource provenance check: for side-effect actions, verify that
+    # referenced resource IDs have been observed from a previous successful
+    # API call. Blocks hallucinated IDs before they reach approval.
+    provenance_warnings: List[str] = []
+    if spec.effect in _SIDE_EFFECT_KINDS and spec.auth.resource_fields:
+        from leapflow.gateway.resource_provenance import ProvenanceStatus
+
+        provenance_pool = _gateway_server_ref.resource_provenance
+        results = provenance_pool.check_payload(
+            platform, spec.auth.resource_fields, payload,
+        )
+        for pr in results:
+            if pr.status == ProvenanceStatus.UNVERIFIED:
+                provenance_warnings.append(
+                    f"⚠ {pr.field_name}='{pr.value}' was NOT found in any "
+                    f"previous API response ({pr.known_values_count} known values). "
+                    "This may be a hallucinated identifier."
+                )
+                logger.warning(
+                    "resource_provenance.unverified platform=%s field=%s value=%s known=%d",
+                    platform, pr.field_name, pr.value, pr.known_values_count,
+                )
+
     preview = await _gateway_server_ref.preview_platform_action(platform, action_name, payload)
     if not preview.get("ok"):
         failure_info = {k: v for k, v in preview.items() if k not in ("ok",)}
@@ -968,8 +991,20 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
                     "capability": spec.capability or spec.name,
                     "required_scopes": _required_scopes_for_identity(spec),
                     "preview": preview.get("summary", ""),
+                    **({"provenance_warnings": provenance_warnings} if provenance_warnings else {}),
                 },
             )
+            # Build enriched approval detail with provenance context.
+            approval_detail = str(preview.get("summary") or approval_action.summary)
+            if provenance_warnings:
+                approval_detail = (
+                    approval_detail + "\n\n"
+                    + "\n".join(provenance_warnings)
+                )
+            risk_hint = 0.6
+            if provenance_warnings:
+                risk_hint = 0.9  # Elevate risk when provenance is unverified
+
             if hasattr(_approval_gate, "evaluate"):
                 result = await _approval_gate.evaluate(approval_action)
                 if not getattr(result, "approved", False):
@@ -978,8 +1013,8 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 decision = await _approval_gate.request_approval(ApprovalRequest(
                     category=approval_action.kind,
-                    detail=str(preview.get("summary") or approval_action.summary),
-                    risk_hint=0.6,
+                    detail=approval_detail,
+                    risk_hint=risk_hint,
                     metadata={
                         "platform": platform,
                         "action": action_name,
@@ -987,6 +1022,7 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
                         "risk_level": spec.risk_level,
                         "capability": spec.capability or spec.name,
                         "required_scopes": _required_scopes_for_identity(spec),
+                        **({"provenance_warnings": provenance_warnings} if provenance_warnings else {}),
                     },
                     action=approval_action,
                 ))

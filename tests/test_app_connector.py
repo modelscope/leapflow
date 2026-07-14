@@ -158,17 +158,20 @@ def test_summarize_action_result_preserves_structured_failure() -> None:
     assert summary["capability"] == "im.message.read"
 
 
-def test_capability_health_ledger_blocks_only_matching_capability() -> None:
+def test_capability_health_ledger_degrades_platform_for_side_effects() -> None:
+    """Hard auth failure on one capability blocks side-effect actions on the whole platform."""
     ledger = CapabilityHealthLedger()
     read_spec = ActionSpec(
         name="im.list_messages",
         backend_kind="cli",
+        effect="read",
         capability="im.message.read",
         auth=ActionAuthSpec(scopes={"common": ("im:message:readonly",)}),
     )
     send_spec = ActionSpec(
         name="im.send_message",
         backend_kind="cli",
+        effect="send",
         capability="im.message.send",
         auth=ActionAuthSpec(scopes={"common": ("im:message:send_as_bot",)}),
     )
@@ -185,14 +188,24 @@ def test_capability_health_ledger_blocks_only_matching_capability() -> None:
 
     ledger.record_failure("feishu", read_spec.capability, failure)
 
-    blocked = ledger.check_feasibility("feishu", read_spec)
-    allowed = ledger.check_feasibility("feishu", send_spec)
+    blocked_read = ledger.check_feasibility("feishu", read_spec)
+    blocked_send = ledger.check_feasibility("feishu", send_spec)
 
-    assert blocked["ok"] is False
-    assert blocked["skip_approval"] is True
-    assert blocked["failure_code"] == "missing_scope"
-    assert blocked["capability"] == "im.message.read"
-    assert allowed == {"ok": True}
+    # Direct capability failure blocks the read action
+    assert blocked_read["ok"] is False
+    assert blocked_read["skip_approval"] is True
+    assert blocked_read["failure_code"] == "missing_scope"
+    assert blocked_read["capability"] == "im.message.read"
+
+    # Platform degradation blocks the side-effect action
+    assert blocked_send["ok"] is False
+    assert blocked_send["failure_code"] == "platform_degraded"
+    assert blocked_send["platform_degraded"] is True
+    assert "llm_instruction" in blocked_send
+
+    # Unrelated platform is not affected
+    other_spec = ActionSpec(name="send", backend_kind="cli", effect="send", capability="im.send")
+    assert ledger.check_feasibility("dingtalk", other_spec) == {"ok": True}
 
 
 def test_lark_cli_error_classifier_from_plain_access_denied() -> None:
@@ -537,6 +550,243 @@ async def test_side_effect_dedup_resets_across_turns() -> None:
         assert result2.get("ok") is True
         assert result2.get("already_executed") is None
         assert backend.call_count == 2
+    finally:
+        await server.stop()
+        set_gateway_approval_gate(None)
+        set_gateway_server(None)
+        reset_platform_action_scope()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Platform degradation tests
+# ═══════════════════════════════════════════════════════════════
+
+
+def test_platform_degradation_blocks_side_effects() -> None:
+    """Authorization failure on a read capability degrades the platform for all side-effects."""
+    from leapflow.gateway.capability_health import CapabilityHealthLedger
+
+    ledger = CapabilityHealthLedger()
+    failure = ActionFailure(
+        failure_class="authorization",
+        failure_code="access_denied",
+        message="Missing scope im:chat:read",
+        recoverability="admin_required",
+        retryable=False,
+        blocks_approval=True,
+    )
+    ledger.record_failure("feishu", "im.chat.read", failure)
+
+    assert ledger.is_platform_degraded("feishu")
+    assert not ledger.is_platform_degraded("dingtalk")
+
+    send_spec = ActionSpec(
+        name="im.send_message",
+        backend_kind="cli",
+        effect="send",
+        capability="im.message.send",
+        auth=ActionAuthSpec(resource_fields=("chat_id",)),
+    )
+    result = ledger.check_feasibility("feishu", send_spec)
+    assert result["ok"] is False
+    assert result["failure_code"] == "platform_degraded"
+    assert result["skip_approval"] is True
+    assert "llm_instruction" in result
+
+
+def test_platform_degradation_allows_read_retry() -> None:
+    """A read action that already failed is blocked directly, not via degradation."""
+    from leapflow.gateway.capability_health import CapabilityHealthLedger
+
+    ledger = CapabilityHealthLedger()
+    failure = ActionFailure(
+        failure_class="authorization",
+        failure_code="missing_scope",
+        message="Scope im:chat:read required",
+        recoverability="admin_required",
+        retryable=False,
+        blocks_approval=True,
+    )
+    ledger.record_failure("feishu", "im.chat.read", failure)
+
+    read_spec = ActionSpec(
+        name="im.list_chats",
+        backend_kind="cli",
+        effect="read",
+        capability="im.chat.read",
+    )
+    result = ledger.check_feasibility("feishu", read_spec)
+    assert result["ok"] is False
+    assert result["failure_code"] == "missing_scope"
+
+
+def test_platform_degradation_clear_restores_access() -> None:
+    """Clearing a platform removes degradation status."""
+    from leapflow.gateway.capability_health import CapabilityHealthLedger
+
+    ledger = CapabilityHealthLedger()
+    failure = ActionFailure(
+        failure_class="authorization",
+        failure_code="access_denied",
+        message="Missing scope",
+        recoverability="admin_required",
+        retryable=False,
+        blocks_approval=True,
+    )
+    ledger.record_failure("feishu", "im.chat.read", failure)
+    assert ledger.is_platform_degraded("feishu")
+
+    ledger.clear("feishu")
+    assert not ledger.is_platform_degraded("feishu")
+
+    send_spec = ActionSpec(
+        name="im.send_message",
+        backend_kind="cli",
+        effect="send",
+        capability="im.message.send",
+    )
+    result = ledger.check_feasibility("feishu", send_spec)
+    assert result["ok"] is True
+
+
+def test_transient_failure_does_not_degrade_platform() -> None:
+    """Timeout/rate-limit failures do not trigger platform degradation."""
+    from leapflow.gateway.capability_health import CapabilityHealthLedger
+
+    ledger = CapabilityHealthLedger()
+    failure = ActionFailure(
+        failure_class="timeout",
+        failure_code="request_timeout",
+        message="Timed out",
+        recoverability="retryable",
+        retryable=True,
+        blocks_approval=False,
+    )
+    ledger.record_failure("feishu", "im.chat.read", failure)
+    assert not ledger.is_platform_degraded("feishu")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Resource provenance tests
+# ═══════════════════════════════════════════════════════════════
+
+
+def test_resource_provenance_verified_after_registration() -> None:
+    """Registered resource IDs are verified in subsequent checks."""
+    from leapflow.gateway.resource_provenance import ProvenanceStatus, ResourceProvenancePool
+
+    pool = ResourceProvenancePool()
+    pool.register("feishu", "chat_id", "oc_real_123")
+    pool.register("feishu", "chat_id", "oc_real_456")
+
+    assert pool.check("feishu", "chat_id", "oc_real_123").status == ProvenanceStatus.VERIFIED
+    assert pool.check("feishu", "chat_id", "oc_real_456").status == ProvenanceStatus.VERIFIED
+    assert pool.check("feishu", "chat_id", "oc_fake").status == ProvenanceStatus.UNVERIFIED
+    assert pool.check("feishu", "message_id", "msg_1").status == ProvenanceStatus.UNKNOWN
+
+
+def test_resource_provenance_extract_from_nested_result() -> None:
+    """register_from_result extracts resource IDs from nested API results."""
+    from leapflow.gateway.resource_provenance import ProvenanceStatus, ResourceProvenancePool
+
+    pool = ResourceProvenancePool()
+    result_data = {
+        "items": [
+            {"chat_id": "oc_a", "name": "Group A"},
+            {"chat_id": "oc_b", "name": "Group B"},
+        ],
+        "page_token": "",
+    }
+    count = pool.register_from_result("feishu", ["chat_id"], result_data)
+    assert count == 2
+    assert pool.check("feishu", "chat_id", "oc_a").status == ProvenanceStatus.VERIFIED
+    assert pool.check("feishu", "chat_id", "oc_b").status == ProvenanceStatus.VERIFIED
+
+
+def test_resource_provenance_check_payload() -> None:
+    """check_payload returns results for all resource fields in one call."""
+    from leapflow.gateway.resource_provenance import ProvenanceStatus, ResourceProvenancePool
+
+    pool = ResourceProvenancePool()
+    pool.register("feishu", "chat_id", "oc_valid")
+
+    results = pool.check_payload(
+        "feishu", ["chat_id", "message_id"], {"chat_id": "oc_valid", "message_id": "msg_1"}
+    )
+    assert len(results) == 2
+    assert results[0].status == ProvenanceStatus.VERIFIED
+    assert results[1].status == ProvenanceStatus.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_platform_degradation_blocks_send_after_list_fails() -> None:
+    """End-to-end: list_chats auth failure degrades platform, blocking send_message."""
+    from leapflow.gateway.adapters.feishu import FeishuAdapter
+    from leapflow.gateway.connectors.protocol import ActionPreview, ActionResult, BackendStatus
+    from leapflow.gateway.server import GatewayServer
+    from leapflow.tools.gateway_tool import (
+        platform_action_handler,
+        reset_platform_action_scope,
+        set_gateway_approval_gate,
+        set_gateway_server,
+    )
+    import tempfile
+    from pathlib import Path
+
+    class AuthFailBackend:
+        kind = "cli"
+
+        async def status(self):
+            return BackendStatus(ok=True, backend_kind=self.kind)
+
+        async def authenticate(self, payload):
+            return BackendStatus(ok=True, backend_kind=self.kind)
+
+        async def execute(self, spec, payload):
+            return ActionResult(
+                ok=False,
+                error="access denied",
+                failure=ActionFailure(
+                    failure_class="authorization",
+                    failure_code="access_denied",
+                    message="Missing scope im:chat:read",
+                    recoverability="admin_required",
+                    retryable=False,
+                    blocks_approval=True,
+                    capability="im.chat.read",
+                ),
+            )
+
+        async def preview(self, spec, payload):
+            return ActionPreview(ok=True, summary=f"preview {spec.name}")
+
+    backend = AuthFailBackend()
+    server = GatewayServer(Path(tempfile.mkdtemp()))
+    server.discover_manifests()
+    adapter = FeishuAdapter(backend=backend)
+    server._adapters["feishu"] = adapter
+    set_gateway_server(server)
+    set_gateway_approval_gate(None)
+    reset_platform_action_scope()
+
+    try:
+        # First: list_chats fails with authorization error
+        list_result = await platform_action_handler({
+            "platform": "feishu",
+            "action": "im.list_chats",
+            "payload": {"page_size": 20},
+        })
+        assert list_result["ok"] is False
+
+        # Now: send_message should be blocked by platform degradation
+        send_result = await platform_action_handler({
+            "platform": "feishu",
+            "action": "im.send_message",
+            "payload": {"chat_id": "oc_hallucinated", "text": "test"},
+        })
+        assert send_result["ok"] is False
+        assert send_result.get("failure_code") == "platform_degraded"
+        assert "llm_instruction" in send_result
     finally:
         await server.stop()
         set_gateway_approval_gate(None)

@@ -450,6 +450,7 @@ class PermissionFailingAdapter(FakeSendAdapter):
 
 @pytest.mark.asyncio
 async def test_platform_action_blocks_known_permission_failure_before_approval(tmp_path) -> None:
+    """Auth failure degrades platform: both retry of same action AND send are blocked."""
     server = GatewayServer(tmp_path)
     adapter = PermissionFailingAdapter()
     gate = CaptureGate()
@@ -471,25 +472,30 @@ async def test_platform_action_blocks_known_permission_failure_before_approval(t
         send = await platform_action_handler({
             "platform": "fake",
             "action": "im.send_message",
-            "payload": {"chat_id": "chat-1", "text": "still allowed"},
+            "payload": {"chat_id": "chat-1", "text": "should be blocked"},
         })
     finally:
         set_gateway_approval_gate(None)
         set_gateway_server(None)
 
+    # First call executes and fails with auth error
     assert first["ok"] is False
     assert first["failure_class"] == "authorization"
     assert first["blocks_approval"] is True
-    assert len(gate.actions) == 2
-    assert adapter.execute_calls == ["im.list_messages", "im.send_message"]
+    # Only the first call reaches execution; after that, feasibility blocks
+    assert len(gate.actions) == 1
+    assert adapter.execute_calls == ["im.list_messages"]
 
+    # Second call blocked by direct capability failure (no execution)
     assert second["ok"] is False
     assert second["skip_approval"] is True
     assert second["failure_code"] == "missing_scope"
     assert second["capability"] == "im.message.read"
 
-    assert send["ok"] is True
-    assert send["capability"] == "im.send_message"
+    # Send blocked by platform degradation (no execution, no approval)
+    assert send["ok"] is False
+    assert send["failure_code"] == "platform_degraded"
+    assert "llm_instruction" in send
 
 
 @pytest.mark.asyncio

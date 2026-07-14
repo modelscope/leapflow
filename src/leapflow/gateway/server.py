@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from leapflow.gateway.capability_health import CapabilityHealthLedger
 from leapflow.gateway.checkpoint_store import CheckpointStore, DeduplicationStore
+from leapflow.gateway.resource_provenance import ResourceProvenancePool
 from leapflow.gateway.config_store import GatewayConfigStore
 from leapflow.gateway.connectors.action_registry import summarize_action_result
 from leapflow.gateway.connectors.event_sources import UnavailableEventSource
@@ -197,6 +198,7 @@ class GatewayServer:
         self._on_event = on_event
         self._started = False
         self._capability_health = CapabilityHealthLedger()
+        self._resource_provenance = ResourceProvenancePool()
 
     # ── Manifest discovery ───────────────────────────────────
 
@@ -542,6 +544,30 @@ class GatewayServer:
         """Return compact non-secret capability health diagnostics."""
         return self._capability_health.summary()
 
+    @property
+    def resource_provenance(self) -> ResourceProvenancePool:
+        """Return the session-scoped resource provenance pool."""
+        return self._resource_provenance
+
+    def _collect_all_resource_fields(self, platform_id: str) -> tuple[str, ...]:
+        """Return all declared resource_fields across a platform's action specs."""
+        adapter = self._adapters.get(platform_id)
+        if adapter is None:
+            return ()
+        action_specs_fn = getattr(adapter, "action_specs", None)
+        if action_specs_fn is None:
+            return ()
+        specs = action_specs_fn()
+        if not isinstance(specs, dict):
+            return ()
+        fields: set[str] = set()
+        for spec in specs.values():
+            auth = getattr(spec, "auth", None)
+            if auth is not None:
+                for f in getattr(auth, "resource_fields", ()):
+                    fields.add(str(f))
+        return tuple(sorted(fields))
+
     async def execute_platform_action(
         self,
         platform_id: str,
@@ -565,6 +591,12 @@ class GatewayServer:
                         spec.capability or spec.name,
                         result.failure,
                     )
+                elif result.ok:
+                    resource_fields = self._collect_all_resource_fields(platform_id)
+                    if resource_fields and result.data:
+                        self._resource_provenance.register_from_result(
+                            platform_id, resource_fields, result.data,
+                        )
                 summary = summarize_action_result(spec, result)
                 summary.update({"platform": platform_id, "action": action})
                 return summary

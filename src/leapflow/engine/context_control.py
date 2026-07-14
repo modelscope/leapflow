@@ -328,6 +328,11 @@ class ToolEvidenceBuilder:
             for key in ("failure_code", "missing_fields", "recovery_hint", "expected_schema", "retryable"):
                 if key in result:
                     evidence[key] = result[key]
+            if result.get("llm_instruction"):
+                evidence["llm_instruction"] = str(result["llm_instruction"])
+            if result.get("platform_degraded"):
+                evidence["platform_degraded"] = True
+                evidence["degradation_reason"] = str(result.get("degradation_reason", ""))
             return evidence
 
         evidence: Dict[str, Any] = {
