@@ -26,7 +26,7 @@ import logging
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Protocol, Sequence, runtime_checkable
 
 from leapflow.gateway.protocol import InboundMessage, MessageSource
-from leapflow.tools.name_resolver import ToolRegistry
+from leapflow.tools.name_resolver import TOOL_NAME_ALIASES, ToolRegistry
 
 
 @runtime_checkable
@@ -143,7 +143,9 @@ class GatewayRouter:
         self._tool_handlers = {
             k: v for k, v in all_handlers.items() if k in allowed_tools
         }
-        self._tool_registry = ToolRegistry.from_definitions(self._tool_defs, self._tool_handlers)
+        self._tool_registry = ToolRegistry.from_definitions(
+            self._tool_defs, self._tool_handlers, aliases=TOOL_NAME_ALIASES
+        )
 
     async def handle_message(
         self,

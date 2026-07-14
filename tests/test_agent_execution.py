@@ -160,11 +160,15 @@ async def test_exact_canonical_tool_names_execute_without_guessing() -> None:
             # Case/separator formatting of the *same* canonical name still resolves.
             assert _normalize_tool_name("File_List") == "file_list"
             assert _normalize_tool_name("file-list") == "file_list"
-            # Common LLM tool-name drift is no longer silently rewritten to a
-            # different canonical tool: it must be reported as unknown.
-            assert _normalize_tool_name("list_directory") == "list_directory"
-            assert _normalize_tool_name("execute_command") == "execute_command"
-            assert _normalize_tool_name("run_terminal") == "run_terminal"
+            # Known LLM drift patterns resolve via static alias table.
+            assert _normalize_tool_name("list_directory") == "file_list"
+            assert _normalize_tool_name("execute_command") == "shell_run"
+            assert _normalize_tool_name("run_terminal") == "shell_run"
+            alias_resolution = _resolve_tool_name("list_directory", {"path": "."})
+            assert alias_resolution.normalized_name == "file_list"
+            assert alias_resolution.status == "aliased"
+            assert alias_resolution.auto_executable is True
+            # Names NOT in alias table remain unknown.
             directory_resolution = _resolve_tool_name("directory_scan", {"path": "."})
             risky_resolution = _resolve_tool_name("please_do", {"command": "ls -la"})
             assert directory_resolution.normalized_name is None
@@ -176,7 +180,6 @@ async def test_exact_canonical_tool_names_execute_without_guessing() -> None:
             assert metadata["original_tool_name"] == "File-List"
             assert metadata["normalized_tool_name"] == "file_list"
             assert metadata["resolved_from"] == "File-List"
-            assert "alias" not in metadata
         finally:
             lt.close()
 
@@ -379,8 +382,8 @@ async def test_app_connector_empty_final_uses_onboarding_recovery_state() -> Non
 
 
 @pytest.mark.asyncio
-async def test_unknown_tool_in_stream_triggers_structured_retry_not_alias_guess() -> None:
-    """Text-mode tool calls with a drifted name must surface a structured unknown, never a silent alias rewrite."""
+async def test_aliased_tool_in_stream_resolves_and_executes() -> None:
+    """Text-mode tool calls with a known drifted name resolve via alias and execute normally."""
     tool_reply = '<tool_call>{"name": "list_directory", "arguments": {"path": "."}}</tool_call>'
     with tempfile.TemporaryDirectory() as td:
         settings = make_settings(td)
@@ -399,8 +402,36 @@ async def test_unknown_tool_in_stream_triggers_structured_retry_not_alias_guess(
             events = [event async for event in engine.run_stream("List current directory")]
 
             tool_events = [event for event in events if event.type in {"tool_start", "tool_complete"}]
-            assert [event.content for event in tool_events] == ["list_directory", "list_directory"]
             assert tool_events[0].metadata["original_tool_name"] == "list_directory"
+            assert tool_events[0].metadata["tool_resolution_status"] == "aliased"
+            assert tool_events[0].metadata["normalized_tool_name"] == "file_list"
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_in_stream_triggers_structured_retry() -> None:
+    """Text-mode tool calls with a truly unknown name surface a structured unknown with suggestions."""
+    tool_reply = '<tool_call>{"name": "directory_scan", "arguments": {"path": "."}}</tool_call>'
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.platform.mock import MockBridge
+
+        rpc = MockBridge()
+        llm = StubLLM([tool_reply, "directory checked"])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+
+            events = [event async for event in engine.run_stream("List current directory")]
+
+            tool_events = [event for event in events if event.type in {"tool_start", "tool_complete"}]
+            assert [event.content for event in tool_events] == ["directory_scan", "directory_scan"]
+            assert tool_events[0].metadata["original_tool_name"] == "directory_scan"
             assert tool_events[0].metadata["tool_resolution_status"] == "unknown"
             assert tool_events[1].metadata["ok"] is False
             assert tool_events[1].metadata["error_type"] == "unknown_tool"

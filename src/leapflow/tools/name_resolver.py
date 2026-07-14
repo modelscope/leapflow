@@ -2,12 +2,19 @@
 
 This module centralizes the Tool Capability Contract: the set of canonical
 tool names the runtime can actually dispatch, plus structured unknown-tool
-feedback when a proposed name is not part of that contract. There is no
-alias table and no argument-shape guessing here — a proposed tool name is
-either the exact canonical name (optionally normalized for case/separator
-formatting or an internal bridge prefix), or it is reported as unknown with
-discovery suggestions. It is intentionally execution-free: callers resolve a
-tool name here, then execute through their existing dispatch path.
+feedback when a proposed name is not part of that contract.
+
+Resolution priority:
+1. Exact canonical name match
+2. Formatting normalization (case, separators)
+3. Internal bridge prefix (``gp_``)
+4. Static alias table — human-verified semantic equivalences for common
+   LLM naming drift (e.g. ``read_file`` → ``file_read``). These are
+   auto-executable because each mapping is a proven 1:1 equivalence.
+5. Unknown — suggestions + one-shot retry
+
+No argument-shape guessing or fuzzy matching is performed. The alias table
+is the only "cross-name" resolution path and requires explicit declaration.
 """
 
 from __future__ import annotations
@@ -16,7 +23,7 @@ import difflib
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Mapping, Sequence
 
-ResolutionStatus = Literal["exact", "normalized", "unknown"]
+ResolutionStatus = Literal["exact", "normalized", "aliased", "unknown"]
 ResolutionConfidence = Literal["high", "medium", "low"]
 RiskLevel = Literal["read_only", "mutating", "external"]
 
@@ -44,6 +51,44 @@ _MUTATING_NAME_SIGNALS = (
     "shell",
     "delegate",
 )
+
+# ─────────────────────────────────────────────────────────────────────
+# Static Alias Table — common LLM naming drift → canonical name
+# ─────────────────────────────────────────────────────────────────────
+# Each entry is a human-verified 1:1 semantic equivalence. These are
+# the *only* cross-name resolution paths — they are applied after
+# formatting normalization and before "unknown" fallback.
+#
+# Guidelines for adding entries:
+# - Only add when a drift pattern is observed repeatedly in production
+# - Each alias must map to exactly one canonical tool
+# - The alias must never collide with another canonical name
+# - Prefer the form: "drifted_name": "canonical_name"
+#
+# This table is intentionally small. The primary mechanism for correct
+# tool naming is the capability schema disclosed to the LLM.
+TOOL_NAME_ALIASES: Dict[str, str] = {
+    # File operations
+    "read_file": "file_read",
+    "write_file": "file_write",
+    "list_files": "file_list",
+    "list_directory": "file_list",
+    "ls": "file_list",
+    # Shell
+    "execute_command": "shell_run",
+    "run_command": "shell_run",
+    "run_terminal": "shell_run",
+    "exec": "shell_run",
+    # Search
+    "grep": "text_search",
+    "search": "text_search",
+    "find_in_files": "text_search",
+    # Text editing
+    "edit_file": "text_replace",
+    "replace_in_file": "text_replace",
+    "sed": "text_replace",
+}
+
 
 def tool_lookup_key(tool_name: str) -> str:
     """Return a stable lookup key for exact tool-name identity matching.
@@ -107,14 +152,14 @@ class ToolRegistry:
     """Single source of truth for tool identity and resolution metadata.
 
     The registry enforces a strict Tool Capability Contract: a proposed tool
-    name is only ever executed when it is the exact canonical name, or a
-    formatting-only variant of it (case, separators, or the internal ``gp_``
-    bridge prefix). There is no alias table and no argument-shape guessing;
-    anything else is reported as unknown so the caller can retry with an
-    exact name from the disclosed capability list.
+    name is resolved only through deterministic paths — exact match, formatting
+    normalization, bridge prefix, or a static alias table of human-verified
+    semantic equivalences. No fuzzy matching or argument-shape guessing is
+    performed for auto-execution.
     """
 
     specs: Mapping[str, ToolSpec]
+    aliases: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_definitions(
@@ -123,8 +168,16 @@ class ToolRegistry:
         handlers: Mapping[str, Any],
         *,
         bridge_tools: Sequence[Mapping[str, Any]] = (),
+        aliases: Mapping[str, str] | None = None,
     ) -> "ToolRegistry":
-        """Build a registry from OpenAI schemas, dispatch handlers, and bridge metadata."""
+        """Build a registry from OpenAI schemas, dispatch handlers, and bridge metadata.
+
+        Parameters
+        ----------
+        aliases : mapping of drifted names → canonical names, optional.
+            Each entry declares a human-verified 1:1 semantic equivalence.
+            Keys are normalized via ``tool_lookup_key`` before storage.
+        """
         bridge_mutates = {
             str(tool.get("name", "")).removeprefix("gp_"): bool(tool.get("mutates_state", False))
             for tool in bridge_tools
@@ -152,7 +205,14 @@ class ToolRegistry:
                     name=canonical,
                     risk_level=_infer_risk_level(canonical, bridge_mutates.get(canonical, False)),
                 )
-        return cls(specs=specs)
+
+        validated_aliases: dict[str, str] = {}
+        for alias, target in (aliases or {}).items():
+            norm_alias = tool_lookup_key(alias)
+            if target in specs and norm_alias not in specs:
+                validated_aliases[norm_alias] = target
+
+        return cls(specs=specs, aliases=validated_aliases)
 
     @property
     def tool_names(self) -> tuple[str, ...]:
@@ -165,7 +225,15 @@ class ToolRegistry:
         return resolution.normalized_name if resolution.auto_executable and resolution.normalized_name else tool_name
 
     def resolve(self, tool_name: str, arguments: Mapping[str, Any] | None = None) -> ToolResolution:
-        """Resolve a proposed tool call against the canonical tool contract."""
+        """Resolve a proposed tool call against the canonical tool contract.
+
+        Resolution priority:
+        1. Exact canonical match
+        2. Formatting normalization (case/separators)
+        3. Internal bridge prefix (``gp_``)
+        4. Static alias table
+        5. Unknown (with suggestions)
+        """
         original_name = str(tool_name or "")
         args = dict(arguments or {})
         key = tool_lookup_key(original_name)
@@ -175,6 +243,10 @@ class ToolRegistry:
             return self._resolution(original_name, key, "normalized", "high", "case or separator normalization")
         if key.startswith("gp_") and key[3:] in self.specs:
             return self._resolution(original_name, key[3:], "normalized", "high", "internal bridge prefix")
+
+        if key in self.aliases:
+            canonical = self.aliases[key]
+            return self._resolution(original_name, canonical, "aliased", "high", f"static alias: {original_name} → {canonical}")
 
         suggestions = self._suggestions(original_name, args)
         return ToolResolution(

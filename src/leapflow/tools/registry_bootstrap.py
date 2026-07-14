@@ -24,7 +24,7 @@ from leapflow.tools.gateway_tool import (
     GATEWAY_TOOL_HANDLERS,
     set_gateway_server as set_gateway_server,
 )
-from leapflow.tools.name_resolver import ToolRegistry
+from leapflow.tools.name_resolver import TOOL_NAME_ALIASES, ToolRegistry
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -451,6 +451,7 @@ TOOL_REGISTRY = ToolRegistry.from_definitions(
     TOOL_DEFINITIONS,
     TOOL_HANDLERS,
     bridge_tools=_BRIDGE_TOOLS,
+    aliases=TOOL_NAME_ALIASES,
 )
 
 
