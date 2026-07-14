@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import re
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -62,16 +63,14 @@ logger = logging.getLogger(__name__)
 
 EventCallback = Callable[..., Any]
 
-import re as _re
-
 _MARKDOWN_PATTERNS = (
-    _re.compile(r"```"),
-    _re.compile(r"^#{1,6}\s", _re.MULTILINE),
-    _re.compile(r"^\s*[-*+]\s", _re.MULTILINE),
-    _re.compile(r"^\s*\d+\.\s", _re.MULTILINE),
-    _re.compile(r"\*\*.+?\*\*"),
-    _re.compile(r"`.+?`"),
-    _re.compile(r"\[.+?\]\(.+?\)"),
+    re.compile(r"```"),
+    re.compile(r"^#{1,6}\s", re.MULTILINE),
+    re.compile(r"^\s*[-*+]\s", re.MULTILINE),
+    re.compile(r"^\s*\d+\.\s", re.MULTILINE),
+    re.compile(r"\*\*.+?\*\*"),
+    re.compile(r"`.+?`"),
+    re.compile(r"\[.+?\]\(.+?\)"),
 )
 
 
@@ -597,6 +596,7 @@ class GatewayServer:
         if source is None:
             return {"ok": True, "status": "stopped"}
         self._save_checkpoint(platform_id)
+        self._save_dedup_state(platform_id)
         status = await source.stop()
         return self._event_status_dict(status)
 

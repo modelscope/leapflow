@@ -27,7 +27,7 @@ from leapflow.gateway.protocol import InboundMessage, MediaAttachment, MessageSo
 
 logger = logging.getLogger(__name__)
 
-_AT_ALL_PATTERN = re.compile(r"@(?:all|所有人|All)\b", re.IGNORECASE)
+_AT_ALL_PATTERN = re.compile(r"@(?:all(?:\b|$)|所有人)", re.IGNORECASE)
 
 _MESSAGE_EVENT_TYPES = frozenset({
     "im.message.receive_v1",
@@ -49,6 +49,8 @@ _LIFECYCLE_EVENT_TYPES = frozenset({
     "im.chat.updated_v1",
     "im.chat.disbanded_v1",
 })
+
+_MEDIA_MESSAGE_TYPES = frozenset({"image", "file", "audio", "video", "media", "sticker"})
 
 
 class FeishuEventNormalizer:
@@ -190,8 +192,7 @@ class FeishuEventNormalizer:
         attachments: list[MediaAttachment] = []
         message_id = str(payload.get("message_id") or payload.get("id", ""))
 
-        _MEDIA_TYPES = {"image", "file", "audio", "video", "media", "sticker"}
-        if message_type not in _MEDIA_TYPES:
+        if message_type not in _MEDIA_MESSAGE_TYPES:
             return []
 
         file_key = str(payload.get("file_key") or payload.get("image_key") or "")

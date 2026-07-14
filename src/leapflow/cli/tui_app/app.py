@@ -303,6 +303,18 @@ class LeapApp:
         """Return the currently running command, if any."""
         return self._active_command
 
+    def complete_active_command_in_response(self) -> Optional[TuiCommand]:
+        """Mark the active command done when its status is rendered with the response label."""
+        if self._active_command is None:
+            return None
+        completed = self._active_command.mark_done()
+        self._active_command = completed
+        self._active_terminal_status = TuiCommandStatus.DONE
+        self._active_terminal_reason = ""
+        self._sync_task_counts()
+        self._invalidate()
+        return completed
+
     def queued_commands(self) -> list[TuiCommand]:
         """Return a snapshot of pending commands in queue order."""
         return self._pending_input.snapshot()

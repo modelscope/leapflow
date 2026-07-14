@@ -298,13 +298,22 @@ class LeapConsole:
             align="left",
         ))
 
-    def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
-        """Print the response attribution line with elapsed time."""
+    def response_label(
+        self,
+        elapsed_s: float,
+        *,
+        tool_count: int = 0,
+        command: TuiCommand | None = None,
+    ) -> None:
+        """Print the response attribution line with optional command status."""
         from leapflow.cli.tui_app.stream import _format_elapsed
 
         label = Text()
-        label.append("  ─ ", style="leap.border")
+        label.append(" |--  ", style="leap.border")
         label.append("LEAP", style="leap.accent")
+        if command is not None:
+            command_style = "leap.success" if command.status == TuiCommandStatus.DONE else "leap.dim"
+            label.append(f"  {command.label} {command.status.value}", style=command_style)
         elapsed_str = _format_elapsed(elapsed_s)
         label.append(f"  {elapsed_str}", style="leap.dim")
         if tool_count > 0:

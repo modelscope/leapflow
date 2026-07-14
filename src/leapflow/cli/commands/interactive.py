@@ -438,6 +438,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
 
         renderer = StreamRenderer(console)
         renderer.start()
+        turn_completed = False
         try:
             async for event in ctx.engine.run_stream(prompt_text):
                 if isinstance(event, StreamEvent):
@@ -458,8 +459,10 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                             renderer.feed(event.content)
                 else:
                     renderer.feed(str(event))
+            turn_completed = True
         finally:
-            renderer.finish()
+            command = app.complete_active_command_in_response() if turn_completed else None
+            renderer.finish(command=command)
             if renderer.has_output:
                 exit_stats.record_assistant_message()
             exit_stats.record_tool_calls(renderer.tool_count)
@@ -1061,7 +1064,8 @@ async def cmd_interactive_daemon(
                 )
                 raise
         finally:
-            renderer.finish()
+            command = app.complete_active_command_in_response() if turn_completed else None
+            renderer.finish(command=command)
             if renderer.has_output:
                 exit_stats.record_assistant_message()
             exit_stats.record_tool_calls(renderer.tool_count)

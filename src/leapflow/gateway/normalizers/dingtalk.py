@@ -17,7 +17,7 @@ from leapflow.gateway.connectors.protocol import (
 from leapflow.gateway.protocol import InboundMessage, MessageSource
 
 
-_AT_ALL_PATTERN = re.compile(r"@(?:all|所有人|All)\b", re.IGNORECASE)
+_AT_ALL_PATTERN = re.compile(r"@(?:all(?:\b|$)|所有人)", re.IGNORECASE)
 
 
 class DingTalkEventNormalizer:

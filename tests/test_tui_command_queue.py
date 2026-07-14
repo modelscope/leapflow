@@ -419,6 +419,29 @@ def test_command_card_keeps_elapsed_in_title_not_body(monkeypatch) -> None:
     assert "summarize the current project layout" in body
 
 
+def test_response_label_merges_done_command_status(monkeypatch) -> None:
+    class CapturingConsole:
+        width = 100
+
+        def __init__(self) -> None:
+            self.rendered = []
+
+        def print(self, renderable) -> None:
+            self.rendered.append(renderable)
+
+    capture = CapturingConsole()
+    leap_console = LeapConsole(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    monkeypatch.setattr(leap_console, "_console", capture)
+
+    command = TuiCommand.create(command_id=1, text="连接飞书并查看可用的群组")
+    command = command.mark_running().mark_done()
+
+    leap_console.response_label(16.5, tool_count=3, command=command)
+
+    assert len(capture.rendered) == 1
+    assert capture.rendered[0].plain == " |--  LEAP  #1 done  16.5s  3 tools"
+
+
 def test_stream_renderer_prints_tool_command_and_success_preview() -> None:
     class CaptureConsole:
         def __init__(self) -> None:
@@ -433,7 +456,7 @@ def test_stream_renderer_prints_tool_command_and_success_preview() -> None:
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -468,7 +491,7 @@ def test_stream_renderer_prints_normalized_tool_name_with_alias_hint() -> None:
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -509,7 +532,7 @@ def test_stream_renderer_prints_tool_failure_exit_and_stderr() -> None:
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -547,7 +570,7 @@ def test_stream_renderer_prints_context_evidence_metadata() -> None:
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -597,7 +620,7 @@ def test_stream_renderer_prints_compression_and_posture_metadata() -> None:
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -653,7 +676,7 @@ def test_stream_renderer_suppresses_structured_tool_blobs_and_compacts_paths() -
         def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
             pass
 
-        def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
             pass
 
         def newline(self) -> None:
@@ -688,6 +711,34 @@ def test_stream_renderer_suppresses_structured_tool_blobs_and_compacts_paths() -
     assert "evidence" not in line
     assert "entries" not in line
     assert "task requires broad" not in line
+
+
+@pytest.mark.asyncio
+async def test_process_loop_does_not_duplicate_done_card_when_response_label_owns_status() -> None:
+    holder: dict[str, LeapApp] = {}
+
+    async def on_input(_text: str) -> None:
+        completed = holder["app"].complete_active_command_in_response()
+        assert completed is not None
+        assert completed.status is TuiCommandStatus.DONE
+
+    app, console, status = _make_app(on_input=on_input)
+    holder["app"] = app
+    app.submit_text("successful command")
+
+    worker = asyncio.create_task(app._process_loop())
+    try:
+        await _wait_for(lambda: app.active_command is None and app._pending_input.qsize() == 0)
+    finally:
+        app._should_exit = True
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+
+    assert [(card.id, card.status) for card in console.cards] == [
+        (1, TuiCommandStatus.RUNNING),
+    ]
+    assert status.counts[-1] == (0, 0)
 
 
 @pytest.mark.asyncio

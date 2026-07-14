@@ -22,7 +22,7 @@ class _Console:
     def __init__(self) -> None:
         self.markdown_calls: list[dict[str, object]] = []
         self.thinking_calls: list[str] = []
-        self.labels: list[tuple[float, int]] = []
+        self.labels: list[tuple[float, int, object | None]] = []
         self.answer_labels = 0
         self.lines = 0
 
@@ -47,8 +47,14 @@ class _Console:
     def answer_label(self) -> None:
         self.answer_labels += 1
 
-    def response_label(self, elapsed_s: float, *, tool_count: int = 0) -> None:
-        self.labels.append((elapsed_s, tool_count))
+    def response_label(
+        self,
+        elapsed_s: float,
+        *,
+        tool_count: int = 0,
+        command: object | None = None,
+    ) -> None:
+        self.labels.append((elapsed_s, tool_count, command))
 
     def newline(self) -> None:
         self.lines += 1

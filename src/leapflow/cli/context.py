@@ -1613,12 +1613,7 @@ class Context:
                     platform, "im.add_reaction",
                     {"message_id": message_id, "emoji_type": "OnIt"},
                 )
-            elif phase == "done":
-                await gw.execute_platform_action(
-                    platform, "im.remove_reaction",
-                    {"message_id": message_id, "emoji_type": "OnIt"},
-                )
-            elif phase == "error":
+            elif phase in ("done", "error"):
                 await gw.execute_platform_action(
                     platform, "im.remove_reaction",
                     {"message_id": message_id, "emoji_type": "OnIt"},

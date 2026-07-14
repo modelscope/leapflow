@@ -378,7 +378,7 @@ class StreamRenderer:
         self._active_tool_detail = ""
         self._tool_start_time = 0.0
 
-    def finish(self) -> None:
+    def finish(self, *, command: Any | None = None) -> None:
         """Render all accumulated content to the console."""
         if self._thinking_buffer.strip():
             self._console.thinking(self._thinking_buffer)
@@ -395,5 +395,5 @@ class StreamRenderer:
                 margin_bottom=_FINAL_RESPONSE_MARGIN_BOTTOM,
             )
 
-        self._console.response_label(self.elapsed, tool_count=self.tool_count)
+        self._console.response_label(self.elapsed, tool_count=self.tool_count, command=command)
         self._console.newline()

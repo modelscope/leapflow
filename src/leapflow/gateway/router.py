@@ -182,10 +182,13 @@ class GatewayRouter:
 
         await self._signal_indicator(message.source, message.message_id, IndicatorPhase.START)
         phase = IndicatorPhase.ERROR
+        reply = ""
+        streamed = False
         try:
-            if self._streaming_enabled and not self._tool_defs:
+            if self._streaming_enabled:
                 reply = await self._stream_reply(message.source, history)
-            else:
+                streamed = bool(reply)
+            if not reply:
                 reply = await self._llm_with_tools(history)
             if not reply:
                 phase = IndicatorPhase.DONE
@@ -194,7 +197,7 @@ class GatewayRouter:
             history.append({"role": "assistant", "content": reply})
             self._persist_message(session_key, "assistant", reply)
 
-            if not self._streaming_enabled or self._tool_defs:
+            if not streamed:
                 try:
                     await self._send_fn(message.source, reply)
                 except Exception:
@@ -294,29 +297,38 @@ class GatewayRouter:
 
         Sends an initial placeholder, then progressively edits the
         message as chunks arrive from the LLM streaming API.  Falls
-        back to non-streaming if the LLM doesn't support streaming.
+        back to non-streaming ``_llm_with_tools`` if the LLM wants to
+        call tools (detected by ``tool_calls`` on the first chunks).
+        Returns empty string to signal the caller to use the tool path.
         """
         assert self._stream_send_fn is not None
 
         try:
-            resp = await self._llm.achat(history, stream=True)
+            llm_kwargs: Dict[str, Any] = {"stream": True}
+            if self._tool_defs:
+                llm_kwargs["tools"] = self._tool_defs
+            resp = await self._llm.achat(history, **llm_kwargs)
         except Exception:
-            logger.error("Streaming LLM call failed, falling back to non-streaming", exc_info=True)
-            return await self._llm_with_tools(history)
+            logger.debug("Streaming LLM call failed, deferring to tool path", exc_info=True)
+            return ""
 
         chunks: list[str] = []
         message_id = ""
         last_update = 0.0
         last_sent_len = 0
+        has_tool_calls = False
 
         async def _collect_stream() -> None:
-            nonlocal message_id, last_update, last_sent_len
+            nonlocal message_id, last_update, last_sent_len, has_tool_calls
             async for chunk in resp:
+                if getattr(chunk, "tool_calls", None):
+                    has_tool_calls = True
+                    return
                 delta = getattr(chunk, "content", "") or ""
                 if not delta:
                     continue
                 chunks.append(delta)
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
                 accumulated = "".join(chunks)
 
                 should_update = (
@@ -347,6 +359,9 @@ class GatewayRouter:
             await _collect_stream()
         except Exception:
             logger.debug("Stream collection error", exc_info=True)
+
+        if has_tool_calls:
+            return ""
 
         full_text = "".join(chunks).strip()
         if not full_text:
