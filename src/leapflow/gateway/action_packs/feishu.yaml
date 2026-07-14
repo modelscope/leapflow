@@ -113,6 +113,103 @@ actions:
         - "{query}"
       timeout_s: 30
 
+  im.list_messages:
+    description: >-
+      List messages in a Feishu/Lark chat or P2P conversation.
+      Returns messages in reverse chronological order by default.
+      Requires chat_id (oc_xxx format); use im.search_chats or im.list_chats
+      to resolve a group name to chat_id first.
+      CLI: lark-cli im +chat-messages-list (supports --start, --end, --order, --page-size flags for advanced use).
+    effect: read
+    risk_level: low
+    output_policy: raw
+    schema:
+      required: [chat_id]
+      properties:
+        chat_id:
+          type: string
+          description: "Target chat ID (oc_xxx format)."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +chat-messages-list
+        - --chat-id
+        - "{chat_id}"
+      timeout_s: 30
+
+  im.get_messages:
+    description: >-
+      Batch-fetch Feishu/Lark messages by their IDs.
+      Returns full message content with sender names and reactions.
+      Accepts up to 50 message IDs (om_xxx format), comma-separated.
+    effect: read
+    risk_level: low
+    output_policy: raw
+    schema:
+      required: [message_ids]
+      properties:
+        message_ids:
+          type: string
+          description: "Comma-separated message IDs (om_xxx format, max 50)."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-mget
+        - --message-ids
+        - "{message_ids}"
+      timeout_s: 30
+
+  im.search_messages:
+    description: >-
+      Search Feishu/Lark messages across chats by keyword.
+      Returns matching messages with sender names, chat context, and reactions.
+      Supports filters: chat_id (limit to specific chat), sender, time range.
+      Note: requires user identity (--as user); does not work with bot identity.
+      CLI: lark-cli im +messages-search (supports --chat-id, --sender, --start, --end,
+      --chat-type, --is-at-me flags for advanced use).
+    effect: read
+    risk_level: medium
+    output_policy: raw
+    schema:
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: "Search keyword or phrase."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +messages-search
+        - --query
+        - "{query}"
+      timeout_s: 60
+
+  im.list_thread_messages:
+    description: >-
+      List messages in a Feishu/Lark thread (reply chain).
+      Accepts a thread ID (omt_xxx) or a message ID (om_xxx) that belongs to a thread.
+      Returns thread replies in chronological order by default.
+    effect: read
+    risk_level: low
+    output_policy: raw
+    schema:
+      required: [thread]
+      properties:
+        thread:
+          type: string
+          description: "Thread ID (omt_xxx) or message ID (om_xxx) within the thread."
+    backend:
+      kind: cli
+      argv:
+        - im
+        - +threads-messages-list
+        - --thread
+        - "{thread}"
+      timeout_s: 30
+
   # ── Docs ───────────────────────────────────────────────────────────────────
 
   docs.create_markdown:

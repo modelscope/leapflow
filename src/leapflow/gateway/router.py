@@ -23,10 +23,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Protocol, Sequence, runtime_checkable
 
 from leapflow.gateway.protocol import InboundMessage, MessageSource
 from leapflow.tools.name_resolver import ToolRegistry
+
+
+@runtime_checkable
+class SessionPersistence(Protocol):
+    """Minimal persistence interface for gateway sessions.
+
+    Satisfied by ``DuckDBConversationStore`` without requiring
+    a direct import — dependency inversion via structural subtyping.
+    """
+
+    def create_session(self, session_id: str, *, title: str = "", **kwargs: Any) -> Any: ...
+    def get_session(self, session_id: str) -> Any: ...
+    def append_message(self, session_id: str, role: str, content: str, **kwargs: Any) -> Any: ...
+    def get_messages(self, session_id: str, *, limit: int = 100, active_only: bool = True) -> list[Any]: ...
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +92,7 @@ class GatewayRouter:
         allowed_tools: frozenset[str] = SAFE_TOOLS,
         max_history: int = 50,
         max_tool_rounds: int = 3,
+        persistence: Optional[SessionPersistence] = None,
     ) -> None:
         self._llm = llm
         self._system_prompt = system_prompt
@@ -86,6 +101,7 @@ class GatewayRouter:
         self._max_tool_rounds = max_tool_rounds
         self._sessions: Dict[str, List[Dict[str, Any]]] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
+        self._persistence = persistence
 
         self._tool_defs = [
             td for td in tool_definitions
@@ -117,12 +133,11 @@ class GatewayRouter:
     ) -> None:
         history = self._sessions.get(session_key)
         if history is None:
-            history = []
-            if self._system_prompt:
-                history.append({"role": "system", "content": self._system_prompt})
+            history = self._init_session(session_key, message)
             self._sessions[session_key] = history
 
         history.append({"role": "user", "content": message.text})
+        self._persist_message(session_key, "user", message.text)
         self._trim_history(history)
 
         reply = await self._llm_with_tools(history)
@@ -130,6 +145,7 @@ class GatewayRouter:
             return
 
         history.append({"role": "assistant", "content": reply})
+        self._persist_message(session_key, "assistant", reply)
         try:
             await self._send_fn(message.source, reply)
         except Exception:
@@ -138,6 +154,55 @@ class GatewayRouter:
                 session_key,
                 exc_info=True,
             )
+
+    def _init_session(
+        self,
+        session_key: str,
+        message: InboundMessage,
+    ) -> List[Dict[str, Any]]:
+        """Initialize a session, restoring history from persistence if available."""
+        history: List[Dict[str, Any]] = []
+        if self._system_prompt:
+            history.append({"role": "system", "content": self._system_prompt})
+
+        if self._persistence is not None:
+            try:
+                existing = self._persistence.get_session(session_key)
+                if existing is not None:
+                    stored = self._persistence.get_messages(
+                        session_key, limit=self._max_history,
+                    )
+                    for msg in stored:
+                        role = getattr(msg, "role", "")
+                        content = getattr(msg, "content", "")
+                        if role in ("user", "assistant") and content:
+                            history.append({"role": role, "content": content})
+                    if stored:
+                        logger.info(
+                            "Restored %d messages for session %s",
+                            len(stored), session_key[:30],
+                        )
+                else:
+                    source = message.source
+                    title = f"{source.platform}:{source.chat_type}:{source.chat_id}"
+                    self._persistence.create_session(
+                        session_key,
+                        title=title[:200],
+                        source=f"gateway:{source.platform}",
+                    )
+            except Exception:
+                logger.debug("Session persistence error for %s", session_key, exc_info=True)
+
+        return history
+
+    def _persist_message(self, session_key: str, role: str, content: str) -> None:
+        """Append a message to persistent storage (fire-and-forget)."""
+        if self._persistence is None:
+            return
+        try:
+            self._persistence.append_message(session_key, role, content)
+        except Exception:
+            logger.debug("Failed to persist %s message for %s", role, session_key, exc_info=True)
 
     async def _llm_with_tools(
         self,
@@ -210,6 +275,52 @@ class GatewayRouter:
             history[1:] = history[-keep:]
         else:
             history[:] = history[-keep:]
+
+    async def handle_callback(
+        self,
+        callback: Any,
+        session_key: str,
+    ) -> None:
+        """Process an inbound callback: inject action context into session, LLM call, reply.
+
+        Callbacks (card button clicks, form submissions) carry action_value
+        that provides context for the LLM to generate an appropriate response.
+        """
+        lock = self._locks.setdefault(session_key, asyncio.Lock())
+        async with lock:
+            from leapflow.gateway.connectors.protocol import InboundCallback
+
+            if not isinstance(callback, InboundCallback):
+                return
+            action_desc = (
+                f"[Card action: {callback.action_type}] "
+                f"value={callback.action_value}"
+            )
+            history = self._sessions.get(session_key)
+            if history is None:
+                history = []
+                if self._system_prompt:
+                    history.append({"role": "system", "content": self._system_prompt})
+                self._sessions[session_key] = history
+
+            history.append({"role": "user", "content": action_desc})
+            self._persist_message(session_key, "user", action_desc)
+            self._trim_history(history)
+
+            reply = await self._llm_with_tools(history)
+            if not reply:
+                return
+
+            history.append({"role": "assistant", "content": reply})
+            self._persist_message(session_key, "assistant", reply)
+            try:
+                await self._send_fn(callback.source, reply)
+            except Exception:
+                logger.error(
+                    "Failed to send callback reply for session %s",
+                    session_key,
+                    exc_info=True,
+                )
 
     def clear_session(self, session_key: str) -> None:
         """Remove all state for a session (called on disconnect/timeout)."""

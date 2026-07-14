@@ -3,12 +3,17 @@
 This module defines the platform-neutral contract used by REST, CLI, and
 future MCP backends. Platform-specific packages provide action specs; backend
 implementations only execute those specs and return normalized results.
+
+It also defines the event normalisation contract used by the gateway consumer
+loop to classify raw backend events into domain types (Message, Callback,
+Signal, Lifecycle, Ignored).
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterator, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, AsyncIterator, Dict, Mapping, Protocol, Sequence, runtime_checkable
 
 
 class BackendKind(str, Enum):
@@ -196,4 +201,65 @@ class AppConnector(Protocol):
         payload: Mapping[str, Any],
     ) -> ActionResult:
         """Validate and execute a platform action."""
+        ...
+
+
+# ═══════════════════════════════════════════════════════════════
+# Event classification types (Orient stage)
+# ═══════════════════════════════════════════════════════════════
+
+class EventKind(str, Enum):
+    """Classification of a backend event for routing."""
+
+    MESSAGE = "message"
+    CALLBACK = "callback"
+    SIGNAL = "signal"
+    LIFECYCLE = "lifecycle"
+    IGNORED = "ignored"
+
+
+@dataclass(frozen=True)
+class InboundCallback:
+    """Platform callback event (card button click, form submit, etc.).
+
+    ``reply_token`` may have platform-specific TTL and usage limits
+    (e.g. Feishu: 30 min, max 2 updates).
+    """
+
+    source: "MessageSource"
+    callback_id: str
+    action_type: str
+    action_value: Mapping[str, Any] = field(default_factory=dict)
+    original_message_id: str = ""
+    reply_token: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True)
+class EventClassification:
+    """Result of classifying a BackendEvent."""
+
+    kind: EventKind
+    message: "InboundMessage | None" = None
+    callback: InboundCallback | None = None
+    raw_event: BackendEvent | None = None
+
+
+@runtime_checkable
+class PlatformEventNormalizer(Protocol):
+    """Classifies raw backend events into domain types.
+
+    Each platform provides a concrete implementation that maps its
+    event schema to the shared ``EventClassification`` type.
+    """
+
+    platform_id: str
+
+    def classify(self, event: BackendEvent) -> EventClassification:
+        """Classify and normalise a backend event."""
+        ...
+
+    def is_self_message(self, event: BackendEvent, bot_id: str) -> bool:
+        """Return True if the event was produced by the bot itself."""
         ...

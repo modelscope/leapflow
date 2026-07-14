@@ -33,6 +33,27 @@ options:
     advanced: true
     help_zh: "发送 IM 文本前在 LeapFlow 侧保留的最大字符数"
     help_en: "Maximum text characters retained by LeapFlow before sending IM messages"
+  - key: events_enabled
+    label: 入站事件
+    type: boolean
+    default: false
+    help_zh: "启用后 LeapFlow 可接收飞书群消息并自动回复（需要先完成 lark-cli 事件总线配置）"
+    help_en: "When enabled, LeapFlow receives Feishu chat messages and can auto-reply (requires lark-cli event bus setup)"
+  - key: event_key
+    label: 事件键
+    type: string
+    default: "im.message.receive_v1"
+    advanced: true
+    help_zh: "lark-cli event consume 订阅的事件键"
+    help_en: "Event key for lark-cli event consume subscription"
+  - key: trigger_mode
+    label: 触发模式
+    type: choice
+    choices: [mention_only, all, keyword, manual]
+    default: mention_only
+    advanced: true
+    help_zh: "何时触发回复：mention_only=被@或私聊时, all=所有消息, keyword=关键词匹配, manual=手动"
+    help_en: "When to trigger replies: mention_only=@mention or DM, all=every message, keyword=keyword match, manual=never"
 
 setup_guide:
   summary_zh: |
@@ -66,10 +87,10 @@ actions:
 
 events:
   kind: cli
-  status: unavailable
-  command: lark-event
+  status: available
+  command: "lark-cli event consume"
   checkpoint: profile
-  note: "Enable after lark-event/WebSocket is configured; no legacy webhook fallback."
+  note: "Requires lark-cli event bus; run 'lark-cli event status' to verify readiness."
 
 adapter:
   module: leapflow.gateway.adapters.feishu

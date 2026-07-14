@@ -14,6 +14,8 @@ from leapflow.gateway.adapters.common import (
     parse_json_object,
     stable_message_id,
 )
+from leapflow.gateway.connectors.dingtalk_event_source import DingTalkWebhookEventSource
+from leapflow.gateway.connectors.protocol import BackendEventSource
 from leapflow.gateway.protocol import InboundMessage, OutboundContent, SendResult, SendTarget
 
 
@@ -53,13 +55,22 @@ class DingTalkAdapter(AdapterLifecycle):
         self._path = path if str(path).startswith("/") else f"/{path}"
         self._http = http_client or UrlLibJsonHttpClient()
         self._access_token = ""
-        self._server: TinyJsonHttpServer | None = None
+        self._event_source_instance: DingTalkWebhookEventSource | None = None
+        if self._connection_mode == "webhook":
+            self._event_source_instance = DingTalkWebhookEventSource(
+                host=self._host,
+                port=self._port,
+                path=self._path,
+                robot_code=self._robot_code,
+            )
+
+    def event_source(self) -> BackendEventSource | None:
+        """Return the webhook-based BackendEventSource for the unified pipeline."""
+        return self._event_source_instance  # type: ignore[return-value]
 
     @property
     def local_url(self) -> str:
-        if self._server is None:
-            return f"http://{self._host}:{self._port}{self._path}"
-        return f"{self._server.url_base}{self._path}"
+        return f"http://{self._host}:{self._port}{self._path}"
 
     async def connect(self, *, is_reconnect: bool = False) -> None:
         self._access_token = await self._fetch_access_token()
@@ -68,15 +79,9 @@ class DingTalkAdapter(AdapterLifecycle):
                 "DingTalk built-in adapter currently supports connection_mode='webhook'. "
                 "dingtalk-stream mode is planned as a later adapter enhancement.",
             )
-        if self._server is None:
-            self._server = TinyJsonHttpServer(self._host, self._port, self._handle_request)
-            await self._server.start()
         await super().connect(is_reconnect=is_reconnect)
 
     async def disconnect(self) -> None:
-        if self._server is not None:
-            await self._server.stop()
-            self._server = None
         await super().disconnect()
 
     async def send(self, target: SendTarget, content: OutboundContent) -> SendResult:

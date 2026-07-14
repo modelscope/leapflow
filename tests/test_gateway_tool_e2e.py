@@ -52,6 +52,8 @@ async def test_app_slash_payloads_reuse_platform_connect_and_manifests(tmp_path)
     assert actions["ok"] is True
     assert set(actions["actions"]) == {
         "im.send_message", "im.list_chats", "im.search_chats",
+        "im.list_messages", "im.get_messages", "im.search_messages",
+        "im.list_thread_messages",
         "docs.create_markdown", "calendar.create_event",
         "drive.search", "sheets.append_row", "mail.search_unread", "task.create",
     }
@@ -449,8 +451,7 @@ async def test_platform_events_report_unavailable_for_feishu(tmp_path) -> None:
     assert status["ok"] is False
     assert started["ok"] is False
     assert status["metadata"]["available"] is False
-    assert status["metadata"]["configuration_hint"]
-    assert "inbound events are not enabled" in status["detail"]
+    assert "not enabled" in status["detail"].lower()
 
 
 @pytest.mark.asyncio

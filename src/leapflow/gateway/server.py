@@ -19,12 +19,26 @@ import asyncio
 import importlib
 import logging
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from leapflow.gateway.checkpoint_store import CheckpointStore
 from leapflow.gateway.config_store import GatewayConfigStore
 from leapflow.gateway.connectors.action_registry import summarize_action_result
-from leapflow.gateway.connectors.protocol import ActionPreview, ActionSpec, BackendEventSource, EventSourceStatus
+from leapflow.gateway.connectors.event_sources import UnavailableEventSource
+from leapflow.gateway.connectors.protocol import (
+    ActionPreview,
+    ActionSpec,
+    BackendEvent,
+    BackendEventSource,
+    EventClassification,
+    EventKind,
+    EventSourceStatus,
+    InboundCallback,
+    PlatformEventNormalizer,
+)
+from leapflow.gateway.trigger_policy import TriggerPolicy, _RateTracker
 from leapflow.gateway.credential_vault import CredentialVault
 from leapflow.gateway.events import (
     GatewayMessageReceived,
@@ -48,6 +62,35 @@ logger = logging.getLogger(__name__)
 
 EventCallback = Callable[..., Any]
 
+_DEFAULT_DEDUP_CAPACITY = 10_000
+
+
+class EventDeduplicator:
+    """LRU-based event_id dedup cache for the consumer loop.
+
+    Prevents duplicate processing when a platform redelivers events
+    (e.g. after reconnection).  In-memory only; checkpoint persistence
+    covers the restart case.
+    """
+
+    __slots__ = ("_capacity", "_seen")
+
+    def __init__(self, capacity: int = _DEFAULT_DEDUP_CAPACITY) -> None:
+        self._capacity = max(1, capacity)
+        self._seen: OrderedDict[str, None] = OrderedDict()
+
+    def is_duplicate(self, event_id: str) -> bool:
+        """Return True if the event_id has been seen before."""
+        if not event_id:
+            return False
+        if event_id in self._seen:
+            self._seen.move_to_end(event_id)
+            return True
+        self._seen[event_id] = None
+        if len(self._seen) > self._capacity:
+            self._seen.popitem(last=False)
+        return False
+
 
 class GatewayServer:
     """Manages platform adapter lifecycle and message routing."""
@@ -58,17 +101,26 @@ class GatewayServer:
         *,
         extra_manifest_dirs: Optional[List[Path]] = None,
         on_event: Optional[EventCallback] = None,
+        checkpoint_store: Optional[CheckpointStore] = None,
     ) -> None:
         self._profile_dir = profile_dir
         self._vault = CredentialVault(profile_dir)
+        self._checkpoint_store = checkpoint_store
         self._config_store = GatewayConfigStore(profile_dir, self._vault)
         self._manifest_loader = ManifestLoader(extra_dirs=extra_manifest_dirs)
         self._manifests: Dict[str, PlatformManifest] = {}
         self._adapters: Dict[str, PlatformAdapter] = {}
         self._event_sources: Dict[str, BackendEventSource] = {}
+        self._consumer_tasks: Dict[str, asyncio.Task[None]] = {}
+        self._normalizers: Dict[str, PlatformEventNormalizer] = {}
+        self._trigger_policies: Dict[str, TriggerPolicy] = {}
+        self._rate_trackers: Dict[str, _RateTracker] = {}
+        self._deduplicators: Dict[str, EventDeduplicator] = {}
+        self._last_event_ids: Dict[str, str] = {}
         self._connected_since: Dict[str, float] = {}
         self._known_sessions: set[SessionKey] = set()
         self._message_handler: Optional[Callable[..., Any]] = None
+        self._callback_handler: Optional[Callable[..., Any]] = None
         self._on_event = on_event
         self._started = False
 
@@ -89,6 +141,29 @@ class GatewayServer:
     def set_message_handler(self, handler: Callable[..., Any]) -> None:
         """Set the callback for inbound messages (typically engine dispatch)."""
         self._message_handler = handler
+
+    def set_callback_handler(self, handler: Callable[..., Any]) -> None:
+        """Set the callback for inbound interactive callbacks (card actions, etc.)."""
+        self._callback_handler = handler
+
+    def register_normalizer(
+        self, platform_id: str, normalizer: PlatformEventNormalizer,
+    ) -> None:
+        """Register a platform event normalizer for the consumer loop."""
+        self._normalizers[platform_id] = normalizer
+
+    def register_trigger_policy(
+        self, platform_id: str, policy: TriggerPolicy,
+    ) -> None:
+        """Register a trigger policy for the consumer loop."""
+        self._trigger_policies[platform_id] = policy
+        self._rate_trackers[platform_id] = _RateTracker()
+
+    def platform_options(self, platform_id: str) -> dict[str, Any]:
+        """Return stored options for a configured platform (public API)."""
+        config = self._config_store.load()
+        pc = config.platforms.get(platform_id)
+        return dict(pc.options) if pc and pc.options else {}
 
     # ── Platform connection ──────────────────────────────────
 
@@ -135,7 +210,6 @@ class GatewayServer:
                 adapter = self._instantiate_adapter(
                     manifest, credentials, options or {},
                 )
-                adapter.on_message = self._on_inbound_message
                 await adapter.connect(is_reconnect=is_reconnect)
                 self._adapters[platform_id] = adapter
                 self._connected_since[platform_id] = time.time()
@@ -170,8 +244,14 @@ class GatewayServer:
 
     async def disconnect_platform(self, platform_id: str) -> Dict[str, Any]:
         """Disconnect a platform adapter and clean up its sessions."""
+        await self._cancel_consumer_task(platform_id)
         adapter = self._adapters.pop(platform_id, None)
-        self._event_sources.pop(platform_id, None)
+        source = self._event_sources.pop(platform_id, None)
+        if source is not None:
+            try:
+                await source.stop()
+            except Exception:
+                logger.debug("Error stopping event source for %s", platform_id, exc_info=True)
         self._connected_since.pop(platform_id, None)
 
         affected = {k for k in self._known_sessions if k.platform == platform_id}
@@ -246,6 +326,7 @@ class GatewayServer:
                 )
                 if result.get("ok"):
                     connected += 1
+                    await self._auto_start_events(pid)
             except Exception as exc:
                 logger.warning(
                     "gateway.auto_connect_failed platform=%s error=%s",
@@ -256,8 +337,35 @@ class GatewayServer:
         self._started = True
         return connected
 
+    async def _auto_start_events(self, platform_id: str) -> None:
+        """Start event source for a platform if adapter reports one."""
+        try:
+            result = await self.start_platform_events(platform_id)
+            if result.get("ok"):
+                logger.info("Auto-started event source for %s", platform_id)
+            else:
+                logger.debug(
+                    "Event source not started for %s: %s",
+                    platform_id, result.get("detail") or result.get("error", ""),
+                )
+        except Exception:
+            logger.warning(
+                "Failed to auto-start events for %s",
+                platform_id, exc_info=True,
+            )
+
     async def stop(self) -> None:
-        """Disconnect all adapters."""
+        """Disconnect all adapters and stop all consumer tasks."""
+        tasks_to_await = []
+        for task in self._consumer_tasks.values():
+            if not task.done():
+                task.cancel()
+                tasks_to_await.append(task)
+        self._consumer_tasks.clear()
+
+        if tasks_to_await:
+            await asyncio.gather(*tasks_to_await, return_exceptions=True)
+
         for pid in list(self._adapters):
             await self.disconnect_platform(pid)
         self._started = False
@@ -376,7 +484,7 @@ class GatewayServer:
         *,
         checkpoint: str = "",
     ) -> Dict[str, Any]:
-        """Start the backend event source for a connected platform."""
+        """Start the backend event source and consumer loop for a platform."""
         adapter = self._adapters.get(platform_id)
         if adapter is None:
             return {"ok": False, "error": f"Platform '{platform_id}' is not connected"}
@@ -386,16 +494,36 @@ class GatewayServer:
         source = event_source_factory()
         if source is None:
             return {"ok": False, "error": f"Platform '{platform_id}' has no backend event source"}
+        if isinstance(source, UnavailableEventSource):
+            unavailable_status = await source.status()
+            return self._event_status_dict(unavailable_status)
+
+        if not checkpoint and self._checkpoint_store is not None:
+            checkpoint = self._checkpoint_store.load(platform_id)
+            if checkpoint:
+                logger.info("Resuming %s from checkpoint %s", platform_id, checkpoint[:20])
+
         status: EventSourceStatus = await source.start(checkpoint=checkpoint)
-        if status.ok:
-            self._event_sources[platform_id] = source
+        if not status.ok:
+            return self._event_status_dict(status)
+
+        self._event_sources[platform_id] = source
+        await self._cancel_consumer_task(platform_id)
+
+        task = asyncio.create_task(
+            self._consume_platform_events(platform_id, source),
+            name=f"gateway-consumer-{platform_id}",
+        )
+        self._consumer_tasks[platform_id] = task
         return self._event_status_dict(status)
 
     async def stop_platform_events(self, platform_id: str) -> Dict[str, Any]:
-        """Stop the backend event source for a connected platform."""
+        """Stop the backend event source and consumer task for a platform."""
+        await self._cancel_consumer_task(platform_id)
         source = self._event_sources.pop(platform_id, None)
         if source is None:
             return {"ok": True, "status": "stopped"}
+        self._save_checkpoint(platform_id)
         status = await source.stop()
         return self._event_status_dict(status)
 
@@ -530,6 +658,150 @@ class GatewayServer:
                 message.source.platform,
                 exc_info=True,
             )
+
+    async def _on_inbound_callback(self, callback: "InboundCallback") -> None:
+        """Route an inbound callback (card button click, form submit, etc.)."""
+        session_key = build_session_key(callback.source)
+        await self._emit_event(callback)
+
+        if self._callback_handler is None:
+            logger.debug(
+                "No callback handler set, dropping callback %s from %s",
+                callback.callback_id, callback.source.platform,
+            )
+            return
+
+        try:
+            result = self._callback_handler(callback, str(session_key))
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            logger.error(
+                "Error handling callback from %s",
+                callback.source.platform,
+                exc_info=True,
+            )
+
+    # ── Event consumer loop ────────────────────────────────────
+
+    async def _consume_platform_events(
+        self,
+        platform_id: str,
+        source: BackendEventSource,
+    ) -> None:
+        """Background task that reads events and routes them."""
+        normalizer = self._normalizers.get(platform_id)
+        policy = self._trigger_policies.get(platform_id)
+        rate_tracker = self._rate_trackers.get(platform_id)
+        dedup = self._deduplicators.setdefault(platform_id, EventDeduplicator())
+
+        self._inject_bot_identity(platform_id, normalizer)
+        try:
+            async for event in source.events():
+                if dedup.is_duplicate(event.event_id):
+                    logger.debug("Dedup: skipping duplicate event %s", event.event_id)
+                    continue
+                try:
+                    await self._process_backend_event(
+                        platform_id, event, normalizer, policy, rate_tracker,
+                    )
+                    if event.event_id:
+                        self._last_event_ids[platform_id] = event.event_id
+                except Exception:
+                    logger.error(
+                        "Error processing event %s from %s",
+                        event.event_id, platform_id, exc_info=True,
+                    )
+        except asyncio.CancelledError:
+            logger.info("Consumer task cancelled for %s", platform_id)
+            self._save_checkpoint(platform_id)
+        except Exception:
+            logger.error(
+                "Consumer loop crashed for %s", platform_id, exc_info=True,
+            )
+
+    async def _process_backend_event(
+        self,
+        platform_id: str,
+        event: BackendEvent,
+        normalizer: PlatformEventNormalizer | None,
+        policy: TriggerPolicy | None,
+        rate_tracker: _RateTracker | None,
+    ) -> None:
+        """Classify and route one backend event."""
+        if normalizer is None:
+            logger.debug("No normalizer for %s, emitting raw event", platform_id)
+            await self._emit_event(event)
+            return
+
+        classification = normalizer.classify(event)
+
+        if classification.kind == EventKind.IGNORED:
+            return
+
+        if classification.kind == EventKind.MESSAGE and classification.message:
+            if policy and not policy.should_activate(
+                classification.message, rate_tracker=rate_tracker,
+            ):
+                await self._emit_event(GatewayMessageReceived(
+                    source=classification.message.source,
+                    session_key="",
+                    text=classification.message.text,
+                    media_urls=tuple(m.url for m in classification.message.media),
+                ))
+                return
+            await self._on_inbound_message(classification.message)
+            return
+
+        if classification.kind == EventKind.CALLBACK and classification.callback:
+            await self._on_inbound_callback(classification.callback)
+            return
+
+        if classification.raw_event:
+            await self._emit_event(classification.raw_event)
+
+    def _inject_bot_identity(
+        self,
+        platform_id: str,
+        normalizer: PlatformEventNormalizer | None,
+    ) -> None:
+        """Inject adapter-resolved bot identity into the normalizer.
+
+        Uses duck typing — works with any adapter that exposes
+        ``bot_identity`` with ``open_id`` / ``app_name`` attributes.
+        """
+        if normalizer is None:
+            return
+        adapter = self._adapters.get(platform_id)
+        if adapter is None:
+            return
+        identity = getattr(adapter, "bot_identity", None)
+        if identity is None:
+            return
+        open_id = getattr(identity, "open_id", "")
+        app_name = getattr(identity, "app_name", "")
+        if open_id and hasattr(normalizer, "bot_id"):
+            normalizer.bot_id = open_id
+            logger.debug("Injected bot_id=%s… for %s", open_id[:10], platform_id)
+        if app_name and hasattr(normalizer, "bot_name"):
+            normalizer.bot_name = app_name
+
+    def _save_checkpoint(self, platform_id: str) -> None:
+        """Persist the last-consumed event_id for a platform."""
+        event_id = self._last_event_ids.get(platform_id)
+        if event_id and self._checkpoint_store is not None:
+            self._checkpoint_store.save(platform_id, event_id)
+            logger.debug("Saved checkpoint %s for %s", event_id[:20], platform_id)
+
+    async def _cancel_consumer_task(self, platform_id: str) -> None:
+        """Cancel and await a consumer task if one exists."""
+        task = self._consumer_tasks.pop(platform_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     async def _emit_event(self, event: object) -> None:
         """Dispatch an event to the optional callback (non-blocking)."""

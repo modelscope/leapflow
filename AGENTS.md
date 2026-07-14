@@ -6,7 +6,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 
 1. **Signal-Driven Intelligence** — All agent intelligence derives from observing real-world signals, not from hardcoded rules. If a behavior cannot be learned from signals, it is not in scope.
 
-2. **Context Pipeline as Core** — Signal → Filter (SNR) → Compress (intent-preserving) → Store (multi-layer) → Retrieve (goal-dependent) → Decide. Every feature must map to this pipeline.
+2. **Context Pipeline as Core** — Signal → Filter (SNR) → Compress (intent-preserving) → Store (multi-layer) → Retrieve (goal-dependent) → Decide. Every feature and every external signal source, including IM collaboration events, must map to this pipeline before it can drive action.
 
 3. **Progressive Trust** — Never auto-execute on first encounter. Earn autonomy through repeated success: DRAFT → CANDIDATE → VERIFIED → PRODUCTION.
 
@@ -36,6 +36,9 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - **TUI Prompt Ownership**: Input prompt and placeholder rendering must have a single owner. Avoid duplicate prompt sources; placeholder text stays visually subordinate, offset after the prompt, and disappears as soon as the user types.
 - **leapd Runtime Consistency**: Daemon-backed behavior must preserve lifecycle correctness: start, stop, restart, status, RPC streaming, cancellation, pending approvals, runtime config reload, multi-client state, and version consistency.
 - **Progressive Context Disclosure (PCD)**: Keep one unified execution loop, but never default every turn to full disclosure. Each LLM call must use the smallest sufficient PromptAssemblyPlan for tools, memory, history, reasoning, streaming, and risk; upgrade progressively only when observable signals require it.
+- **Gateway as Signal Boundary**: External IM/platform integrations are not just messaging features; they extend LeapFlow's Observe/Orient boundary into collaboration environments. Inbound platform events must enter as structured signals (`BackendEvent` → normalized domain event/message), pass SNR filtering and privacy/safety gates, then feed memory, decision, and action paths according to their classification.
+- **Transport-Lifecycle Separation**: Short-lived actions (`ExecutionBackend`/`CliBackend`) and long-lived observations (`BackendEventSource`) are separate responsibilities. Do not implement streaming subscribers, webhooks, polling loops, or CLI NDJSON consumers inside one-shot action execution code.
+- **Platform-Neutral Gateway Core**: Gateway core owns protocols, lifecycle, routing, session isolation, approval, audit, and memory integration. Platform adapters own authentication, send semantics, event-source configuration, and schema normalization. Core modules must not import platform SDKs directly.
 - **Dependency Inversion**: Core logic depends on Protocol abstractions, never on concrete implementations
 - **Protocol over ABC**: Use `typing.Protocol` with `runtime_checkable` for all extension points
 - **Event-Driven Communication**: Modules interact through typed events on EventBus, not direct imports
@@ -43,6 +46,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - **Config-Driven Behavior**: Thresholds, intervals, feature flags, model budgets, platform capabilities, hub backends, gateway manifests, and paths must be configurable through Settings/env/config layers.
 - **Graceful Degradation**: Every optional component (LLM, Hub) can be absent without crash
 - **Single Source of Truth**: DuckDB for persistence, EventBus for communication, Settings for configuration
+- **Inbound Signal Classification**: Platform events must be classified before they activate the agent. Message/callback events may enter Decide; signal/lifecycle events should be stored or routed without triggering LLM by default; ignored events must be explicit (e.g. self-message, duplicate, blocked scope).
 
 ## Implementation Guidelines
 
@@ -51,8 +55,10 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - Consider affected user journeys before changing shared flows; do not introduce regressions, broken links, or worse experiences in adjacent paths
 - Keep common paths transparent: long-running work must stream progress, surface recoverable errors clearly, and avoid silent stalls.
 - For context assembly, prefer manifest-driven progressive disclosure over shortcuts or intent-handler sprawl: expose compact capability indexes, selected schemas, and targeted memory only when the current plan needs them.
+- For gateway or IM work, define the signal contract first: event source, normalizer/classifier, trigger policy, session routing, memory/audit path, and outbound action path. Default inbound activation to least privilege (`mention_only` or equivalent), filter self-generated messages before LLM invocation, and keep cross-chat or proactive sends behind Progressive Trust and ApprovalGate.
 - Avoid rule-based natural-language fitting by default. Do not add keyword/action-verb/alias enumerations, intent-handler taxonomies, or brittle routing rules when LLM-native capability disclosure, manifests, schemas, protocols, or configuration-driven contracts can solve the problem. If a rule-based method is truly unavoidable for a stable protocol boundary, offline fallback, or safety hard gate, explain the necessity, scope, alternatives, and rollback path to a human and obtain explicit second confirmation before implementation.
 - Preserve security and audit paths: dangerous actions, file writes, outbound messages, credentials, and path access must flow through the existing policy, approval, redaction, and audit mechanisms.
+- Preserve gateway safety boundaries: inbound credentials stay in CredentialVault; outbound send/write/execute actions go through ApprovalGate; bot self-messages and duplicate events are filtered before routing; platform-specific metadata must remain in `metadata` escape hatches instead of polluting core message types.
 - Maintain backward-compatible migrations for persistent state, configuration, skills, trajectories, sessions, and profile data.
 - Write unit tests before or alongside the implementation
 - Integrate via EventBus events, not direct function calls between modules
@@ -80,7 +86,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - **Verification sequence**: compile → import → unit test → integration (if applicable)
 - **Behavior contracts over snapshots**: assert invariants, not frozen values
 - **Mock at boundaries only**: mock external I/O (network, disk), never internal logic
-- **Change-scoped validation**: Run the most specific relevant tests first, then broaden only as needed: CLI/TUI changes require CLI/TUI tests; leapd changes require daemon RPC/lifecycle tests; storage or memory changes require persistence tests; gateway or approval changes require security/approval tests; skills, learning, perception, and copilot changes require their lifecycle or pipeline tests.
+- **Change-scoped validation**: Run the most specific relevant tests first, then broaden only as needed: CLI/TUI changes require CLI/TUI tests; leapd changes require daemon RPC/lifecycle tests; storage or memory changes require persistence tests; gateway, IM, event-source, or approval changes require connector lifecycle, event normalization, routing, idempotency, self-message filtering, security/approval, and failure-recovery tests; skills, learning, perception, and copilot changes require their lifecycle or pipeline tests.
 
 ## What to Avoid
 
@@ -92,6 +98,8 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - Hardcoded paths, URLs, thresholds without config escape hatch
 - Chinese comments in source code (English only)
 - Speculative infrastructure: no hooks or extension points without a concrete consumer
+- Mixing long-lived event observation into short-lived action execution; `CliBackend` is for bounded commands, while streaming CLI consumers, webhooks, polling, and WebSocket subscriptions belong behind `BackendEventSource`-style contracts.
+- Activating IM agents on all inbound messages by default, skipping self-message filtering, or allowing cross-chat/proactive sends before Progressive Trust and approval policies explicitly permit them.
 - Shortcut-style natural-language fitting and large intent-handler taxonomies; use stable runtime gates plus capability manifests instead. Rule-based keyword/action-verb/alias matching is prohibited by default and requires explicit human second confirmation before implementation when unavoidable.
 - Bare `except:` clauses — always specify the exception type
 - `# TODO: implement` stubs — implement or don't commit

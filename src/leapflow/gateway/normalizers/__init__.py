@@ -1,0 +1,1 @@
+"""Platform event normalizers."""

@@ -11,8 +11,12 @@ from leapflow.gateway.connectors.protocol import (
     BackendEventSource,
     BackendKind,
     BackendStatus,
+    EventClassification,
+    EventKind,
     EventSourceStatus,
     ExecutionBackend,
+    InboundCallback,
+    PlatformEventNormalizer,
 )
 
 __all__ = [
@@ -28,10 +32,14 @@ __all__ = [
     "BackendStatus",
     "CliDiscovery",
     "DiscoveredCommand",
+    "EventClassification",
+    "EventKind",
     "EventSourceStatus",
     "ExecutionBackend",
     "HelpParser",
     "HelpParseResult",
+    "InboundCallback",
+    "PlatformEventNormalizer",
     "summarize_action_result",
     "validate_payload",
 ]

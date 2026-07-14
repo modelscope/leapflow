@@ -12,6 +12,8 @@ from leapflow.gateway.adapters.common import (
     chunk_text,
     stable_message_id,
 )
+from leapflow.gateway.connectors.protocol import BackendEventSource
+from leapflow.gateway.connectors.telegram_event_source import TelegramPollingEventSource
 from leapflow.gateway.protocol import InboundMessage, OutboundContent, SendResult, SendTarget
 
 
@@ -44,13 +46,34 @@ class TelegramAdapter(AdapterLifecycle):
         self._http = http_client or UrlLibJsonHttpClient()
         self._poll_task: asyncio.Task[None] | None = None
         self._offset = 0
+        self._event_source_instance: TelegramPollingEventSource | None = None
+        if self._transport == "polling":
+            self._event_source_instance = TelegramPollingEventSource(
+                bot_token=self._bot_token,
+                api_base=self._api_base,
+                poll_interval_s=self._poll_interval_s,
+                http_client=self._http,
+            )
+
+    def event_source(self) -> BackendEventSource | None:
+        """Return the polling-based BackendEventSource for the unified pipeline."""
+        return self._event_source_instance  # type: ignore[return-value]
+
+    @property
+    def bot_identity(self) -> Any:
+        """Return bot identity for normalizer injection."""
+        if self._event_source_instance:
+            from leapflow.gateway.connectors.lark_event_source import BotIdentity
+            return BotIdentity(
+                open_id=self._event_source_instance.bot_id,
+                app_name="",
+            )
+        return None
 
     async def connect(self, *, is_reconnect: bool = False) -> None:
         await super().connect(is_reconnect=is_reconnect)
         if self._transport == "webhook" and self._webhook_url:
             await self._api("setWebhook", {"url": self._webhook_url})
-        if self._transport == "polling" and self._auto_poll and self._poll_task is None:
-            self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def disconnect(self) -> None:
         task = self._poll_task
