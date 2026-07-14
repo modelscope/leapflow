@@ -917,7 +917,9 @@ async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]
 
     full_cmd = name + (" " + args if args else "")
     if full_cmd in ("teach start", "teach") or full_cmd.startswith("teach start "):
-        if ctx.session and ctx.session.mode == SessionMode.LEARNING:
+        if ctx.session is None:
+            return {"ok": False, "message": "No active session.", "session_mode": "idle"}
+        if ctx.session.mode == SessionMode.LEARNING:
             return {"ok": False, "message": "Already in teaching mode. Say '/teach stop' to end.", "session_mode": "learning"}
         goal = args if name == "teach start" else ""
         try:
@@ -1103,7 +1105,13 @@ async def _execute_hub(ctx: "Context", name: str, args: str) -> dict[str, Any]:
     if not sub:
         sub = args.split()[0] if args.split() else ""
         args = " ".join(args.split()[1:])
-    return {"ok": False, "message": f"Hub command '/{name} {args}'.strip() is not yet implemented in this runtime."}
+    command_parts = ["/hub"]
+    if sub:
+        command_parts.append(sub)
+    if args:
+        command_parts.append(args)
+    command = " ".join(command_parts)
+    return {"ok": False, "message": f"Hub command '{command}' is not yet implemented in this runtime."}
 
 
 def _execute_scheduler_tasks(ctx: "Context") -> dict[str, Any]:

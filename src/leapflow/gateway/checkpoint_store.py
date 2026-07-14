@@ -71,14 +71,14 @@ class DuckDBDeduplicationStore:
 
             conn = self._holder.connection  # type: ignore[union-attr]
             now = time.time()
-            for eid in event_ids[-1000:]:
-                execute_with_retry(
-                    conn,
+            rows = [(platform_id, eid, now) for eid in event_ids[-1000:]]
+            if rows:
+                conn.executemany(
                     f"""
                     INSERT OR IGNORE INTO {_DEDUP_TABLE}
                     (platform_id, event_id, seen_at) VALUES (?, ?, ?)
                     """,
-                    [platform_id, eid, now],
+                    rows,
                 )
             cutoff = now - 86400 * 7
             execute_with_retry(

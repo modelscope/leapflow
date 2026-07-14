@@ -760,6 +760,8 @@ class GatewayServer:
         )
         max_len = getattr(adapter, "max_message_length", 0) or 8000
         chunks = _chunk_text(text, max_len)
+        if not chunks:
+            return SendResult(ok=True)
         last_result: Optional[SendResult] = None
         for chunk in chunks:
             metadata: Dict[str, Any] = {}
@@ -877,12 +879,13 @@ class GatewayServer:
                     )
         except asyncio.CancelledError:
             logger.info("Consumer task cancelled for %s", platform_id)
-            self._save_checkpoint(platform_id)
-            self._save_dedup_state(platform_id)
         except Exception:
             logger.error(
                 "Consumer loop crashed for %s", platform_id, exc_info=True,
             )
+        finally:
+            self._save_checkpoint(platform_id)
+            self._save_dedup_state(platform_id)
 
     async def _process_backend_event(
         self,

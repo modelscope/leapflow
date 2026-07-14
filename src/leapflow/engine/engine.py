@@ -874,6 +874,7 @@ class AgentEngine:
         # so this dedicated, reset-per-turn attribute is the actual source of
         # truth — never derived from re-parsing text.
         self._last_turn_tool_categories: frozenset[str] = frozenset()
+        self._manifests_by_name: Dict[str, Any] | None = None
         self._healer = MessageHealer()
 
         # B2: Prompt cache optimization (None = disabled)
@@ -1421,13 +1422,16 @@ class AgentEngine:
         several rounds of tool calls keeps every category it touched, not just
         the last round. Reset once per turn by the caller before the first round.
         """
-        from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
+        if self._manifests_by_name is None:
+            from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
 
-        manifests_by_name = {m.name: m for m in build_capability_manifests(TOOL_DEFINITIONS)}
+            self._manifests_by_name = {
+                m.name: m for m in build_capability_manifests(TOOL_DEFINITIONS)
+            }
         categories = set(self._last_turn_tool_categories)
         for call in native_calls:
             name = str(getattr(call, "name", "") or "")
-            manifest = manifests_by_name.get(name)
+            manifest = self._manifests_by_name.get(name)
             if manifest and manifest.category not in {"system", "general"}:
                 categories.add(manifest.category)
         self._last_turn_tool_categories = frozenset(categories)

@@ -197,7 +197,10 @@ async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
                     "requires_approval": True,
                     **_sensitivity_metadata(sensitivity),
                 }
-            approved = await gate.check(str(target), mode, _sensitivity_metadata(sensitivity))
+            try:
+                approved = await gate.check(str(target), mode, _sensitivity_metadata(sensitivity))
+            except TypeError:
+                approved = await gate.check(str(target), mode)
             if not approved:
                 message = str(getattr(gate, "denial_message", "") or f"File read denied by approval gate: {target.name}")
                 return {"ok": False, "error": message}
@@ -285,7 +288,10 @@ async def file_write(params: Dict[str, Any]) -> Dict[str, Any]:
         from leapflow.tools.registry_bootstrap import get_file_write_gate
         gate = get_file_write_gate()
         if gate is not None:
-            approved = await gate.check(str(target), content, mode, _sensitivity_metadata(sensitivity))
+            try:
+                approved = await gate.check(str(target), content, mode, _sensitivity_metadata(sensitivity))
+            except TypeError:
+                approved = await gate.check(str(target), content, mode)
             if not approved:
                 message = str(getattr(gate, "denial_message", "") or f"File write denied by approval gate: {target.name}")
                 return {"ok": False, "error": message}

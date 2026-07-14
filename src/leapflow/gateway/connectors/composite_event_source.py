@@ -104,6 +104,13 @@ class CompositeEventSource:
                 yield item  # type: ignore[misc]
         except asyncio.CancelledError:
             return
+        finally:
+            for task in self._tasks:
+                if not task.done():
+                    task.cancel()
+            if self._tasks:
+                await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks.clear()
 
     async def _consume_child(self, index: int, source: object) -> None:
         """Read events from one child source and push them to the shared queue."""

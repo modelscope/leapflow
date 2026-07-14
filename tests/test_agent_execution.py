@@ -1255,3 +1255,28 @@ def test_permission_override_message_empty_after_successful_followup() -> None:
     ]
 
     assert _permission_override_message(messages) == ""
+
+
+def test_record_tool_call_categories_caches_capability_manifests(monkeypatch) -> None:
+    """Capability manifests are cached instead of rebuilt on every tool-call round."""
+    from types import SimpleNamespace
+
+    import leapflow.engine.engine as engine_module
+
+    calls = 0
+
+    def fake_build_capability_manifests(tool_definitions):
+        nonlocal calls
+        calls += 1
+        return [SimpleNamespace(name="text_replace", category="write")]
+
+    monkeypatch.setattr(engine_module, "build_capability_manifests", fake_build_capability_manifests)
+    engine = object.__new__(AgentEngine)
+    engine._last_turn_tool_categories = frozenset()
+    engine._manifests_by_name = None
+
+    engine._record_tool_call_categories([SimpleNamespace(name="text_replace")])
+    engine._record_tool_call_categories([SimpleNamespace(name="text_replace")])
+
+    assert calls == 1
+    assert engine._last_turn_tool_categories == frozenset({"write"})

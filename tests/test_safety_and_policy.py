@@ -253,3 +253,55 @@ async def test_gateway_start_skips_failed_auto_connect_platform(tmp_path, monkey
     monkeypatch.setattr(server, "connect_platform", connect_platform)
 
     assert await server.start() == 1
+
+
+@pytest.mark.asyncio
+async def test_file_read_gate_supports_legacy_two_argument_check(tmp_path) -> None:
+    from leapflow.tools import registry_bootstrap
+    from leapflow.tools.file_operations import file_read
+
+    class LegacyReadGate:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def check(self, path: str, mode: str) -> bool:
+            self.calls.append((path, mode))
+            return True
+
+    target = tmp_path / ".env"
+    target.write_text("SECRET=value", encoding="utf-8")
+    gate = LegacyReadGate()
+    registry_bootstrap.set_file_read_gate(gate)
+    try:
+        result = await file_read({"path": str(target), "mode": "raw"})
+    finally:
+        registry_bootstrap.set_file_read_gate(None)
+
+    assert result["ok"] is True
+    assert gate.calls == [(str(target.resolve()), "raw")]
+
+
+@pytest.mark.asyncio
+async def test_file_write_gate_supports_legacy_three_argument_check(tmp_path) -> None:
+    from leapflow.tools import registry_bootstrap
+    from leapflow.tools.file_operations import file_write
+
+    class LegacyWriteGate:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []
+
+        async def check(self, path: str, content: str, mode: str) -> bool:
+            self.calls.append((path, content, mode))
+            return True
+
+    target = tmp_path / ".env"
+    gate = LegacyWriteGate()
+    registry_bootstrap.set_file_write_gate(gate)
+    try:
+        result = await file_write({"path": str(target), "content": "SECRET=value", "mode": "overwrite"})
+    finally:
+        registry_bootstrap.set_file_write_gate(None)
+
+    assert result["ok"] is True
+    assert target.read_text(encoding="utf-8") == "SECRET=value"
+    assert gate.calls == [(str(target.resolve()), "SECRET=value", "overwrite")]

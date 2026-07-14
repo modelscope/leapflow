@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -810,3 +811,167 @@ async def test_platform_action_honors_approval_denial(tmp_path) -> None:
 
     assert result == {"ok": False, "error": "denied for test"}
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_send_reply_returns_success_for_empty_text(tmp_path) -> None:
+    from leapflow.gateway.protocol import MessageSource
+
+    server = GatewayServer(tmp_path)
+    adapter = FakeSendAdapter()
+    server._adapters["fake"] = adapter
+
+    result = await server.send_reply(MessageSource(platform="fake", chat_id="chat-1"), "")
+
+    assert result is not None
+    assert result.ok is True
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_consumer_saves_checkpoint_and_dedup_on_source_crash(tmp_path) -> None:
+    from leapflow.gateway.connectors.protocol import EventSourceStatus
+
+    class CrashingSource:
+        platform_id = "fake"
+        backend_kind = "test"
+
+        async def start(self, *, checkpoint: str = "") -> EventSourceStatus:
+            return EventSourceStatus(ok=True, backend_kind=self.backend_kind)
+
+        async def stop(self) -> EventSourceStatus:
+            return EventSourceStatus(ok=True, backend_kind=self.backend_kind)
+
+        async def status(self) -> EventSourceStatus:
+            return EventSourceStatus(ok=True, backend_kind=self.backend_kind)
+
+        async def events(self):
+            raise RuntimeError("source crashed")
+            if False:
+                yield None
+
+    server = GatewayServer(tmp_path)
+    saved: list[str] = []
+    server._save_checkpoint = lambda platform_id: saved.append(f"checkpoint:{platform_id}")  # type: ignore[method-assign]
+    server._save_dedup_state = lambda platform_id: saved.append(f"dedup:{platform_id}")  # type: ignore[method-assign]
+
+    await server._consume_platform_events("fake", CrashingSource())  # type: ignore[arg-type]
+
+    assert saved == ["checkpoint:fake", "dedup:fake"]
+
+
+@pytest.mark.asyncio
+async def test_composite_event_source_cleans_child_tasks_on_cancel() -> None:
+    from leapflow.gateway.connectors.composite_event_source import CompositeEventSource
+    from leapflow.gateway.connectors.protocol import EventSourceStatus
+
+    class HangingSource:
+        platform_id = "fake"
+        backend_kind = "test"
+
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        async def start(self, *, checkpoint: str = "") -> EventSourceStatus:
+            return EventSourceStatus(ok=True, backend_kind=self.backend_kind)
+
+        async def stop(self) -> EventSourceStatus:
+            return EventSourceStatus(ok=True, backend_kind=self.backend_kind)
+
+        async def status(self) -> EventSourceStatus:
+            return EventSourceStatus(ok=True, backend_kind=self.backend_kind)
+
+        async def events(self):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled = True
+            if False:
+                yield None
+
+    source = HangingSource()
+    composite = CompositeEventSource([source], platform_id="fake")
+    await composite.start()
+    iterator = composite.events()
+    task = asyncio.create_task(iterator.__anext__())
+    await asyncio.sleep(0)
+
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, StopAsyncIteration):
+        pass
+
+    assert source.cancelled is True
+    assert composite._tasks == []
+
+
+@pytest.mark.asyncio
+async def test_lark_event_source_kills_identity_subprocess_on_timeout(monkeypatch) -> None:
+    import leapflow.gateway.connectors.lark_event_source as lark_event_source
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode = None
+            self.killed = False
+            self.waited = False
+
+        async def communicate(self):
+            return b"{}", b""
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> None:
+            self.waited = True
+
+    proc = FakeProcess()
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    async def fake_wait_for(awaitable, timeout):
+        awaitable.close()
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(lark_event_source.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(lark_event_source.asyncio, "wait_for", fake_wait_for)
+
+    source = lark_event_source.LarkCliEventSource(binary="lark-cli", profile="default")
+    identity = await source.fetch_bot_identity()
+
+    assert identity.open_id == ""
+    assert proc.killed is True
+    assert proc.waited is True
+
+
+def test_duckdb_deduplication_store_uses_batch_insert() -> None:
+    from leapflow.gateway.checkpoint_store import DuckDBDeduplicationStore
+
+    class FakeConnection:
+        def __init__(self) -> None:
+            self.executed: list[tuple[str, object]] = []
+            self.executemany_calls: list[tuple[str, list[tuple[str, str, float]]]] = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((str(sql), params))
+            return self
+
+        def executemany(self, sql, rows):
+            self.executemany_calls.append((str(sql), list(rows)))
+            return self
+
+    class Holder:
+        def __init__(self) -> None:
+            self.connection = FakeConnection()
+
+    holder = Holder()
+    store = DuckDBDeduplicationStore(holder)
+    store.save_batch("feishu", [f"event-{i}" for i in range(1005)])
+
+    assert len(holder.connection.executemany_calls) == 1
+    _, rows = holder.connection.executemany_calls[0]
+    assert len(rows) == 1000
+    assert rows[0][1] == "event-5"
+    assert rows[-1][1] == "event-1004"

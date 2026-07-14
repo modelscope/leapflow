@@ -113,7 +113,16 @@ class LarkCliEventSource:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            except asyncio.TimeoutError:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+                raise
             data = json.loads(stdout.decode("utf-8", errors="replace"))
             identities = data.get("identities") or {}
             bot_info = identities.get("bot") or {}
