@@ -202,7 +202,13 @@ async def test_file_write_returns_gate_denial_message(tmp_path: Path) -> None:
     class DenyingGate:
         denial_message = "BLOCKED: User denied this action. Do not retry."
 
-        async def check(self, path: str, content: str, mode: str = "overwrite") -> bool:
+        async def check(
+            self,
+            path: str,
+            content: str,
+            mode: str = "overwrite",
+            sensitivity_meta: dict | None = None,
+        ) -> bool:
             return False
 
     set_file_write_gate(DenyingGate())
@@ -218,3 +224,123 @@ async def test_file_write_returns_gate_denial_message(tmp_path: Path) -> None:
         "ok": False,
         "error": "BLOCKED: User denied this action. Do not retry.",
     }
+
+
+def test_default_risk_classifier_detects_sensitive_file_read() -> None:
+    risk = DefaultRiskClassifier().assess(
+        ActionDescriptor.file_read(
+            "/Users/example/.leapflow/.env",
+            metadata={"sensitivity_category": "credential"},
+        ),
+    )
+
+    assert risk.level == RiskLevel.HIGH
+    assert risk.reasons == ("credential_file_read",)
+    assert risk.allow_permanent is False
+
+
+@pytest.mark.asyncio
+async def test_sensitive_file_read_requires_approval_without_gate(tmp_path: Path) -> None:
+    from leapflow.tools.file_operations import file_read
+    from leapflow.tools.registry_bootstrap import set_file_read_gate
+
+    target = tmp_path / ".env"
+    target.write_text("API_KEY=sk-secret-value-123456\n", encoding="utf-8")
+    set_file_read_gate(None)
+
+    result = await file_read({"path": str(target)})
+
+    assert result["ok"] is False
+    assert result["requires_approval"] is True
+    assert result["sensitivity_category"] == "credential"
+
+
+@pytest.mark.asyncio
+async def test_sensitive_file_read_approval_redacts_content(tmp_path: Path) -> None:
+    from leapflow.tools.file_operations import file_read
+    from leapflow.tools.registry_bootstrap import set_file_read_gate
+
+    class AllowingReadGate:
+        denial_message = ""
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def check(
+            self,
+            path: str,
+            mode: str = "raw",
+            sensitivity_meta: dict | None = None,
+        ) -> bool:
+            self.calls.append((path, mode, dict(sensitivity_meta or {})))
+            return True
+
+    target = tmp_path / ".env"
+    target.write_text("API_KEY=sk-secret-value-123456\nPUBLIC_VALUE=ok\n", encoding="utf-8")
+    gate = AllowingReadGate()
+    set_file_read_gate(gate)
+    try:
+        result = await file_read({"path": str(target)})
+    finally:
+        set_file_read_gate(None)
+
+    assert result["ok"] is True
+    assert gate.calls[0][2]["sensitivity_category"] == "credential"
+    assert "sk-secret-value" not in result["content"]
+    assert "«redacted:" in result["content"]
+    assert result["redact_on_read"] is True
+
+
+@pytest.mark.asyncio
+async def test_sensitive_file_write_uses_approval_gate(tmp_path: Path) -> None:
+    from leapflow.tools.file_operations import file_write
+    from leapflow.tools.registry_bootstrap import set_file_write_gate
+
+    class AllowingWriteGate:
+        denial_message = ""
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def check(
+            self,
+            path: str,
+            content: str,
+            mode: str = "overwrite",
+            sensitivity_meta: dict | None = None,
+        ) -> bool:
+            self.calls.append((path, content, mode, dict(sensitivity_meta or {})))
+            return True
+
+    target = tmp_path / ".env"
+    gate = AllowingWriteGate()
+    set_file_write_gate(gate)
+    try:
+        result = await file_write({"path": str(target), "content": "API_KEY=sk-new-value-123456\n"})
+    finally:
+        set_file_write_gate(None)
+
+    assert result["ok"] is True
+    assert target.read_text(encoding="utf-8") == "API_KEY=sk-new-value-123456\n"
+    assert gate.calls[0][3]["sensitivity_category"] == "credential"
+
+
+@pytest.mark.asyncio
+async def test_runtime_database_read_is_hardline_blocked(tmp_path: Path) -> None:
+    from leapflow.tools.file_operations import file_read
+    from leapflow.tools.registry_bootstrap import set_file_read_gate
+
+    class FailingGate:
+        async def check(self, *_args, **_kwargs) -> bool:
+            raise AssertionError("runtime database reads must not request approval")
+
+    target = tmp_path / "leap.duckdb"
+    target.write_bytes(b"not text")
+    set_file_read_gate(FailingGate())
+    try:
+        result = await file_read({"path": str(target)})
+    finally:
+        set_file_read_gate(None)
+
+    assert result["ok"] is False
+    assert "Runtime database" in result["error"]

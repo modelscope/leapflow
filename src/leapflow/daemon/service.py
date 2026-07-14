@@ -384,7 +384,7 @@ class RuntimeLeapService:
             from leapflow.security.actions import ActionDescriptor
             from leapflow.security.orchestrator import ApprovalOrchestrator
             from leapflow.tools.gateway_tool import set_gateway_approval_gate
-            from leapflow.tools.registry_bootstrap import set_file_write_gate
+            from leapflow.tools.registry_bootstrap import set_file_read_gate, set_file_write_gate
             from leapflow.tools.shell_tools import set_approval_gate
 
             existing = getattr(ctx, "_approval_orchestrator", None)
@@ -399,15 +399,40 @@ class RuntimeLeapService:
             set_approval_gate(orchestrator)
             set_gateway_approval_gate(orchestrator)
 
+            class _FileReadGate:
+                def __init__(self) -> None:
+                    self.denial_message = ""
+
+                async def check(
+                    self,
+                    path: str,
+                    mode: str = "raw",
+                    sensitivity_meta: dict | None = None,
+                ) -> bool:
+                    result = await orchestrator.evaluate(
+                        ActionDescriptor.file_read(path, mode=mode, metadata=dict(sensitivity_meta or {}))
+                    )
+                    self.denial_message = result.denial_message if not result.approved else ""
+                    return result.approved
+
             class _FileWriteGate:
                 def __init__(self) -> None:
                     self.denial_message = ""
 
-                async def check(self, path: str, content: str, mode: str = "overwrite") -> bool:
-                    result = await orchestrator.evaluate(ActionDescriptor.file_write(path, content, mode=mode))
+                async def check(
+                    self,
+                    path: str,
+                    content: str,
+                    mode: str = "overwrite",
+                    sensitivity_meta: dict | None = None,
+                ) -> bool:
+                    result = await orchestrator.evaluate(
+                        ActionDescriptor.file_write(path, content, mode=mode, metadata=dict(sensitivity_meta or {}))
+                    )
                     self.denial_message = result.denial_message if not result.approved else ""
                     return result.approved
 
+            set_file_read_gate(_FileReadGate())
             set_file_write_gate(_FileWriteGate())
             logger.debug("daemon approval gate installed")
         except Exception:

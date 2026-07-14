@@ -85,8 +85,12 @@ class _TUIApprovalGate:
 
     _CATEGORY_LABELS = {
         "shell_dangerous": ("Shell Command", "yellow"),
+        "shell.command": ("Shell Command", "yellow"),
+        "file.read": ("Sensitive File Read", "yellow"),
+        "file.write": ("File Write", "yellow"),
         "file_write": ("File Write", "yellow"),
         "gateway_send": ("External Message", "cyan"),
+        "gateway.send": ("External Message", "cyan"),
     }
 
     async def request_approval(
@@ -1907,6 +1911,36 @@ class Context:
             except Exception:
                 logger.debug("Smart approval setup skipped", exc_info=True)
 
+        # ── Wire File Read Approval Gate ──
+        try:
+            from leapflow.security.actions import ActionDescriptor
+            from leapflow.tools.registry_bootstrap import set_file_read_gate
+
+            approval_orchestrator = self._approval_orchestrator
+
+            class _FileReadGate:
+                """File read approval via the action approval orchestrator."""
+
+                def __init__(self) -> None:
+                    self.denial_message = ""
+
+                async def check(
+                    self,
+                    path: str,
+                    mode: str = "raw",
+                    sensitivity_meta: dict | None = None,
+                ) -> bool:
+                    meta = dict(sensitivity_meta or {})
+                    action = ActionDescriptor.file_read(path, mode=mode, metadata=meta)
+                    result = await approval_orchestrator.evaluate(action)
+                    self.denial_message = result.denial_message if not result.approved else ""
+                    return result.approved
+
+            set_file_read_gate(_FileReadGate())
+            logger.debug("File read approval gate: action orchestrator")
+        except Exception:
+            logger.debug("File read gate setup skipped", exc_info=True)
+
         # ── Wire File Write Approval Gate ──
         try:
             from leapflow.security.actions import ActionDescriptor
@@ -1920,8 +1954,15 @@ class Context:
                 def __init__(self) -> None:
                     self.denial_message = ""
 
-                async def check(self, path: str, content: str, mode: str = "overwrite") -> bool:
-                    action = ActionDescriptor.file_write(path, content, mode=mode)
+                async def check(
+                    self,
+                    path: str,
+                    content: str,
+                    mode: str = "overwrite",
+                    sensitivity_meta: dict | None = None,
+                ) -> bool:
+                    meta = dict(sensitivity_meta or {})
+                    action = ActionDescriptor.file_write(path, content, mode=mode, metadata=meta)
                     result = await approval_orchestrator.evaluate(action)
                     self.denial_message = result.denial_message if not result.approved else ""
                     return result.approved

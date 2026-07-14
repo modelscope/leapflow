@@ -456,14 +456,25 @@ TOOL_REGISTRY = ToolRegistry.from_definitions(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# File write approval gate (Protocol-based, injectable)
+# File access approval gates (Protocol-based, injectable)
 # ─────────────────────────────────────────────────────────────────────
 
+_file_read_gate: Any = None
 _file_write_gate: Any = None
 
 
+def set_file_read_gate(gate: Any) -> None:
+    """Install a file-read approval gate."""
+    global _file_read_gate
+    _file_read_gate = gate
+
+
+def get_file_read_gate() -> Any:
+    return _file_read_gate
+
+
 def set_file_write_gate(gate: Any) -> None:
-    """Install a file-write approval gate (independent from shell approval)."""
+    """Install a file-write approval gate."""
     global _file_write_gate
     _file_write_gate = gate
 

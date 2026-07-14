@@ -98,6 +98,8 @@ class DefaultRiskClassifier:
     def assess(self, action: ActionDescriptor) -> RiskAssessment:
         if action.kind == ActionKind.SHELL_COMMAND.value:
             return self._assess_shell(action)
+        if action.kind == ActionKind.FILE_READ.value:
+            return self._assess_file_read(action)
         if action.kind == ActionKind.FILE_WRITE.value:
             return self._assess_file_write(action)
         if action.kind == ActionKind.GATEWAY_SEND.value:
@@ -205,6 +207,38 @@ class DefaultRiskClassifier:
                 explanation="This shell command has side effects or reaches external systems.",
             )
         return RiskAssessment(level=RiskLevel.LOW, score=0.15, reasons=("ordinary_shell_command",))
+
+    def _assess_file_read(self, action: ActionDescriptor) -> RiskAssessment:
+        path = Path(action.resource).expanduser()
+        name = path.name.lower()
+        normalized = str(path).replace("\\", "/").lower()
+        meta = action.metadata or {}
+        category = str(meta.get("sensitivity_category") or "")
+        if category == "credential":
+            return RiskAssessment(
+                level=RiskLevel.HIGH,
+                score=0.82,
+                reasons=("credential_file_read",),
+                explanation="This reads credentials, tokens, or security-sensitive configuration. Content will be redacted.",
+                allow_permanent=False,
+            )
+        if category in ("audit_log", "memory_store", "leapflow_profile_data", "runtime_state"):
+            return RiskAssessment(
+                level=RiskLevel.HIGH,
+                score=0.75,
+                reasons=(f"{category}_read",),
+                explanation="This reads LeapFlow internal data. Content will be redacted.",
+                allow_permanent=False,
+            )
+        if name in self._SENSITIVE_NAMES or any(part in normalized for part in self._SENSITIVE_PARTS):
+            return RiskAssessment(
+                level=RiskLevel.HIGH,
+                score=0.78,
+                reasons=("sensitive_file_read",),
+                explanation="This reads credentials, configuration, or security-sensitive files.",
+                allow_permanent=False,
+            )
+        return RiskAssessment(level=RiskLevel.LOW, score=0.1, reasons=("ordinary_file_read",))
 
     def _assess_file_write(self, action: ActionDescriptor) -> RiskAssessment:
         path = Path(action.resource).expanduser()
