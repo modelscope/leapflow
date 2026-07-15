@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from contextlib import suppress
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -73,6 +75,7 @@ def _make_app(
         theme=resolve_theme(_LIGHT, terminal_bg="#FFFFFF"),
         status=status,
         commands=commands,
+        history_path=Path(tempfile.mkdtemp()) / "tui_history",
         on_input=on_input,
         on_control=on_control,
     )

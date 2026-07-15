@@ -232,7 +232,8 @@ class DefaultRiskClassifier:
             )
         if category in (
             "approval_state", "audit_log", "memory_store", "leapflow_profile_data",
-            "runtime_state", "config", "cache_sensitive",
+            "runtime_state", "config", "mcp_config", "workspace_manifest", "history",
+            "cache_sensitive",
         ):
             return RiskAssessment(
                 level=RiskLevel.HIGH,
@@ -275,7 +276,7 @@ class DefaultRiskClassifier:
                 hardline=True,
                 allow_permanent=False,
             )
-        if category in {"config", "cache_sensitive", "approval_state"}:
+        if category in {"config", "mcp_config", "workspace_manifest", "history", "cache_sensitive", "approval_state"}:
             return RiskAssessment(
                 level=RiskLevel.HIGH,
                 score=0.8,
@@ -315,6 +316,7 @@ class DefaultRiskClassifier:
             token in lowered
             for token in (
                 ".env", "vault.json", "vault.key", "secrets.yaml", "config/user.yaml",
+                "mcp_servers.json", "workspace.yaml", ".leapflow/config.yaml", "tui_history",
                 "profiles/", "config.yaml", *configured_roots,
             )
         )

@@ -146,6 +146,20 @@ def _print_host_status(console: Any, host: dict[str, Any]) -> None:
         console.warning(f"host error: {host['last_error']}")
 
 
+def _print_auth_setup_hint(console: Any, settings: Any) -> bool:
+    """Render a compact first-run auth hint when no primary LLM key is configured."""
+    if getattr(settings, "has_llm_credentials", False):
+        return False
+    warnings = tuple(getattr(settings, "config_warnings", ()) or ())
+    missing_ref = next((item.split("Missing secret ref: ", 1)[1] for item in warnings if "Missing secret ref: " in item), "")
+    console.warning("LLM API key is not configured.")
+    if missing_ref:
+        console.system(f"Set it with `leap vault set {missing_ref}` or export `LEAPFLOW_LLM_API_KEY` for this process.")
+    else:
+        console.system("Run `leap vault set llm.primary.api_key`, then set `api_key_ref: secret://profile/llm/primary/api_key` in `~/.leapflow/profiles/default/config/llm.yaml`.")
+    return True
+
+
 def _host_action(args: str) -> str:
     action = (args or "status").strip().lower()
     if action in {"on", "up", "enable"}:
@@ -485,7 +499,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         try:
             if ctx.reload_runtime_config_if_changed():
                 console.success(
-                    "Configuration reloaded — LLM settings updated for this session."
+                    "Configuration reloaded for this session."
                 )
         except Exception as exc:
             logger.warning("Runtime config reload failed: %s", exc)
@@ -778,11 +792,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         theme=theme,
         status=status,
         commands=completion_entries(),
-        data_dir=(
-            ctx.settings.data_dir
-            if hasattr(ctx.settings, "data_dir")
-            else None
-        ),
+        history_path=ctx.settings.profile_layout.tui_history_path,
         on_input=handle_input,
         on_control=_handle_task_control,
     )
@@ -806,6 +816,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
             console.warning(f"Session '{resume_id}' not found; starting a new session.")
 
     _render_banner()
+    _print_auth_setup_hint(console, ctx.settings)
     _update_status()
     exit_code = 0
     try:
@@ -1284,7 +1295,7 @@ async def cmd_interactive_daemon(
         theme=theme,
         status=status,
         commands=completion_entries(),
-        data_dir=getattr(settings, "data_dir", None),
+        history_path=settings.profile_layout.tui_history_path,
         on_input=handle_input,
         on_control=_handle_task_control,
     )
@@ -1310,6 +1321,7 @@ async def cmd_interactive_daemon(
         console.warning(f"Daemon status unavailable: {exc}")
 
     _render_banner()
+    _print_auth_setup_hint(console, settings)
     _update_status()
 
     # Background notification subscription for push events (distillation progress, etc.)

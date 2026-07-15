@@ -46,6 +46,18 @@ def workspace_id_for_path(path: Path) -> str:
 
 
 @dataclass(frozen=True)
+class ManagedPathDescriptor:
+    """Semantic metadata for one LeapFlow-managed path."""
+
+    path: Path
+    category: str
+    scope: str
+    owner_component: str
+    syncable: bool
+    sensitivity: str
+
+
+@dataclass(frozen=True)
 class SecretsLayout:
     """Secret vault paths for either global or profile scope."""
 
@@ -93,6 +105,32 @@ class CacheLayout:
 
     def session_dir(self, workspace_id: str, session_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "sessions" / session_id
+
+    def workspace_manifest_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "workspace.yaml"
+
+    def write_workspace_manifest(self, workspace_id: str, workspace_root: Path) -> Path:
+        """Persist a small manifest linking workspace id to its canonical path."""
+        path = self.workspace_manifest_path(workspace_id)
+        now = datetime.now(timezone.utc).isoformat()
+        existing: dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (OSError, yaml.YAMLError, ValueError):
+                existing = {}
+        payload = {
+            "version": 1,
+            "workspace_id": workspace_id,
+            "canonical_path": str(workspace_root.expanduser().resolve()),
+            "display_name": workspace_root.expanduser().resolve().name,
+            "first_seen_at": existing.get("first_seen_at") or now,
+            "last_seen_at": now,
+        }
+        _write_yaml(path, payload)
+        return path
 
     def category_dir(
         self,
@@ -323,6 +361,14 @@ class ProfileLayout:
         return self.audit_dir / "runtime.jsonl"
 
     @property
+    def history_dir(self) -> Path:
+        return self.root / "history"
+
+    @property
+    def tui_history_path(self) -> Path:
+        return self.history_dir / "tui_history"
+
+    @property
     def cache(self) -> CacheLayout:
         return CacheLayout(self.root / "cache")
 
@@ -350,6 +396,7 @@ class ProfileLayout:
             self.global_memory_dir,
             self.skills_dir,
             self.audit_dir,
+            self.history_dir,
             self.runtime_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
@@ -426,11 +473,72 @@ class PathLayout:
         profile_layout.ensure()
         return profile_layout
 
+    def workspace_config_path(self, workspace_root: Path) -> Path:
+        return workspace_root / ".leapflow" / "config.yaml"
+
+    def workspace_manifest_path(self, workspace_root: Path) -> Path:
+        return workspace_root / ".leapflow" / "workspace.yaml"
+
+    def write_workspace_manifest(self, workspace_root: Path) -> Path:
+        """Write the workspace-local manifest and return its path."""
+        workspace_root = workspace_root.expanduser().resolve()
+        workspace_id = workspace_id_for_path(workspace_root)
+        path = self.workspace_manifest_path(workspace_root)
+        now = datetime.now(timezone.utc).isoformat()
+        existing: dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (OSError, yaml.YAMLError, ValueError):
+                existing = {}
+        payload = {
+            "version": 1,
+            "workspace_id": workspace_id,
+            "canonical_path": str(workspace_root),
+            "display_name": workspace_root.name,
+            "first_seen_at": existing.get("first_seen_at") or now,
+            "last_seen_at": now,
+        }
+        _write_yaml(path, payload)
+        return path
+
+    def describe_path(self, path: Path) -> ManagedPathDescriptor:
+        """Return semantic metadata for a path under this layout."""
+        expanded = path.expanduser()
+        normalized = str(expanded).replace("\\", "/").lower()
+        name = expanded.name.lower()
+        if "/secrets/" in normalized or name in {"vault.json", "vault.key"}:
+            return ManagedPathDescriptor(expanded, "secret_vault", _scope_from_path(normalized), "secrets", False, "critical" if name.endswith(".key") else "high")
+        if "/config/" in normalized or name in {"profile.yaml", "mcp_servers.json", "workspace.yaml"}:
+            category = "mcp_config" if name == "mcp_servers.json" else ("workspace_manifest" if name == "workspace.yaml" else "config")
+            return ManagedPathDescriptor(expanded, category, _scope_from_path(normalized), "config", True, "high")
+        if "/approval/" in normalized or name == "audit.jsonl":
+            return ManagedPathDescriptor(expanded, "approval_state", "profile", "approval", False, "high")
+        if "/history/" in normalized:
+            return ManagedPathDescriptor(expanded, "history", "profile", "tui", False, "high")
+        if "/runtime/" in normalized:
+            return ManagedPathDescriptor(expanded, "runtime_state", "profile", "runtime", False, "high")
+        if "/memory/" in normalized:
+            return ManagedPathDescriptor(expanded, "memory_store", "profile", "memory", False, "high")
+        if "/cache/" in normalized:
+            sensitive = any(part in normalized for part in ("/sessions/", "/frames/", "/video/", "/vlm/", "/signals/", "/timeline/"))
+            return ManagedPathDescriptor(expanded, "cache_sensitive" if sensitive else "cache_profile", _scope_from_path(normalized), "cache", not sensitive, "high" if sensitive else "medium")
+        if name.endswith(".duckdb") or name.endswith(".duckdb.wal"):
+            return ManagedPathDescriptor(expanded, "runtime_database", "profile", "storage", False, "critical")
+        return ManagedPathDescriptor(expanded, "leapflow_profile_data", _scope_from_path(normalized), "profile", False, "medium")
+
     def watched_config_paths(self, profile_id: str, workspace_root: Path | None = None) -> tuple[Path, ...]:
         profile_layout = self.profile(profile_id)
-        paths: list[Path] = [self.user_config_path, self.policy_config_path, *profile_layout.config_paths()]
+        paths: list[Path] = [
+            self.user_config_path,
+            self.policy_config_path,
+            self.mcp_servers_path,
+            *profile_layout.config_paths(),
+        ]
         if workspace_root is not None:
-            paths.append(workspace_root / ".leapflow" / "config.yaml")
+            paths.append(self.workspace_config_path(workspace_root))
         return tuple(paths)
 
 
@@ -439,11 +547,25 @@ def build_layout(data_dir: str | Path) -> PathLayout:
     return PathLayout(Path(data_dir).expanduser())
 
 
+def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
 def _write_yaml_if_missing(path: Path, payload: dict[str, Any]) -> None:
     if path.exists():
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    _write_yaml(path, payload)
+
+
+def _scope_from_path(normalized_path: str) -> str:
+    if "/sessions/" in normalized_path:
+        return "session"
+    if "/workspaces/" in normalized_path or "/.leapflow/" in normalized_path:
+        return "workspace"
+    if "/profiles/" in normalized_path:
+        return "profile"
+    return "global"
 
 
 def _default_user_config(profile_id: str) -> dict[str, Any]:

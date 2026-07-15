@@ -51,13 +51,14 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 
 ## Path Tree, Configuration, and Secrets Rules
 
-- **Layout is the only path authority**: all LeapFlow-managed paths must come from `PathLayout`, `ProfileLayout`, or their child layout objects. Business modules must not construct paths such as `profile_dir / "cache"`, `profile_dir / "approval"`, `data_dir / ".env"`, or `profile_dir / "gateway.yaml"`.
-- **Profile is the runtime boundary**: profile metadata, config, DBs, memory, skills, gateway state, approval state, audit logs, cache, runtime files, and profile-scoped secrets live under `profiles/<profile>/` and must be addressed through `ProfileLayout`.
-- **Persistent config is structured YAML**: long-lived configuration lives in `config/user.yaml`, `profiles/<profile>/config/*.yaml`, and optional `<workspace>/.leapflow/config.yaml`. `LEAPFLOW_*` process environment values and explicit override files are temporary highest-priority overrides, not persistent config stores.
-- **Secrets are never durable plaintext config**: long-lived LLM, VLM, aux provider, Gateway, and Hub credentials must use `secret://global/...` or `secret://profile/...` references resolved through the vault layer. Config files may store refs, never tokens.
-- **Cache is scope-aware**: cache paths must declare `profile`, `workspace`, or `session` scope and route through `CacheLayout`/`CacheManager`. Session visual/video/VLM/signal artifacts are sensitive, non-syncable by default, and must be eligible for index-driven TTL/quota cleanup.
-- **Runtime and control files are protected**: daemon sockets, pid/lock files, runtime state, DuckDB files, vault files, approval grants/audit, and memory stores must flow through path sensitivity, risk, approval, and redaction metadata before file tools can access them.
-- **No legacy aliases unless explicitly approved**: do not reintroduce global `.env` as a main config source, flat cache directories, profile-root gateway config, `.credential_key`, or `run/` runtime paths.
+- **Path tree is a product contract**: every LeapFlow-managed path must be declared by `PathLayout`, `ProfileLayout`, `CacheLayout`, or a child layout object. Runtime code must consume layout APIs, never assemble managed paths with ad-hoc string joins.
+- **Profile is the runtime boundary**: `profiles/<profile>/` owns profile metadata, config, DBs, memory, skills, gateway state, approval state, audit logs, runtime files, cache roots, and profile-scoped secrets. Cross-profile access requires an explicit layout object.
+- **Workspace is context, not ownership**: workspace-local files are limited to `.leapflow/config.yaml` and `.leapflow/workspace.yaml`; profile data and caches stay under the active profile and are addressed by workspace/session ids.
+- **Config is layered, not scattered**: durable settings live in `config/user.yaml`, `profiles/<profile>/config/*.yaml`, and optional workspace config. `LEAPFLOW_*` values and explicit env files are process overrides only.
+- **Secrets are refs, never durable plaintext**: long-lived LLM, VLM, aux-provider, Gateway, and Hub credentials must be stored in the vault and referenced as `secret://profile/...` or `secret://global/...`. Config may contain refs, never tokens.
+- **Cache declares scope and sensitivity**: cache paths must route through `CacheLayout`/`CacheManager` with `profile`, `workspace`, or `session` scope. Session visual/video/VLM/signal artifacts are sensitive, non-syncable, and TTL/quota managed by index.
+- **Safety follows path semantics**: daemon sockets, pid/lock files, runtime state, DuckDB files, vault files, approval grants, audit logs, and memory stores must flow through layout descriptors, path sensitivity, risk, approval, and redaction gates.
+- **No legacy aliases**: do not reintroduce global `.env` as persistent config, flat cache roots, profile-root gateway config, inline credential files, `.credential_key`, or `run/` runtime paths.
 
 ## Implementation Guidelines
 

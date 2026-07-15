@@ -543,6 +543,7 @@ wheels = [
 name = "leapflow"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "duckdb" },
     { name = "gnureadline", marker = "sys_platform == 'darwin'" },
     { name = "mcp" },
@@ -568,6 +569,7 @@ hub = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=42.0" },
     { name = "duckdb", specifier = ">=1.0.0" },
     { name = "gnureadline", marker = "sys_platform == 'darwin'", specifier = ">=8.0" },
     { name = "mcp", specifier = ">=1.26.0" },

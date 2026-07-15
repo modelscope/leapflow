@@ -185,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument(
         "--no-daemon",
         action="store_true",
-        help="Run chat/interactive in the legacy in-process mode.",
+        help="Run chat/interactive in this process instead of leapd.",
     )
 
     parser = argparse.ArgumentParser(
@@ -255,9 +255,25 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser = daemon_sub.add_parser("serve", help=argparse.SUPPRESS)
     serve_parser.add_argument("--internal", action="store_true", help=argparse.SUPPRESS)
 
+    # leap vault
+    vault_parser = subparsers.add_parser("vault", help="Manage profile/global secret refs")
+    vault_sub = vault_parser.add_subparsers(dest="vault_action")
+    vault_set = vault_sub.add_parser("set", help="Store a secret value in the active vault")
+    vault_set.add_argument("ref", help="secret:// ref or shorthand like llm.primary.api_key")
+    vault_set.add_argument("value", nargs="?", help="Secret value; prompts securely when omitted")
+    vault_set.add_argument("--scope", choices=["profile", "global"], default="profile", help="Scope for shorthand refs; ignored for full secret:// refs")
+    vault_get = vault_sub.add_parser("get", help="Check or reveal a secret value")
+    vault_get.add_argument("ref", help="secret:// ref or shorthand like llm.primary.api_key")
+    vault_get.add_argument("--scope", choices=["profile", "global"], default="profile", help="Scope for shorthand refs; ignored for full secret:// refs")
+    vault_get.add_argument("--reveal", action="store_true", help="Print the plaintext secret value")
+    vault_delete = vault_sub.add_parser("delete", help="Delete a secret ref")
+    vault_delete.add_argument("ref", help="secret:// ref or shorthand like llm.primary.api_key")
+    vault_delete.add_argument("--scope", choices=["profile", "global"], default="profile", help="Scope for shorthand refs; ignored for full secret:// refs")
+    vault_sub.add_parser("list", help="List stored secret refs without revealing values")
+
     # ── Pre-parse: detect if first non-flag arg is a known subcommand ──
     # If not, treat everything non-flag as a chat prompt.
-    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon"}
+    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon", "vault"}
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
 
     # Find first non-flag argument, skipping values owned by global options.
@@ -315,6 +331,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             # leap → interactive REPL (Rich banner rendered inside cmd_interactive)
             args.command = "interactive"
+
+    if args.command == "vault":
+        from leapflow.cli.commands.vault import cmd_vault
+        return cmd_vault(args)
 
     # Host command does not need Context initialization
     if args.command == "host":

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from leapflow.layout import ManagedPathDescriptor, build_layout
+
 
 @dataclass(frozen=True)
 class PathSensitivity:
@@ -89,6 +91,32 @@ def _is_under(path: str, root: Path) -> bool:
     return path == root_text or path.startswith(root_text + "/")
 
 
+def _from_descriptor(descriptor: ManagedPathDescriptor) -> PathSensitivity:
+    category = descriptor.category
+    name = descriptor.path.name.lower()
+    hardline = category == "runtime_database" or (category == "secret_vault" and name.endswith(".key"))
+    writable = category not in {"secret_vault", "runtime_database", "runtime_state", "approval_state"}
+    readable = not hardline
+    requires_approval = category not in {"cache_profile"}
+    redact_on_read = category in {
+        "secret_vault", "approval_state", "memory_store", "runtime_state", "config",
+        "mcp_config", "workspace_manifest", "history", "cache_sensitive", "leapflow_profile_data",
+    }
+    return PathSensitivity(
+        category=category,
+        level=descriptor.sensitivity,
+        hardline=hardline,
+        readable=readable,
+        writable=writable,
+        requires_approval=requires_approval,
+        redact_on_read=redact_on_read,
+        reason=f"{category}_file",
+        scope=descriptor.scope,
+        owner_component=descriptor.owner_component,
+        syncable=descriptor.syncable,
+    )
+
+
 def classify_path_sensitivity(path: Path) -> PathSensitivity:
     """Classify a path before file read/write execution."""
     expanded = path.expanduser()
@@ -148,105 +176,27 @@ def classify_path_sensitivity(path: Path) -> PathSensitivity:
             reason="credential_or_secret_file",
         )
 
+    if "/.leapflow/" in lowered and name in {"config.yaml", "workspace.yaml"}:
+        category = "workspace_manifest" if name == "workspace.yaml" else "config"
+        return PathSensitivity(
+            category=category,
+            level="high",
+            readable=True,
+            writable=True,
+            requires_approval=True,
+            redact_on_read=True,
+            reason=f"{category}_file",
+            scope="workspace",
+            owner_component="config",
+            syncable=True,
+        )
+
     leapflow_root = next(
         (root for root in _LEAPFLOW_DATA_ROOTS if _is_under(normalized, root)),
         None,
     )
     if leapflow_root is not None:
-        if "/secrets/" in lowered or name in {"vault.json", "vault.key"}:
-            return PathSensitivity(
-                category="secret_vault",
-                level="critical" if name.endswith(".key") else "high",
-                hardline=name.endswith(".key"),
-                readable=not name.endswith(".key"),
-                writable=False,
-                requires_approval=True,
-                redact_on_read=True,
-                reason="secret_vault_file",
-                scope="profile" if "/profiles/" in lowered else "global",
-                owner_component="secrets",
-                syncable=False,
-            )
-        if "/approval/" in lowered or name == "audit.jsonl":
-            return PathSensitivity(
-                category="approval_state",
-                level="high",
-                readable=True,
-                writable=False,
-                requires_approval=True,
-                redact_on_read=True,
-                reason="approval_or_runtime_audit_log",
-                scope="profile",
-                owner_component="approval",
-                syncable=False,
-            )
-        if "/memory/" in lowered:
-            return PathSensitivity(
-                category="memory_store",
-                level="high",
-                readable=True,
-                writable=True,
-                requires_approval=True,
-                redact_on_read=True,
-                reason="user_memory_store",
-                scope="profile",
-                owner_component="memory",
-                syncable=False,
-            )
-        if "/runtime/" in lowered:
-            return PathSensitivity(
-                category="runtime_state",
-                level="high",
-                readable=True,
-                writable=False,
-                requires_approval=True,
-                redact_on_read=True,
-                reason="runtime_state_file",
-                scope="profile",
-                owner_component="runtime",
-                syncable=False,
-            )
-        if "/config/" in lowered or name == "profile.yaml":
-            return PathSensitivity(
-                category="config",
-                level="high",
-                readable=True,
-                writable=True,
-                requires_approval=True,
-                redact_on_read=True,
-                reason="runtime_config_file",
-                scope="profile" if "/profiles/" in lowered else "global",
-                owner_component="config",
-                syncable=True,
-            )
-        if "/cache/" in lowered:
-            is_sensitive_cache = any(part in lowered for part in (
-                "/sessions/", "/frames/", "/video/", "/vlm/", "/signals/", "/timeline/",
-            ))
-            return PathSensitivity(
-                category="cache_sensitive" if is_sensitive_cache else "cache_profile",
-                level="high" if is_sensitive_cache else "medium",
-                readable=True,
-                writable=True,
-                requires_approval=is_sensitive_cache,
-                redact_on_read=is_sensitive_cache,
-                reason="sensitive_cache_file" if is_sensitive_cache else "profile_cache_file",
-                scope="session" if "/sessions/" in lowered else ("workspace" if "/workspaces/" in lowered else "profile"),
-                owner_component="cache",
-                syncable=not is_sensitive_cache,
-            )
-        return PathSensitivity(
-            category="leapflow_profile_data",
-            level="medium",
-            readable=True,
-            writable=True,
-            requires_approval=True,
-            redact_on_read=True,
-            reason="leapflow_profile_data",
-            scope="profile",
-            owner_component="profile",
-            syncable=False,
-        )
+        return _from_descriptor(build_layout(leapflow_root).describe_path(expanded))
 
     if expanded.suffix.lower() in _BINARY_EXTENSIONS:
         return PathSensitivity(

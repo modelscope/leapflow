@@ -76,9 +76,36 @@ async def test_context_initialize_degrades_when_primary_db_is_locked(
     finally:
         await ctx.cleanup()
 
+def test_vault_cli_set_get_list_delete(monkeypatch, tmp_path, capsys) -> None:
+    from leapflow.cli.commands import vault as vault_module
+
+    settings = make_settings(str(tmp_path))
+    monkeypatch.setattr(vault_module, "load_config", lambda: settings)
+
+    assert vault_module.normalize_secret_ref("llm.primary.api_key") == "secret://profile/llm/primary/api_key"
+    assert vault_module.normalize_secret_ref("secret://global/llm/shared/api_key", default_scope="profile") == "secret://global/llm/shared/api_key"
+    assert vault_module.cmd_vault(argparse.Namespace(vault_action="set", ref="llm.primary.api_key", value="sk-test", scope="profile")) == 0
+    assert "secret://profile/llm/primary/api_key" in capsys.readouterr().out
+
+    assert vault_module.cmd_vault(argparse.Namespace(vault_action="get", ref="llm.primary.api_key", reveal=False, scope="profile")) == 0
+    assert "is set" in capsys.readouterr().out
+
+    assert vault_module.cmd_vault(argparse.Namespace(vault_action="get", ref="llm.primary.api_key", reveal=True, scope="profile")) == 0
+    assert capsys.readouterr().out.strip() == "sk-test"
+
+    assert vault_module.cmd_vault(argparse.Namespace(vault_action="list")) == 0
+    assert "secret://profile/llm/primary/api_key" in capsys.readouterr().out
+
+    assert vault_module.cmd_vault(argparse.Namespace(vault_action="delete", ref="llm.primary.api_key", scope="profile")) == 0
+    assert "Deleted" in capsys.readouterr().out
+
+    assert vault_module.cmd_vault(argparse.Namespace(vault_action="get", ref="secret://bad/scope", reveal=False, scope="profile")) == 2
+    assert "Invalid secret ref" in capsys.readouterr().out
+
 
 def test_visual_track_defaults_off_without_env(monkeypatch, tmp_path) -> None:
     from leapflow.config import DEFAULT_LLM_CONTEXT_LENGTH, _build_settings_from_env
+    from leapflow.security.path_sensitivity import configured_path_sensitivity_roots
 
     monkeypatch.delenv("LEAPFLOW_VISUAL_TRACK_ENABLED", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
@@ -91,6 +118,50 @@ def test_visual_track_defaults_off_without_env(monkeypatch, tmp_path) -> None:
     assert settings.visual_track_enabled is False
     assert settings.has_vlm_credentials is False
     assert settings.llm_context_length == DEFAULT_LLM_CONTEXT_LENGTH
+    assert configured_path_sensitivity_roots() == (settings.layout.root.resolve(),)
+
+
+def test_interactive_auth_hint_is_short_and_actionable() -> None:
+    from types import SimpleNamespace
+    from leapflow.cli.commands.interactive import _print_auth_setup_hint
+
+    class Console:
+        def __init__(self) -> None:
+            self.warnings: list[str] = []
+            self.systems: list[str] = []
+
+        def warning(self, message: str) -> None:
+            self.warnings.append(message)
+
+        def system(self, message: str) -> None:
+            self.systems.append(message)
+
+    console = Console()
+    rendered = _print_auth_setup_hint(
+        console,
+        SimpleNamespace(
+            has_llm_credentials=False,
+            config_warnings=("Missing secret ref: secret://profile/llm/primary/api_key",),
+        ),
+    )
+
+    assert rendered is True
+    assert console.warnings == ["LLM API key is not configured."]
+    assert console.systems == [
+        "Set it with `leap vault set secret://profile/llm/primary/api_key` or export `LEAPFLOW_LLM_API_KEY` for this process."
+    ]
+
+    console = Console()
+    rendered = _print_auth_setup_hint(
+        console,
+        SimpleNamespace(has_llm_credentials=False, config_warnings=()),
+    )
+
+    assert rendered is True
+    assert console.warnings == ["LLM API key is not configured."]
+    assert console.systems == [
+        "Run `leap vault set llm.primary.api_key`, then set `api_key_ref: secret://profile/llm/primary/api_key` in `~/.leapflow/profiles/default/config/llm.yaml`."
+    ]
 
 
 def test_profile_name_rejects_path_traversal(monkeypatch, tmp_path) -> None:
@@ -113,7 +184,7 @@ def test_context_length_is_exposed_in_env_templates() -> None:
     example = (Path(__file__).parents[1] / ".env.example").read_text(encoding="utf-8")
 
     assert expected in ENV_TEMPLATE
-    assert expected in example
+    assert f"# {expected}" in example
     assert "Runtime context budget" in ENV_TEMPLATE
 
 

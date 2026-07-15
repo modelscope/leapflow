@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from leapflow.layout import PathLayout, ProfileLayout
+
 
 _SECRET_PREFIX = "secret://"
 _FERNET_PREFIX = "enc:fernet:"
@@ -51,6 +53,7 @@ class SecretVault(Protocol):
     def get(self, ref: str) -> str | None: ...
     def set(self, ref: str, value: str, metadata: dict[str, str] | None = None) -> None: ...
     def delete(self, ref: str) -> None: ...
+    def list_refs(self) -> tuple[str, ...]: ...
     def resolve_config_refs(self, value: object) -> object: ...
 
 
@@ -88,6 +91,9 @@ class FernetSecretVault:
         records = self._load()
         records.pop(ref, None)
         self._save(records)
+
+    def list_refs(self) -> tuple[str, ...]:
+        return tuple(sorted(self._load().keys()))
 
     def resolve_config_refs(self, value: object) -> object:
         if isinstance(value, str) and value.startswith(_SECRET_PREFIX):
@@ -176,8 +182,7 @@ class FernetSecretVault:
 
     @staticmethod
     def _validate_ref(ref: str) -> None:
-        if not ref.startswith(_SECRET_PREFIX):
-            raise ValueError("Secret references must start with secret://")
+        secret_scope(ref)
 
 
 def _ensure_private_permissions(path: Path) -> None:
@@ -185,7 +190,52 @@ def _ensure_private_permissions(path: Path) -> None:
         path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
+class ScopedSecretResolver:
+    """Resolve secret refs across global and active profile vaults."""
+
+    def __init__(self, layout: PathLayout, profile_layout: ProfileLayout) -> None:
+        self._global_vault = FernetSecretVault(layout.global_secrets.vault_path, layout.global_secrets.key_path)
+        self._profile_vault = FernetSecretVault(profile_layout.secrets.vault_path, profile_layout.secrets.key_path)
+
+    def vault_for_ref(self, ref: str) -> FernetSecretVault:
+        scope = secret_scope(ref)
+        if scope == "global":
+            return self._global_vault
+        if scope == "profile":
+            return self._profile_vault
+        raise ValueError(f"Unsupported secret scope: {scope}")
+
+    def get(self, ref: str) -> str | None:
+        return self.vault_for_ref(ref).get(ref)
+
+    def set(self, ref: str, value: str, metadata: dict[str, str] | None = None) -> None:
+        self.vault_for_ref(ref).set(ref, value, metadata=metadata)
+
+    def list_refs(self) -> tuple[str, ...]:
+        refs = [*self._global_vault.list_refs(), *self._profile_vault.list_refs()]
+        return tuple(sorted(set(refs)))
+
+    def delete(self, ref: str) -> None:
+        self.vault_for_ref(ref).delete(ref)
+
+
+def secret_scope(ref: str) -> str:
+    """Return the scope component from a normalized secret ref."""
+    if not ref.startswith(_SECRET_PREFIX):
+        raise ValueError("Secret references must start with secret://")
+    rest = ref[len(_SECRET_PREFIX):]
+    scope = rest.split("/", 1)[0]
+    if scope not in {"global", "profile"}:
+        raise ValueError("Secret references must use global or profile scope")
+    return scope
+
+
 def secret_ref(scope: str, *parts: str) -> str:
     """Build a normalized secret reference."""
+    normalized_scope = scope.strip("/")
+    if normalized_scope not in {"global", "profile"}:
+        raise ValueError("Secret scope must be 'global' or 'profile'")
     clean_parts = [part.strip("/") for part in parts if part.strip("/")]
-    return _SECRET_PREFIX + "/".join([scope.strip("/"), *clean_parts])
+    if not clean_parts:
+        raise ValueError("Secret references require at least one path part")
+    return _SECRET_PREFIX + "/".join([normalized_scope, *clean_parts])

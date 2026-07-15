@@ -6,7 +6,7 @@ Public API:
 - ``PlatformAdapter`` Protocol + ``PlatformAdapterMixin`` for graceful degradation
 - ``GatewayServer`` for adapter lifecycle and message routing
 - ``ManifestLoader`` for declarative platform discovery
-- ``CredentialVault`` for at-rest credential encryption
+- ``CredentialVault`` for vault-backed ``secret://`` credential refs
 - ``SessionKey`` / ``build_session_key`` for structured session routing
 - ``GatewayRouter`` for per-session LLM processing of inbound messages
 """

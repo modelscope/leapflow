@@ -16,7 +16,7 @@ from typing import Any, Mapping
 
 import yaml
 
-from leapflow.layout import PathLayout, ProfileLayout, existing_paths
+from leapflow.layout import PathLayout, ProfileLayout
 from leapflow.security.secrets import FernetSecretVault
 
 logger = logging.getLogger(__name__)
@@ -38,6 +38,7 @@ class ConfigBundle:
     values: dict[str, Any]
     sources: tuple[ConfigSource, ...]
     watched_paths: tuple[Path, ...]
+    warnings: tuple[str, ...] = ()
 
     @property
     def env(self) -> dict[str, str]:
@@ -56,7 +57,7 @@ class ConfigLoader:
         self._workspace_root = workspace_root
 
     def sources(self) -> tuple[ConfigSource, ...]:
-        workspace_config = self._workspace_root / ".leapflow" / "config.yaml"
+        workspace_config = self._layout.workspace_config_path(self._workspace_root)
         return (
             ConfigSource(self._layout.user_config_path, "user"),
             ConfigSource(self._layout.policy_config_path, "policy"),
@@ -73,17 +74,21 @@ class ConfigLoader:
 
     def load(self) -> ConfigBundle:
         values: dict[str, Any] = {}
+        warnings: list[str] = []
         sources = self.sources()
         for source in sources:
-            loaded = _read_yaml(source.path)
+            loaded = _read_yaml(source.path, warnings=warnings)
             if loaded:
                 values = _deep_merge(values, loaded)
-        values = _resolve_secret_refs(values, self._layout, self._profile_layout)
+        values = _resolve_secret_refs(values, self._layout, self._profile_layout, warnings=warnings)
         values = _deep_merge(values, _env_overrides())
+        watched = [source.path for source in sources]
+        watched.append(self._layout.mcp_servers_path)
         return ConfigBundle(
             values=values,
             sources=sources,
-            watched_paths=existing_paths(source.path for source in sources),
+            watched_paths=tuple(watched),
+            warnings=tuple(warnings),
         )
 
 
@@ -109,17 +114,20 @@ def config_signature(paths: tuple[Path, ...]) -> tuple[tuple[str, int, int], ...
     return tuple(signature)
 
 
-def _read_yaml(path: Path) -> dict[str, Any]:
+def _read_yaml(path: Path, *, warnings: list[str] | None = None) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
         parsed = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if not isinstance(parsed, dict):
             raise ValueError("YAML root must be a mapping")
+        _validate_known_sections(path, parsed, warnings)
         return parsed
     except (OSError, yaml.YAMLError, ValueError) as exc:
         backup = path.with_suffix(path.suffix + ".corrupt.bak")
         logger.warning("config parse error for %s (%s), backing up to %s", path, exc, backup.name)
+        if warnings is not None:
+            warnings.append(f"{path}: {exc}")
         try:
             shutil.copy2(path, backup)
         except OSError:
@@ -155,6 +163,8 @@ def _resolve_secret_refs(
     values: Mapping[str, Any],
     layout: PathLayout,
     profile_layout: ProfileLayout,
+    *,
+    warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     """Resolve secret:// refs into in-memory config values without writing YAML."""
     profile_vault = FernetSecretVault(
@@ -166,16 +176,24 @@ def _resolve_secret_refs(
         layout.global_secrets.key_path,
     )
 
-    def resolve_ref(ref: str) -> str:
+    def resolve_ref(ref: str) -> str | None:
         try:
             if ref.startswith("secret://global/"):
-                return global_vault.get(ref) or ""
+                resolved = global_vault.get(ref)
+                if resolved is None and warnings is not None:
+                    warnings.append(f"Missing secret ref: {ref}")
+                return resolved
             if ref.startswith("secret://profile/"):
-                return profile_vault.get(ref) or ""
+                resolved = profile_vault.get(ref)
+                if resolved is None and warnings is not None:
+                    warnings.append(f"Missing secret ref: {ref}")
+                return resolved
             logger.warning("Unsupported secret scope in config ref: %s", ref)
         except Exception as exc:
             logger.warning("Failed to resolve config secret ref %s: %s", ref, type(exc).__name__)
-        return ""
+            if warnings is not None:
+                warnings.append(f"Failed to resolve secret ref {ref}: {type(exc).__name__}")
+        return None
 
     def visit(node: Any) -> Any:
         if isinstance(node, Mapping):
@@ -184,18 +202,36 @@ def _resolve_secret_refs(
                 if key.endswith("_ref") and isinstance(value, str) and value.startswith("secret://"):
                     resolved[key] = value
                     target_key = key[:-4]
-                    resolved[target_key] = resolve_ref(value)
+                    secret_value = resolve_ref(value)
+                    if secret_value is not None:
+                        resolved[target_key] = secret_value
                 else:
                     resolved[key] = visit(value)
             return resolved
         if isinstance(node, list):
             return [visit(item) for item in node]
         if isinstance(node, str) and node.startswith("secret://"):
-            return resolve_ref(node)
+            return resolve_ref(node) or node
         return node
 
     result = visit(values)
     return result if isinstance(result, dict) else {}
+
+
+def _validate_known_sections(
+    path: Path,
+    parsed: Mapping[str, Any],
+    warnings: list[str] | None,
+) -> None:
+    if warnings is None:
+        return
+    known_sections = {
+        "user", "paths", "runtime", "llm", "perception", "gateway", "hub",
+        "privacy", "approval", "cache", "logging", "version",
+    }
+    for key, value in parsed.items():
+        if key in known_sections and key != "version" and not isinstance(value, Mapping):
+            warnings.append(f"{path}: section '{key}' must be a mapping")
 
 
 def _env_overrides() -> dict[str, Any]:

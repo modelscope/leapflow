@@ -10,22 +10,29 @@ from __future__ import annotations
 
 ENV_TEMPLATE = """\
 # LeapFlow Process Override Example
-# Use structured YAML for persistent config:
+#
+# Persistent configuration lives in structured YAML under:
 #   ~/.leapflow/config/user.yaml
 #   ~/.leapflow/profiles/<profile>/config/*.yaml
 #   <workspace>/.leapflow/config.yaml
 #
-# LEAPFLOW_* variables are highest-priority temporary overrides.
+# This template documents optional LEAPFLOW_* process overrides for CI,
+# containers, and one-off local debugging. Store long-lived secrets with
+# `leap vault`, then reference them from profile YAML.
 
 # ═══════════════════════════════════════════════════════════════════════
 # LLM — OpenAI-compatible provider (DashScope, OpenAI, DeepSeek, etc.)
 # ═══════════════════════════════════════════════════════════════════════
-LEAPFLOW_LLM_API_KEY=
-LEAPFLOW_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LEAPFLOW_LLM_MODEL=qwen3.7-plus
-LEAPFLOW_LLM_MAX_RETRIES=3
+# Recommended persistent setup:
+#   leap vault set llm.primary.api_key
+#   then set api_key_ref: secret://profile/llm/primary/api_key in ~/.leapflow/profiles/default/config/llm.yaml
+# Temporary process override only:
+# LEAPFLOW_LLM_API_KEY=sk-your-key-here
+# LEAPFLOW_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+# LEAPFLOW_LLM_MODEL=qwen3.7-plus
+# LEAPFLOW_LLM_MAX_RETRIES=3
 # Runtime context budget in tokens. Set to the usable limit for your provider/model.
-LEAPFLOW_LLM_CONTEXT_LENGTH=256000
+# LEAPFLOW_LLM_CONTEXT_LENGTH=256000
 
 # ═══════════════════════════════════════════════════════════════════════
 # Platform — CuaDriver communication
@@ -51,7 +58,7 @@ LEAPFLOW_MOCK_HOST=0
 # ═══════════════════════════════════════════════════════════════════════
 # Logging & Audit
 # ═══════════════════════════════════════════════════════════════════════
-LEAPFLOW_LOG_LEVEL=INFO
+# LEAPFLOW_LOG_LEVEL=INFO
 # LEAPFLOW_AUDIT_LOG_PATH=~/.leapflow/profiles/default/audit/runtime.jsonl
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -101,8 +108,9 @@ LEAPFLOW_RECORDING_MODE=video
 # LEAPFLOW_VIDEO_CODEC=h264
 # Max seconds per video segment file before auto-splitting.
 # LEAPFLOW_VIDEO_MAX_SEGMENT_S=600
-# Directory for video segment cache.
-# LEAPFLOW_VIDEO_CACHE_DIR=~/.leapflow/profiles/default/cache/workspaces/<workspace_id>/shared/video
+# Directory for video segment cache. Derived by layout under
+# ~/.leapflow/profiles/default/cache/workspaces/<workspace_id>/sessions/<session_id>/video.
+# LEAPFLOW_VIDEO_CACHE_DIR is only for temporary process overrides.
 
 # ── Video Analysis ──
 # LEAPFLOW_VIDEO_VLM_URL_SCHEME=base64

@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import duckdb
 
@@ -125,6 +125,76 @@ class CacheManager:
                 _entry_params(entry),
             )
         return entry
+
+    def register_directory(
+        self,
+        *,
+        root: Path,
+        scope: CacheScope | str,
+        category: str,
+        source: str,
+        workspace_id: str = "",
+        session_id: str = "",
+        expires_at: float | None = None,
+        sensitive: bool = False,
+        syncable: bool = True,
+        owner_component: str = "cache",
+        metadata: dict[str, Any] | None = None,
+        suffixes: Iterable[str] | None = None,
+    ) -> list[CacheEntry]:
+        suffix_filter = {suffix.lower() for suffix in suffixes or ()}
+        entries: list[CacheEntry] = []
+        if not root.exists():
+            return entries
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if suffix_filter and path.suffix.lower() not in suffix_filter:
+                continue
+            entries.append(self.register(
+                path=path,
+                scope=scope,
+                category=category,
+                source=source,
+                workspace_id=workspace_id,
+                session_id=session_id,
+                expires_at=expires_at,
+                sensitive=sensitive,
+                syncable=syncable,
+                owner_component=owner_component,
+                metadata=metadata,
+            ))
+        return entries
+
+    def cleanup_quota(
+        self,
+        *,
+        scope: str,
+        max_bytes: int,
+        category: str | None = None,
+        workspace_id: str | None = None,
+        session_id: str | None = None,
+    ) -> int:
+        entries = self.list_entries(
+            scope=scope,
+            category=category,
+            workspace_id=workspace_id,
+            session_id=session_id,
+        )
+        total_size = sum(entry.size_bytes for entry in entries)
+        if total_size <= max_bytes:
+            return 0
+        removed = 0
+        for entry in sorted(entries, key=lambda item: item.last_accessed_at or item.created_at):
+            if total_size <= max_bytes:
+                break
+            if self._is_managed_path(entry.path):
+                entry.path.unlink(missing_ok=True)
+            total_size -= entry.size_bytes
+            with self._connect() as con:
+                con.execute("DELETE FROM cache_entry WHERE id = ?", [entry.entry_id])
+            removed += 1
+        return removed
 
     def touch(self, entry_id: str) -> None:
         with self._connect() as con:

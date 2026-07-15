@@ -101,7 +101,7 @@ class RuntimeLeapService:
                 self._settings = ctx.settings
                 yield StreamChunk(
                     request_id="",
-                    content="Configuration reloaded — LLM settings updated in leapd.",
+                    content="Configuration reloaded in leapd.",
                     event_type="status",
                     metadata={
                         **self._engine_context_metadata(getattr(ctx, "engine", None), ctx.settings),
@@ -144,18 +144,29 @@ class RuntimeLeapService:
         settings = getattr(ctx, "settings", self._settings) if ctx is not None else self._settings
         engine = getattr(ctx, "engine", None) if ctx is not None else None
         db_holder = getattr(ctx, "_db_holder", None) if ctx is not None else None
+        layout = settings.layout
+        profile_layout = settings.profile_layout
+        workspace_root = Path(str(getattr(settings, "workspace_root", os.getcwd())))
+        workspace_config_path = layout.workspace_config_path(workspace_root)
+        workspace_manifest_path = layout.workspace_manifest_path(workspace_root)
         context_metadata = self._engine_context_metadata(engine, settings)
         return {
             "pid": os.getpid(),
             "profile": getattr(settings, "profile", "default"),
-            "profile_dir": str(getattr(settings, "profile_dir", "")),
-            "profile_manifest_path": str(getattr(getattr(settings, "profile_layout", None), "manifest_path", "")),
-            "profile_config_dir": str(getattr(getattr(settings, "profile_layout", None), "config_dir", "")),
-            "user_config_path": str(getattr(getattr(settings, "layout", None), "user_config_path", "")),
-            "workspace_config_path": str(Path(str(getattr(settings, "workspace_root", os.getcwd()))) / ".leapflow" / "config.yaml"),
+            "profile_dir": str(settings.profile_dir),
+            "profile_manifest_path": str(profile_layout.manifest_path),
+            "profile_config_dir": str(profile_layout.config_dir),
+            "user_config_path": str(layout.user_config_path),
+            "mcp_servers_path": str(layout.mcp_servers_path),
+            "workspace_config_path": str(workspace_config_path),
+            "workspace_manifest_path": str(workspace_manifest_path),
             "config_sources": list(getattr(settings, "config_sources", ())),
+            "config_warnings": list(getattr(settings, "config_warnings", ())),
             "watched_config_paths": [str(path) for path in getattr(settings, "watched_config_paths", ())],
             "runtime_dir": str(getattr(settings, "runtime_dir", "")),
+            "tui_history_path": str(profile_layout.tui_history_path),
+            "cache_index_path": str(profile_layout.cache.index_path),
+            "secrets_scope": str(getattr(getattr(settings, "profile_manifest", None), "secrets_scope", "profile")),
             "db_path": str(getattr(db_holder, "db_path", settings.duckdb_path)),
             "volatile": bool(getattr(ctx, "storage_volatile", False)) if ctx is not None else False,
             "uptime_s": max(0.0, time.time() - self._started_at),

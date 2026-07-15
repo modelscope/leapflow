@@ -22,7 +22,6 @@ All logic runs on a single asyncio event loop — no threads::
 from __future__ import annotations
 
 import asyncio
-import os
 import shutil
 import time
 from collections import deque
@@ -182,7 +181,7 @@ class LeapApp:
         theme: Theme,
         status: StatusBar,
         commands: Sequence[tuple[str, str]] = (),
-        data_dir: Optional[Path] = None,
+        history_path: Optional[Path] = None,
         on_input: Optional[InputHandler] = None,
         on_control: Optional[ControlHandler] = None,
     ) -> None:
@@ -214,11 +213,10 @@ class LeapApp:
         self._pending_input = _CommandQueue()
         self._approval_modal: Optional[ApprovalModal] = None
 
-        data_dir = data_dir or Path(
-            os.environ.get("LEAPFLOW_DATA_DIR", "~/.leapflow")
-        ).expanduser()
-        data_dir.mkdir(parents=True, exist_ok=True)
-        self._history_path = data_dir / _HISTORY_FILENAME
+        if history_path is None:
+            raise ValueError("LeapApp requires an explicit layout-derived history_path")
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        self._history_path = history_path
 
         self._input_area = self._build_input_area(commands)
         self._app = self._build_application()

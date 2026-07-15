@@ -50,21 +50,26 @@ def _expand_path(value: str) -> Path:
     return Path(value.replace("~", str(Path.home()))).expanduser()
 
 
-# Legacy constants are kept only for older import sites. Directory creation is
-# owned by PathLayout/ProfileLayout.
-_GLOBAL_SUBDIRS = ["logs"]
-_PROFILE_SUBDIRS = []
-
-
+# Directory creation is owned by PathLayout/ProfileLayout.
 def ensure_data_dir(data_dir: Path, *, profile: str = "default") -> None:
     """Create the LeapFlow data directory using the canonical layout."""
     build_layout(data_dir).ensure(profile_id=_validate_profile_name(profile))
 
 
-def ensure_default_env(data_dir: Path) -> bool:
-    """Deprecated: global .env is no longer a persistent configuration source."""
-    ensure_data_dir(data_dir)
-    return False
+def _bootstrap_data_dir() -> Path:
+    return _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
+
+
+def _bootstrap_profile() -> str:
+    return _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
+
+
+def _bootstrap_layout() -> PathLayout:
+    return build_layout(_bootstrap_data_dir())
+
+
+def _bootstrap_profile_layout() -> ProfileLayout:
+    return _bootstrap_layout().profile(_bootstrap_profile())
 
 
 @dataclass(frozen=True)
@@ -89,26 +94,21 @@ class Settings:
     memory_prefetch_limit: int = 5               # max entries injected per turn
 
     # ── Data Root & Profile ──
-    data_dir: Path = Path("~/.leapflow")
-    profile: str = "default"
-    workspace_root: Path = Path(".")
-    layout: PathLayout = field(default_factory=lambda: build_layout("~/.leapflow"))
-    profile_layout: ProfileLayout = field(
-        default_factory=lambda: build_layout("~/.leapflow").profile("default")
-    )
+    data_dir: Path = field(default_factory=_bootstrap_data_dir)
+    profile: str = field(default_factory=_bootstrap_profile)
+    workspace_root: Path = field(default_factory=lambda: Path.cwd().resolve())
+    layout: PathLayout = field(default_factory=_bootstrap_layout)
+    profile_layout: ProfileLayout = field(default_factory=_bootstrap_profile_layout)
     profile_manifest: ProfileManifest = field(
-        default_factory=lambda: ProfileManifest.default("default")
+        default_factory=lambda: ProfileManifest.default(_bootstrap_profile())
     )
     config_sources: tuple[str, ...] = ()
     watched_config_paths: tuple[Path, ...] = ()
-    runtime_dir: Path = field(
-        default_factory=lambda: build_layout("~/.leapflow").profile("default").runtime_dir
-    )
+    config_warnings: tuple[str, ...] = ()
+    runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
-    audit_log_path: Path = field(
-        default_factory=lambda: build_layout("~/.leapflow").profile("default").audit_log_path
-    )
+    audit_log_path: Path = field(default_factory=lambda: _bootstrap_profile_layout().audit_log_path)
 
     # Imitation Learning
     pattern_library_path: str = ""        # Custom patterns.yaml path (empty = use default)
@@ -132,16 +132,14 @@ class Settings:
     confirm_default_level: str = "confirm"  # Default confirmation level
 
     # Skill Documents (SKILL.md)
-    skills_dir: Path = field(
-        default_factory=lambda: build_layout("~/.leapflow").profile("default").skills_dir
-    )
+    skills_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().skills_dir)
     skill_view_max_chars: int = 5000  # Max chars returned by skill_view tool
     skill_min_quality: float = 0.5    # SkillIndex quality threshold
 
     # Visual Track
     visual_track_enabled: bool = False
     visual_frame_cache_dir: Path = field(
-        default_factory=lambda: build_layout("~/.leapflow").profile("default").cache.category_dir(
+        default_factory=lambda: _bootstrap_profile_layout().cache.category_dir(
             scope="workspace",
             category="perception/keyframes",
             workspace_id=workspace_id_for_path(Path.cwd()),
@@ -265,7 +263,7 @@ class Settings:
     video_codec: str = "h264"
     video_max_segment_s: int = 600
     video_cache_dir: Path = field(
-        default_factory=lambda: build_layout("~/.leapflow").profile("default").cache.category_dir(
+        default_factory=lambda: _bootstrap_profile_layout().cache.category_dir(
             scope="workspace",
             category="video",
             workspace_id=workspace_id_for_path(Path.cwd()),
@@ -433,30 +431,6 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
     return result
 
 
-def _load_yaml_overlay(data_dir: Path) -> Dict[str, str]:
-    """Compatibility wrapper returning flattened structured config values."""
-    layout = build_layout(data_dir)
-    profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
-    workspace_root = _expand_path(
-        os.getenv("LEAPFLOW_WORKSPACE_ROOT", str(Path.cwd())).strip() or str(Path.cwd())
-    ).resolve()
-    profile_layout = layout.profile(profile)
-    bundle = load_config_bundle(layout, profile_layout, workspace_root)
-    return bundle.env
-
-
-def _flatten_yaml(
-    node: Any, *, prefix: str, env_vars: Dict[str, str]
-) -> None:
-    """Flatten nested YAML dict to LEAPFLOW_X_Y_Z = value strings."""
-    if isinstance(node, dict):
-        for key, value in node.items():
-            child_prefix = f"{prefix}_{key}".upper()
-            _flatten_yaml(value, prefix=child_prefix, env_vars=env_vars)
-    else:
-        env_vars[prefix] = str(node)
-
-
 def load_config(*, env_file: str | Path | None = None) -> Settings:
     """Load settings from structured YAML and process environment overrides."""
     if env_file is not None:
@@ -468,7 +442,15 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
         os.getenv("LEAPFLOW_WORKSPACE_ROOT", str(Path.cwd())).strip() or str(Path.cwd())
     ).resolve()
     layout = build_layout(data_dir)
+    try:
+        from leapflow.security.path_sensitivity import configure_path_sensitivity_roots
+        configure_path_sensitivity_roots((layout.root,))
+    except Exception:
+        logger.debug("Path sensitivity root configuration skipped", exc_info=True)
     profile_layout = layout.ensure(profile_id=profile)
+    layout.write_workspace_manifest(workspace_root)
+    workspace_id = workspace_id_for_path(workspace_root)
+    profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
     bundle = load_config_bundle(layout, profile_layout, workspace_root)
 
     original_env = dict(os.environ)
@@ -484,6 +466,7 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
             profile_manifest=profile_layout.load_manifest(),
             config_sources=tuple(str(source.path) for source in bundle.sources),
             watched_config_paths=bundle.watched_paths,
+            config_warnings=bundle.warnings,
         )
     finally:
         for key in injected_keys:
@@ -498,6 +481,7 @@ def _build_settings_from_env(
     profile_manifest: ProfileManifest | None = None,
     config_sources: tuple[str, ...] = (),
     watched_config_paths: tuple[Path, ...] = (),
+    config_warnings: tuple[str, ...] = (),
 ) -> Settings:
     """Build Settings from current os.environ."""
     api_key = os.getenv("LEAPFLOW_LLM_API_KEY", "").strip()
@@ -514,9 +498,19 @@ def _build_settings_from_env(
         os.getenv("LEAPFLOW_WORKSPACE_ROOT", str(Path.cwd())).strip() or str(Path.cwd())
     ).resolve()
     layout = layout or build_layout(data_dir)
+    try:
+        from leapflow.security.path_sensitivity import configure_path_sensitivity_roots
+        configure_path_sensitivity_roots((layout.root,))
+    except Exception:
+        logger.debug("Path sensitivity root configuration skipped", exc_info=True)
     profile_layout = profile_layout or layout.profile(profile)
     profile_manifest = profile_manifest or profile_layout.load_manifest()
     workspace_id = workspace_id_for_path(workspace_root)
+    try:
+        layout.write_workspace_manifest(workspace_root)
+        profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
+    except OSError:
+        logger.debug("Workspace manifest write skipped", exc_info=True)
     _profile_dir = profile_layout.root
     runtime_dir = os.getenv("LEAPFLOW_RUNTIME_DIR", str(profile_layout.runtime_dir)).strip()
 
@@ -857,6 +851,7 @@ def _build_settings_from_env(
         profile_manifest=profile_manifest,
         config_sources=config_sources,
         watched_config_paths=watched_config_paths,
+        config_warnings=config_warnings,
         runtime_dir=_expand_path(runtime_dir),
         audit_log_path=_expand_path(audit_log_path),
         skills_dir=_expand_path(skills_dir),
