@@ -119,21 +119,13 @@ leap config llm set \
 
 Paste your API key when prompted. LeapFlow stores the key in the local secret vault and writes only a `secret://` reference into durable config.
 
-For scripts or CI, pass the key explicitly:
+For scripts or CI, pass the key explicitly through the same config control plane:
 
 ```bash
 leap config llm set \
   --base-url https://api.openai.com/v1 \
   --model gpt-4o \
   --api-key "$OPENAI_API_KEY"
-```
-
-For a one-off shell session, environment variables can temporarily override saved config:
-
-```bash
-export LEAPFLOW_LLM_API_KEY=sk-your-key-here
-export LEAPFLOW_LLM_BASE_URL=https://api.openai.com/v1
-export LEAPFLOW_LLM_MODEL=gpt-4o
 ```
 
 ### 3. Install Execution Backend (macOS only)
@@ -196,95 +188,7 @@ Inside the TUI, the same control plane is available as `/config`. It supports ho
 | `runtime.log_level` | `DEBUG` / `INFO` | Runtime diagnostic verbosity |
 | `scheduler.tick_seconds` | `1.0` | Scheduler polling interval |
 
-`leap config list` is the authoritative source for all writable keys and generated metadata for less common runtime, perception, learning, gateway, hub, safety, and scheduler settings; use `leap config show <key>` or `/config show <key>` when you need one field's details. `LEAPFLOW_*` environment variables remain process-level overrides for automation, containers, or one-off local runs:
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `LEAPFLOW_LLM_API_KEY` | No | — | Temporary API key override; for saved setup, use `leap config llm set --ask-api-key` |
-| `LEAPFLOW_LLM_BASE_URL` | No | DashScope endpoint | Temporary base URL override; for saved setup, use `leap config set llm.base_url <url>` |
-| `LEAPFLOW_LLM_MODEL` | No | `qwen3.7-plus` | Temporary model override; for saved setup, use `leap config set llm.model qwen3.7-plus` |
-| `LEAPFLOW_LLM_CONTEXT_LENGTH` | No | `1000000` | Temporary context budget override; for saved setup, use `leap config set llm.context_length 1000000` |
-| `LEAPFLOW_MOCK_HOST` | No | `0` | Temporary mock-host override; for saved setup, use `leap config set runtime.mock_host true` |
-| `LEAPFLOW_RECORDING_MODE` | No | `video` | Temporary recording-mode override; for saved setup, use `leap config set recording.mode video` |
-| `LEAPFLOW_LOG_LEVEL` | No | `INFO` | Temporary log-level override; for saved setup, use `leap config set runtime.log_level DEBUG` |
-| `LEAPFLOW_DUCKDB_PATH` | No | `~/.leapflow/profiles/default/db/leap.duckdb` | Temporary persistent storage override |
-| `LEAPFLOW_DATA_DIR` | No | `~/.leapflow` | Root data directory |
-
-<details>
-<summary>Full Configuration Reference (all LEAPFLOW_* variables)</summary>
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| **LLM** | | |
-| `LEAPFLOW_LLM_API_KEY` | temporary override | Saved setup: `leap config llm set --ask-api-key` |
-| `LEAPFLOW_LLM_BASE_URL` | DashScope endpoint | OpenAI-compatible base URL |
-| `LEAPFLOW_LLM_MODEL` | `qwen3.7-plus` | Model identifier |
-| `LEAPFLOW_LLM_MAX_RETRIES` | `3` | Retry attempts on transient LLM errors |
-| `LEAPFLOW_LLM_CONTEXT_LENGTH` | `1000000` | Runtime context budget in tokens; explicit config wins over static model hints |
-| **Platform** | | |
-| `LEAPFLOW_MOCK_HOST` | `0` | `1` to use in-process mock (no execution backend) |
-| **Storage** | | |
-| `LEAPFLOW_DUCKDB_PATH` | `~/.leapflow/profiles/default/db/leap.duckdb` | Temporary DuckDB path override |
-| `LEAPFLOW_DATA_DIR` | `~/.leapflow` | Root data directory |
-| `LEAPFLOW_AUDIT_LOG_PATH` | `~/.leapflow/profiles/default/audit/runtime.jsonl` | Temporary audit log path override |
-| **Memory** | | |
-| `LEAPFLOW_MEMORY_WORKING_MAX_TOKENS` | `8192` | Working memory token budget |
-| `LEAPFLOW_MEMORY_EPISODIC_TTL_S` | `300.0` | Episodic memory TTL (seconds) |
-| `LEAPFLOW_MEMORY_EPISODIC_MAX_ENTRIES` | `200` | Max episodic memory entries |
-| `LEAPFLOW_MEMORY_EVOLUTION_MAX_EPISODES` | `1000` | Max episodes for evolution |
-| **Recording** | | |
-| `LEAPFLOW_RECORDING_MODE` | `video` | `video` / `default` / `vision_only` |
-| `LEAPFLOW_VIDEO_FPS` | `5` | Screen capture frames per second |
-| `LEAPFLOW_VIDEO_RESOLUTION_SCALE` | `0.75` | Resolution scale (0.0–1.0) |
-| `LEAPFLOW_VIDEO_CODEC` | `h264` | Video codec (h264 is HW-accelerated on macOS) |
-| `LEAPFLOW_VIDEO_MAX_SEGMENT_S` | `600` | Max seconds per video segment |
-| `LEAPFLOW_VIDEO_CACHE_DIR` | layout-derived session cache | Temporary override; default is `profiles/default/cache/workspaces/<workspace_id>/sessions/<session_id>/video` |
-| **Video Analysis** | | |
-| `LEAPFLOW_VIDEO_VLM_URL_SCHEME` | `base64` | VLM URL scheme (`base64` or HTTPS prefix) |
-| `LEAPFLOW_VIDEO_L2_ENABLED` | `true` | Enable moment-level detailed VLM analysis |
-| `LEAPFLOW_VIDEO_L3_ENABLED` | `true` | Enable frame-level OCR/UI analysis |
-| `LEAPFLOW_VIDEO_MAX_L2_REQUESTS` | `10` | Max VLM calls per segment |
-| **Learnability Assessment** | | |
-| `LEAPFLOW_LEARNABILITY_ENABLED` | `true` | Master switch for learnability filter |
-| `LEAPFLOW_LEARNABILITY_MIN_STEPS` | `3` | Min trajectory steps to consider |
-| `LEAPFLOW_LEARNABILITY_LEARN_THRESHOLD` | `0.65` | Score above → auto-distill |
-| `LEAPFLOW_LEARNABILITY_ASK_THRESHOLD` | `0.40` | Score above → ask user |
-| **Learning & Execution** | | |
-| `LEAPFLOW_LEARN_IDLE_TIMEOUT` | `300` | Idle timeout (seconds) during learn mode |
-| `LEAPFLOW_LEARN_AUTO_DISTILL` | `true` | Auto-distill after recording stops |
-| `LEAPFLOW_CONFIRM_DEFAULT_LEVEL` | `confirm` | Default trust tier for new skills |
-| **Execution Loop** | | |
-| `LEAPFLOW_REACT_MAX_ITERATIONS` | `20` | Hard limit on ReAct iterations |
-| `LEAPFLOW_TOOL_MAX_ITERATIONS` | `30` | Hard limit on tool-call iterations |
-| `LEAPFLOW_COMPRESS_THRESHOLD` | `16` | Context compression trigger |
-| `LEAPFLOW_MAX_TOOL_OUTPUT_CHARS` | `2000` | Truncate tool output beyond this |
-| **Interactive UX** | | |
-| `LEAPFLOW_STREAM_OUTPUT` | `true` | Stream LLM tokens in real-time |
-| `LEAPFLOW_VERBOSE_PROGRESS` | `true` | Show tool execution progress inline |
-| `LEAPFLOW_LOG_LEVEL` | `INFO` | Temporary override; saved setup: `leap config set runtime.log_level DEBUG` |
-| **Signal Fusion** | | |
-| `LEAPFLOW_SIGNAL_CHANNELS` | `all` | Active signal channels (comma-separated or `all`) |
-| `LEAPFLOW_SURPRISE_ENABLED` | `true` | Enable surprise detection annotations |
-| **Causal Inference** | | |
-| `LEAPFLOW_CAUSAL_REORDER_WINDOW_MS` | `300` | Event reorder window (ms) |
-| `LEAPFLOW_CAUSAL_WINDOW_S` | `3.0` | Causal inference time window |
-| `LEAPFLOW_CAUSAL_TIER3_ENABLED` | `false` | Enable VLM-backed Tier 3 inference |
-| **World Model** | | |
-| `LEAPFLOW_PREDICTION_ENABLED` | `true` | Enable predictive coding loop |
-| `LEAPFLOW_PREDICTION_DELTA_THRESHOLD` | `0.3` | Prediction error threshold |
-| `LEAPFLOW_CURIOSITY_ALPHA` | `0.4` | Curiosity: novelty weight |
-| `LEAPFLOW_REPLAY_ON_SESSION_END` | `true` | Run experience replay on session end |
-| **Workflow Copilot** | | |
-| `LEAPFLOW_COPILOT_ENABLED` | `true` | Enable Copilot prediction engine |
-| `LEAPFLOW_COPILOT_MIN_IDLE_MS` | `500` | Min pause to trigger suggestion |
-| `LEAPFLOW_COPILOT_MAX_IDLE_MS` | `5000` | Max idle before suppressing |
-| `LEAPFLOW_COPILOT_CACHE_TTL_S` | `30.0` | Speculative cache TTL |
-| `LEAPFLOW_COPILOT_SPECULATIVE_CACHE_SIZE` | `100` | Cache entry limit |
-| `LEAPFLOW_COPILOT_ACTION_RING_SIZE` | `10` | Context action ring buffer size |
-| **RPC** | | |
-| `LEAPFLOW_RPC_TIMEOUT_DEFAULT` | `30.0` | Default RPC call timeout (seconds) |
-
-</details>
+`leap config list` is the authoritative source for all writable keys and generated metadata for less common runtime, perception, learning, gateway, hub, safety, and scheduler settings; use `leap config show <key>` or `/config show <key>` when you need one field's details. LeapFlow does not load `.env` files; durable settings belong in the config control plane and secrets belong in the vault.
 
 ---
 
@@ -503,7 +407,7 @@ LeapFlow can connect to external messaging platforms — **Feishu (Lark)**, **Di
 |--------|----------|
 | **Config-as-Conversation** | Say *"connect to Feishu"* in the REPL. The agent walks you through credential setup in 1–2 turns — no config files to edit by hand. |
 | **Declarative Manifests** | Each platform is defined by a YAML manifest (credentials, setup guide, adapter module). Add a new platform by dropping a `.yaml` file. |
-| **Credential Security** | Secrets are encrypted at rest (Fernet AES-128-CBC), never appear in LLM context or logs, and can be overridden via environment variables (`LEAPFLOW_<PLATFORM>_<KEY>`). |
+| **Credential Security** | Secrets are encrypted at rest (Fernet AES-128-CBC), never appear in LLM context or logs, and are stored through profile-scoped vault references. |
 | **Lazy Loading** | Platform SDK dependencies are imported only when a platform is first connected, keeping CLI startup instant. |
 | **Adapter Protocol** | Platform adapters implement a simple Python `Protocol` — `connect()`, `disconnect()`, `send()`, `on_message` callback — extensible via `PlatformAdapterMixin` for graceful degradation. |
 | **Auto-Reconnect** | Previously configured platforms are automatically reconnected on startup. Connection state persists across sessions via `gateway.yaml`. |
@@ -599,17 +503,9 @@ class MyAdapter:
 
 3. Say *"connect to my_platform"* in the REPL — the agent handles the rest.
 
-### Environment Variable Overrides
+### Credential Management
 
-For deployment environments (CI/CD, containers), set credentials as environment variables instead of interactive configuration:
-
-```bash
-export LEAPFLOW_TELEGRAM_BOT_TOKEN=your_token_here
-export LEAPFLOW_FEISHU_APP_ID=cli_xxx
-export LEAPFLOW_FEISHU_APP_SECRET=xxx
-```
-
-Environment variables take precedence over values stored in `gateway.yaml`.
+For deployment environments, provision platform credentials through the same gateway setup flow or profile-scoped secret vault used by interactive sessions. `gateway.yaml` stores only non-secret values and `secret://profile/...` references; plaintext credentials should not be committed or placed in ad-hoc environment files.
 
 ---
 
@@ -947,7 +843,7 @@ Transport: stdio (JSON-RPC over stdin/stdout) by default. The `PlatformClient` i
 |---------|-------|-----|
 | `cua-driver not found` | Execution backend not installed | `brew install trycua/tap/cua-driver` |
 | `MCP connection failed` | Backend process not responding | Run `leap host doctor` to diagnose; ensure backend is on PATH |
-| `LEAPFLOW_LLM_API_KEY is empty` | Missing API key | Follow **Configure Your LLM** above, or export `LEAPFLOW_LLM_API_KEY` for a temporary override |
+| `LLM API key is empty` | Missing API key | Follow **Configure Your LLM** above or run `leap config llm key` |
 | `Accessibility permission denied` | macOS privacy gate | System Settings → Privacy & Security → Accessibility → grant permission |
 | `Screen Recording blocked` | macOS privacy gate | System Settings → Privacy & Security → Screen Recording → grant permission |
 

@@ -93,38 +93,36 @@ class CacheManager:
         owner_component: str = "cache",
         metadata: dict[str, Any] | None = None,
     ) -> CacheEntry:
-        scope_value = scope.value if isinstance(scope, CacheScope) else str(scope)
-        resolved = path.expanduser().resolve()
-        size = resolved.stat().st_size if resolved.exists() and resolved.is_file() else 0
-        entry_id = content_hash or _entry_id(resolved)
-        now = time.time()
-        entry = CacheEntry(
-            entry_id=entry_id,
-            profile_id=self._profile_id,
-            workspace_id=workspace_id,
-            session_id=session_id,
-            scope=scope_value,
+        entry = self._build_entry(
+            path=path,
+            scope=scope,
             category=category,
             source=source,
-            path=resolved,
+            workspace_id=workspace_id,
+            session_id=session_id,
             content_hash=content_hash,
-            size_bytes=size,
-            created_at=now,
-            last_accessed_at=now,
             expires_at=expires_at,
             sensitive=sensitive,
             syncable=syncable,
             owner_component=owner_component,
-            metadata=dict(metadata or {}),
+            metadata=metadata,
         )
+        self.register_many((entry,))
+        return entry
+
+    def register_many(self, entries: Iterable[CacheEntry]) -> tuple[CacheEntry, ...]:
+        """Register multiple cache entries using one DuckDB connection."""
+        items = tuple(entries)
+        if not items:
+            return ()
         with self._connect() as con:
-            con.execute(
+            con.executemany(
                 """
                 INSERT OR REPLACE INTO cache_entry VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                _entry_params(entry),
+                [_entry_params(entry) for entry in items],
             )
-        return entry
+        return items
 
     def register_directory(
         self,
@@ -151,7 +149,7 @@ class CacheManager:
                 continue
             if suffix_filter and path.suffix.lower() not in suffix_filter:
                 continue
-            entries.append(self.register(
+            entries.append(self._build_entry(
                 path=path,
                 scope=scope,
                 category=category,
@@ -164,6 +162,7 @@ class CacheManager:
                 owner_component=owner_component,
                 metadata=metadata,
             ))
+        self.register_many(entries)
         return entries
 
     def cleanup_quota(
@@ -185,15 +184,21 @@ class CacheManager:
         if total_size <= max_bytes:
             return 0
         removed = 0
+        to_delete_ids: list[str] = []
         for entry in sorted(entries, key=lambda item: item.last_accessed_at or item.created_at):
             if total_size <= max_bytes:
                 break
             if self._is_managed_path(entry.path):
                 entry.path.unlink(missing_ok=True)
             total_size -= entry.size_bytes
-            with self._connect() as con:
-                con.execute("DELETE FROM cache_entry WHERE id = ?", [entry.entry_id])
+            to_delete_ids.append(entry.entry_id)
             removed += 1
+        if to_delete_ids:
+            with self._connect() as con:
+                con.executemany(
+                    "DELETE FROM cache_entry WHERE id = ?",
+                    [(entry_id,) for entry_id in to_delete_ids],
+                )
         return removed
 
     def touch(self, entry_id: str) -> None:
@@ -274,6 +279,47 @@ class CacheManager:
             )
             con.execute("CREATE INDEX IF NOT EXISTS idx_cache_scope ON cache_entry(profile_id, scope)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_cache_expiry ON cache_entry(expires_at)")
+
+    def _build_entry(
+        self,
+        *,
+        path: Path,
+        scope: CacheScope | str,
+        category: str,
+        source: str,
+        workspace_id: str = "",
+        session_id: str = "",
+        content_hash: str = "",
+        expires_at: float | None = None,
+        sensitive: bool = False,
+        syncable: bool = True,
+        owner_component: str = "cache",
+        metadata: dict[str, Any] | None = None,
+    ) -> CacheEntry:
+        scope_value = scope.value if isinstance(scope, CacheScope) else str(scope)
+        resolved = path.expanduser().resolve()
+        size = resolved.stat().st_size if resolved.exists() and resolved.is_file() else 0
+        entry_id = content_hash or _entry_id(resolved)
+        now = time.time()
+        return CacheEntry(
+            entry_id=entry_id,
+            profile_id=self._profile_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            scope=scope_value,
+            category=category,
+            source=source,
+            path=resolved,
+            content_hash=content_hash,
+            size_bytes=size,
+            created_at=now,
+            last_accessed_at=now,
+            expires_at=expires_at,
+            sensitive=sensitive,
+            syncable=syncable,
+            owner_component=owner_component,
+            metadata=dict(metadata or {}),
+        )
 
     def _connect(self):
         return duckdb.connect(str(self._layout.index_path))

@@ -33,7 +33,7 @@ def test_cache_entry_id_is_stable_across_manager_instances(tmp_path) -> None:
     assert len(first.entry_id) == 64
 
 
-def test_cache_register_directory_and_quota_cleanup(tmp_path) -> None:
+def test_cache_register_directory_and_quota_cleanup(monkeypatch, tmp_path) -> None:
     profile_layout = build_layout(tmp_path / "leap-home").ensure(profile_id="default")
     manager = CacheManager(profile_layout.cache, profile_id="default")
     root = profile_layout.cache.session_dir("ws-test", "session-1") / "video" / "recording"
@@ -44,6 +44,15 @@ def test_cache_register_directory_and_quota_cleanup(tmp_path) -> None:
     old_segment.write_bytes(b"a" * 10)
     new_segment.write_bytes(b"b" * 10)
     ignored.write_text("ignore", encoding="utf-8")
+
+    connect_calls: list[str] = []
+    original_connect = manager._connect
+
+    def counted_connect():
+        connect_calls.append("connect")
+        return original_connect()
+
+    monkeypatch.setattr(manager, "_connect", counted_connect)
 
     entries = manager.register_directory(
         root=root,
@@ -59,9 +68,11 @@ def test_cache_register_directory_and_quota_cleanup(tmp_path) -> None:
     )
 
     assert len(entries) == 2
+    assert len(connect_calls) == 1
     assert all(entry.sensitive is True and entry.syncable is False for entry in entries)
     assert all(entry.owner_component == "perception.video" for entry in entries)
 
+    connect_calls.clear()
     removed = manager.cleanup_quota(
         scope=CacheScope.SESSION.value,
         category="video",
@@ -70,6 +81,7 @@ def test_cache_register_directory_and_quota_cleanup(tmp_path) -> None:
         max_bytes=10,
     )
 
+    assert len(connect_calls) == 2
     remaining = manager.list_entries(
         scope=CacheScope.SESSION.value,
         category="video",

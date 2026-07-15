@@ -16,7 +16,7 @@ async def cmd_relearn(ctx: "Context", trajectory_id: str) -> int:
     if not ctx.settings.has_llm_credentials:
         print(
             "Error: LLM credentials required for learning. "
-            "Configure profile secrets or use LEAPFLOW_LLM_API_KEY as a process override."
+            "Run `leap config llm key` or configure profile secrets."
         )
         return 1
 

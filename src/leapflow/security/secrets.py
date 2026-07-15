@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -149,8 +150,23 @@ class FernetSecretVault:
         payload = {ref: record.to_dict() for ref, record in sorted(records.items())}
         for record in payload.values():
             record.pop("ref", None)
-        self._vault_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        _ensure_private_permissions(self._vault_path)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{self._vault_path.name}.",
+            suffix=".tmp",
+            dir=str(self._vault_path.parent),
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._vault_path)
+            _ensure_private_permissions(self._vault_path)
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def _encrypt(self, value: str) -> str:
         fernet = self._ensure_fernet()

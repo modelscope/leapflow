@@ -59,11 +59,13 @@ class CredentialVault:
                 result[key] = value
         for key in secret_keys:
             ref = stored.get(f"{key}_ref")
-            if not isinstance(ref, str) or not ref.startswith("secret://"):
-                continue
-            resolved = self._vault.get(ref)
-            if resolved:
-                result[key] = resolved
-            else:
+            if isinstance(ref, str) and ref.startswith("secret://"):
+                resolved = self._vault.get(ref)
+                if resolved:
+                    result[key] = resolved
+                    continue
                 logger.warning("Missing gateway credential ref for %s.%s: %s", platform_id, key, ref)
+            legacy_value = stored.get(key)
+            if isinstance(legacy_value, str) and legacy_value:
+                result[key] = legacy_value
         return result

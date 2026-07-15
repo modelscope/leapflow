@@ -5,6 +5,30 @@ from leapflow.layout import build_layout
 from leapflow.security.secrets import FernetSecretVault, secret_ref
 
 
+def test_secret_vault_atomic_save_preserves_existing_file_on_replace_failure(monkeypatch, tmp_path) -> None:
+    import leapflow.security.secrets as secrets_module
+
+    vault = FernetSecretVault(tmp_path / "vault.json", tmp_path / "vault.key")
+    first_ref = secret_ref("profile", "llm", "primary", "api_key")
+    second_ref = secret_ref("profile", "llm", "aux", "api_key")
+    vault.set(first_ref, "sk-original", metadata={"owner": "test"})
+
+    def fail_replace(_src, _dst) -> None:
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(secrets_module.os, "replace", fail_replace)
+
+    try:
+        vault.set(second_ref, "sk-new", metadata={"owner": "test"})
+    except OSError:
+        pass
+    else:
+        raise AssertionError("vault.set should propagate atomic replace failures")
+
+    assert vault.get(first_ref) == "sk-original"
+    assert vault.get(second_ref) is None
+
+
 def test_config_loader_resolves_profile_secret_refs_without_writing_plaintext(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
 

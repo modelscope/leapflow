@@ -1,7 +1,7 @@
 """Configuration loading from structured YAML with environment overrides.
 
 Loading priority (highest wins):
-    1. Process environment variables and explicit override files
+    1. Process environment variables
     2. Workspace ``.leapflow/config.yaml`` overrides
     3. ``profiles/<profile>/config/*.yaml`` profile config
     4. ``config/user.yaml`` user defaults
@@ -16,8 +16,6 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict
-
-from dotenv import load_dotenv
 
 from leapflow.config_loader import load_config_bundle
 from leapflow.domain.trajectory import RecordingMode
@@ -432,11 +430,8 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
     return result
 
 
-def load_config(*, env_file: str | Path | None = None) -> Settings:
+def load_config() -> Settings:
     """Load settings from structured YAML and process environment overrides."""
-    if env_file is not None:
-        load_dotenv(env_file, override=False)
-
     data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
     profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
     workspace_root = _expand_path(
@@ -449,9 +444,12 @@ def load_config(*, env_file: str | Path | None = None) -> Settings:
     except Exception:
         logger.debug("Path sensitivity root configuration skipped", exc_info=True)
     profile_layout = layout.ensure(profile_id=profile)
-    layout.write_workspace_manifest(workspace_root)
     workspace_id = workspace_id_for_path(workspace_root)
-    profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
+    try:
+        layout.write_workspace_manifest(workspace_root)
+        profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
+    except OSError:
+        logger.debug("Workspace manifest write skipped", exc_info=True)
     bundle = load_config_bundle(layout, profile_layout, workspace_root)
 
     original_env = dict(os.environ)
@@ -764,8 +762,7 @@ def _build_settings_from_env(
     # Signal Fusion
     # Default = "all": collect every supported channel (V7 full fusion). Set
     # to "none" or empty list to disable; comma-separated list selects a
-    # specific subset for ablation experiments. See .env.example for the
-    # complete ablation matrix.
+    # specific subset for ablation experiments.
     signal_channels_raw = os.getenv("LEAPFLOW_SIGNAL_CHANNELS", "all").strip().lower()
     if signal_channels_raw == "none":
         signal_channels: frozenset = frozenset()
@@ -1060,7 +1057,7 @@ def _build_settings_from_env(
     )
 
     if not settings.llm_api_key:
-        logger.warning("LEAPFLOW_LLM_API_KEY is empty; LLM calls will fail until configured.")
+        logger.warning("LLM API key is empty; run `leap config llm key` before making LLM calls.")
 
     settings.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
 

@@ -129,6 +129,33 @@ def test_gateway_config_store_warns_for_missing_secret_ref(caplog, tmp_path) -> 
     assert "Missing gateway credential ref" in caplog.text
 
 
+def test_gateway_config_store_loads_legacy_plaintext_secret_without_ref(tmp_path) -> None:
+    from leapflow.gateway.config_store import GatewayConfig, GatewayConfigStore, PlatformConfig
+    from leapflow.gateway.credential_vault import CredentialVault
+    from leapflow.gateway.manifest import CredentialField, PlatformManifest
+
+    manifest = PlatformManifest(
+        platform_id="fake",
+        display_name="Fake",
+        credentials=(
+            CredentialField(key="api_key", label="API Key", secret=True),
+            CredentialField(key="base_url", label="Base URL", secret=False),
+        ),
+    )
+    store = GatewayConfigStore(tmp_path / "gateway.yaml", CredentialVault(tmp_path / "secrets"))
+    store.save(GatewayConfig(platforms={
+        "fake": PlatformConfig(credentials={
+            "api_key": "sk-legacy",
+            "base_url": "https://legacy.example.invalid",
+        }),
+    }))
+
+    assert store.load_platform_credentials("fake", manifest) == {
+        "api_key": "sk-legacy",
+        "base_url": "https://legacy.example.invalid",
+    }
+
+
 @pytest.mark.asyncio
 async def test_gateway_connect_tool_can_connect_builtin_webhook(tmp_path) -> None:
     server = GatewayServer(tmp_path)

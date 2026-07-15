@@ -20,7 +20,6 @@ classifiers = [
 ]
 dependencies = [
     "openai>=1.40",
-    "python-dotenv>=1.0.1",
     "msgpack>=1.0.8",
     "duckdb>=1.0.0",
     "pyyaml>=6.0",

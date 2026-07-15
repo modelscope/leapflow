@@ -13,18 +13,12 @@ fi
 echo "==> Installing Python dependencies (uv sync --all-extras)..."
 uv sync --all-extras
 
-if [ ! -f "${ROOT}/.env" ]; then
-  if [ -f "${ROOT}/.env.example" ]; then
-    cp "${ROOT}/.env.example" "${ROOT}/.env"
-    echo "==> Created .env from .env.example"
-  fi
-fi
-
 echo ""
 echo "Setup complete!"
 echo ""
 echo "Next steps:"
-echo "  1. Edit .env and set LEAPFLOW_LLM_API_KEY"
+echo "  1. Configure the LLM through LeapFlow's config control plane:"
+echo "       uv run leap config llm set --base-url <url> --model <model> --ask-api-key"
 echo "  2. Run LeapFlow:"
 echo "       ./scripts/run.sh --mock-host --prompt \"hello\""
 echo "       # or: uv run leap --mock-host --prompt \"hello\""

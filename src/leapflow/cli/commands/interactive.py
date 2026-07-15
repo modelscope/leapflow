@@ -154,7 +154,7 @@ def _print_auth_setup_hint(console: Any, settings: Any) -> bool:
     missing_ref = next((item.split("Missing secret ref: ", 1)[1] for item in warnings if "Missing secret ref: " in item), "")
     console.warning("LLM API key is not configured.")
     if missing_ref:
-        console.system(f"Set it with `leap config secret set {missing_ref}` or export `LEAPFLOW_LLM_API_KEY` for this process.")
+        console.system(f"Set it with `leap config secret set {missing_ref}` or run `leap config llm key`.")
     else:
         console.system("Run `leap config llm key` to store the API key, or `leap config llm set --api-key <key>` for scripts.")
     return True

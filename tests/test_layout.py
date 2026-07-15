@@ -36,3 +36,27 @@ def test_layout_history_workspace_helpers_and_descriptors(tmp_path) -> None:
     assert video_descriptor.category == "cache_sensitive"
     assert video_descriptor.scope == "session"
     assert video_descriptor.syncable is False
+
+
+def test_layout_yaml_atomic_write_preserves_existing_manifest(monkeypatch, tmp_path) -> None:
+    import leapflow.layout as layout_module
+
+    layout = build_layout(tmp_path / "leap-home")
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    manifest = layout.write_workspace_manifest(workspace_root)
+    original = manifest.read_text(encoding="utf-8")
+
+    def fail_replace(_src, _dst) -> None:
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(layout_module.os, "replace", fail_replace)
+
+    try:
+        layout.write_workspace_manifest(workspace_root)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("workspace manifest write should propagate replace failures")
+
+    assert manifest.read_text(encoding="utf-8") == original

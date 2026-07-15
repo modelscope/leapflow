@@ -570,6 +570,35 @@ async def test_vlm_retry_with_backoff() -> None:
     )
 
 
+async def test_trajectory_recorder_skips_session_cache_without_workspace_id(tmp_path) -> None:
+    from leapflow.perception.video.recorder import TrajectoryRecorder
+
+    class FakeRpc:
+        async def call(self, _name: str, _payload: dict[str, object] | None = None) -> dict[str, object]:
+            return {"segments": []}
+
+    class RecordingCacheManager:
+        def __init__(self) -> None:
+            self.register_calls: list[dict[str, object]] = []
+
+        def register_directory(self, **kwargs) -> list[object]:
+            self.register_calls.append(kwargs)
+            return []
+
+    cache_manager = RecordingCacheManager()
+    recorder = TrajectoryRecorder(
+        FakeRpc(),
+        tmp_path / "recordings",
+        cache_manager=cache_manager,  # type: ignore[arg-type]
+        workspace_id="",
+    )
+
+    await recorder.start("session-1")
+    await recorder.stop()
+
+    assert cache_manager.register_calls == []
+
+
 # ── 7. test_recorder_start_await_no_race ──
 
 

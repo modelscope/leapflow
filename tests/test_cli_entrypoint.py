@@ -226,6 +226,24 @@ def test_config_cli_secret_and_llm_set(monkeypatch, tmp_path, capsys) -> None:
     assert "Config error" in capsys.readouterr().out
 
 
+def test_load_config_degrades_when_workspace_manifest_write_fails(monkeypatch, tmp_path) -> None:
+    from leapflow import config as config_module
+
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "leap-home"))
+    monkeypatch.setenv("LEAPFLOW_WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
+
+    def fail_workspace_manifest(self, workspace_root):
+        raise OSError("read-only workspace")
+
+    monkeypatch.setattr(config_module.PathLayout, "write_workspace_manifest", fail_workspace_manifest)
+
+    settings = config_module.load_config()
+
+    assert settings.layout.root == (tmp_path / "leap-home").expanduser()
+    assert settings.workspace_root == (tmp_path / "workspace").resolve()
+
+
 def test_visual_track_defaults_off_without_env(monkeypatch, tmp_path) -> None:
     from leapflow.config import DEFAULT_LLM_CONTEXT_LENGTH, DEFAULT_LLM_MODEL, _build_settings_from_env
     from leapflow.security.path_sensitivity import configured_path_sensitivity_roots
@@ -273,7 +291,7 @@ def test_interactive_auth_hint_is_short_and_actionable() -> None:
     assert rendered is True
     assert console.warnings == ["LLM API key is not configured."]
     assert console.systems == [
-        "Set it with `leap config secret set secret://profile/llm/primary/api_key` or export `LEAPFLOW_LLM_API_KEY` for this process."
+        "Set it with `leap config secret set secret://profile/llm/primary/api_key` or run `leap config llm key`."
     ]
 
     console = Console()
@@ -301,16 +319,14 @@ def test_profile_name_rejects_path_traversal(monkeypatch, tmp_path) -> None:
     assert not (tmp_path.parent / "escape").exists()
 
 
-def test_context_length_is_exposed_in_env_templates() -> None:
+def test_context_length_is_exposed_in_config_reference() -> None:
     from leapflow.config import DEFAULT_LLM_CONTEXT_LENGTH
-    from leapflow._env_template import ENV_TEMPLATE
 
-    expected = f"LEAPFLOW_LLM_CONTEXT_LENGTH={DEFAULT_LLM_CONTEXT_LENGTH}"
-    example = (Path(__file__).parents[1] / ".env.example").read_text(encoding="utf-8")
+    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
 
-    assert expected in ENV_TEMPLATE
-    assert f"# {expected}" in example
-    assert "Runtime context budget" in ENV_TEMPLATE
+    assert "llm.context_length" in readme
+    assert str(DEFAULT_LLM_CONTEXT_LENGTH) in readme
+    assert "Runtime context budget" in readme
 
 
 def test_build_visual_components_degrades_without_credentials(

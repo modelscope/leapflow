@@ -133,7 +133,7 @@ class TrajectoryRecorder:
         self._reset_state()
         try:
             segments = self._collect_segments(result, output_dir, session_id=session_id)
-            if session_id and output_dir is not None and self._cache_manager is not None:
+            if session_id and output_dir is not None and self._cache_manager is not None and self._workspace_id:
                 self._cache_manager.register_directory(
                     root=output_dir,
                     scope=CacheScope.SESSION,
