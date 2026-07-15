@@ -197,31 +197,22 @@ async def test_context_initialize_degrades_visual_track_without_credentials(
 
 
 @pytest.mark.asyncio
-async def test_context_hot_reloads_llm_credentials_from_env_file(
+async def test_context_hot_reloads_llm_credentials_from_profile_llm_yaml(
     monkeypatch,
     tmp_path,
 ) -> None:
     from leapflow.cli.context import Context
 
     data_dir = tmp_path / "leap-home"
-    data_dir.mkdir()
-    env_path = data_dir / ".env"
-    env_path.write_text(
-        "LEAPFLOW_LLM_API_KEY=\n"
-        "LEAPFLOW_LLM_BASE_URL=https://old.example.invalid/v1\n"
-        "LEAPFLOW_LLM_MODEL=old-model\n"
-        "LEAPFLOW_LLM_CONTEXT_LENGTH=128000\n",
-        encoding="utf-8",
-    )
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(data_dir))
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_MODEL", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_CONTEXT_LENGTH", raising=False)
 
     settings = replace(
-        make_settings(str(tmp_path)),
-        data_dir=data_dir,
+        make_settings(str(data_dir)),
         llm_api_key="",
         llm_base_url="https://old.example.invalid/v1",
         llm_model="old-model",
@@ -237,11 +228,12 @@ async def test_context_hot_reloads_llm_credentials_from_env_file(
         assert ctx.engine is not None
         assert ctx.engine._settings.has_llm_credentials is False
 
-        env_path.write_text(
-            "LEAPFLOW_LLM_API_KEY=sk-hot-reload\n"
-            "LEAPFLOW_LLM_BASE_URL=https://new.example.invalid/v1\n"
-            "LEAPFLOW_LLM_MODEL=new-model\n"
-            "LEAPFLOW_LLM_CONTEXT_LENGTH=512000\n",
+        settings.profile_layout.llm_config_path.write_text(
+            "llm:\n"
+            "  api_key: sk-hot-reload\n"
+            "  base_url: https://new.example.invalid/v1\n"
+            "  model: new-model\n"
+            "  context_length: 512000\n",
             encoding="utf-8",
         )
 
@@ -260,24 +252,22 @@ async def test_context_hot_reloads_llm_credentials_from_env_file(
 
 
 @pytest.mark.asyncio
-async def test_context_hot_reloads_llm_credentials_from_config_yaml(
+async def test_context_hot_reloads_llm_credentials_from_workspace_config_yaml(
     monkeypatch,
     tmp_path,
 ) -> None:
     from leapflow.cli.context import Context
 
     data_dir = tmp_path / "leap-home"
-    data_dir.mkdir()
-    (data_dir / ".env").write_text("LEAPFLOW_LLM_API_KEY=\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(data_dir))
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_BASE_URL", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_MODEL", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_CONTEXT_LENGTH", raising=False)
 
     settings = replace(
-        make_settings(str(tmp_path)),
-        data_dir=data_dir,
+        make_settings(str(data_dir)),
         llm_api_key="",
         llm_base_url="https://old.example.invalid/v1",
         llm_model="old-model",
@@ -285,12 +275,15 @@ async def test_context_hot_reloads_llm_credentials_from_config_yaml(
         vlm_api_key="",
         visual_track_enabled=False,
     )
+    workspace_config = tmp_path / ".leapflow" / "config.yaml"
+    workspace_config.parent.mkdir(parents=True, exist_ok=True)
+    workspace_config.write_text("version: 1\n", encoding="utf-8")
 
     ctx = Context(settings, mock_host=True)
     await ctx.initialize()
     try:
         assert ctx.settings.has_llm_credentials is False
-        (data_dir / "config.yaml").write_text(
+        workspace_config.write_text(
             "llm:\n"
             "  api_key: sk-yaml-hot-reload\n"
             "  base_url: https://yaml.example.invalid/v1\n"
@@ -375,7 +368,9 @@ async def test_daemon_fallback_initializes_local_interactive_with_real_config(
 
     assert result == 0
     assert events == ["interactive"]
-    assert (data_dir / ".env").exists()
+    assert (data_dir / "config" / "user.yaml").exists()
+    assert (data_dir / "profiles" / "default" / "profile.yaml").exists()
+    assert (data_dir / "profiles" / "default" / "config" / "llm.yaml").exists()
 
 
 @pytest.mark.asyncio
@@ -488,7 +483,9 @@ def test_leap_no_daemon_initializes_and_runs_interactive(monkeypatch, tmp_path) 
 
     assert cli.main(["--no-daemon", "--mock-host"]) == 0
     assert events == ["interactive"]
-    assert (data_dir / ".env").exists()
+    assert (data_dir / "config" / "user.yaml").exists()
+    assert (data_dir / "profiles" / "default" / "profile.yaml").exists()
+    assert (data_dir / "profiles" / "default" / "config" / "llm.yaml").exists()
 
 
 def test_leap_daemon_restart_routes_to_daemon_command(monkeypatch) -> None:

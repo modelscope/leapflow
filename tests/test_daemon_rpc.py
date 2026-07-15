@@ -640,18 +640,15 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
     from leapflow.daemon.service import RuntimeLeapService
 
     data_dir = tmp_path / "leap-home"
-    data_dir.mkdir()
-    env_path = data_dir / ".env"
-    env_path.write_text("LEAPFLOW_LLM_API_KEY=\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(data_dir))
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_CONTEXT_LENGTH", raising=False)
 
-    settings = make_settings(str(tmp_path))
+    settings = make_settings(str(data_dir))
     settings = settings.__class__(
         **{
             **settings.__dict__,
-            "data_dir": data_dir,
             "llm_api_key": "",
             "llm_context_length": 128_000,
             "vlm_api_key": "",
@@ -662,9 +659,10 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
     await service.start()
     stream = None
     try:
-        env_path.write_text(
-            "LEAPFLOW_LLM_API_KEY=sk-daemon-hot-reload\n"
-            "LEAPFLOW_LLM_CONTEXT_LENGTH=700000\n",
+        settings.profile_layout.llm_config_path.write_text(
+            "llm:\n"
+            "  api_key: sk-daemon-hot-reload\n"
+            "  context_length: 700000\n",
             encoding="utf-8",
         )
         stream = service.engine_chat("hello")
@@ -682,8 +680,12 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
         assert service.context.engine._settings.llm_api_key == "sk-daemon-hot-reload"
         assert service.context.engine._settings.llm_context_length == 700_000
         status = await service.status()
-        assert status["config_path"] == str(data_dir / ".env")
-        assert status["project_env_path"] == str(tmp_path / ".env")
+        assert status["profile_manifest_path"] == str(settings.profile_layout.manifest_path)
+        assert status["profile_config_dir"] == str(settings.profile_layout.config_dir)
+        assert status["user_config_path"] == str(settings.layout.user_config_path)
+        assert status["workspace_config_path"] == str(tmp_path / ".leapflow" / "config.yaml")
+        assert str(settings.profile_layout.llm_config_path) in status["config_sources"]
+        assert status["runtime_dir"] == str(settings.runtime_dir)
         assert status["llm_context_length"] == 700_000
         assert status["context_used"] == 0
         assert status["runtime_source"].endswith("leapflow/__init__.py")
@@ -814,9 +816,12 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
         "runtime_version": "0.0.test",
         "runtime_source": "/repo/src/leapflow/__init__.py",
         "runtime_executable": "/venv/bin/python",
-        "config_path": "/home/.leapflow/.env",
-        "project_env_path": "/repo/.env",
-        "db_path": "/home/.leapflow/db/leap.duckdb",
+        "profile_manifest_path": "/home/.leapflow/profiles/default/profile.yaml",
+        "profile_config_dir": "/home/.leapflow/profiles/default/config",
+        "user_config_path": "/home/.leapflow/config/user.yaml",
+        "workspace_config_path": "/repo/.leapflow/config.yaml",
+        "runtime_dir": "/home/.leapflow/profiles/default/runtime",
+        "db_path": "/home/.leapflow/profiles/default/db/leap.duckdb",
         "host_backend": {
             "backend": "cua-driver",
             "started": True,
@@ -833,6 +838,10 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
     assert "version: 0.0.test" in output
     assert "source: /repo/src/leapflow/__init__.py" in output
     assert "python: /venv/bin/python" in output
+    assert "profile_config: /home/.leapflow/profiles/default/config" in output
+    assert "user_config: /home/.leapflow/config/user.yaml" in output
+    assert "workspace_config: /repo/.leapflow/config.yaml" in output
+    assert "runtime_dir: /home/.leapflow/profiles/default/runtime" in output
     assert "host: backend=cua-driver started=True pid=None" in output
     assert "host_command: /tmp/cua-driver mcp" in output
     assert "host_capability: test-cap" in output

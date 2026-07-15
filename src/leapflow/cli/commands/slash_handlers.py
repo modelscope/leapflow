@@ -202,13 +202,19 @@ def handle_status(ctx: "Context", console: "LeapConsole", args: str) -> None:
     info.append("CWD:       ", style="dim")
     info.append(f"{cwd}\n")
 
-    config_path = ctx.settings.data_dir / ".env"
-    info.append("Config:    ", style="dim")
-    info.append(f"{str(config_path).replace(os.path.expanduser('~'), '~')}\n")
+    info.append("Profile:   ", style="dim")
+    info.append(f"{ctx.settings.profile}\n")
 
-    project_env = os.path.join(os.getcwd(), ".env")
-    info.append("Override:  ", style="dim")
-    info.append(f"{project_env.replace(os.path.expanduser('~'), '~')}\n")
+    info.append("Config:    ", style="dim")
+    info.append(f"{str(ctx.settings.profile_layout.config_dir).replace(os.path.expanduser('~'), '~')}\n")
+
+    user_config = str(ctx.settings.layout.user_config_path).replace(os.path.expanduser("~"), "~")
+    info.append("User cfg:  ", style="dim")
+    info.append(f"{user_config}\n")
+
+    workspace_config = str(ctx.settings.workspace_root / ".leapflow" / "config.yaml")
+    info.append("Workspace: ", style="dim")
+    info.append(f"{workspace_config.replace(os.path.expanduser('~'), '~')}\n")
 
     session_id = getattr(ctx.session, "session_id", "")
     if session_id:
@@ -830,7 +836,9 @@ def build_status_payload(ctx: "Context") -> dict[str, Any]:
         "turn_count": turn_count,
         "platform": platform_status,
         "cwd": cwd,
-        "config_path": str(ctx.settings.data_dir / ".env").replace(os.path.expanduser("~"), "~"),
+        "config_path": str(ctx.settings.profile_layout.config_dir).replace(os.path.expanduser("~"), "~"),
+        "user_config_path": str(ctx.settings.layout.user_config_path).replace(os.path.expanduser("~"), "~"),
+        "workspace_config_path": str(ctx.settings.workspace_root / ".leapflow" / "config.yaml").replace(os.path.expanduser("~"), "~"),
         "session_id": getattr(ctx.session, "session_id", "") if ctx.session else "",
         "mode": mode,
         "gateway_connected": gateway_connected,

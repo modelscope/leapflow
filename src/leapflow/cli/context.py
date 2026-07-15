@@ -11,12 +11,12 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from dotenv import dotenv_values
 
 from leapflow.platform.cua_client import CuaDriverClient
 from leapflow.platform.event_bus import EventBus
 from leapflow.platform.mock import MockBridge
-from leapflow.config import Settings, _load_yaml_overlay
+from leapflow.config import Settings, _build_settings_from_env
+from leapflow.config_loader import config_signature, load_config_bundle
 from leapflow.engine.engine import AgentEngine, build_default_registry
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.intent_classifier import (
@@ -354,6 +354,11 @@ class Context:
 
     def __init__(self, settings: Settings, mock_host: bool) -> None:
         self.settings = settings
+        try:
+            from leapflow.security.path_sensitivity import configure_path_sensitivity_roots
+            configure_path_sensitivity_roots((settings.layout.root,))
+        except Exception:
+            logger.debug("Path sensitivity root configuration skipped", exc_info=True)
         self.effective_mock = bool(mock_host or settings.mock_host)
 
         # Shared DuckDB connection holder — single leap.duckdb for all stores (P1).
@@ -375,7 +380,7 @@ class Context:
         )
         evolution = EvolutionMemoryProvider(max_episodes=settings.memory_evolution_max_episodes)
         narrative = NarrativeProvider(
-            memory_dir=settings.profile_dir / "memory",
+            memory_dir=settings.profile_layout.memory_dir,
             workspace_path=str(Path.cwd()),
         )
 
@@ -476,13 +481,13 @@ class Context:
         from leapflow.security.grants import ApprovalAuditLog, JsonApprovalGrantStore
         from leapflow.security.orchestrator import ApprovalOrchestrator
 
-        approval_dir = settings.profile_dir / "approval"
+        approval_layout = settings.profile_layout.approval
         self._tui_approval = _TUIApprovalGate()
         self._approval_gate = SessionAwareGate(self._tui_approval)
         self._approval_orchestrator = ApprovalOrchestrator(
             self._approval_gate,
-            grants=JsonApprovalGrantStore(approval_dir / "grants.json"),
-            audit=ApprovalAuditLog(approval_dir / "audit.jsonl"),
+            grants=JsonApprovalGrantStore(approval_layout.grants_path),
+            audit=ApprovalAuditLog(approval_layout.audit_path),
         )
 
     def set_approval_handler(self, handler: Optional[Callable[["ApprovalRequest"], Any]]) -> None:
@@ -603,20 +608,11 @@ class Context:
     @staticmethod
     def _runtime_config_signature(settings: Settings) -> tuple:
         """Return a stable signature for user-editable runtime config files."""
-        paths = (
-            settings.data_dir / ".env",
-            settings.data_dir / "config.yaml",
-            Path.cwd() / ".env",
-        )
-        signature = []
-        for path in paths:
-            try:
-                stat = path.stat()
-            except OSError:
-                signature.append((str(path), 0, 0))
-            else:
-                signature.append((str(path), stat.st_mtime_ns, stat.st_size))
-        return tuple(signature)
+        paths = tuple(settings.watched_config_paths or settings.layout.watched_config_paths(
+            settings.profile,
+            settings.workspace_root,
+        ))
+        return config_signature(paths)
 
     @staticmethod
     def _bool_env(value: str, default: bool) -> bool:
@@ -626,66 +622,29 @@ class Context:
         return text in {"1", "true", "yes", "on"}
 
     def _load_runtime_settings_from_files(self) -> Settings:
-        """Reload hot-swappable LLM/VLM settings directly from config files."""
-        values: dict[str, str] = {}
-        data_env = self.settings.data_dir / ".env"
-        cwd_env = Path.cwd() / ".env"
-        if data_env.exists():
-            values.update({
-                key: value
-                for key, value in dotenv_values(data_env).items()
-                if value is not None
-            })
-        values.update(_load_yaml_overlay(self.settings.data_dir))
-        if cwd_env.exists():
-            values.update({
-                key: value
-                for key, value in dotenv_values(cwd_env).items()
-                if value is not None
-            })
-
-        def _value(key: str, current: str) -> str:
-            env_value = os.environ.get(key, "").strip()
-            if env_value:
-                return env_value
-            return str(values.get(key, current)).strip()
-
-        max_retries_raw = _value(
-            "LEAPFLOW_LLM_MAX_RETRIES",
-            str(self.settings.llm_max_retries),
+        """Reload hot-swappable settings from structured config sources."""
+        bundle = load_config_bundle(
+            self.settings.layout,
+            self.settings.profile_layout,
+            self.settings.workspace_root,
         )
+        original_env = dict(os.environ)
+        injected_keys: list[str] = []
+        for key, value in bundle.env.items():
+            if key not in original_env:
+                os.environ[key] = value
+                injected_keys.append(key)
         try:
-            max_retries = max(1, int(max_retries_raw))
-        except ValueError:
-            max_retries = self.settings.llm_max_retries
-
-        context_length_raw = _value(
-            "LEAPFLOW_LLM_CONTEXT_LENGTH",
-            str(self.settings.llm_context_length),
-        )
-        try:
-            llm_context_length = max(1, int(context_length_raw))
-        except ValueError:
-            llm_context_length = self.settings.llm_context_length
-
-        return replace(
-            self.settings,
-            llm_api_key=_value("LEAPFLOW_LLM_API_KEY", self.settings.llm_api_key),
-            llm_base_url=_value("LEAPFLOW_LLM_BASE_URL", self.settings.llm_base_url).rstrip("/"),
-            llm_model=_value("LEAPFLOW_LLM_MODEL", self.settings.llm_model),
-            llm_max_retries=max_retries,
-            llm_context_length=llm_context_length,
-            vlm_api_key=_value("LEAPFLOW_VLM_API_KEY", self.settings.vlm_api_key),
-            vlm_base_url=_value("LEAPFLOW_VLM_BASE_URL", self.settings.vlm_base_url).rstrip("/"),
-            vlm_model=_value("LEAPFLOW_VLM_MODEL", self.settings.vlm_model),
-            visual_track_enabled=self._bool_env(
-                _value(
-                    "LEAPFLOW_VISUAL_TRACK_ENABLED",
-                    "1" if self.settings.visual_track_enabled else "0",
-                ),
-                self.settings.visual_track_enabled,
-            ),
-        )
+            return _build_settings_from_env(
+                layout=self.settings.layout,
+                profile_layout=self.settings.profile_layout,
+                profile_manifest=self.settings.profile_manifest,
+                config_sources=tuple(str(source.path) for source in bundle.sources),
+                watched_config_paths=bundle.watched_paths,
+            )
+        finally:
+            for key in injected_keys:
+                os.environ.pop(key, None)
 
     def reload_runtime_config_if_changed(self) -> bool:
         """Hot-reload LLM/VLM config when user-editable config files changed."""
@@ -1591,8 +1550,8 @@ class Context:
             await self._gateway_event_bridge.on_gateway_event(event)
 
         self.gateway_server = GatewayServer(
-            settings.profile_dir,
-            extra_manifest_dirs=[settings.profile_dir / "gateway" / "manifests"],
+            settings.profile_layout,
+            extra_manifest_dirs=[settings.profile_layout.gateway.manifests_dir],
             on_event=_on_gateway_event_with_bridge,
             checkpoint_store=_checkpoint_store,
             dedup_store=_dedup_store,
@@ -1727,7 +1686,7 @@ class Context:
         # ── Initialize MCP Manager + register tools into agent surface ──
         self._mcp_manager = None
         try:
-            mcp_config_path = settings.data_dir / "mcp_servers.json"
+            mcp_config_path = settings.layout.mcp_servers_path
             if mcp_config_path.exists():
                 import json as _json_mcp
                 from leapflow.platform.mcp_manager import McpManager, McpServerConfig

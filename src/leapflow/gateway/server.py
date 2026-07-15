@@ -43,6 +43,7 @@ from leapflow.gateway.connectors.protocol import (
 )
 from leapflow.gateway.trigger_policy import TriggerPolicy, _RateTracker
 from leapflow.gateway.credential_vault import CredentialVault
+from leapflow.layout import ProfileLayout
 from leapflow.gateway.events import (
     GatewayMessageReceived,
     GatewaySessionCreated,
@@ -169,18 +170,24 @@ class GatewayServer:
 
     def __init__(
         self,
-        profile_dir: Path,
+        profile_layout: Any,
         *,
         extra_manifest_dirs: Optional[List[Path]] = None,
         on_event: Optional[EventCallback] = None,
         checkpoint_store: Optional[CheckpointStore] = None,
         dedup_store: Optional[DeduplicationStore] = None,
     ) -> None:
-        self._profile_dir = profile_dir
-        self._vault = CredentialVault(profile_dir)
+        if hasattr(profile_layout, "gateway") and hasattr(profile_layout, "secrets"):
+            active_layout = profile_layout
+        else:
+            profile_root = Path(profile_layout)
+            active_layout = ProfileLayout(profile_root, profile_root.name or "default")
+        self._profile_dir = active_layout.root
+        self._vault = CredentialVault(active_layout.secrets.root)
+        config_path = active_layout.gateway_config_path
         self._checkpoint_store = checkpoint_store
         self._dedup_store = dedup_store
-        self._config_store = GatewayConfigStore(profile_dir, self._vault)
+        self._config_store = GatewayConfigStore(config_path, self._vault)
         self._manifest_loader = ManifestLoader(extra_dirs=extra_manifest_dirs)
         self._manifests: Dict[str, PlatformManifest] = {}
         self._adapters: Dict[str, PlatformAdapter] = {}

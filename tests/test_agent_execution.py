@@ -628,9 +628,10 @@ async def test_progressive_disclosure_light_query_omits_tools_and_thinking() -> 
             assert "Original user request: hello" in system_prompt
             assert "Workspace root:" in system_prompt
             assert "never infer `.` as the project root" in system_prompt
-            assert "do not probe that path" in system_prompt
-            assert "~/.leapflow/.env" in system_prompt
-            assert "./.env" in system_prompt
+            assert "LeapFlow workspace config is optional" in system_prompt
+            assert "~/.leapflow/config/user.yaml" in system_prompt
+            assert "~/.leapflow/profiles/<profile>/config/*.yaml" in system_prompt
+            assert "<workspace>/.leapflow/config.yaml" in system_prompt
             snapshot = engine.context_budget_snapshot
             assert snapshot["disclosure_level"] == "core"
             assert snapshot["disclosure"]["native_tools"] is True

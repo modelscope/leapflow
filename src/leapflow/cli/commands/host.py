@@ -58,13 +58,13 @@ _CUA_INSTALL_URL = "https://github.com/trycua/cua"
 def _daemon_pid_file() -> Path:
     """PID file for the ObservationDaemon background process."""
     settings = load_config()
-    return settings.data_dir.expanduser() / "var" / "observation_daemon.pid"
+    return settings.profile_layout.observation_pid_path
 
 
 def _daemon_log_file() -> Path:
     """Log file for ObservationDaemon."""
     settings = load_config()
-    return settings.data_dir.expanduser() / "var" / "observation_daemon.log"
+    return settings.profile_layout.observation_log_path
 
 
 def _cua_driver_installed() -> bool:

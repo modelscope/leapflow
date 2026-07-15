@@ -4,14 +4,13 @@ Defence layers implemented here:
 
 1. Fernet (AES-128-CBC + HMAC-SHA256) encryption at rest for secret fields
 2. File permissions ``0600`` on ``gateway.yaml`` and key file
-3. Graceful degradation to base64 if ``cryptography`` is not installed
+3. Fail-closed persistence when ``cryptography`` is unavailable
 
 Additional layers (file-read denial, tool-result sanitisation, log
 redaction) are implemented at their respective trust boundaries.
 """
 from __future__ import annotations
 
-import base64
 import logging
 import os
 import stat
@@ -21,8 +20,7 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 _FERNET_PREFIX = "enc:fernet:"
-_B64_PREFIX = "enc:b64:"
-_ENC_PREFIXES = (_FERNET_PREFIX, _B64_PREFIX)
+_ENC_PREFIXES = (_FERNET_PREFIX,)
 
 
 def _ensure_file_permissions(path: Path) -> None:
@@ -35,30 +33,27 @@ class CredentialVault:
     """Encrypts and decrypts platform credentials at rest.
 
     Only fields declared ``secret: true`` in the platform manifest are
-    encrypted.  Non-secret fields (e.g. ``app_id``) remain plaintext so
-    users can inspect ``gateway.yaml`` without tools.
+    encrypted. Non-secret fields (e.g. ``app_id``) remain plaintext so users
+    can inspect gateway configuration without tools.
     """
 
-    def __init__(self, profile_dir: Path) -> None:
-        self._key_path = profile_dir / ".credential_key"
+    def __init__(self, secrets_dir: Path) -> None:
+        self._key_path = secrets_dir / "vault.key"
         self._fernet: Optional[Any] = None
-        self._fallback_mode = False
 
     # ── Key management ───────────────────────────────────────
 
     def _ensure_key(self) -> None:
         """Load or generate the encryption key (lazy)."""
-        if self._fernet is not None or self._fallback_mode:
+        if self._fernet is not None:
             return
         try:
             from cryptography.fernet import Fernet
-        except ImportError:
-            logger.warning(
-                "cryptography package not installed; credentials will use "
-                "base64 encoding only.  Install 'cryptography' for AES encryption.",
-            )
-            self._fallback_mode = True
-            return
+        except ImportError as exc:
+            raise RuntimeError(
+                "cryptography is required to persist gateway credentials; "
+                "install the cryptography package or use process environment overrides."
+            ) from exc
 
         if self._key_path.exists():
             key = self._key_path.read_bytes().strip()
@@ -75,12 +70,8 @@ class CredentialVault:
     def encrypt_value(self, plaintext: str) -> str:
         """Encrypt a single credential value.  Returns prefixed ciphertext."""
         self._ensure_key()
-        if self._fernet is not None:
-            token = self._fernet.encrypt(plaintext.encode("utf-8"))
-            return _FERNET_PREFIX + token.decode("ascii")
-        return _B64_PREFIX + base64.b64encode(
-            plaintext.encode("utf-8"),
-        ).decode("ascii")
+        token = self._fernet.encrypt(plaintext.encode("utf-8"))
+        return _FERNET_PREFIX + token.decode("ascii")
 
     def decrypt_value(self, stored: str) -> str:
         """Decrypt a single stored credential value.
@@ -106,9 +97,6 @@ class CredentialVault:
                     type(exc).__name__,
                 )
                 raise
-        if stored.startswith(_B64_PREFIX):
-            encoded = stored[len(_B64_PREFIX):]
-            return base64.b64decode(encoded).decode("utf-8")
         return stored
 
     # ── Batch operations (dict-level) ────────────────────────

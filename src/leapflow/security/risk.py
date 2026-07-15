@@ -1,7 +1,6 @@
 """Risk assessment for structured approval actions."""
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -9,6 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from leapflow.security.actions import ActionDescriptor, ActionKind
+from leapflow.security.path_sensitivity import configured_path_sensitivity_roots
 
 
 class RiskLevel(str, Enum):
@@ -89,8 +89,8 @@ class DefaultRiskClassifier:
         (re.compile(r"\b(pip|npm|brew)\s+install\b", re.IGNORECASE), "dependency_install"),
     )
     _SENSITIVE_NAMES = frozenset({
-        ".env", ".env.local", ".env.production", "config.yaml", "gateway.yaml",
-        ".credential_key", "credentials.json", "secrets.yaml", "secrets.yml",
+        ".env", ".env.local", ".env.production", "credentials.json",
+        "secrets.yaml", "secrets.yml", "vault.json", "vault.key",
         ".npmrc", ".pypirc", ".netrc",
     })
     _SENSITIVE_PARTS = ("/.ssh/", "/.gnupg/", "/.aws/", "/.kube/")
@@ -198,6 +198,14 @@ class DefaultRiskClassifier:
                 explanation="This shell command executes code, changes runtime state, or reaches sensitive resources.",
                 allow_permanent=False,
             )
+        if self._mentions_sensitive_config(command):
+            return RiskAssessment(
+                level=RiskLevel.HIGH,
+                score=0.8,
+                reasons=("sensitive_config_reference",),
+                explanation="This command references LeapFlow configuration, secrets, or profile data.",
+                allow_permanent=False,
+            )
         reasons = self._matched_reasons(command, self._SHELL_MEDIUM)
         if reasons:
             return RiskAssessment(
@@ -214,7 +222,7 @@ class DefaultRiskClassifier:
         normalized = str(path).replace("\\", "/").lower()
         meta = action.metadata or {}
         category = str(meta.get("sensitivity_category") or "")
-        if category == "credential":
+        if category in {"credential", "secret_vault"}:
             return RiskAssessment(
                 level=RiskLevel.HIGH,
                 score=0.82,
@@ -222,7 +230,10 @@ class DefaultRiskClassifier:
                 explanation="This reads credentials, tokens, or security-sensitive configuration. Content will be redacted.",
                 allow_permanent=False,
             )
-        if category in ("audit_log", "memory_store", "leapflow_profile_data", "runtime_state"):
+        if category in (
+            "approval_state", "audit_log", "memory_store", "leapflow_profile_data",
+            "runtime_state", "config", "cache_sensitive",
+        ):
             return RiskAssessment(
                 level=RiskLevel.HIGH,
                 score=0.75,
@@ -245,6 +256,7 @@ class DefaultRiskClassifier:
         name = path.name.lower()
         normalized = str(path).replace("\\", "/").lower()
         size = int(action.metadata.get("bytes") or 0)
+        category = str(action.metadata.get("sensitivity_category") or "")
         if any(normalized.startswith(prefix) for prefix in ("/system", "/usr", "/bin", "/sbin", "/etc")):
             return RiskAssessment(
                 level=RiskLevel.CRITICAL,
@@ -252,6 +264,23 @@ class DefaultRiskClassifier:
                 reasons=("system_path_write",),
                 explanation="This writes to an operating-system controlled path.",
                 hardline=True,
+                allow_permanent=False,
+            )
+        if category in {"runtime_database", "database", "runtime_control", "secret_vault"}:
+            return RiskAssessment(
+                level=RiskLevel.CRITICAL,
+                score=0.95,
+                reasons=(f"{category}_write",),
+                explanation="This writes to protected LeapFlow runtime, database, or secret storage.",
+                hardline=True,
+                allow_permanent=False,
+            )
+        if category in {"config", "cache_sensitive", "approval_state"}:
+            return RiskAssessment(
+                level=RiskLevel.HIGH,
+                score=0.8,
+                reasons=(f"{category}_write",),
+                explanation="This writes to sensitive LeapFlow runtime configuration or state.",
                 allow_permanent=False,
             )
         if name in self._SENSITIVE_NAMES or any(part in normalized for part in self._SENSITIVE_PARTS):
@@ -278,6 +307,14 @@ class DefaultRiskClassifier:
     @staticmethod
     def _mentions_sensitive_config(command: str) -> bool:
         lowered = command.lower().replace("\\", "/")
-        home = str(Path.home()).lower().replace("\\", "/")
-        data_dir = os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").replace("~", home).lower()
-        return any(token in lowered for token in (".env", "config.yaml", "gateway.yaml", data_dir))
+        configured_roots = tuple(
+            str(root).lower().replace("\\", "/").rstrip("/")
+            for root in configured_path_sensitivity_roots()
+        )
+        return any(
+            token in lowered
+            for token in (
+                ".env", "vault.json", "vault.key", "secrets.yaml", "config/user.yaml",
+                "profiles/", "config.yaml", *configured_roots,
+            )
+        )

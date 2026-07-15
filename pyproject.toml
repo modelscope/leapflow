@@ -24,6 +24,7 @@ dependencies = [
     "msgpack>=1.0.8",
     "duckdb>=1.0.0",
     "pyyaml>=6.0",
+    "cryptography>=42.0",
     "Pillow>=10.0",
     "mcp>=1.26.0",
     "watchdog>=3.0",

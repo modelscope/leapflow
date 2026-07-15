@@ -88,10 +88,14 @@ def _print_runtime_status(status: dict) -> None:
         print(f"source: {status['runtime_source']}")
     if status.get("runtime_executable"):
         print(f"python: {status['runtime_executable']}")
-    if status.get("config_path"):
-        print(f"config: {status['config_path']}")
-    if status.get("project_env_path"):
-        print(f"project_env: {status['project_env_path']}")
+    if status.get("profile_config_dir"):
+        print(f"profile_config: {status['profile_config_dir']}")
+    if status.get("user_config_path"):
+        print(f"user_config: {status['user_config_path']}")
+    if status.get("workspace_config_path"):
+        print(f"workspace_config: {status['workspace_config_path']}")
+    if status.get("runtime_dir"):
+        print(f"runtime_dir: {status['runtime_dir']}")
     if status.get("db_path"):
         print(f"db: {status['db_path']}")
     host = status.get("host_backend")

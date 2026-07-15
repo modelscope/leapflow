@@ -148,7 +148,7 @@ uv run leap --mock-host "hello, are you ready?"
 
 ## Configuration Reference
 
-The `.env` file lives in your project root (or `~/.leapflow/.env` for global defaults). Key variables:
+Persistent configuration lives in structured YAML: `~/.leapflow/config/user.yaml`, `~/.leapflow/profiles/<profile>/config/*.yaml`, and optional `<workspace>/.leapflow/config.yaml`. `LEAPFLOW_*` environment variables remain supported as highest-priority temporary overrides:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -159,7 +159,7 @@ The `.env` file lives in your project root (or `~/.leapflow/.env` for global def
 | `LEAPFLOW_MOCK_HOST` | No | `0` | Set `1` to use in-process mock (no execution backend) |
 | `LEAPFLOW_RECORDING_MODE` | No | `video` | `video` / `default` / `vision_only` |
 | `LEAPFLOW_LOG_LEVEL` | No | `INFO` | `DEBUG` / `INFO` / `WARNING` |
-| `LEAPFLOW_DUCKDB_PATH` | No | `~/.leapflow/memory.duckdb` | Persistent storage location |
+| `LEAPFLOW_DUCKDB_PATH` | No | `~/.leapflow/profiles/default/db/leap.duckdb` | Persistent storage location |
 | `LEAPFLOW_DATA_DIR` | No | `~/.leapflow` | Root data directory |
 
 <details>
@@ -316,7 +316,7 @@ The bottom toolbar shows the active model and context usage, for example:
 qwen3.7-plus │ 0/256K │ [░░░░░░░░░░] 0%
 ```
 
-The max value comes from `LEAPFLOW_LLM_CONTEXT_LENGTH` — LeapFlow's runtime context budget. Configure it in `~/.leapflow/.env`, project `./.env`, `~/.leapflow/config.yaml`, or real environment variables. Explicit config always wins over static model capability hints.
+The max value comes from `LEAPFLOW_LLM_CONTEXT_LENGTH` — LeapFlow's runtime context budget. Configure it in profile `config/llm.yaml`, workspace `.leapflow/config.yaml`, or real environment variables. Explicit config always wins over static model capability hints.
 
 <details>
 <summary>More commands — teaching, execution, skills, host, daemon</summary>

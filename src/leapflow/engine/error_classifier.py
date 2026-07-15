@@ -112,15 +112,15 @@ RECOVERY_MAP: Dict[ErrorCategory, RecoveryStrategy] = build_recovery_map()
 _FRIENDLY_MESSAGES: Dict[ErrorCategory, str] = {
     ErrorCategory.AUTH_ERROR: (
         "LLM authentication failed — the API key is missing or invalid. "
-        "Set a valid LEAPFLOW_LLM_API_KEY in ~/.leapflow/.env "
-        "or in a project-specific ./.env file, then retry. "
-        "Also verify LEAPFLOW_LLM_BASE_URL / LEAPFLOW_LLM_MODEL."
+        "Set a valid LLM API key in the profile secret vault or use "
+        "LEAPFLOW_LLM_API_KEY as a process override, then retry. "
+        "Also verify llm.base_url / llm.model in profile config."
     ),
     ErrorCategory.AUTH_PERMANENT: (
         "LLM authentication failed — the API key is missing or invalid. "
-        "Set a valid LEAPFLOW_LLM_API_KEY in ~/.leapflow/.env "
-        "or in a project-specific ./.env file, then retry. "
-        "Also verify LEAPFLOW_LLM_BASE_URL / LEAPFLOW_LLM_MODEL."
+        "Set a valid LLM API key in the profile secret vault or use "
+        "LEAPFLOW_LLM_API_KEY as a process override, then retry. "
+        "Also verify llm.base_url / llm.model in profile config."
     ),
     ErrorCategory.BILLING: (
         "LLM request rejected due to billing/quota limits \u2014 "

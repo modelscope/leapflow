@@ -8,6 +8,7 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any
 
 from leapflow.daemon.lease import ClientLeaseSnapshot
@@ -143,15 +144,18 @@ class RuntimeLeapService:
         settings = getattr(ctx, "settings", self._settings) if ctx is not None else self._settings
         engine = getattr(ctx, "engine", None) if ctx is not None else None
         db_holder = getattr(ctx, "_db_holder", None) if ctx is not None else None
-        config_path = os.path.join(str(getattr(settings, "data_dir", "")), ".env")
-        project_env_path = os.path.join(os.getcwd(), ".env")
         context_metadata = self._engine_context_metadata(engine, settings)
         return {
             "pid": os.getpid(),
             "profile": getattr(settings, "profile", "default"),
             "profile_dir": str(getattr(settings, "profile_dir", "")),
-            "config_path": config_path,
-            "project_env_path": project_env_path,
+            "profile_manifest_path": str(getattr(getattr(settings, "profile_layout", None), "manifest_path", "")),
+            "profile_config_dir": str(getattr(getattr(settings, "profile_layout", None), "config_dir", "")),
+            "user_config_path": str(getattr(getattr(settings, "layout", None), "user_config_path", "")),
+            "workspace_config_path": str(Path(str(getattr(settings, "workspace_root", os.getcwd()))) / ".leapflow" / "config.yaml"),
+            "config_sources": list(getattr(settings, "config_sources", ())),
+            "watched_config_paths": [str(path) for path in getattr(settings, "watched_config_paths", ())],
+            "runtime_dir": str(getattr(settings, "runtime_dir", "")),
             "db_path": str(getattr(db_holder, "db_path", settings.duckdb_path)),
             "volatile": bool(getattr(ctx, "storage_volatile", False)) if ctx is not None else False,
             "uptime_s": max(0.0, time.time() - self._started_at),

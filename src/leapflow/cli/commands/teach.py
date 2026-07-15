@@ -374,8 +374,8 @@ async def cmd_teach(ctx: "Context", goal: str, timeout: Optional[float], field_a
         print()
         print("[ WARNING: LLM NOT CONFIGURED ]")
         print(f"  Recording saved (trajectory: {result.trajectory_id}, {result.step_count} steps).")
-        print("  Learning requires LEAPFLOW_LLM_API_KEY to produce useful skills.")
-        print("  Configure it in .env, then run:")
+        print("  Learning requires an LLM API key from the profile secret vault or LEAPFLOW_LLM_API_KEY override.")
+        print("  Configure profile secrets, then run:")
         print(f"    leap relearn {result.trajectory_id}")
         return 0
 

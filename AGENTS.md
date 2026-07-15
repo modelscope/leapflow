@@ -49,6 +49,16 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - **Single Source of Truth**: DuckDB for persistence, EventBus for communication, Settings for configuration
 - **Inbound Signal Classification**: Platform events must be classified before they activate the agent. Message/callback events may enter Decide; signal/lifecycle events should be stored or routed without triggering LLM by default; ignored events must be explicit (e.g. self-message, duplicate, blocked scope).
 
+## Path Tree, Configuration, and Secrets Rules
+
+- **Layout is the only path authority**: all LeapFlow-managed paths must come from `PathLayout`, `ProfileLayout`, or their child layout objects. Business modules must not construct paths such as `profile_dir / "cache"`, `profile_dir / "approval"`, `data_dir / ".env"`, or `profile_dir / "gateway.yaml"`.
+- **Profile is the runtime boundary**: profile metadata, config, DBs, memory, skills, gateway state, approval state, audit logs, cache, runtime files, and profile-scoped secrets live under `profiles/<profile>/` and must be addressed through `ProfileLayout`.
+- **Persistent config is structured YAML**: long-lived configuration lives in `config/user.yaml`, `profiles/<profile>/config/*.yaml`, and optional `<workspace>/.leapflow/config.yaml`. `LEAPFLOW_*` process environment values and explicit override files are temporary highest-priority overrides, not persistent config stores.
+- **Secrets are never durable plaintext config**: long-lived LLM, VLM, aux provider, Gateway, and Hub credentials must use `secret://global/...` or `secret://profile/...` references resolved through the vault layer. Config files may store refs, never tokens.
+- **Cache is scope-aware**: cache paths must declare `profile`, `workspace`, or `session` scope and route through `CacheLayout`/`CacheManager`. Session visual/video/VLM/signal artifacts are sensitive, non-syncable by default, and must be eligible for index-driven TTL/quota cleanup.
+- **Runtime and control files are protected**: daemon sockets, pid/lock files, runtime state, DuckDB files, vault files, approval grants/audit, and memory stores must flow through path sensitivity, risk, approval, and redaction metadata before file tools can access them.
+- **No legacy aliases unless explicitly approved**: do not reintroduce global `.env` as a main config source, flat cache directories, profile-root gateway config, `.credential_key`, or `run/` runtime paths.
+
 ## Implementation Guidelines
 
 - Define the Protocol first — the contract is the design

@@ -963,12 +963,15 @@ async def cmd_interactive_daemon(
         db_path = daemon_status.get("db_path")
         if db_path:
             console.system(f"DB: {db_path}")
-        config_path = daemon_status.get("config_path")
-        if config_path:
-            console.system(f"Config: {config_path}")
-        project_env_path = daemon_status.get("project_env_path")
-        if project_env_path:
-            console.system(f"Project override: {project_env_path}")
+        profile_config_dir = daemon_status.get("profile_config_dir")
+        if profile_config_dir:
+            console.system(f"Profile config: {profile_config_dir}")
+        user_config_path = daemon_status.get("user_config_path")
+        if user_config_path:
+            console.system(f"User config: {user_config_path}")
+        workspace_config_path = daemon_status.get("workspace_config_path")
+        if workspace_config_path:
+            console.system(f"Workspace config: {workspace_config_path}")
         runtime_version = daemon_status.get("runtime_version")
         if runtime_version:
             console.system(f"Runtime version: {runtime_version}")

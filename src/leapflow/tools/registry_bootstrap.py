@@ -54,8 +54,10 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "Read text file content with adaptive context governance. For large or unfamiliar files, "
                 "prefer mode='outline' or mode='symbols' first, then use mode='raw' "
                 "with start_line/max_lines for the specific range you actually need. "
-                "Do not probe `<workspace>/.leapflow/config.json`; LeapFlow uses `~/.leapflow/.env` "
-                "and optional existing `./.env` project overrides."
+                "Do not probe `<workspace>/.leapflow/config.json`; LeapFlow uses structured "
+                "config under `~/.leapflow/config/user.yaml`, "
+                "`~/.leapflow/profiles/<profile>/config/*.yaml`, and optional "
+                "`<workspace>/.leapflow/config.yaml`."
             ),
             "parameters": {
                 "type": "object",
