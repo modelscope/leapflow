@@ -5,6 +5,7 @@
 
 ### News
 
+- **2026-07-15**: v0.0.3 released — layered YAML config, Path/Profile/Cache layouts, encrypted secret refs, DuckDB cache indexing, `leap config`, and robustness hardening.
 - **2026-07-15**: v0.0.2 released — TUI, Gateway/App Connector, Hub sync, Scheduler, Workflow Copilot, and runtime hardening.
 - **2025-06-30**: LeapFlow Preview released — initial public release with record & replay, multi-modal signal fusion, and Workflow Copilot.
 
