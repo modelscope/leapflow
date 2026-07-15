@@ -226,7 +226,7 @@ def display_rich_banner(
         summary_parts.append(f"{mcp_tools} mcp")
     if gateway_connected:
         summary_parts.append(f"{len(gateway_connected)} gateway")
-    summary_parts.append("/help · /tools · /skills")
+    summary_parts.append("/help · /tool · /skill")
     right_lines.append("")
     right_lines.append(f"[{palette.muted}]{' · '.join(summary_parts)}[/]")
 

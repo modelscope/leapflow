@@ -227,9 +227,9 @@ class RuntimeLeapService:
 
     async def tools_list(self) -> dict[str, Any]:
         """Return daemon-owned tool summary for slash-command rendering."""
-        from leapflow.cli.commands.slash_handlers import build_tools_payload
+        from leapflow.cli.commands.slash_handlers import build_tool_payload
 
-        return build_tools_payload(self.context)
+        return build_tool_payload(self.context)
 
     async def usage_summary(self) -> dict[str, Any]:
         """Return token usage for the current daemon-owned session."""

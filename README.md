@@ -234,7 +234,7 @@ Inside the TUI, use slash commands for quick inspection and control:
 
 ```text
 /status   show runtime and backend status
-/tools    inspect available tools
+/tool     inspect available tools
 /config   view or update saved config; `/config keys` lists writable settings
 /model    show the active model; `/model qwen3.7-plus` updates and hot-reloads it
 /usage    inspect context and token usage

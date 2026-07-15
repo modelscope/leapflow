@@ -268,7 +268,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
         handle_status,
-        handle_tools,
+        handle_tool,
         handle_usage,
         handle_model,
         handle_config,
@@ -592,8 +592,8 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 _render_banner()
                 return
 
-            if canonical == "tools":
-                handle_tools(ctx, console, cmd_args)
+            if canonical == "tool":
+                handle_tool(ctx, console, cmd_args)
                 return
 
             if canonical == "gateway":
@@ -625,8 +625,8 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                     await _after_dispatch(text)
                     return
 
-            if canonical.startswith("skills"):
-                if _handle_skills(ctx, console, cmd_text):
+            if canonical.startswith("skill"):
+                if _handle_skill(ctx, console, cmd_text):
                     return
 
             if canonical.startswith("hub"):
@@ -665,7 +665,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 )
                 return
 
-            if canonical == "tasks":
+            if canonical == "task":
                 from leapflow.cli.commands.scheduler import cmd_tasks
 
                 await cmd_tasks(
@@ -852,7 +852,7 @@ async def cmd_interactive_daemon(
         render_app_payload,
         render_command_payload,
         render_model_payload,
-        render_tools_payload,
+        render_tool_payload,
         render_usage_payload,
     )
     from leapflow.cli.tui_app import (
@@ -1591,9 +1591,9 @@ async def _handle_teach(
     return False
 
 
-def _handle_skills(ctx: "Context", console, line: str) -> bool:
-    """Handle skills commands. Returns True if handled."""
-    if line in ("skills", "skills list", "技能列表"):
+def _handle_skill(ctx: "Context", console, line: str) -> bool:
+    """Handle skill commands. Returns True if handled."""
+    if line in ("skill", "skill list"):
         skills = ctx.registry.list_all() if ctx.registry else []
         if not skills:
             console.system("No skills registered.")
@@ -1618,8 +1618,8 @@ def _handle_skills(ctx: "Context", console, line: str) -> bool:
             console.print(table)
         return True
 
-    if line.startswith("skills show "):
-        name = line[len("skills show "):]
+    if line.startswith("skill show "):
+        name = line[len("skill show "):]
         skill = ctx.registry.get(name) if ctx.registry else None
         if skill is None:
             console.warning(f"Skill '{name}' not found.")
@@ -1640,8 +1640,8 @@ def _handle_skills(ctx: "Context", console, line: str) -> bool:
             )
         return True
 
-    if line.startswith("skills disable "):
-        name = line[len("skills disable "):]
+    if line.startswith("skill disable "):
+        name = line[len("skill disable "):]
         found = False
         if ctx.skill_lib and ctx.skill_lib.deactivate_parameterized(name):
             found = True
@@ -1653,8 +1653,8 @@ def _handle_skills(ctx: "Context", console, line: str) -> bool:
             console.warning(f"Skill '{name}' not found.")
         return True
 
-    if line.startswith("skills delete "):
-        name = line[len("skills delete "):]
+    if line.startswith("skill delete "):
+        name = line[len("skill delete "):]
         found = False
         if ctx.skill_lib:
             stored = ctx.skill_lib.load_skill_by_title(name)

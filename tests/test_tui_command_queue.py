@@ -249,7 +249,7 @@ def test_slash_completer_filters_multi_word_commands() -> None:
     completer = SlashCommandCompleter((
         ("teach start", "Start teaching mode"),
         ("teach stop", "Stop and distill skill"),
-        ("tools", "List available tools"),
+        ("tool", "List available tools"),
     ))
 
     completions = list(completer.get_completions(Document("/teach s", len("/teach s")), None))

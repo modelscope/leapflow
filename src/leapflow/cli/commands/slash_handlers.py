@@ -15,8 +15,8 @@ if TYPE_CHECKING:
     from leapflow.cli.tui_app.console import LeapConsole
 
 
-def build_tools_payload(ctx: "Context") -> dict[str, Any]:
-    """Build a serializable tools summary for local or daemon rendering."""
+def build_tool_payload(ctx: "Context") -> dict[str, Any]:
+    """Build a serializable tool summary for local or daemon rendering."""
     from leapflow.cli.banner import _categorize_tools
     from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
 
@@ -33,8 +33,8 @@ def build_tools_payload(ctx: "Context") -> dict[str, Any]:
     }
 
 
-def render_tools_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
-    """Render a serializable tools summary."""
+def render_tool_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    """Render a serializable tool summary."""
     from rich.table import Table
 
     if not payload.get("ok", True):
@@ -491,9 +491,9 @@ def handle_status(ctx: "Context", console: "LeapConsole", args: str) -> None:
     ))
 
 
-def handle_tools(ctx: "Context", console: "LeapConsole", args: str) -> None:
+def handle_tool(ctx: "Context", console: "LeapConsole", args: str) -> None:
     """Display available tools grouped by category."""
-    render_tools_payload(console, build_tools_payload(ctx))
+    render_tool_payload(console, build_tool_payload(ctx))
 
 
 def handle_usage(ctx: "Context", console: "LeapConsole", args: str) -> None:
@@ -1000,8 +1000,8 @@ async def command_execute(ctx: "Context", name: str, args: str = "") -> dict[str
     """
     if name == "status":
         return build_status_payload(ctx)
-    if name == "tools":
-        return build_tools_payload(ctx)
+    if name == "tool":
+        return build_tool_payload(ctx)
     if name == "usage":
         return build_usage_payload(ctx)
     if name == "model":
@@ -1021,16 +1021,16 @@ async def command_execute(ctx: "Context", name: str, args: str = "") -> dict[str
         return await build_app_payload(ctx, app_args)
     if name.startswith("teach") or name == "annotate":
         return await _execute_teach(ctx, name, args)
-    if name.startswith("skills"):
-        return _execute_skills(ctx, name, args)
+    if name == "skill" or name.startswith("skill "):
+        return _execute_skill(ctx, name, args)
     if name.startswith("hub"):
         return await _execute_hub(ctx, name, args)
     if name == "run":
         return {"ok": True, "stream": True, "prompt": args}
     if name == "arm":
         return await _execute_scheduler_arm(ctx, args)
-    if name == "tasks":
-        return _execute_scheduler_tasks(ctx)
+    if name == "task":
+        return _execute_scheduler_task(ctx)
     return {"ok": False, "message": f"Unknown command: /{name}"}
 
 
@@ -1277,13 +1277,13 @@ async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]
     return {"ok": False, "message": f"Unknown teach command: /{full_cmd}"}
 
 
-def _execute_skills(ctx: "Context", name: str, args: str) -> dict[str, Any]:
-    """Execute skills commands."""
+def _execute_skill(ctx: "Context", name: str, args: str) -> dict[str, Any]:
+    """Execute skill commands."""
     full_cmd = name + (" " + args if args else "")
-    if full_cmd in ("skills", "skills list"):
+    if full_cmd in ("skill", "skill list"):
         skills = ctx.registry.list_all() if ctx.registry else []
         if not skills:
-            return {"ok": True, "view": "skills_list", "skills": []}
+            return {"ok": True, "view": "skill_list", "skills": []}
         entries = []
         for s in skills:
             m = s.metadata
@@ -1293,19 +1293,19 @@ def _execute_skills(ctx: "Context", name: str, args: str) -> dict[str, Any]:
                 "confidence": m.confidence,
                 "description": s.description[:80],
             })
-        return {"ok": True, "view": "skills_list", "skills": entries}
+        return {"ok": True, "view": "skill_list", "skills": entries}
 
-    if name == "skills show":
+    if name == "skill show":
         skill_name = args.strip()
         if not skill_name:
-            return {"ok": False, "message": "Usage: /skills show <name>"}
+            return {"ok": False, "message": "Usage: /skill show <name>"}
         skill = ctx.registry.get(skill_name) if ctx.registry else None
         if skill is None:
             return {"ok": False, "message": f"Skill '{skill_name}' not found."}
         m = skill.metadata
         return {
             "ok": True,
-            "view": "skills_show",
+            "view": "skill_show",
             "name": skill.name,
             "description": skill.description,
             "version": m.version,
@@ -1313,10 +1313,10 @@ def _execute_skills(ctx: "Context", name: str, args: str) -> dict[str, Any]:
             "triggers": list(skill.triggers) if skill.triggers else [],
         }
 
-    if name == "skills disable":
+    if name == "skill disable":
         skill_name = args.strip()
         if not skill_name:
-            return {"ok": False, "message": "Usage: /skills disable <name>"}
+            return {"ok": False, "message": "Usage: /skill disable <name>"}
         found = False
         if ctx.skill_lib and ctx.skill_lib.deactivate_parameterized(skill_name):
             found = True
@@ -1326,10 +1326,10 @@ def _execute_skills(ctx: "Context", name: str, args: str) -> dict[str, Any]:
             return {"ok": True, "message": f"Skill '{skill_name}' disabled."}
         return {"ok": False, "message": f"Skill '{skill_name}' not found."}
 
-    if name == "skills delete":
+    if name == "skill delete":
         skill_name = args.strip()
         if not skill_name:
-            return {"ok": False, "message": "Usage: /skills delete <name>"}
+            return {"ok": False, "message": "Usage: /skill delete <name>"}
         found = False
         if ctx.skill_lib:
             stored = ctx.skill_lib.load_skill_by_title(skill_name)
@@ -1343,7 +1343,7 @@ def _execute_skills(ctx: "Context", name: str, args: str) -> dict[str, Any]:
             return {"ok": True, "message": f"Skill '{skill_name}' deleted."}
         return {"ok": False, "message": f"Skill '{skill_name}' not found."}
 
-    return {"ok": False, "message": f"Unknown skills command: /{full_cmd}"}
+    return {"ok": False, "message": f"Unknown skill command: /{full_cmd}"}
 
 
 async def _execute_hub(ctx: "Context", name: str, args: str) -> dict[str, Any]:
@@ -1367,17 +1367,17 @@ async def _execute_hub(ctx: "Context", name: str, args: str) -> dict[str, Any]:
     return {"ok": False, "message": f"Hub command '{command}' is not yet implemented in this runtime."}
 
 
-def _execute_scheduler_tasks(ctx: "Context") -> dict[str, Any]:
-    """Execute /tasks command."""
+def _execute_scheduler_task(ctx: "Context") -> dict[str, Any]:
+    """Execute /task command."""
     scheduler = getattr(ctx, "scheduler", None)
     if scheduler is None:
-        return {"ok": True, "view": "tasks", "tasks": [], "message": "No scheduler active."}
+        return {"ok": True, "view": "task", "tasks": [], "message": "No scheduler active."}
     tasks = scheduler.list_tasks() if hasattr(scheduler, "list_tasks") else []
     entries = [
         {"name": t.name, "schedule": t.schedule, "next_run": str(getattr(t, "next_run", ""))}
         for t in tasks
     ]
-    return {"ok": True, "view": "tasks", "tasks": entries}
+    return {"ok": True, "view": "task", "tasks": entries}
 
 
 async def _execute_scheduler_arm(ctx: "Context", args: str) -> dict[str, Any]:
@@ -1419,14 +1419,14 @@ def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> N
     if view == "host":
         _render_host_view(console, payload)
         return
-    if view == "skills_list":
-        _render_skills_list_view(console, payload)
+    if view == "skill_list":
+        _render_skill_list_view(console, payload)
         return
-    if view == "skills_show":
-        _render_skills_show_view(console, payload)
+    if view == "skill_show":
+        _render_skill_show_view(console, payload)
         return
-    if view == "tasks":
-        _render_tasks_view(console, payload)
+    if view == "task":
+        _render_task_view(console, payload)
         return
 
     msg = payload.get("message")
@@ -1514,7 +1514,7 @@ def _render_host_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
         console.system("\n".join(lines))
 
 
-def _render_skills_list_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+def _render_skill_list_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
     from rich.table import Table
 
     skills = payload.get("skills") or []
@@ -1536,7 +1536,7 @@ def _render_skills_list_view(console: "LeapConsole", payload: dict[str, Any]) ->
     console.print(table)
 
 
-def _render_skills_show_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+def _render_skill_show_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
     from rich.panel import Panel
     from rich.text import Text
 
@@ -1551,7 +1551,7 @@ def _render_skills_show_view(console: "LeapConsole", payload: dict[str, Any]) ->
     console.print(Panel(info, title=str(payload.get("name") or "Skill"), border_style="cyan"))
 
 
-def _render_tasks_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+def _render_task_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
     tasks = payload.get("tasks") or []
     msg = payload.get("message")
     if msg:
