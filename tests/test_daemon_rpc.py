@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,18 @@ from leapflow.daemon.client import DaemonClient, DaemonUnavailableError, ensure_
 from leapflow.daemon.lifecycle import DaemonInfo
 from leapflow.daemon.protocol import StreamChunk
 from leapflow.daemon.server import UnixRpcServer
+
+
+def test_settings_runtime_dir_defaults_to_profile_runtime(tmp_path) -> None:
+    from conftest import make_settings
+
+    settings = make_settings(str(tmp_path))
+    assert settings.runtime_dir == tmp_path / "profiles" / "default" / "runtime"
+
+    override = tmp_path / "custom-runtime"
+    overridden = replace(settings, runtime_dir=override)
+    assert overridden.profile_dir == settings.profile_dir
+    assert overridden.runtime_dir == override
 
 
 class _FakeService:
@@ -52,17 +65,17 @@ class _SlowFirstChunkService(_FakeService):
         yield StreamChunk(request_id="", content="done", event_type="final")
 
 
-async def _start_server(run_dir: Path, service=None, *, stream_heartbeat_s: float | None = None):
+async def _start_server(runtime_dir: Path, service=None, *, stream_heartbeat_s: float | None = None):
     server = UnixRpcServer(
         service or _FakeService(),
-        sock_path=run_dir / "leapd.sock",
-        run_dir=run_dir,
+        sock_path=runtime_dir / "leapd.sock",
+        runtime_dir=runtime_dir,
         stream_heartbeat_s=stream_heartbeat_s,
     )
     task = asyncio.create_task(server.serve_forever())
     for _ in range(50):
-        if (run_dir / "leapd.sock").exists():
-            return server, task, run_dir
+        if (runtime_dir / "leapd.sock").exists():
+            return server, task, runtime_dir
         await asyncio.sleep(0.02)
     task.cancel()
     raise AssertionError("server did not start")
@@ -71,8 +84,8 @@ async def _start_server(run_dir: Path, service=None, *, stream_heartbeat_s: floa
 @pytest.mark.asyncio
 async def test_daemon_client_receives_stream_events() -> None:
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
-        server, task, run_dir = await _start_server(Path(root) / "run")
-        client = DaemonClient(run_dir / "leapd.sock")
+        server, task, runtime_dir = await _start_server(Path(root) / "runtime")
+        client = DaemonClient(runtime_dir / "leapd.sock")
 
         try:
             events = [event async for event in client.engine_chat("world")]
@@ -95,8 +108,8 @@ async def test_daemon_client_receives_stream_events() -> None:
 async def test_daemon_client_can_cancel_engine_turn() -> None:
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
         service = _FakeService()
-        server, task, run_dir = await _start_server(Path(root) / "run", service=service)
-        client = DaemonClient(run_dir / "leapd.sock")
+        server, task, runtime_dir = await _start_server(Path(root) / "runtime", service=service)
+        client = DaemonClient(runtime_dir / "leapd.sock")
 
         try:
             cancelled = await client.engine_cancel()
@@ -115,12 +128,12 @@ async def test_daemon_client_can_cancel_engine_turn() -> None:
 @pytest.mark.asyncio
 async def test_daemon_client_stream_heartbeat_prevents_idle_timeout() -> None:
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
-        server, task, run_dir = await _start_server(
-            Path(root) / "run",
+        server, task, runtime_dir = await _start_server(
+            Path(root) / "runtime",
             service=_SlowFirstChunkService(),
             stream_heartbeat_s=0.01,
         )
-        client = DaemonClient(run_dir / "leapd.sock", timeout_s=0.03)
+        client = DaemonClient(runtime_dir / "leapd.sock", timeout_s=0.03)
 
         try:
             events = [event async for event in client.engine_chat("world")]
@@ -148,20 +161,16 @@ async def test_client_lease_blocks_daemon_idle_shutdown(tmp_path) -> None:
     class IdleServer:
         active_connections = 0
 
-        def __init__(self, run_dir: Path) -> None:
-            self._run_dir = run_dir
+        def __init__(self, runtime_dir: Path) -> None:
+            self.runtime_dir = runtime_dir
 
-        @property
-        def run_dir(self) -> Path:
-            return self._run_dir
-
-    run_dir = tmp_path / "run"
-    lease = ClientLease(run_dir, kind="tui", session_id="sess-live", touch_interval_s=1.0)
+    runtime_dir = tmp_path / "runtime"
+    lease = ClientLease(runtime_dir, kind="tui", session_id="sess-live", touch_interval_s=1.0)
     await lease.start()
     stop_event = asyncio.Event()
     task = asyncio.create_task(
         _watch_idle_shutdown(
-            IdleServer(run_dir),
+            IdleServer(runtime_dir),
             stop_event,
             idle_timeout_s=0.03,
             lease_ttl_s=1.0,
@@ -171,7 +180,7 @@ async def test_client_lease_blocks_daemon_idle_shutdown(tmp_path) -> None:
     try:
         await asyncio.sleep(0.08)
         assert not stop_event.is_set()
-        snapshots = read_active_client_leases(run_dir, ttl_s=1.0)
+        snapshots = read_active_client_leases(runtime_dir, ttl_s=1.0)
         assert [(item.kind, item.session_id, item.state) for item in snapshots] == [
             ("tui", "sess-live", "idle")
         ]
@@ -251,24 +260,24 @@ async def test_daemon_shutdown_rpc_triggers_server_stop() -> None:
             self.shutdown_called = True
 
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
-        run_dir = Path(root) / "run"
+        runtime_dir = Path(root) / "runtime"
         service = ShutdownService()
         shutdown_event = asyncio.Event()
         server = UnixRpcServer(
             service,
-            sock_path=run_dir / "leapd.sock",
-            run_dir=run_dir,
+            sock_path=runtime_dir / "leapd.sock",
+            runtime_dir=runtime_dir,
             on_shutdown=shutdown_event.set,
         )
         task = asyncio.create_task(server.serve_forever())
         for _ in range(50):
-            if (run_dir / "leapd.sock").exists():
+            if (runtime_dir / "leapd.sock").exists():
                 break
             await asyncio.sleep(0.02)
         else:
             task.cancel()
             raise AssertionError("server did not start")
-        client = DaemonClient(run_dir / "leapd.sock")
+        client = DaemonClient(runtime_dir / "leapd.sock")
         try:
             await client.shutdown()
             await asyncio.wait_for(shutdown_event.wait(), timeout=1.0)
@@ -330,8 +339,8 @@ async def test_daemon_client_host_lifecycle_rpc() -> None:
             return {"ok": True, "backend": "cua-driver", "started": True, "changed": True}
 
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
-        server, task, run_dir = await _start_server(Path(root) / "run", service=HostRpcService())
-        client = DaemonClient(run_dir / "leapd.sock")
+        server, task, runtime_dir = await _start_server(Path(root) / "runtime", service=HostRpcService())
+        client = DaemonClient(runtime_dir / "leapd.sock")
         try:
             status = await client.host_status()
             started = await client.host_start()
@@ -369,14 +378,13 @@ async def test_daemon_client_slash_metadata_rpc() -> None:
                 "context_length": 100,
             }
 
-        async def model_info(self, model_name: str = "") -> dict[str, Any]:
+        async def command_execute(self, name: str, args: str = "") -> dict[str, Any]:
             return {
                 "ok": True,
+                "view": name,
                 "model": "test-model",
                 "context_length": 100,
-                "requested_model": model_name,
-                "switch_supported": False,
-                "env_var": "LEAPFLOW_LLM_MODEL",
+                "requested_model": args,
             }
 
         async def app_command(self, args: str = "") -> dict[str, Any]:
@@ -388,12 +396,12 @@ async def test_daemon_client_slash_metadata_rpc() -> None:
             }
 
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
-        server, task, run_dir = await _start_server(Path(root) / "run", service=SlashMetadataService())
-        client = DaemonClient(run_dir / "leapd.sock")
+        server, task, runtime_dir = await _start_server(Path(root) / "runtime", service=SlashMetadataService())
+        client = DaemonClient(runtime_dir / "leapd.sock")
         try:
             tools = await client.tools_list()
             usage = await client.usage_summary()
-            model = await client.model_info("next-model")
+            model = await client.command_execute("model", "next-model")
             app_payload = await client.app_command("list")
         finally:
             task.cancel()
@@ -459,7 +467,7 @@ async def test_runtime_service_slash_metadata_payloads() -> None:
         try:
             tools = await service.tools_list()
             usage = await service.usage_summary()
-            model = await service.model_info("other-model")
+            model = await service.command_execute("model", "")
             app_list = await service.app_command("list")
             app_status = await service.app_command("status feishu")
         finally:
@@ -470,7 +478,7 @@ async def test_runtime_service_slash_metadata_payloads() -> None:
     assert usage["total_tokens"] == 20
     assert usage["context_length"] == 4096
     assert model["model"] == settings.llm_model
-    assert model["requested_model"] == "other-model"
+    assert model["requested_model"] == ""
     assert app_list["ok"] is True
     assert app_list["view"] == "list"
     assert {entry["id"] for entry in app_list["result"]["platforms"]} >= {"feishu", "telegram", "dingtalk"}
@@ -536,8 +544,8 @@ async def test_daemon_client_approval_resolve_rpc() -> None:
             return {"ok": True, "pending_id": pending_id, "decision": "deny", "reason": reason}
 
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
-        server, task, run_dir = await _start_server(Path(root) / "run", service=ApprovalRpcService())
-        client = DaemonClient(run_dir / "leapd.sock")
+        server, task, runtime_dir = await _start_server(Path(root) / "runtime", service=ApprovalRpcService())
+        client = DaemonClient(runtime_dir / "leapd.sock")
         try:
             result = await client.approval_resolve("p1", "allow_once", reason="user")
             status = await client.approval_status()
@@ -558,8 +566,8 @@ async def test_daemon_client_approval_resolve_rpc() -> None:
 @pytest.mark.asyncio
 async def test_daemon_client_reports_unknown_method() -> None:
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
-        server, task, run_dir = await _start_server(Path(root) / "run")
-        client = DaemonClient(run_dir / "leapd.sock")
+        server, task, runtime_dir = await _start_server(Path(root) / "runtime")
+        client = DaemonClient(runtime_dir / "leapd.sock")
 
         try:
             with pytest.raises(DaemonUnavailableError, match="Unknown method"):
@@ -580,11 +588,11 @@ async def test_ensure_daemon_client_reuses_healthy_daemon() -> None:
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
         root_path = Path(root)
         settings = make_settings(str(root_path))
-        server, task, run_dir = await _start_server(settings.profile_dir / "run")
+        server, task, runtime_dir = await _start_server(settings.runtime_dir)
 
         try:
             client = await ensure_daemon_client(settings)
-            assert client.sock_path == run_dir / "leapd.sock"
+            assert client.sock_path == runtime_dir / "leapd.sock"
             status = await client.status()
         finally:
             task.cancel()
@@ -600,11 +608,11 @@ async def test_ensure_daemon_client_reuses_healthy_daemon() -> None:
 @pytest.mark.asyncio
 async def test_daemon_client_surfaces_stream_errors() -> None:
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
-        server, task, run_dir = await _start_server(
-            Path(root) / "run",
+        server, task, runtime_dir = await _start_server(
+            Path(root) / "runtime",
             service=_FailingStreamService(),
         )
-        client = DaemonClient(run_dir / "leapd.sock")
+        client = DaemonClient(runtime_dir / "leapd.sock")
         events = []
 
         try:
@@ -631,18 +639,15 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
     from leapflow.daemon.service import RuntimeLeapService
 
     data_dir = tmp_path / "leap-home"
-    data_dir.mkdir()
-    env_path = data_dir / ".env"
-    env_path.write_text("LEAPFLOW_LLM_API_KEY=\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(data_dir))
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
     monkeypatch.delenv("LEAPFLOW_LLM_CONTEXT_LENGTH", raising=False)
 
-    settings = make_settings(str(tmp_path))
+    settings = make_settings(str(data_dir))
     settings = settings.__class__(
         **{
             **settings.__dict__,
-            "data_dir": data_dir,
             "llm_api_key": "",
             "llm_context_length": 128_000,
             "vlm_api_key": "",
@@ -653,9 +658,10 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
     await service.start()
     stream = None
     try:
-        env_path.write_text(
-            "LEAPFLOW_LLM_API_KEY=sk-daemon-hot-reload\n"
-            "LEAPFLOW_LLM_CONTEXT_LENGTH=700000\n",
+        settings.profile_layout.llm_config_path.write_text(
+            "llm:\n"
+            "  api_key: sk-daemon-hot-reload\n"
+            "  context_length: 700000\n",
             encoding="utf-8",
         )
         stream = service.engine_chat("hello")
@@ -673,8 +679,12 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
         assert service.context.engine._settings.llm_api_key == "sk-daemon-hot-reload"
         assert service.context.engine._settings.llm_context_length == 700_000
         status = await service.status()
-        assert status["config_path"] == str(data_dir / ".env")
-        assert status["project_env_path"] == str(tmp_path / ".env")
+        assert status["profile_manifest_path"] == str(settings.profile_layout.manifest_path)
+        assert status["profile_config_dir"] == str(settings.profile_layout.config_dir)
+        assert status["user_config_path"] == str(settings.layout.user_config_path)
+        assert status["workspace_config_path"] == str(tmp_path / ".leapflow" / "config.yaml")
+        assert str(settings.profile_layout.llm_config_path) in status["config_sources"]
+        assert status["runtime_dir"] == str(settings.runtime_dir)
         assert status["llm_context_length"] == 700_000
         assert status["context_used"] == 0
         assert status["runtime_source"].endswith("leapflow/__init__.py")
@@ -773,13 +783,13 @@ async def test_ensure_daemon_client_does_not_spawn_when_daemon_unhealthy(
     settings = make_settings(str(tmp_path))
     unhealthy = DaemonInfo(
         pid=4321,
-        sock_path=settings.profile_dir / "run" / "leapd.sock",
+        sock_path=settings.runtime_dir / "leapd.sock",
         start_time=1.0,
         is_running=True,
         is_healthy=False,
     )
 
-    monkeypatch.setattr(client_module.DaemonInfo, "discover", lambda run_dir: unhealthy)
+    monkeypatch.setattr(client_module.DaemonInfo, "discover", lambda runtime_dir: unhealthy)
 
     def fail_spawn(*args, **kwargs):
         raise AssertionError("spawn_daemon must not be called for a running unhealthy daemon")
@@ -800,14 +810,17 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
         "volatile": False,
         "model": "qwen3.7-plus",
         "context_used": 256,
-        "llm_context_length": 256_000,
+        "llm_context_length": 1_000_000,
         "session_id": "sess-1",
         "runtime_version": "0.0.test",
         "runtime_source": "/repo/src/leapflow/__init__.py",
         "runtime_executable": "/venv/bin/python",
-        "config_path": "/home/.leapflow/.env",
-        "project_env_path": "/repo/.env",
-        "db_path": "/home/.leapflow/db/leap.duckdb",
+        "profile_manifest_path": "/home/.leapflow/profiles/default/profile.yaml",
+        "profile_config_dir": "/home/.leapflow/profiles/default/config",
+        "user_config_path": "/home/.leapflow/config/user.yaml",
+        "workspace_config_path": "/repo/.leapflow/config.yaml",
+        "runtime_dir": "/home/.leapflow/profiles/default/runtime",
+        "db_path": "/home/.leapflow/profiles/default/db/leap.duckdb",
         "host_backend": {
             "backend": "cua-driver",
             "started": True,
@@ -820,10 +833,14 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
 
     output = capsys.readouterr().out
     assert "runtime: profile=default clients=1 connected=2 volatile=False" in output
-    assert "model: qwen3.7-plus context=256/256000" in output
+    assert "model: qwen3.7-plus context=256/1000000" in output
     assert "version: 0.0.test" in output
     assert "source: /repo/src/leapflow/__init__.py" in output
     assert "python: /venv/bin/python" in output
+    assert "profile_config: /home/.leapflow/profiles/default/config" in output
+    assert "user_config: /home/.leapflow/config/user.yaml" in output
+    assert "workspace_config: /repo/.leapflow/config.yaml" in output
+    assert "runtime_dir: /home/.leapflow/profiles/default/runtime" in output
     assert "host: backend=cua-driver started=True pid=None" in output
     assert "host_command: /tmp/cua-driver mcp" in output
     assert "host_capability: test-cap" in output
@@ -834,7 +851,7 @@ def test_stop_daemon_sends_sigterm_waits_and_cleans(monkeypatch, tmp_path) -> No
 
     running = lifecycle_module.DaemonInfo(
         pid=1234,
-        sock_path=tmp_path / "run" / "leapd.sock",
+        sock_path=tmp_path / "runtime" / "leapd.sock",
         start_time=None,
         is_running=True,
         is_healthy=True,
@@ -849,18 +866,18 @@ def test_stop_daemon_sends_sigterm_waits_and_cleans(monkeypatch, tmp_path) -> No
     states = [running, stopped]
     signals: list[int] = []
 
-    def discover(run_dir):
+    def discover(runtime_dir):
         return states.pop(0) if states else stopped
 
-    def send_signal(run_dir, sig):
+    def send_signal(runtime_dir, sig):
         signals.append(sig)
         return True
 
     monkeypatch.setattr(lifecycle_module.DaemonInfo, "discover", staticmethod(discover))
     monkeypatch.setattr(lifecycle_module, "send_signal", send_signal)
-    monkeypatch.setattr(lifecycle_module, "cleanup_stale", lambda run_dir: True)
+    monkeypatch.setattr(lifecycle_module, "cleanup_stale", lambda runtime_dir: True)
 
-    result = lifecycle_module.stop_daemon(tmp_path / "run", timeout_s=1.0)
+    result = lifecycle_module.stop_daemon(tmp_path / "runtime", timeout_s=1.0)
 
     assert result.stopped is True
     assert result.signal_sent is True
@@ -873,18 +890,18 @@ def test_stop_daemon_force_escalates_after_timeout(monkeypatch, tmp_path) -> Non
 
     running = lifecycle_module.DaemonInfo(
         pid=1234,
-        sock_path=tmp_path / "run" / "leapd.sock",
+        sock_path=tmp_path / "runtime" / "leapd.sock",
         start_time=None,
         is_running=True,
         is_healthy=False,
     )
     signals: list[int] = []
 
-    monkeypatch.setattr(lifecycle_module.DaemonInfo, "discover", staticmethod(lambda run_dir: running))
-    monkeypatch.setattr(lifecycle_module, "send_signal", lambda run_dir, sig: signals.append(sig) or True)
+    monkeypatch.setattr(lifecycle_module.DaemonInfo, "discover", staticmethod(lambda runtime_dir: running))
+    monkeypatch.setattr(lifecycle_module, "send_signal", lambda runtime_dir, sig: signals.append(sig) or True)
 
     result = lifecycle_module.stop_daemon(
-        tmp_path / "run",
+        tmp_path / "runtime",
         timeout_s=0.05,
         force=True,
         force_timeout_s=0.05,
@@ -904,11 +921,12 @@ def test_daemon_restart_stops_and_starts(monkeypatch, tmp_path) -> None:
 
     class Settings:
         profile_dir = tmp_path
+        runtime_dir = tmp_path / "runtime"
 
     monkeypatch.setattr(
         daemon_module,
         "_stop",
-        lambda run_dir, **kwargs: calls.append(f"stop:{kwargs.get('force')}") or 0,
+        lambda runtime_dir, **kwargs: calls.append(f"stop:{kwargs.get('force')}") or 0,
     )
     monkeypatch.setattr(daemon_module, "_start", lambda settings, mock_host: calls.append("start") or 0)
 
@@ -923,11 +941,12 @@ def test_daemon_restart_aborts_when_stop_fails(monkeypatch, tmp_path) -> None:
 
     class Settings:
         profile_dir = tmp_path
+        runtime_dir = tmp_path / "runtime"
 
     monkeypatch.setattr(
         daemon_module,
         "_stop",
-        lambda run_dir, **kwargs: calls.append("stop") or 1,
+        lambda runtime_dir, **kwargs: calls.append("stop") or 1,
     )
     monkeypatch.setattr(daemon_module, "_start", lambda settings, mock_host: calls.append("start") or 0)
 

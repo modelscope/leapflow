@@ -158,12 +158,6 @@ class DaemonClient:
         result = await self.request("usage.summary")
         return dict(result or {})
 
-    async def model_info(self, model_name: str = "") -> dict[str, Any]:
-        """Return daemon-owned model information."""
-        params = {"model_name": model_name} if model_name else {}
-        result = await self.request("model.info", params)
-        return dict(result or {})
-
     async def app_command(self, args: str = "") -> dict[str, Any]:
         """Return daemon-owned App Connector command payload."""
         result = await self.request("app.command", {"args": args})
@@ -239,22 +233,22 @@ async def ensure_daemon_client(
     status_callback: StatusCallback | None = None,
 ) -> DaemonClient:
     """Return a client connected to a healthy daemon, starting one if needed."""
-    run_dir = settings.profile_dir / "run"
-    sock_path = run_dir / "leapd.sock"
-    info = DaemonInfo.discover(run_dir)
+    runtime_dir = settings.runtime_dir
+    sock_path = runtime_dir / "leapd.sock"
+    info = DaemonInfo.discover(runtime_dir)
     if info.is_healthy:
         _emit(status_callback, f"Connected to leapd (pid={info.pid}).")
         return DaemonClient(sock_path)
 
     if info.pid is not None and not info.is_running:
-        cleanup_stale(run_dir)
+        cleanup_stale(runtime_dir)
     elif info.is_running and not info.is_healthy:
         raise DaemonUnavailableError(
             f"leapd is running but unhealthy (pid={info.pid}). "
             "Run 'leap daemon stop' and retry."
         )
 
-    lock = DaemonLock(run_dir / "leapd.lock")
+    lock = DaemonLock(runtime_dir / "leapd.lock")
     if lock.acquire():
         try:
             _emit(status_callback, "Starting leapd daemon...")
@@ -264,7 +258,7 @@ async def ensure_daemon_client(
     else:
         _emit(status_callback, "Waiting for leapd daemon...")
 
-    ready = wait_ready(run_dir, timeout_s=_daemon_start_timeout())
+    ready = wait_ready(runtime_dir, timeout_s=_daemon_start_timeout())
     if not ready.is_healthy:
         raise DaemonUnavailableError(
             "leapd did not become ready. Run 'leap daemon status' for details."
@@ -287,12 +281,12 @@ async def recover_daemon_client(
             status_callback=status_callback,
         )
     except DaemonUnavailableError as exc:
-        run_dir = settings.profile_dir / "run"
-        info = DaemonInfo.discover(run_dir)
+        runtime_dir = settings.runtime_dir
+        info = DaemonInfo.discover(runtime_dir)
         if not info.is_running:
             raise
         _emit(status_callback, f"Restarting unhealthy leapd (pid={info.pid})...")
-        result = await asyncio.to_thread(stop_daemon, run_dir, timeout_s=10.0)
+        result = await asyncio.to_thread(stop_daemon, runtime_dir, timeout_s=10.0)
         if not result.stopped:
             raise exc
         return await ensure_daemon_client(

@@ -11,6 +11,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import pytest
 
 from leapflow.config import Settings
+from leapflow.layout import build_layout
 from leapflow.domain.events import SystemEvent
 from leapflow.domain.trajectory import (
     ActionType,
@@ -245,6 +246,8 @@ def make_candidate(
 
 def make_settings(tmp_dir: str) -> Settings:
     """Create a Settings instance suitable for integration tests."""
+    layout = build_layout(Path(tmp_dir))
+    profile_layout = layout.ensure(profile_id="default")
     return Settings(
         llm_api_key="sk-test",
         llm_base_url="https://example.invalid/v1",
@@ -253,5 +256,11 @@ def make_settings(tmp_dir: str) -> Settings:
         mock_host=True,
         duckdb_path=Path(tmp_dir) / "mem.duckdb",
         log_level="WARNING",
+        data_dir=Path(tmp_dir),
+        profile="default",
+        layout=layout,
+        profile_layout=profile_layout,
+        profile_manifest=profile_layout.load_manifest(),
+        runtime_dir=profile_layout.runtime_dir,
         prediction_enabled=False,
     )

@@ -69,6 +69,93 @@ async def test_app_slash_payloads_reuse_platform_connect_and_manifests(tmp_path)
     assert "feishu" in invalid_option["available"]
 
 
+def test_gateway_config_store_persists_secret_refs_and_env_override(monkeypatch, tmp_path) -> None:
+    from leapflow.gateway.config_store import GatewayConfigStore
+    from leapflow.gateway.credential_vault import CredentialVault
+    from leapflow.gateway.manifest import CredentialField, PlatformManifest
+    from leapflow.security.secrets import FernetSecretVault, secret_ref
+
+    manifest = PlatformManifest(
+        platform_id="fake",
+        display_name="Fake",
+        credentials=(
+            CredentialField(key="api_key", label="API Key", secret=True),
+            CredentialField(key="base_url", label="Base URL", secret=False),
+        ),
+    )
+    vault = CredentialVault(tmp_path / "secrets")
+    store = GatewayConfigStore(tmp_path / "gateway.yaml", vault)
+
+    store.save_platform(
+        "fake",
+        {"api_key": "sk-gateway", "base_url": "https://gateway.example.invalid"},
+        {},
+        manifest,
+    )
+
+    saved = store.load().platforms["fake"].credentials
+    api_key_ref = secret_ref("profile", "gateway", "fake", "api_key")
+    assert saved == {"api_key_ref": api_key_ref, "base_url": "https://gateway.example.invalid"}
+    assert "sk-gateway" not in (tmp_path / "gateway.yaml").read_text(encoding="utf-8")
+    assert FernetSecretVault(tmp_path / "secrets" / "vault.json", tmp_path / "secrets" / "vault.key").get(api_key_ref) == "sk-gateway"
+
+    assert store.load_platform_credentials("fake", manifest) == {
+        "api_key": "sk-gateway",
+        "base_url": "https://gateway.example.invalid",
+    }
+
+    monkeypatch.setenv("LEAPFLOW_FAKE_API_KEY", "sk-env")
+    assert store.load_platform_credentials("fake", manifest)["api_key"] == "sk-env"
+
+
+def test_gateway_config_store_warns_for_missing_secret_ref(caplog, tmp_path) -> None:
+    from leapflow.gateway.config_store import GatewayConfig, GatewayConfigStore, PlatformConfig
+    from leapflow.gateway.credential_vault import CredentialVault
+    from leapflow.gateway.manifest import CredentialField, PlatformManifest
+
+    manifest = PlatformManifest(
+        platform_id="fake",
+        display_name="Fake",
+        credentials=(CredentialField(key="api_key", label="API Key", secret=True),),
+    )
+    store = GatewayConfigStore(tmp_path / "gateway.yaml", CredentialVault(tmp_path / "secrets"))
+    store.save(GatewayConfig(platforms={
+        "fake": PlatformConfig(credentials={"api_key_ref": "secret://profile/gateway/fake/api_key"}),
+    }))
+
+    with caplog.at_level("WARNING"):
+        assert store.load_platform_credentials("fake", manifest) == {}
+
+    assert "Missing gateway credential ref" in caplog.text
+
+
+def test_gateway_config_store_loads_legacy_plaintext_secret_without_ref(tmp_path) -> None:
+    from leapflow.gateway.config_store import GatewayConfig, GatewayConfigStore, PlatformConfig
+    from leapflow.gateway.credential_vault import CredentialVault
+    from leapflow.gateway.manifest import CredentialField, PlatformManifest
+
+    manifest = PlatformManifest(
+        platform_id="fake",
+        display_name="Fake",
+        credentials=(
+            CredentialField(key="api_key", label="API Key", secret=True),
+            CredentialField(key="base_url", label="Base URL", secret=False),
+        ),
+    )
+    store = GatewayConfigStore(tmp_path / "gateway.yaml", CredentialVault(tmp_path / "secrets"))
+    store.save(GatewayConfig(platforms={
+        "fake": PlatformConfig(credentials={
+            "api_key": "sk-legacy",
+            "base_url": "https://legacy.example.invalid",
+        }),
+    }))
+
+    assert store.load_platform_credentials("fake", manifest) == {
+        "api_key": "sk-legacy",
+        "base_url": "https://legacy.example.invalid",
+    }
+
+
 @pytest.mark.asyncio
 async def test_gateway_connect_tool_can_connect_builtin_webhook(tmp_path) -> None:
     server = GatewayServer(tmp_path)

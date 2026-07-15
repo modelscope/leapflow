@@ -14,7 +14,10 @@ async def cmd_relearn(ctx: "Context", trajectory_id: str) -> int:
     """Re-run learning pipeline on a saved trajectory (requires LLM)."""
     require_initialized(ctx)
     if not ctx.settings.has_llm_credentials:
-        print("Error: LEAPFLOW_LLM_API_KEY required for learning. Configure it in .env.")
+        print(
+            "Error: LLM credentials required for learning. "
+            "Run `leap config llm key` or configure profile secrets."
+        )
         return 1
 
     traj = ctx.imitation.get_trajectory(trajectory_id)

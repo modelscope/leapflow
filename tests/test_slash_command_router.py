@@ -24,11 +24,11 @@ def test_command_router_all_commands_supported_in_daemon() -> None:
         "/app status feishu",
         "/app connect feishu",
         "/teach start",
-        "/skills show demo",
+        "/skill show demo",
         "/hub search test",
         "/gateway",
         "/arm test_skill 0 * * * *",
-        "/tasks",
+        "/task",
     ):
         inv = daemon_router.parse(cmd_text)
         assert inv is not None, f"parse failed for {cmd_text}"
@@ -48,10 +48,16 @@ def test_command_router_client_local_commands() -> None:
         assert inv.command.client_local is True, f"{cmd_text} should be client_local"
 
     # Engine-routed commands
-    for cmd_text in ("/teach start", "/skills", "/gateway", "/tools", "/model"):
+    for cmd_text in ("/teach start", "/skill", "/gateway", "/tool", "/model"):
         inv = router.parse(cmd_text)
         assert inv is not None, f"parse failed for {cmd_text}"
         assert inv.command.client_local is False, f"{cmd_text} should NOT be client_local"
+
+def test_plural_skill_tool_task_commands_are_not_registered() -> None:
+    router = CommandRouter("daemon")
+
+    for cmd_text in ("/skills", "/skills show demo", "/tools", "/tasks"):
+        assert router.parse(cmd_text) is None
 
 
 def test_app_commands_are_registered_for_completion() -> None:
@@ -77,8 +83,8 @@ def test_command_router_unsupported_always_returns_none() -> None:
     """unsupported_result always returns None — all commands are supported."""
     router = CommandRouter("daemon")
 
-    invocation = router.parse("/skills show demo")
+    invocation = router.parse("/skill show demo")
 
     assert invocation is not None
-    assert invocation.command.name == "skills show"
+    assert invocation.command.name == "skill show"
     assert router.unsupported_result(invocation) is None

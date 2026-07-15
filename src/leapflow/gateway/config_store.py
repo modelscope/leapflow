@@ -1,6 +1,8 @@
 """Gateway configuration persistence (``gateway.yaml``).
 
-Reads and writes platform configurations with encrypted credentials.
+Reads and writes platform configurations. Manifest-declared secret fields are
+stored in the profile secret vault and referenced from ``gateway.yaml`` as
+``secret://`` refs; non-secret options remain inline.
 Thread-safe via atomic write (write to temp file then ``os.replace``).
 """
 from __future__ import annotations
@@ -50,15 +52,15 @@ class GatewayConfig:
 # ═══════════════════════════════════════════════════════════════
 
 class GatewayConfigStore:
-    """Reads and writes ``gateway.yaml`` with credential encryption."""
+    """Reads and writes gateway configuration with vault-backed credential refs."""
 
-    def __init__(self, profile_dir: Path, vault: CredentialVault) -> None:
-        self._config_path = profile_dir / "gateway.yaml"
+    def __init__(self, config_path: Path, vault: CredentialVault) -> None:
+        self._config_path = config_path
         self._vault = vault
         self._manifests: Dict[str, PlatformManifest] = {}
 
     def set_manifests(self, manifests: Dict[str, PlatformManifest]) -> None:
-        """Provide manifest lookup for encryption / decryption decisions."""
+        """Provide manifest lookup for secret ref decisions."""
         self._manifests = manifests
 
     # ── Read ─────────────────────────────────────────────────
@@ -145,11 +147,11 @@ class GatewayConfigStore:
         secret_keys = frozenset(
             c.key for c in manifest.credentials if c.secret
         )
-        encrypted = self._vault.encrypt_credentials(credentials, secret_keys)
+        stored_credentials = self._vault.store_credentials(platform_id, credentials, secret_keys)
 
         config.platforms[platform_id] = PlatformConfig(
             enabled=True,
-            credentials=encrypted,
+            credentials=stored_credentials,
             options=options,
             configured_at=datetime.now(timezone.utc).isoformat(),
             configured_by="conversation",
@@ -164,10 +166,10 @@ class GatewayConfigStore:
         platform_id: str,
         manifest: PlatformManifest,
     ) -> Optional[Dict[str, str]]:
-        """Load and decrypt credentials for a platform.
+        """Load and resolve credentials for a platform.
 
         Environment variables ``LEAPFLOW_<PLATFORM>_<KEY>`` (uppercased)
-        take precedence over file-stored values, enabling container and
+        take precedence over file-stored refs, enabling container and
         CI/CD deployments without touching ``gateway.yaml``.
 
         Returns ``None`` if the platform is not configured (neither file
@@ -189,7 +191,7 @@ class GatewayConfigStore:
         secret_keys = frozenset(
             c.key for c in manifest.credentials if c.secret
         )
-        result = self._vault.decrypt_credentials(pc.credentials, secret_keys)
+        result = self._vault.load_credentials(platform_id, pc.credentials, secret_keys)
 
         env_overrides = self._load_from_env(platform_id, manifest)
         if env_overrides:

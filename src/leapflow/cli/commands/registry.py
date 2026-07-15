@@ -90,6 +90,7 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
 
     # Chat
     CommandDef("model", "Show or switch active model", "Chat", args_hint="[model_name]", requires_llm=True),
+    CommandDef("config", "View or update runtime configuration", "Chat", args_hint="[show|list|keys|sources|get|set|unset|llm|secret] ...", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
     CommandDef("usage", "Show token usage for current session", "Chat", requires_llm=True),
 
     # Teaching
@@ -103,11 +104,11 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("annotate", "Add annotation during teaching", "Teaching", args_hint="<text>"),
 
     # Skills & Tools
-    CommandDef("skills", "List all skills", "Skills & Tools", aliases=("skills list",)),
-    CommandDef("skills show", "Show skill details", "Skills & Tools", args_hint="<name>"),
-    CommandDef("skills disable", "Disable a skill", "Skills & Tools", args_hint="<name>"),
-    CommandDef("skills delete", "Delete a skill", "Skills & Tools", args_hint="<name>"),
-    CommandDef("tools", "List available tools", "Skills & Tools"),
+    CommandDef("skill", "List all skills", "Skills & Tools", aliases=("skill list",)),
+    CommandDef("skill show", "Show skill details", "Skills & Tools", args_hint="<name>"),
+    CommandDef("skill disable", "Disable a skill", "Skills & Tools", args_hint="<name>"),
+    CommandDef("skill delete", "Delete a skill", "Skills & Tools", args_hint="<name>"),
+    CommandDef("tool", "List available tools", "Skills & Tools"),
     CommandDef("run", "Execute a skill by trigger", "Skills & Tools", args_hint="<trigger>", requires_llm=True, execution=CommandExecution.STREAMING),
 
     # Hub
@@ -130,7 +131,7 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
 
     # Scheduler
     CommandDef("arm", "Schedule a skill for timed execution", "Scheduler", args_hint="<skill> <cron>"),
-    CommandDef("tasks", "List scheduled tasks", "Scheduler"),
+    CommandDef("task", "List scheduled tasks", "Scheduler"),
 )
 
 # ── Derived structures ───────────────────────────────────────────────
@@ -150,8 +151,8 @@ _COMMAND_LOOKUP = _build_lookup()
 def resolve_command(text: str) -> Optional[CommandDef]:
     """Resolve user input to a CommandDef, handling aliases and multi-word commands.
 
-    Tries longest match first: ``skills show foo`` matches ``skills show``
-    before ``skills``.
+    Tries longest match first: ``skill show foo`` matches ``skill show``
+    before ``skill``.
     """
     words = text.strip().lower().split()
     for length in range(min(len(words), 3), 0, -1):

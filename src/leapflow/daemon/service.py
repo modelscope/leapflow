@@ -8,6 +8,7 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import Any
 
 from leapflow.daemon.lease import ClientLeaseSnapshot
@@ -100,7 +101,7 @@ class RuntimeLeapService:
                 self._settings = ctx.settings
                 yield StreamChunk(
                     request_id="",
-                    content="Configuration reloaded — LLM settings updated in leapd.",
+                    content="Configuration reloaded in leapd.",
                     event_type="status",
                     metadata={
                         **self._engine_context_metadata(getattr(ctx, "engine", None), ctx.settings),
@@ -143,15 +144,29 @@ class RuntimeLeapService:
         settings = getattr(ctx, "settings", self._settings) if ctx is not None else self._settings
         engine = getattr(ctx, "engine", None) if ctx is not None else None
         db_holder = getattr(ctx, "_db_holder", None) if ctx is not None else None
-        config_path = os.path.join(str(getattr(settings, "data_dir", "")), ".env")
-        project_env_path = os.path.join(os.getcwd(), ".env")
+        layout = settings.layout
+        profile_layout = settings.profile_layout
+        workspace_root = Path(str(getattr(settings, "workspace_root", os.getcwd())))
+        workspace_config_path = layout.workspace_config_path(workspace_root)
+        workspace_manifest_path = layout.workspace_manifest_path(workspace_root)
         context_metadata = self._engine_context_metadata(engine, settings)
         return {
             "pid": os.getpid(),
             "profile": getattr(settings, "profile", "default"),
-            "profile_dir": str(getattr(settings, "profile_dir", "")),
-            "config_path": config_path,
-            "project_env_path": project_env_path,
+            "profile_dir": str(settings.profile_dir),
+            "profile_manifest_path": str(profile_layout.manifest_path),
+            "profile_config_dir": str(profile_layout.config_dir),
+            "user_config_path": str(layout.user_config_path),
+            "mcp_servers_path": str(layout.mcp_servers_path),
+            "workspace_config_path": str(workspace_config_path),
+            "workspace_manifest_path": str(workspace_manifest_path),
+            "config_sources": list(getattr(settings, "config_sources", ())),
+            "config_warnings": list(getattr(settings, "config_warnings", ())),
+            "watched_config_paths": [str(path) for path in getattr(settings, "watched_config_paths", ())],
+            "runtime_dir": str(getattr(settings, "runtime_dir", "")),
+            "tui_history_path": str(profile_layout.tui_history_path),
+            "cache_index_path": str(profile_layout.cache.index_path),
+            "secrets_scope": str(getattr(getattr(settings, "profile_manifest", None), "secrets_scope", "profile")),
             "db_path": str(getattr(db_holder, "db_path", settings.duckdb_path)),
             "volatile": bool(getattr(ctx, "storage_volatile", False)) if ctx is not None else False,
             "uptime_s": max(0.0, time.time() - self._started_at),
@@ -212,21 +227,15 @@ class RuntimeLeapService:
 
     async def tools_list(self) -> dict[str, Any]:
         """Return daemon-owned tool summary for slash-command rendering."""
-        from leapflow.cli.commands.slash_handlers import build_tools_payload
+        from leapflow.cli.commands.slash_handlers import build_tool_payload
 
-        return build_tools_payload(self.context)
+        return build_tool_payload(self.context)
 
     async def usage_summary(self) -> dict[str, Any]:
         """Return token usage for the current daemon-owned session."""
         from leapflow.cli.commands.slash_handlers import build_usage_payload
 
         return build_usage_payload(self.context)
-
-    async def model_info(self, model_name: str = "") -> dict[str, Any]:
-        """Return active daemon model information and restart guidance."""
-        from leapflow.cli.commands.slash_handlers import build_model_payload
-
-        return build_model_payload(self.context, model_name)
 
     async def app_command(self, args: str = "") -> dict[str, Any]:
         """Return daemon-owned App Connector slash-command payload."""

@@ -188,7 +188,11 @@ async def test_file_read_rejects_workspace_leapflow_config_probe(tmp_path) -> No
     assert result["ok"] is False
     assert result["error_type"] == "unsupported_config_probe"
     assert result["retryable"] is False
-    assert result["config_locations"] == ["~/.leapflow/.env", "./.env"]
+    assert result["config_locations"] == [
+        "~/.leapflow/config/user.yaml",
+        "~/.leapflow/profiles/<profile>/config/*.yaml",
+        "<workspace>/.leapflow/config.yaml",
+    ]
     assert ".leapflow/config.json" in result["error"]
 
 

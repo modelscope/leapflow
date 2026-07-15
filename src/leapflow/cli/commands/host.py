@@ -58,13 +58,13 @@ _CUA_INSTALL_URL = "https://github.com/trycua/cua"
 def _daemon_pid_file() -> Path:
     """PID file for the ObservationDaemon background process."""
     settings = load_config()
-    return settings.data_dir.expanduser() / "var" / "observation_daemon.pid"
+    return settings.profile_layout.observation_pid_path
 
 
 def _daemon_log_file() -> Path:
     """Log file for ObservationDaemon."""
     settings = load_config()
-    return settings.data_dir.expanduser() / "var" / "observation_daemon.log"
+    return settings.profile_layout.observation_log_path
 
 
 def _cua_driver_installed() -> bool:
@@ -128,8 +128,8 @@ async def _fetch_leapd_status(settings: object) -> tuple[object, Optional[dict],
     from leapflow.daemon.client import DaemonClient
     from leapflow.daemon.lifecycle import DaemonInfo
 
-    run_dir = getattr(settings, "profile_dir") / "run"
-    info = DaemonInfo.discover(run_dir)
+    runtime_dir = settings.runtime_dir
+    info = DaemonInfo.discover(runtime_dir)
     if not info.is_healthy or info.sock_path is None:
         return info, None, ""
     try:
@@ -142,11 +142,11 @@ async def _stop_leapd_if_running(settings: object) -> bool:
     """Stop leapd so the daemon-owned CuaDriverClient releases its MCP session."""
     from leapflow.daemon.lifecycle import DaemonInfo, send_signal
 
-    run_dir = getattr(settings, "profile_dir") / "run"
-    info = DaemonInfo.discover(run_dir)
+    runtime_dir = settings.runtime_dir
+    info = DaemonInfo.discover(runtime_dir)
     if not info.is_running:
         return False
-    if send_signal(run_dir, signal.SIGTERM):
+    if send_signal(runtime_dir, signal.SIGTERM):
         _ok(f"Sent SIGTERM to leapd (PID {info.pid})")
         return True
     _warn("leapd is running but could not be signalled")

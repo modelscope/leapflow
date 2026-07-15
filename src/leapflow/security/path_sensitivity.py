@@ -7,9 +7,11 @@ it does not know about UI or approval rendering.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
+
+from leapflow.layout import ManagedPathDescriptor, build_layout
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,9 @@ class PathSensitivity:
     requires_approval: bool = False
     redact_on_read: bool = False
     reason: str = "ordinary_file"
+    scope: str = ""
+    owner_component: str = ""
+    syncable: bool = True
 
     @property
     def is_sensitive(self) -> bool:
@@ -39,7 +44,6 @@ _CREDENTIAL_NAMES = frozenset({
     ".env", ".env.local", ".env.production", ".env.staging",
     "credentials.json", "service_account.json", "token.json",
     "secrets.yaml", "secrets.yml", ".netrc", ".npmrc", ".pypirc",
-    "gateway.yaml", ".credential_key",
 })
 
 _CREDENTIAL_PATTERNS = (
@@ -61,6 +65,56 @@ _BINARY_EXTENSIONS = frozenset({
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".pyc", ".pyo", ".class", ".o", ".obj", ".wasm",
 })
+_LEAPFLOW_DATA_ROOTS: tuple[Path, ...] = (Path("~/.leapflow").expanduser(),)
+
+
+def configure_path_sensitivity_roots(roots: Iterable[Path]) -> None:
+    """Set canonical LeapFlow data roots used by path sensitivity classification."""
+    global _LEAPFLOW_DATA_ROOTS
+    normalized: list[Path] = []
+    for root in roots:
+        try:
+            normalized.append(root.expanduser().resolve())
+        except OSError:
+            normalized.append(root.expanduser())
+    if normalized:
+        _LEAPFLOW_DATA_ROOTS = tuple(normalized)
+
+
+def configured_path_sensitivity_roots() -> tuple[Path, ...]:
+    """Return canonical LeapFlow data roots used by path sensitivity classification."""
+    return _LEAPFLOW_DATA_ROOTS
+
+
+def _is_under(path: str, root: Path) -> bool:
+    root_text = str(root.expanduser()).replace("\\", "/").rstrip("/")
+    return path == root_text or path.startswith(root_text + "/")
+
+
+def _from_descriptor(descriptor: ManagedPathDescriptor) -> PathSensitivity:
+    category = descriptor.category
+    name = descriptor.path.name.lower()
+    hardline = category == "runtime_database" or (category == "secret_vault" and name.endswith(".key"))
+    writable = category not in {"secret_vault", "runtime_database", "runtime_state", "approval_state"}
+    readable = not hardline
+    requires_approval = category not in {"cache_profile"}
+    redact_on_read = category in {
+        "secret_vault", "approval_state", "memory_store", "runtime_state", "config",
+        "mcp_config", "workspace_manifest", "history", "cache_sensitive", "leapflow_profile_data",
+    }
+    return PathSensitivity(
+        category=category,
+        level=descriptor.sensitivity,
+        hardline=hardline,
+        readable=readable,
+        writable=writable,
+        requires_approval=requires_approval,
+        redact_on_read=redact_on_read,
+        reason=f"{category}_file",
+        scope=descriptor.scope,
+        owner_component=descriptor.owner_component,
+        syncable=descriptor.syncable,
+    )
 
 
 def classify_path_sensitivity(path: Path) -> PathSensitivity:
@@ -122,48 +176,27 @@ def classify_path_sensitivity(path: Path) -> PathSensitivity:
             reason="credential_or_secret_file",
         )
 
-    data_dir = os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow")
-    leapflow_dir = str(Path(data_dir).expanduser()).replace("\\", "/")
-    if normalized.startswith(leapflow_dir):
-        if "/approval/" in lowered or name == "audit.jsonl":
-            return PathSensitivity(
-                category="audit_log",
-                level="high",
-                readable=True,
-                writable=False,
-                requires_approval=True,
-                redact_on_read=True,
-                reason="approval_or_runtime_audit_log",
-            )
-        if "/memory/" in lowered:
-            return PathSensitivity(
-                category="memory_store",
-                level="high",
-                readable=True,
-                writable=True,
-                requires_approval=True,
-                redact_on_read=True,
-                reason="user_memory_store",
-            )
-        if "/run/" in lowered:
-            return PathSensitivity(
-                category="runtime_state",
-                level="medium",
-                readable=True,
-                writable=False,
-                requires_approval=True,
-                redact_on_read=True,
-                reason="runtime_state_file",
-            )
+    if "/.leapflow/" in lowered and name in {"config.yaml", "workspace.yaml"}:
+        category = "workspace_manifest" if name == "workspace.yaml" else "config"
         return PathSensitivity(
-            category="leapflow_profile_data",
-            level="medium",
+            category=category,
+            level="high",
             readable=True,
             writable=True,
             requires_approval=True,
             redact_on_read=True,
-            reason="leapflow_profile_data",
+            reason=f"{category}_file",
+            scope="workspace",
+            owner_component="config",
+            syncable=True,
         )
+
+    leapflow_root = next(
+        (root for root in _LEAPFLOW_DATA_ROOTS if _is_under(normalized, root)),
+        None,
+    )
+    if leapflow_root is not None:
+        return _from_descriptor(build_layout(leapflow_root).describe_path(expanded))
 
     if expanded.suffix.lower() in _BINARY_EXTENSIONS:
         return PathSensitivity(

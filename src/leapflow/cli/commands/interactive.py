@@ -70,7 +70,7 @@ async def _prompt_stop_daemon_on_exit(
 
     from leapflow.daemon.lifecycle import stop_daemon
 
-    run_dir = settings.profile_dir / "run"
+    runtime_dir = settings.runtime_dir
     console.system(f"Stopping leapd (pid={pid})...")
     graceful_requested = False
     try:
@@ -80,7 +80,7 @@ async def _prompt_stop_daemon_on_exit(
         graceful_requested = False
     result = await asyncio.to_thread(
         stop_daemon,
-        run_dir,
+        runtime_dir,
         timeout_s=5.0,
         grace_timeout_s=1.0 if graceful_requested else 0.0,
     )
@@ -144,6 +144,20 @@ def _print_host_status(console: Any, host: dict[str, Any]) -> None:
     console.system(f"backend={backend} started={host.get('started')}{extra}")
     if host.get("last_error"):
         console.warning(f"host error: {host['last_error']}")
+
+
+def _print_auth_setup_hint(console: Any, settings: Any) -> bool:
+    """Render a compact first-run auth hint when no primary LLM key is configured."""
+    if getattr(settings, "has_llm_credentials", False):
+        return False
+    warnings = tuple(getattr(settings, "config_warnings", ()) or ())
+    missing_ref = next((item.split("Missing secret ref: ", 1)[1] for item in warnings if "Missing secret ref: " in item), "")
+    console.warning("LLM API key is not configured.")
+    if missing_ref:
+        console.system(f"Set it with `leap config secret set {missing_ref}` or run `leap config llm key`.")
+    else:
+        console.system("Run `leap config llm key` to store the API key, or `leap config llm set --api-key <key>` for scripts.")
+    return True
 
 
 def _host_action(args: str) -> str:
@@ -250,12 +264,14 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     from leapflow.cli.tui_app.status import StatusBar
     from leapflow.cli.banner import display_rich_banner
     from leapflow.cli.commands.registry import completion_entries
+    from leapflow.config_service import ConfigService
     from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
         handle_status,
-        handle_tools,
+        handle_tool,
         handle_usage,
         handle_model,
+        handle_config,
         handle_clear,
         handle_gateway,
         handle_app,
@@ -485,7 +501,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         try:
             if ctx.reload_runtime_config_if_changed():
                 console.success(
-                    "Configuration reloaded — LLM settings updated for this session."
+                    "Configuration reloaded for this session."
                 )
         except Exception as exc:
             logger.warning("Runtime config reload failed: %s", exc)
@@ -576,8 +592,8 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 _render_banner()
                 return
 
-            if canonical == "tools":
-                handle_tools(ctx, console, cmd_args)
+            if canonical == "tool":
+                handle_tool(ctx, console, cmd_args)
                 return
 
             if canonical == "gateway":
@@ -596,6 +612,12 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
 
             if canonical == "model":
                 handle_model(ctx, console, cmd_args)
+                _update_status()
+                return
+
+            if canonical == "config":
+                handle_config(ctx, console, cmd_args)
+                _update_status()
                 return
 
             if canonical.startswith("teach") or canonical == "annotate":
@@ -603,8 +625,8 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                     await _after_dispatch(text)
                     return
 
-            if canonical.startswith("skills"):
-                if _handle_skills(ctx, console, cmd_text):
+            if canonical.startswith("skill"):
+                if _handle_skill(ctx, console, cmd_text):
                     return
 
             if canonical.startswith("hub"):
@@ -643,7 +665,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 )
                 return
 
-            if canonical == "tasks":
+            if canonical == "task":
                 from leapflow.cli.commands.scheduler import cmd_tasks
 
                 await cmd_tasks(
@@ -778,11 +800,8 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         theme=theme,
         status=status,
         commands=completion_entries(),
-        data_dir=(
-            ctx.settings.data_dir
-            if hasattr(ctx.settings, "data_dir")
-            else None
-        ),
+        config_fields=tuple(ConfigService(ctx.settings).list_fields()),
+        history_path=ctx.settings.profile_layout.tui_history_path,
         on_input=handle_input,
         on_control=_handle_task_control,
     )
@@ -806,6 +825,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
             console.warning(f"Session '{resume_id}' not found; starting a new session.")
 
     _render_banner()
+    _print_auth_setup_hint(console, ctx.settings)
     _update_status()
     exit_code = 0
     try:
@@ -826,12 +846,13 @@ async def cmd_interactive_daemon(
     """Persistent REPL backed by leapd thin-client RPC."""
     from leapflow.cli.banner import display_rich_banner
     from leapflow.cli.commands.registry import completion_entries
+    from leapflow.config_service import ConfigService
     from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
         render_app_payload,
         render_command_payload,
         render_model_payload,
-        render_tools_payload,
+        render_tool_payload,
         render_usage_payload,
     )
     from leapflow.cli.tui_app import (
@@ -860,7 +881,7 @@ async def cmd_interactive_daemon(
     runtime_daemon_pid = ""
     runtime_host_online = False
     client_lease = ClientLease(
-        settings.profile_dir / "run",
+        settings.runtime_dir,
         kind="tui",
         session_id=active_session_id,
     )
@@ -963,12 +984,15 @@ async def cmd_interactive_daemon(
         db_path = daemon_status.get("db_path")
         if db_path:
             console.system(f"DB: {db_path}")
-        config_path = daemon_status.get("config_path")
-        if config_path:
-            console.system(f"Config: {config_path}")
-        project_env_path = daemon_status.get("project_env_path")
-        if project_env_path:
-            console.system(f"Project override: {project_env_path}")
+        profile_config_dir = daemon_status.get("profile_config_dir")
+        if profile_config_dir:
+            console.system(f"Profile config: {profile_config_dir}")
+        user_config_path = daemon_status.get("user_config_path")
+        if user_config_path:
+            console.system(f"User config: {user_config_path}")
+        workspace_config_path = daemon_status.get("workspace_config_path")
+        if workspace_config_path:
+            console.system(f"Workspace config: {workspace_config_path}")
         runtime_version = daemon_status.get("runtime_version")
         if runtime_version:
             console.system(f"Runtime version: {runtime_version}")
@@ -1281,7 +1305,8 @@ async def cmd_interactive_daemon(
         theme=theme,
         status=status,
         commands=completion_entries(),
-        data_dir=getattr(settings, "data_dir", None),
+        config_fields=tuple(ConfigService(settings).list_fields()),
+        history_path=settings.profile_layout.tui_history_path,
         on_input=handle_input,
         on_control=_handle_task_control,
     )
@@ -1307,6 +1332,7 @@ async def cmd_interactive_daemon(
         console.warning(f"Daemon status unavailable: {exc}")
 
     _render_banner()
+    _print_auth_setup_hint(console, settings)
     _update_status()
 
     # Background notification subscription for push events (distillation progress, etc.)
@@ -1565,9 +1591,9 @@ async def _handle_teach(
     return False
 
 
-def _handle_skills(ctx: "Context", console, line: str) -> bool:
-    """Handle skills commands. Returns True if handled."""
-    if line in ("skills", "skills list", "技能列表"):
+def _handle_skill(ctx: "Context", console, line: str) -> bool:
+    """Handle skill commands. Returns True if handled."""
+    if line in ("skill", "skill list"):
         skills = ctx.registry.list_all() if ctx.registry else []
         if not skills:
             console.system("No skills registered.")
@@ -1592,8 +1618,8 @@ def _handle_skills(ctx: "Context", console, line: str) -> bool:
             console.print(table)
         return True
 
-    if line.startswith("skills show "):
-        name = line[len("skills show "):]
+    if line.startswith("skill show "):
+        name = line[len("skill show "):]
         skill = ctx.registry.get(name) if ctx.registry else None
         if skill is None:
             console.warning(f"Skill '{name}' not found.")
@@ -1614,8 +1640,8 @@ def _handle_skills(ctx: "Context", console, line: str) -> bool:
             )
         return True
 
-    if line.startswith("skills disable "):
-        name = line[len("skills disable "):]
+    if line.startswith("skill disable "):
+        name = line[len("skill disable "):]
         found = False
         if ctx.skill_lib and ctx.skill_lib.deactivate_parameterized(name):
             found = True
@@ -1627,8 +1653,8 @@ def _handle_skills(ctx: "Context", console, line: str) -> bool:
             console.warning(f"Skill '{name}' not found.")
         return True
 
-    if line.startswith("skills delete "):
-        name = line[len("skills delete "):]
+    if line.startswith("skill delete "):
+        name = line[len("skill delete "):]
         found = False
         if ctx.skill_lib:
             stored = ctx.skill_lib.load_skill_by_title(name)

@@ -11,12 +11,12 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from dotenv import dotenv_values
 
 from leapflow.platform.cua_client import CuaDriverClient
 from leapflow.platform.event_bus import EventBus
 from leapflow.platform.mock import MockBridge
-from leapflow.config import Settings, _load_yaml_overlay
+from leapflow.config import Settings, _build_settings_from_env
+from leapflow.config_loader import config_signature, load_config_bundle
 from leapflow.engine.engine import AgentEngine, build_default_registry
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.intent_classifier import (
@@ -206,18 +206,24 @@ def _build_video_components(settings: Settings, rpc: Any, vlm: Any):
 
     Returns (TrajectoryRecorder, VideoAnalyzer, VideoSegmenter, SignalTimeline).
     """
+    from leapflow.cache.manager import CacheManager
+    from leapflow.layout import workspace_id_for_path
     from leapflow.perception.video.analyzer import VideoAnalyzer
     from leapflow.perception.video.cache_manager import VideoCacheManager
     from leapflow.perception.video.recorder import TrajectoryRecorder
     from leapflow.perception.video.segmenter import VideoSegmenter
     from leapflow.perception.video.timeline import SignalTimeline
 
-    cache_manager = VideoCacheManager(
+    workspace_id = workspace_id_for_path(settings.workspace_root)
+    cache_index = CacheManager(settings.profile_layout.cache, profile_id=settings.profile)
+    video_cache_manager = VideoCacheManager(
         settings.video_cache_dir,
         max_age_days=settings.video_cache_max_age_days,
         max_size_gb=settings.video_cache_max_size_gb,
+        cache_manager=cache_index,
+        workspace_id=workspace_id,
     )
-    cache_manager.cleanup()
+    video_cache_manager.cleanup()
 
     recorder = TrajectoryRecorder(
         rpc,
@@ -226,6 +232,8 @@ def _build_video_components(settings: Settings, rpc: Any, vlm: Any):
         resolution_scale=settings.video_resolution_scale,
         codec=settings.video_codec,
         max_segment_s=settings.video_max_segment_s,
+        cache_manager=cache_index,
+        workspace_id=workspace_id,
     )
     analyzer = VideoAnalyzer(
         vlm,
@@ -354,6 +362,11 @@ class Context:
 
     def __init__(self, settings: Settings, mock_host: bool) -> None:
         self.settings = settings
+        try:
+            from leapflow.security.path_sensitivity import configure_path_sensitivity_roots
+            configure_path_sensitivity_roots((settings.layout.root,))
+        except Exception:
+            logger.debug("Path sensitivity root configuration skipped", exc_info=True)
         self.effective_mock = bool(mock_host or settings.mock_host)
 
         # Shared DuckDB connection holder — single leap.duckdb for all stores (P1).
@@ -375,7 +388,7 @@ class Context:
         )
         evolution = EvolutionMemoryProvider(max_episodes=settings.memory_evolution_max_episodes)
         narrative = NarrativeProvider(
-            memory_dir=settings.profile_dir / "memory",
+            memory_dir=settings.profile_layout.memory_dir,
             workspace_path=str(Path.cwd()),
         )
 
@@ -476,13 +489,13 @@ class Context:
         from leapflow.security.grants import ApprovalAuditLog, JsonApprovalGrantStore
         from leapflow.security.orchestrator import ApprovalOrchestrator
 
-        approval_dir = settings.profile_dir / "approval"
+        approval_layout = settings.profile_layout.approval
         self._tui_approval = _TUIApprovalGate()
         self._approval_gate = SessionAwareGate(self._tui_approval)
         self._approval_orchestrator = ApprovalOrchestrator(
             self._approval_gate,
-            grants=JsonApprovalGrantStore(approval_dir / "grants.json"),
-            audit=ApprovalAuditLog(approval_dir / "audit.jsonl"),
+            grants=JsonApprovalGrantStore(approval_layout.grants_path),
+            audit=ApprovalAuditLog(approval_layout.audit_path),
         )
 
     def set_approval_handler(self, handler: Optional[Callable[["ApprovalRequest"], Any]]) -> None:
@@ -603,20 +616,11 @@ class Context:
     @staticmethod
     def _runtime_config_signature(settings: Settings) -> tuple:
         """Return a stable signature for user-editable runtime config files."""
-        paths = (
-            settings.data_dir / ".env",
-            settings.data_dir / "config.yaml",
-            Path.cwd() / ".env",
-        )
-        signature = []
-        for path in paths:
-            try:
-                stat = path.stat()
-            except OSError:
-                signature.append((str(path), 0, 0))
-            else:
-                signature.append((str(path), stat.st_mtime_ns, stat.st_size))
-        return tuple(signature)
+        paths = tuple(settings.watched_config_paths or settings.layout.watched_config_paths(
+            settings.profile,
+            settings.workspace_root,
+        ))
+        return config_signature(paths)
 
     @staticmethod
     def _bool_env(value: str, default: bool) -> bool:
@@ -626,76 +630,124 @@ class Context:
         return text in {"1", "true", "yes", "on"}
 
     def _load_runtime_settings_from_files(self) -> Settings:
-        """Reload hot-swappable LLM/VLM settings directly from config files."""
-        values: dict[str, str] = {}
-        data_env = self.settings.data_dir / ".env"
-        cwd_env = Path.cwd() / ".env"
-        if data_env.exists():
-            values.update({
-                key: value
-                for key, value in dotenv_values(data_env).items()
-                if value is not None
-            })
-        values.update(_load_yaml_overlay(self.settings.data_dir))
-        if cwd_env.exists():
-            values.update({
-                key: value
-                for key, value in dotenv_values(cwd_env).items()
-                if value is not None
-            })
-
-        def _value(key: str, current: str) -> str:
-            env_value = os.environ.get(key, "").strip()
-            if env_value:
-                return env_value
-            return str(values.get(key, current)).strip()
-
-        max_retries_raw = _value(
-            "LEAPFLOW_LLM_MAX_RETRIES",
-            str(self.settings.llm_max_retries),
+        """Reload hot-swappable settings from structured config sources."""
+        bundle = load_config_bundle(
+            self.settings.layout,
+            self.settings.profile_layout,
+            self.settings.workspace_root,
         )
+        original_env = dict(os.environ)
+        injected_keys: list[str] = []
+        for key, value in bundle.env.items():
+            if key not in original_env:
+                os.environ[key] = value
+                injected_keys.append(key)
         try:
-            max_retries = max(1, int(max_retries_raw))
-        except ValueError:
-            max_retries = self.settings.llm_max_retries
+            return _build_settings_from_env(
+                layout=self.settings.layout,
+                profile_layout=self.settings.profile_layout,
+                profile_manifest=self.settings.profile_manifest,
+                config_sources=tuple(str(source.path) for source in bundle.sources),
+                watched_config_paths=bundle.watched_paths,
+                config_warnings=bundle.warnings,
+            )
+        finally:
+            for key in injected_keys:
+                os.environ.pop(key, None)
 
-        context_length_raw = _value(
-            "LEAPFLOW_LLM_CONTEXT_LENGTH",
-            str(self.settings.llm_context_length),
-        )
+    def _configure_mcp_manager(self, settings: Settings) -> None:
+        """Rebuild MCP manager and global MCP tool registrations from layout config."""
+        from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
+
+        previous_names = set(getattr(self, "_mcp_tool_names", ()))
+        previous_manager = getattr(self, "_mcp_manager", None)
+        if previous_manager is not None:
+            try:
+                previous_manager.close()
+            except Exception:
+                logger.debug("MCP manager close failed during rebuild", exc_info=True)
+        if previous_names:
+            TOOL_DEFINITIONS[:] = [
+                definition for definition in TOOL_DEFINITIONS
+                if str((definition.get("function") or {}).get("name") or "") not in previous_names
+            ]
+            for name in previous_names:
+                TOOL_HANDLERS.pop(name, None)
+        self._mcp_manager = None
+        self._mcp_tool_names = ()
+
         try:
-            llm_context_length = max(1, int(context_length_raw))
-        except ValueError:
-            llm_context_length = self.settings.llm_context_length
+            mcp_config_path = settings.layout.mcp_servers_path
+            if not mcp_config_path.exists():
+                return
+            import json as _json_mcp
+            from leapflow.platform.mcp_manager import McpManager, McpServerConfig
+            from leapflow.security.threat_patterns import scan_mcp_description
 
-        return replace(
-            self.settings,
-            llm_api_key=_value("LEAPFLOW_LLM_API_KEY", self.settings.llm_api_key),
-            llm_base_url=_value("LEAPFLOW_LLM_BASE_URL", self.settings.llm_base_url).rstrip("/"),
-            llm_model=_value("LEAPFLOW_LLM_MODEL", self.settings.llm_model),
-            llm_max_retries=max_retries,
-            llm_context_length=llm_context_length,
-            vlm_api_key=_value("LEAPFLOW_VLM_API_KEY", self.settings.vlm_api_key),
-            vlm_base_url=_value("LEAPFLOW_VLM_BASE_URL", self.settings.vlm_base_url).rstrip("/"),
-            vlm_model=_value("LEAPFLOW_VLM_MODEL", self.settings.vlm_model),
-            visual_track_enabled=self._bool_env(
-                _value(
-                    "LEAPFLOW_VISUAL_TRACK_ENABLED",
-                    "1" if self.settings.visual_track_enabled else "0",
-                ),
-                self.settings.visual_track_enabled,
-            ),
-        )
+            raw_configs = _json_mcp.loads(mcp_config_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_configs, dict):
+                logger.warning("MCP config must be a JSON object: %s", mcp_config_path)
+                return
+            server_configs = [
+                McpServerConfig(
+                    name=name,
+                    command=cfg.get("command", ""),
+                    args=cfg.get("args", []),
+                    env=cfg.get("env", {}),
+                    parallel_safe=cfg.get("parallel_safe", False),
+                )
+                for name, cfg in raw_configs.items()
+                if isinstance(cfg, dict) and cfg.get("enabled", True) and cfg.get("command")
+            ]
+            if not server_configs:
+                return
 
-    def reload_runtime_config_if_changed(self) -> bool:
+            mgr = McpManager()
+            total_tools = 0
+            for sc in server_configs:
+                try:
+                    schemas = mgr.add_server(sc)
+                    total_tools += len(schemas)
+                except Exception:
+                    logger.warning("MCP server '%s' failed to connect", sc.name)
+
+            tool_names: list[str] = []
+
+            def _build_mcp_handler(manager, tool_name: str):
+                async def _handler(params: dict) -> dict:
+                    return await manager.call_tool(tool_name, params)
+                return _handler
+
+            for schema in mgr.get_tool_schemas():
+                threats = scan_mcp_description(schema.description)
+                if threats:
+                    logger.warning(
+                        "MCP tool '%s' description has threats: %s",
+                        schema.name,
+                        [t.pattern_name for t in threats],
+                    )
+                TOOL_DEFINITIONS.append(schema.to_openai_function())
+                TOOL_HANDLERS[schema.name] = _build_mcp_handler(mgr, schema.name)
+                tool_names.append(schema.name)
+
+            if tool_names:
+                self._mcp_manager = mgr
+                self._mcp_tool_names = tuple(tool_names)
+                logger.info("MCP Manager: %d servers, %d tools registered to agent", len(server_configs), total_tools)
+            else:
+                mgr.close()
+        except Exception:
+            logger.debug("MCP Manager initialization skipped", exc_info=True)
+
+    def reload_runtime_config_if_changed(self, *, force: bool = False) -> bool:
         """Hot-reload LLM/VLM config when user-editable config files changed."""
         signature = self._runtime_config_signature(self.settings)
-        if signature == self._config_signature:
+        if not force and signature == self._config_signature:
             return False
 
         previous = self.settings
         updated = self._load_runtime_settings_from_files()
-        self._config_signature = signature
+        self._config_signature = self._runtime_config_signature(updated)
         llm_changed = (
             previous.llm_api_key != updated.llm_api_key
             or previous.llm_base_url != updated.llm_base_url
@@ -708,8 +760,17 @@ class Context:
             or previous.visual_track_enabled != updated.visual_track_enabled
         )
         self.settings = updated
+        self._configure_mcp_manager(updated)
         if not llm_changed:
-            return False
+            if self.engine is not None:
+                self.engine.reconfigure_runtime(
+                    settings=updated,
+                    llm=self.llm,
+                    vlm=self.vlm,
+                    classifier=self.intent_classifier,
+                )
+            logger.info("Runtime configuration reloaded")
+            return True
 
         self._configure_llm_clients(updated)
         classifier: IntentClassifier = (
@@ -731,7 +792,7 @@ class Context:
                 classifier=classifier,
             )
             self._sync_engine_runtime_budget(updated)
-        logger.info("Runtime LLM configuration reloaded")
+        logger.info("Runtime configuration reloaded")
         return True
 
     def _host_backend_snapshot(self) -> dict[str, Any]:
@@ -1591,8 +1652,8 @@ class Context:
             await self._gateway_event_bridge.on_gateway_event(event)
 
         self.gateway_server = GatewayServer(
-            settings.profile_dir,
-            extra_manifest_dirs=[settings.profile_dir / "gateway" / "manifests"],
+            settings.profile_layout,
+            extra_manifest_dirs=[settings.profile_layout.gateway.manifests_dir],
             on_event=_on_gateway_event_with_bridge,
             checkpoint_store=_checkpoint_store,
             dedup_store=_dedup_store,
@@ -1725,58 +1786,7 @@ class Context:
             self._gateway_router._persistence = self._conversation_store
 
         # ── Initialize MCP Manager + register tools into agent surface ──
-        self._mcp_manager = None
-        try:
-            mcp_config_path = settings.data_dir / "mcp_servers.json"
-            if mcp_config_path.exists():
-                import json as _json_mcp
-                from leapflow.platform.mcp_manager import McpManager, McpServerConfig
-                from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
-
-                raw_configs = _json_mcp.loads(mcp_config_path.read_text())
-                server_configs = [
-                    McpServerConfig(
-                        name=name,
-                        command=cfg.get("command", ""),
-                        args=cfg.get("args", []),
-                        env=cfg.get("env", {}),
-                        parallel_safe=cfg.get("parallel_safe", False),
-                    )
-                    for name, cfg in raw_configs.items()
-                    if cfg.get("enabled", True) and cfg.get("command")
-                ]
-                if server_configs:
-                    mgr = McpManager()
-                    total_tools = 0
-                    for sc in server_configs:
-                        try:
-                            schemas = mgr.add_server(sc)
-                            total_tools += len(schemas)
-                        except Exception:
-                            logger.warning("MCP server '%s' failed to connect", sc.name)
-
-                    if total_tools > 0:
-                        self._mcp_manager = mgr
-
-                        from leapflow.security.threat_patterns import scan_mcp_description
-
-                        def _build_mcp_handler(manager, tool_name: str):
-                            async def _handler(params: dict) -> dict:
-                                return await manager.call_tool(tool_name, params)
-                            return _handler
-
-                        for schema in mgr.get_tool_schemas():
-                            threats = scan_mcp_description(schema.description)
-                            if threats:
-                                logger.warning("MCP tool '%s' description has threats: %s",
-                                               schema.name, [t.pattern_name for t in threats])
-                            TOOL_DEFINITIONS.append(schema.to_openai_function())
-                            TOOL_HANDLERS[schema.name] = _build_mcp_handler(mgr, schema.name)
-
-                        logger.info("MCP Manager: %d servers, %d tools registered to agent",
-                                    len(server_configs), total_tools)
-        except Exception:
-            logger.debug("MCP Manager initialization skipped", exc_info=True)
+        self._configure_mcp_manager(settings)
 
         # ── Unified approval gate wiring (shell, file, gateway) ──
         try:

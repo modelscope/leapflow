@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from leapflow.perception.types import VideoSegment
+from leapflow.cache.manager import CacheManager, CacheScope
 
 if TYPE_CHECKING:
     from leapflow.platform.protocol import HostRpc
@@ -55,6 +56,8 @@ class TrajectoryRecorder:
         codec: str = "h264",
         max_segment_s: int = 600,
         record_video: bool = True,
+        cache_manager: CacheManager | None = None,
+        workspace_id: str = "",
     ) -> None:
         self._rpc = rpc
         self._cache_dir = cache_dir
@@ -63,6 +66,8 @@ class TrajectoryRecorder:
         self._codec = codec
         self._max_segment_s = max_segment_s
         self._record_video = record_video
+        self._cache_manager = cache_manager
+        self._workspace_id = workspace_id
         self._session_id: Optional[str] = None
         self._output_dir: Optional[Path] = None
         self._active = False
@@ -82,7 +87,16 @@ class TrajectoryRecorder:
 
     async def start(self, session_id: str) -> None:
         """Begin trajectory recording for *session_id*."""
-        output_dir = self._cache_dir / session_id
+        if self._cache_manager is not None and self._workspace_id:
+            output_dir = self._cache_manager.path(
+                scope=CacheScope.SESSION,
+                category="video",
+                workspace_id=self._workspace_id,
+                session_id=session_id,
+                source="recording",
+            )
+        else:
+            output_dir = self._cache_dir / session_id
         output_dir.mkdir(parents=True, exist_ok=True)
         self._session_id = session_id
         self._output_dir = output_dir
@@ -119,6 +133,20 @@ class TrajectoryRecorder:
         self._reset_state()
         try:
             segments = self._collect_segments(result, output_dir, session_id=session_id)
+            if session_id and output_dir is not None and self._cache_manager is not None and self._workspace_id:
+                self._cache_manager.register_directory(
+                    root=output_dir,
+                    scope=CacheScope.SESSION,
+                    category="video",
+                    source="recording",
+                    workspace_id=self._workspace_id,
+                    session_id=session_id,
+                    expires_at=None,
+                    sensitive=True,
+                    syncable=False,
+                    owner_component="perception.video",
+                    suffixes=(".mp4", ".mkv", ".webm", ".avi"),
+                )
         except Exception as exc:
             logger.warning("Failed to collect trajectory segments: %s", exc)
             return []

@@ -38,13 +38,13 @@ def default_lease_ttl_s() -> float:
 
 
 def read_active_client_leases(
-    run_dir: Path,
+    runtime_dir: Path,
     *,
     now: float | None = None,
     ttl_s: float | None = None,
 ) -> list[ClientLeaseSnapshot]:
     """Return currently active client leases and remove stale entries."""
-    clients_dir = run_dir / _CLIENTS_DIR
+    clients_dir = runtime_dir / _CLIENTS_DIR
     if not clients_dir.exists():
         return []
     current = time.time() if now is None else now
@@ -63,13 +63,13 @@ def read_active_client_leases(
 
 
 def has_active_client_leases(
-    run_dir: Path,
+    runtime_dir: Path,
     *,
     now: float | None = None,
     ttl_s: float | None = None,
 ) -> bool:
     """Return True when any live client lease exists."""
-    return bool(read_active_client_leases(run_dir, now=now, ttl_s=ttl_s))
+    return bool(read_active_client_leases(runtime_dir, now=now, ttl_s=ttl_s))
 
 
 class ClientLease:
@@ -77,14 +77,14 @@ class ClientLease:
 
     def __init__(
         self,
-        run_dir: Path,
+        runtime_dir: Path,
         *,
         kind: str,
         session_id: str = "",
         state: str = "idle",
         touch_interval_s: float = _DEFAULT_TOUCH_INTERVAL_S,
     ) -> None:
-        self._run_dir = run_dir
+        self._runtime_dir = runtime_dir
         self._client_id = uuid.uuid4().hex
         self._kind = kind
         self.session_id = session_id
@@ -101,7 +101,7 @@ class ClientLease:
     @property
     def path(self) -> Path:
         """Return the lease file path."""
-        return self._run_dir / _CLIENTS_DIR / f"{self._client_id}.json"
+        return self._runtime_dir / _CLIENTS_DIR / f"{self._client_id}.json"
 
     async def start(self) -> None:
         """Create the lease and start periodic touch updates."""

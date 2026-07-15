@@ -185,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument(
         "--no-daemon",
         action="store_true",
-        help="Run chat/interactive in the legacy in-process mode.",
+        help="Run chat/interactive in this process instead of leapd.",
     )
 
     parser = argparse.ArgumentParser(
@@ -255,9 +255,58 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser = daemon_sub.add_parser("serve", help=argparse.SUPPRESS)
     serve_parser.add_argument("--internal", action="store_true", help=argparse.SUPPRESS)
 
+    # leap config
+    config_parser = subparsers.add_parser("config", help="View and update LeapFlow configuration")
+    config_sub = config_parser.add_subparsers(dest="config_action")
+    config_show = config_sub.add_parser("show", help="Show effective configuration or one config field")
+    config_show.add_argument("key", nargs="?", help="Optional config key, e.g. llm.model")
+    config_sub.add_parser("keys", help="List writable configuration keys")
+    config_list = config_sub.add_parser("list", help="List writable configuration fields with descriptions")
+    config_list.add_argument("category", nargs="?", help="Optional category or key prefix filter, e.g. llm or memory")
+    config_list.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    config_sub.add_parser("sources", help="List configuration sources")
+    config_get = config_sub.add_parser("get", help="Show one effective config value")
+    config_get.add_argument("key", help="Config key, e.g. llm.model")
+    config_set = config_sub.add_parser("set", help="Set a writable config value")
+    config_set.add_argument("key", help="Config key, e.g. llm.model")
+    config_set.add_argument("value", help="Config value")
+    config_set.add_argument("--scope", choices=["profile", "workspace"], default="profile", help="Durable config scope")
+    config_unset = config_sub.add_parser("unset", help="Unset a writable config value")
+    config_unset.add_argument("key", help="Config key, e.g. llm.model")
+    config_unset.add_argument("--scope", choices=["profile", "workspace"], default="profile", help="Durable config scope")
+
+    config_llm = config_sub.add_parser("llm", help="Configure the primary LLM provider")
+    config_llm_sub = config_llm.add_subparsers(dest="llm_action")
+    config_llm_sub.add_parser("show", help="Show LLM configuration")
+    config_llm_set = config_llm_sub.add_parser("set", help="Set LLM provider fields")
+    config_llm_set.add_argument("--api-key", help="LLM API key; prefer --ask-api-key for shell history safety")
+    config_llm_set.add_argument("--ask-api-key", action="store_true", help="Prompt securely for the LLM API key")
+    config_llm_set.add_argument("--base-url", help="OpenAI-compatible base URL")
+    config_llm_set.add_argument("--model", help="Model name")
+    config_llm_set.add_argument("--context-length", type=int, help="Runtime context budget in tokens")
+    config_llm_set.add_argument("--max-retries", type=int, help="Provider retry count")
+    config_llm_set.add_argument("--scope", choices=["profile", "workspace"], default="profile", help="Durable config scope")
+    config_llm_key = config_llm_sub.add_parser("key", help="Prompt securely for the LLM API key")
+    config_llm_key.add_argument("--scope", choices=["profile", "workspace"], default="profile", help="Durable config scope")
+
+    config_secret = config_sub.add_parser("secret", help="Manage profile/global secret refs")
+    config_secret_sub = config_secret.add_subparsers(dest="secret_action")
+    config_secret_set = config_secret_sub.add_parser("set", help="Store a secret value")
+    config_secret_set.add_argument("ref", help="secret:// ref or shorthand like llm.primary.api_key")
+    config_secret_set.add_argument("value", nargs="?", help="Secret value; prompts securely when omitted")
+    config_secret_set.add_argument("--scope", choices=["profile", "global"], default="profile", help="Scope for shorthand refs")
+    config_secret_get = config_secret_sub.add_parser("get", help="Check or reveal a secret value")
+    config_secret_get.add_argument("ref", help="secret:// ref or shorthand like llm.primary.api_key")
+    config_secret_get.add_argument("--scope", choices=["profile", "global"], default="profile", help="Scope for shorthand refs")
+    config_secret_get.add_argument("--reveal", action="store_true", help="Print the plaintext secret value")
+    config_secret_delete = config_secret_sub.add_parser("delete", help="Delete a secret ref")
+    config_secret_delete.add_argument("ref", help="secret:// ref or shorthand like llm.primary.api_key")
+    config_secret_delete.add_argument("--scope", choices=["profile", "global"], default="profile", help="Scope for shorthand refs")
+    config_secret_sub.add_parser("list", help="List stored secret refs without revealing values")
+
     # ── Pre-parse: detect if first non-flag arg is a known subcommand ──
     # If not, treat everything non-flag as a chat prompt.
-    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon"}
+    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon", "config"}
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
 
     # Find first non-flag argument, skipping values owned by global options.
@@ -315,6 +364,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             # leap → interactive REPL (Rich banner rendered inside cmd_interactive)
             args.command = "interactive"
+
+    if args.command == "config":
+        from leapflow.cli.commands.config import cmd_config
+        return cmd_config(args)
 
     # Host command does not need Context initialization
     if args.command == "host":

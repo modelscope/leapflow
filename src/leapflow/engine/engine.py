@@ -695,9 +695,9 @@ class TaskContract:
                 "as the project root when a workspace root is provided."
             ),
             (
-                "- LeapFlow config is not stored at `<workspace>/.leapflow/config.json`; "
-                "do not probe that path. Runtime config is loaded from `~/.leapflow/.env` "
-                "with optional project override `./.env` only when that file exists."
+                "- LeapFlow workspace config is optional at `<workspace>/.leapflow/config.yaml`; "
+                "runtime config is loaded from `~/.leapflow/config/user.yaml` and "
+                "`~/.leapflow/profiles/<profile>/config/*.yaml`."
             ),
             (
                 "- Preserve this task contract across summarization, compression, "

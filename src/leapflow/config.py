@@ -1,10 +1,10 @@
-"""Configuration loading from environment variables with optional YAML overlay.
+"""Configuration loading from structured YAML with environment overrides.
 
 Loading priority (highest wins):
-    1. Real environment variables
-    2. CWD ``.env`` — project-specific overrides
-    3. ``<data_dir>/config.yaml`` — structured YAML config (deep-merged)
-    4. ``<data_dir>/.env`` — global user defaults
+    1. Process environment variables
+    2. Workspace ``.leapflow/config.yaml`` overrides
+    3. ``profiles/<profile>/config/*.yaml`` profile config
+    4. ``config/user.yaml`` user defaults
     5. Hard-coded fallbacks
 """
 
@@ -13,31 +13,31 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict
 
-from dotenv import load_dotenv
-
-from leapflow._env_template import ENV_TEMPLATE
+from leapflow.config_loader import load_config_bundle
 from leapflow.domain.trajectory import RecordingMode
+from leapflow.layout import (
+    PathLayout,
+    ProfileLayout,
+    ProfileManifest,
+    build_layout,
+    validate_profile_name,
+    workspace_id_for_path,
+)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LLM_CONTEXT_LENGTH = 256_000
+DEFAULT_LLM_MODEL = "qwen3.7-plus"
+DEFAULT_LLM_CONTEXT_LENGTH = 1_000_000
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _validate_profile_name(profile: str) -> str:
     """Return a safe profile name or raise before any path construction."""
-    normalized = (profile or "default").strip()
-    if not _PROFILE_NAME_RE.fullmatch(normalized):
-        raise ValueError(
-            "Invalid LEAPFLOW_PROFILE; use only letters, numbers, underscores, or dashes"
-        )
-    return normalized
+    return validate_profile_name(profile)
 
 ALL_SIGNAL_CHANNELS = frozenset({
     "click", "app_switch", "clipboard", "clipboard_content",
@@ -49,70 +49,26 @@ def _expand_path(value: str) -> Path:
     return Path(value.replace("~", str(Path.home()))).expanduser()
 
 
-# Global subdirectories (shared across profiles).
-_GLOBAL_SUBDIRS = [
-    "logs",
-]
-
-# Per-profile subdirectories — created under profiles/<profile>/.
-_PROFILE_SUBDIRS = [
-    "db",
-    "memory",
-    "memory/global",
-    "skills",
-    "cache",
-    "cache/frames",
-    "cache/video",
-    "run",
-    "gateway",
-    "gateway/manifests",
-]
-
-
+# Directory creation is owned by PathLayout/ProfileLayout.
 def ensure_data_dir(data_dir: Path, *, profile: str = "default") -> None:
-    """Create the LeapFlow data directory and standard subdirectories.
-
-    Idempotent — safe to call on every startup. Creates both global
-    directories and profile-specific directories under ``profiles/<profile>/``.
-    """
-    profile = _validate_profile_name(profile)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    for sub in _GLOBAL_SUBDIRS:
-        (data_dir / sub).mkdir(parents=True, exist_ok=True)
-
-    profile_dir = data_dir / "profiles" / profile
-    for sub in _PROFILE_SUBDIRS:
-        (profile_dir / sub).mkdir(parents=True, exist_ok=True)
+    """Create the LeapFlow data directory using the canonical layout."""
+    build_layout(data_dir).ensure(profile_id=_validate_profile_name(profile))
 
 
-def ensure_default_env(data_dir: Path) -> bool:
-    """Create a default ``.env`` in *data_dir* if one does not already exist.
+def _bootstrap_data_dir() -> Path:
+    return _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
 
-    The content mirrors ``.env.example`` from the project repository so that
-    users have a ready-to-edit configuration file on first run.
 
-    Returns ``True`` when a new file was written, ``False`` if it already existed.
-    """
-    env_path = data_dir / ".env"
-    if env_path.exists():
-        return False
+def _bootstrap_profile() -> str:
+    return _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
 
-    env_path.write_text(ENV_TEMPLATE, encoding="utf-8")
-    # Inform the user (logging may not be configured yet at this point).
-    if sys.stderr.isatty():
-        sys.stderr.write(
-            f"\033[2m→ Created default config: {env_path}\033[0m\n"
-            f"\033[2m  Edit LEAPFLOW_LLM_API_KEY in this file to configure your LLM provider.\033[0m\n"
-            f"\033[2m  Optional project override: ./.env in your working directory.\033[0m\n"
-        )
-    else:
-        sys.stderr.write(
-            f"→ Created default config: {env_path}\n"
-            f"  Edit LEAPFLOW_LLM_API_KEY in this file to configure your LLM provider.\n"
-            f"  Optional project override: ./.env in your working directory.\n"
-        )
-    sys.stderr.flush()
-    return True
+
+def _bootstrap_layout() -> PathLayout:
+    return build_layout(_bootstrap_data_dir())
+
+
+def _bootstrap_profile_layout() -> ProfileLayout:
+    return _bootstrap_layout().profile(_bootstrap_profile())
 
 
 @dataclass(frozen=True)
@@ -137,12 +93,21 @@ class Settings:
     memory_prefetch_limit: int = 5               # max entries injected per turn
 
     # ── Data Root & Profile ──
-    data_dir: Path = Path("~/.leapflow")
-    profile: str = "default"
-    workspace_root: Path = Path(".")
+    data_dir: Path = field(default_factory=_bootstrap_data_dir)
+    profile: str = field(default_factory=_bootstrap_profile)
+    workspace_root: Path = field(default_factory=lambda: Path.cwd().resolve())
+    layout: PathLayout = field(default_factory=_bootstrap_layout)
+    profile_layout: ProfileLayout = field(default_factory=_bootstrap_profile_layout)
+    profile_manifest: ProfileManifest = field(
+        default_factory=lambda: ProfileManifest.default(_bootstrap_profile())
+    )
+    config_sources: tuple[str, ...] = ()
+    watched_config_paths: tuple[Path, ...] = ()
+    config_warnings: tuple[str, ...] = ()
+    runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
-    audit_log_path: Path = Path("~/.leapflow/profiles/default/audit.jsonl")
+    audit_log_path: Path = field(default_factory=lambda: _bootstrap_profile_layout().audit_log_path)
 
     # Imitation Learning
     pattern_library_path: str = ""        # Custom patterns.yaml path (empty = use default)
@@ -166,13 +131,19 @@ class Settings:
     confirm_default_level: str = "confirm"  # Default confirmation level
 
     # Skill Documents (SKILL.md)
-    skills_dir: Path = Path("~/.leapflow/profiles/default/skills/")
+    skills_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().skills_dir)
     skill_view_max_chars: int = 5000  # Max chars returned by skill_view tool
     skill_min_quality: float = 0.5    # SkillIndex quality threshold
 
     # Visual Track
     visual_track_enabled: bool = False
-    visual_frame_cache_dir: Path = Path("~/.leapflow/profiles/default/cache/frames")
+    visual_frame_cache_dir: Path = field(
+        default_factory=lambda: _bootstrap_profile_layout().cache.category_dir(
+            scope="workspace",
+            category="perception/keyframes",
+            workspace_id=workspace_id_for_path(Path.cwd()),
+        )
+    )
     visual_sample_strategy: str = "keyframe"  # keyframe | periodic | all
     vlm_model: str = ""  # 空则复用 llm_model
     vlm_api_key: str = ""  # 空则复用 llm_api_key
@@ -215,7 +186,7 @@ class Settings:
 
     # ── Perceptual Field ──
     perceptual_field_enabled: bool = False
-    perceptual_field_config: str = "~/.leapflow/profiles/default/perceptual_fields.yaml"
+    perceptual_field_config: str = ""
 
     # ── Context Learning Attention ──
     attention_foreground_gate: bool = True
@@ -290,7 +261,13 @@ class Settings:
     video_resolution_scale: float = 0.75
     video_codec: str = "h264"
     video_max_segment_s: int = 600
-    video_cache_dir: Path = Path("~/.leapflow/profiles/default/cache/video")
+    video_cache_dir: Path = field(
+        default_factory=lambda: _bootstrap_profile_layout().cache.category_dir(
+            scope="workspace",
+            category="video",
+            workspace_id=workspace_id_for_path(Path.cwd()),
+        )
+    )
     video_cache_max_age_days: int = 7           # 视频缓存最大保留天数
     video_cache_max_size_gb: float = 5.0        # 视频缓存最大占用空间(GB)
     video_l2_enabled: bool = True
@@ -430,7 +407,7 @@ class Settings:
     @property
     def profile_dir(self) -> Path:
         """Root directory for the active profile."""
-        return self.data_dir / "profiles" / self.profile
+        return self.profile_layout.root
 
     @property
     def has_llm_credentials(self) -> bool:
@@ -453,120 +430,65 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
     return result
 
 
-def _load_yaml_overlay(data_dir: Path) -> Dict[str, str]:
-    """Load config.yaml and flatten dot-separated keys to env var format.
-
-    Handles corrupt YAML by backing up and continuing with empty config.
-    Returns dict of LEAPFLOW_* env var names to string values.
-    """
-    yaml_path = data_dir / "config.yaml"
-    if not yaml_path.exists():
-        return {}
-
+def load_config() -> Settings:
+    """Load settings from structured YAML and process environment overrides."""
+    data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
+    profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
+    workspace_root = _expand_path(
+        os.getenv("LEAPFLOW_WORKSPACE_ROOT", str(Path.cwd())).strip() or str(Path.cwd())
+    ).resolve()
+    layout = build_layout(data_dir)
     try:
-        import yaml
-    except ImportError:
-        return {}
-
+        from leapflow.security.path_sensitivity import configure_path_sensitivity_roots
+        configure_path_sensitivity_roots((layout.root,))
+    except Exception:
+        logger.debug("Path sensitivity root configuration skipped", exc_info=True)
+    profile_layout = layout.ensure(profile_id=profile)
+    workspace_id = workspace_id_for_path(workspace_root)
     try:
-        raw = yaml_path.read_text(encoding="utf-8")
-        parsed = yaml.safe_load(raw) or {}
-        if not isinstance(parsed, dict):
-            raise ValueError("config.yaml root must be a mapping")
-    except Exception as exc:
-        backup = yaml_path.with_suffix(".yaml.corrupt.bak")
-        logger.warning("config.yaml parse error (%s), backing up to %s", exc, backup.name)
-        try:
-            shutil.copy2(yaml_path, backup)
-        except OSError:
-            pass
-        return {}
+        layout.write_workspace_manifest(workspace_root)
+        profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
+    except OSError:
+        logger.debug("Workspace manifest write skipped", exc_info=True)
+    bundle = load_config_bundle(layout, profile_layout, workspace_root)
 
-    env_vars: Dict[str, str] = {}
-    _flatten_yaml(parsed, prefix="LEAPFLOW", env_vars=env_vars)
-    return env_vars
-
-
-def _flatten_yaml(
-    node: Any, *, prefix: str, env_vars: Dict[str, str]
-) -> None:
-    """Flatten nested YAML dict to LEAPFLOW_X_Y_Z = value strings."""
-    if isinstance(node, dict):
-        for key, value in node.items():
-            child_prefix = f"{prefix}_{key}".upper()
-            _flatten_yaml(value, prefix=child_prefix, env_vars=env_vars)
-    else:
-        env_vars[prefix] = str(node)
+    original_env = dict(os.environ)
+    injected_keys: list[str] = []
+    for key, value in bundle.env.items():
+        if key not in original_env:
+            os.environ[key] = value
+            injected_keys.append(key)
+    try:
+        settings = _build_settings_from_env(
+            layout=layout,
+            profile_layout=profile_layout,
+            profile_manifest=profile_layout.load_manifest(),
+            config_sources=tuple(str(source.path) for source in bundle.sources),
+            watched_config_paths=bundle.watched_paths,
+            config_warnings=bundle.warnings,
+        )
+    finally:
+        for key in injected_keys:
+            os.environ.pop(key, None)
+    return settings
 
 
-def load_config(*, env_file: str | Path | None = None) -> Settings:
-    """Load settings from `.env` and process environment.
-
-    On the very first run the function bootstraps the data directory
-    (default ``~/.leapflow/``) and writes a default ``.env`` there so
-    the user has a ready-to-edit configuration file.
-
-    Loading priority (highest wins):
-        1. Real environment variables (always honoured)
-        2. CWD ``.env`` — project-specific overrides
-        3. ``<data_dir>/.env`` — global user defaults
-        4. Hard-coded fallbacks in this function
-
-    Args:
-        env_file: Optional explicit path to a dotenv file.  When given,
-            *only* this file is loaded (no CWD or global layering).
-
-    Returns:
-        Frozen settings snapshot.
-    """
-    if env_file is not None:
-        load_dotenv(env_file, override=False)
-    else:
-        # Layer 1: CWD .env — project-specific overrides
-        load_dotenv(override=False)
-
-    # Resolve data directory early — it may come from env or CWD .env.
-    _data_dir_raw = os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip()
-    _data_dir = _expand_path(_data_dir_raw)
-
-    # Bootstrap: create directory structure + default .env on first run.
-    _profile = _validate_profile_name(os.getenv("LEAPFLOW_PROFILE", "default"))
-    ensure_data_dir(_data_dir, profile=_profile)
-    ensure_default_env(_data_dir)
-
-    if env_file is None:
-        # Layer 2: YAML config overlay (deep-merge, dot.separated keys).
-        # Inject into os.environ only for the duration of this call so tests
-        # and repeated load_config() calls are not polluted.
-        yaml_vars = _load_yaml_overlay(_data_dir)
-        injected_yaml_keys: list[str] = []
-        for k, v in yaml_vars.items():
-            if k not in os.environ:
-                os.environ[k] = v
-                injected_yaml_keys.append(k)
-
-        try:
-            # Layer 3: global user .env — fills in any variables not already set.
-            _global_env = _data_dir / ".env"
-            if _global_env.exists():
-                load_dotenv(_global_env, override=False)
-
-            return _build_settings_from_env()
-        finally:
-            for k in injected_yaml_keys:
-                os.environ.pop(k, None)
-
-    return _build_settings_from_env()
-
-
-def _build_settings_from_env() -> Settings:
-    """Build Settings from current os.environ (called by load_config)."""
+def _build_settings_from_env(
+    *,
+    layout: PathLayout | None = None,
+    profile_layout: ProfileLayout | None = None,
+    profile_manifest: ProfileManifest | None = None,
+    config_sources: tuple[str, ...] = (),
+    watched_config_paths: tuple[Path, ...] = (),
+    config_warnings: tuple[str, ...] = (),
+) -> Settings:
+    """Build Settings from current os.environ."""
     api_key = os.getenv("LEAPFLOW_LLM_API_KEY", "").strip()
     base_url = os.getenv(
         "LEAPFLOW_LLM_BASE_URL",
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
     ).strip()
-    model = os.getenv("LEAPFLOW_LLM_MODEL", "qwen-plus").strip()
+    model = os.getenv("LEAPFLOW_LLM_MODEL", DEFAULT_LLM_MODEL).strip()
     max_retries = int(os.getenv("LEAPFLOW_LLM_MAX_RETRIES", "3"))
 
     data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())
@@ -574,10 +496,25 @@ def _build_settings_from_env() -> Settings:
     workspace_root = _expand_path(
         os.getenv("LEAPFLOW_WORKSPACE_ROOT", str(Path.cwd())).strip() or str(Path.cwd())
     ).resolve()
-    _profile_dir = data_dir / "profiles" / profile
+    layout = layout or build_layout(data_dir)
+    try:
+        from leapflow.security.path_sensitivity import configure_path_sensitivity_roots
+        configure_path_sensitivity_roots((layout.root,))
+    except Exception:
+        logger.debug("Path sensitivity root configuration skipped", exc_info=True)
+    profile_layout = profile_layout or layout.profile(profile)
+    profile_manifest = profile_manifest or profile_layout.load_manifest()
+    workspace_id = workspace_id_for_path(workspace_root)
+    try:
+        layout.write_workspace_manifest(workspace_root)
+        profile_layout.cache.write_workspace_manifest(workspace_id, workspace_root)
+    except OSError:
+        logger.debug("Workspace manifest write skipped", exc_info=True)
+    _profile_dir = profile_layout.root
+    runtime_dir = os.getenv("LEAPFLOW_RUNTIME_DIR", str(profile_layout.runtime_dir)).strip()
 
     mock_host = os.getenv("LEAPFLOW_MOCK_HOST", "0").strip() in ("1", "true", "True", "yes")
-    duckdb = os.getenv("LEAPFLOW_DUCKDB_PATH", str(_profile_dir / "db" / "leap.duckdb")).strip()
+    duckdb = os.getenv("LEAPFLOW_DUCKDB_PATH", str(profile_layout.duckdb_path)).strip()
     log_level = os.getenv("LEAPFLOW_LOG_LEVEL", "INFO").strip()
 
     # Memory Providers
@@ -590,11 +527,18 @@ def _build_settings_from_env() -> Settings:
     memory_prefetch_limit = int(os.getenv("LEAPFLOW_MEMORY_PREFETCH_LIMIT", "5"))
 
     # Audit
-    audit_log_path = os.getenv("LEAPFLOW_AUDIT_LOG_PATH", str(_profile_dir / "audit.jsonl")).strip()
+    audit_log_path = os.getenv("LEAPFLOW_AUDIT_LOG_PATH", str(profile_layout.audit_log_path)).strip()
 
     # Visual Track
     visual_track_enabled = os.getenv("LEAPFLOW_VISUAL_TRACK_ENABLED", "0").strip() in ("1", "true", "True", "yes")
-    visual_frame_cache_dir = os.getenv("LEAPFLOW_VISUAL_FRAME_CACHE_DIR", str(_profile_dir / "cache" / "frames")).strip()
+    visual_frame_cache_dir = os.getenv(
+        "LEAPFLOW_VISUAL_FRAME_CACHE_DIR",
+        str(profile_layout.cache.category_dir(
+            scope="workspace",
+            category="perception/keyframes",
+            workspace_id=workspace_id,
+        )),
+    ).strip()
     visual_sample_strategy = os.getenv("LEAPFLOW_VISUAL_SAMPLE_STRATEGY", "keyframe").strip()
     vlm_model = os.getenv("LEAPFLOW_VLM_MODEL", "").strip() or model
     vlm_api_key = os.getenv("LEAPFLOW_VLM_API_KEY", "").strip()
@@ -603,7 +547,7 @@ def _build_settings_from_env() -> Settings:
     privacy_sensitive_apps = tuple(b.strip() for b in privacy_sensitive_apps_raw.split(",") if b.strip()) if privacy_sensitive_apps_raw else ()
 
     # Skill Documents
-    skills_dir = os.getenv("LEAPFLOW_SKILLS_DIR", str(_profile_dir / "skills")).strip()
+    skills_dir = os.getenv("LEAPFLOW_SKILLS_DIR", str(profile_layout.skills_dir)).strip()
     skill_view_max_chars = int(os.getenv("LEAPFLOW_SKILL_VIEW_MAX_CHARS", "5000"))
     skill_min_quality = float(os.getenv("LEAPFLOW_SKILL_MIN_QUALITY", "0.5"))
 
@@ -651,7 +595,7 @@ def _build_settings_from_env() -> Settings:
     # Perceptual Field
     perceptual_field_enabled = _bool("LEAPFLOW_PERCEPTUAL_FIELD_ENABLED", "false")
     perceptual_field_config = os.getenv(
-        "LEAPFLOW_PERCEPTUAL_FIELD_CONFIG", str(_profile_dir / "perceptual_fields.yaml")
+        "LEAPFLOW_PERCEPTUAL_FIELD_CONFIG", str(profile_layout.config_dir / "perceptual_fields.yaml")
     ).strip()
 
     # Context Learning Attention
@@ -729,7 +673,10 @@ def _build_settings_from_env() -> Settings:
     video_resolution_scale = float(os.getenv("LEAPFLOW_VIDEO_RESOLUTION_SCALE", "0.75"))
     video_codec = os.getenv("LEAPFLOW_VIDEO_CODEC", "h264").strip()
     video_max_segment_s = int(os.getenv("LEAPFLOW_VIDEO_MAX_SEGMENT_S", "600"))
-    video_cache_dir = os.getenv("LEAPFLOW_VIDEO_CACHE_DIR", str(_profile_dir / "cache" / "video")).strip()
+    video_cache_dir = os.getenv(
+        "LEAPFLOW_VIDEO_CACHE_DIR",
+        str(profile_layout.cache.category_dir(scope="workspace", category="video", workspace_id=workspace_id)),
+    ).strip()
     video_cache_max_age_days = int(os.getenv("LEAPFLOW_VIDEO_CACHE_MAX_AGE_DAYS", "7"))
     video_cache_max_size_gb = float(os.getenv("LEAPFLOW_VIDEO_CACHE_MAX_SIZE_GB", "5.0"))
     video_l2_enabled = _bool("LEAPFLOW_VIDEO_L2_ENABLED", "true")
@@ -815,8 +762,7 @@ def _build_settings_from_env() -> Settings:
     # Signal Fusion
     # Default = "all": collect every supported channel (V7 full fusion). Set
     # to "none" or empty list to disable; comma-separated list selects a
-    # specific subset for ablation experiments. See .env.example for the
-    # complete ablation matrix.
+    # specific subset for ablation experiments.
     signal_channels_raw = os.getenv("LEAPFLOW_SIGNAL_CHANNELS", "all").strip().lower()
     if signal_channels_raw == "none":
         signal_channels: frozenset = frozenset()
@@ -898,6 +844,13 @@ def _build_settings_from_env() -> Settings:
         data_dir=data_dir,
         profile=profile,
         workspace_root=workspace_root,
+        layout=layout,
+        profile_layout=profile_layout,
+        profile_manifest=profile_manifest,
+        config_sources=config_sources,
+        watched_config_paths=watched_config_paths,
+        config_warnings=config_warnings,
+        runtime_dir=_expand_path(runtime_dir),
         audit_log_path=_expand_path(audit_log_path),
         skills_dir=_expand_path(skills_dir),
         skill_view_max_chars=skill_view_max_chars,
@@ -1104,7 +1057,7 @@ def _build_settings_from_env() -> Settings:
     )
 
     if not settings.llm_api_key:
-        logger.warning("LEAPFLOW_LLM_API_KEY is empty; LLM calls will fail until configured.")
+        logger.warning("LLM API key is empty; run `leap config llm key` before making LLM calls.")
 
     settings.duckdb_path.parent.mkdir(parents=True, exist_ok=True)
 

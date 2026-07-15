@@ -169,5 +169,6 @@ def test_file_read_schema_discourages_workspace_config_probe() -> None:
     description = str(file_read_def["function"].get("description", ""))
 
     assert "Do not probe `<workspace>/.leapflow/config.json`" in description
-    assert "~/.leapflow/.env" in description
-    assert "./.env" in description
+    assert "~/.leapflow/config/user.yaml" in description
+    assert "~/.leapflow/profiles/<profile>/config/*.yaml" in description
+    assert "<workspace>/.leapflow/config.yaml" in description

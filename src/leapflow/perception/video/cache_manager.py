@@ -6,18 +6,15 @@ import time
 from pathlib import Path
 from typing import Iterator
 
+from leapflow.cache.manager import CacheManager, CacheScope
+
 logger = logging.getLogger(__name__)
 
 _VIDEO_EXTENSIONS = frozenset((".mp4", ".mkv", ".webm", ".avi"))
 
 
 class VideoCacheManager:
-    """Manages video cache storage with configurable retention policies.
-
-    Policies (applied in order):
-    1. Age-based: remove files older than max_age_days
-    2. Size-based: if total size exceeds max_size_gb, remove oldest files first
-    """
+    """Video cache policy wrapper backed by the unified CacheManager index."""
 
     def __init__(
         self,
@@ -25,20 +22,52 @@ class VideoCacheManager:
         *,
         max_age_days: int = 7,
         max_size_gb: float = 5.0,
+        cache_manager: CacheManager | None = None,
+        workspace_id: str = "",
     ) -> None:
         self._cache_dir = cache_dir
         self._max_age_s = max_age_days * 86400
         self._max_size_bytes = int(max_size_gb * 1024 * 1024 * 1024)
+        self._cache_manager = cache_manager
+        self._workspace_id = workspace_id
+
+    def register_session(self, session_id: str, root: Path) -> int:
+        """Register session video artifacts in the unified cache index."""
+        if self._cache_manager is None:
+            return 0
+        entries = self._cache_manager.register_directory(
+            root=root,
+            scope=CacheScope.SESSION,
+            category="video",
+            source="recording",
+            workspace_id=self._workspace_id,
+            session_id=session_id,
+            expires_at=time.time() + self._max_age_s,
+            sensitive=True,
+            syncable=False,
+            owner_component="perception.video",
+            suffixes=_VIDEO_EXTENSIONS,
+        )
+        return len(entries)
 
     def cleanup(self) -> int:
         """Run cleanup policies. Returns number of files removed."""
-        if not self._cache_dir.exists():
-            return 0
-
         removed = 0
+        if self._cache_manager is not None:
+            removed += self._cache_manager.cleanup_expired()
+            if self._workspace_id:
+                removed += self._cache_manager.cleanup_quota(
+                    scope=CacheScope.SESSION.value,
+                    category="video",
+                    workspace_id=self._workspace_id,
+                    max_bytes=self._max_size_bytes,
+                )
+        if not self._cache_dir.exists():
+            return removed
+
         now = time.time()
 
-        # Phase 1: Age-based removal
+        # Fallback guard for unregistered files under the managed video root.
         for f in self._iter_video_files():
             age = now - f.stat().st_mtime
             if age > self._max_age_s:
@@ -50,7 +79,6 @@ class VideoCacheManager:
                     age / 86400,
                 )
 
-        # Phase 2: Size-based removal (oldest first)
         files = sorted(self._iter_video_files(), key=lambda p: p.stat().st_mtime)
         total_size = sum(f.stat().st_size for f in files)
 

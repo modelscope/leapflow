@@ -112,6 +112,9 @@ def _sensitivity_metadata(sensitivity: PathSensitivity) -> dict[str, Any]:
         "sensitivity_category": sensitivity.category,
         "sensitivity_level": sensitivity.level,
         "sensitivity_reason": sensitivity.reason,
+        "sensitivity_scope": sensitivity.scope,
+        "owner_component": sensitivity.owner_component,
+        "syncable": sensitivity.syncable,
         "redact_on_read": sensitivity.redact_on_read,
     }
 
@@ -175,12 +178,17 @@ async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
                 "ok": False,
                 "error": (
                     "LeapFlow does not use <workspace>/.leapflow/config.json. "
-                    "Use ~/.leapflow/.env for global runtime config, or an existing ./.env "
-                    "for project overrides."
+                    "Use ~/.leapflow/config/user.yaml, "
+                    "~/.leapflow/profiles/<profile>/config/*.yaml, or "
+                    "<workspace>/.leapflow/config.yaml for structured configuration."
                 ),
                 "error_type": "unsupported_config_probe",
                 "retryable": False,
-                "config_locations": ["~/.leapflow/.env", "./.env"],
+                "config_locations": [
+                    "~/.leapflow/config/user.yaml",
+                    "~/.leapflow/profiles/<profile>/config/*.yaml",
+                    "<workspace>/.leapflow/config.yaml",
+                ],
             }
         return {"ok": False, "error": f"File not found: {path}"}
     if not target.is_file():
