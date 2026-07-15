@@ -90,6 +90,7 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
 
     # Chat
     CommandDef("model", "Show or switch active model", "Chat", args_hint="[model_name]", requires_llm=True),
+    CommandDef("config", "View or update runtime configuration", "Chat", args_hint="[show|list|keys|sources|get|set|unset|llm|secret] ...", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
     CommandDef("usage", "Show token usage for current session", "Chat", requires_llm=True),
 
     # Teaching

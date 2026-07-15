@@ -107,34 +107,27 @@ uv run leap --help
 
 ### 2. Configure Your LLM
 
-If you already have an API key, base URL, and model name, use the persistent setup below.
+If you already have an API key, base URL, and model name, save them through the unified config command:
 
 ```bash
-leap vault set llm.primary.api_key
+leap config llm set \
+  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  --model qwen3.7-plus \
+  --ask-api-key
 ```
 
-Paste your API key when prompted. Then write your provider settings:
+Paste your API key when prompted. LeapFlow stores the key in the local secret vault and writes only a `secret://` reference into durable config.
+
+For scripts or CI, pass the key explicitly:
 
 ```bash
-mkdir -p ~/.leapflow/profiles/default/config
-cat > ~/.leapflow/profiles/default/config/llm.yaml <<'YAML'
-llm:
-  api_key_ref: secret://profile/llm/primary/api_key
-  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  model: qwen3.7-plus
-YAML
+leap config llm set \
+  --base-url https://api.openai.com/v1 \
+  --model gpt-4o \
+  --api-key "$OPENAI_API_KEY"
 ```
 
-Replace `base_url` and `model` with your provider values. For example, OpenAI-compatible providers usually look like:
-
-```yaml
-llm:
-  api_key_ref: secret://profile/llm/primary/api_key
-  base_url: https://api.openai.com/v1
-  model: gpt-4o
-```
-
-For a one-off shell session, environment variables are the fastest path:
+For a one-off shell session, environment variables can temporarily override saved config:
 
 ```bash
 export LEAPFLOW_LLM_API_KEY=sk-your-key-here
@@ -165,17 +158,54 @@ Expected: LeapFlow responds with a greeting confirming it's operational.
 
 ## Configuration Reference
 
-For normal setup, follow the Installation steps above. For automation, containers, or one-off local runs, `LEAPFLOW_*` environment variables can override the saved configuration for the current process:
+For normal setup, follow the Installation steps above. For day-to-day changes, use `leap config` as the durable configuration control plane:
+
+```bash
+leap config list                  # human-readable catalog: key, value, type, scope, reload, description
+leap config show llm.model        # detailed metadata and effective value for one key
+leap config keys                  # compact key-only output for scripts
+leap config get llm.model
+leap config set memory.working_max_tokens 12000
+leap config set visual.track_enabled true
+```
+
+Inside the TUI, the same control plane is available as `/config`. It supports hot reload for the active session when possible and provides inline completion for subcommands, config keys, and simple values:
+
+```text
+/config list
+/config list llm
+/config show llm.model
+/config get llm.model
+/config set runtime.log_level DEBUG
+/config set visual.track_enabled true
+```
+
+### Important Config Keys
+
+| Key | Typical value | Description |
+|-----|---------------|-------------|
+| `llm.api_key` | secret value | Primary LLM API key; stored in the local vault, never as durable plaintext |
+| `llm.base_url` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI-compatible LLM endpoint |
+| `llm.model` | `qwen3.7-plus` | Primary model used for chat, planning, and tool reasoning |
+| `llm.context_length` | `1000000` | Runtime context budget shown in the TUI status bar |
+| `memory.working_max_tokens` | `12000` | Working-memory budget injected into active reasoning |
+| `visual.track_enabled` | `true` / `false` | Enable screenshot-based visual perception |
+| `recording.mode` | `video` | Default teaching/observation recording pipeline |
+| `runtime.mock_host` | `true` / `false` | Use the in-process mock host when native OS control is unavailable |
+| `runtime.log_level` | `DEBUG` / `INFO` | Runtime diagnostic verbosity |
+| `scheduler.tick_seconds` | `1.0` | Scheduler polling interval |
+
+`leap config list` is the authoritative source for all writable keys and generated metadata for less common runtime, perception, learning, gateway, hub, safety, and scheduler settings; use `leap config show <key>` or `/config show <key>` when you need one field's details. `LEAPFLOW_*` environment variables remain process-level overrides for automation, containers, or one-off local runs:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `LEAPFLOW_LLM_API_KEY` | No | — | Temporary API key override; for saved setup, use `leap vault set llm.primary.api_key` |
-| `LEAPFLOW_LLM_BASE_URL` | No | DashScope endpoint | OpenAI-compatible base URL |
-| `LEAPFLOW_LLM_MODEL` | No | `qwen3.7-plus` | Model identifier |
-| `LEAPFLOW_LLM_CONTEXT_LENGTH` | No | `256000` | Runtime context budget shown in the TUI status bar |
-| `LEAPFLOW_MOCK_HOST` | No | `0` | Set `1` to use in-process mock (no execution backend) |
-| `LEAPFLOW_RECORDING_MODE` | No | `video` | `video` / `default` / `vision_only` |
-| `LEAPFLOW_LOG_LEVEL` | No | `INFO` | `DEBUG` / `INFO` / `WARNING` |
+| `LEAPFLOW_LLM_API_KEY` | No | — | Temporary API key override; for saved setup, use `leap config llm set --ask-api-key` |
+| `LEAPFLOW_LLM_BASE_URL` | No | DashScope endpoint | Temporary base URL override; for saved setup, use `leap config set llm.base_url <url>` |
+| `LEAPFLOW_LLM_MODEL` | No | `qwen3.7-plus` | Temporary model override; for saved setup, use `leap config set llm.model qwen3.7-plus` |
+| `LEAPFLOW_LLM_CONTEXT_LENGTH` | No | `1000000` | Temporary context budget override; for saved setup, use `leap config set llm.context_length 1000000` |
+| `LEAPFLOW_MOCK_HOST` | No | `0` | Temporary mock-host override; for saved setup, use `leap config set runtime.mock_host true` |
+| `LEAPFLOW_RECORDING_MODE` | No | `video` | Temporary recording-mode override; for saved setup, use `leap config set recording.mode video` |
+| `LEAPFLOW_LOG_LEVEL` | No | `INFO` | Temporary log-level override; for saved setup, use `leap config set runtime.log_level DEBUG` |
 | `LEAPFLOW_DUCKDB_PATH` | No | `~/.leapflow/profiles/default/db/leap.duckdb` | Temporary persistent storage override |
 | `LEAPFLOW_DATA_DIR` | No | `~/.leapflow` | Root data directory |
 
@@ -185,11 +215,11 @@ For normal setup, follow the Installation steps above. For automation, container
 | Variable | Default | Description |
 |----------|---------|-------------|
 | **LLM** | | |
-| `LEAPFLOW_LLM_API_KEY` | temporary override | Saved setup: `leap vault set llm.primary.api_key` plus the LLM config file from Installation |
+| `LEAPFLOW_LLM_API_KEY` | temporary override | Saved setup: `leap config llm set --ask-api-key` |
 | `LEAPFLOW_LLM_BASE_URL` | DashScope endpoint | OpenAI-compatible base URL |
 | `LEAPFLOW_LLM_MODEL` | `qwen3.7-plus` | Model identifier |
 | `LEAPFLOW_LLM_MAX_RETRIES` | `3` | Retry attempts on transient LLM errors |
-| `LEAPFLOW_LLM_CONTEXT_LENGTH` | `256000` | Runtime context budget in tokens; explicit config wins over static model hints |
+| `LEAPFLOW_LLM_CONTEXT_LENGTH` | `1000000` | Runtime context budget in tokens; explicit config wins over static model hints |
 | **Platform** | | |
 | `LEAPFLOW_MOCK_HOST` | `0` | `1` to use in-process mock (no execution backend) |
 | **Storage** | | |
@@ -230,7 +260,7 @@ For normal setup, follow the Installation steps above. For automation, container
 | **Interactive UX** | | |
 | `LEAPFLOW_STREAM_OUTPUT` | `true` | Stream LLM tokens in real-time |
 | `LEAPFLOW_VERBOSE_PROGRESS` | `true` | Show tool execution progress inline |
-| `LEAPFLOW_LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` |
+| `LEAPFLOW_LOG_LEVEL` | `INFO` | Temporary override; saved setup: `leap config set runtime.log_level DEBUG` |
 | **Signal Fusion** | | |
 | `LEAPFLOW_SIGNAL_CHANNELS` | `all` | Active signal channels (comma-separated or `all`) |
 | `LEAPFLOW_SURPRISE_ENABLED` | `true` | Enable surprise detection annotations |
@@ -282,7 +312,7 @@ On first launch, LeapFlow surfaces missing setup directly in the TUI. For exampl
 The bottom status bar keeps the important runtime state visible:
 
 ```text
-qwen3.7-plus │ 0/256K │ [░░░░░░░░░░] 0%
+qwen3.7-plus │ 0/1M │ [░░░░░░░░░░] 0%
 ```
 
 ### Step 3: Ask Naturally
@@ -300,9 +330,16 @@ Inside the TUI, use slash commands for quick inspection and control:
 ```text
 /status   show runtime and backend status
 /tools    inspect available tools
-/model    inspect or change model settings
+/config   view or update saved config; `/config keys` lists writable settings
+/model    show the active model; `/model qwen3.7-plus` updates and hot-reloads it
 /usage    inspect context and token usage
 /clear    clear the visible conversation
+```
+
+For example, this changes the model without leaving the TUI:
+
+```text
+/config llm set --model qwen3.7-plus
 ```
 
 Use the TUI for day-to-day work. Reach for standalone CLI subcommands only when scripting, automation, or explicit one-shot operations are more convenient.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from dataclasses import replace
 from pathlib import Path
@@ -26,6 +27,89 @@ def test_shortcut_commands_are_not_registered() -> None:
     assert resolve_command("shortcut") is None
     assert resolve_command("shortcut add hello = hi") is None
     assert "Shortcuts" not in commands_by_category()
+
+
+@pytest.mark.asyncio
+async def test_config_slash_updates_model_and_hot_reloads(tmp_path) -> None:
+    from leapflow.cli.context import Context
+    from leapflow.cli.commands.slash_handlers import command_execute, render_config_payload
+
+    ctx = Context(make_settings(str(tmp_path)), mock_host=True)
+    await ctx.initialize()
+    try:
+        payload = await command_execute(ctx, "config", "llm set --model qwen3.7-plus")
+
+        assert payload["ok"] is True
+        assert payload["view"] == "config"
+        assert payload["reloaded"] is True
+        assert ctx.settings.llm_model == "qwen3.7-plus"
+        assert "model: qwen3.7-plus" in ctx.settings.profile_layout.llm_config_path.read_text(encoding="utf-8")
+
+        payload = await command_execute(ctx, "config", "set memory.working_max_tokens 12000")
+        assert payload["ok"] is True
+        assert payload["reloaded"] is True
+        assert ctx.settings.memory_working_max_tokens == 12000
+
+        keys = await command_execute(ctx, "config", "keys")
+        assert keys["ok"] is True
+        assert "memory.working_max_tokens" in keys["sources"]
+
+        fields = await command_execute(ctx, "config", "list memory")
+        assert fields["ok"] is True
+        assert fields["mode"] == "list"
+        assert any(item["key"] == "memory.working_max_tokens" for item in fields["fields"])
+        memory_field = next(item for item in fields["fields"] if item["key"] == "memory.working_max_tokens")
+        assert memory_field["type"] == "int"
+        assert memory_field["description"]
+
+        detail = await command_execute(ctx, "config", "show memory.working_max_tokens")
+        assert detail["ok"] is True
+        assert detail["mode"] == "show_detail"
+        assert detail["field"]["key"] == "memory.working_max_tokens"
+        assert detail["field"]["type"] == "int"
+        assert detail["field"]["description"]
+
+        class RecordingConsole:
+            def __init__(self) -> None:
+                self.rendered: list[object] = []
+                self.systems: list[str] = []
+                self.warnings: list[str] = []
+
+            def print(self, renderable: object) -> None:
+                self.rendered.append(renderable)
+
+            def system(self, message: str) -> None:
+                self.systems.append(message)
+
+            def warning(self, message: str) -> None:
+                self.warnings.append(message)
+
+        console = RecordingConsole()
+        render_config_payload(console, fields)  # type: ignore[arg-type]
+        render_config_payload(console, detail)  # type: ignore[arg-type]
+        assert len(console.rendered) == 2
+        assert any("/config show <key>" in message for message in console.systems)
+        assert console.warnings == []
+    finally:
+        await ctx.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_model_slash_is_config_shortcut(tmp_path) -> None:
+    from leapflow.cli.context import Context
+    from leapflow.cli.commands.slash_handlers import command_execute
+
+    ctx = Context(make_settings(str(tmp_path)), mock_host=True)
+    await ctx.initialize()
+    try:
+        payload = await command_execute(ctx, "model", "qwen3.7-plus")
+
+        assert payload["ok"] is True
+        assert payload["view"] == "model"
+        assert payload["requested_model"] == "qwen3.7-plus"
+        assert ctx.settings.llm_model == "qwen3.7-plus"
+    finally:
+        await ctx.cleanup()
 
 
 @pytest.mark.asyncio
@@ -76,35 +160,74 @@ async def test_context_initialize_degrades_when_primary_db_is_locked(
     finally:
         await ctx.cleanup()
 
-def test_vault_cli_set_get_list_delete(monkeypatch, tmp_path, capsys) -> None:
-    from leapflow.cli.commands import vault as vault_module
+def test_config_cli_secret_and_llm_set(monkeypatch, tmp_path, capsys) -> None:
+    from leapflow.cli.commands import config as config_module
+    from leapflow.config_service import normalize_secret_ref
 
     settings = make_settings(str(tmp_path))
-    monkeypatch.setattr(vault_module, "load_config", lambda: settings)
+    monkeypatch.setattr(config_module, "load_config", lambda: settings)
 
-    assert vault_module.normalize_secret_ref("llm.primary.api_key") == "secret://profile/llm/primary/api_key"
-    assert vault_module.normalize_secret_ref("secret://global/llm/shared/api_key", default_scope="profile") == "secret://global/llm/shared/api_key"
-    assert vault_module.cmd_vault(argparse.Namespace(vault_action="set", ref="llm.primary.api_key", value="sk-test", scope="profile")) == 0
+    assert normalize_secret_ref("llm.primary.api_key") == "secret://profile/llm/primary/api_key"
+    assert normalize_secret_ref("secret://global/llm/shared/api_key", default_scope="profile") == "secret://global/llm/shared/api_key"
+    assert config_module.cmd_config(argparse.Namespace(config_action="secret", secret_action="set", ref="llm.primary.api_key", value="sk-test", scope="profile")) == 0
     assert "secret://profile/llm/primary/api_key" in capsys.readouterr().out
 
-    assert vault_module.cmd_vault(argparse.Namespace(vault_action="get", ref="llm.primary.api_key", reveal=False, scope="profile")) == 0
+    assert config_module.cmd_config(argparse.Namespace(config_action="secret", secret_action="get", ref="llm.primary.api_key", reveal=False, scope="profile")) == 0
     assert "is set" in capsys.readouterr().out
 
-    assert vault_module.cmd_vault(argparse.Namespace(vault_action="get", ref="llm.primary.api_key", reveal=True, scope="profile")) == 0
+    assert config_module.cmd_config(argparse.Namespace(config_action="secret", secret_action="get", ref="llm.primary.api_key", reveal=True, scope="profile")) == 0
     assert capsys.readouterr().out.strip() == "sk-test"
 
-    assert vault_module.cmd_vault(argparse.Namespace(vault_action="list")) == 0
+    assert config_module.cmd_config(argparse.Namespace(config_action="llm", llm_action="set", api_key=None, ask_api_key=False, base_url=None, model="qwen3.7-plus", context_length=1_000_000, max_retries=None, scope="profile")) == 0
+    llm_config = settings.profile_layout.llm_config_path.read_text(encoding="utf-8")
+    assert "model: qwen3.7-plus" in llm_config
+    assert "context_length: 1000000" in llm_config
+
+    assert config_module.cmd_config(argparse.Namespace(config_action="keys")) == 0
+    keys_output = capsys.readouterr().out
+    assert "memory.working_max_tokens" in keys_output
+    assert "visual.track_enabled" in keys_output
+    assert "scheduler.tick_seconds" in keys_output
+
+    assert config_module.cmd_config(argparse.Namespace(config_action="list", category="llm", json=False)) == 0
+    list_output = capsys.readouterr().out
+    assert "description:" in list_output
+    assert "llm.model" in list_output
+    assert "Primary LLM model" in list_output
+
+    assert config_module.cmd_config(argparse.Namespace(config_action="show", key="llm.model")) == 0
+    show_output = capsys.readouterr().out
+    assert "llm.model" in show_output
+    assert "value:" in show_output
+    assert "description: Primary LLM model" in show_output
+
+    assert config_module.cmd_config(argparse.Namespace(config_action="list", category="visual", json=True)) == 0
+    list_json = json.loads(capsys.readouterr().out)
+    assert any(item["key"] == "visual.track_enabled" and item["type"] == "bool" for item in list_json)
+
+    assert config_module.cmd_config(argparse.Namespace(config_action="set", key="memory.working_max_tokens", value="12000", scope="profile")) == 0
+    assert config_module.cmd_config(argparse.Namespace(config_action="set", key="visual.track_enabled", value="true", scope="profile")) == 0
+    assert config_module.cmd_config(argparse.Namespace(config_action="set", key="llm.api_key", value="sk-workspace", scope="workspace")) == 2
+    assert "does not support scope: workspace" in capsys.readouterr().out
+    assert config_module.cmd_config(argparse.Namespace(config_action="unset", key="llm.api_key", scope="workspace")) == 2
+    assert "does not support scope: workspace" in capsys.readouterr().out
+    runtime_config = settings.profile_layout.runtime_config_path.read_text(encoding="utf-8")
+    perception_config = settings.profile_layout.perception_config_path.read_text(encoding="utf-8")
+    assert "working_max_tokens: 12000" in runtime_config
+    assert "track_enabled: true" in perception_config
+
+    assert config_module.cmd_config(argparse.Namespace(config_action="secret", secret_action="list")) == 0
     assert "secret://profile/llm/primary/api_key" in capsys.readouterr().out
 
-    assert vault_module.cmd_vault(argparse.Namespace(vault_action="delete", ref="llm.primary.api_key", scope="profile")) == 0
+    assert config_module.cmd_config(argparse.Namespace(config_action="secret", secret_action="delete", ref="llm.primary.api_key", scope="profile")) == 0
     assert "Deleted" in capsys.readouterr().out
 
-    assert vault_module.cmd_vault(argparse.Namespace(vault_action="get", ref="secret://bad/scope", reveal=False, scope="profile")) == 2
-    assert "Invalid secret ref" in capsys.readouterr().out
+    assert config_module.cmd_config(argparse.Namespace(config_action="secret", secret_action="get", ref="secret://bad/scope", reveal=False, scope="profile")) == 2
+    assert "Config error" in capsys.readouterr().out
 
 
 def test_visual_track_defaults_off_without_env(monkeypatch, tmp_path) -> None:
-    from leapflow.config import DEFAULT_LLM_CONTEXT_LENGTH, _build_settings_from_env
+    from leapflow.config import DEFAULT_LLM_CONTEXT_LENGTH, DEFAULT_LLM_MODEL, _build_settings_from_env
     from leapflow.security.path_sensitivity import configured_path_sensitivity_roots
 
     monkeypatch.delenv("LEAPFLOW_VISUAL_TRACK_ENABLED", raising=False)
@@ -118,6 +241,8 @@ def test_visual_track_defaults_off_without_env(monkeypatch, tmp_path) -> None:
     assert settings.visual_track_enabled is False
     assert settings.has_vlm_credentials is False
     assert settings.llm_context_length == DEFAULT_LLM_CONTEXT_LENGTH
+    assert settings.llm_model == DEFAULT_LLM_MODEL
+    assert settings.llm_model == "qwen3.7-plus"
     assert configured_path_sensitivity_roots() == (settings.layout.root.resolve(),)
 
 
@@ -148,7 +273,7 @@ def test_interactive_auth_hint_is_short_and_actionable() -> None:
     assert rendered is True
     assert console.warnings == ["LLM API key is not configured."]
     assert console.systems == [
-        "Set it with `leap vault set secret://profile/llm/primary/api_key` or export `LEAPFLOW_LLM_API_KEY` for this process."
+        "Set it with `leap config secret set secret://profile/llm/primary/api_key` or export `LEAPFLOW_LLM_API_KEY` for this process."
     ]
 
     console = Console()
@@ -160,7 +285,7 @@ def test_interactive_auth_hint_is_short_and_actionable() -> None:
     assert rendered is True
     assert console.warnings == ["LLM API key is not configured."]
     assert console.systems == [
-        "Run `leap vault set llm.primary.api_key`, then set `api_key_ref: secret://profile/llm/primary/api_key` in `~/.leapflow/profiles/default/config/llm.yaml`."
+        "Run `leap config llm key` to store the API key, or `leap config llm set --api-key <key>` for scripts."
     ]
 
 

@@ -126,8 +126,14 @@ def render_usage_payload(console: "LeapConsole", payload: dict[str, Any]) -> Non
 
 
 def build_model_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
-    """Build a serializable model summary."""
+    """Build a serializable model summary or update the active model."""
     model_arg = args.strip()
+    if model_arg:
+        payload = build_config_payload(ctx, f"llm set --model {shlex.quote(model_arg)}")
+        payload["view"] = "model"
+        payload["requested_model"] = model_arg
+        return payload
+
     engine = ctx.engine
     context_length = 0
     if engine is not None:
@@ -137,31 +143,263 @@ def build_model_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
             context_length = int(caps.context_length)
     return {
         "ok": True,
+        "view": "model",
         "model": ctx.settings.llm_model,
         "context_length": context_length,
-        "requested_model": model_arg,
-        "switch_supported": False,
-        "env_var": "LEAPFLOW_LLM_MODEL",
+        "requested_model": "",
     }
 
 
 def render_model_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
     """Render a serializable model summary."""
     if not payload.get("ok", True):
-        console.warning(str(payload.get("error") or "Model information is not available."))
+        console.warning(str(payload.get("error") or payload.get("message") or "Model information is not available."))
         return
     requested = str(payload.get("requested_model") or "")
     model = str(payload.get("model") or "")
-    if not requested:
-        console.system(f"Current model: {model}")
-        context_length = int(payload.get("context_length") or 0)
-        if context_length > 0:
-            console.system(f"Context length: {context_length:,}")
+    if requested:
+        console.success(f"Model updated: {model}")
+        if payload.get("reloaded"):
+            console.system("Configuration reloaded for this session.")
         return
 
-    console.warning("Model switching requires restarting with LEAPFLOW_LLM_MODEL env var.")
-    console.system(f"  Current: {model}")
-    console.system(f"  Example: LEAPFLOW_LLM_MODEL={requested} leap")
+    console.system(f"Current model: {model}")
+    context_length = int(payload.get("context_length") or 0)
+    if context_length > 0:
+        console.system(f"Context length: {context_length:,}")
+
+
+def build_config_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
+    """Execute a config command and return a serializable payload."""
+    from leapflow.config_service import ConfigService
+
+    service = ConfigService(ctx.settings)
+    try:
+        tokens = shlex.split(args)
+    except ValueError as exc:
+        return {"ok": False, "message": f"Invalid /config syntax: {exc}"}
+    if not tokens:
+        tokens = ["show"]
+    action = tokens[0]
+    try:
+        if action == "show":
+            if len(tokens) > 1:
+                return {
+                    "ok": True,
+                    "view": "config",
+                    "mode": "show_detail",
+                    "field": _config_field_to_dict(service.describe(tokens[1])),
+                }
+            return _config_snapshot_payload(service)
+        if action == "keys":
+            return {"ok": True, "view": "config", "mode": "keys", "sources": list(service.writable_keys())}
+        if action == "list":
+            category = tokens[1] if len(tokens) > 1 and not tokens[1].startswith("--") else None
+            return {"ok": True, "view": "config", "mode": "list", "fields": [_config_field_to_dict(item) for item in service.list_fields(category)]}
+        if action == "sources":
+            return {"ok": True, "view": "config", "mode": "sources", "sources": list(service.sources())}
+        if action == "get" and len(tokens) == 2:
+            value = service.get(tokens[1])
+            return {"ok": True, "view": "config", "mode": "get", "values": [_config_value_to_dict(value)]}
+        if action == "set" and len(tokens) >= 3:
+            scope = _option_value(tokens[3:], "--scope", "profile")
+            result = service.set(tokens[1], tokens[2], scope=scope)  # type: ignore[arg-type]
+            return _config_mutation_payload(ctx, service, result)
+        if action == "unset" and len(tokens) >= 2:
+            scope = _option_value(tokens[2:], "--scope", "profile")
+            result = service.unset(tokens[1], scope=scope)  # type: ignore[arg-type]
+            return _config_mutation_payload(ctx, service, result)
+        if action == "llm":
+            return _build_llm_config_payload(ctx, service, tokens[1:])
+        if action == "secret":
+            return _build_secret_config_payload(ctx, service, tokens[1:])
+    except (KeyError, ValueError, RuntimeError) as exc:
+        return {"ok": False, "message": f"Config error: {exc}"}
+    return {"ok": False, "message": "Usage: /config [show|list|keys|sources|get|set|unset|llm|secret] ..."}
+
+
+def render_config_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    """Render config command output."""
+    if not payload.get("ok", True):
+        console.warning(str(payload.get("message") or "Config command failed."))
+        return
+    mode = str(payload.get("mode") or "show")
+    if mode in {"sources", "keys"}:
+        label = "Writable config keys" if mode == "keys" else "Config sources"
+        sources = [str(source) for source in payload.get("sources") or []]
+        if not sources:
+            console.system(f"No {label.lower()} found.")
+            return
+        console.system(f"{label}:")
+        for source in sources:
+            console.system(f"  {source}")
+        return
+    if mode == "list":
+        fields = [dict(item) for item in payload.get("fields") or []]
+        if not fields:
+            console.system("No writable config fields found.")
+            return
+        from rich.table import Table
+
+        table = Table(title="Writable config fields", show_lines=False)
+        table.add_column("Key", no_wrap=True)
+        table.add_column("Value", no_wrap=True)
+        table.add_column("Type", no_wrap=True)
+        table.add_column("Scope", no_wrap=True)
+        table.add_column("Reload", no_wrap=True)
+        table.add_column("Description")
+        for item in fields:
+            table.add_row(
+                str(item.get("key") or ""),
+                str(item.get("value") or ""),
+                str(item.get("type") or ""),
+                ",".join(str(scope) for scope in item.get("scopes") or []),
+                str(item.get("hot_reload") or ""),
+                str(item.get("description") or ""),
+            )
+        console.print(table)
+        console.system("Use /config show <key>, /config get <key>, /config set <key> <value>, or /config keys for compact output.")
+        return
+    if mode == "show_detail":
+        field = dict(payload.get("field") or {})
+        if not field:
+            console.warning("No config field details found.")
+            return
+        from rich.panel import Panel
+        from rich.text import Text
+
+        details = Text()
+        details.append(f"value: {field.get('value') or ''}\n")
+        details.append(f"type: {field.get('type') or ''}\n")
+        details.append(f"category: {field.get('category') or ''}\n")
+        details.append(f"scope: {','.join(str(scope) for scope in field.get('scopes') or [])}\n")
+        details.append(f"reload: {field.get('hot_reload') or ''}\n")
+        details.append(f"secret: {'true' if field.get('secret') else 'false'}\n")
+        value_hint = str(field.get("value_hint") or "")
+        if value_hint:
+            details.append(f"value hint: {value_hint}\n")
+        details.append(f"description: {field.get('description') or ''}")
+        examples = [str(example) for example in field.get("examples") or []]
+        if examples:
+            details.append(f"\nexample: {examples[0]}")
+        console.print(Panel(details, title=str(field.get("key") or "Config field"), border_style="cyan"))
+        return
+    if mode == "mutation":
+        console.success(str(payload.get("message") or "Config updated."))
+        for key in payload.get("changed_keys") or []:
+            console.system(f"  {key}")
+        if payload.get("reloaded"):
+            console.system("Configuration reloaded for this session.")
+        return
+    values = payload.get("values") or []
+    if values:
+        for item in values:
+            console.system(f"{item.get('key')}={item.get('value')}")
+    warnings = payload.get("warnings") or []
+    for warning in warnings:
+        console.warning(str(warning))
+
+
+def _config_snapshot_payload(service: Any) -> dict[str, Any]:
+    snapshot = service.snapshot()
+    return {
+        "ok": True,
+        "view": "config",
+        "mode": "show",
+        "values": [_config_value_to_dict(value) for value in snapshot.values],
+        "sources": list(snapshot.sources),
+        "warnings": list(snapshot.warnings),
+    }
+
+
+def _config_value_to_dict(value: Any) -> dict[str, Any]:
+    return {"key": value.key, "value": value.value, "source": value.source, "secret": value.secret}
+
+
+def _config_field_to_dict(value: Any) -> dict[str, Any]:
+    return {
+        "key": value.key,
+        "value": value.value,
+        "type": value.value_type,
+        "category": value.category,
+        "scopes": list(value.scopes),
+        "hot_reload": value.hot_reload,
+        "secret": value.secret,
+        "description": value.description,
+        "value_hint": value.value_hint,
+        "examples": list(value.examples),
+    }
+
+
+def _build_llm_config_payload(ctx: "Context", service: Any, tokens: list[str]) -> dict[str, Any]:
+    action = tokens[0] if tokens else "show"
+    if action == "show":
+        payload = _config_snapshot_payload(service)
+        payload["values"] = [item for item in payload["values"] if str(item.get("key") or "").startswith("llm.")]
+        return payload
+    if action != "set":
+        return {"ok": False, "message": "Usage: /config llm [show|set --model NAME --base-url URL --api-key KEY]"}
+    options = tokens[1:]
+    if "--ask-api-key" in options:
+        return {"ok": False, "message": "Use `leap config llm key` in a terminal for secure API key prompts."}
+    result = service.configure_llm(
+        api_key=_option_value(options, "--api-key"),
+        base_url=_option_value(options, "--base-url"),
+        model=_option_value(options, "--model"),
+        context_length=_option_int(options, "--context-length"),
+        max_retries=_option_int(options, "--max-retries"),
+        scope=_option_value(options, "--scope", "profile"),
+    )
+    return _config_mutation_payload(ctx, service, result)
+
+
+def _build_secret_config_payload(ctx: "Context", service: Any, tokens: list[str]) -> dict[str, Any]:
+    action = tokens[0] if tokens else "list"
+    if action == "list":
+        return {"ok": True, "view": "config", "mode": "sources", "sources": list(service.list_secrets())}
+    if action == "set" and len(tokens) >= 3:
+        scope = _option_value(tokens[3:], "--scope", "profile")
+        result = service.set_secret(tokens[1], tokens[2], scope=scope)  # type: ignore[arg-type]
+        return _config_mutation_payload(ctx, service, result)
+    if action == "get" and len(tokens) >= 2:
+        scope = _option_value(tokens[2:], "--scope", "profile")
+        reveal = "--reveal" in tokens[2:]
+        value = service.get_secret(tokens[1], scope=scope, reveal=reveal)  # type: ignore[arg-type]
+        return {"ok": True, "view": "config", "mode": "get", "values": [{"key": tokens[1], "value": value, "secret": not reveal}]}
+    if action == "delete" and len(tokens) >= 2:
+        scope = _option_value(tokens[2:], "--scope", "profile")
+        result = service.delete_secret(tokens[1], scope=scope)  # type: ignore[arg-type]
+        return _config_mutation_payload(ctx, service, result)
+    return {"ok": False, "message": "Usage: /config secret [list|set|get|delete] ..."}
+
+
+def _config_mutation_payload(ctx: "Context", service: Any, result: Any) -> dict[str, Any]:
+    reloaded = False
+    if result.changed_keys:
+        reloaded = bool(ctx.reload_runtime_config_if_changed(force=True))
+    return {
+        "ok": bool(result.ok),
+        "view": "config",
+        "mode": "mutation",
+        "message": result.message,
+        "changed_keys": list(result.changed_keys),
+        "reloaded": reloaded,
+        "model": ctx.settings.llm_model,
+    }
+
+
+def _option_value(tokens: list[str], option: str, default: str | None = None) -> str | None:
+    if option not in tokens:
+        return default
+    index = tokens.index(option)
+    if index + 1 >= len(tokens):
+        raise ValueError(f"Missing value for {option}")
+    return tokens[index + 1]
+
+
+def _option_int(tokens: list[str], option: str) -> int | None:
+    value = _option_value(tokens, option)
+    return int(value) if value is not None else None
 
 
 def handle_status(ctx: "Context", console: "LeapConsole", args: str) -> None:
@@ -266,6 +504,11 @@ def handle_usage(ctx: "Context", console: "LeapConsole", args: str) -> None:
 def handle_model(ctx: "Context", console: "LeapConsole", args: str) -> None:
     """Show or switch the active model."""
     render_model_payload(console, build_model_payload(ctx, args))
+
+
+def handle_config(ctx: "Context", console: "LeapConsole", args: str) -> None:
+    """View or update runtime configuration."""
+    render_config_payload(console, build_config_payload(ctx, args))
 
 
 def handle_gateway(ctx: "Context", console: "LeapConsole", args: str) -> None:
@@ -763,6 +1006,8 @@ async def command_execute(ctx: "Context", name: str, args: str = "") -> dict[str
         return build_usage_payload(ctx)
     if name == "model":
         return build_model_payload(ctx, args)
+    if name == "config":
+        return build_config_payload(ctx, args)
     if name == "gateway":
         return build_gateway_payload(ctx)
     if name == "host":
@@ -1161,6 +1406,12 @@ def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> N
 
     if view == "status":
         _render_status_view(console, payload)
+        return
+    if view == "model":
+        render_model_payload(console, payload)
+        return
+    if view == "config":
+        render_config_payload(console, payload)
         return
     if view == "gateway":
         _render_gateway_view(console, payload)

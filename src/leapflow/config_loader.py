@@ -226,8 +226,20 @@ def _validate_known_sections(
     if warnings is None:
         return
     known_sections = {
-        "user", "paths", "runtime", "llm", "perception", "gateway", "hub",
-        "privacy", "approval", "cache", "logging", "version",
+        "user", "paths", "version",
+        "runtime", "mock", "log",
+        "llm", "vlm",
+        "memory", "pattern", "snapshot", "codegen", "dag", "intent",
+        "learn", "confirm", "skill",
+        "perception", "visual", "text", "clipboard", "perceptual", "attention",
+        "recording", "video", "learnability",
+        "causal", "heuristic", "prediction", "curiosity", "replay", "semantic",
+        "budget", "ast", "mhms", "surprise", "signal",
+        "react", "tool", "native", "stream", "verbose", "compress", "max",
+        "context", "error", "session", "stale", "default", "circuit",
+        "rpc", "use", "cua", "copilot", "notification", "live",
+        "gateway", "hub", "privacy", "approval", "cache", "logging",
+        "observer", "scheduler",
     }
     for key, value in parsed.items():
         if key in known_sections and key != "version" and not isinstance(value, Mapping):

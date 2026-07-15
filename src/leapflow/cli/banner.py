@@ -157,7 +157,11 @@ def display_rich_banner(
     if model:
         model_short = model.split("/")[-1] if "/" in model else model
         if context_length >= 1_000_000:
-            ctx_label = f"{context_length / 1_000_000:.1f}M"
+            ctx_label = (
+                f"{context_length // 1_000_000}M"
+                if context_length % 1_000_000 == 0
+                else f"{context_length / 1_000_000:.1f}M"
+            )
         elif context_length >= 1_000:
             ctx_label = f"{context_length // 1000}K"
         else:

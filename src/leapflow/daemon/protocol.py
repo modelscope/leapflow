@@ -211,10 +211,6 @@ class LeapService(Protocol):
         """Return token usage for the current daemon session."""
         ...
 
-    async def model_info(self, model_name: str = "") -> Dict[str, Any]:
-        """Return active model information and switch guidance."""
-        ...
-
     async def app_command(self, args: str = "") -> Dict[str, Any]:
         """Return an App Connector slash-command payload."""
         ...
@@ -296,7 +292,6 @@ METHOD_REGISTRY: Dict[str, str] = {
     "host.restart": "host_restart",
     "tools.list": "tools_list",
     "usage.summary": "usage_summary",
-    "model.info": "model_info",
     "app.command": "app_command",
     "command.execute": "command_execute",
     "approval.status": "approval_status",

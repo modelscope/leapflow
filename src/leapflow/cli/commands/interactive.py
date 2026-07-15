@@ -154,9 +154,9 @@ def _print_auth_setup_hint(console: Any, settings: Any) -> bool:
     missing_ref = next((item.split("Missing secret ref: ", 1)[1] for item in warnings if "Missing secret ref: " in item), "")
     console.warning("LLM API key is not configured.")
     if missing_ref:
-        console.system(f"Set it with `leap vault set {missing_ref}` or export `LEAPFLOW_LLM_API_KEY` for this process.")
+        console.system(f"Set it with `leap config secret set {missing_ref}` or export `LEAPFLOW_LLM_API_KEY` for this process.")
     else:
-        console.system("Run `leap vault set llm.primary.api_key`, then set `api_key_ref: secret://profile/llm/primary/api_key` in `~/.leapflow/profiles/default/config/llm.yaml`.")
+        console.system("Run `leap config llm key` to store the API key, or `leap config llm set --api-key <key>` for scripts.")
     return True
 
 
@@ -264,12 +264,14 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     from leapflow.cli.tui_app.status import StatusBar
     from leapflow.cli.banner import display_rich_banner
     from leapflow.cli.commands.registry import completion_entries
+    from leapflow.config_service import ConfigService
     from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
         handle_status,
         handle_tools,
         handle_usage,
         handle_model,
+        handle_config,
         handle_clear,
         handle_gateway,
         handle_app,
@@ -610,6 +612,12 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
 
             if canonical == "model":
                 handle_model(ctx, console, cmd_args)
+                _update_status()
+                return
+
+            if canonical == "config":
+                handle_config(ctx, console, cmd_args)
+                _update_status()
                 return
 
             if canonical.startswith("teach") or canonical == "annotate":
@@ -792,6 +800,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         theme=theme,
         status=status,
         commands=completion_entries(),
+        config_fields=tuple(ConfigService(ctx.settings).list_fields()),
         history_path=ctx.settings.profile_layout.tui_history_path,
         on_input=handle_input,
         on_control=_handle_task_control,
@@ -837,6 +846,7 @@ async def cmd_interactive_daemon(
     """Persistent REPL backed by leapd thin-client RPC."""
     from leapflow.cli.banner import display_rich_banner
     from leapflow.cli.commands.registry import completion_entries
+    from leapflow.config_service import ConfigService
     from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
         render_app_payload,
@@ -1295,6 +1305,7 @@ async def cmd_interactive_daemon(
         theme=theme,
         status=status,
         commands=completion_entries(),
+        config_fields=tuple(ConfigService(settings).list_fields()),
         history_path=settings.profile_layout.tui_history_path,
         on_input=handle_input,
         on_control=_handle_task_control,

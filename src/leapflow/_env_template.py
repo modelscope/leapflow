@@ -17,22 +17,22 @@ ENV_TEMPLATE = """\
 #   <workspace>/.leapflow/config.yaml
 #
 # This template documents optional LEAPFLOW_* process overrides for CI,
-# containers, and one-off local debugging. Store long-lived secrets with
-# `leap vault`, then reference them from profile YAML.
+# containers, and one-off local debugging. Store durable settings with
+# `leap config keys`, `leap config get`, and `leap config set`.
 
 # ═══════════════════════════════════════════════════════════════════════
 # LLM — OpenAI-compatible provider (DashScope, OpenAI, DeepSeek, etc.)
 # ═══════════════════════════════════════════════════════════════════════
 # Recommended persistent setup:
-#   leap vault set llm.primary.api_key
-#   then set api_key_ref: secret://profile/llm/primary/api_key in ~/.leapflow/profiles/default/config/llm.yaml
+#   leap config llm set --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 --model qwen3.7-plus
+#   leap config llm key
 # Temporary process override only:
 # LEAPFLOW_LLM_API_KEY=sk-your-key-here
 # LEAPFLOW_LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 # LEAPFLOW_LLM_MODEL=qwen3.7-plus
 # LEAPFLOW_LLM_MAX_RETRIES=3
 # Runtime context budget in tokens. Set to the usable limit for your provider/model.
-# LEAPFLOW_LLM_CONTEXT_LENGTH=256000
+# LEAPFLOW_LLM_CONTEXT_LENGTH=1000000
 
 # ═══════════════════════════════════════════════════════════════════════
 # Platform — CuaDriver communication

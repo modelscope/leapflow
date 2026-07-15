@@ -258,6 +258,30 @@ def test_slash_completer_filters_multi_word_commands() -> None:
     assert all(completion.start_position == -len("/teach s") for completion in completions)
 
 
+def test_slash_completer_guides_config_subcommands_keys_and_values() -> None:
+    completer = SlashCommandCompleter(
+        (("config", "View or update runtime configuration"),),
+        config_fields=(
+            ("memory.working_max_tokens", "Token budget for working memory", "int", ""),
+            ("visual.track_enabled", "Enable visual perception", "bool", "true|false"),
+        ),
+    )
+
+    actions = list(completer.get_completions(Document("/config ", len("/config ")), None))
+    assert "list" in [completion.text for completion in actions]
+    assert "get" in [completion.text for completion in actions]
+
+    keys = list(completer.get_completions(Document("/config get mem", len("/config get mem")), None))
+    assert [completion.text for completion in keys] == ["memory.working_max_tokens"]
+    assert to_plain_text(keys[0].display_meta) == "Token budget for working memory"
+
+    show_keys = list(completer.get_completions(Document("/config show visual", len("/config show visual")), None))
+    assert [completion.text for completion in show_keys] == ["visual.track_enabled"]
+
+    values = list(completer.get_completions(Document("/config set visual.track_enabled ", len("/config set visual.track_enabled ")), None))
+    assert [completion.text for completion in values] == ["true", "false"]
+
+
 def test_slash_completer_does_not_pollute_natural_language() -> None:
     completer = SlashCommandCompleter((("help", "Show available commands"),))
 

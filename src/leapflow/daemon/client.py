@@ -158,12 +158,6 @@ class DaemonClient:
         result = await self.request("usage.summary")
         return dict(result or {})
 
-    async def model_info(self, model_name: str = "") -> dict[str, Any]:
-        """Return daemon-owned model information."""
-        params = {"model_name": model_name} if model_name else {}
-        result = await self.request("model.info", params)
-        return dict(result or {})
-
     async def app_command(self, args: str = "") -> dict[str, Any]:
         """Return daemon-owned App Connector command payload."""
         result = await self.request("app.command", {"args": args})

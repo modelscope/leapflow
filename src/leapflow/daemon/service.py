@@ -237,12 +237,6 @@ class RuntimeLeapService:
 
         return build_usage_payload(self.context)
 
-    async def model_info(self, model_name: str = "") -> dict[str, Any]:
-        """Return active daemon model information and restart guidance."""
-        from leapflow.cli.commands.slash_handlers import build_model_payload
-
-        return build_model_payload(self.context, model_name)
-
     async def app_command(self, args: str = "") -> dict[str, Any]:
         """Return daemon-owned App Connector slash-command payload."""
         from leapflow.cli.commands.slash_handlers import build_app_payload

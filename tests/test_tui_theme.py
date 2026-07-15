@@ -197,12 +197,14 @@ def test_rich_banner_accepts_resolved_theme(capsys) -> None:
         platform_online=False,
         tool_defs=[],
         skills=[],
+        context_length=1_000_000,
         show_welcome=False,
         theme=theme,
     )
 
     output = capsys.readouterr().out
     assert "LeapFlow" in output
+    assert "1M ctx" in output
     assert "#FFF8DC" not in output
 
 
@@ -329,7 +331,7 @@ def test_status_bar_compacts_on_narrow_terminal(monkeypatch) -> None:
     assert "[" not in rendered
 
 
-def test_status_bar_shows_fractional_k_for_small_context_usage(monkeypatch) -> None:
+def test_status_bar_shows_compact_m_for_default_context_budget(monkeypatch) -> None:
     monkeypatch.setattr(
         "leapflow.cli.tui_app.status.shutil.get_terminal_size",
         lambda: terminal_size((120, 24)),
@@ -338,12 +340,12 @@ def test_status_bar_shows_fractional_k_for_small_context_usage(monkeypatch) -> N
     status.update(
         model_name="qwen3.7-plus",
         context_used=240,
-        context_max=256_000,
+        context_max=1_000_000,
     )
 
     rendered = "".join(text for _, text in status())
-    assert "0.2K/256K" in rendered
-    assert "0.1%" in rendered
+    assert "0.2K/1M" in rendered
+    assert "<0.1%" in rendered
     assert "[█░░░░░░░░░]" in rendered
 
 

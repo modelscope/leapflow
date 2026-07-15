@@ -739,15 +739,15 @@ class Context:
         except Exception:
             logger.debug("MCP Manager initialization skipped", exc_info=True)
 
-    def reload_runtime_config_if_changed(self) -> bool:
+    def reload_runtime_config_if_changed(self, *, force: bool = False) -> bool:
         """Hot-reload LLM/VLM config when user-editable config files changed."""
         signature = self._runtime_config_signature(self.settings)
-        if signature == self._config_signature:
+        if not force and signature == self._config_signature:
             return False
 
         previous = self.settings
         updated = self._load_runtime_settings_from_files()
-        self._config_signature = signature
+        self._config_signature = self._runtime_config_signature(updated)
         llm_changed = (
             previous.llm_api_key != updated.llm_api_key
             or previous.llm_base_url != updated.llm_base_url

@@ -378,14 +378,13 @@ async def test_daemon_client_slash_metadata_rpc() -> None:
                 "context_length": 100,
             }
 
-        async def model_info(self, model_name: str = "") -> dict[str, Any]:
+        async def command_execute(self, name: str, args: str = "") -> dict[str, Any]:
             return {
                 "ok": True,
+                "view": name,
                 "model": "test-model",
                 "context_length": 100,
-                "requested_model": model_name,
-                "switch_supported": False,
-                "env_var": "LEAPFLOW_LLM_MODEL",
+                "requested_model": args,
             }
 
         async def app_command(self, args: str = "") -> dict[str, Any]:
@@ -402,7 +401,7 @@ async def test_daemon_client_slash_metadata_rpc() -> None:
         try:
             tools = await client.tools_list()
             usage = await client.usage_summary()
-            model = await client.model_info("next-model")
+            model = await client.command_execute("model", "next-model")
             app_payload = await client.app_command("list")
         finally:
             task.cancel()
@@ -468,7 +467,7 @@ async def test_runtime_service_slash_metadata_payloads() -> None:
         try:
             tools = await service.tools_list()
             usage = await service.usage_summary()
-            model = await service.model_info("other-model")
+            model = await service.command_execute("model", "")
             app_list = await service.app_command("list")
             app_status = await service.app_command("status feishu")
         finally:
@@ -479,7 +478,7 @@ async def test_runtime_service_slash_metadata_payloads() -> None:
     assert usage["total_tokens"] == 20
     assert usage["context_length"] == 4096
     assert model["model"] == settings.llm_model
-    assert model["requested_model"] == "other-model"
+    assert model["requested_model"] == ""
     assert app_list["ok"] is True
     assert app_list["view"] == "list"
     assert {entry["id"] for entry in app_list["result"]["platforms"]} >= {"feishu", "telegram", "dingtalk"}
@@ -811,7 +810,7 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
         "volatile": False,
         "model": "qwen3.7-plus",
         "context_used": 256,
-        "llm_context_length": 256_000,
+        "llm_context_length": 1_000_000,
         "session_id": "sess-1",
         "runtime_version": "0.0.test",
         "runtime_source": "/repo/src/leapflow/__init__.py",
@@ -834,7 +833,7 @@ def test_daemon_runtime_status_prints_diagnostics(capsys) -> None:
 
     output = capsys.readouterr().out
     assert "runtime: profile=default clients=1 connected=2 volatile=False" in output
-    assert "model: qwen3.7-plus context=256/256000" in output
+    assert "model: qwen3.7-plus context=256/1000000" in output
     assert "version: 0.0.test" in output
     assert "source: /repo/src/leapflow/__init__.py" in output
     assert "python: /venv/bin/python" in output

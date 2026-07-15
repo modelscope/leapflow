@@ -32,7 +32,8 @@ from leapflow.layout import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LLM_CONTEXT_LENGTH = 256_000
+DEFAULT_LLM_MODEL = "qwen3.7-plus"
+DEFAULT_LLM_CONTEXT_LENGTH = 1_000_000
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -489,7 +490,7 @@ def _build_settings_from_env(
         "LEAPFLOW_LLM_BASE_URL",
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
     ).strip()
-    model = os.getenv("LEAPFLOW_LLM_MODEL", "qwen-plus").strip()
+    model = os.getenv("LEAPFLOW_LLM_MODEL", DEFAULT_LLM_MODEL).strip()
     max_retries = int(os.getenv("LEAPFLOW_LLM_MAX_RETRIES", "3"))
 
     data_dir = _expand_path(os.getenv("LEAPFLOW_DATA_DIR", "~/.leapflow").strip())

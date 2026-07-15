@@ -24,7 +24,7 @@ def _compact_tokens(n: int) -> str:
     < 1K   → ``0.1K``, ``0.9K``  (1 decimal)
     1–10K  → ``1.2K``, ``9.8K``  (1 decimal)
     10–999K → ``12K``, ``256K``   (integer K)
-    ≥ 1M   → ``1.2M``            (1 decimal)
+    ≥ 1M   → ``1M``, ``1.2M``     (compact M)
     """
     if n < 0:
         return "?"
@@ -34,6 +34,8 @@ def _compact_tokens(n: int) -> str:
         return f"{n / 1000:.1f}K"
     if n < 1_000_000:
         return f"{n // 1000}K"
+    if n % 1_000_000 == 0:
+        return f"{n // 1_000_000}M"
     return f"{n / 1_000_000:.1f}M"
 
 
@@ -63,6 +65,8 @@ def _format_percent(used: int, total: int) -> str:
     if total <= 0:
         return "0%"
     pct = max(0.0, min(used * 100 / total, 100.0))
+    if 0 < pct < 0.1:
+        return "<0.1%"
     if 0 < pct < 10:
         return f"{pct:.1f}%"
     return f"{int(pct)}%"
