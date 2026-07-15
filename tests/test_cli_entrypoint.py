@@ -719,12 +719,13 @@ async def test_daemon_tui_exit_prompt_stops_by_default(monkeypatch, tmp_path) ->
 
     class Settings:
         profile_dir = tmp_path
+        runtime_dir = tmp_path / "runtime"
 
     async def yes(prompt: str) -> bool:
         return True
 
-    def record_stop(run_dir, **kwargs):
-        calls.append((run_dir, kwargs))
+    def record_stop(runtime_dir, **kwargs):
+        calls.append((runtime_dir, kwargs))
         return lifecycle_module.StopDaemonResult(pid=1234, stopped=True)
 
     calls = []
@@ -735,7 +736,7 @@ async def test_daemon_tui_exit_prompt_stops_by_default(monkeypatch, tmp_path) ->
     await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
 
     assert "shutdown" in calls
-    assert any(isinstance(call, tuple) and call[0] == tmp_path / "run" for call in calls)
+    assert any(isinstance(call, tuple) and call[0] == tmp_path / "runtime" for call in calls)
     assert "leapd stopped" in console.systems[-1]
 
 
@@ -761,6 +762,7 @@ async def test_daemon_tui_exit_prompt_can_keep_daemon(monkeypatch, tmp_path) -> 
 
     class Settings:
         profile_dir = tmp_path
+        runtime_dir = tmp_path / "runtime"
 
     def fail_stop(*args, **kwargs):
         raise AssertionError("daemon should be kept running")
@@ -802,6 +804,7 @@ async def test_daemon_tui_exit_prompt_keeps_daemon_by_default_for_other_clients(
 
     class Settings:
         profile_dir = tmp_path
+        runtime_dir = tmp_path / "runtime"
 
     prompts: list[str] = []
 

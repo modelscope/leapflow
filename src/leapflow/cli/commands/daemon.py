@@ -18,16 +18,16 @@ def cmd_daemon(args: Namespace) -> int:
     from leapflow.config import load_config
 
     settings = load_config()
-    run_dir = settings.profile_dir / "run"
+    runtime_dir = settings.runtime_dir
 
     action = getattr(args, "daemon_action", None) or "status"
 
     if action == "status":
-        return _status(run_dir)
+        return _status(runtime_dir)
     if action == "start":
         return _start(settings, getattr(args, "mock_host", False))
     if action == "stop":
-        return _stop(run_dir, force=getattr(args, "force", False))
+        return _stop(runtime_dir, force=getattr(args, "force", False))
     if action == "restart":
         return _restart(settings, getattr(args, "mock_host", False), force=getattr(args, "force", False))
     if action == "serve":
@@ -40,10 +40,10 @@ def cmd_daemon(args: Namespace) -> int:
     return 1
 
 
-def _status(run_dir: Path) -> int:
+def _status(runtime_dir: Path) -> int:
     from leapflow.daemon.lifecycle import DaemonInfo
 
-    info = DaemonInfo.discover(run_dir)
+    info = DaemonInfo.discover(runtime_dir)
     print(info.format_status())
     if info.sock_path is not None:
         print(f"socket: {info.sock_path}")
@@ -136,13 +136,13 @@ def _start(settings: object, mock_host: bool) -> int:
     return asyncio.run(_run())
 
 
-def _stop(run_dir: Path, *, force: bool = False, timeout_s: float = 10.0) -> int:
+def _stop(runtime_dir: Path, *, force: bool = False, timeout_s: float = 10.0) -> int:
     from leapflow.daemon.lifecycle import DaemonInfo, cleanup_stale, stop_daemon
 
-    info = DaemonInfo.discover(run_dir)
+    info = DaemonInfo.discover(runtime_dir)
     if not info.is_running:
         if info.pid is not None:
-            cleanup_stale(run_dir)
+            cleanup_stale(runtime_dir)
             print("Cleaned up stale daemon files.")
         else:
             print("leapd is not running.")
@@ -153,7 +153,7 @@ def _stop(run_dir: Path, *, force: bool = False, timeout_s: float = 10.0) -> int
         graceful_requested = _request_shutdown(info.sock_path)
     print(f"Stopping leapd (pid={info.pid})...")
     result = stop_daemon(
-        run_dir,
+        runtime_dir,
         timeout_s=timeout_s,
         force=force,
         grace_timeout_s=2.0 if graceful_requested else 0.0,
@@ -184,9 +184,9 @@ def _request_shutdown(sock_path: Path) -> bool:
 
 
 def _restart(settings: object, mock_host: bool, *, force: bool = False) -> int:
-    run_dir = settings.profile_dir / "run"
+    runtime_dir = settings.runtime_dir
     print("Restarting leapd...")
-    stop_code = _stop(run_dir, force=force, timeout_s=10.0)
+    stop_code = _stop(runtime_dir, force=force, timeout_s=10.0)
     if stop_code != 0:
         sys.stderr.write("Restart aborted because old leapd did not stop cleanly.\n")
         return stop_code

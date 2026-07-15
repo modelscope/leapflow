@@ -253,5 +253,8 @@ def make_settings(tmp_dir: str) -> Settings:
         mock_host=True,
         duckdb_path=Path(tmp_dir) / "mem.duckdb",
         log_level="WARNING",
+        data_dir=Path(tmp_dir),
+        profile="default",
+        runtime_dir=Path(tmp_dir) / "profiles" / "default" / "runtime",
         prediction_enabled=False,
     )

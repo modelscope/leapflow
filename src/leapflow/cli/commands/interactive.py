@@ -70,7 +70,7 @@ async def _prompt_stop_daemon_on_exit(
 
     from leapflow.daemon.lifecycle import stop_daemon
 
-    run_dir = settings.profile_dir / "run"
+    runtime_dir = settings.runtime_dir
     console.system(f"Stopping leapd (pid={pid})...")
     graceful_requested = False
     try:
@@ -80,7 +80,7 @@ async def _prompt_stop_daemon_on_exit(
         graceful_requested = False
     result = await asyncio.to_thread(
         stop_daemon,
-        run_dir,
+        runtime_dir,
         timeout_s=5.0,
         grace_timeout_s=1.0 if graceful_requested else 0.0,
     )
@@ -860,7 +860,7 @@ async def cmd_interactive_daemon(
     runtime_daemon_pid = ""
     runtime_host_online = False
     client_lease = ClientLease(
-        settings.profile_dir / "run",
+        settings.runtime_dir,
         kind="tui",
         session_id=active_session_id,
     )

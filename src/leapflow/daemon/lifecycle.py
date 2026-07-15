@@ -10,7 +10,7 @@ Handles the leapd daemon lifecycle:
 
 Usage::
 
-    info = DaemonInfo.discover(run_dir)
+    info = DaemonInfo.discover(runtime_dir)
     if info.is_healthy:
         # connect to existing daemon
     else:
@@ -44,11 +44,11 @@ class DaemonInfo:
     is_healthy: bool
 
     @classmethod
-    def discover(cls, run_dir: Path) -> DaemonInfo:
-        """Probe the run directory to determine daemon state."""
-        pid = _read_pid(run_dir / "leapd.pid")
-        sock_path = run_dir / "leapd.sock"
-        meta = _read_meta(run_dir / "leapd.json")
+    def discover(cls, runtime_dir: Path) -> DaemonInfo:
+        """Probe the runtime directory to determine daemon state."""
+        pid = _read_pid(runtime_dir / "leapd.pid")
+        sock_path = runtime_dir / "leapd.sock"
+        meta = _read_meta(runtime_dir / "leapd.json")
         start_time = meta.get("start_time") if meta else None
 
         is_running = pid is not None and _process_alive(pid)
@@ -99,7 +99,7 @@ class DaemonLock:
 
     Usage::
 
-        lock = DaemonLock(run_dir / "leapd.lock")
+        lock = DaemonLock(runtime_dir / "leapd.lock")
         if lock.acquire():
             # we are the leader — spawn daemon
             ...
@@ -140,35 +140,35 @@ class DaemonLock:
         self.release()
 
 
-def write_pid_file(run_dir: Path, pid: Optional[int] = None) -> None:
+def write_pid_file(runtime_dir: Path, pid: Optional[int] = None) -> None:
     """Write the daemon PID file and metadata."""
-    run_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
     actual_pid = pid or os.getpid()
-    (run_dir / "leapd.pid").write_text(str(actual_pid))
+    (runtime_dir / "leapd.pid").write_text(str(actual_pid))
 
     meta = {
         "pid": actual_pid,
         "start_time": time.time(),
         "version": "1",
     }
-    (run_dir / "leapd.json").write_text(json.dumps(meta))
-    logger.info("daemon: wrote pid=%d to %s", actual_pid, run_dir / "leapd.pid")
+    (runtime_dir / "leapd.json").write_text(json.dumps(meta))
+    logger.info("daemon: wrote pid=%d to %s", actual_pid, runtime_dir / "leapd.pid")
 
 
-def cleanup_run_dir(run_dir: Path) -> None:
+def cleanup_runtime_dir(runtime_dir: Path) -> None:
     """Remove daemon runtime files (PID, socket, metadata)."""
     for name in ("leapd.pid", "leapd.json", "leapd.sock"):
-        path = run_dir / name
+        path = runtime_dir / name
         path.unlink(missing_ok=True)
-    logger.info("daemon: cleaned up %s", run_dir)
+    logger.info("daemon: cleaned up %s", runtime_dir)
 
 
-def cleanup_stale(run_dir: Path) -> bool:
+def cleanup_stale(runtime_dir: Path) -> bool:
     """Detect and clean up stale daemon files.
 
     Returns True if stale files were cleaned.
     """
-    pid = _read_pid(run_dir / "leapd.pid")
+    pid = _read_pid(runtime_dir / "leapd.pid")
     if pid is None:
         return False
 
@@ -176,13 +176,13 @@ def cleanup_stale(run_dir: Path) -> bool:
         return False
 
     logger.info("daemon: stale pid=%d detected, cleaning up", pid)
-    cleanup_run_dir(run_dir)
+    cleanup_runtime_dir(runtime_dir)
     return True
 
 
-def send_signal(run_dir: Path, sig: int = signal.SIGTERM) -> bool:
+def send_signal(runtime_dir: Path, sig: int = signal.SIGTERM) -> bool:
     """Send a signal to the running daemon. Returns True if sent."""
-    pid = _read_pid(run_dir / "leapd.pid")
+    pid = _read_pid(runtime_dir / "leapd.pid")
     if pid is None or not _process_alive(pid):
         return False
     try:
@@ -193,7 +193,7 @@ def send_signal(run_dir: Path, sig: int = signal.SIGTERM) -> bool:
 
 
 def stop_daemon(
-    run_dir: Path,
+    runtime_dir: Path,
     *,
     timeout_s: float = 10.0,
     force: bool = False,
@@ -202,37 +202,37 @@ def stop_daemon(
     force_timeout_s: float = 2.0,
 ) -> StopDaemonResult:
     """Stop leapd as a bounded transaction and verify final state."""
-    info = DaemonInfo.discover(run_dir)
+    info = DaemonInfo.discover(runtime_dir)
     pid = info.pid
     if not info.is_running:
-        stale_cleaned = cleanup_stale(run_dir) if pid is not None else False
+        stale_cleaned = cleanup_stale(runtime_dir) if pid is not None else False
         return StopDaemonResult(pid=pid, stopped=True, stale_cleaned=stale_cleaned)
 
     deadline = time.time() + max(0.1, timeout_s)
     interval = max(0.01, poll_interval_s)
     if grace_timeout_s > 0:
         grace_deadline = min(deadline, time.time() + grace_timeout_s)
-        if _wait_until_stopped(run_dir, deadline=grace_deadline, interval_s=interval):
-            stale_cleaned = cleanup_stale(run_dir)
+        if _wait_until_stopped(runtime_dir, deadline=grace_deadline, interval_s=interval):
+            stale_cleaned = cleanup_stale(runtime_dir)
             return StopDaemonResult(pid=pid, stopped=True, stale_cleaned=stale_cleaned)
 
-    signal_sent = send_signal(run_dir, signal.SIGTERM)
-    if not signal_sent and not DaemonInfo.discover(run_dir).is_running:
-        stale_cleaned = cleanup_stale(run_dir)
+    signal_sent = send_signal(runtime_dir, signal.SIGTERM)
+    if not signal_sent and not DaemonInfo.discover(runtime_dir).is_running:
+        stale_cleaned = cleanup_stale(runtime_dir)
         return StopDaemonResult(pid=pid, stopped=True, stale_cleaned=stale_cleaned)
     if not signal_sent:
         return StopDaemonResult(pid=pid, stopped=False, error="failed to send SIGTERM")
 
-    if _wait_until_stopped(run_dir, deadline=deadline, interval_s=interval):
-        stale_cleaned = cleanup_stale(run_dir)
+    if _wait_until_stopped(runtime_dir, deadline=deadline, interval_s=interval):
+        stale_cleaned = cleanup_stale(runtime_dir)
         return StopDaemonResult(pid=pid, stopped=True, signal_sent=True, stale_cleaned=stale_cleaned)
 
     forced = False
     if force:
-        forced = send_signal(run_dir, signal.SIGKILL)
+        forced = send_signal(runtime_dir, signal.SIGKILL)
         kill_deadline = time.time() + max(0.1, force_timeout_s)
-        if forced and _wait_until_stopped(run_dir, deadline=kill_deadline, interval_s=interval):
-            stale_cleaned = cleanup_stale(run_dir)
+        if forced and _wait_until_stopped(runtime_dir, deadline=kill_deadline, interval_s=interval):
+            stale_cleaned = cleanup_stale(runtime_dir)
             return StopDaemonResult(
                 pid=pid,
                 stopped=True,
@@ -253,9 +253,9 @@ def stop_daemon(
 
 def spawn_daemon(settings: object, *, mock_host: bool = False) -> subprocess.Popen[bytes]:
     """Spawn a detached leapd process for the active environment."""
-    run_dir = getattr(settings, "profile_dir") / "run"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    log_path = run_dir / "leapd.log"
+    runtime_dir = settings.runtime_dir
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    log_path = runtime_dir / "leapd.log"
     command = [sys.executable, "-m", "leapflow"]
     if mock_host:
         command.append("--mock-host")
@@ -276,24 +276,24 @@ def spawn_daemon(settings: object, *, mock_host: bool = False) -> subprocess.Pop
     return proc
 
 
-def wait_ready(run_dir: Path, *, timeout_s: float = 30.0, interval_s: float = 0.1) -> DaemonInfo:
+def wait_ready(runtime_dir: Path, *, timeout_s: float = 30.0, interval_s: float = 0.1) -> DaemonInfo:
     """Wait until the daemon socket becomes healthy or timeout expires."""
     deadline = time.time() + max(0.1, timeout_s)
-    last = DaemonInfo.discover(run_dir)
+    last = DaemonInfo.discover(runtime_dir)
     while time.time() < deadline:
-        last = DaemonInfo.discover(run_dir)
+        last = DaemonInfo.discover(runtime_dir)
         if last.is_healthy:
             return last
         time.sleep(max(0.01, interval_s))
     return last
 
 
-def _wait_until_stopped(run_dir: Path, *, deadline: float, interval_s: float) -> bool:
+def _wait_until_stopped(runtime_dir: Path, *, deadline: float, interval_s: float) -> bool:
     while time.time() < deadline:
-        if not DaemonInfo.discover(run_dir).is_running:
+        if not DaemonInfo.discover(runtime_dir).is_running:
             return True
         time.sleep(interval_s)
-    return not DaemonInfo.discover(run_dir).is_running
+    return not DaemonInfo.discover(runtime_dir).is_running
 
 
 # ── Internal helpers ──

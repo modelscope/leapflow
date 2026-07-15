@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from leapflow.daemon.lease import default_lease_ttl_s, read_active_client_leases
-from leapflow.daemon.lifecycle import cleanup_run_dir, write_pid_file
+from leapflow.daemon.lifecycle import cleanup_runtime_dir, write_pid_file
 from leapflow.daemon.protocol import ErrorCode, METHOD_REGISTRY, RpcRequest, RpcResponse, StreamChunk
 
 logger = logging.getLogger(__name__)
@@ -44,13 +44,13 @@ class UnixRpcServer:
         service: Any,
         *,
         sock_path: Path,
-        run_dir: Path,
+        runtime_dir: Path,
         stream_heartbeat_s: float | None = None,
         on_shutdown: Callable[[], None] | None = None,
     ) -> None:
         self._service = service
         self._sock_path = sock_path
-        self._run_dir = run_dir
+        self._runtime_dir = runtime_dir
         self._stream_heartbeat_s = stream_heartbeat_s or _stream_heartbeat_interval()
         self._on_shutdown = on_shutdown
         self._server: asyncio.AbstractServer | None = None
@@ -58,12 +58,12 @@ class UnixRpcServer:
         if hasattr(service, "set_client_count_provider"):
             service.set_client_count_provider(lambda: self._active_connections)
         if hasattr(service, "set_client_lease_provider"):
-            service.set_client_lease_provider(lambda: read_active_client_leases(self._run_dir))
+            service.set_client_lease_provider(lambda: read_active_client_leases(self._runtime_dir))
 
     @property
-    def run_dir(self) -> Path:
+    def runtime_dir(self) -> Path:
         """Return the daemon runtime directory."""
-        return self._run_dir
+        return self._runtime_dir
 
     @property
     def active_connections(self) -> int:
@@ -72,13 +72,13 @@ class UnixRpcServer:
 
     async def serve_forever(self) -> None:
         """Start listening and serve until cancelled."""
-        self._run_dir.mkdir(parents=True, exist_ok=True)
+        self._runtime_dir.mkdir(parents=True, exist_ok=True)
         self._sock_path.unlink(missing_ok=True)
         self._server = await asyncio.start_unix_server(
             self._handle_client,
             path=str(self._sock_path),
         )
-        write_pid_file(self._run_dir)
+        write_pid_file(self._runtime_dir)
         try:
             async with self._server:
                 await self._server.serve_forever()
@@ -240,8 +240,8 @@ async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
     """Run a daemon server for the provided settings until signalled."""
     from leapflow.daemon.service import RuntimeLeapService
 
-    run_dir = settings.profile_dir / "run"
-    sock_path = run_dir / "leapd.sock"
+    runtime_dir = settings.runtime_dir
+    sock_path = runtime_dir / "leapd.sock"
     service = RuntimeLeapService(settings, mock_host=mock_host)
     await service.start()
     loop = asyncio.get_running_loop()
@@ -253,7 +253,7 @@ async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
     server = UnixRpcServer(
         service,
         sock_path=sock_path,
-        run_dir=run_dir,
+        runtime_dir=runtime_dir,
         on_shutdown=_request_stop,
     )
 
@@ -286,7 +286,7 @@ async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
             pass
         await server.stop()
         await service.shutdown()
-        cleanup_run_dir(run_dir)
+        cleanup_runtime_dir(runtime_dir)
     return 0
 
 
@@ -306,7 +306,7 @@ async def _watch_idle_shutdown(
     while not stop_event.is_set():
         has_lease = await asyncio.to_thread(
             read_active_client_leases,
-            server.run_dir,
+            server.runtime_dir,
             ttl_s=max_lease_age,
         )
         if server.active_connections > 0 or has_lease:
