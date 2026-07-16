@@ -7,6 +7,7 @@ conversion, and disclosure shrinkage.
 from __future__ import annotations
 
 from leapflow.engine.failure_envelope import FailureEnvelope
+from leapflow.engine.recovery_budget import RecoveryBudget
 from leapflow.engine.recovery_coordinator import RecoveryState
 from leapflow.engine.recovery_decision import (
     RecoveryAction,
@@ -46,7 +47,8 @@ class ContextCompressStrategy:
     def applicable_categories(self) -> frozenset[str]:
         return frozenset({"context_overflow", "payload_too_large"})
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
         """Applicable if there are remaining compression phases."""
         return state.compress_phase_index < len(_PHASES)
 

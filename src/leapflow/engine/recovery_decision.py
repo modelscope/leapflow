@@ -9,9 +9,12 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from leapflow.engine.failure_envelope import FailureEnvelope
+
+if TYPE_CHECKING:
+    from leapflow.engine.interaction_request import InteractionRequest
 
 
 class RecoveryAction(Enum):
@@ -61,6 +64,9 @@ class RecoveryDecision:
     retry_semantics: RetrySemantics = field(default_factory=RetrySemantics)
     budget_cost: int = 0
     audit_metadata: tuple[tuple[str, Any], ...] = ()
+    interaction: InteractionRequest | None = None
+    transform_description: str = ""
+    failover_target: str = ""
 
     @classmethod
     def create(
@@ -73,6 +79,9 @@ class RecoveryDecision:
         retry_semantics: RetrySemantics | None = None,
         budget_cost: int = 0,
         audit_metadata: dict[str, Any] | None = None,
+        interaction: InteractionRequest | None = None,
+        transform_description: str = "",
+        failover_target: str = "",
     ) -> RecoveryDecision:
         """Factory that auto-generates decision_id and normalizes audit_metadata."""
         meta_tuple = tuple(sorted((audit_metadata or {}).items()))
@@ -85,6 +94,9 @@ class RecoveryDecision:
             retry_semantics=retry_semantics or RetrySemantics(),
             budget_cost=budget_cost,
             audit_metadata=meta_tuple,
+            interaction=interaction,
+            transform_description=transform_description,
+            failover_target=failover_target,
         )
 
     @property

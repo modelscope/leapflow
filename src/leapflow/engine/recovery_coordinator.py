@@ -39,6 +39,7 @@ class RecoveryState:
     compress_phase_index: int = 0
     last_failure_timestamp: float = 0.0
     total_decisions: int = 0
+    current_turn_id: int = 0
 
 
 @runtime_checkable
@@ -70,7 +71,8 @@ class RecoveryStrategy(Protocol):
         """Set of error category strings this strategy handles. Empty = all."""
         ...
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
         """Whether this strategy can handle the given failure envelope."""
         ...
 
@@ -111,25 +113,32 @@ class RecoveryCoordinator:
         """
         # Deadline check
         if self._budget.is_deadline_exceeded():
-            decision = self._make_terminal(
-                envelope, reason="Turn deadline exceeded"
+            reason = (
+                f"Turn deadline exceeded ({self._budget.turn_deadline_s}s). "
+                f"Strategies attempted: {', '.join(self._guard.used_strategies()) or 'none'}."
             )
+            decision = self._make_terminal(envelope, reason=reason)
             self._record_audit(decision, strategy_key="<deadline>")
             return decision
 
         # Global budget exhaustion
         if self._budget.remaining() == 0:
-            decision = self._make_terminal(
-                envelope, reason="Recovery budget exhausted"
+            reason = (
+                f"Recovery budget exhausted ({self._budget._consumed}/{self._budget.total_recovery_actions}). "
+                f"Strategies attempted: {', '.join(self._guard.used_strategies()) or 'none'}. "
+                f"Last error: {envelope.category}/{envelope.failure_code}."
             )
+            decision = self._make_terminal(envelope, reason=reason)
             self._record_audit(decision, strategy_key="<budget_exhausted>")
             return decision
 
         # Non-recoverable failures short-circuit
         if envelope.recoverability == Recoverability.NON_RECOVERABLE:
-            decision = self._make_terminal(
-                envelope, reason="Failure is non-recoverable"
+            reason = (
+                f"Failure is non-recoverable: {envelope.message[:100]}. "
+                f"Category: {envelope.category}, code: {envelope.failure_code}."
             )
+            decision = self._make_terminal(envelope, reason=reason)
             self._record_audit(decision, strategy_key="<non_recoverable>")
             return decision
 
@@ -141,7 +150,7 @@ class RecoveryCoordinator:
                 continue
             if not self._guard.is_available(strategy.key):
                 continue
-            if not strategy.can_apply(envelope, self._state):
+            if not strategy.can_apply(envelope, self._state, self._budget):
                 continue
 
             # Budget pre-check for the strategy's expected cost
@@ -218,6 +227,14 @@ class RecoveryCoordinator:
     def guard(self) -> OneShotGuard:
         """Access the one-shot guard (primarily for testing/introspection)."""
         return self._guard
+
+    def new_turn(self, turn_id: int = 0) -> None:
+        """Reset per-turn state for a new turn. Called at turn start."""
+        self._guard.new_turn()
+        self._state.compress_phase_index = 0
+        self._state.consecutive_failures = 0
+        self._state.consecutive_api_errors = 0
+        self._state.current_turn_id = turn_id
 
     # ------------------------------------------------------------------
     # Private helpers

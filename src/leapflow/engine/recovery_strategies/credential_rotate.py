@@ -6,6 +6,7 @@ Handles auth errors and rate limiting by rotating to alternate credentials
 from __future__ import annotations
 
 from leapflow.engine.failure_envelope import FailureEnvelope
+from leapflow.engine.recovery_budget import RecoveryBudget
 from leapflow.engine.recovery_coordinator import RecoveryState
 from leapflow.engine.recovery_decision import (
     RecoveryAction,
@@ -38,11 +39,11 @@ class CredentialRotateStrategy:
     def applicable_categories(self) -> frozenset[str]:
         return frozenset({"auth_error", "rate_limited", "billing"})
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
-        """Applicable when credential rotation budget remains.
-
-        The coordinator's budget_cost check handles the actual budget enforcement.
-        """
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
+        """Applicable when credential rotation budget remains."""
+        if budget is not None and budget.category_remaining("credential_rotate") <= 0:
+            return False
         return True
 
     def decide(self, envelope: FailureEnvelope, state: RecoveryState) -> RecoveryDecision:

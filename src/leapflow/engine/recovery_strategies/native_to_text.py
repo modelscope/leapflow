@@ -6,6 +6,7 @@ text-based tool calling when the native mode produces parsing conflicts.
 from __future__ import annotations
 
 from leapflow.engine.failure_envelope import FailureEnvelope
+from leapflow.engine.recovery_budget import RecoveryBudget
 from leapflow.engine.recovery_coordinator import RecoveryState
 from leapflow.engine.recovery_decision import (
     RecoveryAction,
@@ -38,7 +39,8 @@ class NativeToTextFallbackStrategy:
     def applicable_categories(self) -> frozenset[str]:
         return frozenset({"format_error"})
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
         """Applicable when native tool mode is indicated by failure context.
 
         Checks for indicators that native tool calling mode is active:

@@ -14,10 +14,12 @@ class OneShotGuard:
 
     Each strategy key can fire at most once per guard lifetime.
     Provides an audit trail of which strategies were attempted and when.
+    Supports per-turn reset via new_turn() while preserving audit history.
     """
 
     def __init__(self) -> None:
         self._used: dict[str, float] = {}
+        self._history: list[dict[str, float]] = []
 
     def is_available(self, key: str) -> bool:
         """Check whether a strategy key has not been used yet."""
@@ -36,9 +38,25 @@ class OneShotGuard:
         """Return a mapping of strategy key → timestamp when it was consumed."""
         return dict(self._used)
 
+    def new_turn(self) -> None:
+        """Reset guard state for a new turn. Called at turn boundary.
+
+        Previous turn's used strategies remain in history for audit,
+        but are no longer blocking.
+        """
+        if self._used:
+            self._history.append(dict(self._used))
+        self._used.clear()
+
     def reset(self) -> None:
         """Clear all usage records. Intended for testing and turn resets."""
         self._used.clear()
+        self._history.clear()
+
+    @property
+    def turn_history(self) -> list[dict[str, float]]:
+        """Return previous turns' usage records for audit purposes."""
+        return list(self._history)
 
     def __len__(self) -> int:
         """Number of strategy keys that have been consumed."""

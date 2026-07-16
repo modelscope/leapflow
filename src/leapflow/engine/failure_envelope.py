@@ -54,6 +54,10 @@ class FailureContext:
     trace_id: str = ""
     turn_id: int = 0
     session_id: str = ""
+    provider: str = ""
+    model: str = ""
+    attempt_number: int = 0
+    elapsed_ms: float = 0.0
 
     @classmethod
     def from_dict_args(
@@ -65,6 +69,10 @@ class FailureContext:
         trace_id: str = "",
         turn_id: int = 0,
         session_id: str = "",
+        provider: str = "",
+        model: str = "",
+        attempt_number: int = 0,
+        elapsed_ms: float = 0.0,
     ) -> FailureContext:
         """Factory that converts a dict of arguments into frozen-compatible tuple form."""
         args_tuple = tuple(sorted((arguments or {}).items()))
@@ -75,6 +83,10 @@ class FailureContext:
             trace_id=trace_id,
             turn_id=turn_id,
             session_id=session_id,
+            provider=provider,
+            model=model,
+            attempt_number=attempt_number,
+            elapsed_ms=elapsed_ms,
         )
 
     @property

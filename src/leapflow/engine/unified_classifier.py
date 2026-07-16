@@ -21,8 +21,8 @@ from leapflow.engine.failure_envelope import (
 
 logger = logging.getLogger(__name__)
 
-# Mapping from ErrorCategory to (Recoverability, default_failure_class)
-_CATEGORY_RECOVERABILITY: dict[str, tuple[Recoverability, str]] = {
+# Default mapping from ErrorCategory to (Recoverability, default_failure_class)
+_DEFAULT_MAPPINGS: dict[str, tuple[Recoverability, str]] = {
     ErrorCategory.TRANSIENT.value: (Recoverability.AUTO_RETRY, "transient"),
     ErrorCategory.RATE_LIMITED.value: (Recoverability.AUTO_RETRY, "rate_limited"),
     ErrorCategory.OVERLOADED.value: (Recoverability.AUTO_RETRY, "overloaded"),
@@ -40,6 +40,30 @@ _CATEGORY_RECOVERABILITY: dict[str, tuple[Recoverability, str]] = {
     ErrorCategory.PERMANENT.value: (Recoverability.NON_RECOVERABLE, "permanent"),
 }
 
+
+class RecoverabilityRegistry:
+    """Extensible registry for category -> recoverability mapping.
+
+    Allows plugins and configuration to register new error categories
+    without modifying this module.
+    """
+
+    def __init__(self) -> None:
+        self._mappings: dict[str, tuple[Recoverability, str]] = dict(_DEFAULT_MAPPINGS)
+
+    def register(self, category: str, recoverability: Recoverability,
+                 failure_class: str = "") -> None:
+        """Register or override a category mapping."""
+        self._mappings[category] = (recoverability, failure_class or category)
+
+    def get(self, category: str) -> tuple[Recoverability, str]:
+        """Get recoverability for a category, defaulting to NON_RECOVERABLE."""
+        return self._mappings.get(category, (Recoverability.NON_RECOVERABLE, "unknown"))
+
+    def categories(self) -> list[str]:
+        """List all registered categories."""
+        return list(self._mappings.keys())
+
 # Permission failure classes that indicate non-recoverable tool permission errors
 _PERMISSION_FAILURE_CLASSES = frozenset({"authorization", "scope_denied"})
 _PERMISSION_FAILURE_CODES = frozenset({"access_denied", "missing_scope", "platform_degraded"})
@@ -54,16 +78,19 @@ class UnifiedErrorClassifier:
     - System exceptions -> FailureEnvelope (new)
     """
 
-    def __init__(self, error_classifier: Any = None) -> None:
+    def __init__(self, error_classifier: Any = None,
+                 registry: RecoverabilityRegistry | None = None) -> None:
         """Accept existing ErrorClassifier instance for LLM error classification.
 
         Args:
             error_classifier: An ErrorClassifier instance. If None, a default is created.
+            registry: Optional RecoverabilityRegistry for extensible category mapping.
         """
         if error_classifier is not None and isinstance(error_classifier, ErrorClassifier):
             self._classifier: ErrorClassifier = error_classifier
         else:
             self._classifier = ErrorClassifier()
+        self._registry = registry or RecoverabilityRegistry()
 
     def classify_llm_error(
         self,
@@ -80,9 +107,7 @@ class UnifiedErrorClassifier:
         category = self._classifier.classify(exc)
         category_str = category.value
 
-        recoverability, failure_class = _CATEGORY_RECOVERABILITY.get(
-            category_str, (Recoverability.NON_RECOVERABLE, "unknown")
-        )
+        recoverability, failure_class = self._registry.get(category_str)
 
         # Build recovery hint from the classifier's friendly message
         friendly_msg = ErrorClassifier.friendly_message(category, str(exc)[:200])

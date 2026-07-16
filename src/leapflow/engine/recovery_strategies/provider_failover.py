@@ -39,11 +39,11 @@ class ProviderFailoverStrategy:
     def applicable_categories(self) -> frozenset[str]:
         return frozenset({"billing", "auth_permanent", "overloaded", "model_not_found", "content_blocked"})
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
         """Applicable if failover budget remains."""
-        # Access budget through a duck-typed approach — the coordinator passes
-        # the budget externally. We check state for a budget reference if available,
-        # but the coordinator already checks can_afford for budget_cost > 0.
+        if budget is not None and budget.category_remaining("failover") <= 0:
+            return False
         return True
 
     def decide(self, envelope: FailureEnvelope, state: RecoveryState) -> RecoveryDecision:

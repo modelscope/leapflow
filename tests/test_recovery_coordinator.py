@@ -52,7 +52,8 @@ class MockRetryStrategy:
     applicable_sources: frozenset[str] = frozenset({"llm"})
     applicable_categories: frozenset[str] = frozenset({"rate_limited", "transient"})
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
         return state.consecutive_failures < 5
 
     def decide(self, envelope: FailureEnvelope, state: RecoveryState) -> RecoveryDecision:
@@ -78,7 +79,8 @@ class MockCompressStrategy:
     applicable_sources: frozenset[str] = frozenset()
     applicable_categories: frozenset[str] = frozenset({"context_overflow"})
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
         return True
 
     def decide(self, envelope: FailureEnvelope, state: RecoveryState) -> RecoveryDecision:
@@ -100,7 +102,8 @@ class MockFailoverStrategy:
     applicable_sources: frozenset[str] = frozenset({"llm"})
     applicable_categories: frozenset[str] = frozenset()
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
         return state.consecutive_failures >= 3
 
     def decide(self, envelope: FailureEnvelope, state: RecoveryState) -> RecoveryDecision:
@@ -122,7 +125,8 @@ class MockCatchAllStrategy:
     applicable_sources: frozenset[str] = frozenset()
     applicable_categories: frozenset[str] = frozenset()
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
         return True
 
     def decide(self, envelope: FailureEnvelope, state: RecoveryState) -> RecoveryDecision:
@@ -503,7 +507,7 @@ class TestRecoveryCoordinator:
         env = _make_envelope()
         decision = coord.evaluate(env)
         assert decision.action == RecoveryAction.HALT_CLEAN
-        assert "exhausted" in decision.reason
+        assert "exhausted" in decision.reason.lower()
 
     def test_evaluate_terminal_on_deadline_exceeded(self) -> None:
         """When deadline is exceeded, terminal decision immediately."""

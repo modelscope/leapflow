@@ -6,6 +6,7 @@ Applies decorrelated jitter backoff with category-specific delay parameters.
 from __future__ import annotations
 
 from leapflow.engine.failure_envelope import FailureEnvelope, Recoverability
+from leapflow.engine.recovery_budget import RecoveryBudget
 from leapflow.engine.recovery_coordinator import RecoveryState
 from leapflow.engine.recovery_decision import (
     BackoffConfig,
@@ -74,7 +75,8 @@ class JitteredRetryStrategy:
     def applicable_categories(self) -> frozenset[str]:
         return frozenset({"transient", "rate_limited", "overloaded", "tool_timeout"})
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
         """Applicable for AUTO_RETRY failures when budget allows."""
         return envelope.recoverability == Recoverability.AUTO_RETRY
 

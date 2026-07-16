@@ -6,6 +6,7 @@ additional tools that the LLM attempted to call but were not in scope.
 from __future__ import annotations
 
 from leapflow.engine.failure_envelope import FailureEnvelope, Recoverability
+from leapflow.engine.recovery_budget import RecoveryBudget
 from leapflow.engine.recovery_coordinator import RecoveryState
 from leapflow.engine.recovery_decision import (
     RecoveryAction,
@@ -38,7 +39,8 @@ class ToolSchemaExpandStrategy:
     def applicable_categories(self) -> frozenset[str]:
         return frozenset({"tool_unknown"})
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
         """Applicable when the tool error is marked as auto-recoverable."""
         return envelope.recoverability == Recoverability.AUTO_RECOVER
 

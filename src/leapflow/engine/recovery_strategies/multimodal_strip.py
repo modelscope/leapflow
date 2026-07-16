@@ -6,6 +6,7 @@ to text descriptions before retry.
 from __future__ import annotations
 
 from leapflow.engine.failure_envelope import FailureEnvelope
+from leapflow.engine.recovery_budget import RecoveryBudget
 from leapflow.engine.recovery_coordinator import RecoveryState
 from leapflow.engine.recovery_decision import (
     RecoveryAction,
@@ -37,7 +38,8 @@ class MultimodalStripStrategy:
     def applicable_categories(self) -> frozenset[str]:
         return frozenset({"image_too_large"})
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
         """Applicable when the failure message indicates an image size issue."""
         msg = envelope.message.lower()
         return "image" in msg or "large" in msg or "size" in msg or envelope.category == "image_too_large"

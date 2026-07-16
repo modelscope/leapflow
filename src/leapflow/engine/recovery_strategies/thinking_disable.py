@@ -6,6 +6,7 @@ which can conflict with certain output format expectations.
 from __future__ import annotations
 
 from leapflow.engine.failure_envelope import FailureEnvelope
+from leapflow.engine.recovery_budget import RecoveryBudget
 from leapflow.engine.recovery_coordinator import RecoveryState
 from leapflow.engine.recovery_decision import (
     RecoveryAction,
@@ -38,8 +39,9 @@ class ThinkingDisableStrategy:
     def applicable_categories(self) -> frozenset[str]:
         return frozenset({"format_error"})
 
-    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState) -> bool:
-        """Always applicable — the one-shot guard handles dedup at coordinator level."""
+    def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
+                  budget: RecoveryBudget | None = None) -> bool:
+        """Always applicable -- the one-shot guard handles dedup at coordinator level."""
         return True
 
     def decide(self, envelope: FailureEnvelope, state: RecoveryState) -> RecoveryDecision:
