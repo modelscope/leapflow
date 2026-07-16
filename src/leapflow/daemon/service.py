@@ -89,6 +89,16 @@ class RuntimeLeapService:
             self._monitors.producers.register(SessionAnalysisProducer())
             setattr(ctx, "monitors", self._monitors)
             await self._monitors.start()
+            # A fresh daemon lifetime owns no interactive clients yet, so any
+            # persisted client-coupled watch (e.g. a session-analysis watch left
+            # over from a prior run or an unclean client exit) is stale. Drop it
+            # so the status bar and keep-alive only reflect real active monitors.
+            try:
+                swept = self._monitors.sweep_client_coupled_watches()
+                if swept:
+                    logger.info("daemon: swept %d stale client-coupled watch(es) on startup", swept)
+            except Exception:
+                logger.debug("daemon: client-coupled watch sweep failed", exc_info=True)
             logger.debug("daemon: monitor runtime started")
         except Exception:
             logger.debug("daemon: monitor runtime start skipped", exc_info=True)

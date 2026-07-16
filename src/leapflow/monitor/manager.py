@@ -267,6 +267,27 @@ class MonitorManager:
             return True
         return False
 
+    def sweep_client_coupled_watches(self) -> int:
+        """Delete leftover client-coupled watches (e.g. session analysis).
+
+        Client-coupled watches only make sense while an interactive client owns
+        them. On a fresh daemon lifetime none can, so any persisted ones are
+        stale and must not surface as active monitors (status bar, keep-alive,
+        ``/board list``). Standalone watches are intentionally durable and are
+        left untouched. Returns the number of watches removed.
+        """
+        removed = 0
+        for task in self._task_store.load_all():
+            if not _is_watch(task):
+                continue
+            meta = task.metadata if isinstance(task.metadata, dict) else {}
+            if not meta.get(METADATA_CLIENT_COUPLED_KEY):
+                continue
+            self._task_store.delete(task.task_id)
+            self._finding_store.delete_for_watch(task.task_id)
+            removed += 1
+        return removed
+
     def pause_watch(self, watch_id: str) -> Optional[WatchView]:
         """Suspend a watch so it stops firing until resumed."""
         return self._transition(watch_id, TaskState.SUSPENDED.value)

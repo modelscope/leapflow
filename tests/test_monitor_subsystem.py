@@ -218,3 +218,27 @@ async def test_has_active_watches_excludes_client_coupled(tmp_path: Path) -> Non
     assert manager.has_active_watches() is True
     manager._task_store.update_state(standalone.watch_id, "executing")
     assert manager.has_active_watches() is True
+
+
+async def test_sweep_client_coupled_watches_removes_only_session_watches(tmp_path: Path) -> None:
+    manager = MonitorManager(holder=_holder(tmp_path))
+    session = await manager.arm_watch(WatchSpec(name="S", domain="session", client_coupled=True))
+    standalone = await manager.arm_watch(WatchSpec(name="F", domain="finance"))
+    manager.finding_store.save(
+        Finding(watch_id=session.watch_id, domain="session", title="stale", severity=Severity.INFO)
+    )
+
+    removed = manager.sweep_client_coupled_watches()
+
+    assert removed == 1
+    remaining = [v.watch_id for v in manager.list_watches()]
+    assert remaining == [standalone.watch_id]  # standalone watch is durable
+    assert manager.get_watch(session.watch_id) is None
+    assert manager.finding_store.count(watch_id=session.watch_id) == 0
+
+
+async def test_sweep_client_coupled_watches_is_noop_without_session_watches(tmp_path: Path) -> None:
+    manager = MonitorManager(holder=_holder(tmp_path))
+    await manager.arm_watch(WatchSpec(name="F", domain="finance"))
+    assert manager.sweep_client_coupled_watches() == 0
+    assert len(manager.list_watches()) == 1
