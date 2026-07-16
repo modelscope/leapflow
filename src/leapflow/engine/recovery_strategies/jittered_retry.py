@@ -68,12 +68,17 @@ class JitteredRetryStrategy:
         return 100
 
     @property
+    def repeatable(self) -> bool:
+        return True
+
+    @property
     def applicable_sources(self) -> frozenset[str]:
         return frozenset({"llm", "tool", "system"})
 
     @property
     def applicable_categories(self) -> frozenset[str]:
-        return frozenset({"transient", "rate_limited", "overloaded", "tool_timeout"})
+        return frozenset({"transient", "rate_limited", "overloaded", "tool_timeout",
+                          "system_timeout", "system_network"})
 
     def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
                   budget: RecoveryBudget | None = None) -> bool:

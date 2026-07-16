@@ -32,6 +32,10 @@ class ProviderFailoverStrategy:
         return 20
 
     @property
+    def repeatable(self) -> bool:
+        return False
+
+    @property
     def applicable_sources(self) -> frozenset[str]:
         return frozenset({"llm"})
 
@@ -42,7 +46,7 @@ class ProviderFailoverStrategy:
     def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
                   budget: RecoveryBudget | None = None) -> bool:
         """Applicable if failover budget remains."""
-        if budget is not None and budget.category_remaining("failover") <= 0:
+        if budget is not None and not budget.can_failover():
             return False
         return True
 

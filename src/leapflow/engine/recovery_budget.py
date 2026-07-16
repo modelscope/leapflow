@@ -39,6 +39,19 @@ class RecoveryBudget:
         """Called at turn start to anchor the wall-clock deadline."""
         self._deadline_start = time.monotonic()
 
+    def new_turn(self) -> None:
+        """Reset all per-turn accounting for a new turn.
+
+        Configuration limits (max_retries_per_turn, etc.) remain unchanged;
+        only the consumption counters and deadline are reset.
+        """
+        self._consumed = 0
+        self._category_consumed.clear()
+        self._transforms_used = 0
+        self._failovers_used = 0
+        self._rotations_used = 0
+        self.start_deadline()
+
     def can_afford(self, cost: int, category: str = "") -> bool:
         """Check whether spending `cost` actions is within budget.
 

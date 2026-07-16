@@ -32,6 +32,10 @@ class CredentialRotateStrategy:
         return 25
 
     @property
+    def repeatable(self) -> bool:
+        return False
+
+    @property
     def applicable_sources(self) -> frozenset[str]:
         return frozenset({"llm"})
 
@@ -42,7 +46,7 @@ class CredentialRotateStrategy:
     def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
                   budget: RecoveryBudget | None = None) -> bool:
         """Applicable when credential rotation budget remains."""
-        if budget is not None and budget.category_remaining("credential_rotate") <= 0:
+        if budget is not None and not budget.can_rotate():
             return False
         return True
 

@@ -32,6 +32,10 @@ class NativeToTextFallbackStrategy:
         return 35
 
     @property
+    def repeatable(self) -> bool:
+        return False
+
+    @property
     def applicable_sources(self) -> frozenset[str]:
         return frozenset({"llm"})
 

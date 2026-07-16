@@ -348,7 +348,8 @@ class TestJitteredRetryStrategy:
         assert JitteredRetryStrategy().applicable_sources == frozenset({"llm", "tool", "system"})
 
     def test_applicable_categories(self) -> None:
-        expected = frozenset({"transient", "rate_limited", "overloaded", "tool_timeout"})
+        expected = frozenset({"transient", "rate_limited", "overloaded", "tool_timeout",
+                              "system_timeout", "system_network"})
         assert JitteredRetryStrategy().applicable_categories == expected
 
     def test_can_apply_auto_retry(self) -> None:
@@ -406,6 +407,27 @@ class TestJitteredRetryStrategy:
         decision = s.decide(env, _fresh_state())
         assert decision.retry_semantics.resets_retry_count is False
 
+    def test_decide_system_timeout(self) -> None:
+        s = JitteredRetryStrategy()
+        env = _make_envelope(
+            source=FailureSource.SYSTEM,
+            category="system_timeout",
+            recoverability=Recoverability.AUTO_RETRY,
+        )
+        decision = s.decide(env, _fresh_state())
+        assert decision.action == RecoveryAction.RETRY_WITH_BACKOFF
+        assert decision.retry_semantics.backoff_config is not None
+
+    def test_decide_system_network(self) -> None:
+        s = JitteredRetryStrategy()
+        env = _make_envelope(
+            source=FailureSource.SYSTEM,
+            category="system_network",
+            recoverability=Recoverability.AUTO_RETRY,
+        )
+        decision = s.decide(env, _fresh_state())
+        assert decision.action == RecoveryAction.RETRY_WITH_BACKOFF
+
 
 # ===========================================================================
 # Integration: Strategy Priority Ordering
@@ -435,3 +457,13 @@ class TestStrategyPriorityOrdering:
                 f"{strategies[i].key} (priority={strategies[i].priority}) should be "
                 f"lower than {strategies[i+1].key} (priority={strategies[i+1].priority})"
             )
+
+    def test_repeatable_property_correctness(self) -> None:
+        strategies = default_strategies()
+        repeatable_keys = {s.key for s in strategies if s.repeatable}
+        non_repeatable_keys = {s.key for s in strategies if not s.repeatable}
+        assert repeatable_keys == {"context_compress", "jittered_retry"}
+        assert non_repeatable_keys == {
+            "multimodal_strip", "provider_failover", "credential_rotate",
+            "thinking_disable", "native_to_text", "tool_schema_expand",
+        }

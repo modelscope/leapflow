@@ -62,6 +62,16 @@ class RecoveryStrategy(Protocol):
         ...
 
     @property
+    def repeatable(self) -> bool:
+        """Whether this strategy can fire multiple times per turn.
+
+        Repeatable strategies manage their own deduplication (e.g. phase index)
+        and are NOT guarded by the OneShotGuard. Non-repeatable strategies
+        fire at most once per turn and are automatically one-shot guarded.
+        """
+        ...
+
+    @property
     def applicable_sources(self) -> frozenset[str]:
         """Set of FailureSource values this strategy handles. Empty = all."""
         ...
@@ -148,7 +158,8 @@ class RecoveryCoordinator:
                 continue
             if not self._matches_category(strategy, envelope):
                 continue
-            if not self._guard.is_available(strategy.key):
+            # One-shot guard: only check for non-repeatable strategies
+            if not strategy.repeatable and not self._guard.is_available(strategy.key):
                 continue
             if not strategy.can_apply(envelope, self._state, self._budget):
                 continue
@@ -163,8 +174,11 @@ class RecoveryCoordinator:
             if decision.budget_cost > 0:
                 self._budget.consume(decision.budget_cost, envelope.category)
 
-            # Mark one-shot if the action is terminal or irreversible
-            if decision.is_terminal or decision.action == RecoveryAction.FAILOVER:
+            # Track type-specific budget counters
+            self._consume_type_budget(decision)
+
+            # Mark one-shot guard for non-repeatable strategies
+            if not strategy.repeatable:
                 self._guard.mark_used(strategy.key)
 
             self._update_state(envelope, decision)
@@ -231,6 +245,7 @@ class RecoveryCoordinator:
     def new_turn(self, turn_id: int = 0) -> None:
         """Reset per-turn state for a new turn. Called at turn start."""
         self._guard.new_turn()
+        self._budget.new_turn()
         self._state.compress_phase_index = 0
         self._state.consecutive_failures = 0
         self._state.consecutive_api_errors = 0
@@ -275,6 +290,16 @@ class RecoveryCoordinator:
             retry_semantics=RetrySemantics(consumes_retry_budget=False),
             budget_cost=0,
         )
+
+    def _consume_type_budget(self, decision: RecoveryDecision) -> None:
+        """Consume type-specific budget counters based on action type."""
+        if decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+            self._budget.consume_transform()
+        elif decision.action == RecoveryAction.FAILOVER:
+            if "credential" in decision.strategy_key:
+                self._budget.consume_rotation()
+            else:
+                self._budget.consume_failover()
 
     def _record_audit(self, decision: RecoveryDecision, *, strategy_key: str) -> None:
         """Append a decision record to the audit log."""

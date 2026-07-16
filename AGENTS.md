@@ -23,6 +23,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - Design for generalization and universality; prefer reusable domain concepts over one-off special cases
 - Easy to extend, avoid hardcoding and hard rules
 - Industrial-grade robustness: every external call has timeout, retry, and fallback
+- Structured error propagation: failures must flow as typed envelopes (`FailureEnvelope`) with source, category, recoverability, and side-effect state — never as ad-hoc dicts, bare strings, or unclassified exceptions
 - User experience is a first-class quality bar: optimize for clarity, ease of use, fast feedback, and graceful recovery
 - All comments and docstrings in English
 - Type annotations on all public APIs
@@ -48,6 +49,10 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - **Graceful Degradation**: Every optional component (LLM, Hub) can be absent without crash
 - **Single Source of Truth**: DuckDB for persistence, EventBus for communication, Settings for configuration
 - **Inbound Signal Classification**: Platform events must be classified before they activate the agent. Message/callback events may enter Decide; signal/lifecycle events should be stored or routed without triggering LLM by default; ignored events must be explicit (e.g. self-message, duplicate, blocked scope).
+- **Single Recovery Decision Point**: All agent loop errors (LLM, tool, system, security) enter one `RecoveryCoordinator`. No parallel decision paths, no scattered if/break logic. The pipeline is always: `FailureEnvelope` → `RecoveryDecision` → `StrategyOutcome` feedback.
+- **Side-Effect Gating**: Recovery actions are gated by `SideEffectState`. Committed or partial side effects block automatic retry; only user-mediated or checkpoint-based resumption is permitted after state mutation.
+- **Budget-Constrained Recovery**: Turn-level deadlines, per-category limits, and a global recovery budget prevent infinite retry loops. Every recovery action has an explicit cost; exhaustion triggers a clean halt or user escalation.
+- **Recovery Strategy as Protocol**: Recovery strategies implement a `RecoveryStrategy` Protocol (`can_apply` + `decide`), registered by priority, composable, and extensible without modifying the coordinator.
 
 ## Path Tree, Configuration, and Secrets Rules
 
@@ -81,6 +86,9 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - Every module must be importable standalone without side effects
 - No placeholder stubs — implement fully or do not add the code
 - ANSI output must check `sys.stdout.isatty()` before emitting escape codes
+- For error recovery, route all failures through the `RecoveryCoordinator` — classify into a `FailureEnvelope`, receive a `RecoveryDecision` with an explainable `reason` and `strategy_key`, then feed the outcome back. Never handle errors with ad-hoc if/break in the loop body.
+- Recovery strategies are standalone Protocol implementations with `can_apply()` + `decide()`. Add new strategies by registration, never by modifying the coordinator's decision logic.
+- When automatic recovery exhausts its budget or encounters non-recoverable failures, emit a structured `InteractionRequest` (typed action, severity, suggested actions, timeout behavior, resumption key) — not raw text appended to conversation.
 
 ## Review Requirements
 
@@ -103,6 +111,8 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - **Behavior contracts over snapshots**: assert invariants, not frozen values
 - **Mock at boundaries only**: mock external I/O (network, disk), never internal logic
 - **Change-scoped validation**: Run the most specific relevant tests first, then broaden only as needed: CLI/TUI changes require CLI/TUI tests; leapd changes require daemon RPC/lifecycle tests; storage or memory changes require persistence tests; gateway, IM, event-source, or approval changes require connector lifecycle, event normalization, routing, idempotency, self-message filtering, security/approval, and failure-recovery tests; skills, learning, perception, and copilot changes require their lifecycle or pipeline tests.
+- **Recovery strategy isolation**: Each `RecoveryStrategy` must be testable in isolation — verify `can_apply` predicates, `decide` outputs, and side-effect-state gating independently of the coordinator and other strategies.
+- **Budget boundary tests**: Verify that recovery budgets exhaust correctly (per-category, per-turn, deadline), that exhaustion produces a deterministic halt decision, and that cost accounting is exact.
 
 ## What to Avoid
 
@@ -118,6 +128,10 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - Activating IM agents on all inbound messages by default, skipping self-message filtering, or allowing cross-chat/proactive sends before Progressive Trust and approval policies explicitly permit them.
 - Putting third-party app business code into platform core: do not add vendor scopes, lark-cli/SDK JSON parsing, auth command construction, console-specific recovery instructions, or resource-specific branching to gateway-wide modules such as action registries, capability ledgers, approval gates, or engine recovery paths.
 - Shortcut-style natural-language fitting and large intent-handler taxonomies; use stable runtime gates plus capability manifests instead. Rule-based keyword/action-verb/alias matching is prohibited by default and requires explicit human second confirmation before implementation when unavoidable.
+- Scattered if/break/continue recovery decisions inside the agent loop body; all error handling enters the `RecoveryCoordinator` as a `FailureEnvelope`
+- Magic retry counts or unbounded retry loops without budget constraints and deadline enforcement
+- Feeding unstructured error text back to the LLM without classification, recoverability assessment, or side-effect awareness
+- Multiple parallel error-handling paths for the same failure domain (LLM errors in one handler, tool errors in another, security errors in a third); use a unified classification and coordination pipeline
 - Bare `except:` clauses — always specify the exception type
 - `# TODO: implement` stubs — implement or don't commit
 

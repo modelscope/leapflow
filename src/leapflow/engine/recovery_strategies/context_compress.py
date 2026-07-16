@@ -40,6 +40,10 @@ class ContextCompressStrategy:
         return 10
 
     @property
+    def repeatable(self) -> bool:
+        return True
+
+    @property
     def applicable_sources(self) -> frozenset[str]:
         return frozenset({"llm"})
 

@@ -49,6 +49,7 @@ class MockRetryStrategy:
 
     key: str = "mock_retry"
     priority: int = 10
+    repeatable: bool = True
     applicable_sources: frozenset[str] = frozenset({"llm"})
     applicable_categories: frozenset[str] = frozenset({"rate_limited", "transient"})
 
@@ -76,6 +77,7 @@ class MockCompressStrategy:
 
     key: str = "mock_compress"
     priority: int = 5
+    repeatable: bool = True
     applicable_sources: frozenset[str] = frozenset()
     applicable_categories: frozenset[str] = frozenset({"context_overflow"})
 
@@ -99,6 +101,7 @@ class MockFailoverStrategy:
 
     key: str = "mock_failover"
     priority: int = 20
+    repeatable: bool = False
     applicable_sources: frozenset[str] = frozenset({"llm"})
     applicable_categories: frozenset[str] = frozenset()
 
@@ -122,6 +125,7 @@ class MockCatchAllStrategy:
 
     key: str = "mock_catchall"
     priority: int = 100
+    repeatable: bool = True
     applicable_sources: frozenset[str] = frozenset()
     applicable_categories: frozenset[str] = frozenset()
 
@@ -611,3 +615,76 @@ class TestRecoveryCoordinator:
         # Budget now exhausted
         d4 = coord.evaluate(env)
         assert d4.action == RecoveryAction.HALT_CLEAN
+
+    def test_new_turn_resets_guard_and_state(self) -> None:
+        """new_turn() resets one-shot guard and per-turn state."""
+        strategies: list[RecoveryStrategy] = [MockFailoverStrategy(), MockCatchAllStrategy()]
+        coord = RecoveryCoordinator(strategies=strategies)
+        coord.budget.start_deadline()
+        coord.state.consecutive_failures = 5
+
+        env = _make_envelope(source=FailureSource.LLM, category="transient")
+        d1 = coord.evaluate(env)
+        assert d1.action == RecoveryAction.FAILOVER
+
+        # Failover is one-shot, should fall to catch-all
+        coord.state.consecutive_failures = 5
+        d2 = coord.evaluate(env)
+        assert d2.strategy_key == "mock_catchall"
+
+        # After new_turn, failover should be available again
+        coord.new_turn(turn_id=2)
+        coord.state.consecutive_failures = 5
+        d3 = coord.evaluate(env)
+        assert d3.action == RecoveryAction.FAILOVER
+        assert coord.state.current_turn_id == 2
+
+    def test_non_repeatable_transform_is_one_shot(self) -> None:
+        """Non-repeatable TRANSFORM_AND_RETRY strategies fire only once."""
+
+        @dataclass
+        class MockTransformStrategy:
+            key: str = "mock_transform"
+            priority: int = 5
+            repeatable: bool = False
+            applicable_sources: frozenset[str] = frozenset()
+            applicable_categories: frozenset[str] = frozenset({"format_error"})
+
+            def can_apply(self, envelope, state, budget=None):
+                return True
+
+            def decide(self, envelope, state):
+                return RecoveryDecision.create(
+                    envelope=envelope,
+                    action=RecoveryAction.TRANSFORM_AND_RETRY,
+                    reason="Transform once",
+                    strategy_key=self.key,
+                    budget_cost=0,
+                )
+
+        strategies: list[RecoveryStrategy] = [MockTransformStrategy(), MockCatchAllStrategy()]
+        coord = RecoveryCoordinator(strategies=strategies)
+        coord.budget.start_deadline()
+
+        env = _make_envelope(category="format_error")
+        d1 = coord.evaluate(env)
+        assert d1.action == RecoveryAction.TRANSFORM_AND_RETRY
+        assert d1.strategy_key == "mock_transform"
+
+        # Second call should skip transform (one-shot marked) and fall to catch-all
+        d2 = coord.evaluate(env)
+        assert d2.strategy_key == "mock_catchall"
+
+    def test_repeatable_strategy_fires_multiple_times(self) -> None:
+        """Repeatable strategies can fire multiple times per turn."""
+        strategies: list[RecoveryStrategy] = [MockRetryStrategy()]
+        coord = RecoveryCoordinator(strategies=strategies)
+        coord.budget.start_deadline()
+
+        env = _make_envelope(source=FailureSource.LLM, category="rate_limited")
+        d1 = coord.evaluate(env)
+        assert d1.strategy_key == "mock_retry"
+        d2 = coord.evaluate(env)
+        assert d2.strategy_key == "mock_retry"
+        d3 = coord.evaluate(env)
+        assert d3.strategy_key == "mock_retry"
