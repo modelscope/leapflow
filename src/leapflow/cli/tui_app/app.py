@@ -54,7 +54,7 @@ from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.widgets import TextArea
 
 from leapflow.cli.tui_app.approval_modal import ApprovalModal, request_is_expired
-from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
+from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus, command_key
 from leapflow.cli.tui_app.input import build_completer
 from leapflow.cli.tui_app.paste import (
     PASTE_FRAGMENT_WINDOW_S,
@@ -158,6 +158,9 @@ class _CommandQueue:
 
     def qsize(self) -> int:
         return len(self._items)
+
+    def contains_key(self, key: str) -> bool:
+        return any(command.command_key == key for command in self._items)
 
     def snapshot(self) -> list[TuiCommand]:
         return list(self._items)
@@ -283,8 +286,15 @@ class LeapApp:
             raise ValueError("Cannot submit an empty TUI command")
         if self._dispatch_control_text(normalized):
             return TuiCommand.create(command_id=0, text=normalized).mark_done()
+        key = command_key(normalized)
         command = TuiCommand.create(command_id=self._next_command_id, text=normalized)
         self._next_command_id += 1
+        if self._is_duplicate_command_key(key):
+            skipped = command.mark_skipped("duplicate queued/running command skipped")
+            self._console.command_card(skipped)
+            self._sync_task_counts()
+            self._invalidate()
+            return skipped
         self._pending_input.put_nowait(command)
         self._sync_task_counts()
         if self._active_command is not None or self._pending_input.qsize() > 1 or self._queue_paused:
@@ -421,6 +431,10 @@ class LeapApp:
         if status == TuiCommandStatus.BLOCKED:
             return command.mark_blocked(reason)
         return command.mark_failed(reason)
+
+    def _is_duplicate_command_key(self, key: str) -> bool:
+        active = self._active_command
+        return bool((active is not None and active.command_key == key) or self._pending_input.contains_key(key))
 
     def _dispatch_control_text(self, text: str) -> bool:
         handler = self._on_control

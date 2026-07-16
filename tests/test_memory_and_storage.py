@@ -374,6 +374,52 @@ def test_skill_library_crud(skill_library) -> None:
     assert active[0].skill_id == "s1"
 
 
+def test_tool_execution_store_roundtrip_and_unique_key(tmp_path: Path) -> None:
+    from leapflow.engine.tool_execution import ToolExecutionRecord
+    from leapflow.storage.conversation_store import DuckDBConversationStore
+
+    store = DuckDBConversationStore(tmp_path / "conversation.duckdb")
+    try:
+        record = ToolExecutionRecord.create(
+            session_id="session-1",
+            turn_id="turn-1",
+            command_id="command-1",
+            tool_call_id="tool-a",
+            tool_name="shell_run",
+            idempotency_key="idem-1",
+            arguments={"command": "git push"},
+            policy="external_side_effect",
+        )
+        duplicate = ToolExecutionRecord.create(
+            session_id="session-1",
+            turn_id="turn-1",
+            command_id="command-1",
+            tool_call_id="tool-b",
+            tool_name="shell_run",
+            idempotency_key="idem-1",
+            arguments={"command": "git push"},
+            policy="external_side_effect",
+        )
+
+        store.reserve_tool_execution(record)
+        store.reserve_tool_execution(duplicate)
+        completed = record.mark_completed({"ok": True, "stdout": "pushed"})
+        store.complete_tool_execution(completed)
+
+        loaded = store.get_tool_execution_by_key("session-1", "idem-1")
+        rows = store._conn.execute("SELECT COUNT(*) FROM tool_executions").fetchone()[0]
+
+        assert rows == 1
+        assert loaded is not None
+        assert loaded.execution_id == record.execution_id
+        assert loaded.tool_call_id == "tool-a"
+        assert loaded.arguments == {"command": "git push"}
+        assert loaded.result == {"ok": True, "stdout": "pushed"}
+        assert loaded.status == "completed"
+    finally:
+        store.close()
+
+
 # ── Cross-tier integration ─────────────────────────────────────────
 
 

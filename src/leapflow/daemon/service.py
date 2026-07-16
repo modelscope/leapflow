@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import sys
@@ -32,6 +33,10 @@ class RuntimeLeapService:
         self._client_leases: Callable[[], list[ClientLeaseSnapshot]] = lambda: []
         self._approval_pending: dict[str, dict[str, Any]] = {}
         self._approval_event_queue: asyncio.Queue[StreamChunk] | None = None
+        self._active_engine_request_id: str = ""
+        self._engine_request_ledger: dict[str, dict[str, Any]] = {}
+        self._request_ledger_ttl_s = max(1.0, float(getattr(settings, "daemon_request_ledger_ttl_s", 600.0) or 600.0))
+        self._request_ledger_max_entries = max(1, int(getattr(settings, "daemon_request_ledger_max_entries", 128) or 128))
 
         from leapflow.daemon.notifications import NotificationBus
         self.notification_bus = NotificationBus()
@@ -95,33 +100,93 @@ class RuntimeLeapService:
         return {"found": found, "session_id": str(current or session_id)}
 
     async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+        request_id = str(kwargs.get("request_id") or uuid.uuid4().hex[:12])
         async with self._engine_lock:
-            ctx = self.context
-            if ctx.reload_runtime_config_if_changed():
-                self._settings = ctx.settings
+            self._prune_engine_request_ledger()
+            existing = self._engine_request_ledger.get(request_id)
+            if existing and existing.get("status") == "completed":
+                for chunk in existing.get("chunks", []):
+                    if isinstance(chunk, StreamChunk):
+                        metadata = dict(chunk.metadata or {})
+                        metadata["replayed_request"] = True
+                        yield StreamChunk(
+                            request_id=request_id,
+                            content=chunk.content,
+                            done=chunk.done,
+                            event_type=chunk.event_type,
+                            metadata=metadata,
+                        )
+                return
+            if existing and existing.get("status") == "running":
                 yield StreamChunk(
-                    request_id="",
-                    content="Configuration reloaded in leapd.",
+                    request_id=request_id,
+                    content="Duplicate engine request is already running.",
                     event_type="status",
-                    metadata={
-                        **self._engine_context_metadata(getattr(ctx, "engine", None), ctx.settings),
-                        "llm_model": getattr(ctx.settings, "llm_model", ""),
-                    },
+                    metadata={"request_id": request_id, "duplicate_request": True},
                 )
-            engine = getattr(ctx, "engine", None)
-            if engine is None:
-                raise RuntimeError("leapd engine is not initialized")
+                return
 
-            enable_thinking = bool(kwargs.get("enable_thinking", False))
-            approval_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
-            previous_queue = self._approval_event_queue
-            self._approval_event_queue = approval_queue
+            request_record: dict[str, Any] = {
+                "status": "running",
+                "chunks": [],
+                "created_at": time.time(),
+            }
+            self._engine_request_ledger[request_id] = request_record
+            ctx = self.context
             try:
-                stream = engine.run_stream(message, enable_thinking=enable_thinking)
-                async for chunk in self._stream_engine_events(stream, approval_queue):
+                if ctx.reload_runtime_config_if_changed():
+                    self._settings = ctx.settings
+                    chunk = StreamChunk(
+                        request_id=request_id,
+                        content="Configuration reloaded in leapd.",
+                        event_type="status",
+                        metadata={
+                            **self._engine_context_metadata(getattr(ctx, "engine", None), ctx.settings),
+                            "llm_model": getattr(ctx.settings, "llm_model", ""),
+                            "request_id": request_id,
+                        },
+                    )
+                    request_record["chunks"].append(chunk)
                     yield chunk
-            finally:
-                self._approval_event_queue = previous_queue
+                engine = getattr(ctx, "engine", None)
+                if engine is None:
+                    raise RuntimeError("leapd engine is not initialized")
+
+                enable_thinking = bool(kwargs.get("enable_thinking", False))
+                approval_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
+                previous_queue = self._approval_event_queue
+                previous_request_id = self._active_engine_request_id
+                self._approval_event_queue = approval_queue
+                self._active_engine_request_id = request_id
+                try:
+                    sig = inspect.signature(engine.run_stream)
+                    if "request_id" in sig.parameters:
+                        stream = engine.run_stream(
+                            message,
+                            enable_thinking=enable_thinking,
+                            request_id=request_id,
+                        )
+                    else:
+                        stream = engine.run_stream(
+                            message,
+                            enable_thinking=enable_thinking,
+                        )
+                    async for chunk in self._stream_engine_events(
+                        stream, approval_queue, request_id=request_id,
+                    ):
+                        request_record["chunks"].append(chunk)
+                        yield chunk
+                    request_record["status"] = "completed"
+                    request_record["completed_at"] = time.time()
+                    self._prune_engine_request_ledger()
+                finally:
+                    self._approval_event_queue = previous_queue
+                    self._active_engine_request_id = previous_request_id
+            except Exception:
+                request_record["status"] = "failed"
+                request_record["completed_at"] = time.time()
+                self._prune_engine_request_ledger()
+                raise
 
     async def engine_cancel(self) -> bool:
         ctx = self.context
@@ -376,6 +441,30 @@ class RuntimeLeapService:
     ) -> dict[str, Any]:
         raise NotImplementedError("gateway.send is not available in this daemon phase")
 
+    def _prune_engine_request_ledger(self) -> None:
+        """Bound completed/failed engine request replay records by TTL and size."""
+        now = time.time()
+        for request_id, record in list(self._engine_request_ledger.items()):
+            status = str(record.get("status") or "")
+            if status == "running":
+                continue
+            completed_at = float(record.get("completed_at") or record.get("created_at") or 0.0)
+            if now - completed_at > self._request_ledger_ttl_s:
+                self._engine_request_ledger.pop(request_id, None)
+        overflow = len(self._engine_request_ledger) - self._request_ledger_max_entries
+        if overflow <= 0:
+            return
+        evictable = sorted(
+            (
+                (float(record.get("completed_at") or record.get("created_at") or 0.0), request_id)
+                for request_id, record in self._engine_request_ledger.items()
+                if str(record.get("status") or "") != "running"
+            ),
+            key=lambda item: item[0],
+        )
+        for _timestamp, request_id in evictable[:overflow]:
+            self._engine_request_ledger.pop(request_id, None)
+
     def _memory_entry_to_dict(self, entry: MemoryEntry) -> dict[str, Any]:
         return {
             "entry_id": entry.entry_id,
@@ -519,6 +608,8 @@ class RuntimeLeapService:
         self,
         stream: AsyncIterator[object],
         approval_queue: asyncio.Queue[StreamChunk],
+        *,
+        request_id: str = "",
     ) -> AsyncIterator[StreamChunk]:
         engine_task: asyncio.Task[Any] | None = asyncio.create_task(anext(stream))
         approval_task: asyncio.Task[StreamChunk] | None = asyncio.create_task(approval_queue.get())
@@ -537,7 +628,7 @@ class RuntimeLeapService:
                         engine_task = None
                         break
                     stream_event = self._normalize_event(event)
-                    yield self._chunk_from_event(stream_event)
+                    yield self._chunk_from_event(stream_event, request_id=request_id)
                     engine_task = asyncio.create_task(anext(stream))
         finally:
             for task in (engine_task, approval_task):
@@ -558,9 +649,10 @@ class RuntimeLeapService:
         if queue is None:
             return "deny"
         pending_id = str(getattr(request, "request_id", "") or uuid.uuid4().hex)
+        request_id = self._active_engine_request_id or pending_id
         payload = request.to_dict()
         payload["pending_id"] = pending_id
-        payload.setdefault("request_id", pending_id)
+        payload["request_id"] = request_id
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._approval_pending[pending_id] = {
             "request": payload,
@@ -569,10 +661,10 @@ class RuntimeLeapService:
             "created_at": time.time(),
         }
         await queue.put(StreamChunk(
-            request_id="",
+            request_id=request_id,
             content="Approval required",
             event_type="approval_request",
-            metadata={"approval": payload},
+            metadata={"approval": payload, "request_id": request_id},
         ))
         timeout_s = 120.0
         if getattr(request, "expires_at", None):
@@ -618,17 +710,19 @@ class RuntimeLeapService:
             return event
         return StreamEvent(type="chunk", content=str(event), metadata=None)
 
-    def _chunk_from_event(self, event: StreamEvent) -> StreamChunk:
+    def _chunk_from_event(self, event: StreamEvent, *, request_id: str = "") -> StreamChunk:
         ctx = self.context
         engine = getattr(ctx, "engine", None)
         metadata = dict(event.metadata or {})
         session_id = getattr(engine, "_current_session_id", "") if engine else ""
+        if request_id:
+            metadata.setdefault("request_id", request_id)
         if session_id:
             metadata.setdefault("session_id", str(session_id))
         if engine is not None:
             metadata.update(self._engine_context_metadata(engine, getattr(ctx, "settings", self._settings)))
         return StreamChunk(
-            request_id="",
+            request_id=request_id,
             content=event.content,
             done=False,
             event_type=event.type,

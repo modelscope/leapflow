@@ -20,7 +20,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Union, runtime_checkable
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Union, runtime_checkable
+
+if TYPE_CHECKING:
+    from leapflow.engine.tool_execution import ToolExecutionRecord
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +82,9 @@ class ConversationStore(Protocol):
     def get_session(self, session_id: str) -> Optional[ConversationSession]: ...
     def list_sessions(self, *, limit: int = 20, active_only: bool = True) -> List[ConversationSession]: ...
     def append_message(self, session_id: str, role: str, content: str, **kwargs: Any) -> ConversationMessage: ...
+    def reserve_tool_execution(self, record: "ToolExecutionRecord") -> None: ...
+    def complete_tool_execution(self, record: "ToolExecutionRecord") -> None: ...
+    def get_tool_execution_by_key(self, session_id: str, idempotency_key: str) -> Optional["ToolExecutionRecord"]: ...
     def get_messages(self, session_id: str, *, limit: int = 100, active_only: bool = True) -> List[ConversationMessage]: ...
     def search_messages(self, query: str, *, limit: int = 10) -> List[ConversationSearchResult]: ...
     def close(self) -> None: ...
@@ -139,6 +145,32 @@ class DuckDBConversationStore:
                 token_count INTEGER DEFAULT 0,
                 metadata_json VARCHAR DEFAULT '{}'
             )
+        """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS tool_executions (
+                execution_id VARCHAR PRIMARY KEY,
+                session_id VARCHAR NOT NULL,
+                turn_id VARCHAR NOT NULL,
+                command_id VARCHAR DEFAULT '',
+                tool_call_id VARCHAR DEFAULT '',
+                tool_name VARCHAR NOT NULL,
+                idempotency_key VARCHAR NOT NULL,
+                arguments_json VARCHAR DEFAULT '{}',
+                policy VARCHAR DEFAULT 'read_only',
+                status VARCHAR NOT NULL,
+                result_json VARCHAR,
+                created_at DOUBLE DEFAULT 0.0,
+                completed_at DOUBLE DEFAULT 0.0,
+                UNIQUE(session_id, idempotency_key)
+            )
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tool_executions_session
+            ON tool_executions (session_id, idempotency_key)
+        """)
+        self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tool_executions_turn
+            ON tool_executions (turn_id, created_at)
         """)
         self._conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_conv_messages_session
@@ -277,6 +309,75 @@ class DuckDBConversationStore:
             tool_call_id=tool_call_id, tool_calls_json=tc_json,
             token_count=token_count, metadata=metadata or {},
         )
+
+    def reserve_tool_execution(self, record: "ToolExecutionRecord") -> None:
+        """Reserve a tool execution idempotently."""
+        self._execute_write(
+            """
+            INSERT INTO tool_executions
+                (execution_id, session_id, turn_id, command_id, tool_call_id,
+                 tool_name, idempotency_key, arguments_json, policy, status,
+                 result_json, created_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (session_id, idempotency_key) DO NOTHING
+            """,
+            [
+                record.execution_id,
+                record.session_id,
+                record.turn_id,
+                record.command_id,
+                record.tool_call_id,
+                record.tool_name,
+                record.idempotency_key,
+                json.dumps(record.arguments, ensure_ascii=False, default=str),
+                record.policy,
+                record.status,
+                json.dumps(record.result, ensure_ascii=False, default=str) if record.result is not None else None,
+                record.created_at,
+                record.completed_at,
+            ],
+        )
+
+    def complete_tool_execution(self, record: "ToolExecutionRecord") -> None:
+        """Store the final status and result for a reserved tool execution."""
+        self._execute_write(
+            """
+            UPDATE tool_executions SET
+                status = ?,
+                result_json = ?,
+                completed_at = ?,
+                tool_call_id = COALESCE(NULLIF(?, ''), tool_call_id)
+            WHERE session_id = ? AND idempotency_key = ?
+            """,
+            [
+                record.status,
+                json.dumps(record.result, ensure_ascii=False, default=str) if record.result is not None else None,
+                record.completed_at,
+                record.tool_call_id,
+                record.session_id,
+                record.idempotency_key,
+            ],
+        )
+
+    def get_tool_execution_by_key(
+        self,
+        session_id: str,
+        idempotency_key: str,
+    ) -> Optional["ToolExecutionRecord"]:
+        """Return a stored tool execution by session and idempotency key."""
+        row = self._conn.execute(
+            """
+            SELECT execution_id, session_id, turn_id, command_id, tool_call_id,
+                   tool_name, idempotency_key, arguments_json, policy, status,
+                   result_json, created_at, completed_at
+            FROM tool_executions
+            WHERE session_id = ? AND idempotency_key = ?
+            """,
+            [session_id, idempotency_key],
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_tool_execution(row)
 
     def get_messages(
         self,
@@ -553,6 +654,38 @@ class DuckDBConversationStore:
             message_count=row[8] or 0, total_tokens=row[9] or 0,
             is_active=bool(row[10]) if row[10] is not None else True,
             metadata=meta,
+        )
+
+    def _row_to_tool_execution(self, row: tuple) -> "ToolExecutionRecord":
+        from leapflow.engine.tool_execution import ToolExecutionRecord
+
+        arguments: dict[str, Any] = {}
+        result: Any = None
+        try:
+            arguments_raw = row[7]
+            parsed_arguments = json.loads(arguments_raw) if arguments_raw else {}
+            if isinstance(parsed_arguments, dict):
+                arguments = parsed_arguments
+        except (json.JSONDecodeError, TypeError):
+            arguments = {}
+        try:
+            result = json.loads(row[10]) if row[10] else None
+        except (json.JSONDecodeError, TypeError):
+            result = row[10]
+        return ToolExecutionRecord(
+            execution_id=row[0] or "",
+            session_id=row[1] or "",
+            turn_id=row[2] or "",
+            command_id=row[3] or "",
+            tool_call_id=row[4] or "",
+            tool_name=row[5] or "",
+            idempotency_key=row[6] or "",
+            arguments=arguments,
+            policy=row[8] or "read_only",
+            status=row[9] or "reserved",
+            result=result,
+            created_at=row[11] or 0.0,
+            completed_at=row[12] or 0.0,
         )
 
     def _row_to_message(self, row: tuple) -> ConversationMessage:

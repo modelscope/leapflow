@@ -356,7 +356,6 @@ class ToolEvidenceBuilder:
             evidence["execution_note"] = str(result.get("execution_note") or "Done. Do not repeat.")
         if result.get("already_executed"):
             evidence["status"] = "ALREADY_EXECUTED"
-            evidence["execution_note"] = str(result.get("execution_note") or "")
             original = result.get("original_result")
             if isinstance(original, dict) and original.get("resource_id"):
                 evidence["resource_id"] = str(original["resource_id"])

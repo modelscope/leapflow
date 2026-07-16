@@ -156,6 +156,8 @@ class UnixRpcServer:
 
         method = getattr(self._service, attr)
         params = dict(request.params or {})
+        if request.method == "engine.chat":
+            params.setdefault("request_id", request.id)
         if request.method in ("engine.chat", "events.subscribe"):
             await self._dispatch_stream(request, method, params, writer)
             return

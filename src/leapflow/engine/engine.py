@@ -46,11 +46,20 @@ from leapflow.engine.prompt_cache import CacheStrategy
 from leapflow.engine.stale_stream import StaleStreamError, stale_guarded_stream, build_continuation_prompt
 from leapflow.engine.turn_recovery import TurnRecoveryState
 from leapflow.engine.turn_usage import TurnUsageTracker
+from leapflow.engine.recovery_coordinator import RecoveryCoordinator, RecoveryState
+from leapflow.engine.recovery_budget import RecoveryBudget
+from leapflow.engine.unified_classifier import UnifiedErrorClassifier
+from leapflow.engine.failure_envelope import FailureEnvelope, FailureSource, Recoverability
+from leapflow.engine.recovery_decision import RecoveryAction
+from leapflow.engine.recovery_strategies import default_strategies
+from leapflow.engine.recovery_audit import JsonlAuditSink, create_audit_entry
+from leapflow.engine.recovery_checkpoint import RecoveryCheckpoint, InMemoryCheckpointStore
 from leapflow.engine.tool_concurrency import (
     DefaultConcurrencyPolicy,
     ToolCall as ConcurrentToolCall,
     ToolConcurrencyPolicy,
 )
+from leapflow.engine.tool_execution import ToolExecutionLedger, execution_policy_for
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.scheduler import TaskScheduler
 from leapflow.engine.session import SessionController, SessionMode
@@ -174,7 +183,13 @@ def _tool_result_metadata(
         for key in ("exit_code", "path", "lines", "truncated", "bytes_written"):
             if key in result:
                 metadata[key] = result[key]
-        for key in ("error_type", "retryable", "resolution_status", "resolution_confidence"):
+        for key in (
+            "error_type", "retryable", "resolution_status", "resolution_confidence",
+            "already_executed", "duplicate_suppressed", "execution_reused", "execution_skipped",
+            "counts_as_failure", "counts_as_tool_attempt", "ui_hidden", "skipped_reason",
+            "blocked_by_tool", "blocked_by_error", "execution_id", "idempotency_key", "execution_status",
+            "execution_policy", "tool_call_id",
+        ):
             if key in result:
                 metadata[key] = result[key]
         # App Connector authorization failure metadata
@@ -224,22 +239,6 @@ def _is_retryable_unknown_tool_result(result: Any) -> bool:
     )
 
 
-def _platform_action_fingerprint(tool_name: str, arguments: Mapping[str, Any]) -> str | None:
-    """Return a dedup fingerprint for platform_action calls; None for all other tools.
-
-    Used to prevent duplicate side-effect actions (send, write) within one turn.
-    Two calls are considered duplicates when platform, action name, and payload
-    are all identical.
-    """
-    if tool_name != "platform_action":
-        return None
-    platform = str(arguments.get("platform") or "")
-    action = str(arguments.get("action") or "")
-    payload = arguments.get("payload") or {}
-    payload_key = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return f"{platform}:{action}:{payload_key}"
-
-
 def _has_completed_side_effect(results: List[Dict[str, Any]]) -> bool:
     """Return True if any result is a completed side-effect platform_action."""
     for item in results:
@@ -277,6 +276,68 @@ def _is_permission_failure_payload(payload: Dict[str, Any]) -> bool:
 def _is_permission_hard_stop_payload(payload: Dict[str, Any]) -> bool:
     """Return whether a failed tool result must stop the current agent turn."""
     return is_permission_hard_stop_payload(payload)
+
+
+_SIDE_EFFECT_STOP_POLICIES = frozenset({"external_side_effect", "mutating_once", "mutating_idempotent"})
+_SIDE_EFFECT_STOP_TOOLS = frozenset({
+    "shell_run",
+    "scm_sync",
+    "platform_action",
+    "platform_connect",
+    "gateway_send",
+    "gateway_connect",
+    "hub_push",
+    "hub_pull",
+    "hub_sync",
+})
+
+
+def _tool_result_counts_as_failure(payload: Dict[str, Any]) -> bool:
+    """Return whether a tool payload represents a real failed execution attempt."""
+    if payload.get("counts_as_failure") is False:
+        return False
+    if _tool_result_is_control_signal(payload):
+        return False
+    return payload.get("ok") is False
+
+
+def _tool_result_is_control_signal(payload: Dict[str, Any]) -> bool:
+    """Return whether a tool payload is execution control metadata, not an attempt result."""
+    return bool(payload.get("already_executed") or payload.get("duplicate_suppressed") or payload.get("execution_skipped"))
+
+
+def _tool_failure_text(payload: Dict[str, Any]) -> str:
+    """Return the most useful root-cause text from a failed tool payload."""
+    for key in ("error", "stderr", "stdout", "message"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return "unknown error"
+
+
+def _should_stop_after_tool_result(tool_name: str, payload: Dict[str, Any]) -> bool:
+    """Return whether a failed side-effect result must stop the current tool batch."""
+    if _is_permission_hard_stop_payload(payload):
+        return True
+    if not _tool_result_counts_as_failure(payload):
+        return False
+    policy = str(payload.get("execution_policy") or "")
+    normalized_name = str(tool_name or "").removeprefix("gp_")
+    return policy in _SIDE_EFFECT_STOP_POLICIES or normalized_name in _SIDE_EFFECT_STOP_TOOLS
+
+
+def _skipped_after_failure_result(blocking_tool: str, blocking_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a non-failure result for a tool skipped because an earlier side effect failed."""
+    return {
+        "ok": True,
+        "execution_skipped": True,
+        "skipped_reason": "previous_tool_failed",
+        "blocked_by_tool": blocking_tool,
+        "blocked_by_error": _tool_failure_text(blocking_result),
+        "counts_as_failure": False,
+        "counts_as_tool_attempt": False,
+        "ui_hidden": True,
+    }
 
 
 def _permission_hard_stop_from_results(results: List[Dict[str, Any]]) -> Dict[str, Any] | None:
@@ -353,7 +414,7 @@ def _extract_recent_tool_failures(messages: List[Dict[str, Any]]) -> List[Dict[s
             payload = json.loads(content)
         except (json.JSONDecodeError, ValueError):
             continue
-        if not isinstance(payload, dict) or payload.get("ok", True):
+        if not isinstance(payload, dict) or not _tool_result_counts_as_failure(payload):
             continue
         failures.append(payload)
         if len(failures) >= 3:
@@ -423,7 +484,7 @@ def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
 
     last = failures[0]
     failure_code = str(last.get("failure_code") or "")
-    error = str(last.get("error") or "")
+    error = str(last.get("error") or last.get("stderr") or last.get("stdout") or "")
     recovery_hint = str(last.get("recovery_hint") or "")
     available_actions: List[str] = list(last.get("available_action_names") or [])
 
@@ -783,6 +844,11 @@ class AgentEngine:
         # Session persistence (injected by CLI)
         self._conversation_store: Optional[Any] = None
         self._current_session_id: Optional[str] = None
+        self._current_turn_id: str = ""
+        self._current_command_id: str = ""
+        self._tool_execution_ledger = ToolExecutionLedger()
+
+        self._current_request_id: str = ""
 
         # Memory context snapshot (frozen at session start for prefix cache stability)
         self._memory_context_snapshot: Optional[str] = None
@@ -882,6 +948,12 @@ class AgentEngine:
 
         # B4: Output sanitization (None = disabled)
         self._sanitizer: MessageSanitizer | None = None
+
+        # Recovery coordinator infrastructure
+        self._unified_classifier = UnifiedErrorClassifier(self._error_classifier)
+        self._recovery_coordinator = RecoveryCoordinator()  # Re-created per turn
+        self._checkpoint_store = InMemoryCheckpointStore()
+        self._audit_sink = JsonlAuditSink()  # In-memory; path-based if layout available
 
     # ── Optional strategy setters (config-driven) ────────────────────────
 
@@ -996,14 +1068,11 @@ class AgentEngine:
         use_native_tools: bool = False,
         tools_kwarg: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
-        """Unified API error recovery dispatcher. Returns 'continue' to retry, else None.
+        """Legacy API error recovery dispatcher. Returns 'continue' to retry, else None.
 
-        Wires ALL TurnRecoveryState one-shot guards to their matching ErrorCategory:
-        - CONTEXT_OVERFLOW → try_compress
-        - IMAGE_TOO_LARGE → try_multimodal_strip
-        - should_fallback → try_provider_failover
-        - should_rotate_credential → try_credential_rotate
-        - FORMAT_ERROR with thinking → try_disable_thinking
+        DEPRECATED: No longer called from main loops. Retained only for backward
+        compat with any external subclass overrides. All recovery now flows through
+        RecoveryCoordinator.evaluate().
         """
         if classified == ErrorCategory.CONTEXT_OVERFLOW and recovery.try_compress():
             messages[:] = self._compressor.force_compress(messages)
@@ -1091,6 +1160,46 @@ class AgentEngine:
                     else:
                         messages[i] = {**msg, "content": "[images removed to reduce context]"}
 
+    def _execute_transform_decision(
+        self,
+        decision: "RecoveryDecision",
+        messages: list,
+    ) -> bool:
+        """Execute a TRANSFORM_AND_RETRY decision. Returns True if transform succeeded.
+
+        Handles different transform strategies:
+        - context_compress: force-compress conversation history
+        - multimodal_strip: remove image content from messages
+        - native_to_text: disable native tool calling
+        - thinking_disable: disable thinking mode (handled externally)
+        """
+        strategy_key = decision.strategy_key
+        # Determine specific phase from audit_metadata if available
+        phase = dict(decision.audit_metadata).get("phase", "")
+
+        if strategy_key == "context_compress":
+            if phase == "multimodal_to_text":
+                self._strip_images_from_messages(messages)
+            else:
+                # Default: history_summarize and disclosure_shrink both use force_compress
+                messages[:] = self._compressor.force_compress(messages)
+            return True
+
+        if strategy_key == "multimodal_strip":
+            self._strip_images_from_messages(messages)
+            return True
+
+        if strategy_key == "native_to_text":
+            # Handled by caller via tools_kwarg mutation
+            return True
+
+        if strategy_key == "thinking_disable":
+            # Handled by caller via enable_thinking flag
+            return True
+
+        logger.warning("Unknown transform strategy: %s", strategy_key)
+        return True
+
     def _check_guardrail(
         self,
         messages: List[Dict[str, Any]],
@@ -1171,6 +1280,7 @@ class AgentEngine:
     def set_conversation_store(self, store: Any) -> None:
         """Inject conversation persistence store."""
         self._conversation_store = store
+        self._tool_execution_ledger.reset(store=store)
 
     def load_session(self, session_id: str) -> bool:
         """Resume a previous session by loading messages from DuckDB.
@@ -1253,6 +1363,9 @@ class AgentEngine:
         self._last_disclosure_metadata = {}
         self._context_governance_controller.reset_turn_scope()
         self._current_task_contract = self._build_task_contract(user_text)
+        self._current_turn_id = self._current_task_contract.task_id
+        self._current_command_id = self._current_task_contract.task_id
+        self._tool_execution_ledger.reset(store=self._conversation_store)
         try:
             from leapflow.tools.gateway_tool import reset_platform_action_scope
             reset_platform_action_scope()
@@ -1684,7 +1797,7 @@ class AgentEngine:
         return await self._unified_tool_loop(user_text, enable_thinking=enable_thinking)
 
     async def run_stream(
-        self, user_text: str, *, enable_thinking: bool = False
+        self, user_text: str, *, enable_thinking: bool = False, request_id: str = ""
     ) -> AsyncIterator[Union[str, StreamEvent]]:
         """Like run(), but yields text chunks for streamable responses.
 
@@ -1695,6 +1808,7 @@ class AgentEngine:
             StreamEvent(type="tool_call"): internal tool invocation (suppress display).
         """
         self._session_turn_count += 1
+        self._current_request_id = request_id
         logger.info("audit.user_input chars=%s", len(user_text))
         self._begin_turn_context(user_text)
         self._emit_chat_event("user_message", {"content": user_text[:500]})
@@ -2153,6 +2267,14 @@ class AgentEngine:
         content = ""
         fatal_error: Optional[str] = None
         recovery = TurnRecoveryState()
+        # P3: Initialize recovery coordinator for this turn
+        recovery_budget = RecoveryBudget()
+        recovery_budget.start_deadline()
+        self._recovery_coordinator = RecoveryCoordinator(
+            strategies=default_strategies(),
+            budget=recovery_budget,
+        )
+        self._recovery_coordinator.new_turn(turn_id=budget.used)
         use_native_tools = assembly.plan.native_tools
         result_budget = self._effective_tool_result_budget()
         unknown_tool_retry_used = False
@@ -2205,21 +2327,84 @@ class AgentEngine:
                 category_str = classified.value if hasattr(classified, 'value') else str(classified)
                 recovery.record_api_error(category_str)
 
-                if await self._handle_api_error(
-                    classified, rec, recovery, messages, budget,
-                    use_native_tools=use_native_tools, tools_kwarg=tools_kwarg,
-                ) == "continue":
-                    if classified == ErrorCategory.CONTEXT_OVERFLOW:
+                # Classify through unified coordinator and execute recovery
+                envelope = self._unified_classifier.classify_llm_error(
+                    exc, provider=getattr(self._llm, 'provider', ''),
+                    model=getattr(self._llm, 'model', ''),
+                )
+                coordinator = self._recovery_coordinator
+                try:
+                    decision = coordinator.evaluate(envelope)
+                except Exception as coord_exc:
+                    logger.error("recovery_coordinator.evaluate() failed: %s", coord_exc)
+                    fatal_error = f"Internal recovery error: {coord_exc}"
+                    break
+                self._audit_sink.record(create_audit_entry(
+                    envelope, decision, coordinator.budget,
+                    session_id=getattr(self, '_current_session_id', '') or '',
+                    turn_id=budget.used,
+                ))
+
+                # Execute decision via coordinator
+                if decision.action == RecoveryAction.RETRY_WITH_BACKOFF:
+                    if decision.retry_semantics.backoff_config:
+                        await asyncio.sleep(
+                            jittered_backoff(budget.used, base=decision.retry_semantics.backoff_config.base_delay)
+                        )
+                    continue
+
+                elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                    # Handle native_to_text locally (needs local var mutation)
+                    if decision.strategy_key == "native_to_text":
+                        tools_kwarg = {}
+                        use_native_tools = False
+                        transform_ok = True
+                    else:
+                        transform_ok = self._execute_transform_decision(decision, messages)
+                    if transform_ok:
                         self._usage_tracker.mark_compression()
+                    coordinator.on_strategy_outcome(decision.decision_id, transform_ok)
+                    if not transform_ok:
+                        fatal_error = f"Transform failed: {decision.reason}"
+                        break
                     continue
-                if classified in (ErrorCategory.FORMAT_ERROR,) and tools_kwarg and recovery.try_native_fallback():
-                    logger.info("Native tool calling failed, falling back to text mode")
-                    tools_kwarg = {}
-                    use_native_tools = False
+
+                elif decision.action == RecoveryAction.FAILOVER:
+                    if hasattr(self._llm, '_failover'):
+                        self._llm._failover(f"recovery: {decision.reason}")
+                    coordinator.on_strategy_outcome(decision.decision_id, True)
                     continue
-                fatal_error = self._error_classifier.friendly_message(classified, str(exc))
-                logger.error("unified_loop: unrecoverable %s: %s", category_str, exc)
-                break
+
+                elif decision.action in (RecoveryAction.HALT_CLEAN, RecoveryAction.HALT_WITH_CHECKPOINT):
+                    if decision.action == RecoveryAction.HALT_WITH_CHECKPOINT:
+                        checkpoint = RecoveryCheckpoint(
+                            session_id=getattr(self, '_current_session_id', '') or '',
+                            turn_id=budget.used,
+                            failure_envelope_data={
+                                "message": envelope.message,
+                                "category": envelope.category,
+                                "failure_code": envelope.failure_code,
+                                "source": envelope.source.value,
+                            },
+                            messages_snapshot=list(messages),
+                            context_data={
+                                "tools_kwarg_keys": list(tools_kwarg.keys()),
+                                "use_native_tools": use_native_tools,
+                                "budget_used": budget.used,
+                            },
+                        )
+                        self._checkpoint_store.save(checkpoint)
+                    fatal_error = decision.reason
+                    self._audit_sink.update_outcome(
+                        decision.decision_id, "failure",
+                        reason="Terminal halt",
+                    )
+                    break
+
+                else:
+                    # ASK_USER, SKIP_AND_CONTINUE, or unknown
+                    fatal_error = decision.reason
+                    break
             _clear_indicator()
 
             content = (resp.content or "").strip()
@@ -2328,7 +2513,9 @@ class AgentEngine:
                 "arguments_summary": json.dumps(tool_arguments, default=str, ensure_ascii=False)[:300] if tool_arguments else "",
             })
             _show_progress("executing", tool_name)
-            result = await self._execute_general_tool(normalized_tool_call, TOOL_HANDLERS)
+            result = await self._execute_tool_with_ledger(
+                normalized_tool_call, TOOL_HANDLERS, tool_call_id=f"text-{budget.used}",
+            )
             _clear_indicator()
             self._emit_chat_event("tool_result", {
                 "tool_name": tool_name,
@@ -2342,7 +2529,7 @@ class AgentEngine:
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
 
-            is_error = isinstance(result, dict) and not result.get("ok", True)
+            is_error = isinstance(result, dict) and _tool_result_counts_as_failure(result)
             if is_error:
                 recovery.record_tool_failure()
             else:
@@ -2352,7 +2539,11 @@ class AgentEngine:
             messages.append(build_user_message_text(
                 f"Tool result ({tool_name}):\n{result_text}"
             ))
-            self._persist_message(session_id, "tool", result_text, tool_name=tool_name)
+            self._persist_message(
+                session_id, "tool", result_text,
+                tool_name=tool_name, tool_call_id=f"text-{budget.used}",
+                metadata=self._tool_execution_metadata(result),
+            )
 
             if _is_permission_hard_stop_payload(result):
                 logger.info(
@@ -2361,6 +2552,28 @@ class AgentEngine:
                     result.get("capability") or result.get("action") or tool_name,
                 )
                 break
+
+            # Classify tool failures through coordinator for audit and decision
+            if (
+                isinstance(result, dict)
+                and not result.get("ok", True)
+                and result.get("counts_as_failure") is not False
+            ):
+                tool_envelope = self._unified_classifier.classify_tool_result(
+                    result, tool_name=tool_name,
+                    execution_policy=result.get("execution_policy", "read_only"),
+                )
+                if tool_envelope is not None:
+                    tool_decision = self._recovery_coordinator.evaluate(tool_envelope)
+                    self._audit_sink.record(create_audit_entry(
+                        tool_envelope, tool_decision, self._recovery_coordinator.budget,
+                        session_id=getattr(self, '_current_session_id', '') or '',
+                        turn_id=budget.used,
+                    ))
+                    if tool_decision.action in (RecoveryAction.HALT_CLEAN, RecoveryAction.HALT_WITH_CHECKPOINT):
+                        fatal_error = tool_decision.reason
+                        break
+                    # Other actions: let LLM handle (append result to messages as before)
 
             if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
                 unknown_tool_retry_used = True
@@ -2564,6 +2777,14 @@ class AgentEngine:
         content = ""
         fatal_error: Optional[str] = None
         turn_recovery = TurnRecoveryState()
+        # Initialize recovery coordinator for stream turn
+        recovery_budget = RecoveryBudget()
+        recovery_budget.start_deadline()
+        self._recovery_coordinator = RecoveryCoordinator(
+            strategies=default_strategies(),
+            budget=recovery_budget,
+        )
+        self._recovery_coordinator.new_turn(turn_id=budget.used)
         use_native_tools = assembly.plan.native_tools
         result_budget = self._effective_tool_result_budget()
         unknown_tool_retry_used = False
@@ -2618,18 +2839,48 @@ class AgentEngine:
                     rec = self._error_classifier.get_recovery(classified)
                     turn_recovery.record_api_error()
 
-                    if await self._handle_api_error(
-                        classified, rec, turn_recovery, messages, budget,
-                        use_native_tools=use_native_tools, tools_kwarg=tools_kwarg,
-                    ) == "continue":
+                    # Classify through unified coordinator
+                    envelope = self._unified_classifier.classify_llm_error(
+                        exc, provider=getattr(self._llm, 'provider', ''),
+                        model=getattr(self._llm, 'model', ''),
+                    )
+                    coordinator = self._recovery_coordinator
+                    try:
+                        decision = coordinator.evaluate(envelope)
+                    except Exception as coord_exc:
+                        logger.error("recovery_coordinator.evaluate() failed: %s", coord_exc)
+                        yield StreamEvent(type="error", content=f"Internal recovery error: {coord_exc}")
+                        break
+                    self._audit_sink.record(create_audit_entry(
+                        envelope, decision, coordinator.budget,
+                        session_id=getattr(self, '_current_session_id', '') or '',
+                        turn_id=budget.used,
+                    ))
+
+                    if decision.action == RecoveryAction.RETRY_WITH_BACKOFF:
+                        if decision.retry_semantics.backoff_config:
+                            await asyncio.sleep(
+                                jittered_backoff(budget.used, base=decision.retry_semantics.backoff_config.base_delay)
+                            )
                         continue
-                    if tools_kwarg and turn_recovery.try_native_fallback():
-                        logger.info("Native tool calling failed, falling back to text mode")
-                        tools_kwarg = {}
-                        use_native_tools = False
+                    elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                        if decision.strategy_key == "native_to_text":
+                            tools_kwarg = {}
+                            use_native_tools = False
+                        else:
+                            self._execute_transform_decision(decision, messages)
+                        coordinator.on_strategy_outcome(decision.decision_id, True)
                         continue
-                    yield StreamEvent(type="error", content=str(exc))
-                    break
+                    elif decision.action == RecoveryAction.FAILOVER:
+                        if hasattr(self._llm, '_failover'):
+                            self._llm._failover(f"recovery: {decision.reason}")
+                        coordinator.on_strategy_outcome(decision.decision_id, True)
+                        continue
+                    else:
+                        # Terminal: HALT_CLEAN, HALT_WITH_CHECKPOINT, ASK_USER
+                        fatal_error = decision.reason
+                        yield StreamEvent(type="error", content=decision.reason)
+                        break
                 _clear_indicator()
 
                 content = (resp.content or "").strip()
@@ -2780,14 +3031,43 @@ class AgentEngine:
                         classified = self._error_classifier.classify(exc)
                         rec = self._error_classifier.get_recovery(classified)
                         turn_recovery.record_api_error()
-                        if await self._handle_api_error(
-                            classified, rec, turn_recovery, messages, budget,
-                        ) == "continue":
+                        # Classify through unified coordinator
+                        envelope = self._unified_classifier.classify_llm_error(
+                            exc, provider=getattr(self._llm, 'provider', ''),
+                            model=getattr(self._llm, 'model', ''),
+                        )
+                        coordinator = self._recovery_coordinator
+                        try:
+                            decision = coordinator.evaluate(envelope)
+                        except Exception as coord_exc:
+                            logger.error("recovery_coordinator.evaluate() failed: %s", coord_exc)
+                            yield StreamEvent(type="error", content=f"Internal recovery error: {coord_exc}")
+                            break
+                        self._audit_sink.record(create_audit_entry(
+                            envelope, decision, coordinator.budget,
+                            session_id=getattr(self, '_current_session_id', '') or '',
+                            turn_id=budget.used,
+                        ))
+                        if decision.action == RecoveryAction.RETRY_WITH_BACKOFF:
+                            if decision.retry_semantics.backoff_config:
+                                await asyncio.sleep(
+                                    jittered_backoff(budget.used, base=decision.retry_semantics.backoff_config.base_delay)
+                                )
                             continue
-                        fatal_error = self._error_classifier.friendly_message(classified, str(exc))
-                        logger.error("unified_loop_stream: unrecoverable %s: %s", classified.value, exc)
-                        yield StreamEvent(type="error", content=fatal_error)
-                        break
+                        elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                            self._execute_transform_decision(decision, messages)
+                            coordinator.on_strategy_outcome(decision.decision_id, True)
+                            continue
+                        elif decision.action == RecoveryAction.FAILOVER:
+                            if hasattr(self._llm, '_failover'):
+                                self._llm._failover(f"recovery: {decision.reason}")
+                            coordinator.on_strategy_outcome(decision.decision_id, True)
+                            continue
+                        else:
+                            fatal_error = decision.reason
+                            logger.error("unified_loop_stream: unrecoverable %s: %s", envelope.category, exc)
+                            yield StreamEvent(type="error", content=decision.reason)
+                            break
 
                     content = "".join(content_parts).strip()
                     if self._sanitizer:
@@ -2812,14 +3092,43 @@ class AgentEngine:
                         classified = self._error_classifier.classify(exc)
                         rec = self._error_classifier.get_recovery(classified)
                         turn_recovery.record_api_error()
-                        if await self._handle_api_error(
-                            classified, rec, turn_recovery, messages, budget,
-                        ) == "continue":
+                        # Classify through unified coordinator
+                        envelope = self._unified_classifier.classify_llm_error(
+                            exc, provider=getattr(self._llm, 'provider', ''),
+                            model=getattr(self._llm, 'model', ''),
+                        )
+                        coordinator = self._recovery_coordinator
+                        try:
+                            decision = coordinator.evaluate(envelope)
+                        except Exception as coord_exc:
+                            logger.error("recovery_coordinator.evaluate() failed: %s", coord_exc)
+                            yield StreamEvent(type="error", content=f"Internal recovery error: {coord_exc}")
+                            break
+                        self._audit_sink.record(create_audit_entry(
+                            envelope, decision, coordinator.budget,
+                            session_id=getattr(self, '_current_session_id', '') or '',
+                            turn_id=budget.used,
+                        ))
+                        if decision.action == RecoveryAction.RETRY_WITH_BACKOFF:
+                            if decision.retry_semantics.backoff_config:
+                                await asyncio.sleep(
+                                    jittered_backoff(budget.used, base=decision.retry_semantics.backoff_config.base_delay)
+                                )
                             continue
-                        fatal_error = self._error_classifier.friendly_message(classified, str(exc))
-                        logger.error("unified_loop_stream: unrecoverable %s: %s", classified.value, exc)
-                        yield StreamEvent(type="error", content=fatal_error)
-                        break
+                        elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                            self._execute_transform_decision(decision, messages)
+                            coordinator.on_strategy_outcome(decision.decision_id, True)
+                            continue
+                        elif decision.action == RecoveryAction.FAILOVER:
+                            if hasattr(self._llm, '_failover'):
+                                self._llm._failover(f"recovery: {decision.reason}")
+                            coordinator.on_strategy_outcome(decision.decision_id, True)
+                            continue
+                        else:
+                            fatal_error = decision.reason
+                            logger.error("unified_loop_stream: unrecoverable %s: %s", envelope.category, exc)
+                            yield StreamEvent(type="error", content=decision.reason)
+                            break
                     _clear_indicator()
                     content = (resp.content or "").strip()
                     if self._sanitizer:
@@ -2870,7 +3179,9 @@ class AgentEngine:
                     original_tool_name=original_tool_name,
                 ),
             )
-            result = await self._execute_general_tool(normalized_tool_call, TOOL_HANDLERS)
+            result = await self._execute_tool_with_ledger(
+                normalized_tool_call, TOOL_HANDLERS, tool_call_id=f"text-{budget.used}",
+            )
             _clear_indicator()
             self._emit_chat_event("tool_result", {
                 "tool_name": tool_name,
@@ -2901,7 +3212,7 @@ class AgentEngine:
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
 
-            is_error = isinstance(result, dict) and not result.get("ok", True)
+            is_error = isinstance(result, dict) and _tool_result_counts_as_failure(result)
             if is_error:
                 turn_recovery.record_tool_failure()
             else:
@@ -2912,7 +3223,11 @@ class AgentEngine:
             messages.append(build_user_message_text(
                 f"Tool result ({tool_name}):\n{result_text}"
             ))
-            self._persist_message(session_id, "tool", result_text, tool_name=tool_name)
+            self._persist_message(
+                session_id, "tool", result_text,
+                tool_name=tool_name, tool_call_id=f"text-{budget.used}",
+                metadata=self._tool_execution_metadata(result),
+            )
 
             if _is_permission_hard_stop_payload(result):
                 logger.info(
@@ -3027,47 +3342,6 @@ class AgentEngine:
         executed: list[Dict[str, Any]] = []
         original_names_by_id = {str(tc.id): str(tc.name) for tc in native_calls}
 
-        # Idempotency guard: skip duplicate platform_action calls within one turn.
-        # Prevents the model from accidentally repeating a side-effect action
-        # (e.g. im.send_message) when it copies the "first-try-failed → retry"
-        # pattern from a previous turn into the current turn's tool_calls list.
-        seen_action_fps: set[str] = set()
-        deduped: list = []
-        for tc in native_calls:
-            fp = _platform_action_fingerprint(str(tc.name), dict(tc.arguments or {}))
-            if fp is not None and fp in seen_action_fps:
-                action_name = str((tc.arguments or {}).get("action") or tc.name)
-                skip_result: Dict[str, Any] = {
-                    "ok": False,
-                    "error": "idempotency_guard: duplicate platform_action skipped",
-                    "reason": (
-                        f"'{action_name}' with identical payload was already queued "
-                        "in this turn; LeapFlow prevents duplicate side-effects."
-                    ),
-                    "retryable": False,
-                }
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": json.dumps(skip_result, ensure_ascii=False),
-                })
-                executed.append({
-                    "id": tc.id,
-                    "name": "platform_action",
-                    "original_tool_name": "platform_action",
-                    "arguments": dict(tc.arguments or {}),
-                    "result": skip_result,
-                })
-                logger.info(
-                    "idempotency_guard: skipped duplicate platform_action tc_id=%s action=%s",
-                    tc.id, action_name,
-                )
-                continue
-            if fp is not None:
-                seen_action_fps.add(fp)
-            deduped.append(tc)
-        native_calls = deduped
-
         tc_wrappers = [
             ConcurrentToolCall(
                 id=tc.id,
@@ -3087,7 +3361,9 @@ class AgentEngine:
                     "arguments_summary": json.dumps(tc.arguments, default=str, ensure_ascii=False)[:300],
                 })
                 _show_progress("executing", normalized_name, step=i + 1, total=len(native_calls))
-                result = await self._execute_general_tool(tool_call_dict, handlers)
+                result = await self._execute_tool_with_ledger(
+                    tool_call_dict, handlers, tool_call_id=str(tc.id),
+                )
                 _clear_indicator()
                 self._emit_chat_event("tool_result", {
                     "tool_name": normalized_name,
@@ -3103,6 +3379,11 @@ class AgentEngine:
                 result_payload = self._compact_tool_result(normalized_name, tc.arguments, result)
                 result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
+                self._persist_message(
+                    self._current_session_id, "tool", result_text,
+                    tool_name=normalized_name, tool_call_id=str(tc.id),
+                    metadata=self._tool_execution_metadata(result),
+                )
                 executed.append({
                     "id": tc.id,
                     "name": normalized_name,
@@ -3110,9 +3391,19 @@ class AgentEngine:
                     "arguments": tc.arguments,
                     "result": result,
                 })
-                if isinstance(result, dict) and _is_permission_hard_stop_payload(result):
+                if isinstance(result, dict) and _should_stop_after_tool_result(normalized_name, result):
+                    for skipped_tc in native_calls[i + 1:]:
+                        skipped_call = _normalize_tool_call({"name": str(skipped_tc.name), "arguments": skipped_tc.arguments})
+                        skipped_name = str(skipped_call["name"])
+                        executed.append({
+                            "id": skipped_tc.id,
+                            "name": skipped_name,
+                            "original_tool_name": str(skipped_call.get("original_tool_name") or skipped_tc.name),
+                            "arguments": skipped_tc.arguments,
+                            "result": _skipped_after_failure_result(normalized_name, result),
+                        })
                     logger.info(
-                        "tool_concurrency: stopping remaining native tool calls after permission blocker from %s",
+                        "tool_concurrency: stopping remaining native tool calls after failed side effect from %s",
                         normalized_name,
                     )
                     break
@@ -3135,7 +3426,9 @@ class AgentEngine:
                     "original_tool_name": original_name,
                     "normalized_tool_name": ctc.name,
                 }
-                return await self._execute_general_tool(tool_call_dict, handlers)
+                return await self._execute_tool_with_ledger(
+                    tool_call_dict, handlers, tool_call_id=str(ctc.id),
+                )
 
             gather_results = await asyncio.gather(
                 *[_run_one(ctc) for ctc in concurrent],
@@ -3171,8 +3464,13 @@ class AgentEngine:
                     )
                     result_payload = self._compact_tool_result(ctc.name, ctc.arguments, result)
                     result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
-                messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
                 effective_result = error_result if isinstance(result, Exception) else result
+                messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
+                self._persist_message(
+                    self._current_session_id, "tool", result_text,
+                    tool_name=ctc.name, tool_call_id=str(ctc.id),
+                    metadata=self._tool_execution_metadata(effective_result),
+                )
                 executed.append({
                     "id": ctc.id,
                     "name": ctc.name,
@@ -3180,9 +3478,18 @@ class AgentEngine:
                     "arguments": ctc.arguments,
                     "result": effective_result,
                 })
-                if isinstance(effective_result, dict) and _is_permission_hard_stop_payload(effective_result):
+                if isinstance(effective_result, dict) and _should_stop_after_tool_result(ctc.name, effective_result):
+                    for skipped_ctc in sequential:
+                        skipped_original = original_names_by_id.get(str(skipped_ctc.id), skipped_ctc.name)
+                        executed.append({
+                            "id": skipped_ctc.id,
+                            "name": skipped_ctc.name,
+                            "original_tool_name": skipped_original,
+                            "arguments": skipped_ctc.arguments,
+                            "result": _skipped_after_failure_result(ctc.name, effective_result),
+                        })
                     logger.info(
-                        "tool_concurrency: permission blocker returned from concurrent tool %s; skipping sequential group",
+                        "tool_concurrency: failed side effect returned from concurrent tool %s; skipping sequential group",
                         ctc.name,
                     )
                     return executed
@@ -3196,7 +3503,9 @@ class AgentEngine:
                 "original_tool_name": original_name,
                 "normalized_tool_name": ctc.name,
             }
-            result = await self._execute_general_tool(tool_call_dict, handlers)
+            result = await self._execute_tool_with_ledger(
+                tool_call_dict, handlers, tool_call_id=str(ctc.id),
+            )
             _clear_indicator()
             _print_tool_result(ctc.name, result, enabled=self._settings.verbose_progress)
             trace.record(
@@ -3207,6 +3516,11 @@ class AgentEngine:
             result_payload = self._compact_tool_result(ctc.name, ctc.arguments, result)
             result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
             messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
+            self._persist_message(
+                self._current_session_id, "tool", result_text,
+                tool_name=ctc.name, tool_call_id=str(ctc.id),
+                metadata=self._tool_execution_metadata(result),
+            )
             executed.append({
                 "id": ctc.id,
                 "name": ctc.name,
@@ -3214,13 +3528,113 @@ class AgentEngine:
                 "arguments": ctc.arguments,
                 "result": result,
             })
-            if isinstance(result, dict) and _is_permission_hard_stop_payload(result):
+            if isinstance(result, dict) and _should_stop_after_tool_result(ctc.name, result):
+                for skipped_ctc in sequential[i + 1:]:
+                    skipped_original = original_names_by_id.get(str(skipped_ctc.id), skipped_ctc.name)
+                    executed.append({
+                        "id": skipped_ctc.id,
+                        "name": skipped_ctc.name,
+                        "original_tool_name": skipped_original,
+                        "arguments": skipped_ctc.arguments,
+                        "result": _skipped_after_failure_result(ctc.name, result),
+                    })
                 logger.info(
-                    "tool_concurrency: stopping sequential native tool calls after permission blocker from %s",
+                    "tool_concurrency: stopping sequential native tool calls after failed side effect from %s",
                     ctc.name,
                 )
                 break
         return executed
+
+    async def _execute_tool_with_ledger(
+        self,
+        tool_call: Dict[str, Any],
+        handlers: Dict[str, Any],
+        *,
+        tool_call_id: str = "",
+    ) -> Dict[str, Any]:
+        """Execute a tool through the unified idempotency ledger."""
+        original_name = str(tool_call.get("original_tool_name") or tool_call.get("name", ""))
+        proposed_name = str(tool_call.get("name", ""))
+        args = dict(tool_call.get("arguments") or {})
+        registry = _default_tool_registry()
+        resolution = registry.resolve(proposed_name, args)
+        if not resolution.auto_executable or resolution.normalized_name is None:
+            return await self._execute_general_tool(tool_call, handlers)
+
+        tool_name = resolution.normalized_name
+        spec = registry.specs.get(tool_name)
+        policy = execution_policy_for(tool_name, spec)
+        session_id = self._current_session_id or "ephemeral"
+        turn_id = self._current_turn_id or f"turn-{self._session_turn_count}"
+        command_id = self._current_command_id or turn_id
+        normalized_call = {
+            **tool_call,
+            "name": tool_name,
+            "arguments": args,
+            "original_tool_name": original_name,
+            "normalized_tool_name": tool_name,
+        }
+        record, existing = self._tool_execution_ledger.reserve(
+            session_id=session_id,
+            turn_id=turn_id,
+            command_id=command_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            arguments=args,
+            policy=policy,
+        )
+        if existing is not None:
+            if existing.status == "running":
+                existing = await self._tool_execution_ledger.wait_for_completion(
+                    existing,
+                    timeout_s=self._tool_timeouts.get(tool_name, self._default_tool_timeout_s),
+                )
+            duplicate = ToolExecutionLedger.duplicate_result(existing)
+            duplicate.update({
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "execution_policy": existing.policy,
+            })
+            logger.info(
+                "tool_idempotency: skipped duplicate tool=%s policy=%s key=%s",
+                tool_name, existing.policy, existing.idempotency_key[:12],
+            )
+            return duplicate
+
+        try:
+            result = await self._execute_general_tool(normalized_call, handlers)
+        except Exception as exc:
+            failed_result: Dict[str, Any] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "retryable": True,
+                "execution_id": record.execution_id,
+                "idempotency_key": record.idempotency_key,
+                "execution_policy": policy,
+                "tool_call_id": tool_call_id,
+            }
+            self._tool_execution_ledger.complete(record, failed_result)
+            raise
+        if isinstance(result, dict):
+            result_for_ledger: Dict[str, Any] = {
+                **result,
+                "execution_id": record.execution_id,
+                "idempotency_key": record.idempotency_key,
+                "execution_policy": policy,
+                "tool_call_id": tool_call_id,
+            }
+        else:
+            result_for_ledger = {
+                "ok": True,
+                "result": result,
+                "execution_id": record.execution_id,
+                "idempotency_key": record.idempotency_key,
+                "execution_policy": policy,
+                "tool_call_id": tool_call_id,
+            }
+        completed = self._tool_execution_ledger.complete(record, result_for_ledger)
+        result_for_ledger["execution_status"] = completed.status
+        return result_for_ledger
 
     async def _execute_general_tool(
         self, tool_call: Dict[str, Any], handlers: Dict[str, Any]
@@ -3422,10 +3836,28 @@ class AgentEngine:
             logger.debug("session.ensure failed", exc_info=True)
             return None
 
+    @staticmethod
+    def _tool_execution_metadata(result: Any) -> Dict[str, Any]:
+        """Extract tool execution audit metadata for transcript rows."""
+        if not isinstance(result, dict):
+            return {}
+        metadata: Dict[str, Any] = {}
+        for key in (
+            "execution_id", "idempotency_key", "execution_status", "execution_policy",
+            "already_executed", "duplicate_suppressed", "execution_reused", "execution_skipped",
+            "counts_as_failure", "counts_as_tool_attempt", "ui_hidden", "skipped_reason",
+            "blocked_by_tool", "blocked_by_error", "tool_call_id",
+        ):
+            if key in result:
+                metadata[key] = result[key]
+        return metadata
+
     def _persist_message(
         self, session_id: Optional[str], role: str, content: str,
         *, tool_name: Optional[str] = None,
+        tool_call_id: Optional[str] = None,
         tool_calls: Optional[list] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Persist a message to conversation store (fire-and-forget)."""
         if not session_id or not self._conversation_store:
@@ -3433,7 +3865,8 @@ class AgentEngine:
         try:
             self._conversation_store.append_message(
                 session_id, role, content[:8000],
-                tool_name=tool_name, tool_calls=tool_calls,
+                tool_name=tool_name, tool_call_id=tool_call_id,
+                tool_calls=tool_calls, metadata=metadata,
             )
         except Exception:
             logger.debug("session.persist_message failed", exc_info=True)
@@ -3532,9 +3965,12 @@ class AgentEngine:
                 continue
             try:
                 parsed = json.loads(content)
-                if isinstance(parsed, dict) and parsed.get("ok") is False:
-                    count += 1
-                    continue
+                if isinstance(parsed, dict):
+                    if _tool_result_counts_as_failure(parsed):
+                        count += 1
+                        continue
+                    if parsed.get("counts_as_failure") is False or _tool_result_is_control_signal(parsed):
+                        continue
             except (json.JSONDecodeError, ValueError):
                 pass
             # Non-JSON or ok!=False — treat as success, reset
@@ -4059,7 +4495,9 @@ class AgentEngine:
         if a_type == "tool":
             from leapflow.tools.registry_bootstrap import TOOL_HANDLERS
             tool_call_dict = {"name": name, "arguments": payload}
-            result = await self._execute_general_tool(tool_call_dict, TOOL_HANDLERS)
+            result = await self._execute_tool_with_ledger(
+                tool_call_dict, TOOL_HANDLERS, tool_call_id=f"action-{name}",
+            )
             logger.info("audit.tool name=%s ok=%s", name, result.get("ok"))
             return result
 
