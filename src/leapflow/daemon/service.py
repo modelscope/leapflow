@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -18,6 +20,11 @@ from leapflow.engine import StreamEvent
 from leapflow.memory.protocol import MemoryEntry, MemoryQuery
 
 logger = logging.getLogger(__name__)
+
+_MAX_SESSION_ARTIFACTS = 5
+_MAX_SESSION_ARTIFACT_CHARS = 6000
+_MAX_SESSION_ARTIFACT_TOTAL_CHARS = 16000
+_PATH_RE = re.compile(r'(?P<key>path|file_path)["\'=:\s]+(?P<value>[^"\'\n|]+)')
 
 
 class RuntimeLeapService:
@@ -297,8 +304,9 @@ class RuntimeLeapService:
     async def session_history(self, limit: int = 200) -> dict[str, Any]:
         ctx = self._ctx
         if ctx is None:
-            return {"session_id": "", "turn_count": 0, "token_count": 0, "messages": []}
+            return {"session_id": "", "turn_count": 0, "token_count": 0, "messages": [], "artifacts": []}
         engine = getattr(ctx, "engine", None)
+        session_id = getattr(engine, "_current_session_id", "") if engine else ""
         messages: list[dict[str, Any]] = []
         if engine is not None:
             wm = getattr(engine, "_wm", None)
@@ -307,26 +315,170 @@ class RuntimeLeapService:
                     messages = [dict(m) for m in wm.as_chat_messages() if isinstance(m, dict)]
                 except Exception:
                     messages = []
-        if not messages:
-            store = getattr(ctx, "_conversation_store", None)
-            session_id = getattr(engine, "_current_session_id", "") if engine else ""
-            if store is not None and session_id:
-                try:
-                    messages = [
-                        dict(m) for m in store.get_messages(session_id, limit=int(limit))
-                        if isinstance(m, dict)
-                    ]
-                except Exception:
-                    messages = []
+        store_messages = self._session_store_messages(session_id, limit=int(limit))
+        if store_messages:
+            if not messages:
+                messages = store_messages
+            else:
+                messages.extend(m for m in store_messages if m.get("role") == "tool")
         normalized = [
-            {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
+            {
+                "role": str(m.get("role", "")),
+                "content": str(m.get("content", "")),
+                "tool_name": str(m.get("tool_name", "") or ""),
+                "created_at": float(m.get("created_at", 0.0) or 0.0),
+            }
             for m in messages
         ][-int(limit):]
+        artifacts = self._collect_session_artifacts(session_id, store_messages or normalized)
         return {
-            "session_id": getattr(engine, "_current_session_id", "") if engine else "",
+            "session_id": session_id,
             "turn_count": int(getattr(engine, "turn_count", 0)) if engine else 0,
             "token_count": int(getattr(engine, "context_token_count", 0)) if engine else 0,
             "messages": normalized,
+            "artifacts": artifacts,
+        }
+
+    def _session_store_messages(self, session_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        ctx = self._ctx
+        store = getattr(ctx, "_conversation_store", None) if ctx is not None else None
+        if store is None or not session_id:
+            return []
+        try:
+            rows = store.get_messages(session_id, limit=int(limit))
+        except Exception:
+            logger.debug("daemon: session store messages unavailable", exc_info=True)
+            return []
+        return [self._conversation_message_to_dict(row) for row in rows]
+
+    @staticmethod
+    def _conversation_message_to_dict(message: Any) -> dict[str, Any]:
+        if isinstance(message, dict):
+            return dict(message)
+        return {
+            "role": str(getattr(message, "role", "")),
+            "content": str(getattr(message, "content", "")),
+            "tool_name": str(getattr(message, "tool_name", "") or ""),
+            "tool_call_id": str(getattr(message, "tool_call_id", "") or ""),
+            "created_at": float(getattr(message, "created_at", 0.0) or 0.0),
+            "metadata": dict(getattr(message, "metadata", {}) or {}),
+        }
+
+    def _collect_session_artifacts(self, session_id: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not session_id:
+            return []
+        workspace = self._workspace_root()
+        candidates: list[tuple[str, dict[str, Any]]] = []
+        for message in messages:
+            if str(message.get("role", "")) != "tool":
+                continue
+            tool_name = str(message.get("tool_name", "") or "")
+            if tool_name and tool_name not in {"file_write", "write_file"}:
+                continue
+            for path in self._extract_artifact_paths(message):
+                candidates.append((path, message))
+        seen: set[str] = set()
+        artifacts: list[dict[str, Any]] = []
+        total_chars = 0
+        for raw_path, message in reversed(candidates):
+            if len(artifacts) >= _MAX_SESSION_ARTIFACTS:
+                break
+            artifact = self._read_session_artifact(raw_path, workspace, message)
+            key = str(artifact.get("path") or raw_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            if artifact.get("status") == "included":
+                content = str(artifact.get("content_excerpt", ""))
+                remaining = max(0, _MAX_SESSION_ARTIFACT_TOTAL_CHARS - total_chars)
+                if len(content) > remaining:
+                    artifact["content_excerpt"] = content[:remaining]
+                    artifact["truncated"] = True
+                    artifact["reason"] = "artifact context budget reached"
+                total_chars += len(str(artifact.get("content_excerpt", "")))
+            artifacts.append(artifact)
+        artifacts.reverse()
+        return artifacts
+
+    @staticmethod
+    def _extract_artifact_paths(message: dict[str, Any]) -> list[str]:
+        paths: list[str] = []
+        payloads = [message.get("content", ""), message.get("metadata", {})]
+        for payload in payloads:
+            if isinstance(payload, dict):
+                for key in ("path", "file_path"):
+                    if payload.get(key):
+                        paths.append(str(payload[key]))
+                continue
+            text = str(payload or "")
+            try:
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    for key in ("path", "file_path"):
+                        if data.get(key):
+                            paths.append(str(data[key]))
+            except Exception:
+                pass
+            for match in _PATH_RE.finditer(text):
+                value = match.group("value").strip().strip(",}")
+                if value:
+                    paths.append(value)
+        return paths
+
+    def _workspace_root(self) -> Path:
+        ctx = self._ctx
+        settings = getattr(ctx, "settings", self._settings) if ctx is not None else self._settings
+        return Path(str(getattr(settings, "workspace_root", os.getcwd()))).expanduser().resolve()
+
+    def _read_session_artifact(self, raw_path: str, workspace: Path, message: dict[str, Any]) -> dict[str, Any]:
+        target = Path(raw_path).expanduser()
+        if not target.is_absolute():
+            target = workspace / target
+        try:
+            target = target.resolve()
+        except OSError:
+            target = target.absolute()
+        base = {
+            "path": str(target),
+            "name": target.name,
+            "source": "file_write",
+            "tool_call_id": str(message.get("tool_call_id", "") or ""),
+            "status": "skipped",
+        }
+        try:
+            target.relative_to(workspace)
+        except ValueError:
+            return {**base, "reason": "outside workspace boundary"}
+        try:
+            from leapflow.security.path_sensitivity import classify_path_sensitivity
+            sensitivity = classify_path_sensitivity(target)
+        except Exception:
+            sensitivity = None
+        if sensitivity is not None:
+            base.update({"sensitivity": sensitivity.category, "sensitivity_level": sensitivity.level})
+            if not sensitivity.readable or sensitivity.requires_approval or sensitivity.redact_on_read:
+                return {**base, "reason": f"sensitive path ({sensitivity.category}) not read in background"}
+        if not target.exists() or not target.is_file():
+            return {**base, "reason": "file no longer exists"}
+        try:
+            stat = target.stat()
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return {**base, "reason": f"read failed: {exc}"}
+        truncated = len(content) > _MAX_SESSION_ARTIFACT_CHARS
+        excerpt = content[:_MAX_SESSION_ARTIFACT_CHARS]
+        try:
+            from leapflow.security.redact import redact_sensitive_text
+            excerpt = redact_sensitive_text(excerpt, file_read=bool(getattr(sensitivity, "redact_on_read", False)))
+        except Exception:
+            pass
+        return {
+            **base,
+            "status": "included",
+            "size": int(stat.st_size),
+            "mtime": float(stat.st_mtime),
+            "content_excerpt": excerpt,
+            "truncated": truncated,
         }
 
     async def session_analyze(self) -> dict[str, Any]:
@@ -343,7 +495,12 @@ class RuntimeLeapService:
         settings = getattr(self._ctx, "settings", self._settings)
         return await ensure_session_watch(monitors, params=session_watch_params(settings))
 
-    async def _analyze_session_llm(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    async def _analyze_session_llm(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        artifacts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         base: dict[str, Any] = {
             "story": "", "insights": [], "decisions": [], "action_items": [],
             "open_questions": [], "entities": [], "next_prompts": [], "usage": {},
@@ -355,9 +512,11 @@ class RuntimeLeapService:
         transcript = "\n".join(
             f"{m.get('role', '')}: {str(m.get('content', ''))[:500]}" for m in messages[-40:]
         )[:12000]
+        artifact_block = self._format_artifact_context(artifacts or [])
+        user_content = transcript if not artifact_block else f"{transcript}\n\n## Session file artifacts\n{artifact_block}"
         prompt = [
             {"role": "system", "content": _SESSION_ANALYSIS_SYSTEM},
-            {"role": "user", "content": transcript},
+            {"role": "user", "content": user_content[:18000]},
         ]
         try:
             response = await llm.achat(prompt, stream=False)
@@ -370,6 +529,20 @@ class RuntimeLeapService:
                 if key != "usage" and key in data:
                     base[key] = data[key]
         return base
+
+    @staticmethod
+    def _format_artifact_context(artifacts: list[dict[str, Any]]) -> str:
+        lines: list[str] = []
+        for artifact in artifacts:
+            status = str(artifact.get("status", ""))
+            path = str(artifact.get("path", ""))
+            if status != "included":
+                lines.append(f"- SKIPPED {path}: {artifact.get('reason', 'not included')}")
+                continue
+            excerpt = str(artifact.get("content_excerpt", ""))[:_MAX_SESSION_ARTIFACT_CHARS]
+            truncated = " (truncated)" if artifact.get("truncated") else ""
+            lines.append(f"- FILE {path}{truncated}\n```text\n{excerpt}\n```")
+        return "\n".join(lines)
 
     async def _session_should_refresh(self, messages: list[dict[str, Any]]) -> bool:
         ctx = self._ctx
@@ -926,8 +1099,10 @@ _SESSION_ANALYSIS_SYSTEM = (
     "JSON only, with keys: story (string narrative of the session arc), insights "
     "(array of {title, summary, severity in [info,notable,alert]}), decisions "
     "(array of strings), action_items (array of strings), open_questions (array of "
-    "strings), entities (array of strings), next_prompts (array of strings). Do not "
-    "wrap the JSON in prose or code fences."
+    "strings), entities (array of strings), next_prompts (array of strings). If a "
+    "Session file artifacts section is present, incorporate the artifact contents "
+    "as first-class evidence and mention generated files when they materially "
+    "change the analysis. Do not wrap the JSON in prose or code fences."
 )
 
 _SESSION_SALIENCE_SYSTEM = (
@@ -967,9 +1142,13 @@ class _ProducerServices:
         return await self._service.session_history()
 
     async def analyze_session(
-        self, messages: list[dict[str, Any]], *, prior: dict[str, Any] | None = None
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        prior: dict[str, Any] | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        return await self._service._analyze_session_llm(messages)
+        return await self._service._analyze_session_llm(messages, artifacts=artifacts)
 
     async def should_refresh(self, messages: list[dict[str, Any]]) -> bool:
         return await self._service._session_should_refresh(messages)

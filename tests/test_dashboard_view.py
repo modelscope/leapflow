@@ -100,13 +100,15 @@ async def test_builder_watch_scopes_to_target() -> None:
 
 async def test_builder_session_uses_analysis_payload() -> None:
     provider = _FakeProvider(
-        watches=[],
+        watches=[{"watch_id": "s", "domain": "session", "state": "armed", "last_run_at": 10.0, "next_due_at": 20.0, "run_count": 2}],
         findings=[
             {"finding_id": "s1", "watch_id": "s", "domain": "session", "title": "analysis",
              "severity": "notable", "payload": {
                  "story": "the arc",
                  "insights": [{"title": "i", "summary": "s", "severity": "notable"}],
                  "next_prompts": ["p"],
+                 "observation_status": {"refresh_reason": "artifact_changed", "context_coverage_pct": 90},
+                 "artifact_context": [{"name": "report.md", "status": "included"}],
              }},
             {"finding_id": "x1", "watch_id": "w", "domain": "finance", "title": "noise", "severity": "info"},
         ],
@@ -127,6 +129,7 @@ async def test_builder_session_uses_analysis_payload() -> None:
     assert "StoryPanel" in types
     assert "BarChart" in types
     assert "EntityGraph" in types
+    assert "Table" in types
     assert len([n for n in flat if n["type"] == "InsightCard"]) == 1  # from analysis payload
 
 

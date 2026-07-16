@@ -530,7 +530,7 @@ Watch (leapd-hosted) ── observe → SNR filter → score → Finding ──�
 ```
 
 - **Continuous observation** — a board starts as a `Watch` in `leapd`. Scheduler triggers, manual `/board refresh`, and session-analysis batch thresholds all run the same observe→finding cycle; new findings are persisted, severity-gated, and pushed to browsers over WebSocket.
-- **Refresh model** — overview boards refresh when watch state or new findings arrive; session boards refresh as the conversation accumulates turns (and can optionally use model salience). Muted watches still persist findings but stop pushing notifications; paused/stopped watches stop observing.
+- **Refresh model** — overview boards refresh when watch state or new findings arrive; session boards refresh as the conversation accumulates turns, when written workspace artifacts change, or when manual/model-salience triggers fire. Muted watches still persist findings but stop pushing notifications; paused/stopped watches stop observing.
 - **Server-Driven UI** — each scenario is authored as a **YAML template** compiled into a validated **ViewSpec** over a fixed component catalog (cards, tables, charts, timelines, gauges, story panels…). Interactive components talk back through a bidirectional action protocol; unknown component types degrade gracefully, and bespoke visuals use a `Custom` escape hatch. The board never renders arbitrary HTML/JS.
 - **View client** — the board connects to `leapd` like the TUI does, with no privileged coupling. The web server is optional (`aiohttp`) and degrades with a clear install hint when absent.
 
@@ -580,6 +580,8 @@ Executing any entry auto-launches your default browser at the token-scoped local
 /board stop <id>           end the watch and remove it from active refresh
 ```
 
+**Session context coverage** — `/board session` watches more than chat text. It also scans current-session `file_write` tool results and, when the path is inside the workspace and safe to read without approval, includes a capped/redacted file excerpt in the analysis. The board's **Observation status** panel shows refresh reason, coverage, observed targets, included/skipped file artifacts, and missing context notes. Skipped artifacts usually mean the file is outside the workspace, no longer exists, or is sensitive enough that background reads are intentionally blocked.
+
 **Natural language** — just ask ("open a finance board", "analyze this conversation"); the agent opens or creates boards for you when the runtime can safely map the request to a board intent.
 
 ### Showcase
@@ -587,7 +589,7 @@ Executing any entry auto-launches your default browser at the token-scoped local
 - **Financial market watch** — monitor a symbol or source on an interval/condition; the board emphasizes price/action charts, severity mix, signal momentum, and capped evidence cards.
 - **Public-opinion (sentiment) watch** — track a brand or topic; sentiment direction, distribution, timeline, and representative mentions are shown as an analyst-style narrative pulse.
 - **Paper hunting** — watch arXiv / venues / authors / keywords; new papers flow through a research-pipeline layout with source links and clipped abstracts.
-- **Session analysis (built-in)** — after a few conversation turns, `/board session` opens a board that reads the transcript and renders a storyline, insights, decisions, action items, open questions, an entity map, and suggested next prompts — refreshing automatically as the conversation grows (batch threshold, optional model salience, or manual `/board refresh`).
+- **Session analysis (built-in)** — after a few conversation turns, `/board session` opens a board that reads the transcript plus safe workspace file artifacts written during the session, then renders a storyline, insights, decisions, action items, open questions, an entity map, artifact coverage, and suggested next prompts — refreshing automatically as the conversation grows or artifacts change (batch threshold, optional model salience, or manual `/board refresh`).
 
 > Adding a new scenario = one YAML template (plus an optional renderer) and a producer. The board core stays untouched — no domain branching, no hardcoded layouts.
 

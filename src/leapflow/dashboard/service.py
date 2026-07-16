@@ -96,15 +96,29 @@ class DashboardViewBuilder:
         return self._templates.render(name, data)
 
     async def _build_session(self, intent: DashboardIntent, provider: DashboardDataProvider) -> dict[str, Any]:
-        # The session watch (P3) emits an insight finding whose payload carries
-        # the structured analysis. Until it exists this renders gracefully empty.
+        # The session watch emits an insight finding whose payload carries the
+        # structured analysis plus observation transparency metadata.
+        watches = await provider.watches()
+        session_watch = next((w for w in watches if str(w.get("domain")) == "session"), {})
         findings = await provider.findings(watch_id="", limit=50)
         session_findings = [f for f in findings if str(f.get("domain")) == "session"]
         analysis = session_findings[0].get("payload") if session_findings else {}
+        observation = dict((analysis or {}).get("observation_status") or {})
+        if session_watch:
+            observation.update({
+                "watch_state": session_watch.get("state", ""),
+                "watch_muted": session_watch.get("muted", False),
+                "last_run_at": session_watch.get("last_run_at", 0),
+                "next_due_at": session_watch.get("next_due_at", 0),
+                "run_count": session_watch.get("run_count", 0),
+            })
         data = {
             "title": "Session Analysis",
             "analysis": analysis or {},
+            "observation": observation,
+            "artifact_context": (analysis or {}).get("artifact_context") or [],
             "findings": session_findings,
+            "watch": session_watch,
         }
         name = select_template("session", intent.template, self._templates.names())
         return self._templates.render(name, data)

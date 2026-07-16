@@ -46,11 +46,10 @@ from leapflow.engine.prompt_cache import CacheStrategy
 from leapflow.engine.stale_stream import StaleStreamError, stale_guarded_stream, build_continuation_prompt
 from leapflow.engine.turn_recovery import TurnRecoveryState
 from leapflow.engine.turn_usage import TurnUsageTracker
-from leapflow.engine.recovery_coordinator import RecoveryCoordinator, RecoveryState
+from leapflow.engine.recovery_coordinator import RecoveryCoordinator
 from leapflow.engine.recovery_budget import RecoveryBudget
 from leapflow.engine.unified_classifier import UnifiedErrorClassifier
-from leapflow.engine.failure_envelope import FailureEnvelope, FailureSource, Recoverability
-from leapflow.engine.recovery_decision import RecoveryAction
+from leapflow.engine.recovery_decision import RecoveryAction, RecoveryDecision
 from leapflow.engine.recovery_strategies import default_strategies
 from leapflow.engine.recovery_audit import JsonlAuditSink, create_audit_entry
 from leapflow.engine.recovery_checkpoint import RecoveryCheckpoint, InMemoryCheckpointStore
@@ -2323,7 +2322,6 @@ class AgentEngine:
             except Exception as exc:
                 _clear_indicator()
                 classified = self._error_classifier.classify(exc)
-                rec = self._error_classifier.get_recovery(classified)
                 category_str = classified.value if hasattr(classified, 'value') else str(classified)
                 recovery.record_api_error(category_str)
 
@@ -2835,8 +2833,6 @@ class AgentEngine:
                         self._record_provider_usage(resp.model or '', usage)
                 except Exception as exc:
                     _clear_indicator()
-                    classified = self._error_classifier.classify(exc)
-                    rec = self._error_classifier.get_recovery(classified)
                     turn_recovery.record_api_error()
 
                     # Classify through unified coordinator
@@ -3028,8 +3024,6 @@ class AgentEngine:
                         break
                     except Exception as exc:
                         _clear_indicator()
-                        classified = self._error_classifier.classify(exc)
-                        rec = self._error_classifier.get_recovery(classified)
                         turn_recovery.record_api_error()
                         # Classify through unified coordinator
                         envelope = self._unified_classifier.classify_llm_error(
@@ -3089,8 +3083,6 @@ class AgentEngine:
                             self._last_context_tokens = provider_prompt
                     except Exception as exc:
                         _clear_indicator()
-                        classified = self._error_classifier.classify(exc)
-                        rec = self._error_classifier.get_recovery(classified)
                         turn_recovery.record_api_error()
                         # Classify through unified coordinator
                         envelope = self._unified_classifier.classify_llm_error(
@@ -3846,7 +3838,8 @@ class AgentEngine:
             "execution_id", "idempotency_key", "execution_status", "execution_policy",
             "already_executed", "duplicate_suppressed", "execution_reused", "execution_skipped",
             "counts_as_failure", "counts_as_tool_attempt", "ui_hidden", "skipped_reason",
-            "blocked_by_tool", "blocked_by_error", "tool_call_id",
+            "blocked_by_tool", "blocked_by_error", "tool_call_id", "path", "file_path",
+            "bytes_written",
         ):
             if key in result:
                 metadata[key] = result[key]

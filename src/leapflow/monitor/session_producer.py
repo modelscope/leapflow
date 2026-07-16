@@ -40,9 +40,13 @@ class SessionAnalysisServices(Protocol):
         ...
 
     async def analyze_session(
-        self, messages: list[dict[str, Any]], *, prior: dict[str, Any] | None = None
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        prior: dict[str, Any] | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Return a structured analysis payload for the transcript."""
+        """Return a structured analysis payload for the transcript and artifacts."""
         ...
 
     async def should_refresh(self, messages: list[dict[str, Any]]) -> bool:
@@ -55,12 +59,98 @@ def _first_line(text: str, limit: int = 180) -> str:
     return line if len(line) <= limit else line[: limit - 1] + "\u2026"
 
 
+def _artifact_fingerprint(artifacts: list[dict[str, Any]]) -> str:
+    """Return a stable fingerprint for artifact state changes."""
+    parts: list[str] = []
+    for artifact in artifacts:
+        path = str(artifact.get("path", ""))
+        mtime = str(artifact.get("mtime", ""))
+        size = str(artifact.get("size", ""))
+        status = str(artifact.get("status", ""))
+        parts.append(f"{path}:{mtime}:{size}:{status}")
+    return "|".join(sorted(parts))
+
+
+def _refresh_reason(
+    *,
+    force: bool,
+    first: bool,
+    artifact_changed: bool,
+    turn_delta: int,
+    token_delta: int,
+    batch_turns: int,
+    batch_tokens: int,
+) -> str:
+    if force:
+        return "manual_refresh"
+    if first:
+        return "first_observation"
+    if artifact_changed:
+        return "artifact_changed"
+    if turn_delta >= batch_turns:
+        return "batch_turns"
+    if token_delta >= batch_tokens:
+        return "batch_tokens"
+    return "model_salience"
+
+
+def _observation_status(
+    *,
+    artifacts: list[dict[str, Any]],
+    reason: str,
+    now: float,
+    turn_count: int,
+    token_count: int,
+    batch_turns: int,
+    batch_tokens: int,
+    last_turn: int,
+) -> dict[str, Any]:
+    included = [a for a in artifacts if a.get("status") == "included"]
+    skipped = [a for a in artifacts if a.get("status") == "skipped"]
+    observed_targets = ["conversation transcript", "tool results"]
+    if artifacts:
+        observed_targets.append("file artifacts")
+    missing_items: list[str] = []
+    if not artifacts:
+        missing_items.append("No file-write artifacts detected in the current session yet.")
+    for artifact in skipped[:5]:
+        label = artifact.get("path") or artifact.get("name") or "artifact"
+        missing_items.append(f"{label}: {artifact.get('reason', 'not included')}")
+    coverage = 0.7
+    if included:
+        coverage += 0.2
+    if artifacts and not skipped:
+        coverage += 0.1
+    if skipped:
+        coverage -= min(0.3, len(skipped) * 0.08)
+    coverage = max(0.1, min(1.0, coverage))
+    return {
+        "state": "watching",
+        "refresh_reason": reason,
+        "last_refresh_at": now,
+        "observed_targets": observed_targets,
+        "context_coverage_pct": round(coverage * 100),
+        "missing_items": missing_items,
+        "artifact_count": len(artifacts),
+        "artifacts_included": len(included),
+        "artifacts_skipped": len(skipped),
+        "next_threshold": {
+            "turns": batch_turns,
+            "tokens": batch_tokens,
+            "turns_since_last": max(0, turn_count - max(last_turn, 0)),
+            "current_turns": turn_count,
+            "current_tokens": token_count,
+        },
+    }
+
+
 class SessionAnalysisProducer:
     """Produce session-analysis findings from the live conversation transcript."""
 
     def __init__(self) -> None:
         self._last_turn: dict[str, int] = {}
         self._last_tokens: dict[str, int] = {}
+        self._last_artifact_fingerprint: dict[str, str] = {}
         self._last_run_at: dict[str, float] = {}
         self._recent_runs: dict[str, list[float]] = {}
 
@@ -89,12 +179,15 @@ class SessionAnalysisProducer:
         token_count = int(history.get("token_count", 0) or 0)
         session_id = str(history.get("session_id", "") or "")
         messages = list(history.get("messages") or [])
+        artifacts = list(history.get("artifacts") or [])
+        artifact_fingerprint = _artifact_fingerprint(artifacts)
 
         last_turn = self._last_turn.get(watch_id, -1)
         first = last_turn < 0
+        artifact_changed = bool(artifact_fingerprint and artifact_fingerprint != self._last_artifact_fingerprint.get(watch_id, ""))
 
-        if not ctx.force and not first and turn_count <= last_turn:
-            return []  # no new turns since last analysis
+        if not ctx.force and not first and turn_count <= last_turn and not artifact_changed:
+            return []  # no new turns or artifacts since last analysis
 
         if not ctx.force and not first:
             if (ctx.now - self._last_run_at.get(watch_id, 0.0)) < debounce_s:
@@ -106,6 +199,7 @@ class SessionAnalysisProducer:
         should = (
             ctx.force
             or first
+            or artifact_changed
             or (turn_count - last_turn >= batch_turns)
             or (token_count - self._last_tokens.get(watch_id, 0) >= batch_tokens)
         )
@@ -117,7 +211,18 @@ class SessionAnalysisProducer:
         if not should:
             return []
 
+        reason = _refresh_reason(
+            force=ctx.force,
+            first=first,
+            artifact_changed=artifact_changed,
+            turn_delta=turn_count - last_turn,
+            token_delta=token_count - self._last_tokens.get(watch_id, 0),
+            batch_turns=batch_turns,
+            batch_tokens=batch_tokens,
+        )
         try:
+            analysis = dict(await services.analyze_session(messages, artifacts=artifacts))
+        except TypeError:
             analysis = dict(await services.analyze_session(messages))
         except Exception as exc:  # noqa: BLE001 - surface as no-op, not crash
             logger.debug("session producer: analysis failed: %s", exc)
@@ -125,11 +230,23 @@ class SessionAnalysisProducer:
 
         self._last_turn[watch_id] = turn_count
         self._last_tokens[watch_id] = token_count
+        self._last_artifact_fingerprint[watch_id] = artifact_fingerprint
         self._last_run_at[watch_id] = ctx.now
         self._recent_runs.setdefault(watch_id, []).append(ctx.now)
 
         analysis.setdefault("usage", {})
         analysis["usage"].update({"turns": turn_count, "tokens": token_count})
+        analysis["artifact_context"] = artifacts
+        analysis["observation_status"] = _observation_status(
+            artifacts=artifacts,
+            reason=reason,
+            now=ctx.now,
+            turn_count=turn_count,
+            token_count=token_count,
+            batch_turns=batch_turns,
+            batch_tokens=batch_tokens,
+            last_turn=last_turn,
+        )
         story = str(analysis.get("story") or "")
         summary = _first_line(story) if story else f"{turn_count} turns analyzed"
         return [

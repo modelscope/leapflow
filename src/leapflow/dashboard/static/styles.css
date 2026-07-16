@@ -92,6 +92,8 @@ body {
 .timeline-item.sev-alert::before { background: var(--alert); }
 .timeline-item.sev-notable::before { background: var(--notable); }
 .timeline-title { font-weight: 650; }
+.progress { height: 10px; background: #222735; border-radius: 999px; overflow: hidden; margin-top: 10px; }
+.progress-fill { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
 .data-table { font-size: 13px; }
 .quote { margin: 0; padding: 10px 14px; border-left: 3px solid var(--accent); color: var(--text); background: rgba(143,164,199,.08); }
 .quote cite { display: block; color: var(--muted); margin-top: 6px; font-size: 12px; }

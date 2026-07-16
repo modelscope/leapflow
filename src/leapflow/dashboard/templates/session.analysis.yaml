@@ -12,6 +12,58 @@ layout:
     children:
       - type: Section
         props:
+          title: "Observation status"
+          subtitle: "LeapBoard continuously watches the transcript, tool results, and workspace file artifacts. This panel explains what triggered the latest refresh and what context was included."
+        children:
+          - type: Grid
+            children:
+              - type: Card
+                props:
+                  title: "Refresh state"
+                children:
+                  - type: Row
+                    children:
+                      - type: Stat
+                        props:
+                          label: "Refresh reason"
+                          value: "{{ observation.refresh_reason }}"
+                      - type: Stat
+                        props:
+                          label: "Coverage"
+                          value: "{{ observation.context_coverage_pct }}%"
+                      - type: Stat
+                        props:
+                          label: "Artifacts"
+                          value: "{{ observation.artifacts_included }}/{{ observation.artifact_count }}"
+                  - type: ProgressBar
+                    props:
+                      value: "{{ observation.context_coverage_pct }}"
+              - type: Card
+                props:
+                  title: "Observed context"
+                children:
+                  - type: List
+                    props:
+                      bind: observation.observed_targets
+                  - type: List
+                    props:
+                      bind: observation.missing_items
+              - type: Card
+                props:
+                  title: "File artifacts"
+                children:
+                  - type: Table
+                    props:
+                      bind: artifact_context
+                      columns:
+                        - key: name
+                          label: File
+                        - key: status
+                          label: Status
+                        - key: reason
+                          label: Note
+      - type: Section
+        props:
           title: "Executive brief"
           subtitle: "Conversation intelligence rendered like an analyst memo: storyline first, then implications."
         children:

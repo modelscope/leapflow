@@ -14,6 +14,7 @@ from leapflow.daemon.service import RuntimeLeapService
 from leapflow.monitor import MonitorManager, ProducerRegistry, SessionAnalysisProducer, WatchSpec
 from leapflow.monitor.types import ProducerContext
 from leapflow.storage.connection import LocalConnectionHolder
+from leapflow.storage.conversation_store import ConversationMessage
 
 
 class _FakeServices:
@@ -26,9 +27,12 @@ class _FakeServices:
     async def session_history(self) -> dict:
         return dict(self._history)
 
-    async def analyze_session(self, messages, *, prior=None) -> dict:
+    async def analyze_session(self, messages, *, prior=None, artifacts=None) -> dict:
         self.analyze_calls += 1
-        return dict(self._analysis)
+        data = dict(self._analysis)
+        if artifacts is not None:
+            data["seen_artifacts"] = list(artifacts)
+        return data
 
     async def should_refresh(self, messages) -> bool:
         return self._salient
@@ -87,6 +91,20 @@ async def test_session_producer_force_without_new_turns() -> None:
     assert len(out) == 1 and out[0].payload["story"] == "forced"
 
 
+async def test_session_producer_artifact_change_refreshes_without_new_turns() -> None:
+    prod = SessionAnalysisProducer()
+    spec = WatchSpec(name="Session", watch_id="w-art", domain="session", params={"use_model_salience": False, "debounce_s": 0})
+    base_history = {"session_id": "s", "turn_count": 2, "token_count": 10, "messages": [{"role": "u", "content": "x"}]}
+    await prod.observe(_ctx(spec, _FakeServices({**base_history, "artifacts": []}, {"story": "initial"}), now=1.0))
+    artifact = {"path": "/workspace/report.md", "status": "included", "mtime": 2.0, "size": 12, "content_excerpt": "new report"}
+    svc = _FakeServices({**base_history, "artifacts": [artifact]}, {"story": "with artifact"})
+    out = list(await prod.observe(_ctx(spec, svc, now=2.0)))
+    assert len(out) == 1
+    assert out[0].payload["artifact_context"][0]["content_excerpt"] == "new report"
+    assert out[0].payload["observation_status"]["refresh_reason"] == "artifact_changed"
+    assert out[0].payload["observation_status"]["artifacts_included"] == 1
+
+
 async def test_session_dedup_key_is_session_scoped() -> None:
     prod = SessionAnalysisProducer()
     spec = WatchSpec(name="Session", watch_id="w", domain="session", params={"use_model_salience": False, "debounce_s": 0})
@@ -133,13 +151,39 @@ async def test_session_history_reads_engine_transcript() -> None:
             return [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
 
     engine = SimpleNamespace(_wm=_WM(), _current_session_id="sid", turn_count=2, context_token_count=42)
-    service = RuntimeLeapService(SimpleNamespace())
-    service._ctx = SimpleNamespace(engine=engine, _conversation_store=None)
+    service = RuntimeLeapService(SimpleNamespace(workspace_root="."))
+    service._ctx = SimpleNamespace(engine=engine, _conversation_store=None, settings=SimpleNamespace(workspace_root="."))
     history = await service.session_history()
     assert history["turn_count"] == 2
     assert history["token_count"] == 42
     assert history["session_id"] == "sid"
     assert [m["role"] for m in history["messages"]] == ["user", "assistant"]
+
+
+async def test_session_history_collects_file_write_artifact(tmp_path: Path) -> None:
+    artifact = tmp_path / "china_ecommerce_overseas_analysis.md"
+    artifact.write_text("# China ecommerce\n\nKey findings from the research.", encoding="utf-8")
+
+    class _Store:
+        def get_messages(self, session_id, *, limit=200):
+            assert session_id == "sid"
+            return [ConversationMessage(
+                message_id="m1",
+                session_id="sid",
+                role="tool",
+                content='{"ok": true, "path": "china_ecommerce_overseas_analysis.md", "bytes_written": 45}',
+                tool_name="file_write",
+                tool_call_id="t1",
+            )]
+
+    engine = SimpleNamespace(_wm=None, _current_session_id="sid", turn_count=1, context_token_count=10)
+    settings = SimpleNamespace(workspace_root=str(tmp_path))
+    service = RuntimeLeapService(settings)
+    service._ctx = SimpleNamespace(engine=engine, _conversation_store=_Store(), settings=settings)
+    history = await service.session_history()
+    assert history["artifacts"][0]["status"] == "included"
+    assert history["artifacts"][0]["name"] == "china_ecommerce_overseas_analysis.md"
+    assert "Key findings" in history["artifacts"][0]["content_excerpt"]
 
 
 async def test_session_history_empty_without_context() -> None:
@@ -162,7 +206,14 @@ def test_session_template_renders_analysis() -> None:
         "open_questions": [],
         "entities": ["Alice"],
         "next_prompts": ["ask z"],
-    }})
+    }, "observation": {
+        "refresh_reason": "artifact_changed",
+        "context_coverage_pct": 90,
+        "artifacts_included": 1,
+        "artifact_count": 1,
+        "observed_targets": ["conversation transcript", "file artifacts"],
+        "missing_items": [],
+    }, "artifact_context": [{"name": "report.md", "status": "included", "reason": ""}]})
     flat: list[dict] = []
 
     def _walk(nodes: list) -> None:
@@ -173,4 +224,6 @@ def test_session_template_renders_analysis() -> None:
     _walk(spec["root"])
     types = {n["type"] for n in flat}
     assert "StoryPanel" in types
+    assert "ProgressBar" in types
+    assert "Table" in types
     assert len([n for n in flat if n["type"] == "InsightCard"]) == 1
