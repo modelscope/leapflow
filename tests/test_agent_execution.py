@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from typing import List
 from unittest.mock import AsyncMock
@@ -180,6 +181,188 @@ async def test_exact_canonical_tool_names_execute_without_guessing() -> None:
             assert metadata["original_tool_name"] == "File-List"
             assert metadata["normalized_tool_name"] == "file_list"
             assert metadata["resolved_from"] == "File-List"
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_ledger_skips_duplicate_external_tool() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.platform.mock import MockBridge
+
+        rpc = MockBridge()
+        llm = StubLLM([])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        calls: list[dict[str, object]] = []
+
+        async def shell_handler(args):
+            calls.append(dict(args))
+            return {"ok": True, "stdout": "pushed"}
+
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+            engine._tool_bridge = None
+            engine._current_session_id = "session-1"
+            engine._session_turn_count = 1
+            engine._begin_turn_context("push once")
+            call = {"name": "shell_run", "arguments": {"command": "git push"}}
+
+            first = await engine._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="a")
+            second = await engine._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="b")
+
+            assert len(calls) == 1
+            assert first["ok"] is True
+            assert first["execution_policy"] == "external_side_effect"
+            assert second["already_executed"] is True
+            assert second["original_result"]["stdout"] == "pushed"
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_ledger_waits_for_inflight_duplicate_external_tool() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.platform.mock import MockBridge
+
+        rpc = MockBridge()
+        llm = StubLLM([])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[dict[str, object]] = []
+
+        async def shell_handler(args):
+            calls.append(dict(args))
+            started.set()
+            await release.wait()
+            return {"ok": True, "stdout": "pushed"}
+
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+            engine._tool_bridge = None
+            engine._current_session_id = "session-1"
+            engine._session_turn_count = 1
+            engine._begin_turn_context("push once")
+            call = {"name": "shell_run", "arguments": {"command": "git push"}}
+
+            first_task = asyncio.create_task(
+                engine._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="a")
+            )
+            await started.wait()
+            second_task = asyncio.create_task(
+                engine._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="b")
+            )
+            await asyncio.sleep(0)
+
+            assert len(calls) == 1
+            assert not second_task.done()
+
+            release.set()
+            first, second = await asyncio.gather(first_task, second_task)
+
+            assert first["ok"] is True
+            assert second["already_executed"] is True
+            assert second["ok"] is True
+            assert second["original_result"]["stdout"] == "pushed"
+            assert len(calls) == 1
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_ledger_allows_repeated_read_only_tool() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        from leapflow.platform.mock import MockBridge
+
+        rpc = MockBridge()
+        llm = StubLLM([])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        calls: list[dict[str, object]] = []
+
+        async def file_list_handler(args):
+            calls.append(dict(args))
+            return {"ok": True, "entries": []}
+
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+            engine._tool_bridge = None
+            engine._current_session_id = "session-1"
+            engine._session_turn_count = 1
+            engine._begin_turn_context("list twice")
+            call = {"name": "file_list", "arguments": {"path": "."}}
+
+            first = await engine._execute_tool_with_ledger(call, {"file_list": file_list_handler}, tool_call_id="a")
+            second = await engine._execute_tool_with_ledger(call, {"file_list": file_list_handler}, tool_call_id="b")
+
+            assert len(calls) == 2
+            assert first["execution_policy"] == "read_only"
+            assert second["execution_policy"] == "read_only"
+            assert "already_executed" not in second
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_side_effect_failure_stops_remaining_native_tool_batch() -> None:
+    from leapflow.engine.execution_trace import ExecutionTrace
+    from leapflow.llm.base import ToolCallInfo
+    from leapflow.platform.mock import MockBridge
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        rpc = MockBridge()
+        llm = StubLLM([])
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        calls: list[str] = []
+
+        async def execute_tool(tool_call, _handlers):
+            calls.append(str(tool_call.get("arguments", {}).get("command")))
+            return {"ok": False, "returncode": 1, "stderr": "cd: no such file or directory"}
+
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            classifier = _FixedClassifier("complex")
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+            engine._tool_bridge = None
+            engine._execute_general_tool = AsyncMock(side_effect=execute_tool)  # type: ignore[method-assign]
+            engine._current_session_id = "session-1"
+            engine._session_turn_count = 1
+            engine._begin_turn_context("run git commands")
+            messages: list[dict[str, object]] = []
+
+            results = await engine._execute_tools_concurrent(
+                [
+                    ToolCallInfo(id="tc1", name="shell_run", arguments={"command": "cd missing"}),
+                    ToolCallInfo(id="tc2", name="shell_run", arguments={"command": "git status"}),
+                ],
+                {"shell_run": execute_tool},
+                trace=ExecutionTrace(),
+                messages=messages,
+            )
+
+            assert calls == ["cd missing"]
+            assert len(results) == 2
+            assert results[0]["result"]["ok"] is False
+            assert results[1]["result"]["execution_skipped"] is True
+            assert results[1]["result"]["counts_as_failure"] is False
+            assert AgentEngine._count_consecutive_tool_failures(messages) == 1
         finally:
             lt.close()
 
@@ -964,36 +1147,43 @@ def test_task_graph_retry_policy() -> None:
 # ═══════════════════════════════════════════════════════════════════
 
 
-def test_platform_action_fingerprint_deduplicates_identical_calls() -> None:
-    """_platform_action_fingerprint returns the same key for identical calls."""
-    from leapflow.engine.engine import _platform_action_fingerprint
+def test_platform_action_idempotency_key_deduplicates_identical_calls() -> None:
+    """Unified idempotency keys replace the old platform_action fingerprint."""
+    from leapflow.engine.tool_execution import build_idempotency_key
 
-    fp1 = _platform_action_fingerprint(
-        "platform_action",
-        {"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_1", "text": "hi"}},
+    args = {"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_1", "text": "hi"}}
+    key1 = build_idempotency_key(
+        session_id="session-1",
+        turn_id="turn-1",
+        tool_name="platform_action",
+        arguments=args,
+        policy="external_side_effect",
     )
-    fp2 = _platform_action_fingerprint(
-        "platform_action",
-        {"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_1", "text": "hi"}},
+    key2 = build_idempotency_key(
+        session_id="session-1",
+        turn_id="turn-2",
+        tool_name="platform_action",
+        arguments=args,
+        policy="external_side_effect",
     )
-    fp_different = _platform_action_fingerprint(
-        "platform_action",
-        {"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_2", "text": "hi"}},
+    different_payload = build_idempotency_key(
+        session_id="session-1",
+        turn_id="turn-1",
+        tool_name="platform_action",
+        arguments={"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_2", "text": "hi"}},
+        policy="external_side_effect",
     )
-    fp_read = _platform_action_fingerprint(
-        "platform_action",
-        {"platform": "feishu", "action": "im.search_chats", "payload": {"query": "LeapFlow"}},
-    )
-    fp_other_tool = _platform_action_fingerprint(
-        "file_list",
-        {"path": "."},
+    other_tool = build_idempotency_key(
+        session_id="session-1",
+        turn_id="turn-1",
+        tool_name="file_list",
+        arguments={"path": "."},
+        policy="read_only",
     )
 
-    assert fp1 is not None
-    assert fp1 == fp2, "Identical calls must produce the same fingerprint"
-    assert fp1 != fp_different, "Different payload must produce a different fingerprint"
-    assert fp_read is not None, "Read platform_actions are also fingerprinted (dedup applies)"
-    assert fp_other_tool is None, "Non-platform_action tools must return None"
+    assert key1 == key2, "External side effects deduplicate across turns in the same session"
+    assert key1 != different_payload, "Different payload must produce a different idempotency key"
+    assert key1 != other_tool, "Tool name and policy participate in the key"
 
 
 def test_last_tool_failures_recovery_message_from_unknown_action() -> None:
@@ -1038,8 +1228,37 @@ def test_last_tool_failures_recovery_message_missing_fields() -> None:
     assert "text" in result
 
 
-def test_last_tool_failures_recovery_message_returns_empty_when_no_failures() -> None:
-    """Returns empty string when there are no failed tool results in history."""
+def test_duplicate_suppression_is_not_counted_as_consecutive_tool_failure() -> None:
+    """Suppressed duplicate side effects are control signals, not failed executions."""
+    import json
+    from leapflow.engine.engine import _last_tool_failures_recovery_message
+
+    root_failure = {
+        "ok": False,
+        "error": "git push rejected",
+        "stderr": "non-fast-forward",
+        "execution_policy": "external_side_effect",
+    }
+    duplicate_suppressed = {
+        "ok": False,
+        "already_executed": True,
+        "duplicate_suppressed": True,
+        "counts_as_failure": False,
+        "error": "An identical side-effect attempt is already recorded. Review the original result before retrying.",
+    }
+    messages = [
+        {"role": "tool", "content": json.dumps(root_failure)},
+        {"role": "tool", "content": json.dumps(duplicate_suppressed)},
+    ]
+
+    assert AgentEngine._count_consecutive_tool_failures(messages) == 1
+    recovery = _last_tool_failures_recovery_message(messages)
+    assert "git push rejected" in recovery
+    assert "consecutive tool failures" not in recovery
+    assert "duplicate execution was not replayed" not in recovery
+
+
+
     import json
     from leapflow.engine.engine import _last_tool_failures_recovery_message
 

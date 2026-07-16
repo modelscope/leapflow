@@ -108,6 +108,9 @@ class ToolSpec:
     parameters: frozenset[str] = field(default_factory=frozenset)
     required: frozenset[str] = field(default_factory=frozenset)
     risk_level: RiskLevel = "read_only"
+    mutates_state: bool = False
+    effect_scope: str = "local"
+    idempotency_scope: str = "turn"
 
 
 @dataclass(frozen=True)
@@ -178,8 +181,8 @@ class ToolRegistry:
             Each entry declares a human-verified 1:1 semantic equivalence.
             Keys are normalized via ``tool_lookup_key`` before storage.
         """
-        bridge_mutates = {
-            str(tool.get("name", "")).removeprefix("gp_"): bool(tool.get("mutates_state", False))
+        bridge_meta = {
+            str(tool.get("name", "")).removeprefix("gp_"): dict(tool)
             for tool in bridge_tools
         }
         specs: dict[str, ToolSpec] = {}
@@ -191,19 +194,32 @@ class ToolRegistry:
             parameters_schema = function.get("parameters", {}) or {}
             properties = parameters_schema.get("properties", {}) or {}
             required = parameters_schema.get("required", []) or []
+            metadata = function.get("x_leapflow", {}) or definition.get("x_leapflow", {}) or {}
+            bridge_tool = bridge_meta.get(name, {})
+            mutates_state = bool(bridge_tool.get("mutates_state", metadata.get("mutates_state", False)))
+            risk_level = _infer_risk_level(name, mutates_state)
             specs[name] = ToolSpec(
                 name=name,
                 description=str(function.get("description") or definition.get("description") or ""),
                 parameters=frozenset(str(key) for key in properties.keys()),
                 required=frozenset(str(key) for key in required),
-                risk_level=_infer_risk_level(name, bridge_mutates.get(name, False)),
+                risk_level=risk_level,
+                mutates_state=mutates_state,
+                effect_scope=str(metadata.get("effect_scope") or ("external" if risk_level == "external" else "local")),
+                idempotency_scope=str(metadata.get("idempotency_scope") or ("session" if risk_level == "external" else "turn")),
             )
         for name in handlers.keys():
             canonical = str(name).removeprefix("gp_")
             if canonical and canonical not in specs:
+                bridge_tool = bridge_meta.get(canonical, {})
+                mutates_state = bool(bridge_tool.get("mutates_state", False))
+                risk_level = _infer_risk_level(canonical, mutates_state)
                 specs[canonical] = ToolSpec(
                     name=canonical,
-                    risk_level=_infer_risk_level(canonical, bridge_mutates.get(canonical, False)),
+                    risk_level=risk_level,
+                    mutates_state=mutates_state,
+                    effect_scope="external" if risk_level == "external" else "local",
+                    idempotency_scope="session" if risk_level == "external" else "turn",
                 )
 
         validated_aliases: dict[str, str] = {}

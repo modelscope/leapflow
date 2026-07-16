@@ -425,12 +425,12 @@ class TestValidatePayloadStructured:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Task-scoped side-effect dedup tests
+# Direct gateway handler execution tests
 # ═══════════════════════════════════════════════════════════════
 
 @pytest.mark.asyncio
-async def test_side_effect_dedup_blocks_duplicate_send() -> None:
-    """Second identical send call returns already_executed without execution."""
+async def test_platform_action_direct_handler_does_not_deduplicate_send() -> None:
+    """Direct gateway handler calls stay stateless; engine ledger owns idempotency."""
     from leapflow.gateway.connectors.protocol import ActionPreview, ActionResult, BackendStatus
     from leapflow.gateway.adapters.feishu import FeishuAdapter
     from leapflow.gateway.server import GatewayServer
@@ -481,9 +481,8 @@ async def test_side_effect_dedup_blocks_duplicate_send() -> None:
 
         assert result1.get("ok") is True
         assert result2.get("ok") is True
-        assert result2.get("already_executed") is True
-        assert "Do not re-invoke" in result2.get("execution_note", "")
-        assert backend.call_count == 1
+        assert result2.get("already_executed") is None
+        assert backend.call_count == 2
     finally:
         await server.stop()
         set_gateway_approval_gate(None)
@@ -492,8 +491,8 @@ async def test_side_effect_dedup_blocks_duplicate_send() -> None:
 
 
 @pytest.mark.asyncio
-async def test_side_effect_dedup_allows_read_actions_to_repeat() -> None:
-    """Read actions (effect=read) are not subject to dedup."""
+async def test_platform_action_direct_handler_allows_read_actions_to_repeat() -> None:
+    """Read actions (effect=read) naturally repeat through the stateless handler."""
     from leapflow.gateway.connectors.protocol import ActionPreview, ActionResult, BackendStatus
     from leapflow.gateway.adapters.feishu import FeishuAdapter
     from leapflow.gateway.server import GatewayServer
@@ -554,8 +553,8 @@ async def test_side_effect_dedup_allows_read_actions_to_repeat() -> None:
 
 
 @pytest.mark.asyncio
-async def test_side_effect_dedup_resets_across_turns() -> None:
-    """After reset_platform_action_scope, same action can execute again."""
+async def test_reset_platform_action_scope_is_compatibility_noop() -> None:
+    """The reset hook no longer owns deduplication; direct calls still execute."""
     from leapflow.gateway.connectors.protocol import ActionPreview, ActionResult, BackendStatus
     from leapflow.gateway.adapters.feishu import FeishuAdapter
     from leapflow.gateway.server import GatewayServer

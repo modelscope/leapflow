@@ -21,22 +21,18 @@ _gateway_server_ref: Any = None
 _approval_gate: Any = None
 _pending_app_onboarding: Dict[str, Any] | None = None
 
-# Task-scoped side-effect dedup: tracks completed (platform, action, payload)
-# fingerprints within the current user turn. Reset at each engine.run() via
-# reset_platform_action_scope(). Prevents cross-turn duplicate execution of
-# send/write/execute actions regardless of LLM behavior.
-_task_completed_actions: Dict[str, Dict[str, Any]] = {}
-
+# Platform action idempotency is enforced centrally by the engine ToolExecutionLedger.
+# The reset hook remains for callers that still mark turn boundaries.
 _SIDE_EFFECT_KINDS = frozenset({"send", "write", "execute"})
 
 
 def reset_platform_action_scope() -> None:
-    """Reset the task-scoped action dedup state. Called at each turn boundary."""
-    _task_completed_actions.clear()
+    """Compatibility hook for turn boundaries; engine ledger owns deduplication."""
+    return None
 
 
 def _action_fingerprint(platform: str, action: str, payload: Mapping[str, Any]) -> str:
-    """Stable fingerprint for dedup: hash of (platform, action, sorted payload)."""
+    """Return the legacy fingerprint format for diagnostics only."""
     raw = f"{platform}:{action}:{_json.dumps(payload, sort_keys=True, ensure_ascii=False)}"
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
@@ -906,27 +902,6 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
     if not validation.ok:
         return _structured_validation_error(spec, validation, params)
 
-    # Task-scoped side-effect dedup: block re-execution of identical
-    # send/write/execute actions within the same user turn.
-    fp = _action_fingerprint(platform, action_name, payload)
-    if spec.effect in _SIDE_EFFECT_KINDS and fp in _task_completed_actions:
-        logger.info(
-            "side_effect_dedup: blocked duplicate %s.%s fp=%s",
-            platform, action_name, fp,
-        )
-        original = _task_completed_actions[fp]
-        return {
-            "ok": True,
-            "already_executed": True,
-            "execution_note": (
-                f"This exact action ({platform}.{action_name}) was already executed "
-                "successfully in this task. Do not re-invoke. Report the original "
-                "result to the user."
-            ),
-            "original_result": original,
-            "retryable": False,
-        }
-
     feasibility = _gateway_server_ref.check_platform_action_feasibility(
         platform, action_name, payload
     )
@@ -1032,13 +1007,6 @@ async def platform_action_handler(params: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": False, "error": "Platform action approval check failed"}
 
     result = await _gateway_server_ref.execute_platform_action(platform, action_name, payload)
-
-    # Register successful side-effect actions for dedup.
-    if result.get("ok") and spec.effect in _SIDE_EFFECT_KINDS:
-        _task_completed_actions[fp] = {
-            k: v for k, v in result.items()
-            if k in ("ok", "resource_id", "data", "action", "platform")
-        }
 
     return result
 

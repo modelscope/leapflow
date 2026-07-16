@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from leapflow.tools.file_operations import file_list, file_read, file_write
+from leapflow.tools.scm_tools import scm_sync
 from leapflow.tools.shell_tools import shell_run
 from leapflow.tools.system_tools import env_info, time_get
 from leapflow.tools.text_tools import text_replace, text_search
@@ -105,6 +106,45 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "timeout": {"type": "number", "description": "Timeout in seconds (default: 30, max: 120)"},
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scm_sync",
+            "description": (
+                "Run a typed git SCM action. Use this instead of shell_run for git pull/push/status. "
+                "For 'pull origin main then push', set action='pull_then_push', remote='origin', "
+                "pull_ref='main', and omit push_ref so LeapFlow pushes the current local branch."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "pull", "push", "pull_then_push"],
+                        "description": "Structured SCM action to run.",
+                    },
+                    "cwd": {"type": "string", "description": "Repository working directory (optional)."},
+                    "remote": {"type": "string", "description": "Git remote, default origin."},
+                    "pull_ref": {"type": "string", "description": "Remote ref to pull, e.g. main."},
+                    "push_ref": {
+                        "type": "string",
+                        "description": "Ref to push. Omit or use current_branch to push the current local branch.",
+                    },
+                    "timeout": {"type": "number", "description": "Timeout in seconds (default/max 120)."},
+                },
+                "required": ["action"],
+            },
+            "x_leapflow": {
+                "category": "scm",
+                "risk_level": "high",
+                "schema_cost": "high",
+                "requires_approval": True,
+                "effect_scope": "external",
+                "idempotency_scope": "session",
+                "summary": "Typed git status/pull/push with explicit current-branch push semantics.",
             },
         },
     },
@@ -332,6 +372,20 @@ _BRIDGE_TOOLS = [
             "timeout": "number (optional) — timeout in seconds (default: 30, max: 120)",
         },
         "handler": shell_run,
+        "mutates_state": True,
+    },
+    {
+        "name": "gp_scm_sync",
+        "description": "Run typed git status/pull/push actions with explicit current-branch push semantics.",
+        "parameters": {
+            "action": "string (required) — status|pull|push|pull_then_push",
+            "cwd": "string (optional) — repository working directory",
+            "remote": "string (optional) — git remote, default origin",
+            "pull_ref": "string (optional) — ref to pull, e.g. main",
+            "push_ref": "string (optional) — ref to push; default current_branch",
+            "timeout": "number (optional) — timeout in seconds (default/max 120)",
+        },
+        "handler": scm_sync,
         "mutates_state": True,
     },
     {

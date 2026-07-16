@@ -269,6 +269,8 @@ def _tool_icon(name: str, *, ok: bool = True) -> str:
 def _tool_result_detail(metadata: dict[str, Any] | None) -> str:
     if not metadata:
         return ""
+    if metadata.get("already_executed") or metadata.get("duplicate_suppressed") or metadata.get("execution_skipped"):
+        return ""
     if metadata.get("ok") is False:
         exit_code = metadata.get("exit_code")
         prefix = f"exit={exit_code} " if exit_code is not None else ""
@@ -412,6 +414,11 @@ class StreamRenderer:
         tool_name = _metadata_text(metadata, "normalized_tool_name") or name or self._active_tool
         original_tool_name = _metadata_text(metadata, "original_tool_name")
         alias_detail = original_tool_name if original_tool_name and original_tool_name != tool_name else ""
+        if tool_name and metadata.get("ui_hidden"):
+            self._active_tool = ""
+            self._active_tool_detail = ""
+            self._tool_start_time = 0.0
+            return
         if tool_name and self._tool_start_time > 0:
             duration = time.monotonic() - self._tool_start_time
             self._tool_history.append((tool_name, duration))

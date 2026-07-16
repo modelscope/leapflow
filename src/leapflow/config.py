@@ -349,6 +349,8 @@ class Settings:
     # ── Stream & Tool Robustness ──
     stale_stream_timeout_s: float = 180.0  # Idle timeout for streaming responses
     default_tool_timeout_s: float = 120.0  # Default per-tool execution timeout
+    daemon_request_ledger_ttl_s: float = 600.0  # Replay cache retention for completed engine requests
+    daemon_request_ledger_max_entries: int = 128  # Maximum completed engine requests kept for replay
     circuit_breaker_threshold: int = 5  # Consecutive failures before circuit opens
     circuit_breaker_cooldown_s: float = 60.0  # Circuit breaker cooldown period
 
@@ -756,6 +758,8 @@ def _build_settings_from_env(
     # Stream & Tool Robustness
     stale_stream_timeout_s = float(os.getenv("LEAPFLOW_STALE_STREAM_TIMEOUT_S", "180.0"))
     default_tool_timeout_s = float(os.getenv("LEAPFLOW_DEFAULT_TOOL_TIMEOUT_S", "120.0"))
+    daemon_request_ledger_ttl_s = float(os.getenv("LEAPFLOW_DAEMON_REQUEST_LEDGER_TTL_S", "600.0"))
+    daemon_request_ledger_max_entries = int(os.getenv("LEAPFLOW_DAEMON_REQUEST_LEDGER_MAX_ENTRIES", "128"))
     circuit_breaker_threshold = int(os.getenv("LEAPFLOW_CIRCUIT_BREAKER_THRESHOLD", "5"))
     circuit_breaker_cooldown_s = float(os.getenv("LEAPFLOW_CIRCUIT_BREAKER_COOLDOWN_S", "60.0"))
 
@@ -1018,6 +1022,8 @@ def _build_settings_from_env(
         # Stream & Tool Robustness
         stale_stream_timeout_s=stale_stream_timeout_s,
         default_tool_timeout_s=default_tool_timeout_s,
+        daemon_request_ledger_ttl_s=daemon_request_ledger_ttl_s,
+        daemon_request_ledger_max_entries=daemon_request_ledger_max_entries,
         circuit_breaker_threshold=circuit_breaker_threshold,
         circuit_breaker_cooldown_s=circuit_breaker_cooldown_s,
         # Signal Fusion

@@ -221,6 +221,20 @@ def test_submit_text_assigns_ids_and_keeps_input_editable() -> None:
     assert app._input_area.buffer.read_only() is False
 
 
+def test_submit_text_skips_duplicate_pending_command() -> None:
+    app, console, status = _make_app()
+
+    first = app.submit_text("repeat me")
+    duplicate = app.submit_text("  repeat me  ")
+
+    assert first.status is TuiCommandStatus.QUEUED
+    assert duplicate.status is TuiCommandStatus.SKIPPED
+    assert duplicate.error == "duplicate queued/running command skipped"
+    assert app._pending_input.qsize() == 1
+    assert [card.status for card in console.cards] == [TuiCommandStatus.SKIPPED]
+    assert status.counts[-1] == (0, 1)
+
+
 def test_submit_text_rejects_empty_commands() -> None:
     app, console, status = _make_app()
 
@@ -604,6 +618,47 @@ def test_stream_renderer_prints_tool_failure_exit_and_stderr() -> None:
     assert "$ false" in line
     assert "→ exit=1 permission denied" in line
     assert " | " in line
+
+
+def test_stream_renderer_hides_duplicate_suppression_metadata() -> None:
+    class CaptureConsole:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def print(self, renderable) -> None:
+            self.lines.append(getattr(renderable, "plain", str(renderable)))
+
+        def thinking(self, text: str) -> None:
+            pass
+
+        def markdown(self, text: str, *, indent: int = 0, margin_top: int = 0) -> None:
+            pass
+
+        def response_label(self, elapsed_s: float, *, tool_count: int = 0, command=None) -> None:
+            pass
+
+        def newline(self) -> None:
+            pass
+
+    console = CaptureConsole()
+    renderer = StreamRenderer(console)  # type: ignore[arg-type]
+    renderer.start()
+
+    renderer.tool_started("shell_run", metadata={"command": "git push"})
+    renderer.tool_finished(
+        "shell_run",
+        metadata={
+            "ok": False,
+            "already_executed": True,
+            "duplicate_suppressed": True,
+            "counts_as_failure": False,
+            "ui_hidden": True,
+            "error_preview": "duplicate execution was not replayed",
+        },
+    )
+
+    assert console.lines == []
+    assert renderer.tool_count == 0
 
 
 def test_stream_renderer_prints_context_evidence_metadata() -> None:

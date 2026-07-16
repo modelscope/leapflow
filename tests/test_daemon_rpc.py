@@ -65,6 +65,23 @@ class _SlowFirstChunkService(_FakeService):
         yield StreamChunk(request_id="", content="done", event_type="final")
 
 
+class _RequestIdCaptureService(_FakeService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.request_ids: list[str] = []
+
+    async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+        request_id = str(kwargs.get("request_id") or "")
+        self.request_ids.append(request_id)
+        yield StreamChunk(
+            request_id=request_id,
+            content=f"request {message}",
+            event_type="chunk",
+            metadata={"request_id": request_id},
+        )
+        yield StreamChunk(request_id=request_id, content="done", event_type="final")
+
+
 async def _start_server(runtime_dir: Path, service=None, *, stream_heartbeat_s: float | None = None):
     server = UnixRpcServer(
         service or _FakeService(),
@@ -102,6 +119,96 @@ async def test_daemon_client_receives_stream_events() -> None:
         ("final", "done"),
     ]
     assert events[0].metadata == {"session_id": "sess-1"}
+
+
+@pytest.mark.asyncio
+async def test_daemon_server_injects_rpc_request_id_into_engine_chat() -> None:
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        service = _RequestIdCaptureService()
+        server, task, runtime_dir = await _start_server(Path(root) / "runtime", service=service)
+        client = DaemonClient(runtime_dir / "leapd.sock")
+
+        try:
+            events = [event async for event in client.engine_chat("world")]
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert len(service.request_ids) == 1
+    assert service.request_ids[0]
+    assert events[0].metadata == {"request_id": service.request_ids[0]}
+
+
+@pytest.mark.asyncio
+async def test_runtime_service_replays_duplicate_engine_request_without_rerun() -> None:
+    from types import SimpleNamespace
+
+    from leapflow.daemon.service import RuntimeLeapService
+    from leapflow.engine import StreamEvent
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.calls = 0
+            self._current_session_id = "session-1"
+
+        async def run_stream(self, message: str, *, enable_thinking: bool = False, request_id: str = ""):
+            self.calls += 1
+            yield StreamEvent(
+                type="chunk",
+                content=f"{request_id}:{message}",
+                metadata={"seen_request_id": request_id},
+            )
+            yield StreamEvent(type="final", content="done")
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(llm_context_length=100)
+            self.engine = FakeEngine()
+
+        def reload_runtime_config_if_changed(self) -> bool:
+            return False
+
+    service = RuntimeLeapService(SimpleNamespace(llm_context_length=100))
+    ctx = FakeContext()
+    service._ctx = ctx
+
+    first = [chunk async for chunk in service.engine_chat("hello", request_id="req-1")]
+    second = [chunk async for chunk in service.engine_chat("hello", request_id="req-1")]
+
+    assert ctx.engine.calls == 1
+    assert [chunk.content for chunk in first] == ["req-1:hello", "done"]
+    assert [chunk.content for chunk in second] == ["req-1:hello", "done"]
+    assert second[0].metadata["replayed_request"] is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_service_prunes_completed_engine_request_replay_records() -> None:
+    from types import SimpleNamespace
+
+    from leapflow.daemon.service import RuntimeLeapService
+
+    settings = SimpleNamespace(
+        llm_context_length=100,
+        daemon_request_ledger_ttl_s=1_000_000_000_000.0,
+        daemon_request_ledger_max_entries=2,
+    )
+    service = RuntimeLeapService(settings)
+    service._engine_request_ledger = {
+        "old-1": {"status": "completed", "chunks": [], "created_at": 1.0, "completed_at": 1.0},
+        "old-2": {"status": "failed", "chunks": [], "created_at": 2.0, "completed_at": 2.0},
+        "new-1": {"status": "completed", "chunks": [], "created_at": 3.0, "completed_at": 3.0},
+        "running": {"status": "running", "chunks": [], "created_at": 0.0},
+    }
+
+    service._prune_engine_request_ledger()
+
+    assert "running" in service._engine_request_ledger
+    assert "new-1" in service._engine_request_ledger
+    assert len(service._engine_request_ledger) <= 2
 
 
 @pytest.mark.asyncio
@@ -234,6 +341,8 @@ async def test_runtime_service_streams_pending_approval_and_resolves(tmp_path) -
         assert approval_event.event_type == "approval_request"
         assert isinstance(payload, dict)
         assert payload["pending_id"]
+        assert (approval_event.metadata or {}).get("request_id")
+        assert payload.get("request_id") == (approval_event.metadata or {}).get("request_id")
         status = await service.approval_status()
         assert len(status["pending"]) == 1
 
@@ -242,7 +351,9 @@ async def test_runtime_service_streams_pending_approval_and_resolves(tmp_path) -
     finally:
         await stream.aclose()
 
-    assert resolved == {"ok": True, "pending_id": payload["pending_id"], "decision": "deny"}
+    assert resolved["ok"] is True
+    assert resolved["pending_id"] == payload["pending_id"]
+    assert resolved["decision"] == "deny"
     assert final.event_type == "final"
     assert final.content == "decision=deny"
     assert final.metadata["session_id"] == "sess-approval"
@@ -669,7 +780,10 @@ async def test_runtime_service_hot_reloads_config_before_daemon_chat(
 
         assert first.event_type == "status"
         assert "Configuration reloaded" in first.content
-        assert first.metadata == {
+        metadata = dict(first.metadata or {})
+        request_id = metadata.pop("request_id", "")
+        assert request_id
+        assert metadata == {
             "llm_model": service.context.settings.llm_model,
             "llm_context_length": 700_000,
             "context_used": 0,

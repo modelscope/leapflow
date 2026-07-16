@@ -7,6 +7,7 @@ and future schedulers can share the same contract.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -23,6 +24,11 @@ def _truncate(text: str, limit: int) -> str:
     if limit <= 1:
         return "…"
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def command_key(text: str) -> str:
+    """Return a stable identity key for equivalent submitted commands."""
+    return hashlib.sha256(_single_line(text).encode("utf-8")).hexdigest()
 
 
 class TuiCommandStatus(str, Enum):
@@ -45,6 +51,7 @@ class TuiCommand:
     text: str
     status: TuiCommandStatus
     created_at: float
+    command_key: str
     started_at: float = 0.0
     finished_at: float = 0.0
     error: str = ""
@@ -57,6 +64,7 @@ class TuiCommand:
             text=text,
             status=TuiCommandStatus.QUEUED,
             created_at=time.monotonic(),
+            command_key=command_key(text),
         )
 
     @property

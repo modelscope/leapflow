@@ -68,6 +68,7 @@ _DEFAULT_PATH_SCOPED: FrozenSet[str] = frozenset({
 # rest of the turn).
 _DEFAULT_NEVER_PARALLEL: FrozenSet[str] = frozenset({
     "gp_shell_run", "shell_run",
+    "gp_scm_sync", "scm_sync",
     "clarify", "gp_clarify",
     "delegate_task", "gp_delegate_task",
     "memory_add", "gp_memory_add",
