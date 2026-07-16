@@ -47,8 +47,15 @@ class RecoveryAuditEntry:
     elapsed_ms: float = 0.0
 
     def to_json_dict(self) -> dict[str, Any]:
-        """Serialize to JSON-safe dict."""
-        return {k: v for k, v in asdict(self).items() if v != "" and v != 0}
+        """Serialize to JSON-safe dict. Excludes only trailing optional fields when empty."""
+        d = asdict(self)
+        # Only strip the optional outcome fields when they are at default/empty
+        for key in ("outcome", "outcome_reason"):
+            if d.get(key) == "":
+                del d[key]
+        if d.get("elapsed_ms") == 0.0:
+            del d["elapsed_ms"]
+        return d
 
 
 class RecoveryAuditSink(Protocol):

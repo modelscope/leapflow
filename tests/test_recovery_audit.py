@@ -90,8 +90,8 @@ class TestRecoveryAuditEntry:
         assert entry.turn_id == 3
         assert entry.strategy_key == "jittered_retry"
 
-    def test_to_json_dict_excludes_empty(self) -> None:
-        """to_json_dict() excludes empty strings and zero values."""
+    def test_to_json_dict_excludes_empty_optional_fields(self) -> None:
+        """to_json_dict() excludes empty outcome fields and zero elapsed_ms."""
         entry = RecoveryAuditEntry(
             timestamp=1234567890.0,
             session_id="sess-1",
@@ -113,8 +113,14 @@ class TestRecoveryAuditEntry:
             elapsed_ms=0.0,
         )
         d = entry.to_json_dict()
-        assert "budget_cost" not in d
+        # budget_cost=0 and turn_id kept (they are regular fields with valid zero values)
+        assert d["budget_cost"] == 0
+        assert d["budget_consumed"] == 0
+        assert d["budget_remaining"] == 0
+        assert d["turn_id"] == 3
+        # Optional outcome fields removed when at default
         assert "outcome" not in d
+        assert "outcome_reason" not in d
         assert "elapsed_ms" not in d
         assert d["session_id"] == "sess-1"
         assert d["timestamp"] == 1234567890.0

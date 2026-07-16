@@ -949,9 +949,9 @@ class AgentEngine:
         # B4: Output sanitization (None = disabled)
         self._sanitizer: MessageSanitizer | None = None
 
-        # Recovery coordinator infrastructure (P3 integration)
+        # Recovery coordinator infrastructure
         self._unified_classifier = UnifiedErrorClassifier(self._error_classifier)
-        self._recovery_coordinator: RecoveryCoordinator | None = None  # Created per-turn
+        self._recovery_coordinator = RecoveryCoordinator()  # Re-created per turn
         self._checkpoint_store = InMemoryCheckpointStore()
         self._audit_sink = JsonlAuditSink()  # In-memory; path-based if layout available
 
@@ -1068,17 +1068,11 @@ class AgentEngine:
         use_native_tools: bool = False,
         tools_kwarg: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
-        """Unified API error recovery dispatcher. Returns 'continue' to retry, else None.
+        """Legacy API error recovery dispatcher. Returns 'continue' to retry, else None.
 
-        DEPRECATED: Retained for stream loop and fallback paths.
-        New code should use RecoveryCoordinator.evaluate() via _unified_tool_loop.
-
-        Wires ALL TurnRecoveryState one-shot guards to their matching ErrorCategory:
-        - CONTEXT_OVERFLOW → try_compress
-        - IMAGE_TOO_LARGE → try_multimodal_strip
-        - should_fallback → try_provider_failover
-        - should_rotate_credential → try_credential_rotate
-        - FORMAT_ERROR with thinking → try_disable_thinking
+        DEPRECATED: No longer called from main loops. Retained only for backward
+        compat with any external subclass overrides. All recovery now flows through
+        RecoveryCoordinator.evaluate().
         """
         if classified == ErrorCategory.CONTEXT_OVERFLOW and recovery.try_compress():
             messages[:] = self._compressor.force_compress(messages)
@@ -1165,6 +1159,46 @@ class AgentEngine:
                         messages[i] = {**msg, "content": text_parts}
                     else:
                         messages[i] = {**msg, "content": "[images removed to reduce context]"}
+
+    def _execute_transform_decision(
+        self,
+        decision: "RecoveryDecision",
+        messages: list,
+    ) -> bool:
+        """Execute a TRANSFORM_AND_RETRY decision. Returns True if transform succeeded.
+
+        Handles different transform strategies:
+        - context_compress: force-compress conversation history
+        - multimodal_strip: remove image content from messages
+        - native_to_text: disable native tool calling
+        - thinking_disable: disable thinking mode (handled externally)
+        """
+        strategy_key = decision.strategy_key
+        # Determine specific phase from audit_metadata if available
+        phase = dict(decision.audit_metadata).get("phase", "")
+
+        if strategy_key == "context_compress":
+            if phase == "multimodal_to_text":
+                self._strip_images_from_messages(messages)
+            else:
+                # Default: history_summarize and disclosure_shrink both use force_compress
+                messages[:] = self._compressor.force_compress(messages)
+            return True
+
+        if strategy_key == "multimodal_strip":
+            self._strip_images_from_messages(messages)
+            return True
+
+        if strategy_key == "native_to_text":
+            # Handled by caller via tools_kwarg mutation
+            return True
+
+        if strategy_key == "thinking_disable":
+            # Handled by caller via enable_thinking flag
+            return True
+
+        logger.warning("Unknown transform strategy: %s", strategy_key)
+        return True
 
     def _check_guardrail(
         self,
@@ -2293,80 +2327,83 @@ class AgentEngine:
                 category_str = classified.value if hasattr(classified, 'value') else str(classified)
                 recovery.record_api_error(category_str)
 
-                # P3: Classify through unified coordinator and audit
+                # Classify through unified coordinator and execute recovery
                 envelope = self._unified_classifier.classify_llm_error(
                     exc, provider=getattr(self._llm, 'provider', ''),
                     model=getattr(self._llm, 'model', ''),
                 )
                 coordinator = self._recovery_coordinator
-                if coordinator is not None:
+                try:
                     decision = coordinator.evaluate(envelope)
-                    self._audit_sink.record(create_audit_entry(
-                        envelope, decision, coordinator.budget,
-                        session_id=getattr(self, '_current_session_id', '') or '',
-                        turn_id=budget.used,
-                    ))
+                except Exception as coord_exc:
+                    logger.error("recovery_coordinator.evaluate() failed: %s", coord_exc)
+                    fatal_error = f"Internal recovery error: {coord_exc}"
+                    break
+                self._audit_sink.record(create_audit_entry(
+                    envelope, decision, coordinator.budget,
+                    session_id=getattr(self, '_current_session_id', '') or '',
+                    turn_id=budget.used,
+                ))
 
-                    # Execute decision via coordinator
-                    if decision.action == RecoveryAction.RETRY_WITH_BACKOFF:
-                        if decision.retry_semantics.backoff_config:
-                            await asyncio.sleep(
-                                jittered_backoff(budget.used, base=decision.retry_semantics.backoff_config.base_delay)
-                            )
-                        coordinator.on_strategy_outcome(decision.decision_id, True)
-                        continue
+                # Execute decision via coordinator
+                if decision.action == RecoveryAction.RETRY_WITH_BACKOFF:
+                    if decision.retry_semantics.backoff_config:
+                        await asyncio.sleep(
+                            jittered_backoff(budget.used, base=decision.retry_semantics.backoff_config.base_delay)
+                        )
+                    continue
 
-                    elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
-                        if decision.strategy_key == "context_compress":
-                            messages[:] = self._compressor.force_compress(messages)
-                            self._usage_tracker.mark_compression()
-                        elif decision.strategy_key == "multimodal_strip":
-                            self._strip_images_from_messages(messages)
-                        elif decision.strategy_key == "native_to_text":
-                            tools_kwarg = {}
-                            use_native_tools = False
-                        coordinator.on_strategy_outcome(decision.decision_id, True)
-                        continue
-
-                    elif decision.action == RecoveryAction.FAILOVER:
-                        if hasattr(self._llm, '_failover'):
-                            self._llm._failover(f"recovery: {decision.reason}")
-                        coordinator.on_strategy_outcome(decision.decision_id, True)
-                        continue
-
-                    elif decision.action in (RecoveryAction.HALT_CLEAN, RecoveryAction.HALT_WITH_CHECKPOINT):
-                        if decision.action == RecoveryAction.HALT_WITH_CHECKPOINT:
-                            checkpoint = RecoveryCheckpoint(
-                                session_id=getattr(self, '_current_session_id', '') or '',
-                                turn_id=budget.used,
-                                failure_envelope_data={"message": envelope.message, "category": envelope.category},
-                                messages_snapshot=list(messages),
-                            )
-                            self._checkpoint_store.save(checkpoint)
-                        fatal_error = decision.reason
-                        coordinator.on_strategy_outcome(decision.decision_id, False)
-                        break
-
-                    else:
-                        # ASK_USER, SKIP_AND_CONTINUE, or unknown
-                        fatal_error = decision.reason
-                        break
-                else:
-                    # Fallback to legacy handler if coordinator not initialized
-                    if await self._handle_api_error(
-                        classified, rec, recovery, messages, budget,
-                        use_native_tools=use_native_tools, tools_kwarg=tools_kwarg,
-                    ) == "continue":
-                        if classified == ErrorCategory.CONTEXT_OVERFLOW:
-                            self._usage_tracker.mark_compression()
-                        continue
-                    if classified in (ErrorCategory.FORMAT_ERROR,) and tools_kwarg and recovery.try_native_fallback():
-                        logger.info("Native tool calling failed, falling back to text mode")
+                elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                    # Handle native_to_text locally (needs local var mutation)
+                    if decision.strategy_key == "native_to_text":
                         tools_kwarg = {}
                         use_native_tools = False
-                        continue
-                    fatal_error = self._error_classifier.friendly_message(classified, str(exc))
-                    logger.error("unified_loop: unrecoverable %s: %s", category_str, exc)
+                        transform_ok = True
+                    else:
+                        transform_ok = self._execute_transform_decision(decision, messages)
+                    if transform_ok:
+                        self._usage_tracker.mark_compression()
+                    coordinator.on_strategy_outcome(decision.decision_id, transform_ok)
+                    if not transform_ok:
+                        fatal_error = f"Transform failed: {decision.reason}"
+                        break
+                    continue
+
+                elif decision.action == RecoveryAction.FAILOVER:
+                    if hasattr(self._llm, '_failover'):
+                        self._llm._failover(f"recovery: {decision.reason}")
+                    coordinator.on_strategy_outcome(decision.decision_id, True)
+                    continue
+
+                elif decision.action in (RecoveryAction.HALT_CLEAN, RecoveryAction.HALT_WITH_CHECKPOINT):
+                    if decision.action == RecoveryAction.HALT_WITH_CHECKPOINT:
+                        checkpoint = RecoveryCheckpoint(
+                            session_id=getattr(self, '_current_session_id', '') or '',
+                            turn_id=budget.used,
+                            failure_envelope_data={
+                                "message": envelope.message,
+                                "category": envelope.category,
+                                "failure_code": envelope.failure_code,
+                                "source": envelope.source.value,
+                            },
+                            messages_snapshot=list(messages),
+                            context_data={
+                                "tools_kwarg_keys": list(tools_kwarg.keys()),
+                                "use_native_tools": use_native_tools,
+                                "budget_used": budget.used,
+                            },
+                        )
+                        self._checkpoint_store.save(checkpoint)
+                    fatal_error = decision.reason
+                    self._audit_sink.update_outcome(
+                        decision.decision_id, "failure",
+                        reason="Terminal halt",
+                    )
+                    break
+
+                else:
+                    # ASK_USER, SKIP_AND_CONTINUE, or unknown
+                    fatal_error = decision.reason
                     break
             _clear_indicator()
 
@@ -2516,12 +2553,11 @@ class AgentEngine:
                 )
                 break
 
-            # P3: Classify tool failures through coordinator for audit
+            # Classify tool failures through coordinator for audit and decision
             if (
                 isinstance(result, dict)
                 and not result.get("ok", True)
                 and result.get("counts_as_failure") is not False
-                and self._recovery_coordinator is not None
             ):
                 tool_envelope = self._unified_classifier.classify_tool_result(
                     result, tool_name=tool_name,
@@ -2741,6 +2777,14 @@ class AgentEngine:
         content = ""
         fatal_error: Optional[str] = None
         turn_recovery = TurnRecoveryState()
+        # Initialize recovery coordinator for stream turn
+        recovery_budget = RecoveryBudget()
+        recovery_budget.start_deadline()
+        self._recovery_coordinator = RecoveryCoordinator(
+            strategies=default_strategies(),
+            budget=recovery_budget,
+        )
+        self._recovery_coordinator.new_turn(turn_id=budget.used)
         use_native_tools = assembly.plan.native_tools
         result_budget = self._effective_tool_result_budget()
         unknown_tool_retry_used = False
@@ -2795,18 +2839,48 @@ class AgentEngine:
                     rec = self._error_classifier.get_recovery(classified)
                     turn_recovery.record_api_error()
 
-                    if await self._handle_api_error(
-                        classified, rec, turn_recovery, messages, budget,
-                        use_native_tools=use_native_tools, tools_kwarg=tools_kwarg,
-                    ) == "continue":
+                    # Classify through unified coordinator
+                    envelope = self._unified_classifier.classify_llm_error(
+                        exc, provider=getattr(self._llm, 'provider', ''),
+                        model=getattr(self._llm, 'model', ''),
+                    )
+                    coordinator = self._recovery_coordinator
+                    try:
+                        decision = coordinator.evaluate(envelope)
+                    except Exception as coord_exc:
+                        logger.error("recovery_coordinator.evaluate() failed: %s", coord_exc)
+                        yield StreamEvent(type="error", content=f"Internal recovery error: {coord_exc}")
+                        break
+                    self._audit_sink.record(create_audit_entry(
+                        envelope, decision, coordinator.budget,
+                        session_id=getattr(self, '_current_session_id', '') or '',
+                        turn_id=budget.used,
+                    ))
+
+                    if decision.action == RecoveryAction.RETRY_WITH_BACKOFF:
+                        if decision.retry_semantics.backoff_config:
+                            await asyncio.sleep(
+                                jittered_backoff(budget.used, base=decision.retry_semantics.backoff_config.base_delay)
+                            )
                         continue
-                    if tools_kwarg and turn_recovery.try_native_fallback():
-                        logger.info("Native tool calling failed, falling back to text mode")
-                        tools_kwarg = {}
-                        use_native_tools = False
+                    elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                        if decision.strategy_key == "native_to_text":
+                            tools_kwarg = {}
+                            use_native_tools = False
+                        else:
+                            self._execute_transform_decision(decision, messages)
+                        coordinator.on_strategy_outcome(decision.decision_id, True)
                         continue
-                    yield StreamEvent(type="error", content=str(exc))
-                    break
+                    elif decision.action == RecoveryAction.FAILOVER:
+                        if hasattr(self._llm, '_failover'):
+                            self._llm._failover(f"recovery: {decision.reason}")
+                        coordinator.on_strategy_outcome(decision.decision_id, True)
+                        continue
+                    else:
+                        # Terminal: HALT_CLEAN, HALT_WITH_CHECKPOINT, ASK_USER
+                        fatal_error = decision.reason
+                        yield StreamEvent(type="error", content=decision.reason)
+                        break
                 _clear_indicator()
 
                 content = (resp.content or "").strip()
@@ -2957,14 +3031,43 @@ class AgentEngine:
                         classified = self._error_classifier.classify(exc)
                         rec = self._error_classifier.get_recovery(classified)
                         turn_recovery.record_api_error()
-                        if await self._handle_api_error(
-                            classified, rec, turn_recovery, messages, budget,
-                        ) == "continue":
+                        # Classify through unified coordinator
+                        envelope = self._unified_classifier.classify_llm_error(
+                            exc, provider=getattr(self._llm, 'provider', ''),
+                            model=getattr(self._llm, 'model', ''),
+                        )
+                        coordinator = self._recovery_coordinator
+                        try:
+                            decision = coordinator.evaluate(envelope)
+                        except Exception as coord_exc:
+                            logger.error("recovery_coordinator.evaluate() failed: %s", coord_exc)
+                            yield StreamEvent(type="error", content=f"Internal recovery error: {coord_exc}")
+                            break
+                        self._audit_sink.record(create_audit_entry(
+                            envelope, decision, coordinator.budget,
+                            session_id=getattr(self, '_current_session_id', '') or '',
+                            turn_id=budget.used,
+                        ))
+                        if decision.action == RecoveryAction.RETRY_WITH_BACKOFF:
+                            if decision.retry_semantics.backoff_config:
+                                await asyncio.sleep(
+                                    jittered_backoff(budget.used, base=decision.retry_semantics.backoff_config.base_delay)
+                                )
                             continue
-                        fatal_error = self._error_classifier.friendly_message(classified, str(exc))
-                        logger.error("unified_loop_stream: unrecoverable %s: %s", classified.value, exc)
-                        yield StreamEvent(type="error", content=fatal_error)
-                        break
+                        elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                            self._execute_transform_decision(decision, messages)
+                            coordinator.on_strategy_outcome(decision.decision_id, True)
+                            continue
+                        elif decision.action == RecoveryAction.FAILOVER:
+                            if hasattr(self._llm, '_failover'):
+                                self._llm._failover(f"recovery: {decision.reason}")
+                            coordinator.on_strategy_outcome(decision.decision_id, True)
+                            continue
+                        else:
+                            fatal_error = decision.reason
+                            logger.error("unified_loop_stream: unrecoverable %s: %s", envelope.category, exc)
+                            yield StreamEvent(type="error", content=decision.reason)
+                            break
 
                     content = "".join(content_parts).strip()
                     if self._sanitizer:
@@ -2989,14 +3092,43 @@ class AgentEngine:
                         classified = self._error_classifier.classify(exc)
                         rec = self._error_classifier.get_recovery(classified)
                         turn_recovery.record_api_error()
-                        if await self._handle_api_error(
-                            classified, rec, turn_recovery, messages, budget,
-                        ) == "continue":
+                        # Classify through unified coordinator
+                        envelope = self._unified_classifier.classify_llm_error(
+                            exc, provider=getattr(self._llm, 'provider', ''),
+                            model=getattr(self._llm, 'model', ''),
+                        )
+                        coordinator = self._recovery_coordinator
+                        try:
+                            decision = coordinator.evaluate(envelope)
+                        except Exception as coord_exc:
+                            logger.error("recovery_coordinator.evaluate() failed: %s", coord_exc)
+                            yield StreamEvent(type="error", content=f"Internal recovery error: {coord_exc}")
+                            break
+                        self._audit_sink.record(create_audit_entry(
+                            envelope, decision, coordinator.budget,
+                            session_id=getattr(self, '_current_session_id', '') or '',
+                            turn_id=budget.used,
+                        ))
+                        if decision.action == RecoveryAction.RETRY_WITH_BACKOFF:
+                            if decision.retry_semantics.backoff_config:
+                                await asyncio.sleep(
+                                    jittered_backoff(budget.used, base=decision.retry_semantics.backoff_config.base_delay)
+                                )
                             continue
-                        fatal_error = self._error_classifier.friendly_message(classified, str(exc))
-                        logger.error("unified_loop_stream: unrecoverable %s: %s", classified.value, exc)
-                        yield StreamEvent(type="error", content=fatal_error)
-                        break
+                        elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                            self._execute_transform_decision(decision, messages)
+                            coordinator.on_strategy_outcome(decision.decision_id, True)
+                            continue
+                        elif decision.action == RecoveryAction.FAILOVER:
+                            if hasattr(self._llm, '_failover'):
+                                self._llm._failover(f"recovery: {decision.reason}")
+                            coordinator.on_strategy_outcome(decision.decision_id, True)
+                            continue
+                        else:
+                            fatal_error = decision.reason
+                            logger.error("unified_loop_stream: unrecoverable %s: %s", envelope.category, exc)
+                            yield StreamEvent(type="error", content=decision.reason)
+                            break
                     _clear_indicator()
                     content = (resp.content or "").strip()
                     if self._sanitizer:
