@@ -6,12 +6,13 @@ exercised with an in-memory MonitorManager and a fake producer.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
 from leapflow.cli.commands.slash_handlers import command_execute
 from leapflow.daemon.service import RuntimeLeapService
-from leapflow.monitor import Finding, MonitorManager, ProducerRegistry, Severity
+from leapflow.monitor import Finding, MonitorManager, ProducerRegistry, Severity, WatchSpec
 from leapflow.monitor.types import ProducerContext
 from leapflow.storage.connection import LocalConnectionHolder
 
@@ -108,6 +109,35 @@ async def test_dashboard_command_execute_flow(tmp_path: Path) -> None:
 
     unknown = await command_execute(ctx, "board", "bogus")
     assert unknown["ok"] is False
+
+
+async def test_schedule_watch_once_runs_in_background(tmp_path: Path) -> None:
+    """schedule_watch_once must not block the caller yet still produce findings."""
+    manager = _manager(tmp_path)
+    view = await manager.arm_watch(WatchSpec(name="D", domain="demo", sensitivity="notable"))
+
+    manager.schedule_watch_once(view.watch_id, force=True)
+
+    tasks = list(manager._background_tasks)
+    assert len(tasks) == 1  # scheduled, not awaited inline
+    assert manager.finding_store.count(watch_id=view.watch_id) == 0  # not run yet
+    await asyncio.gather(*tasks)
+    assert manager.finding_store.count(watch_id=view.watch_id) >= 1
+
+
+async def test_board_session_returns_watch_id_without_blocking(tmp_path: Path) -> None:
+    """/board session arms the session watch, returns its id + open payload, and
+    schedules the (LLM-backed) analysis in the background instead of awaiting it."""
+    manager = _manager(tmp_path)
+    ctx = SimpleNamespace(monitors=manager, settings=None, engine=None)
+
+    payload = await command_execute(ctx, "board session", "")
+
+    assert payload["view"] == "dashboard" and payload["mode"] == "open"
+    assert payload["action"] == "session"
+    assert payload.get("watch_id")  # id surfaced to the user
+    assert len(manager._background_tasks) == 1  # analysis deferred, RPC returns fast
+    await asyncio.gather(*list(manager._background_tasks))
 
 
 async def test_dashboard_command_scheduler_disabled(tmp_path: Path) -> None:

@@ -176,6 +176,12 @@ async def _open_dashboard_view(settings: Any, console: Any, payload: dict[str, A
         console.system(f"Opened dashboard in your browser: {url}")
     else:
         console.system(f"Dashboard ready (open manually): {url}")
+    watch_id = str(payload.get("watch_id") or "")
+    if watch_id:
+        console.system(
+            f"Session board watch {watch_id[:8]} is observing; "
+            "analysis streams to the board as it completes."
+        )
 
 
 async def _ask_yes_no_default_yes(prompt: str) -> bool:

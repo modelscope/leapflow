@@ -6,6 +6,7 @@ All display logic uses ``LeapConsole`` for consistent theming.
 
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 from typing import TYPE_CHECKING, Any
@@ -13,6 +14,9 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from leapflow.cli.context import Context
     from leapflow.cli.tui_app.console import LeapConsole
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_tool_payload(ctx: "Context") -> dict[str, Any]:
@@ -1146,14 +1150,22 @@ def _resolve_watch_id(monitors: Any, token: str) -> str:
     return matches[0] if len(matches) == 1 else token
 
 
-async def _ensure_session_watch_refresh(ctx: "Context", monitors: Any) -> None:
-    """Ensure an active session watch exists and run one analysis cycle now."""
+async def _ensure_session_watch_refresh(ctx: "Context", monitors: Any) -> str:
+    """Ensure an active session watch exists and trigger one analysis cycle.
+
+    The analysis producer is LLM-backed and can take tens of seconds, so it is
+    scheduled in the background: arming the watch and opening the board must be
+    instant and must never block the command RPC past its timeout. The board
+    receives the resulting finding over WebSocket when the cycle completes.
+    Returns the session watch id.
+    """
     from leapflow.monitor.session_producer import ensure_session_watch, session_watch_params
 
     watch_id = await ensure_session_watch(
         monitors, params=session_watch_params(getattr(ctx, "settings", None))
     )
-    await monitors.run_watch_once(watch_id, force=True)
+    monitors.schedule_watch_once(watch_id, force=True)
+    return watch_id
 
 
 async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[str, Any]:
@@ -1254,11 +1266,12 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
             engine = getattr(ctx, "engine", None)
             if engine is not None and int(getattr(engine, "turn_count", 0) or 0) > 0:
                 intent = DashboardIntent(action="session", target="session")
+        session_watch_id = ""
         if intent.action == "session" and monitors is not None:
             try:
-                await _ensure_session_watch_refresh(ctx, monitors)
+                session_watch_id = await _ensure_session_watch_refresh(ctx, monitors)
             except Exception:
-                pass
+                logger.debug("dashboard: session watch refresh failed", exc_info=True)
         settings = getattr(ctx, "settings", None)
         state = None
         if settings is not None:
@@ -1270,6 +1283,8 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
             "ok": True, "view": "dashboard", "mode": "open",
             "action": intent.action, "intent": intent.to_dict(), "running": bool(state),
         }
+        if session_watch_id:
+            payload["watch_id"] = session_watch_id
         if state:
             url = launcher.build_url(state["bind"], state["port"], state["token"])
             if intent.action != "home":

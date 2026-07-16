@@ -9,6 +9,7 @@ logic and no transport -- both are injected.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import replace
@@ -191,6 +192,7 @@ class MonitorManager:
             default_tier="local",
         )
         self._started = False
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -343,6 +345,24 @@ class MonitorManager:
         if force:
             params["_force"] = True
         return await self._executor.execute(task.skill_name, params)
+
+    def schedule_watch_once(self, watch_id: str, *, force: bool = False) -> None:
+        """Fire one observation cycle in the background (non-blocking).
+
+        Producers may be slow (e.g. an LLM-backed session analysis). Callers
+        that only need to *trigger* a refresh -- such as opening a live board --
+        must not block on that latency, so the cycle runs as a tracked task and
+        its finding reaches clients over the normal push path when it completes.
+        """
+        task = asyncio.create_task(self._safe_run_once(watch_id, force=force))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _safe_run_once(self, watch_id: str, *, force: bool) -> None:
+        try:
+            await self.run_watch_once(watch_id, force=force)
+        except Exception:  # noqa: BLE001 - background refresh must never crash the loop
+            logger.debug("monitor: background run_watch_once failed for %s", watch_id, exc_info=True)
 
     # ── Internal ───────────────────────────────────────────────────────────
 
