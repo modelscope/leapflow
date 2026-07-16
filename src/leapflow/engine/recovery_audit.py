@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Protocol
@@ -78,9 +79,11 @@ class JsonlAuditSink:
     Thread-safe via append mode.
     """
 
-    def __init__(self, path: Path | str | None = None):
+    _MAX_IN_MEMORY = 1000  # Default configurable cap
+
+    def __init__(self, path: Path | str | None = None, max_in_memory: int = 1000):
         self._path = Path(path) if path else None
-        self._entries: list[RecoveryAuditEntry] = []  # In-memory buffer for testing
+        self._entries: deque[RecoveryAuditEntry] = deque(maxlen=max_in_memory)
 
     def record(self, entry: RecoveryAuditEntry) -> None:
         """Write entry to JSONL file and in-memory buffer."""

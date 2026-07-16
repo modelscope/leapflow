@@ -117,8 +117,10 @@ class TestInMemoryCheckpointStore:
             ttl_seconds=3600.0,
         )
         self.store.save(cp)
-        self.store.load("cp-exp")
-        assert cp.state == CheckpointState.EXPIRED
+        result = self.store.load("cp-exp")
+        assert result is None
+        # Expired checkpoint is removed from store
+        assert self.store.load("cp-exp") is None
 
     def test_load_and_consume_cas_success(self) -> None:
         cp = RecoveryCheckpoint(checkpoint_id="cp-cas")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import sys
@@ -158,15 +159,14 @@ class RuntimeLeapService:
                 self._approval_event_queue = approval_queue
                 self._active_engine_request_id = request_id
                 try:
-                    try:
+                    sig = inspect.signature(engine.run_stream)
+                    if "request_id" in sig.parameters:
                         stream = engine.run_stream(
                             message,
                             enable_thinking=enable_thinking,
                             request_id=request_id,
                         )
-                    except TypeError as exc:
-                        if "request_id" not in str(exc):
-                            raise
+                    else:
                         stream = engine.run_stream(
                             message,
                             enable_thinking=enable_thinking,

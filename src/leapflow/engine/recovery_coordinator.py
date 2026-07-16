@@ -168,11 +168,16 @@ class RecoveryCoordinator:
             decision = strategy.decide(envelope, self._state)
             if decision.budget_cost > 0:
                 if not self._budget.can_afford(decision.budget_cost, envelope.category):
+                    # Rollback any state mutations from decide()
+                    self._rollback_state_changes(decision, strategy)
                     continue
 
             # Commit the decision
             if decision.budget_cost > 0:
                 self._budget.consume(decision.budget_cost, envelope.category)
+
+            # Commit state changes AFTER decision is accepted
+            self._commit_state_changes(decision, strategy)
 
             # Track type-specific budget counters
             self._consume_type_budget(decision)
@@ -276,9 +281,24 @@ class RecoveryCoordinator:
         self._state.last_error_category = envelope.category
         self._state.last_failure_timestamp = envelope.timestamp
         self._state.total_decisions += 1
-        self._state.consecutive_failures += 1
         if envelope.source.value == "llm":
             self._state.consecutive_api_errors += 1
+
+    def _commit_state_changes(self, decision: RecoveryDecision, strategy: RecoveryStrategy) -> None:
+        """Commit strategy-specific state changes after a decision is accepted."""
+        # ContextCompressStrategy phase advancement
+        if strategy.key == "context_compress":
+            phase_index = decision.audit_metadata_dict.get("phase_index")
+            if phase_index is not None:
+                self._state.compress_phase_index = phase_index + 1
+
+    def _rollback_state_changes(self, decision: RecoveryDecision, strategy: RecoveryStrategy) -> None:
+        """Rollback state mutations from decide() when a decision is rejected."""
+        # ContextCompressStrategy phase rollback
+        if strategy.key == "context_compress":
+            phase_index = decision.audit_metadata_dict.get("phase_index")
+            if phase_index is not None:
+                self._state.compress_phase_index = phase_index
 
     def _make_terminal(self, envelope: FailureEnvelope, *, reason: str) -> RecoveryDecision:
         """Create a HALT_CLEAN terminal decision."""

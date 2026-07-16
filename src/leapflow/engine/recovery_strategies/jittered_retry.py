@@ -77,8 +77,7 @@ class JitteredRetryStrategy:
 
     @property
     def applicable_categories(self) -> frozenset[str]:
-        return frozenset({"transient", "rate_limited", "overloaded", "tool_timeout",
-                          "system_timeout", "system_network"})
+        return frozenset()  # Empty = wildcard, matches all categories
 
     def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
                   budget: RecoveryBudget | None = None) -> bool:

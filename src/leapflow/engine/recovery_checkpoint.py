@@ -135,6 +135,10 @@ class CheckpointStore(Protocol):
         """Load a checkpoint by ID. Returns None if not found or expired."""
         ...
 
+    def consume(self, checkpoint_id: str) -> bool:
+        """Atomically mark a PENDING checkpoint as CONSUMED. Returns True if successful."""
+        ...
+
     def load_and_consume(self, checkpoint_id: str) -> RecoveryCheckpoint | None:
         """Atomically load and mark as CONSUMED (CAS semantics).
 
@@ -182,9 +186,26 @@ class InMemoryCheckpointStore:
         if cp is None:
             return None
         if cp.is_expired:
-            cp.state = CheckpointState.EXPIRED
+            self._checkpoints.pop(checkpoint_id, None)
             return None
         return cp
+
+    def consume(self, checkpoint_id: str) -> bool:
+        """Atomically mark a PENDING checkpoint as CONSUMED. Returns True if successful."""
+        cp = self._checkpoints.get(checkpoint_id)
+        if cp is None:
+            return False
+        if cp.is_expired:
+            cp.state = CheckpointState.EXPIRED
+            return False
+        if cp.state != CheckpointState.PENDING:
+            return False
+        if cp.resume_attempts >= cp.max_resume_attempts:
+            return False
+        cp.state = CheckpointState.CONSUMED
+        cp.consumed_at = time.time()
+        cp.version += 1
+        return True
 
     def load_and_consume(self, checkpoint_id: str) -> RecoveryCheckpoint | None:
         """Atomically load and mark as CONSUMED (CAS semantics).
@@ -298,9 +319,9 @@ class CheckpointResumer:
             current_context: Current environment values for drift detection
                            (e.g. {"session_id": "...", "workspace_root": "..."})
         """
-        # 1. CAS load
-        checkpoint = self._store.load_and_consume(checkpoint_id)
-        if checkpoint is None:
+        # 1. Load checkpoint (without consuming)
+        checkpoint = self._store.load(checkpoint_id)
+        if checkpoint is None or not checkpoint.is_consumable:
             return ResumeResult(
                 success=False,
                 reason="Checkpoint not available (expired, consumed, or not found)",
@@ -321,13 +342,25 @@ class CheckpointResumer:
                     drift_warnings.append(msg)
 
         if drift_errors:
+            # Preconditions failed: increment resume_attempts, keep PENDING
+            checkpoint.resume_attempts += 1
+            if checkpoint.resume_attempts >= checkpoint.max_resume_attempts:
+                checkpoint.state = CheckpointState.EXPIRED
+            self._store.save(checkpoint)
             return ResumeResult(
                 success=False,
                 reason=f"Critical precondition drift: {'; '.join(drift_errors)}",
                 drift_warnings=tuple(drift_warnings),
             )
 
-        # 3. Build resume messages
+        # 3. Preconditions passed — atomically consume
+        if not self._store.consume(checkpoint_id):
+            return ResumeResult(
+                success=False,
+                reason="Checkpoint not available (expired, consumed, or not found)",
+            )
+
+        # 4. Build resume messages
         messages = list(checkpoint.messages_snapshot)
         failure_msg = checkpoint.failure_envelope_data.get("message", "unknown")
         messages.append({

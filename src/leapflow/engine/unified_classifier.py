@@ -110,7 +110,7 @@ class UnifiedErrorClassifier:
         recoverability, failure_class = self._registry.get(category_str)
 
         # Build recovery hint from the classifier's friendly message
-        friendly_msg = ErrorClassifier.friendly_message(category, str(exc)[:200])
+        friendly_msg = self._classifier.friendly_message(category, str(exc)[:200])
         hint = RecoveryHint(hint_text=friendly_msg) if friendly_msg else None
 
         return FailureEnvelope.create(
@@ -155,7 +155,7 @@ class UnifiedErrorClassifier:
         failure_code = str(result.get("failure_code") or "")
         error_msg = str(result.get("error") or "")
         error_type = str(result.get("error_type") or "")
-        retryable = bool(result.get("retryable", True))
+        retryable = bool(result.get("retryable") if result.get("retryable") is not None else True)
 
         # Determine side-effect state based on execution policy
         side_effect_state = self._side_effect_state_from_policy(execution_policy)

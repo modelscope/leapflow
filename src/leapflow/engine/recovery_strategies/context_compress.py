@@ -61,9 +61,6 @@ class ContextCompressStrategy:
         phase_idx = state.compress_phase_index
         phase_name = _PHASES[phase_idx]
 
-        # Advance the phase index for next invocation
-        state.compress_phase_index = phase_idx + 1
-
         return RecoveryDecision.create(
             envelope=envelope,
             action=RecoveryAction.TRANSFORM_AND_RETRY,

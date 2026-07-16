@@ -130,15 +130,20 @@ class TestContextCompressStrategy:
         d1 = s.decide(env, state)
         assert d1.action == RecoveryAction.TRANSFORM_AND_RETRY
         assert "history_summarize" in d1.reason
-        assert state.compress_phase_index == 1
+        assert d1.audit_metadata_dict["phase_index"] == 0
+        # decide() no longer mutates state; coordinator handles phase advancement
+        assert state.compress_phase_index == 0
 
+        # Simulate coordinator committing phase advancement
+        state.compress_phase_index = 1
         d2 = s.decide(env, state)
         assert "multimodal_to_text" in d2.reason
-        assert state.compress_phase_index == 2
+        assert d2.audit_metadata_dict["phase_index"] == 1
 
+        state.compress_phase_index = 2
         d3 = s.decide(env, state)
         assert "disclosure_shrink" in d3.reason
-        assert state.compress_phase_index == 3
+        assert d3.audit_metadata_dict["phase_index"] == 2
 
     def test_decide_does_not_consume_budget(self) -> None:
         s = ContextCompressStrategy()
@@ -348,9 +353,8 @@ class TestJitteredRetryStrategy:
         assert JitteredRetryStrategy().applicable_sources == frozenset({"llm", "tool", "system"})
 
     def test_applicable_categories(self) -> None:
-        expected = frozenset({"transient", "rate_limited", "overloaded", "tool_timeout",
-                              "system_timeout", "system_network"})
-        assert JitteredRetryStrategy().applicable_categories == expected
+        # Empty frozenset = wildcard, matches all categories
+        assert JitteredRetryStrategy().applicable_categories == frozenset()
 
     def test_can_apply_auto_retry(self) -> None:
         s = JitteredRetryStrategy()
