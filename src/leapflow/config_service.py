@@ -119,6 +119,11 @@ _FIELD_DESCRIPTIONS = {
     "visual.track_enabled": "Enable screenshot-based visual perception for the active profile.",
     "recording.mode": "Default recording pipeline used during teaching and observation.",
     "scheduler.tick_seconds": "Scheduler polling interval in seconds.",
+    "dashboard.enabled": "Enable the local monitoring web dashboard.",
+    "dashboard.bind": "Address the dashboard web server binds to (keep loopback).",
+    "dashboard.port": "TCP port for the local dashboard web server.",
+    "dashboard.auto_open": "Open the default browser automatically when launching the dashboard.",
+    "dashboard.token_ref": "Secret ref for the local dashboard access token.",
     "stream.output": "Stream assistant tokens and progress in interactive sessions.",
     "verbose.progress": "Show inline execution progress for tools and runtime steps.",
 }
@@ -146,6 +151,8 @@ _SECTION_CATEGORIES = {
     "mock": "Runtime",
     "log": "Runtime",
     "scheduler": "Scheduler",
+    "dashboard": "Dashboard",
+    "monitor": "Dashboard",
     "copilot": "Copilot",
     "react": "Execution Loop",
     "tool": "Execution Loop",
@@ -166,7 +173,7 @@ _VALUE_HINTS = {
     "signal.channels": "all or comma-separated channel names",
 }
 
-_PARTIAL_RELOAD_SECTIONS = frozenset({"runtime", "mock", "gateway", "hub", "scheduler", "observer", "cua", "use"})
+_PARTIAL_RELOAD_SECTIONS = frozenset({"runtime", "mock", "gateway", "hub", "scheduler", "observer", "cua", "use", "dashboard"})
 
 _PROFILE_FILE_BY_SECTION = {
     "llm": "llm.yaml",

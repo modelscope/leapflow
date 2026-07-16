@@ -183,6 +183,43 @@ class LeapConsole:
             padding=(0, 1),
         ))
 
+    def monitor_card(self, finding: Mapping[str, Any]) -> None:
+        """Render a compact, non-blocking card for a pushed monitor finding."""
+        severity = str(finding.get("severity", "info"))
+        border = {
+            "alert": "leap.error",
+            "notable": "leap.warning",
+            "info": "leap.border",
+        }.get(severity, "leap.border")
+        domain = str(finding.get("domain", ""))
+        watch_id = str(finding.get("watch_id", ""))[:8]
+        title_text = str(finding.get("title", "")) or "(finding)"
+        summary = str(finding.get("summary", ""))
+
+        body = Text(title_text, style="bold")
+        if summary:
+            body.append("\n")
+            body.append(summary, style="leap.muted")
+        actions = finding.get("suggested_actions") or []
+        if actions:
+            labels = ", ".join(str(a.get("label") or a.get("name")) for a in actions[:3])
+            body.append("\n")
+            body.append(f"actions: {labels}", style="leap.dim")
+
+        head = Text()
+        head.append("◉ ", style=border)
+        head.append(domain or "monitor", style="bold")
+        if watch_id:
+            head.append(f"  [{watch_id}]", style="leap.dim")
+        head.append(f"  {severity}", style=border)
+        self._console.print(Panel(
+            body,
+            title=head,
+            title_align="left",
+            border_style=border,
+            padding=(0, 1),
+        ))
+
     def markdown(
         self,
         text: str,

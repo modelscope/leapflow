@@ -1,0 +1,37 @@
+template: generic
+version: 1
+title: "{{ title }}"
+domain: generic
+# Refresh policy is consumed by session/monitor producers; harmless elsewhere.
+refresh:
+  batch_turns: 6
+layout:
+  - type: Page
+    props:
+      title: "{{ title }}"
+    children:
+      - type: Toolbar
+        children:
+          - type: FilterBar
+            props:
+              fields: ["severity", "domain", "watch"]
+            action:
+              kind: nav
+              name: filter
+      - type: Board
+        props:
+          title: Findings
+        children:
+          - type: FindingCard
+            repeat: findings
+            as: f
+            props:
+              title: "{{ f.title }}"
+              summary: "{{ f.summary }}"
+              severity: "{{ f.severity }}"
+              bind: f
+            action:
+              kind: intent
+              name: drilldown
+              params:
+                finding_id: "{{ f.finding_id }}"

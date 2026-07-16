@@ -1,0 +1,44 @@
+template: finance.market
+version: 1
+title: "{{ title }}"
+domain: finance
+layout:
+  - type: Page
+    props:
+      title: "{{ title }}"
+    children:
+      - type: Row
+        children:
+          - type: Stat
+            props:
+              label: "Watch"
+              value: "{{ watch.name }}"
+          - type: Stat
+            props:
+              label: "Signals"
+              value: "{{ watch.finding_count }}"
+      - type: Card
+        props:
+          title: "Price action"
+        children:
+          - type: Custom
+            props:
+              render: candlestick
+              bind: findings
+      - type: Board
+        props:
+          title: "Signals"
+        children:
+          - type: FindingCard
+            repeat: findings
+            as: f
+            props:
+              title: "{{ f.title }}"
+              summary: "{{ f.summary }}"
+              severity: "{{ f.severity }}"
+              bind: f
+            action:
+              kind: intent
+              name: drilldown
+              params:
+                finding_id: "{{ f.finding_id }}"

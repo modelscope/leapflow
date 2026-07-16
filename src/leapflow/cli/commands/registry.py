@@ -132,6 +132,20 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     # Scheduler
     CommandDef("arm", "Schedule a skill for timed execution", "Scheduler", args_hint="<skill> <cron>"),
     CommandDef("task", "List scheduled tasks", "Scheduler"),
+
+    # Dashboard & Monitors
+    CommandDef("dashboard", "Manage monitoring dashboards and watches", "Dashboard", args_hint="[open|session|list|status|new|pause|resume|stop|mute|refresh|findings] ...", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("dashboard open", "Open the monitoring web dashboard", "Dashboard", args_hint="[watch-id]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("dashboard session", "Open the current-session analysis dashboard", "Dashboard", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("dashboard list", "List active watches", "Dashboard"),
+    CommandDef("dashboard status", "Show monitoring runtime status", "Dashboard"),
+    CommandDef("dashboard new", "Create a watch for a domain", "Dashboard", args_hint="<domain> [--name --trigger --sensitivity]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("dashboard pause", "Pause a watch", "Dashboard", args_hint="<id>", effect=CommandEffect.SESSION),
+    CommandDef("dashboard resume", "Resume a watch", "Dashboard", args_hint="<id>", effect=CommandEffect.SESSION),
+    CommandDef("dashboard stop", "Stop a watch", "Dashboard", args_hint="<id>", effect=CommandEffect.SESSION),
+    CommandDef("dashboard mute", "Mute or unmute a watch", "Dashboard", args_hint="<id> [on|off]", effect=CommandEffect.SESSION),
+    CommandDef("dashboard refresh", "Run a watch once now", "Dashboard", args_hint="<id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("dashboard findings", "Show recent findings", "Dashboard", args_hint="[id] [--limit N]"),
 )
 
 # ── Derived structures ───────────────────────────────────────────────

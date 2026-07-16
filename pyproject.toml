@@ -39,6 +39,7 @@ dev = [
     "ruff>=0.4.0",
 ]
 hub = ["modelscope-hub>=0.1.0"]
+dashboard = ["aiohttp>=3.9"]
 
 [project.scripts]
 leap = "leapflow.__main__:main"
@@ -56,6 +57,8 @@ include = ["leapflow*"]
 
 [tool.setuptools.package-data]
 "leapflow.gateway.action_packs" = ["*.yaml"]
+"leapflow.dashboard.templates" = ["*.yaml"]
+"leapflow.dashboard.static" = ["*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

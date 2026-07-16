@@ -183,6 +183,54 @@ class LeapService(Protocol):
         """Arm a scheduled task. Returns task_id."""
         ...
 
+    # ── Watch runtime (monitor subsystem) ──
+
+    async def watch_arm(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Arm a monitor watch. Returns its runtime view."""
+        ...
+
+    async def watch_list(self) -> List[Dict[str, Any]]:
+        """List all watches."""
+        ...
+
+    async def watch_get(self, watch_id: str) -> Dict[str, Any]:
+        """Return a single watch view."""
+        ...
+
+    async def watch_pause(self, watch_id: str) -> Dict[str, Any]:
+        """Suspend a watch until resumed."""
+        ...
+
+    async def watch_resume(self, watch_id: str) -> Dict[str, Any]:
+        """Re-arm a suspended watch."""
+        ...
+
+    async def watch_stop(self, watch_id: str) -> Dict[str, Any]:
+        """Terminally stop a watch (kept for history)."""
+        ...
+
+    async def watch_mute(self, watch_id: str, muted: bool = True) -> Dict[str, Any]:
+        """Toggle whether a watch's findings are pushed to view clients."""
+        ...
+
+    async def watch_refresh(self, watch_id: str) -> Dict[str, Any]:
+        """Run one observation cycle immediately (manual refresh)."""
+        ...
+
+    async def watch_findings(
+        self, watch_id: str = "", limit: int = 50, offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        """Return persisted findings, newest first."""
+        ...
+
+    async def session_history(self, limit: int = 200) -> Dict[str, Any]:
+        """Return the current conversation transcript and turn/token counts."""
+        ...
+
+    async def session_analyze(self) -> Dict[str, Any]:
+        """Ensure a session-analysis watch and run one analysis cycle now."""
+        ...
+
     async def status(self) -> Dict[str, Any]:
         """Return daemon status (uptime, connections, db path, etc.)."""
         ...
@@ -284,6 +332,17 @@ METHOD_REGISTRY: Dict[str, str] = {
     "engine.cancel": "engine_cancel",
     "skill.execute": "skill_execute",
     "scheduler.arm": "scheduler_arm",
+    "watch.arm": "watch_arm",
+    "watch.list": "watch_list",
+    "watch.get": "watch_get",
+    "watch.pause": "watch_pause",
+    "watch.resume": "watch_resume",
+    "watch.stop": "watch_stop",
+    "watch.mute": "watch_mute",
+    "watch.refresh": "watch_refresh",
+    "watch.findings": "watch_findings",
+    "session.history": "session_history",
+    "session.analyze": "session_analyze",
     "daemon.status": "status",
     "daemon.shutdown": "shutdown",
     "host.status": "host_status",

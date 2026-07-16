@@ -255,6 +255,15 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser = daemon_sub.add_parser("serve", help=argparse.SUPPRESS)
     serve_parser.add_argument("--internal", action="store_true", help=argparse.SUPPRESS)
 
+    # leap dashboard
+    dashboard_parser = subparsers.add_parser("dashboard", help="Open or serve the monitoring web dashboard")
+    dashboard_parser.add_argument("action", nargs="?", default="home", help="home | session | open")
+    dashboard_parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
+    dashboard_parser.add_argument("--token", default="", help=argparse.SUPPRESS)
+    dashboard_parser.add_argument("--port", type=int, default=0, help="Override the dashboard port")
+    dashboard_parser.add_argument("--bind", default="", help="Override the dashboard bind address")
+    dashboard_parser.add_argument("--no-open", action="store_true", help="Print the URL instead of opening a browser")
+
     # leap config
     config_parser = subparsers.add_parser("config", help="View and update LeapFlow configuration")
     config_sub = config_parser.add_subparsers(dest="config_action")
@@ -306,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Pre-parse: detect if first non-flag arg is a known subcommand ──
     # If not, treat everything non-flag as a chat prompt.
-    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon", "config"}
+    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon", "config", "dashboard"}
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
 
     # Find first non-flag argument, skipping values owned by global options.
@@ -381,6 +390,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "daemon":
         from leapflow.cli.commands.daemon import cmd_daemon
         return cmd_daemon(args)
+
+    # Dashboard is a view client (connects to leapd); no Context initialization
+    if args.command == "dashboard":
+        from leapflow.cli.commands.dashboard import cmd_dashboard
+        return cmd_dashboard(args)
 
     try:
         if args.command in {"interactive", "chat"} and _daemon_enabled(args):

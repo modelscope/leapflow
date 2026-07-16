@@ -1121,6 +1121,28 @@ async def cmd_interactive_daemon(
     # Session mode tracking for teaching — daemon-side state mirrored here
     daemon_session_mode = "idle"
 
+    async def _open_dashboard(payload: dict) -> None:
+        """Open the web dashboard on the user's machine (client-side)."""
+        from leapflow.dashboard import launcher
+
+        action = str(payload.get("action") or "home")
+        url = payload.get("url")
+        if not url:
+            try:
+                state = await asyncio.to_thread(launcher.ensure_server, settings)
+            except Exception as exc:
+                console.warning(f"Could not start the dashboard server: {exc}")
+                return
+            url = launcher.build_url(state["bind"], state["port"], state["token"])
+            if action != "home":
+                url += f"&action={action}"
+                if action == "session":
+                    url += "&target=session"
+        if launcher.open_in_browser(url):
+            console.system(f"Opened dashboard in your browser: {url}")
+        else:
+            console.system(f"Dashboard ready (open manually): {url}")
+
     async def handle_input(text: str) -> None:
         nonlocal daemon_session_mode
 
@@ -1183,6 +1205,10 @@ async def cmd_interactive_daemon(
             if payload.get("view") == "host" and payload.get("result"):
                 _apply_daemon_runtime_metadata({"host_backend": payload["result"]})
                 _update_status()
+
+            if str(payload.get("view")) == "dashboard" and payload.get("mode") == "open":
+                await _open_dashboard(payload)
+                return
 
             # Render: app-specific views use app renderer, others use generic
             view = str(payload.get("view") or "")
@@ -1342,11 +1368,22 @@ async def cmd_interactive_daemon(
         """Subscribe to daemon notifications and render them in TUI."""
         nonlocal daemon_session_mode
         from leapflow.daemon.client import DaemonUnavailableError
+
+        async def _refresh_watch_count() -> None:
+            try:
+                watches = await bridge.client.watch_list()
+            except Exception:
+                return
+            active = sum(1 for w in watches if w.get("state") in ("armed", "watching"))
+            status.update_monitor_counts(watches=active)
+            app.invalidate()
+
         while True:
             try:
                 # Reset stale state on each (re)connection attempt
                 status.distill_phase = ""
                 status.distill_progress = 0.0
+                await _refresh_watch_count()
                 async for event in bridge.client.subscribe_notifications():
                     event_type = event.get("event_type", "")
                     payload = event.get("payload") or {}
@@ -1381,6 +1418,15 @@ async def cmd_interactive_daemon(
                         else:
                             console.system("Distillation complete — no skills produced (insufficient signal)")
                         app.invalidate()
+                    elif event_type == "monitor.finding":
+                        console.monitor_card(payload)
+                        if str(payload.get("severity")) == "alert":
+                            status.update_monitor_counts(alerts=status.alert_count + 1)
+                        app.invalidate()
+                    elif event_type == "watch.state":
+                        await _refresh_watch_count()
+                    elif event_type == "monitor.error":
+                        logger.debug("monitor error notification: %s", payload)
             except (DaemonUnavailableError, OSError, asyncio.IncompleteReadError):
                 await asyncio.sleep(3.0)
             except asyncio.CancelledError:

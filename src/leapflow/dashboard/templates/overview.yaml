@@ -1,0 +1,44 @@
+template: overview
+version: 1
+title: "{{ title }}"
+domain: ""
+layout:
+  - type: Page
+    props:
+      title: "{{ title }}"
+    children:
+      - type: Board
+        props:
+          title: "Watches"
+        children:
+          - type: Card
+            repeat: watches
+            as: w
+            props:
+              title: "{{ w.name }}"
+            action:
+              kind: nav
+              name: openWatch
+              params:
+                target: "{{ w.watch_id }}"
+            children:
+              - type: Markdown
+                props:
+                  text: "{{ w.domain }} · {{ w.trigger }} · {{ w.state }} · {{ w.finding_count }} findings"
+      - type: Board
+        props:
+          title: "Recent findings"
+        children:
+          - type: FindingCard
+            repeat: findings
+            as: f
+            props:
+              title: "{{ f.title }}"
+              summary: "{{ f.summary }}"
+              severity: "{{ f.severity }}"
+              bind: f
+            action:
+              kind: intent
+              name: drilldown
+              params:
+                finding_id: "{{ f.finding_id }}"

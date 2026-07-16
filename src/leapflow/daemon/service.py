@@ -27,6 +27,7 @@ class RuntimeLeapService:
         self._settings = settings
         self._mock_host = mock_host
         self._ctx: Any | None = None
+        self._monitors: Any | None = None
         self._engine_lock = asyncio.Lock()
         self._started_at = time.time()
         self._client_count: Callable[[], int] = lambda: 0
@@ -60,6 +61,42 @@ class RuntimeLeapService:
         self._install_daemon_approval(ctx)
         self._install_learn_notifications(ctx)
         self._ctx = ctx
+        await self._start_monitors(ctx)
+
+    async def _start_monitors(self, ctx: Any) -> None:
+        """Build and start the daemon-hosted monitor runtime (watches)."""
+        settings = getattr(ctx, "settings", self._settings)
+        if not getattr(settings, "scheduler_enabled", True):
+            return
+        try:
+            from leapflow.monitor import MonitorManager, SessionAnalysisProducer
+
+            bus = self.notification_bus
+            self._monitors = MonitorManager(
+                holder=ctx._db_holder,
+                emit=lambda event_type, payload: bus.emit_event(event_type, **payload),
+                services=_ProducerServices(self),
+                tick_seconds=int(getattr(settings, "scheduler_tick_seconds", 60)),
+                grace_seconds=float(getattr(settings, "scheduler_grace_seconds", 120.0)),
+            )
+            self._monitors.producers.register(SessionAnalysisProducer())
+            setattr(ctx, "monitors", self._monitors)
+            await self._monitors.start()
+            logger.debug("daemon: monitor runtime started")
+        except Exception:
+            logger.debug("daemon: monitor runtime start skipped", exc_info=True)
+            self._monitors = None
+            setattr(ctx, "monitors", None)
+
+    def has_active_watches(self) -> bool:
+        """Return True when any hosted watch is armed/watching (idle keep-alive)."""
+        monitors = self._monitors
+        if monitors is None:
+            return False
+        try:
+            return bool(monitors.has_active_watches())
+        except Exception:
+            return False
 
     @property
     def context(self) -> Any:
@@ -203,6 +240,154 @@ class RuntimeLeapService:
 
     async def scheduler_arm(self, task_config: dict[str, Any]) -> str:
         raise NotImplementedError("scheduler.arm is not available in this daemon phase")
+
+    # ── Watch runtime (monitor subsystem) ───────────────────────────────
+
+    def _require_monitors(self) -> Any:
+        if self._monitors is None:
+            raise RuntimeError("monitor runtime is not available (scheduler disabled)")
+        return self._monitors
+
+    async def watch_arm(self, spec: dict[str, Any]) -> dict[str, Any]:
+        from leapflow.monitor import WatchSpec
+
+        view = await self._require_monitors().arm_watch(WatchSpec.from_dict(spec or {}))
+        return view.to_dict()
+
+    async def watch_list(self) -> list[dict[str, Any]]:
+        if self._monitors is None:
+            return []
+        return [view.to_dict() for view in self._monitors.list_watches()]
+
+    async def watch_get(self, watch_id: str) -> dict[str, Any]:
+        view = self._require_monitors().get_watch(watch_id)
+        return view.to_dict() if view else {}
+
+    async def watch_pause(self, watch_id: str) -> dict[str, Any]:
+        view = self._require_monitors().pause_watch(watch_id)
+        return view.to_dict() if view else {}
+
+    async def watch_resume(self, watch_id: str) -> dict[str, Any]:
+        view = self._require_monitors().resume_watch(watch_id)
+        return view.to_dict() if view else {}
+
+    async def watch_stop(self, watch_id: str) -> dict[str, Any]:
+        view = self._require_monitors().stop_watch(watch_id)
+        return view.to_dict() if view else {}
+
+    async def watch_mute(self, watch_id: str, muted: bool = True) -> dict[str, Any]:
+        view = self._require_monitors().set_muted(watch_id, bool(muted))
+        return view.to_dict() if view else {}
+
+    async def watch_refresh(self, watch_id: str) -> dict[str, Any]:
+        return await self._require_monitors().run_watch_once(watch_id)
+
+    async def watch_findings(
+        self, watch_id: str = "", limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        if self._monitors is None:
+            return []
+        findings = self._monitors.list_findings(
+            watch_id=watch_id or None, limit=int(limit), offset=int(offset)
+        )
+        return [finding.to_dict() for finding in findings]
+
+    # ── Session analysis (domain=session watch) ───────────────────────
+
+    async def session_history(self, limit: int = 200) -> dict[str, Any]:
+        ctx = self._ctx
+        if ctx is None:
+            return {"session_id": "", "turn_count": 0, "token_count": 0, "messages": []}
+        engine = getattr(ctx, "engine", None)
+        messages: list[dict[str, Any]] = []
+        if engine is not None:
+            wm = getattr(engine, "_wm", None)
+            if wm is not None and hasattr(wm, "as_chat_messages"):
+                try:
+                    messages = [dict(m) for m in wm.as_chat_messages() if isinstance(m, dict)]
+                except Exception:
+                    messages = []
+        if not messages:
+            store = getattr(ctx, "_conversation_store", None)
+            session_id = getattr(engine, "_current_session_id", "") if engine else ""
+            if store is not None and session_id:
+                try:
+                    messages = [
+                        dict(m) for m in store.get_messages(session_id, limit=int(limit))
+                        if isinstance(m, dict)
+                    ]
+                except Exception:
+                    messages = []
+        normalized = [
+            {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
+            for m in messages
+        ][-int(limit):]
+        return {
+            "session_id": getattr(engine, "_current_session_id", "") if engine else "",
+            "turn_count": int(getattr(engine, "turn_count", 0)) if engine else 0,
+            "token_count": int(getattr(engine, "context_token_count", 0)) if engine else 0,
+            "messages": normalized,
+        }
+
+    async def session_analyze(self) -> dict[str, Any]:
+        if self._monitors is None:
+            return {"ok": False, "error": "monitor runtime unavailable"}
+        watch_id = await self._ensure_session_watch()
+        result = await self._monitors.run_watch_once(watch_id, force=True)
+        return {"ok": bool(result.get("ok", True)), "watch_id": watch_id, "result": result}
+
+    async def _ensure_session_watch(self) -> str:
+        from leapflow.monitor.session_producer import ensure_session_watch, session_watch_params
+
+        monitors = self._require_monitors()
+        settings = getattr(self._ctx, "settings", self._settings)
+        return await ensure_session_watch(monitors, params=session_watch_params(settings))
+
+    async def _analyze_session_llm(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "story": "", "insights": [], "decisions": [], "action_items": [],
+            "open_questions": [], "entities": [], "next_prompts": [], "usage": {},
+        }
+        ctx = self._ctx
+        llm = getattr(ctx, "llm", None) if ctx is not None else None
+        if llm is None or not messages:
+            return base
+        transcript = "\n".join(
+            f"{m.get('role', '')}: {str(m.get('content', ''))[:500]}" for m in messages[-40:]
+        )[:12000]
+        prompt = [
+            {"role": "system", "content": _SESSION_ANALYSIS_SYSTEM},
+            {"role": "user", "content": transcript},
+        ]
+        try:
+            response = await llm.achat(prompt, stream=False)
+            data = _parse_session_json(getattr(response, "content", ""))
+        except Exception:
+            logger.debug("daemon: session analysis LLM call failed", exc_info=True)
+            return base
+        if isinstance(data, dict):
+            for key in base:
+                if key != "usage" and key in data:
+                    base[key] = data[key]
+        return base
+
+    async def _session_should_refresh(self, messages: list[dict[str, Any]]) -> bool:
+        ctx = self._ctx
+        llm = getattr(ctx, "llm", None) if ctx is not None else None
+        if llm is None or not messages:
+            return False
+        tail = "\n".join(
+            f"{m.get('role', '')}: {str(m.get('content', ''))[:200]}" for m in messages[-6:]
+        )[:2000]
+        prompt = [
+            {"role": "system", "content": _SESSION_SALIENCE_SYSTEM},
+            {"role": "user", "content": tail},
+        ]
+        try:
+            response = await llm.achat(prompt, stream=False)
+            return str(getattr(response, "content", "")).strip().upper().startswith("Y")
+        except Exception:
+            return False
 
     async def status(self) -> dict[str, Any]:
         ctx = self._ctx
@@ -415,6 +600,12 @@ class RuntimeLeapService:
             return
         ctx = self._ctx
         self._ctx = None
+        if self._monitors is not None:
+            try:
+                await self._monitors.stop()
+            except Exception:
+                logger.debug("daemon: monitor stop failed", exc_info=True)
+            self._monitors = None
         self._checkpoint_open_connection(ctx)
         await ctx.cleanup()
 
@@ -728,6 +919,60 @@ class RuntimeLeapService:
             event_type=event.type,
             metadata=metadata,
         )
+
+
+_SESSION_ANALYSIS_SYSTEM = (
+    "You are a session analyst. Read the conversation transcript and return STRICT "
+    "JSON only, with keys: story (string narrative of the session arc), insights "
+    "(array of {title, summary, severity in [info,notable,alert]}), decisions "
+    "(array of strings), action_items (array of strings), open_questions (array of "
+    "strings), entities (array of strings), next_prompts (array of strings). Do not "
+    "wrap the JSON in prose or code fences."
+)
+
+_SESSION_SALIENCE_SYSTEM = (
+    "Answer with only YES or NO: does the latest conversation contain a new decision, "
+    "a topic shift, or a new action item that would justify refreshing an analysis "
+    "dashboard?"
+)
+
+
+def _parse_session_json(content: str) -> Any:
+    """Best-effort extraction of a JSON object from an LLM response."""
+    import json as _json
+
+    text = str(content or "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if "\n" in text:
+            first, rest = text.split("\n", 1)
+            if first.strip().lower().startswith("json"):
+                text = rest
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end + 1]
+    try:
+        return _json.loads(text)
+    except Exception:
+        return None
+
+
+class _ProducerServices:
+    """Facade exposing daemon capabilities to monitor producers (session, etc.)."""
+
+    def __init__(self, service: "RuntimeLeapService") -> None:
+        self._service = service
+
+    async def session_history(self) -> dict[str, Any]:
+        return await self._service.session_history()
+
+    async def analyze_session(
+        self, messages: list[dict[str, Any]], *, prior: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return await self._service._analyze_session_llm(messages)
+
+    async def should_refresh(self, messages: list[dict[str, Any]]) -> bool:
+        return await self._service._session_should_refresh(messages)
 
 
 class _DaemonApprovalGate:

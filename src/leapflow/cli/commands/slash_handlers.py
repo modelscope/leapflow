@@ -1112,7 +1112,173 @@ async def command_execute(ctx: "Context", name: str, args: str = "") -> dict[str
         return await _execute_scheduler_arm(ctx, args)
     if name == "task":
         return _execute_scheduler_task(ctx)
+    if name == "dashboard" or name.startswith("dashboard "):
+        return await _execute_dashboard(ctx, name, args)
     return {"ok": False, "message": f"Unknown command: /{name}"}
+
+
+def _parse_watch_spec(tokens: list[str]) -> dict[str, Any]:
+    """Parse ``<domain> [--name N --trigger EXPR --sensitivity S]`` into a spec dict."""
+    spec: dict[str, Any] = {"domain": tokens[0]}
+    flag_map = {"--name": "name", "--trigger": "trigger_expr", "--sensitivity": "sensitivity"}
+    i = 1
+    while i < len(tokens):
+        key = flag_map.get(tokens[i])
+        if key and i + 1 < len(tokens):
+            spec[key] = tokens[i + 1]
+            i += 2
+        else:
+            i += 1
+    spec.setdefault("name", spec["domain"])
+    return spec
+
+
+def _resolve_watch_id(monitors: Any, token: str) -> str:
+    """Accept a full watch id or a unique short prefix from the list view."""
+    try:
+        views = monitors.list_watches()
+    except Exception:
+        return token
+    for view in views:
+        if view.watch_id == token:
+            return token
+    matches = [view.watch_id for view in views if view.watch_id.startswith(token)]
+    return matches[0] if len(matches) == 1 else token
+
+
+async def _ensure_session_watch_refresh(ctx: "Context", monitors: Any) -> None:
+    """Ensure an active session watch exists and run one analysis cycle now."""
+    from leapflow.monitor.session_producer import ensure_session_watch, session_watch_params
+
+    watch_id = await ensure_session_watch(
+        monitors, params=session_watch_params(getattr(ctx, "settings", None))
+    )
+    await monitors.run_watch_once(watch_id, force=True)
+
+
+async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[str, Any]:
+    """Manage monitor watches from the TUI (data operations; web open is separate)."""
+    monitors = getattr(ctx, "monitors", None)
+    sub = name[len("dashboard"):].strip()
+    rest = (sub + ((" " + args) if args else "")).strip() if sub else args.strip()
+    try:
+        tokens = shlex.split(rest) if rest else []
+    except ValueError:
+        tokens = rest.split()
+    action = tokens[0].lower() if tokens else "open"
+    rest_tokens = tokens[1:]
+
+    if monitors is None:
+        return {"ok": False, "message": "Monitor runtime is unavailable (scheduler disabled)."}
+
+    if action in ("list", "ls"):
+        return {"ok": True, "view": "dashboard", "mode": "list",
+                "watches": [v.to_dict() for v in monitors.list_watches()]}
+
+    if action == "status":
+        watches = monitors.list_watches()
+        by_state: dict[str, int] = {}
+        findings_total = 0
+        for v in watches:
+            by_state[v.state] = by_state.get(v.state, 0) + 1
+            findings_total += v.finding_count
+        return {"ok": True, "view": "dashboard", "mode": "status",
+                "count": len(watches), "by_state": by_state, "findings_total": findings_total,
+                "domains": sorted({v.domain for v in watches})}
+
+    if action in ("new", "add", "arm"):
+        if not rest_tokens:
+            return {"ok": False, "message": "Usage: /dashboard new <domain> [--name N --trigger EXPR --sensitivity S]"}
+        from leapflow.monitor import WatchSpec
+
+        view = await monitors.arm_watch(WatchSpec.from_dict(_parse_watch_spec(rest_tokens)))
+        return {"ok": True, "view": "dashboard", "mode": "armed", "watch": view.to_dict()}
+
+    if action in ("pause", "resume", "stop"):
+        if not rest_tokens:
+            return {"ok": False, "message": f"Usage: /dashboard {action} <id>"}
+        watch_id = _resolve_watch_id(monitors, rest_tokens[0])
+        method = {"pause": monitors.pause_watch, "resume": monitors.resume_watch,
+                  "stop": monitors.stop_watch}[action]
+        view = method(watch_id)
+        if view is None:
+            return {"ok": False, "message": f"Watch not found: {rest_tokens[0]}"}
+        return {"ok": True, "view": "dashboard", "mode": "control", "action": action,
+                "watch": view.to_dict()}
+
+    if action == "mute":
+        if not rest_tokens:
+            return {"ok": False, "message": "Usage: /dashboard mute <id> [on|off]"}
+        watch_id = _resolve_watch_id(monitors, rest_tokens[0])
+        muted = not (len(rest_tokens) > 1 and rest_tokens[1].lower() in ("off", "false", "0", "no"))
+        view = monitors.set_muted(watch_id, muted)
+        if view is None:
+            return {"ok": False, "message": f"Watch not found: {rest_tokens[0]}"}
+        return {"ok": True, "view": "dashboard", "mode": "control", "action": "mute",
+                "watch": view.to_dict()}
+
+    if action == "refresh":
+        if not rest_tokens:
+            return {"ok": False, "message": "Usage: /dashboard refresh <id>"}
+        watch_id = _resolve_watch_id(monitors, rest_tokens[0])
+        result = await monitors.run_watch_once(watch_id)
+        return {"ok": bool(result.get("ok", False)), "view": "dashboard", "mode": "refresh",
+                "watch_id": watch_id, "result": result,
+                "message": None if result.get("ok") else str(result.get("error", "refresh failed"))}
+
+    if action == "findings":
+        positional = [t for t in rest_tokens if not t.startswith("--")]
+        watch_id = _resolve_watch_id(monitors, positional[0]) if positional else ""
+        limit = 20
+        if "--limit" in rest_tokens:
+            try:
+                limit = int(rest_tokens[rest_tokens.index("--limit") + 1])
+            except (ValueError, IndexError):
+                pass
+        findings = monitors.list_findings(watch_id=watch_id or None, limit=limit)
+        return {"ok": True, "view": "dashboard", "mode": "findings",
+                "findings": [f.to_dict() for f in findings]}
+
+    if action in ("open", "home", "session"):
+        from leapflow.dashboard import launcher
+        from leapflow.dashboard.intent import DashboardIntent
+
+        intent = DashboardIntent.from_args(rest)
+        # Bare `/dashboard` (open, no target): prefer the session view when there
+        # is an active conversation, otherwise the overview.
+        if intent.action == "open" and not intent.target:
+            engine = getattr(ctx, "engine", None)
+            if engine is not None and int(getattr(engine, "turn_count", 0) or 0) > 0:
+                intent = DashboardIntent(action="session", target="session")
+        if intent.action == "session" and monitors is not None:
+            try:
+                await _ensure_session_watch_refresh(ctx, monitors)
+            except Exception:
+                pass
+        settings = getattr(ctx, "settings", None)
+        state = None
+        if settings is not None:
+            try:
+                state = launcher.server_running(settings)
+            except Exception:
+                state = None
+        payload: dict[str, Any] = {
+            "ok": True, "view": "dashboard", "mode": "open",
+            "action": intent.action, "intent": intent.to_dict(), "running": bool(state),
+        }
+        if state:
+            url = launcher.build_url(state["bind"], state["port"], state["token"])
+            if intent.action != "home":
+                url += f"&action={intent.action}"
+                if intent.action == "session":
+                    url += "&target=session"
+            payload["url"] = url
+        else:
+            payload["hint"] = "Run `leap dashboard` to open the web view."
+        return payload
+
+    return {"ok": False, "message": f"Unknown dashboard subcommand: {action}. "
+            "Try list|status|new|pause|resume|stop|mute|refresh|findings|open|session."}
 
 
 def _is_app_command_name(name: str) -> bool:
@@ -1509,10 +1675,97 @@ def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> N
     if view == "task":
         _render_task_view(console, payload)
         return
+    if view == "dashboard":
+        _render_dashboard_view(console, payload)
+        return
 
     msg = payload.get("message")
     if msg:
         console.success(str(msg))
+
+
+def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    from rich.table import Table
+
+    mode = str(payload.get("mode") or "")
+    if mode == "list":
+        watches = payload.get("watches") or []
+        if not watches:
+            console.system("No watches. Create one with /dashboard new <domain>.")
+            return
+        table = Table(title="Watches", title_style="bold cyan", border_style="bright_black")
+        for col in ("id", "name", "domain", "trigger", "state", "muted", "runs", "findings"):
+            table.add_column(col)
+        for w in watches:
+            table.add_row(
+                str(w.get("watch_id", ""))[:8],
+                str(w.get("name", "")),
+                str(w.get("domain", "")),
+                str(w.get("trigger", "")),
+                str(w.get("state", "")),
+                "yes" if w.get("muted") else "",
+                str(w.get("run_count", 0)),
+                str(w.get("finding_count", 0)),
+            )
+        console.print(table)
+        return
+    if mode == "status":
+        by_state = payload.get("by_state") or {}
+        parts = ", ".join(f"{k}:{v}" for k, v in sorted(by_state.items())) or "none"
+        console.system(
+            f"Watches: {payload.get('count', 0)} ({parts}) · "
+            f"findings: {payload.get('findings_total', 0)} · "
+            f"domains: {', '.join(payload.get('domains') or []) or '-'}"
+        )
+        return
+    if mode == "armed":
+        w = payload.get("watch") or {}
+        console.success(
+            f"Armed watch {str(w.get('watch_id', ''))[:8]} · {w.get('domain')} · {w.get('trigger')}"
+        )
+        return
+    if mode == "control":
+        w = payload.get("watch") or {}
+        suffix = " (muted)" if w.get("muted") else ""
+        console.success(
+            f"{payload.get('action', 'update')}: {w.get('name')} "
+            f"[{str(w.get('watch_id', ''))[:8]}] -> {w.get('state')}{suffix}"
+        )
+        return
+    if mode == "refresh":
+        r = payload.get("result") or {}
+        console.success(
+            f"Refreshed {str(payload.get('watch_id', ''))[:8]} · "
+            f"{r.get('findings', 0)} finding(s), {r.get('emitted', 0)} pushed"
+        )
+        return
+    if mode == "open":
+        url = payload.get("url")
+        if url:
+            console.system(f"Dashboard: {url}")
+        elif payload.get("running"):
+            console.system("Dashboard is running.")
+        else:
+            console.system(str(payload.get("hint") or "Run `leap dashboard` to open the web view."))
+        return
+    if mode == "findings":
+        _render_findings_lines(console, payload.get("findings") or [])
+        return
+
+
+def _render_findings_lines(console: "LeapConsole", findings: list) -> None:
+    if not findings:
+        console.system("No findings yet.")
+        return
+    markers = {"alert": "!!", "notable": " *", "info": " -"}
+    for f in findings[:50]:
+        sev = str(f.get("severity", "info"))
+        title = str(f.get("title", ""))
+        summary = str(f.get("summary", ""))
+        line = f"{markers.get(sev, ' -')} [{sev}] {title}"
+        if summary:
+            line += f" — {summary}"
+        console.system(line)
 
 
 def _render_status_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
