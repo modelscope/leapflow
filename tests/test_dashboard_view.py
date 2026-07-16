@@ -59,7 +59,7 @@ async def test_builder_overview_renders_findings() -> None:
     )
     builder = DashboardViewBuilder(TemplateLibrary())
     spec = await builder.build(DashboardIntent(action="home"), provider)
-    assert spec["title"] == "LeapFlow Monitors"
+    assert spec["title"] == "LeapBoard"
     assert len(_finding_cards(spec)) == 1
 
 
@@ -80,6 +80,8 @@ async def test_builder_overview_lists_watch_lanes() -> None:
             _walk(node.get("children") or [])
 
     _walk(spec["root"])
+    types = {n["type"] for n in flat}
+    assert {"BarChart", "Timeline"}.issubset(types)
     watch_cards = [n for n in flat if n["type"] == "Card" and n.get("action", {}).get("name") == "openWatch"]
     assert len(watch_cards) == 1
     assert watch_cards[0]["action"]["params"]["target"] == "w1"
@@ -123,6 +125,8 @@ async def test_builder_session_uses_analysis_payload() -> None:
     _walk(spec["root"])
     types = {n["type"] for n in flat}
     assert "StoryPanel" in types
+    assert "BarChart" in types
+    assert "EntityGraph" in types
     assert len([n for n in flat if n["type"] == "InsightCard"]) == 1  # from analysis payload
 
 

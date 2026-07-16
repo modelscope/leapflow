@@ -10,15 +10,27 @@ layout:
     props:
       title: "Session Analysis"
     children:
-      - type: StoryPanel
+      - type: Section
         props:
-          title: "Story"
-          text: "{{ analysis.story }}"
-      - type: Grid
+          title: "Executive brief"
+          subtitle: "Conversation intelligence rendered like an analyst memo: storyline first, then implications."
         children:
-          - type: Card
-            props:
-              title: "Insights"
+          - type: Grid
+            children:
+              - type: StoryPanel
+                props:
+                  title: "Storyline"
+                  text: "{{ analysis.story }}"
+              - type: BarChart
+                props:
+                  title: "Severity mix"
+                  bind: analysis.insights
+      - type: Section
+        props:
+          title: "Insights"
+          subtitle: "Key observations are carded and capped for fast reading."
+        children:
+          - type: Grid
             children:
               - type: InsightCard
                 repeat: analysis.insights
@@ -28,38 +40,52 @@ layout:
                   summary: "{{ i.summary }}"
                   severity: "{{ i.severity }}"
                   bind: i
-          - type: Card
-            props:
-              title: "Action items"
-            children:
-              - type: List
-                props:
-                  bind: analysis.action_items
-          - type: Card
-            props:
-              title: "Decisions"
-            children:
-              - type: List
-                props:
-                  bind: analysis.decisions
-          - type: Card
-            props:
-              title: "Open questions"
-            children:
-              - type: List
-                props:
-                  bind: analysis.open_questions
-          - type: Card
-            props:
-              title: "Entities"
-            children:
-              - type: List
-                props:
-                  bind: analysis.entities
-      - type: Card
+      - type: Section
         props:
-          title: "Suggested next prompts"
+          title: "Operating agenda"
+          subtitle: "Decisions, actions, and unresolved questions are separated so the next step is obvious."
         children:
-          - type: SuggestionChips
-            props:
-              bind: analysis.next_prompts
+          - type: Grid
+            children:
+              - type: Card
+                props:
+                  title: "Action items"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.action_items
+              - type: Card
+                props:
+                  title: "Decisions"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.decisions
+              - type: Card
+                props:
+                  title: "Open questions"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.open_questions
+      - type: Section
+        props:
+          title: "Context map"
+          subtitle: "Entities and recommended follow-ups keep the analysis actionable."
+        children:
+          - type: Grid
+            children:
+              - type: Card
+                props:
+                  title: "Entities"
+                children:
+                  - type: EntityGraph
+                    props:
+                      bind: analysis.entities
+              - type: Card
+                props:
+                  title: "Suggested next prompts"
+                children:
+                  - type: SuggestionChips
+                    props:
+                      bind: analysis.next_prompts

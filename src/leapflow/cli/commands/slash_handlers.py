@@ -1244,7 +1244,7 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
         from leapflow.dashboard.intent import DashboardIntent
 
         intent = DashboardIntent.from_args(rest)
-        # Bare `/dashboard` (open, no target): prefer the session view when there
+        # Bare `/board` (open, no target): prefer the session view when there
         # is an active conversation, otherwise the overview.
         if intent.action == "open" and not intent.target:
             engine = getattr(ctx, "engine", None)

@@ -7,30 +7,56 @@ layout:
     props:
       title: "{{ title }}"
     children:
-      - type: Row
-        children:
-          - type: Gauge
-            props:
-              label: "Latest sentiment"
-              bind: "findings[0].payload.sentiment"
-          - type: Stat
-            props:
-              label: "Mentions"
-              value: "{{ watch.finding_count }}"
-      - type: Board
+      - type: Section
         props:
-          title: "Mentions"
+          title: "Narrative pulse"
+          subtitle: "Sentiment is presented as a direction, distribution, and evidence stream."
         children:
-          - type: FindingCard
-            repeat: findings
-            as: f
+          - type: Row
+            children:
+              - type: Gauge
+                props:
+                  label: "Latest sentiment"
+                  bind: "findings[0].payload.sentiment"
+              - type: Stat
+                props:
+                  label: "Mentions"
+                  value: "{{ watch.finding_count }}"
+              - type: PieChart
+                props:
+                  title: "Sentiment structure"
+                  bind: findings
+      - type: Section
+        props:
+          title: "Signal momentum"
+          subtitle: "A compact directional view of how the topic is evolving."
+        children:
+          - type: LineChart
             props:
-              title: "{{ f.title }}"
-              summary: "{{ f.summary }}"
-              severity: "{{ f.severity }}"
-              bind: f
-            action:
-              kind: intent
-              name: drilldown
-              params:
-                finding_id: "{{ f.finding_id }}"
+              title: "Mentions"
+              bind: findings
+      - type: Section
+        props:
+          title: "Evidence stream"
+          subtitle: "Representative mentions are formatted for scanning and drill-down."
+        children:
+          - type: Timeline
+            props:
+              bind: findings
+          - type: Board
+            props:
+              title: "Mentions"
+            children:
+              - type: FindingCard
+                repeat: findings
+                as: f
+                props:
+                  title: "{{ f.title }}"
+                  summary: "{{ f.summary }}"
+                  severity: "{{ f.severity }}"
+                  bind: f
+                action:
+                  kind: intent
+                  name: drilldown
+                  params:
+                    finding_id: "{{ f.finding_id }}"

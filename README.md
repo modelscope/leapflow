@@ -524,12 +524,14 @@ It is domain-neutral by design: finance, sentiment, research, and session analys
 
 ```
 Watch (leapd-hosted) ── observe → SNR filter → score → Finding ──▶ NotificationBus
-                                                                      │ push
+        ▲                                                              │ push
+        └── trigger / manual refresh / session batch / salience ───────┘
   YAML template ─▶ ViewSpec (validated) ─▶ Web board (SDUI) ◀── WebSocket
 ```
 
-- **Runtime** — watches run inside the shared `leapd` daemon, so they survive TUI restarts and are shared across clients. Findings are persisted (DuckDB) and pushed live; session-analysis watches are client-coupled and never keep the daemon alive on their own.
-- **Server-Driven UI** — each scenario is authored as a **YAML template** compiled into a validated **ViewSpec** over a fixed component catalog (cards, tables, charts, gauges, story panels…). Interactive components talk back through a bidirectional action protocol; unknown component types degrade gracefully, and bespoke visuals use a `Custom` escape hatch. The board never renders arbitrary HTML/JS.
+- **Continuous observation** — a board starts as a `Watch` in `leapd`. Scheduler triggers, manual `/board refresh`, and session-analysis batch thresholds all run the same observe→finding cycle; new findings are persisted, severity-gated, and pushed to browsers over WebSocket.
+- **Refresh model** — overview boards refresh when watch state or new findings arrive; session boards refresh as the conversation accumulates turns (and can optionally use model salience). Muted watches still persist findings but stop pushing notifications; paused/stopped watches stop observing.
+- **Server-Driven UI** — each scenario is authored as a **YAML template** compiled into a validated **ViewSpec** over a fixed component catalog (cards, tables, charts, timelines, gauges, story panels…). Interactive components talk back through a bidirectional action protocol; unknown component types degrade gracefully, and bespoke visuals use a `Custom` escape hatch. The board never renders arbitrary HTML/JS.
 - **View client** — the board connects to `leapd` like the TUI does, with no privileged coupling. The web server is optional (`aiohttp`) and degrades with a clear install hint when absent.
 
 ### Install & enable
@@ -550,21 +552,12 @@ The board binds to `127.0.0.1` with a per-session access token. Tune it through 
 
 ### Usage
 
-**Slash command (`/board`)** — inside the TUI:
+**Start / open** — from the TUI or shell:
 
 ```text
 /board                     open the board (session analysis if a conversation is active, else overview)
 /board session             open the current-session analysis board
-/board new finance --name "AAPL watch" --trigger 5m
-/board list                list active watches (in-TUI)
-/board findings            show recent findings
-/board pause|resume|stop|mute <id>
-/board refresh <id>        run one observation cycle now
 ```
-
-**Natural language** — just ask ("open a finance board", "analyze this conversation"); the agent opens or creates boards for you.
-
-**CLI** — from any shell:
 
 ```bash
 leap board                 # ensure the server is running and open the browser
@@ -572,14 +565,29 @@ leap board session         # open the session-analysis board
 leap board --no-open       # print the URL instead of opening a browser
 ```
 
-Executing any entry auto-launches your default browser at the token-scoped local URL.
+Executing any entry auto-launches your default browser at the token-scoped local URL. Inside the browser, the language switcher supports English, Chinese, French, Spanish, Arabic, and Russian.
+
+**Create and manage watches** — inside the TUI:
+
+```text
+/board new finance --name "AAPL watch" --trigger 5m
+/board list                list active watches
+/board findings            show recent findings
+/board refresh <id>        run one observation cycle now
+/board pause <id>          temporarily stop observation
+/board resume <id>         resume observation
+/board mute <id> [on|off]  keep observing but suppress push notifications
+/board stop <id>           end the watch and remove it from active refresh
+```
+
+**Natural language** — just ask ("open a finance board", "analyze this conversation"); the agent opens or creates boards for you when the runtime can safely map the request to a board intent.
 
 ### Showcase
 
-- **Financial market watch** — monitor a symbol or source on an interval/condition; anomalies and opportunities arrive as alert-severity finding cards alongside a candlestick panel.
-- **Public-opinion (sentiment) watch** — track a brand or topic; a sentiment gauge plus a live stream of representative mentions.
-- **Paper hunting** — watch arXiv / venues / authors / keywords; new relevant papers appear as cards linking straight to the source.
-- **Session analysis (built-in)** — after a few conversation turns, `/board session` opens a board that reads the transcript and renders a story arc, insights, decisions, action items, open questions, an entity view, and suggested next prompts — refreshing automatically as the conversation grows (batch threshold, optional model salience, or manual `/board refresh`).
+- **Financial market watch** — monitor a symbol or source on an interval/condition; the board emphasizes price/action charts, severity mix, signal momentum, and capped evidence cards.
+- **Public-opinion (sentiment) watch** — track a brand or topic; sentiment direction, distribution, timeline, and representative mentions are shown as an analyst-style narrative pulse.
+- **Paper hunting** — watch arXiv / venues / authors / keywords; new papers flow through a research-pipeline layout with source links and clipped abstracts.
+- **Session analysis (built-in)** — after a few conversation turns, `/board session` opens a board that reads the transcript and renders a storyline, insights, decisions, action items, open questions, an entity map, and suggested next prompts — refreshing automatically as the conversation grows (batch threshold, optional model salience, or manual `/board refresh`).
 
 > Adding a new scenario = one YAML template (plus an optional renderer) and a producer. The board core stays untouched — no domain branching, no hardcoded layouts.
 

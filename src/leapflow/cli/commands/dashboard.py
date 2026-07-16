@@ -1,4 +1,4 @@
-"""`leap dashboard` — open or serve the monitoring web dashboard.
+"""`leap board` — open or serve the LeapBoard monitoring web dashboard.
 
 Two modes:
 - default (client): ensure a dashboard server is running, then open the default
@@ -25,7 +25,7 @@ _DEP_HINT = (
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
-    """Entry point for the ``leap dashboard`` subcommand."""
+    """Entry point for the ``leap board`` subcommand."""
     settings = load_config()
 
     if not launcher.aiohttp_available():

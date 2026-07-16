@@ -74,7 +74,7 @@ class DashboardViewBuilder:
     async def _build_overview(self, intent: DashboardIntent, provider: DashboardDataProvider) -> dict[str, Any]:
         watches = await provider.watches()
         findings = await provider.findings(watch_id="", limit=50)
-        data = {"title": "LeapFlow Monitors", "watches": watches, "findings": findings}
+        data = {"title": "LeapBoard", "watches": watches, "findings": findings}
         name = "overview" if "overview" in self._templates.names() else "generic"
         return self._templates.render(name, data)
 

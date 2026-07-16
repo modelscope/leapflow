@@ -46,6 +46,8 @@ def test_finance_template_uses_custom_candlestick() -> None:
     })
     types = _types(spec)
     assert "Custom" in types  # escape-hatch candlestick component
+    assert "PieChart" in types
+    assert "Sparkline" in types
     assert "Stat" in types
     assert len([n for n in _flatten(spec) if n["type"] == "FindingCard"]) == 1
     custom = next(n for n in _flatten(spec) if n["type"] == "Custom")
@@ -62,6 +64,8 @@ def test_sentiment_template_binds_gauge_value() -> None:
     })
     gauge = next(n for n in _flatten(spec) if n["type"] == "Gauge")
     assert gauge["props"]["data"] == 0.82  # bound from findings[0].payload.sentiment
+    assert "PieChart" in _types(spec)
+    assert "LineChart" in _types(spec)
 
 
 def test_research_template_binds_paper_link_action() -> None:
@@ -72,6 +76,9 @@ def test_research_template_binds_paper_link_action() -> None:
                       "payload": {"url": "http://arxiv.org/abs/x"}}],
     })
     cards = [n for n in _flatten(spec) if n["type"] == "FindingCard"]
+    types = _types(spec)
+    assert "PieChart" in types
+    assert "Timeline" in types
     assert len(cards) == 1
     assert cards[0]["action"]["kind"] == "nav"
     assert cards[0]["action"]["params"]["url"] == "http://arxiv.org/abs/x"
@@ -79,5 +86,7 @@ def test_research_template_binds_paper_link_action() -> None:
 
 def test_custom_component_is_in_catalog_and_survives_normalize() -> None:
     assert "Custom" in COMPONENT_TYPES
+    for component in ("BarChart", "PieChart", "LineChart", "Sparkline", "Timeline", "EntityGraph"):
+        assert component in COMPONENT_TYPES
     spec = normalize_viewspec({"root": [{"type": "Custom", "props": {"render": "candlestick"}}]})
     assert spec["root"][0]["type"] == "Custom"

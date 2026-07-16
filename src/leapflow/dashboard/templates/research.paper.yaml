@@ -7,20 +7,39 @@ layout:
     props:
       title: "{{ title }}"
     children:
-      - type: Board
+      - type: Section
+        props:
+          title: "Research pipeline"
+          subtitle: "New papers are organized as a decision funnel: signal mix, timeline, then source links."
+        children:
+          - type: Grid
+            children:
+              - type: PieChart
+                props:
+                  title: "Severity mix"
+                  bind: findings
+              - type: Timeline
+                props:
+                  bind: findings
+      - type: Section
         props:
           title: "New papers"
+          subtitle: "Abstracts are clipped for readability; open source links for the full paper."
         children:
-          - type: FindingCard
-            repeat: findings
-            as: f
+          - type: Board
             props:
-              title: "{{ f.title }}"
-              summary: "{{ f.summary }}"
-              severity: "{{ f.severity }}"
-              bind: f
-            action:
-              kind: nav
-              name: openLink
-              params:
-                url: "{{ f.payload.url }}"
+              title: "New papers"
+            children:
+              - type: FindingCard
+                repeat: findings
+                as: f
+                props:
+                  title: "{{ f.title }}"
+                  summary: "{{ f.summary }}"
+                  severity: "{{ f.severity }}"
+                  bind: f
+                action:
+                  kind: nav
+                  name: openLink
+                  params:
+                    url: "{{ f.payload.url }}"

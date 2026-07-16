@@ -7,38 +7,59 @@ layout:
     props:
       title: "{{ title }}"
     children:
-      - type: Row
+      - type: Section
+        props:
+          title: "Market brief"
+          subtitle: "Price action, signal count, and severity structure in one executive view."
         children:
-          - type: Stat
-            props:
-              label: "Watch"
-              value: "{{ watch.name }}"
-          - type: Stat
-            props:
-              label: "Signals"
-              value: "{{ watch.finding_count }}"
-      - type: Card
+          - type: Row
+            children:
+              - type: Stat
+                props:
+                  label: "Watch"
+                  value: "{{ watch.name }}"
+              - type: Stat
+                props:
+                  label: "Signals"
+                  value: "{{ watch.finding_count }}"
+              - type: PieChart
+                props:
+                  title: "Signal mix"
+                  bind: findings
+      - type: Section
         props:
           title: "Price action"
+          subtitle: "Chart-first reading before drilling into narrative evidence."
         children:
-          - type: Custom
-            props:
-              render: candlestick
-              bind: findings
-      - type: Board
+          - type: Grid
+            children:
+              - type: Custom
+                props:
+                  render: candlestick
+                  bind: findings
+              - type: Sparkline
+                props:
+                  title: "Signal momentum"
+                  bind: findings
+      - type: Section
         props:
-          title: "Signals"
+          title: "Evidence stream"
+          subtitle: "Each card is capped for scanability; open it for drill-down context."
         children:
-          - type: FindingCard
-            repeat: findings
-            as: f
+          - type: Board
             props:
-              title: "{{ f.title }}"
-              summary: "{{ f.summary }}"
-              severity: "{{ f.severity }}"
-              bind: f
-            action:
-              kind: intent
-              name: drilldown
-              params:
-                finding_id: "{{ f.finding_id }}"
+              title: "Signals"
+            children:
+              - type: FindingCard
+                repeat: findings
+                as: f
+                props:
+                  title: "{{ f.title }}"
+                  summary: "{{ f.summary }}"
+                  severity: "{{ f.severity }}"
+                  bind: f
+                action:
+                  kind: intent
+                  name: drilldown
+                  params:
+                    finding_id: "{{ f.finding_id }}"

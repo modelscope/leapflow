@@ -10,28 +10,40 @@ layout:
     props:
       title: "{{ title }}"
     children:
-      - type: Toolbar
-        children:
-          - type: FilterBar
-            props:
-              fields: ["severity", "domain", "watch"]
-            action:
-              kind: nav
-              name: filter
-      - type: Board
+      - type: Section
         props:
-          title: Findings
+          title: "Executive brief"
+          subtitle: "A concise operating view of the active signal stream."
         children:
-          - type: FindingCard
-            repeat: findings
-            as: f
+          - type: Row
+            children:
+              - type: Stat
+                props:
+                  label: "Findings"
+                  value: "{{ watch.finding_count }}"
+              - type: PieChart
+                props:
+                  title: "Severity mix"
+                  bind: findings
+      - type: Section
+        props:
+          title: "Signal flow"
+          subtitle: "Latest observations, formatted for quick triage rather than long-form reading."
+        children:
+          - type: Board
             props:
-              title: "{{ f.title }}"
-              summary: "{{ f.summary }}"
-              severity: "{{ f.severity }}"
-              bind: f
-            action:
-              kind: intent
-              name: drilldown
-              params:
-                finding_id: "{{ f.finding_id }}"
+              title: Findings
+            children:
+              - type: FindingCard
+                repeat: findings
+                as: f
+                props:
+                  title: "{{ f.title }}"
+                  summary: "{{ f.summary }}"
+                  severity: "{{ f.severity }}"
+                  bind: f
+                action:
+                  kind: intent
+                  name: drilldown
+                  params:
+                    finding_id: "{{ f.finding_id }}"

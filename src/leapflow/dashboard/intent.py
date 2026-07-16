@@ -1,6 +1,6 @@
 """DashboardIntent: the single normalized request behind both entry doors.
 
-Slash commands (``/dashboard ...``) and the engine ``dashboard`` tool both
+Slash commands (``/board ...``) and the engine board tool both
 produce a ``DashboardIntent``, so there is one implementation with two front
 doors -- no duplicated routing and no keyword-matching taxonomy.
 """
@@ -67,7 +67,7 @@ class DashboardIntent:
         """Parse a slash argument string into an intent.
 
         The first token is the action when recognized; otherwise it is treated
-        as a domain to create (``/dashboard finance`` -> new finance watch).
+        as a domain to create (``/board finance`` -> new finance watch).
         """
         try:
             tokens = shlex.split(args or "")
