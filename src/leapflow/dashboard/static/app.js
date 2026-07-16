@@ -159,7 +159,7 @@
     rootEl.innerHTML = "";
     (spec.root || []).forEach((n) => rootEl.appendChild(renderNode(n)));
     if (!(spec.root || []).length) rootEl.appendChild(el("div", "empty", "No content yet."));
-    document.title = spec.title || "LeapFlow Monitors";
+    document.title = spec.title ? spec.title + " \u00b7 LeapBoard" : "LeapBoard";
   }
 
   function toast(finding) {

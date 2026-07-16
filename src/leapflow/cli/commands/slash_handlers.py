@@ -1112,7 +1112,7 @@ async def command_execute(ctx: "Context", name: str, args: str = "") -> dict[str
         return await _execute_scheduler_arm(ctx, args)
     if name == "task":
         return _execute_scheduler_task(ctx)
-    if name == "dashboard" or name.startswith("dashboard "):
+    if name == "board" or name.startswith("board "):
         return await _execute_dashboard(ctx, name, args)
     return {"ok": False, "message": f"Unknown command: /{name}"}
 
@@ -1159,7 +1159,7 @@ async def _ensure_session_watch_refresh(ctx: "Context", monitors: Any) -> None:
 async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[str, Any]:
     """Manage monitor watches from the TUI (data operations; web open is separate)."""
     monitors = getattr(ctx, "monitors", None)
-    sub = name[len("dashboard"):].strip()
+    sub = name.split(" ", 1)[1].strip() if " " in name else ""
     rest = (sub + ((" " + args) if args else "")).strip() if sub else args.strip()
     try:
         tokens = shlex.split(rest) if rest else []
@@ -1188,7 +1188,7 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
 
     if action in ("new", "add", "arm"):
         if not rest_tokens:
-            return {"ok": False, "message": "Usage: /dashboard new <domain> [--name N --trigger EXPR --sensitivity S]"}
+            return {"ok": False, "message": "Usage: /board new <domain> [--name N --trigger EXPR --sensitivity S]"}
         from leapflow.monitor import WatchSpec
 
         view = await monitors.arm_watch(WatchSpec.from_dict(_parse_watch_spec(rest_tokens)))
@@ -1196,7 +1196,7 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
 
     if action in ("pause", "resume", "stop"):
         if not rest_tokens:
-            return {"ok": False, "message": f"Usage: /dashboard {action} <id>"}
+            return {"ok": False, "message": f"Usage: /board {action} <id>"}
         watch_id = _resolve_watch_id(monitors, rest_tokens[0])
         method = {"pause": monitors.pause_watch, "resume": monitors.resume_watch,
                   "stop": monitors.stop_watch}[action]
@@ -1208,7 +1208,7 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
 
     if action == "mute":
         if not rest_tokens:
-            return {"ok": False, "message": "Usage: /dashboard mute <id> [on|off]"}
+            return {"ok": False, "message": "Usage: /board mute <id> [on|off]"}
         watch_id = _resolve_watch_id(monitors, rest_tokens[0])
         muted = not (len(rest_tokens) > 1 and rest_tokens[1].lower() in ("off", "false", "0", "no"))
         view = monitors.set_muted(watch_id, muted)
@@ -1219,7 +1219,7 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
 
     if action == "refresh":
         if not rest_tokens:
-            return {"ok": False, "message": "Usage: /dashboard refresh <id>"}
+            return {"ok": False, "message": "Usage: /board refresh <id>"}
         watch_id = _resolve_watch_id(monitors, rest_tokens[0])
         result = await monitors.run_watch_once(watch_id)
         return {"ok": bool(result.get("ok", False)), "view": "dashboard", "mode": "refresh",
@@ -1274,10 +1274,10 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
                     url += "&target=session"
             payload["url"] = url
         else:
-            payload["hint"] = "Run `leap dashboard` to open the web view."
+            payload["hint"] = "Run `leap board` to open the web view."
         return payload
 
-    return {"ok": False, "message": f"Unknown dashboard subcommand: {action}. "
+    return {"ok": False, "message": f"Unknown board subcommand: {action}. "
             "Try list|status|new|pause|resume|stop|mute|refresh|findings|open|session."}
 
 
@@ -1691,7 +1691,7 @@ def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> N
     if mode == "list":
         watches = payload.get("watches") or []
         if not watches:
-            console.system("No watches. Create one with /dashboard new <domain>.")
+            console.system("No watches. Create one with /board new <domain>.")
             return
         table = Table(title="Watches", title_style="bold cyan", border_style="bright_black")
         for col in ("id", "name", "domain", "trigger", "state", "muted", "runs", "findings"):
@@ -1746,7 +1746,7 @@ def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> N
         elif payload.get("running"):
             console.system("Dashboard is running.")
         else:
-            console.system(str(payload.get("hint") or "Run `leap dashboard` to open the web view."))
+            console.system(str(payload.get("hint") or "Run `leap board` to open the web view."))
         return
     if mode == "findings":
         _render_findings_lines(console, payload.get("findings") or [])

@@ -1,4 +1,4 @@
-"""Hermetic tests for the watch RPC surface and the /dashboard command handler.
+"""Hermetic tests for the watch RPC surface and the /board command handler.
 
 No network, no LLM, no full Context: the daemon service and slash handler are
 exercised with an in-memory MonitorManager and a fake producer.
@@ -70,33 +70,33 @@ async def test_service_watch_unavailable_is_graceful() -> None:
 async def test_dashboard_command_execute_flow(tmp_path: Path) -> None:
     ctx = SimpleNamespace(monitors=_manager(tmp_path))
 
-    armed = await command_execute(ctx, "dashboard new", "demo --name Market --trigger 5m")
+    armed = await command_execute(ctx, "board new", "demo --name Market --trigger 5m")
     assert armed["ok"] is True and armed["mode"] == "armed"
     watch_id = armed["watch"]["watch_id"]
     assert armed["watch"]["trigger"] == "every 5m"
 
-    listed = await command_execute(ctx, "dashboard list", "")
+    listed = await command_execute(ctx, "board list", "")
     assert listed["mode"] == "list" and len(listed["watches"]) == 1
 
-    status_payload = await command_execute(ctx, "dashboard status", "")
+    status_payload = await command_execute(ctx, "board status", "")
     assert status_payload["mode"] == "status" and status_payload["count"] == 1
 
     # Short-prefix id resolution + manual refresh.
-    refreshed = await command_execute(ctx, "dashboard refresh", watch_id[:8])
+    refreshed = await command_execute(ctx, "board refresh", watch_id[:8])
     assert refreshed["mode"] == "refresh" and refreshed["ok"] is True
 
-    finds = await command_execute(ctx, "dashboard findings", "")
+    finds = await command_execute(ctx, "board findings", "")
     assert finds["mode"] == "findings" and len(finds["findings"]) >= 1
 
-    paused = await command_execute(ctx, "dashboard pause", watch_id[:8])
+    paused = await command_execute(ctx, "board pause", watch_id[:8])
     assert paused["watch"]["state"] == "suspended"
 
-    unknown = await command_execute(ctx, "dashboard", "bogus")
+    unknown = await command_execute(ctx, "board", "bogus")
     assert unknown["ok"] is False
 
 
 async def test_dashboard_command_scheduler_disabled(tmp_path: Path) -> None:
     ctx = SimpleNamespace(monitors=None)
-    disabled = await command_execute(ctx, "dashboard list", "")
+    disabled = await command_execute(ctx, "board list", "")
     assert disabled["ok"] is False
     assert "unavailable" in disabled["message"].lower()

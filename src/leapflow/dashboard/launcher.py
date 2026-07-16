@@ -126,7 +126,7 @@ def ensure_server(settings: Any, *, wait_s: float = 8.0) -> dict[str, Any]:
     port = int(getattr(settings, "dashboard_port", 8765))
     bind = str(getattr(settings, "dashboard_bind", "127.0.0.1"))
     cmd = [
-        sys.executable, "-m", "leapflow", "dashboard", "--serve",
+        sys.executable, "-m", "leapflow", "board", "--serve",
         "--token", token, "--port", str(port), "--bind", bind,
     ]
     creationflags = 0

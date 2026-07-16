@@ -5,6 +5,7 @@
 
 ### News
 
+- **2026-07-16**: **LeapBoard** — general-purpose monitoring web dashboard (Watch→Finding + Server-Driven UI); `/board` entry, live session analysis, and finance/sentiment/research templates.
 - **2026-07-16**: v0.0.4 released — protocol-driven recovery coordinator with budget-constrained strategies, unified error classification, checkpoint-based cross-turn resumption, structured audit trail, and tool execution idempotency ledger.
 - **2026-07-15**: v0.0.3 released — layered YAML config, Path/Profile/Cache layouts, encrypted secret refs, DuckDB cache indexing, `leap config`, and robustness hardening.
 - **2026-07-15**: v0.0.2 released — TUI, Gateway/App Connector, Hub sync, Scheduler, Workflow Copilot, and runtime hardening.
@@ -511,6 +512,79 @@ For deployment environments, provision platform credentials through the same gat
 
 ---
 
+## LeapBoard — Monitoring Dashboard
+
+> **Signals into insight.**
+
+**LeapBoard** extends LeapFlow's Observe/Orient boundary into a general-purpose, always-on monitoring surface. Launch independent, persistent **watches** — for financial-market anomalies, public-opinion (sentiment) shifts, new research papers, or your own live conversation — and each one continuously observes its source, filters signal from noise, and surfaces **findings** (typed, scored, with evidence) onto a real-time web board.
+
+It is domain-neutral by design: finance, sentiment, research, and session analysis differ only by a small YAML template and their finding payload — never by branching in core code.
+
+### How it works
+
+```
+Watch (leapd-hosted) ── observe → SNR filter → score → Finding ──▶ NotificationBus
+                                                                      │ push
+  YAML template ─▶ ViewSpec (validated) ─▶ Web board (SDUI) ◀── WebSocket
+```
+
+- **Runtime** — watches run inside the shared `leapd` daemon, so they survive TUI restarts and are shared across clients. Findings are persisted (DuckDB) and pushed live; session-analysis watches are client-coupled and never keep the daemon alive on their own.
+- **Server-Driven UI** — each scenario is authored as a **YAML template** compiled into a validated **ViewSpec** over a fixed component catalog (cards, tables, charts, gauges, story panels…). Interactive components talk back through a bidirectional action protocol; unknown component types degrade gracefully, and bespoke visuals use a `Custom` escape hatch. The board never renders arbitrary HTML/JS.
+- **View client** — the board connects to `leapd` like the TUI does, with no privileged coupling. The web server is optional (`aiohttp`) and degrades with a clear install hint when absent.
+
+### Install & enable
+
+```bash
+pip install 'leapflow[dashboard]'   # adds the optional aiohttp web server
+```
+
+The board binds to `127.0.0.1` with a per-session access token. Tune it through `leap config`:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `dashboard.enabled` | `true` | Enable the local monitoring web board |
+| `dashboard.bind` | `127.0.0.1` | Bind address (keep loopback) |
+| `dashboard.port` | `8765` | Web server port |
+| `dashboard.auto_open` | `true` | Open the default browser automatically |
+| `monitor.session_batch_turns` | `6` | Re-analyze the session every N new turns |
+
+### Usage
+
+**Slash command (`/board`)** — inside the TUI:
+
+```text
+/board                     open the board (session analysis if a conversation is active, else overview)
+/board session             open the current-session analysis board
+/board new finance --name "AAPL watch" --trigger 5m
+/board list                list active watches (in-TUI)
+/board findings            show recent findings
+/board pause|resume|stop|mute <id>
+/board refresh <id>        run one observation cycle now
+```
+
+**Natural language** — just ask ("open a finance board", "analyze this conversation"); the agent opens or creates boards for you.
+
+**CLI** — from any shell:
+
+```bash
+leap board                 # ensure the server is running and open the browser
+leap board session         # open the session-analysis board
+leap board --no-open       # print the URL instead of opening a browser
+```
+
+Executing any entry auto-launches your default browser at the token-scoped local URL.
+
+### Showcase
+
+- **Financial market watch** — monitor a symbol or source on an interval/condition; anomalies and opportunities arrive as alert-severity finding cards alongside a candlestick panel.
+- **Public-opinion (sentiment) watch** — track a brand or topic; a sentiment gauge plus a live stream of representative mentions.
+- **Paper hunting** — watch arXiv / venues / authors / keywords; new relevant papers appear as cards linking straight to the source.
+- **Session analysis (built-in)** — after a few conversation turns, `/board session` opens a board that reads the transcript and renders a story arc, insights, decisions, action items, open questions, an entity view, and suggested next prompts — refreshing automatically as the conversation grows (batch threshold, optional model salience, or manual `/board refresh`).
+
+> Adding a new scenario = one YAML template (plus an optional renderer) and a producer. The board core stays untouched — no domain branching, no hardcoded layouts.
+
+---
+
 ## Safety & Approval
 
 LeapFlow enforces a **layered safety architecture** that balances autonomy with human oversight. The goal is minimal interruption — the agent asks for permission only when an action carries real consequences.
@@ -768,6 +842,8 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | `learning/` | Skill distillation, parameterization, and maturity lifecycle |
 | `skills/` | Skill library, runtime execution, and self-evolution (Loop γ) |
 | `copilot/` | Workflow-level next-step prediction and proactive suggestion |
+| `monitor/` | Domain-neutral Watch→Finding monitoring runtime (leapd-hosted scheduler, findings store) |
+| `dashboard/` | LeapBoard — Server-Driven UI web board (ViewSpec catalog, YAML templates, WebSocket fan-out) |
 | `analysis/` | Six-layer denoising pipeline for trajectory refinement |
 | `engine/` | Session orchestration and ReAct execution loop |
 | `memory/` | Three-tier event-driven memory (working → episodic → long-term) |

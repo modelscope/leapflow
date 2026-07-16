@@ -133,19 +133,19 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("arm", "Schedule a skill for timed execution", "Scheduler", args_hint="<skill> <cron>"),
     CommandDef("task", "List scheduled tasks", "Scheduler"),
 
-    # Dashboard & Monitors
-    CommandDef("dashboard", "Manage monitoring dashboards and watches", "Dashboard", args_hint="[open|session|list|status|new|pause|resume|stop|mute|refresh|findings] ...", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
-    CommandDef("dashboard open", "Open the monitoring web dashboard", "Dashboard", args_hint="[watch-id]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
-    CommandDef("dashboard session", "Open the current-session analysis dashboard", "Dashboard", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
-    CommandDef("dashboard list", "List active watches", "Dashboard"),
-    CommandDef("dashboard status", "Show monitoring runtime status", "Dashboard"),
-    CommandDef("dashboard new", "Create a watch for a domain", "Dashboard", args_hint="<domain> [--name --trigger --sensitivity]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
-    CommandDef("dashboard pause", "Pause a watch", "Dashboard", args_hint="<id>", effect=CommandEffect.SESSION),
-    CommandDef("dashboard resume", "Resume a watch", "Dashboard", args_hint="<id>", effect=CommandEffect.SESSION),
-    CommandDef("dashboard stop", "Stop a watch", "Dashboard", args_hint="<id>", effect=CommandEffect.SESSION),
-    CommandDef("dashboard mute", "Mute or unmute a watch", "Dashboard", args_hint="<id> [on|off]", effect=CommandEffect.SESSION),
-    CommandDef("dashboard refresh", "Run a watch once now", "Dashboard", args_hint="<id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
-    CommandDef("dashboard findings", "Show recent findings", "Dashboard", args_hint="[id] [--limit N]"),
+    # Board & Monitors (LeapBoard)
+    CommandDef("board", "Open or manage monitoring boards and watches", "Board", args_hint="[open|session|list|status|new|pause|resume|stop|mute|refresh|findings] ...", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board open", "Open the monitoring web board", "Board", args_hint="[watch-id]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board session", "Open the current-session analysis board", "Board", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board list", "List active watches", "Board"),
+    CommandDef("board status", "Show monitoring runtime status", "Board"),
+    CommandDef("board new", "Create a watch for a domain", "Board", args_hint="<domain> [--name --trigger --sensitivity]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board pause", "Pause a watch", "Board", args_hint="<id>", effect=CommandEffect.SESSION),
+    CommandDef("board resume", "Resume a watch", "Board", args_hint="<id>", effect=CommandEffect.SESSION),
+    CommandDef("board stop", "Stop a watch", "Board", args_hint="<id>", effect=CommandEffect.SESSION),
+    CommandDef("board mute", "Mute or unmute a watch", "Board", args_hint="<id> [on|off]", effect=CommandEffect.SESSION),
+    CommandDef("board refresh", "Run a watch once now", "Board", args_hint="<id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board findings", "Show recent findings", "Board", args_hint="[id] [--limit N]"),
 )
 
 # ── Derived structures ───────────────────────────────────────────────
