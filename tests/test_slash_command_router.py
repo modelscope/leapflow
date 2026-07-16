@@ -53,6 +53,22 @@ def test_command_router_client_local_commands() -> None:
         assert inv is not None, f"parse failed for {cmd_text}"
         assert inv.command.client_local is False, f"{cmd_text} should NOT be client_local"
 
+def test_board_commands_resolve_as_engine_routed() -> None:
+    """Board commands must resolve as non-client-local so the in-process REPL
+    routes them through command_execute instead of leaking to the LLM chat."""
+    router = CommandRouter("daemon")
+
+    for cmd_text in ("/board", "/board session", "/board open", "/board list"):
+        inv = router.parse(cmd_text)
+        assert inv is not None, f"parse failed for {cmd_text}"
+        assert inv.command.name.startswith("board"), cmd_text
+        assert inv.command.client_local is False, f"{cmd_text} must be engine-routed"
+
+    session = router.parse("/board session")
+    assert session is not None
+    assert session.command.name == "board session"
+
+
 def test_plural_skill_tool_task_commands_are_not_registered() -> None:
     router = CommandRouter("daemon")
 

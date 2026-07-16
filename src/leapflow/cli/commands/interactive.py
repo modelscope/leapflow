@@ -151,6 +151,33 @@ def _format_watch_samples(watches: list[dict[str, Any]]) -> str:
     return ", ".join(labels) + suffix
 
 
+async def _open_dashboard_view(settings: Any, console: Any, payload: dict[str, Any]) -> None:
+    """Open the web dashboard on the user's machine (client-side).
+
+    Shared by both the in-process and daemon-backed REPLs so a single owner
+    handles server discovery, URL assembly, and the browser-open UX.
+    """
+    from leapflow.dashboard import launcher
+
+    action = str(payload.get("action") or "home")
+    url = payload.get("url")
+    if not url:
+        try:
+            state = await asyncio.to_thread(launcher.ensure_server, settings)
+        except Exception as exc:
+            console.warning(f"Could not start the dashboard server: {exc}")
+            return
+        url = launcher.build_url(state["bind"], state["port"], state["token"])
+        if action != "home":
+            url += f"&action={action}"
+            if action == "session":
+                url += "&target=session"
+    if launcher.open_in_browser(url):
+        console.system(f"Opened dashboard in your browser: {url}")
+    else:
+        console.system(f"Dashboard ready (open manually): {url}")
+
+
 async def _ask_yes_no_default_yes(prompt: str) -> bool:
     """Return True by default, including non-interactive or interrupted prompts."""
     if not sys.stdin.isatty():
@@ -325,6 +352,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     from leapflow.config_service import ConfigService
     from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
+        command_execute,
         handle_status,
         handle_tool,
         handle_usage,
@@ -333,6 +361,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         handle_clear,
         handle_gateway,
         handle_app,
+        render_command_payload,
     )
     from leapflow.utils.terminal_io import TerminalIOProvider
     from leapflow.engine.session import SessionMode
@@ -730,6 +759,22 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                     ctx,
                     cmd_text.split()[1:] if len(cmd_text.split()) > 1 else [],
                 )
+                return
+
+            # Registered engine command with no in-process fast path (e.g.
+            # /board): route through the shared command_execute contract so a
+            # recognized slash command never leaks into the LLM chat stream.
+            # Client-local commands are handled above or via task-control.
+            if not cmd_def.client_local:
+                try:
+                    payload = await command_execute(ctx, canonical, cmd_args)
+                except Exception as exc:
+                    console.warning(f"/{canonical} failed: {exc}")
+                    return
+                if str(payload.get("view")) == "dashboard" and payload.get("mode") == "open":
+                    await _open_dashboard_view(ctx.settings, console, payload)
+                else:
+                    render_command_payload(console, payload)
                 return
 
         if _learning:
@@ -1178,25 +1223,7 @@ async def cmd_interactive_daemon(
 
     async def _open_dashboard(payload: dict) -> None:
         """Open the web dashboard on the user's machine (client-side)."""
-        from leapflow.dashboard import launcher
-
-        action = str(payload.get("action") or "home")
-        url = payload.get("url")
-        if not url:
-            try:
-                state = await asyncio.to_thread(launcher.ensure_server, settings)
-            except Exception as exc:
-                console.warning(f"Could not start the dashboard server: {exc}")
-                return
-            url = launcher.build_url(state["bind"], state["port"], state["token"])
-            if action != "home":
-                url += f"&action={action}"
-                if action == "session":
-                    url += "&target=session"
-        if launcher.open_in_browser(url):
-            console.system(f"Opened dashboard in your browser: {url}")
-        else:
-            console.system(f"Dashboard ready (open manually): {url}")
+        await _open_dashboard_view(settings, console, payload)
 
     async def handle_input(text: str) -> None:
         nonlocal daemon_session_mode

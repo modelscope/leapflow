@@ -115,3 +115,16 @@ async def test_dashboard_command_scheduler_disabled(tmp_path: Path) -> None:
     disabled = await command_execute(ctx, "board list", "")
     assert disabled["ok"] is False
     assert "unavailable" in disabled["message"].lower()
+
+
+async def test_dashboard_web_view_actions_work_without_monitor_runtime() -> None:
+    """open/home/session must open the web board even with no local monitor
+    runtime (the in-process fallback REPL), never leak back to chat."""
+    ctx = SimpleNamespace(monitors=None, settings=None, engine=None)
+    for command in ("board session", "board open", "board home"):
+        payload = await command_execute(ctx, command, "")
+        assert payload["ok"] is True, command
+        assert payload["view"] == "dashboard"
+        assert payload["mode"] == "open"
+    session_payload = await command_execute(ctx, "board session", "")
+    assert session_payload["action"] == "session"

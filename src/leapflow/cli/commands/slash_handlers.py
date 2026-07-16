@@ -1168,7 +1168,11 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
     action = tokens[0].lower() if tokens else "open"
     rest_tokens = tokens[1:]
 
-    if monitors is None:
+    # Web-view actions (open/home/session) only need a client-side browser and
+    # the dashboard server; they must work even when this process hosts no
+    # monitor runtime (e.g. the in-process fallback REPL). Data operations below
+    # still require the runtime.
+    if monitors is None and action not in ("open", "home", "session"):
         return {"ok": False, "message": "Monitor runtime is unavailable (scheduler disabled)."}
 
     if action in ("list", "ls"):
