@@ -1142,7 +1142,7 @@ async def test_daemon_tui_exit_releases_session_watches_and_reports_keepalive(
     stop_call = next(call for call in calls if call[0] == "stop_daemon")
     assert stop_call[2]["force"] is True
     assert prompts == ["Stop leapd now (pid=1234)? [Y/n]: "]
-    assert console.systems[-1] == "leapd stopped with force."
+    assert console.systems[-1] == "leapd stopped (forced with SIGKILL)."
 
 
 

@@ -80,28 +80,33 @@ async def _prompt_stop_daemon_on_exit(
     from leapflow.daemon.lifecycle import stop_daemon
 
     runtime_dir = settings.runtime_dir
-    console.system(f"Stopping leapd (pid={pid})...")
+    console.system(f"Stopping leapd (pid={pid}); requesting graceful shutdown...")
     graceful_requested = False
     try:
-        await asyncio.wait_for(client.shutdown(), timeout=2.0)
+        await asyncio.wait_for(client.shutdown(), timeout=3.0)
         graceful_requested = True
     except Exception:
         graceful_requested = False
+    # The user confirmed the stop, so escalate all the way to SIGKILL if needed.
+    # Patience over surprise: use generous windows and narrate every step so the
+    # wait is transparent rather than a silent stall.
     result = await asyncio.to_thread(
         stop_daemon,
         runtime_dir,
-        timeout_s=5.0,
+        timeout_s=8.0,
         force=True,
-        grace_timeout_s=1.0 if graceful_requested else 0.0,
-        force_timeout_s=2.0,
+        grace_timeout_s=3.0 if graceful_requested else 0.0,
+        force_timeout_s=6.0,
+        on_progress=console.system,
     )
     if result.stopped:
-        suffix = " with force" if result.forced else ""
+        suffix = " (forced with SIGKILL)" if result.forced else ""
         console.system(f"leapd stopped{suffix}.")
     else:
         console.warning(
-            f"leapd did not stop within the exit window (pid={result.pid}). "
-            "Inspect the process manually if it remains unhealthy."
+            f"leapd could not be stopped even after SIGKILL (pid={result.pid}). "
+            "It may be blocked on the OS (e.g. disk I/O); run "
+            f"`kill -9 {result.pid}` if it stays unhealthy."
         )
 
 
