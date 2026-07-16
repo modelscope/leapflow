@@ -218,6 +218,102 @@ def build_config_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
     return {"ok": False, "message": "Usage: /config [show|list|keys|sources|get|set|unset|llm|secret] ..."}
 
 
+_CONFIG_LIST_COMPACT_WIDTH = 92
+_CONFIG_LIST_FULL_WIDTH = 118
+
+
+def _display_width(console: object, default: int = 100) -> int:
+    """Return the active Rich console width with a safe fallback for tests."""
+    width = getattr(console, "width", None)
+    if isinstance(width, int) and width > 0:
+        return width
+    raw = getattr(console, "raw", None)
+    raw_width = getattr(raw, "width", None)
+    if isinstance(raw_width, int) and raw_width > 0:
+        return raw_width
+    return default
+
+
+def _shorten(text: object, limit: int) -> str:
+    """Shorten a cell value before Rich allocates table columns."""
+    value = str(text or "")
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[: max(1, limit - 1)] + "…"
+
+
+def _config_scope_text(item: dict[str, Any], *, limit: int) -> str:
+    scopes = ",".join(str(scope) for scope in item.get("scopes") or [])
+    return _shorten(scopes, limit)
+
+
+def _config_reload_text(item: dict[str, Any]) -> str:
+    return "yes" if item.get("hot_reload") else "no"
+
+
+def _config_meta_text(item: dict[str, Any], *, scope_limit: int) -> str:
+    parts = [str(item.get("type") or "?")]
+    scope = _config_scope_text(item, limit=scope_limit)
+    if scope:
+        parts.append(scope)
+    parts.append(f"reload:{_config_reload_text(item)}")
+    return " · ".join(parts)
+
+
+def _build_config_list_table(console: object, fields: list[dict[str, Any]]) -> object:
+    """Build a width-aware config list table for TUI rendering."""
+    from rich.table import Table
+
+    width = _display_width(console)
+    table = Table(title="Writable config fields", show_lines=False, expand=True)
+    if width < _CONFIG_LIST_COMPACT_WIDTH:
+        table.add_column("Key", no_wrap=True, overflow="ellipsis", max_width=32, ratio=2)
+        table.add_column("Value", overflow="fold", max_width=24, ratio=1)
+        table.add_column("Meta", overflow="fold", max_width=24, ratio=1)
+        for item in fields:
+            table.add_row(
+                _shorten(item.get("key"), 36),
+                _shorten(item.get("value"), 32),
+                _config_meta_text(item, scope_limit=14),
+            )
+        return table
+
+    if width < _CONFIG_LIST_FULL_WIDTH:
+        table.add_column("Key", no_wrap=True, overflow="ellipsis", max_width=34, ratio=2)
+        table.add_column("Value", overflow="fold", max_width=30, ratio=1)
+        table.add_column("Type", no_wrap=True, max_width=8)
+        table.add_column("Scope", no_wrap=True, overflow="ellipsis", max_width=18)
+        table.add_column("Reload", no_wrap=True, max_width=6)
+        for item in fields:
+            table.add_row(
+                _shorten(item.get("key"), 38),
+                _shorten(item.get("value"), 40),
+                str(item.get("type") or ""),
+                _config_scope_text(item, limit=18),
+                _config_reload_text(item),
+            )
+        return table
+
+    table.add_column("Key", no_wrap=True, overflow="ellipsis", max_width=36, ratio=2)
+    table.add_column("Value", overflow="fold", max_width=36, ratio=1)
+    table.add_column("Type", no_wrap=True, max_width=10)
+    table.add_column("Scope", no_wrap=True, overflow="ellipsis", max_width=22)
+    table.add_column("Reload", no_wrap=True, max_width=6)
+    table.add_column("Description", overflow="fold", ratio=2)
+    for item in fields:
+        table.add_row(
+            _shorten(item.get("key"), 42),
+            _shorten(item.get("value"), 48),
+            str(item.get("type") or ""),
+            _config_scope_text(item, limit=22),
+            _config_reload_text(item),
+            str(item.get("description") or ""),
+        )
+    return table
+
+
 def render_config_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
     """Render config command output."""
     if not payload.get("ok", True):
@@ -239,25 +335,7 @@ def render_config_payload(console: "LeapConsole", payload: dict[str, Any]) -> No
         if not fields:
             console.system("No writable config fields found.")
             return
-        from rich.table import Table
-
-        table = Table(title="Writable config fields", show_lines=False)
-        table.add_column("Key", no_wrap=True)
-        table.add_column("Value", no_wrap=True)
-        table.add_column("Type", no_wrap=True)
-        table.add_column("Scope", no_wrap=True)
-        table.add_column("Reload", no_wrap=True)
-        table.add_column("Description")
-        for item in fields:
-            table.add_row(
-                str(item.get("key") or ""),
-                str(item.get("value") or ""),
-                str(item.get("type") or ""),
-                ",".join(str(scope) for scope in item.get("scopes") or []),
-                str(item.get("hot_reload") or ""),
-                str(item.get("description") or ""),
-            )
-        console.print(table)
+        console.print(_build_config_list_table(console, fields))
         console.system("Use /config show <key>, /config get <key>, /config set <key> <value>, or /config keys for compact output.")
         return
     if mode == "show_detail":

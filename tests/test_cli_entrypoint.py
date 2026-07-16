@@ -94,6 +94,38 @@ async def test_config_slash_updates_model_and_hot_reloads(tmp_path) -> None:
         await ctx.cleanup()
 
 
+def test_config_list_table_adapts_to_terminal_width() -> None:
+    from leapflow.cli.commands.slash_handlers import _build_config_list_table
+
+    class Console:
+        def __init__(self, width: int) -> None:
+            self.width = width
+
+    fields = [
+        {
+            "key": "memory.working_max_tokens",
+            "value": "1234567890" * 6,
+            "type": "int",
+            "scopes": ["profile", "workspace"],
+            "hot_reload": True,
+            "description": "Runtime context budget for working memory before compaction.",
+        }
+    ]
+
+    compact = _build_config_list_table(Console(72), fields)
+    assert [column.header for column in compact.columns] == ["Key", "Value", "Meta"]
+    assert "Description" not in [column.header for column in compact.columns]
+    assert "reload:yes" in compact.columns[2]._cells[0]
+
+    medium = _build_config_list_table(Console(100), fields)
+    assert [column.header for column in medium.columns] == ["Key", "Value", "Type", "Scope", "Reload"]
+    assert "Description" not in [column.header for column in medium.columns]
+
+    full = _build_config_list_table(Console(132), fields)
+    assert [column.header for column in full.columns] == ["Key", "Value", "Type", "Scope", "Reload", "Description"]
+    assert len(full.columns[1]._cells[0]) <= 48
+
+
 @pytest.mark.asyncio
 async def test_model_slash_is_config_shortcut(tmp_path) -> None:
     from leapflow.cli.context import Context
