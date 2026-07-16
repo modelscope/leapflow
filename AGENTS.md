@@ -94,6 +94,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 
 - **Deep review for large changes**: When a change substantially affects architecture, runtime behavior, user flows, persistence, safety, or multiple modules, perform an additional deep review before considering the work complete.
 - **Human confirmation for TUI changes**: Any TUI layout or interaction-logic change requires a second human confirmation before it is considered ready.
+- **Human confirmation for slash-command paths**: Any change that adds, removes, renames, reroutes, or alters the behavior of a slash command (`/...`) — across the registry, router, in-process REPL, daemon REPL, `command_execute`, completion, and rendering — requires a second human confirmation before it is considered ready. This applies especially to user-experience-facing behavior (dispatch, prompts, confirmations, output, browser/dashboard launches, and error/recovery messaging), which must never be shipped on a single pass.
 - **Design goal check**: Verify that the implementation actually achieves the intended design goal and is not just a local patch.
 - **Optimality check**: Evaluate whether the solution is the simplest robust design, avoids unnecessary abstractions, and fits the existing architecture.
 - **Regression impact check**: Inspect affected modules and user journeys for logic bugs, degraded UX, broken compatibility, slower feedback, weaker diagnostics, or worse failure recovery.
