@@ -46,6 +46,14 @@ from leapflow.engine.prompt_cache import CacheStrategy
 from leapflow.engine.stale_stream import StaleStreamError, stale_guarded_stream, build_continuation_prompt
 from leapflow.engine.turn_recovery import TurnRecoveryState
 from leapflow.engine.turn_usage import TurnUsageTracker
+from leapflow.engine.recovery_coordinator import RecoveryCoordinator, RecoveryState
+from leapflow.engine.recovery_budget import RecoveryBudget
+from leapflow.engine.unified_classifier import UnifiedErrorClassifier
+from leapflow.engine.failure_envelope import FailureEnvelope, FailureSource, Recoverability
+from leapflow.engine.recovery_decision import RecoveryAction
+from leapflow.engine.recovery_strategies import default_strategies
+from leapflow.engine.recovery_audit import JsonlAuditSink, create_audit_entry
+from leapflow.engine.recovery_checkpoint import RecoveryCheckpoint, InMemoryCheckpointStore
 from leapflow.engine.tool_concurrency import (
     DefaultConcurrencyPolicy,
     ToolCall as ConcurrentToolCall,
@@ -941,6 +949,12 @@ class AgentEngine:
         # B4: Output sanitization (None = disabled)
         self._sanitizer: MessageSanitizer | None = None
 
+        # Recovery coordinator infrastructure (P3 integration)
+        self._unified_classifier = UnifiedErrorClassifier(self._error_classifier)
+        self._recovery_coordinator: RecoveryCoordinator | None = None  # Created per-turn
+        self._checkpoint_store = InMemoryCheckpointStore()
+        self._audit_sink = JsonlAuditSink()  # In-memory; path-based if layout available
+
     # ── Optional strategy setters (config-driven) ────────────────────────
 
     def set_cache_strategy(self, strategy: CacheStrategy | None) -> None:
@@ -1055,6 +1069,9 @@ class AgentEngine:
         tools_kwarg: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Unified API error recovery dispatcher. Returns 'continue' to retry, else None.
+
+        DEPRECATED: Retained for stream loop and fallback paths.
+        New code should use RecoveryCoordinator.evaluate() via _unified_tool_loop.
 
         Wires ALL TurnRecoveryState one-shot guards to their matching ErrorCategory:
         - CONTEXT_OVERFLOW → try_compress
@@ -2216,6 +2233,14 @@ class AgentEngine:
         content = ""
         fatal_error: Optional[str] = None
         recovery = TurnRecoveryState()
+        # P3: Initialize recovery coordinator for this turn
+        recovery_budget = RecoveryBudget()
+        recovery_budget.start_deadline()
+        self._recovery_coordinator = RecoveryCoordinator(
+            strategies=default_strategies(),
+            budget=recovery_budget,
+        )
+        self._recovery_coordinator.new_turn(turn_id=budget.used)
         use_native_tools = assembly.plan.native_tools
         result_budget = self._effective_tool_result_budget()
         unknown_tool_retry_used = False
@@ -2268,21 +2293,81 @@ class AgentEngine:
                 category_str = classified.value if hasattr(classified, 'value') else str(classified)
                 recovery.record_api_error(category_str)
 
-                if await self._handle_api_error(
-                    classified, rec, recovery, messages, budget,
-                    use_native_tools=use_native_tools, tools_kwarg=tools_kwarg,
-                ) == "continue":
-                    if classified == ErrorCategory.CONTEXT_OVERFLOW:
-                        self._usage_tracker.mark_compression()
-                    continue
-                if classified in (ErrorCategory.FORMAT_ERROR,) and tools_kwarg and recovery.try_native_fallback():
-                    logger.info("Native tool calling failed, falling back to text mode")
-                    tools_kwarg = {}
-                    use_native_tools = False
-                    continue
-                fatal_error = self._error_classifier.friendly_message(classified, str(exc))
-                logger.error("unified_loop: unrecoverable %s: %s", category_str, exc)
-                break
+                # P3: Classify through unified coordinator and audit
+                envelope = self._unified_classifier.classify_llm_error(
+                    exc, provider=getattr(self._llm, 'provider', ''),
+                    model=getattr(self._llm, 'model', ''),
+                )
+                coordinator = self._recovery_coordinator
+                if coordinator is not None:
+                    decision = coordinator.evaluate(envelope)
+                    self._audit_sink.record(create_audit_entry(
+                        envelope, decision, coordinator.budget,
+                        session_id=getattr(self, '_current_session_id', '') or '',
+                        turn_id=budget.used,
+                    ))
+
+                    # Execute decision via coordinator
+                    if decision.action == RecoveryAction.RETRY_WITH_BACKOFF:
+                        if decision.retry_semantics.backoff_config:
+                            await asyncio.sleep(
+                                jittered_backoff(budget.used, base=decision.retry_semantics.backoff_config.base_delay)
+                            )
+                        coordinator.on_strategy_outcome(decision.decision_id, True)
+                        continue
+
+                    elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                        if decision.strategy_key == "context_compress":
+                            messages[:] = self._compressor.force_compress(messages)
+                            self._usage_tracker.mark_compression()
+                        elif decision.strategy_key == "multimodal_strip":
+                            self._strip_images_from_messages(messages)
+                        elif decision.strategy_key == "native_to_text":
+                            tools_kwarg = {}
+                            use_native_tools = False
+                        coordinator.on_strategy_outcome(decision.decision_id, True)
+                        continue
+
+                    elif decision.action == RecoveryAction.FAILOVER:
+                        if hasattr(self._llm, '_failover'):
+                            self._llm._failover(f"recovery: {decision.reason}")
+                        coordinator.on_strategy_outcome(decision.decision_id, True)
+                        continue
+
+                    elif decision.action in (RecoveryAction.HALT_CLEAN, RecoveryAction.HALT_WITH_CHECKPOINT):
+                        if decision.action == RecoveryAction.HALT_WITH_CHECKPOINT:
+                            checkpoint = RecoveryCheckpoint(
+                                session_id=getattr(self, '_current_session_id', '') or '',
+                                turn_id=budget.used,
+                                failure_envelope_data={"message": envelope.message, "category": envelope.category},
+                                messages_snapshot=list(messages),
+                            )
+                            self._checkpoint_store.save(checkpoint)
+                        fatal_error = decision.reason
+                        coordinator.on_strategy_outcome(decision.decision_id, False)
+                        break
+
+                    else:
+                        # ASK_USER, SKIP_AND_CONTINUE, or unknown
+                        fatal_error = decision.reason
+                        break
+                else:
+                    # Fallback to legacy handler if coordinator not initialized
+                    if await self._handle_api_error(
+                        classified, rec, recovery, messages, budget,
+                        use_native_tools=use_native_tools, tools_kwarg=tools_kwarg,
+                    ) == "continue":
+                        if classified == ErrorCategory.CONTEXT_OVERFLOW:
+                            self._usage_tracker.mark_compression()
+                        continue
+                    if classified in (ErrorCategory.FORMAT_ERROR,) and tools_kwarg and recovery.try_native_fallback():
+                        logger.info("Native tool calling failed, falling back to text mode")
+                        tools_kwarg = {}
+                        use_native_tools = False
+                        continue
+                    fatal_error = self._error_classifier.friendly_message(classified, str(exc))
+                    logger.error("unified_loop: unrecoverable %s: %s", category_str, exc)
+                    break
             _clear_indicator()
 
             content = (resp.content or "").strip()
@@ -2430,6 +2515,29 @@ class AgentEngine:
                     result.get("capability") or result.get("action") or tool_name,
                 )
                 break
+
+            # P3: Classify tool failures through coordinator for audit
+            if (
+                isinstance(result, dict)
+                and not result.get("ok", True)
+                and result.get("counts_as_failure") is not False
+                and self._recovery_coordinator is not None
+            ):
+                tool_envelope = self._unified_classifier.classify_tool_result(
+                    result, tool_name=tool_name,
+                    execution_policy=result.get("execution_policy", "read_only"),
+                )
+                if tool_envelope is not None:
+                    tool_decision = self._recovery_coordinator.evaluate(tool_envelope)
+                    self._audit_sink.record(create_audit_entry(
+                        tool_envelope, tool_decision, self._recovery_coordinator.budget,
+                        session_id=getattr(self, '_current_session_id', '') or '',
+                        turn_id=budget.used,
+                    ))
+                    if tool_decision.action in (RecoveryAction.HALT_CLEAN, RecoveryAction.HALT_WITH_CHECKPOINT):
+                        fatal_error = tool_decision.reason
+                        break
+                    # Other actions: let LLM handle (append result to messages as before)
 
             if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
                 unknown_tool_retry_used = True
