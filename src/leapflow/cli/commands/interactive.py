@@ -30,6 +30,8 @@ _CLI_EVENT_SOURCE = "interactive_repl"
 
 _last_hint: Optional["PredictionCandidate"] = None
 
+_WATCH_EXIT_ACTIVE_STATES = frozenset({"armed", "watching", "due", "confirming", "executing"})
+
 
 def _is_app_command(canonical: str) -> bool:
     """Return true only for `/app` or `/app ...`, not `/apple`."""
@@ -51,6 +53,13 @@ async def _prompt_stop_daemon_on_exit(
         "leapd runs in the background; stop/restart it after reinstalling LeapFlow "
         "to load new code."
     )
+    watch_snapshot = await _cleanup_client_coupled_watches_on_exit(client, console)
+    standalone_active = _standalone_active_watches(watch_snapshot)
+    if standalone_active:
+        console.system(
+            "Active standalone LeapBoard watch(es) will keep leapd alive if you leave it running: "
+            f"{_format_watch_samples(standalone_active)}"
+        )
     connected_clients = daemon_status.get("connected_clients")
     other_clients = 0
     try:
@@ -82,15 +91,64 @@ async def _prompt_stop_daemon_on_exit(
         stop_daemon,
         runtime_dir,
         timeout_s=5.0,
+        force=True,
         grace_timeout_s=1.0 if graceful_requested else 0.0,
+        force_timeout_s=2.0,
     )
     if result.stopped:
-        console.system("leapd stopped.")
+        suffix = " with force" if result.forced else ""
+        console.system(f"leapd stopped{suffix}.")
     else:
         console.warning(
             f"leapd did not stop within the exit window (pid={result.pid}). "
-            "Run `leap daemon stop --force` if it remains unhealthy."
+            "Inspect the process manually if it remains unhealthy."
         )
+
+
+async def _cleanup_client_coupled_watches_on_exit(client: "DaemonClient", console: Any) -> list[dict[str, Any]]:
+    """Stop TUI-scoped watches and return the latest watch snapshot best-effort."""
+    try:
+        watches = await asyncio.wait_for(client.watch_list(), timeout=1.5)
+    except Exception:
+        return []
+    snapshot = [dict(watch) for watch in watches if isinstance(watch, dict)]
+    coupled = [watch for watch in snapshot if _is_active_watch(watch) and _is_client_coupled_watch(watch)]
+    stopped = 0
+    for watch in coupled:
+        watch_id = str(watch.get("watch_id", ""))
+        if not watch_id:
+            continue
+        try:
+            await asyncio.wait_for(client.watch_stop(watch_id), timeout=1.0)
+            watch["state"] = "done"
+            stopped += 1
+        except Exception:
+            logger.debug("interactive: failed to stop client-coupled watch %s", watch_id, exc_info=True)
+    if stopped:
+        console.system(f"Released {stopped} TUI-scoped LeapBoard watch(es).")
+    return snapshot
+
+
+def _is_active_watch(watch: dict[str, Any]) -> bool:
+    return str(watch.get("state", "")) in _WATCH_EXIT_ACTIVE_STATES
+
+
+def _is_client_coupled_watch(watch: dict[str, Any]) -> bool:
+    return bool(watch.get("client_coupled", False))
+
+
+def _standalone_active_watches(watches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [watch for watch in watches if _is_active_watch(watch) and not _is_client_coupled_watch(watch)]
+
+
+def _format_watch_samples(watches: list[dict[str, Any]]) -> str:
+    labels: list[str] = []
+    for watch in watches[:3]:
+        label = str(watch.get("name") or watch.get("domain") or watch.get("watch_id") or "watch")
+        state = str(watch.get("state") or "active")
+        labels.append(f"{label}({state})")
+    suffix = f", +{len(watches) - 3} more" if len(watches) > 3 else ""
+    return ", ".join(labels) + suffix
 
 
 async def _ask_yes_no_default_yes(prompt: str) -> bool:
@@ -847,13 +905,10 @@ async def cmd_interactive_daemon(
     from leapflow.cli.banner import display_rich_banner
     from leapflow.cli.commands.registry import completion_entries
     from leapflow.config_service import ConfigService
-    from leapflow.cli.commands.router import CommandRouter, render_command_result
+    from leapflow.cli.commands.router import CommandRouter
     from leapflow.cli.commands.slash_handlers import (
         render_app_payload,
         render_command_payload,
-        render_model_payload,
-        render_tool_payload,
-        render_usage_payload,
     )
     from leapflow.cli.tui_app import (
         LeapApp,

@@ -264,6 +264,7 @@ class WatchView:
     next_due_at: float
     last_run_at: float
     finding_count: int = 0
+    client_coupled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -277,6 +278,7 @@ class WatchView:
             "next_due_at": self.next_due_at,
             "last_run_at": self.last_run_at,
             "finding_count": self.finding_count,
+            "client_coupled": self.client_coupled,
         }
 
 

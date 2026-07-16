@@ -46,6 +46,7 @@ async def test_service_watch_rpc_roundtrip(tmp_path: Path) -> None:
 
     assert len(await service.watch_list()) == 1
     assert (await service.watch_get(watch_id))["domain"] == "demo"
+    assert (await service.watch_get(watch_id))["client_coupled"] is False
 
     result = await service.watch_refresh(watch_id)
     assert result["ok"] is True and result["findings"] == 1
@@ -57,6 +58,20 @@ async def test_service_watch_rpc_roundtrip(tmp_path: Path) -> None:
     assert (await service.watch_resume(watch_id))["state"] == "armed"
     assert (await service.watch_mute(watch_id, muted=True))["muted"] is True
     assert (await service.watch_stop(watch_id))["state"] == "done"
+
+
+async def test_service_watch_summary_separates_keepalive_watches(tmp_path: Path) -> None:
+    service = RuntimeLeapService(SimpleNamespace())
+    service._monitors = _manager(tmp_path)
+
+    await service.watch_arm({"name": "Session", "domain": "demo", "client_coupled": True})
+    await service.watch_arm({"name": "Market", "domain": "demo"})
+    summary = service._watch_runtime_summary()
+
+    assert summary["active"] == 2
+    assert summary["client_coupled_active"] == 1
+    assert summary["standalone_active"] == 1
+    assert summary["active_samples"][0]["state"] == "armed"
 
 
 async def test_service_watch_unavailable_is_graceful() -> None:

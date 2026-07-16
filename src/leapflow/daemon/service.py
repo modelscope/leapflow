@@ -105,6 +105,42 @@ class RuntimeLeapService:
         except Exception:
             return False
 
+    def _watch_runtime_summary(self) -> dict[str, Any]:
+        monitors = self._monitors
+        if monitors is None:
+            return {
+                "total": 0,
+                "active": 0,
+                "standalone_active": 0,
+                "client_coupled_active": 0,
+                "active_samples": [],
+            }
+        try:
+            watches = [view.to_dict() for view in monitors.list_watches()]
+        except Exception:
+            logger.debug("daemon: watch summary unavailable", exc_info=True)
+            watches = []
+        active_states = {"armed", "watching", "due", "confirming", "executing"}
+        active = [watch for watch in watches if str(watch.get("state", "")) in active_states]
+        standalone = [watch for watch in active if not bool(watch.get("client_coupled", False))]
+        coupled = [watch for watch in active if bool(watch.get("client_coupled", False))]
+        return {
+            "total": len(watches),
+            "active": len(active),
+            "standalone_active": len(standalone),
+            "client_coupled_active": len(coupled),
+            "active_samples": [
+                {
+                    "watch_id": str(watch.get("watch_id", "")),
+                    "name": str(watch.get("name", "")),
+                    "domain": str(watch.get("domain", "")),
+                    "state": str(watch.get("state", "")),
+                    "client_coupled": bool(watch.get("client_coupled", False)),
+                }
+                for watch in active[:5]
+            ],
+        }
+
     @property
     def context(self) -> Any:
         """Return the initialized Context or raise a clear lifecycle error."""
@@ -573,6 +609,7 @@ class RuntimeLeapService:
         workspace_config_path = layout.workspace_config_path(workspace_root)
         workspace_manifest_path = layout.workspace_manifest_path(workspace_root)
         context_metadata = self._engine_context_metadata(engine, settings)
+        watch_summary = self._watch_runtime_summary()
         return {
             "pid": os.getpid(),
             "profile": getattr(settings, "profile", "default"),
@@ -610,6 +647,7 @@ class RuntimeLeapService:
             "runtime_executable": sys.executable,
             "runtime_version": self._runtime_version(),
             "pending_approvals": len(self._approval_pending),
+            "watch_summary": watch_summary,
             "host_backend": self._host_backend_status(ctx),
         }
 

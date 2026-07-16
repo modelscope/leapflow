@@ -1079,6 +1079,73 @@ async def test_daemon_tui_exit_prompt_keeps_daemon_by_default_for_other_clients(
     assert any("kept running" in message for message in console.systems)
 
 
+@pytest.mark.asyncio
+async def test_daemon_tui_exit_releases_session_watches_and_reports_keepalive(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from leapflow.cli.commands import interactive as interactive_module
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    class Client:
+        async def status(self):
+            return {"pid": 1234, "connected_clients": 0}
+
+        async def watch_list(self):
+            return [
+                {"watch_id": "session-watch", "name": "Session", "domain": "session", "state": "armed", "client_coupled": True},
+                {"watch_id": "market-watch", "name": "Market", "domain": "finance", "state": "executing", "client_coupled": False},
+            ]
+
+        async def watch_stop(self, watch_id: str):
+            calls.append(("watch_stop", watch_id))
+            return {"watch_id": watch_id, "state": "done"}
+
+        async def shutdown(self):
+            calls.append(("shutdown",))
+
+    class Console:
+        def __init__(self) -> None:
+            self.systems: list[str] = []
+            self.warnings: list[str] = []
+
+        def system(self, message: str) -> None:
+            self.systems.append(message)
+
+        def warning(self, message: str) -> None:
+            self.warnings.append(message)
+
+    class Settings:
+        profile_dir = tmp_path
+        runtime_dir = tmp_path / "runtime"
+
+    async def yes(prompt: str) -> bool:
+        prompts.append(prompt)
+        return True
+
+    def record_stop(runtime_dir, **kwargs):
+        calls.append(("stop_daemon", runtime_dir, kwargs))
+        return lifecycle_module.StopDaemonResult(pid=1234, stopped=True, forced=True)
+
+    calls = []
+    prompts: list[str] = []
+    monkeypatch.setattr(interactive_module, "_ask_yes_no_default_yes", yes)
+    monkeypatch.setattr(lifecycle_module, "stop_daemon", record_stop)
+    console = Console()
+
+    await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
+
+    assert ("watch_stop", "session-watch") in calls
+    assert ("watch_stop", "market-watch") not in calls
+    assert any("Released 1 TUI-scoped LeapBoard watch" in message for message in console.systems)
+    assert any("Active standalone LeapBoard watch" in message for message in console.systems)
+    stop_call = next(call for call in calls if call[0] == "stop_daemon")
+    assert stop_call[2]["force"] is True
+    assert prompts == ["Stop leapd now (pid=1234)? [Y/n]: "]
+    assert console.systems[-1] == "leapd stopped with force."
+
+
+
 def test_leap_prompt_uses_daemon_chat_route(monkeypatch) -> None:
     from leapflow.cli import cli
 

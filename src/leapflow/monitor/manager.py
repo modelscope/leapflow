@@ -39,7 +39,13 @@ logger = logging.getLogger(__name__)
 # Emit signature: (event_type, payload_dict) -> None. Injected by the host.
 EmitFn = Callable[[str, dict], None]
 
-_ACTIVE_STATES = frozenset({TaskState.ARMED.value, TaskState.WATCHING.value})
+_ACTIVE_STATES = frozenset({
+    TaskState.ARMED.value,
+    TaskState.WATCHING.value,
+    TaskState.DUE.value,
+    TaskState.CONFIRMING.value,
+    TaskState.EXECUTING.value,
+})
 
 
 def _format_trigger(task: ArmedTask) -> str:
@@ -342,6 +348,7 @@ class MonitorManager:
             next_due_at=task.next_due_at,
             last_run_at=task.last_run_at,
             finding_count=self._finding_store.count(watch_id=task.task_id),
+            client_coupled=bool(meta.get(METADATA_CLIENT_COUPLED_KEY, False)),
         )
 
     def _emit_state(self, task: ArmedTask) -> None:

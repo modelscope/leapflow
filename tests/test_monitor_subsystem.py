@@ -7,8 +7,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from leapflow.monitor import (
     EVENT_FINDING,
     Evidence,
@@ -134,6 +132,8 @@ async def test_manager_arm_list_and_state_transitions(tmp_path: Path) -> None:
     view = await manager.arm_watch(WatchSpec(name="Market", domain="finance", trigger_expr="5m"))
     assert view.domain == "finance"
     assert view.state == "armed"
+    assert view.client_coupled is False
+    assert view.to_dict()["client_coupled"] is False
 
     assert [v.watch_id for v in manager.list_watches()] == [view.watch_id]
     assert manager.has_active_watches() is True
@@ -211,7 +211,10 @@ async def test_manager_unknown_domain_is_graceful(tmp_path: Path) -> None:
 
 async def test_has_active_watches_excludes_client_coupled(tmp_path: Path) -> None:
     manager = MonitorManager(holder=_holder(tmp_path))
-    await manager.arm_watch(WatchSpec(name="S", domain="session", client_coupled=True))
+    coupled = await manager.arm_watch(WatchSpec(name="S", domain="session", client_coupled=True))
+    assert coupled.client_coupled is True
     assert manager.has_active_watches() is False  # client-coupled must not keep leapd alive
-    await manager.arm_watch(WatchSpec(name="F", domain="finance"))
+    standalone = await manager.arm_watch(WatchSpec(name="F", domain="finance"))
+    assert manager.has_active_watches() is True
+    manager._task_store.update_state(standalone.watch_id, "executing")
     assert manager.has_active_watches() is True
