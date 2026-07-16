@@ -104,26 +104,38 @@ def test_config_list_table_adapts_to_terminal_width() -> None:
     fields = [
         {
             "key": "memory.working_max_tokens",
-            "value": "1234567890" * 6,
+            "value": 0,
             "type": "int",
             "scopes": ["profile", "workspace"],
-            "hot_reload": True,
+            "hot_reload": "partial",
             "description": "Runtime context budget for working memory before compaction.",
-        }
+        },
+        {
+            "key": "visual.track_enabled",
+            "value": False,
+            "type": "bool",
+            "scopes": ["profile"],
+            "hot_reload": False,
+            "description": "Enable visual perception.",
+        },
     ]
 
     compact = _build_config_list_table(Console(72), fields)
     assert [column.header for column in compact.columns] == ["Key", "Value", "Meta"]
     assert "Description" not in [column.header for column in compact.columns]
-    assert "reload:yes" in compact.columns[2]._cells[0]
+    assert "reload:partial" in compact.columns[2]._cells[0]
+    assert compact.columns[1]._cells[0] == "0"
+    assert compact.columns[1]._cells[1] == "False"
 
     medium = _build_config_list_table(Console(100), fields)
     assert [column.header for column in medium.columns] == ["Key", "Value", "Type", "Scope", "Reload"]
-    assert "Description" not in [column.header for column in medium.columns]
+    assert medium.columns[4]._cells[0] == "partial"
+    assert medium.columns[4]._cells[1] == "no"
 
     full = _build_config_list_table(Console(132), fields)
     assert [column.header for column in full.columns] == ["Key", "Value", "Type", "Scope", "Reload", "Description"]
     assert len(full.columns[1]._cells[0]) <= 48
+    assert full.columns[4]._cells[0] == "partial"
 
 
 @pytest.mark.asyncio

@@ -236,7 +236,7 @@ def _display_width(console: object, default: int = 100) -> int:
 
 def _shorten(text: object, limit: int) -> str:
     """Shorten a cell value before Rich allocates table columns."""
-    value = str(text or "")
+    value = str(text) if text is not None else ""
     if limit <= 0:
         return ""
     if len(value) <= limit:
@@ -250,7 +250,10 @@ def _config_scope_text(item: dict[str, Any], *, limit: int) -> str:
 
 
 def _config_reload_text(item: dict[str, Any]) -> str:
-    return "yes" if item.get("hot_reload") else "no"
+    value = item.get("hot_reload")
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value) if value is not None and str(value) else "no"
 
 
 def _config_meta_text(item: dict[str, Any], *, scope_limit: int) -> str:
