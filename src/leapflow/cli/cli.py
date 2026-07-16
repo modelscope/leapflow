@@ -175,6 +175,23 @@ def _daemon_enabled(args: argparse.Namespace) -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _suggest_known_command(token: str, known_commands: set[str]) -> str | None:
+    """Return the closest known command when a token looks like a typo, else None.
+
+    Uses a conservative similarity cutoff so genuine free-text prompts (e.g.
+    ``leap what is a daemon``) still route to chat, while near-miss command
+    typos (e.g. ``deamon`` -> ``daemon``) are caught and surfaced as a
+    suggestion instead of silently becoming an LLM chat turn that also spawns a
+    daemon.
+    """
+    import difflib
+
+    matches = difflib.get_close_matches(
+        token.lower(), sorted(known_commands), n=1, cutoff=0.82
+    )
+    return matches[0] if matches else None
+
+
 def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
@@ -336,6 +353,21 @@ def main(argv: list[str] | None = None) -> int:
         break
 
     if first_pos is not None and effective_argv[first_pos] not in known_commands:
+        first_token = effective_argv[first_pos]
+        non_flag_tokens = [tok for tok in effective_argv if not tok.startswith("-")]
+        # A short, command-like invocation whose first word is a near-miss of a
+        # known command is almost certainly a typo (e.g. `leap deamon status`).
+        # Surface a suggestion instead of silently spawning a daemon + LLM chat.
+        if len(non_flag_tokens) <= 3:
+            suggestion = _suggest_known_command(first_token, known_commands)
+            if suggestion is not None:
+                corrected = " ".join(["leap", suggestion, *effective_argv[first_pos + 1:]])
+                sys.stderr.write(
+                    f"leap: '{first_token}' is not a leap command. "
+                    f"Did you mean '{suggestion}'?\n"
+                    f"Try: {corrected}\n"
+                )
+                return 2
         # Collect all non-option prompt tokens while preserving global option values.
         flags: list[str] = []
         prompt_words = []

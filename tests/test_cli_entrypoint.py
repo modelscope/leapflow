@@ -1162,6 +1162,44 @@ def test_leap_prompt_uses_daemon_chat_route(monkeypatch) -> None:
     assert captured == {"command": "chat", "prompt": "hello world"}
 
 
+def test_leap_typo_command_suggests_instead_of_chatting(monkeypatch, capsys) -> None:
+    from leapflow.cli import cli
+
+    called = {"chat": False}
+
+    async def fake_daemon_main(args):  # pragma: no cover - must not run
+        called["chat"] = True
+        return 0
+
+    monkeypatch.setattr(cli, "_async_daemon_main", fake_daemon_main)
+
+    code = cli.main(["deamon", "status"])
+
+    assert code == 2  # usage error, not a chat turn
+    assert called["chat"] is False  # never spawned a daemon or asked the LLM
+    err = capsys.readouterr().err
+    assert "Did you mean 'daemon'" in err
+    assert "leap daemon status" in err
+
+
+def test_leap_long_freetext_near_miss_still_chats(monkeypatch) -> None:
+    from leapflow.cli import cli
+
+    captured = {}
+
+    async def fake_daemon_main(args):
+        captured["command"] = args.command
+        captured["prompt"] = args.prompt
+        return 0
+
+    monkeypatch.setattr(cli, "_async_daemon_main", fake_daemon_main)
+
+    # First word is a near-miss of `daemon`, but a full sentence is genuine chat
+    # and must not be hijacked by the did-you-mean guard.
+    assert cli.main(["deamon", "is", "a", "background", "process"]) == 0
+    assert captured == {"command": "chat", "prompt": "deamon is a background process"}
+
+
 @pytest.mark.asyncio
 async def test_teach_start_without_session_returns_structured_error() -> None:
     from types import SimpleNamespace
