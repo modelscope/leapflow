@@ -340,7 +340,7 @@ class ConfigService:
             raise ValueError(f"Unknown config key: {key}")
         if spec.secret:
             value = str(getattr(self._settings, spec.setting_name or "", "") or "")
-            return ConfigValueView(normalized, "set" if value.strip() else "missing", secret=True)
+            return ConfigValueView(normalized, _mask_secret(value), secret=True)
         value = getattr(self._settings, spec.setting_name or "", None)
         return ConfigValueView(normalized, _format_value(value), secret=False)
 
@@ -626,6 +626,19 @@ def _coerce_value(value: object, value_type: Any) -> object:
     if text.startswith("{") or text.startswith("["):
         return yaml.safe_load(text)
     return text
+
+
+def _mask_secret(raw: str) -> str:
+    """Render a secret as a masked hint (e.g. ``***3ab``), never the full value.
+
+    Empty secrets render as ``missing``; short values are fully masked.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return "missing"
+    # Reveal last 3 chars only when the secret is long enough to remain safe.
+    suffix = text[-3:] if len(text) >= 8 else ""
+    return f"***{suffix}" if suffix else "***"
 
 
 def _format_value(value: object) -> str:

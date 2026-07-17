@@ -111,25 +111,43 @@ uv run leap --help
 
 ### 2. Configure Your LLM
 
-If you already have an API key, base URL, and model name, save them through the unified config command:
+Launch the interactive TUI and configure your provider with the built-in `/config` command. It stores the API key in the local secret vault and writes only a `secret://` reference into durable config:
 
 ```bash
+leap
+```
+
+Inside the TUI (subcommands, keys, and values all auto-complete as you type):
+
+```text
+/config llm set --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 --model qwen3.7-plus --api-key sk-...
+/config show llm.model       # verify the model and base URL
+/config show llm.api_key     # confirm the key is stored (shown masked, e.g. ***abc)
+```
+
+Changes hot-reload the active session when possible, so you can start chatting right away.
+
+<details>
+<summary>More: configure from the shell (CLI)</summary>
+
+The same control plane is available as `leap config` for terminals, scripts, or CI. Use `--ask-api-key` for a secure masked prompt, or `--api-key` to pass it explicitly:
+
+```bash
+# Interactive, secure key prompt:
 leap config llm set \
   --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
   --model qwen3.7-plus \
   --ask-api-key
-```
 
-Paste your API key when prompted. LeapFlow stores the key in the local secret vault and writes only a `secret://` reference into durable config.
-
-For scripts or CI, pass the key explicitly through the same config control plane:
-
-```bash
+# Non-interactive (scripts/CI):
 leap config llm set \
   --base-url https://api.openai.com/v1 \
   --model gpt-4o \
   --api-key "$OPENAI_API_KEY"
 ```
+
+LeapFlow stores the key in the local secret vault and writes only a `secret://` reference into durable config.
+</details>
 
 ### 3. Install Execution Backend (macOS only)
 

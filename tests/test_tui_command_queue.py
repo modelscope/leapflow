@@ -296,6 +296,26 @@ def test_slash_completer_guides_config_subcommands_keys_and_values() -> None:
     assert [completion.text for completion in values] == ["true", "false"]
 
 
+def test_slash_completer_guides_config_llm_and_secret_subcommands() -> None:
+    completer = SlashCommandCompleter((("config", "View or update runtime configuration"),))
+
+    llm_actions = list(completer.get_completions(Document("/config llm ", len("/config llm ")), None))
+    assert {"show", "set"} <= {completion.text for completion in llm_actions}
+
+    llm_flags = list(completer.get_completions(Document("/config llm set ", len("/config llm set ")), None))
+    flag_texts = {completion.text for completion in llm_flags}
+    assert {"--model", "--base-url", "--api-key"} <= flag_texts
+
+    llm_flag_prefix = list(completer.get_completions(Document("/config llm set --mo", len("/config llm set --mo")), None))
+    assert [completion.text for completion in llm_flag_prefix] == ["--model"]
+
+    secret_actions = list(completer.get_completions(Document("/config secret ", len("/config secret ")), None))
+    assert {"list", "set", "get", "delete"} <= {completion.text for completion in secret_actions}
+
+    secret_prefix = list(completer.get_completions(Document("/config secret de", len("/config secret de")), None))
+    assert [completion.text for completion in secret_prefix] == ["delete"]
+
+
 def test_slash_completer_does_not_pollute_natural_language() -> None:
     completer = SlashCommandCompleter((("help", "Show available commands"),))
 

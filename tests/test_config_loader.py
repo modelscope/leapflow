@@ -77,3 +77,16 @@ def test_config_loader_warns_on_missing_secret_ref_and_bad_section(monkeypatch, 
     assert "LEAPFLOW_LLM_API_KEY" not in bundle.env
     assert any("Missing secret ref" in warning for warning in bundle.warnings)
     assert any("section 'cache' must be a mapping" in warning for warning in bundle.warnings)
+
+
+def test_mask_secret_reveals_only_a_short_suffix() -> None:
+    from leapflow.config_service import _mask_secret
+
+    assert _mask_secret("") == "missing"
+    assert _mask_secret("   ") == "missing"
+    # Long enough to reveal the last 3 characters as a recognizable hint.
+    assert _mask_secret("sk-1234567890abc") == "***abc"
+    # Too short to safely reveal any characters.
+    assert _mask_secret("short") == "***"
+    # Never leaks the full value.
+    assert "1234567890" not in _mask_secret("sk-1234567890abc")

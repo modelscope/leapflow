@@ -40,6 +40,27 @@ _CONFIG_ACTIONS: tuple[tuple[str, str], ...] = (
     ("secret", "Manage stored secret refs"),
 )
 
+_CONFIG_LLM_ACTIONS: tuple[tuple[str, str], ...] = (
+    ("show", "Show current LLM configuration"),
+    ("set", "Set LLM model, base URL, or API key"),
+)
+
+_CONFIG_LLM_SET_FLAGS: tuple[tuple[str, str], ...] = (
+    ("--model", "Model name (e.g. qwen3.7-plus)"),
+    ("--base-url", "OpenAI-compatible endpoint URL"),
+    ("--api-key", "API key (stored in the local vault)"),
+    ("--context-length", "Context window size (tokens)"),
+    ("--max-retries", "Max request retries"),
+    ("--scope", "Config scope: profile"),
+)
+
+_CONFIG_SECRET_ACTIONS: tuple[tuple[str, str], ...] = (
+    ("list", "List stored secret refs"),
+    ("set", "Store a secret value: set <ref> <value>"),
+    ("get", "Read a secret value (add --reveal to show)"),
+    ("delete", "Remove a stored secret"),
+)
+
 
 @dataclass(frozen=True)
 class ConfigCompletionField:
@@ -135,6 +156,33 @@ class SlashCommandCompleter(Completer):
                 return
             if len(parts) == 2 and not ends_space:
                 yield from self._config_category_completions(parts[1], -len(parts[1]))
+            return
+
+        if action == "llm":
+            if len(parts) == 1 and ends_space:
+                yield from _complete_pairs(_CONFIG_LLM_ACTIONS, "", 0)
+                return
+            if len(parts) == 2 and not ends_space:
+                yield from _complete_pairs(_CONFIG_LLM_ACTIONS, parts[1], -len(parts[1]))
+                return
+            if len(parts) >= 2 and parts[1] == "set":
+                last = parts[-1]
+                if not ends_space and last.startswith("-"):
+                    # Completing a flag name.
+                    yield from _complete_pairs(_CONFIG_LLM_SET_FLAGS, last, -len(last))
+                elif ends_space and not last.startswith("-"):
+                    # Finished a value (or bare `set`); offer the next flag. After a
+                    # flag token the user needs to type its value, so suggest nothing.
+                    yield from _complete_pairs(_CONFIG_LLM_SET_FLAGS, "", 0)
+            return
+
+        if action == "secret":
+            if len(parts) == 1 and ends_space:
+                yield from _complete_pairs(_CONFIG_SECRET_ACTIONS, "", 0)
+                return
+            if len(parts) == 2 and not ends_space:
+                yield from _complete_pairs(_CONFIG_SECRET_ACTIONS, parts[1], -len(parts[1]))
+            return
 
     def _config_key_completions(self, prefix: str, start_position: int) -> "Iterable[Completion]":
         query = prefix.lower()
