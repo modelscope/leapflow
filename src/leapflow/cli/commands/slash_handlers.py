@@ -1202,8 +1202,11 @@ async def _execute_board_open(ctx: "Context", monitors: Any, *, template: str) -
             session_watch_id = await _ensure_session_watch_refresh(ctx, monitors)
         except Exception:
             logger.debug("dashboard: session watch refresh failed", exc_info=True)
-    payload: dict[str, Any] = {"ok": True, "view": "dashboard", "mode": "open"}
-    payload.update(_board_web_directive(getattr(ctx, "settings", None), template=template))
+    # The client owns the dashboard server lifecycle (it spawns/validates it off
+    # the event loop), so the daemon only conveys the chosen lens here.
+    payload: dict[str, Any] = {
+        "ok": True, "view": "dashboard", "mode": "open", "template": template or "generic",
+    }
     if session_watch_id:
         payload["watch_id"] = session_watch_id
     return payload
@@ -1385,31 +1388,6 @@ def _flag_value(tokens: list[str], flag: str) -> str:
         if idx + 1 < len(tokens) and not tokens[idx + 1].startswith("--"):
             return tokens[idx + 1]
     return ""
-
-
-def _board_web_directive(settings: Any, *, template: str) -> dict[str, Any]:
-    """Build the web-open directive (running state + URL or install hint).
-
-    Single owner of URL assembly so both the daemon-running and not-yet-running
-    cases carry the chosen template consistently.
-    """
-    from leapflow.dashboard import launcher
-
-    directive: dict[str, Any] = {"template": template or "generic"}
-    state = None
-    if settings is not None:
-        try:
-            state = launcher.server_running(settings)
-        except Exception:
-            state = None
-    directive["running"] = bool(state)
-    if state:
-        directive["url"] = launcher.build_view_url(
-            state["bind"], state["port"], state["token"], template=template,
-        )
-    else:
-        directive["hint"] = "Run `leap board` to open the web view."
-    return directive
 
 
 def _is_app_command_name(name: str) -> bool:

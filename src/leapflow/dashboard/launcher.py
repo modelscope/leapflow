@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -112,14 +113,43 @@ def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
         return False
 
 
+def probe_token(bind: str, port: int, token: str, *, timeout: float = 0.6) -> bool:
+    """Return True when the server on (bind, port) actually accepts ``token``.
+
+    A reachable port is not enough: a stale discovery-state token (server
+    restarted with a new token, port reused, or a leftover instance) would make
+    the browser land on ``missing or invalid token``. This probes the real
+    server so callers only ever trust a token that works.
+    """
+    import urllib.error
+    import urllib.request
+
+    if not token:
+        return False
+    try:
+        with urllib.request.urlopen(  # noqa: S310 - fixed localhost URL
+            build_url(bind, port, token), timeout=timeout
+        ) as response:
+            return 200 <= int(getattr(response, "status", 200)) < 400
+    except urllib.error.HTTPError:
+        return False  # 401 -> token rejected by the running server
+    except OSError:
+        return False
+
+
 def server_running(settings: Any) -> Optional[dict[str, Any]]:
-    """Return live dashboard state when a server appears reachable, else None."""
+    """Return live dashboard state when a server accepts the stored token, else None.
+
+    Validates the token (not just port reachability) so a stale/mismatched
+    discovery state never yields a URL the server would reject.
+    """
     state = load_state(settings)
     if not state:
         return None
     port = int(state.get("port") or 0)
     bind = str(state.get("bind") or settings.dashboard_bind)
-    if port and is_port_open(bind, port):
+    token = str(state.get("token") or "")
+    if port and is_port_open(bind, port) and probe_token(bind, port, token):
         return state
     return None
 
@@ -133,11 +163,46 @@ def open_in_browser(url: str) -> bool:
         return False
 
 
+def _find_free_port(bind: str, start: int, *, span: int = 20) -> int:
+    """Return the first free port at or above ``start`` (falls back to ``start``)."""
+    for candidate in range(start, start + span):
+        if not is_port_open(bind, candidate):
+            return candidate
+    return start
+
+
+def _retire_stale_server(settings: Any) -> None:
+    """Best-effort retire a stale dashboard server recorded in discovery state.
+
+    Called only after ``server_running`` rejected the state (dead server or a
+    token the server no longer accepts). Signals the recorded pid so the port
+    frees for a fresh, trusted server, then drops the stale state file.
+    """
+    state = load_state(settings)
+    if not state:
+        return
+    port = int(state.get("port") or 0)
+    bind = str(state.get("bind") or getattr(settings, "dashboard_bind", "127.0.0.1"))
+    pid = int(state.get("pid") or 0)
+    if port and pid > 0 and is_port_open(bind, port):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            logger.debug("dashboard: stale server pid=%s not signalable", pid, exc_info=True)
+        else:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and is_port_open(bind, port):
+                time.sleep(0.1)
+    clear_state(settings)
+
+
 def ensure_server(settings: Any, *, wait_s: float = 8.0) -> dict[str, Any]:
     """Return running dashboard state, spawning a detached server if needed.
 
-    Raises RuntimeError when the optional web dependency is missing so callers
-    can surface an actionable install hint instead of spawning a doomed process.
+    Reuses an existing server only when it accepts the stored token; otherwise
+    it retires the stale one, picks a free port, and spawns a fresh server whose
+    token is verified before its state is published. Raises RuntimeError when the
+    optional web dependency is missing so callers can surface an install hint.
     """
     existing = server_running(settings)
     if existing:
@@ -148,9 +213,14 @@ def ensure_server(settings: Any, *, wait_s: float = 8.0) -> dict[str, Any]:
             "Install it with: pip install 'leapflow[dashboard]'"
         )
 
+    # A prior server may be dead-but-recorded, or alive with a token we can no
+    # longer prove. Retire it so a fresh, trusted server can take over cleanly.
+    _retire_stale_server(settings)
+
     token = generate_token()
-    port = int(getattr(settings, "dashboard_port", 8765))
     bind = str(getattr(settings, "dashboard_bind", "127.0.0.1"))
+    preferred = int(getattr(settings, "dashboard_port", 8765))
+    port = preferred if not is_port_open(bind, preferred) else _find_free_port(bind, preferred)
     cmd = [
         sys.executable, "-m", "leapflow", "board", "--serve",
         "--token", token, "--port", str(port), "--bind", bind,
@@ -170,7 +240,8 @@ def ensure_server(settings: Any, *, wait_s: float = 8.0) -> dict[str, Any]:
 
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        if is_port_open(bind, port):
+        # Token-aware readiness: a mere open port could be a foreign/stale server.
+        if probe_token(bind, port, token):
             break
         if proc.poll() is not None:
             raise RuntimeError("dashboard server exited before becoming ready")
@@ -199,6 +270,7 @@ __all__ = [
     "build_url",
     "build_view_url",
     "is_port_open",
+    "probe_token",
     "server_running",
     "open_in_browser",
     "ensure_server",

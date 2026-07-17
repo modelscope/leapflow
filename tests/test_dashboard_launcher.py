@@ -7,7 +7,6 @@ covered by an importorskip guard.
 
 from __future__ import annotations
 
-import socket
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,21 +46,40 @@ def test_state_roundtrip(tmp_path: Path) -> None:
     assert launcher.load_state(settings) is None
 
 
-def test_server_running_requires_open_port(tmp_path: Path) -> None:
+def test_server_running_requires_open_port_and_valid_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     settings = _settings(tmp_path)
-    launcher.write_state(settings, {"port": 65534, "bind": "127.0.0.1", "token": "t"})
-    assert launcher.server_running(settings) is None  # nothing listening
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
-    try:
-        port = srv.getsockname()[1]
-        launcher.write_state(settings, {"port": port, "bind": "127.0.0.1", "token": "t"})
-        state = launcher.server_running(settings)
-        assert state is not None and state["port"] == port
-    finally:
-        srv.close()
+    # No discovery state -> not running.
+    assert launcher.server_running(settings) is None
+
+    launcher.write_state(settings, {"port": 8765, "bind": "127.0.0.1", "token": "t"})
+
+    # Port closed -> not running (the token is never probed).
+    monkeypatch.setattr(launcher, "is_port_open", lambda *a, **k: False)
+    assert launcher.server_running(settings) is None
+
+    # Port open but the server rejects the token (stale/foreign): not running,
+    # so callers never build a URL that renders as 'missing or invalid token'.
+    monkeypatch.setattr(launcher, "is_port_open", lambda *a, **k: True)
+    monkeypatch.setattr(launcher, "probe_token", lambda *a, **k: False)
+    assert launcher.server_running(settings) is None
+
+    # Port open and the token is accepted: usable.
+    monkeypatch.setattr(launcher, "probe_token", lambda *a, **k: True)
+    state = launcher.server_running(settings)
+    assert state is not None and state["port"] == 8765
+
+
+def test_ensure_server_reuses_token_valid_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    valid = {"port": 8765, "bind": "127.0.0.1", "token": "T"}
+    monkeypatch.setattr(launcher, "server_running", lambda s: valid)
+    # A validated existing server is reused as-is; no spawn is attempted.
+    assert launcher.ensure_server(settings) is valid
 
 
 def test_open_in_browser_handles_failure(monkeypatch: pytest.MonkeyPatch) -> None:
