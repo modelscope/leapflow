@@ -53,13 +53,7 @@ async def _prompt_stop_daemon_on_exit(
         "leapd runs in the background; stop/restart it after reinstalling LeapFlow "
         "to load new code."
     )
-    watch_snapshot = await _cleanup_client_coupled_watches_on_exit(client, console)
-    standalone_active = _standalone_active_watches(watch_snapshot)
-    if standalone_active:
-        console.system(
-            "Active standalone LeapBoard watch(es) will keep leapd alive if you leave it running: "
-            f"{_format_watch_samples(standalone_active)}"
-        )
+    await _stop_board_watches_on_exit(client, console)
     connected_clients = daemon_status.get("connected_clients")
     other_clients = 0
     try:
@@ -110,50 +104,33 @@ async def _prompt_stop_daemon_on_exit(
         )
 
 
-async def _cleanup_client_coupled_watches_on_exit(client: "DaemonClient", console: Any) -> list[dict[str, Any]]:
-    """Stop TUI-scoped watches and return the latest watch snapshot best-effort."""
+async def _stop_board_watches_on_exit(client: "DaemonClient", console: Any) -> None:
+    """Stop every active board watch before exiting so none linger in leapd.
+
+    LeapBoard watches are tied to the interactive session, so leaving the TUI
+    tears them down; a brief line tells the user what was stopped.
+    """
     try:
         watches = await asyncio.wait_for(client.watch_list(), timeout=1.5)
     except Exception:
-        return []
-    snapshot = [dict(watch) for watch in watches if isinstance(watch, dict)]
-    coupled = [watch for watch in snapshot if _is_active_watch(watch) and _is_client_coupled_watch(watch)]
+        return
+    active = [w for w in watches if isinstance(w, dict) and _is_active_watch(w)]
     stopped = 0
-    for watch in coupled:
+    for watch in active:
         watch_id = str(watch.get("watch_id", ""))
         if not watch_id:
             continue
         try:
             await asyncio.wait_for(client.watch_stop(watch_id), timeout=1.0)
-            watch["state"] = "done"
             stopped += 1
         except Exception:
-            logger.debug("interactive: failed to stop client-coupled watch %s", watch_id, exc_info=True)
+            logger.debug("interactive: failed to stop board watch %s", watch_id, exc_info=True)
     if stopped:
-        console.system(f"Released {stopped} TUI-scoped LeapBoard watch(es).")
-    return snapshot
+        console.system(f"Stopped {stopped} board watch(es) on exit.")
 
 
 def _is_active_watch(watch: dict[str, Any]) -> bool:
     return str(watch.get("state", "")) in _WATCH_EXIT_ACTIVE_STATES
-
-
-def _is_client_coupled_watch(watch: dict[str, Any]) -> bool:
-    return bool(watch.get("client_coupled", False))
-
-
-def _standalone_active_watches(watches: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [watch for watch in watches if _is_active_watch(watch) and not _is_client_coupled_watch(watch)]
-
-
-def _format_watch_samples(watches: list[dict[str, Any]]) -> str:
-    labels: list[str] = []
-    for watch in watches[:3]:
-        label = str(watch.get("name") or watch.get("domain") or watch.get("watch_id") or "watch")
-        state = str(watch.get("state") or "active")
-        labels.append(f"{label}({state})")
-    suffix = f", +{len(watches) - 3} more" if len(watches) > 3 else ""
-    return ", ".join(labels) + suffix
 
 
 async def _open_dashboard_view(settings: Any, console: Any, payload: dict[str, Any]) -> None:
@@ -179,9 +156,6 @@ async def _open_dashboard_view(settings: Any, console: Any, payload: dict[str, A
         console.system(f"Opened dashboard in your browser: {url}")
     else:
         console.system(f"Dashboard ready (open manually): {url}")
-    note = str(payload.get("note") or "")
-    if note:
-        console.system(note)
     if payload.get("watch_id"):
         console.system(
             "Observing the current session; analysis streams to the board as it completes."

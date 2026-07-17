@@ -1080,7 +1080,7 @@ async def test_daemon_tui_exit_prompt_keeps_daemon_by_default_for_other_clients(
 
 
 @pytest.mark.asyncio
-async def test_daemon_tui_exit_releases_session_watches_and_reports_keepalive(
+async def test_daemon_tui_exit_stops_all_board_watches(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -1135,10 +1135,10 @@ async def test_daemon_tui_exit_releases_session_watches_and_reports_keepalive(
 
     await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
 
+    # Every active board watch is stopped on exit, regardless of coupling.
     assert ("watch_stop", "session-watch") in calls
-    assert ("watch_stop", "market-watch") not in calls
-    assert any("Released 1 TUI-scoped LeapBoard watch" in message for message in console.systems)
-    assert any("Active standalone LeapBoard watch" in message for message in console.systems)
+    assert ("watch_stop", "market-watch") in calls
+    assert any("Stopped 2 board watch(es) on exit." in message for message in console.systems)
     stop_call = next(call for call in calls if call[0] == "stop_daemon")
     assert stop_call[2]["force"] is True
     assert prompts == ["Stop leapd now (pid=1234)? [Y/n]: "]

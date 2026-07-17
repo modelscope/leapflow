@@ -1142,14 +1142,19 @@ async def _ensure_session_watch_refresh(ctx: "Context", monitors: Any) -> str:
 
 _BOARD_VERBS = frozenset({"templates", "refresh", "pause", "resume", "stop", "status"})
 
+# States in which a watch can still be paused/resumed/stopped (i.e. not terminal).
+_BOARD_CONTROLLABLE_STATES = frozenset(
+    {"armed", "watching", "due", "confirming", "executing", "suspended"}
+)
+
 
 async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[str, Any]:
     """Analyze the current session and render it through a template.
 
-    LeapBoard has a single analysis target — the current session. ``/board`` (or
-    ``/board <template>``) opens the web board with that template (``generic``
-    default; unknown names fall back to generic). Reserved verbs manage custom
-    templates and control the session observation.
+    LeapBoard has a single analysis target — the current session. ``/board``
+    opens the default (``generic``) lens; ``/board <template>`` opens a known
+    lens. Reserved verbs manage templates and the session observation. Any other
+    token is an unknown command and is rejected (never silently coerced).
     """
     monitors = getattr(ctx, "monitors", None)
     sub = name.split(" ", 1)[1].strip() if " " in name else ""
@@ -1166,79 +1171,146 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
     if verb == "status":
         return _execute_board_status(ctx, monitors)
     if verb in ("refresh", "pause", "resume", "stop"):
-        return await _execute_board_control(ctx, monitors, verb)
-    # Anything else is a template name (empty = default): open the session board.
-    return await _execute_board_open(ctx, monitors, template=verb)
+        return await _execute_board_control(
+            ctx, monitors, verb, target=rest_tokens[0] if rest_tokens else "",
+        )
+    if not verb:
+        return await _execute_board_open(ctx, monitors, template="")
+    # A non-empty, non-verb token must name a known template lens; otherwise it
+    # is an unknown command and is rejected rather than coerced to generic.
+    if verb in set(_template_library(ctx).names()):
+        return await _execute_board_open(ctx, monitors, template=verb)
+    return {
+        "ok": False,
+        "message": (
+            f"Unknown board command: '{verb}'. Use /board for the session board, "
+            "/board <template> for a lens (see /board templates), or "
+            "/board templates|refresh|pause|resume|stop|status."
+        ),
+    }
 
 
 async def _execute_board_open(ctx: "Context", monitors: Any, *, template: str) -> dict[str, Any]:
-    """Open the current-session board rendered with the requested template."""
-    library = _template_library(ctx)
-    names = set(library.names())
-    note = ""
-    effective = template
-    if template and template not in names:
-        note = f"Unknown template '{template}'; using 'generic'."
-        effective = ""
+    """Open the current-session board rendered with the requested template.
+
+    ``template`` is guaranteed to be empty (default) or a known lens by the
+    dispatcher, so there is no silent fallback here.
+    """
     session_watch_id = ""
     if monitors is not None:
         try:
             session_watch_id = await _ensure_session_watch_refresh(ctx, monitors)
         except Exception:
             logger.debug("dashboard: session watch refresh failed", exc_info=True)
-    payload: dict[str, Any] = {
-        "ok": True, "view": "dashboard", "mode": "open",
-    }
-    payload.update(_board_web_directive(getattr(ctx, "settings", None), template=effective))
+    payload: dict[str, Any] = {"ok": True, "view": "dashboard", "mode": "open"}
+    payload.update(_board_web_directive(getattr(ctx, "settings", None), template=template))
     if session_watch_id:
         payload["watch_id"] = session_watch_id
-    if note:
-        payload["note"] = note
     return payload
 
 
-async def _execute_board_control(ctx: "Context", monitors: Any, verb: str) -> dict[str, Any]:
-    """Control the single session observation: refresh / pause / resume / stop."""
+async def _execute_board_control(
+    ctx: "Context", monitors: Any, verb: str, *, target: str = "",
+) -> dict[str, Any]:
+    """Control a board observation: refresh / pause / resume / stop.
+
+    Without ``target`` the verb applies to the current session watch (``refresh``
+    starts it if absent; the others require an existing one). With ``target`` it
+    applies to the watch whose id — a full id or a unique prefix, as shown by
+    ``/board status`` — matches, so ``/board stop <id>`` stops that watch.
+    """
     if monitors is None:
         return {"ok": False, "message": "Monitor runtime is unavailable (scheduler disabled)."}
-    from leapflow.monitor.session_producer import ensure_session_watch, session_watch_params
 
-    watch_id = await ensure_session_watch(
-        monitors, params=session_watch_params(getattr(ctx, "settings", None))
-    )
+    if target:
+        watch_id = _resolve_watch_id(monitors, target)
+        if not watch_id:
+            return {"ok": False,
+                    "message": f"No board watch matches '{target}'. Run /board status to see ids."}
+    elif verb == "refresh":
+        from leapflow.monitor.session_producer import ensure_session_watch, session_watch_params
+        watch_id = await ensure_session_watch(
+            monitors, params=session_watch_params(getattr(ctx, "settings", None))
+        )
+    else:
+        watch_id = _find_session_watch_id(monitors)
+        if not watch_id:
+            return {"ok": False,
+                    "message": f"No active session board to {verb}. Run /board to start one."}
+
     if verb == "refresh":
         monitors.schedule_watch_once(watch_id, force=True)
         return {"ok": True, "view": "dashboard", "mode": "control", "action": "refresh",
+                "watch_id": watch_id,
                 "message": "Re-analyzing the current session; the board updates when it completes."}
+
     method = {"pause": monitors.pause_watch, "resume": monitors.resume_watch,
               "stop": monitors.stop_watch}[verb]
     view = method(watch_id)
+    if view is None:
+        return {"ok": False, "message": f"Watch not found: {watch_id[:8]}."}
+    label = view.name or watch_id[:8]
     messages = {
-        "pause": "Paused session analysis; use /board resume to continue.",
-        "resume": "Resumed session analysis.",
-        "stop": "Stopped observing this session; /board restarts it.",
+        "pause": f"Paused {label}; use /board resume to continue.",
+        "resume": f"Resumed {label}.",
+        "stop": f"Stopped {label}; run /board to start again.",
     }
-    return {"ok": bool(view), "view": "dashboard", "mode": "control", "action": verb,
-            "watch": view.to_dict() if view else {}, "message": messages[verb]}
+    return {"ok": True, "view": "dashboard", "mode": "control", "action": verb,
+            "watch": view.to_dict(), "message": messages[verb]}
+
+
+def _resolve_watch_id(monitors: Any, target: str) -> str:
+    """Resolve a watch id from an exact id or a unique prefix (as /board status shows)."""
+    target = target.strip()
+    if not target:
+        return ""
+    try:
+        views = list(monitors.list_watches())
+    except Exception:
+        return ""
+    for view in views:
+        if view.watch_id == target:
+            return view.watch_id
+    prefix_matches = [view.watch_id for view in views if view.watch_id.startswith(target)]
+    return prefix_matches[0] if len(prefix_matches) == 1 else ""
+
+
+def _find_session_watch_id(monitors: Any) -> str:
+    """Return the current controllable session watch id, or empty when none is active."""
+    try:
+        views = list(monitors.list_watches())
+    except Exception:
+        return ""
+    for view in views:
+        if view.domain == "session" and view.state in _BOARD_CONTROLLABLE_STATES:
+            return view.watch_id
+    return ""
 
 
 def _execute_board_status(ctx: "Context", monitors: Any) -> dict[str, Any]:
-    """Return a compact status of the session observation and available templates."""
+    """Return session-observation status: watch detail + recent findings + lenses.
+
+    Fields:
+      - ``templates`` / ``default``: available lenses and the default.
+      - ``watches``: every watch with state, run/finding counts, and last-run age.
+      - ``findings``: recent findings (severity, title, summary, age) across watches.
+    """
     library = _template_library(ctx)
     data: dict[str, Any] = {
         "ok": True, "view": "dashboard", "mode": "status",
         "templates": library.names(), "default": "generic",
+        "watches": [], "findings": [],
     }
-    if monitors is not None:
-        try:
-            session = next((v for v in monitors.list_watches() if v.domain == "session"), None)
-        except Exception:
-            session = None
-        if session is not None:
-            data["session"] = {
-                "state": session.state, "run_count": session.run_count,
-                "finding_count": session.finding_count, "last_run_at": session.last_run_at,
-            }
+    if monitors is None:
+        return data
+    try:
+        data["watches"] = [v.to_dict() for v in monitors.list_watches()]
+    except Exception:
+        logger.debug("dashboard: watch list unavailable", exc_info=True)
+    try:
+        data["findings"] = [f.to_dict() for f in monitors.list_findings(limit=20)]
+    except Exception:
+        logger.debug("dashboard: finding list unavailable", exc_info=True)
     return data
 
 
@@ -1743,6 +1815,26 @@ def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> N
         console.success(str(msg))
 
 
+def _ago(ts: Any) -> str:
+    """Format an epoch timestamp as a compact relative age (e.g. '2m ago')."""
+    import time
+
+    try:
+        value = float(ts or 0)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return "never"
+    delta = max(0, int(time.time() - value))
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
 def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
     from rich.table import Table
 
@@ -1758,8 +1850,6 @@ def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> N
             console.system("Dashboard is running.")
         else:
             console.system(str(payload.get("hint") or "Run `leap board` to open the web view."))
-        if payload.get("note"):
-            console.system(str(payload["note"]))
         return
 
     if mode == "control":
@@ -1771,14 +1861,41 @@ def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> N
         console.system(
             f"Templates: {', '.join(templates) or '-'} (default: {payload.get('default', 'generic')})"
         )
-        session = payload.get("session")
-        if isinstance(session, dict):
-            console.system(
-                f"Session: state={session.get('state')} "
-                f"runs={session.get('run_count', 0)} findings={session.get('finding_count', 0)}"
-            )
+        watches = payload.get("watches") or []
+        if watches:
+            table = Table(title="Watches", title_style="bold cyan", border_style="bright_black")
+            for col in ("id", "name", "domain", "state", "runs", "findings", "muted", "last run"):
+                table.add_column(col)
+            for w in watches:
+                table.add_row(
+                    str(w.get("watch_id", ""))[:8],
+                    str(w.get("name", "")),
+                    str(w.get("domain", "")),
+                    str(w.get("state", "")),
+                    str(w.get("run_count", 0)),
+                    str(w.get("finding_count", 0)),
+                    "yes" if w.get("muted") else "",
+                    _ago(w.get("last_run_at", 0)),
+                )
+            console.print(table)
         else:
-            console.system("Session: not observing yet — run /board to start it.")
+            console.system("Watches: none active — run /board to start session analysis.")
+        findings = payload.get("findings") or []
+        if findings:
+            console.system(f"Recent findings ({len(findings)}):")
+            markers = {"alert": "!!", "notable": " *", "info": " -"}
+            for f in findings[:20]:
+                sev = str(f.get("severity", "info"))
+                line = f"  {markers.get(sev, ' -')} [{sev}] {str(f.get('title', ''))}"
+                summary = str(f.get("summary", ""))
+                if summary:
+                    line += f" \u2014 {summary}"
+                age = _ago(f.get("ts", 0))
+                if age:
+                    line += f"  ({age})"
+                console.system(line)
+        else:
+            console.system("Findings: none yet.")
         return
 
     if mode == "templates":

@@ -130,16 +130,16 @@ async def test_board_named_template_opens_session_with_lens(tmp_path: Path) -> N
     await asyncio.gather(*list(manager._background_tasks))
 
 
-async def test_board_unknown_template_falls_back_with_note(tmp_path: Path) -> None:
+async def test_board_unknown_command_is_rejected(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     ctx = SimpleNamespace(monitors=manager, settings=None, engine=None)
 
     payload = await command_execute(ctx, "board", "nope")
 
-    assert payload["mode"] == "open"
-    assert payload["template"] == "generic"  # degraded to default
-    assert "note" in payload and "nope" in payload["note"]
-    await asyncio.gather(*list(manager._background_tasks))
+    assert payload["ok"] is False
+    assert "nope" in payload["message"] and "Unknown board command" in payload["message"]
+    # A rejected command must not arm a session watch (no silent side effect).
+    assert not manager._background_tasks
 
 
 async def test_board_status_and_templates_are_discoverable(tmp_path: Path) -> None:
@@ -149,6 +149,8 @@ async def test_board_status_and_templates_are_discoverable(tmp_path: Path) -> No
     assert status_payload["mode"] == "status"
     assert "generic" in status_payload["templates"]
     assert status_payload["default"] == "generic"
+    assert isinstance(status_payload["watches"], list)
+    assert isinstance(status_payload["findings"], list)
 
     templates = await command_execute(ctx, "board templates", "")
     assert templates["mode"] == "templates"
@@ -171,6 +173,48 @@ async def test_board_control_requires_monitor_runtime() -> None:
     disabled = await command_execute(ctx, "board refresh", "")
     assert disabled["ok"] is False
     assert "unavailable" in disabled["message"].lower()
+
+
+async def test_board_stop_defaults_to_current_session(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    ctx = SimpleNamespace(monitors=manager, settings=None, engine=None)
+    session = await manager.arm_watch(WatchSpec(name="Session", domain="session", client_coupled=True))
+
+    stopped = await command_execute(ctx, "board stop", "")
+
+    assert stopped["ok"] is True and stopped["action"] == "stop"
+    assert stopped["watch"]["watch_id"] == session.watch_id
+    assert {w.watch_id: w.state for w in manager.list_watches()}[session.watch_id] == "done"
+
+
+async def test_board_stop_by_id_targets_that_watch(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    ctx = SimpleNamespace(monitors=manager, settings=None, engine=None)
+    view = await manager.arm_watch(WatchSpec(name="Market", domain="demo"))
+
+    # Prefix id, exactly as /board status renders it.
+    stopped = await command_execute(ctx, "board stop", view.watch_id[:8])
+
+    assert stopped["ok"] is True and stopped["action"] == "stop"
+    assert stopped["watch"]["watch_id"] == view.watch_id
+    assert {w.watch_id: w.state for w in manager.list_watches()}[view.watch_id] == "done"
+
+
+async def test_board_stop_unknown_id_is_rejected(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    ctx = SimpleNamespace(monitors=manager, settings=None, engine=None)
+
+    result = await command_execute(ctx, "board stop", "does-not-exist")
+
+    assert result["ok"] is False and "does-not-exist" in result["message"]
+
+
+async def test_board_stop_without_session_reports_nothing_to_stop(tmp_path: Path) -> None:
+    ctx = SimpleNamespace(monitors=_manager(tmp_path), settings=None, engine=None)
+
+    result = await command_execute(ctx, "board stop", "")
+
+    assert result["ok"] is False and "No active session board" in result["message"]
 
 
 async def test_board_opens_without_monitor_runtime() -> None:
@@ -286,10 +330,13 @@ def test_render_dashboard_payload_covers_new_modes() -> None:
     render_command_payload(status, {
         "ok": True, "view": "dashboard", "mode": "status",
         "templates": ["generic", "finance"], "default": "generic",
-        "session": {"state": "armed", "run_count": 2, "finding_count": 1},
+        "watches": [{"watch_id": "abc12345", "name": "Session", "domain": "session",
+                     "state": "armed", "run_count": 2, "finding_count": 1, "last_run_at": 0}],
+        "findings": [{"ts": 0, "severity": "notable", "title": "Spike detected", "summary": "x"}],
     })
-    text = " ".join(status.lines)
-    assert "generic" in text and "finance" in text and "armed" in text
+    assert any("generic" in line and "finance" in line for line in status.lines)  # templates line
+    assert len(status.printed) == 1  # watches table
+    assert any("Spike detected" in line for line in status.lines)  # findings detail
 
     control = _CaptureConsole()
     render_command_payload(control, {

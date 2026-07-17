@@ -552,15 +552,15 @@ The board binds to `127.0.0.1` with a per-session access token. Tune it through 
 
 ### Usage
 
-**Analyze the current session** — from the TUI or shell. LeapBoard always analyzes the *current session*; a **template** is just the lens it renders through (`generic` is the default; unknown names fall back to it):
+**Analyze the current session** — from the TUI or shell. LeapBoard always analyzes the *current session*; a **template** is just the lens it renders through (`generic` is the default; an unrecognized name is rejected rather than silently coerced):
 
 ```text
 /board                 open the session board with the default (generic) template
 /board finance         render the same session analysis through the finance lens
-/board status          show observation state and available templates (text)
-/board refresh         re-analyze the current session now
-/board pause|resume    pause / resume automatic re-analysis
-/board stop            stop observing this session (any /board restarts it)
+/board status          show watch state, recent findings, and available templates
+/board refresh         re-analyze now (append an id to target a specific watch)
+/board pause|resume    pause / resume analysis (append an id to target a watch)
+/board stop            stop the current session, or `/board stop <id>` a specific watch
 ```
 
 ```bash
