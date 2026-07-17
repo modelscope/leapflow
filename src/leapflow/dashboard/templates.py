@@ -79,10 +79,16 @@ def _coerce_str(value: Any) -> str:
 
 
 def bind_value(value: Any, data: Mapping[str, Any]) -> Any:
-    """Bind ``{{ path }}`` templates inside strings/dicts/lists against ``data``."""
+    """Bind ``{{ path }}`` templates inside strings/dicts/lists against ``data``.
+
+    A string that is a *single* placeholder resolves to the bound value with its
+    native type preserved (e.g. an int stays an int). Any other string -- plain
+    text, or multiple placeholders such as ``"{{ a }}/{{ b }}"`` -- is rendered
+    by per-placeholder interpolation into a string.
+    """
     if isinstance(value, str):
         full = _FULL_RE.match(value.strip())
-        if full:
+        if full and "{{" not in full.group(1) and "}}" not in full.group(1):
             return resolve_path(data, full.group(1))
         return _PART_RE.sub(lambda m: _coerce_str(resolve_path(data, m.group(1))), value)
     if isinstance(value, Mapping):

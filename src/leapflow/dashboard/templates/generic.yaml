@@ -14,10 +14,46 @@ layout:
     props:
       title: "{{ title }}"
     children:
+      # ── 01 Executive brief: metrics band, abstract, and severity figure ──
       - type: Section
         props:
-          title: "Observation status"
-          subtitle: "LeapBoard continuously watches the transcript, tool results, and workspace file artifacts. This panel explains what triggered the latest refresh and what context was included."
+          title: "Executive brief"
+          subtitle: "Live coverage, the storyline as an abstract, and how insight severity is distributed."
+        children:
+          - type: Row
+            children:
+              - type: Stat
+                props:
+                  label: "Coverage"
+                  value: "{{ observation.context_coverage_pct }}%"
+              - type: Stat
+                props:
+                  label: "Artifacts"
+                  value: "{{ observation.artifacts_included }}/{{ observation.artifact_count }}"
+              - type: Stat
+                props:
+                  label: "Turns"
+                  value: "{{ analysis.usage.turns }}"
+              - type: Stat
+                props:
+                  label: "Tokens"
+                  value: "{{ analysis.usage.tokens }}"
+          - type: Grid
+            children:
+              - type: StoryPanel
+                props:
+                  title: "Abstract"
+                  text: "{{ analysis.story }}"
+              - type: BarChart
+                props:
+                  title: "Severity mix"
+                  caption: "Insight count by severity class."
+                  bind: analysis.insights
+      # ── 02 Observation: what triggered the refresh and included context ──
+      - type: Section
+        props:
+          title: "Observation"
+          subtitle: "Refresh trigger, coverage, and the file artifacts folded into this analysis."
         children:
           - type: Grid
             children:
@@ -25,20 +61,10 @@ layout:
                 props:
                   title: "Refresh state"
                 children:
-                  - type: Row
-                    children:
-                      - type: Stat
-                        props:
-                          label: "Refresh reason"
-                          value: "{{ observation.refresh_reason }}"
-                      - type: Stat
-                        props:
-                          label: "Coverage"
-                          value: "{{ observation.context_coverage_pct }}%"
-                      - type: Stat
-                        props:
-                          label: "Artifacts"
-                          value: "{{ observation.artifacts_included }}/{{ observation.artifact_count }}"
+                  - type: Stat
+                    props:
+                      label: "Reason"
+                      value: "{{ observation.refresh_reason }}"
                   - type: ProgressBar
                     props:
                       value: "{{ observation.context_coverage_pct }}"
@@ -58,6 +84,7 @@ layout:
                 children:
                   - type: Table
                     props:
+                      caption: "Session file artifacts and inclusion status."
                       bind: artifact_context
                       columns:
                         - key: name
@@ -66,25 +93,11 @@ layout:
                           label: Status
                         - key: reason
                           label: Note
-      - type: Section
-        props:
-          title: "Executive brief"
-          subtitle: "Conversation intelligence rendered like an analyst memo: storyline first, then implications."
-        children:
-          - type: Grid
-            children:
-              - type: StoryPanel
-                props:
-                  title: "Storyline"
-                  text: "{{ analysis.story }}"
-              - type: BarChart
-                props:
-                  title: "Severity mix"
-                  bind: analysis.insights
+      # ── 03 Insights: key observations, carded and capped ──
       - type: Section
         props:
           title: "Insights"
-          subtitle: "Key observations are carded and capped for fast reading."
+          subtitle: "Key observations, capped for fast scanning."
         children:
           - type: Grid
             children:
@@ -96,10 +109,11 @@ layout:
                   summary: "{{ i.summary }}"
                   severity: "{{ i.severity }}"
                   bind: i
+      # ── 04 Operating agenda: decisions, actions, open questions ──
       - type: Section
         props:
           title: "Operating agenda"
-          subtitle: "Decisions, actions, and unresolved questions are separated so the next step is obvious."
+          subtitle: "Decisions, actions, and unresolved questions, separated for the next step."
         children:
           - type: Grid
             children:
@@ -124,10 +138,11 @@ layout:
                   - type: List
                     props:
                       bind: analysis.open_questions
+      # ── 05 Context map: entities and recommended follow-ups ──
       - type: Section
         props:
           title: "Context map"
-          subtitle: "Entities and recommended follow-ups keep the analysis actionable."
+          subtitle: "Entities in play and recommended follow-up prompts."
         children:
           - type: Grid
             children:
@@ -140,7 +155,7 @@ layout:
                       bind: analysis.entities
               - type: Card
                 props:
-                  title: "Suggested next prompts"
+                  title: "Next prompts"
                 children:
                   - type: SuggestionChips
                     props:

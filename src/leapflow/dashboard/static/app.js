@@ -15,6 +15,8 @@
   const browserLocale = (navigator.language || "en").slice(0, 2).toLowerCase();
   let locale = storedLocale || (["en", "zh", "fr", "es", "ar", "ru"].includes(browserLocale) ? browserLocale : "en");
   let current = { template: params.get("template") || "" };
+  let figSeq = 0;  // academic figure counter, reset each render()
+  let tblSeq = 0;  // academic table counter, reset each render()
 
   const I18N = {
     zh: { "Overview": "概览", "Session": "会话", "Language": "语言", "connecting…": "连接中…", "live": "实时", "reconnecting…": "重连中…", "Loading…": "加载中…", "No content yet.": "暂无内容。", "Failed to load view": "视图加载失败", "Action failed": "操作失败", "Candlestick": "K线", "Series": "序列", "Gauge": "仪表", "Custom": "自定义", "unknown": "未知", "Watch portfolio": "观察组合", "Refresh cadence": "刷新节奏", "Active watches": "活跃观察", "Recent findings": "最新发现", "Watches": "观察任务", "Findings": "发现", "Signals": "信号", "Watch": "观察", "Price action": "价格行为", "Signal mix": "信号结构", "Market brief": "市场简报", "Latest sentiment": "最新情绪", "Mentions": "提及", "Sentiment structure": "情绪结构", "Narrative pulse": "叙事脉搏", "New papers": "新论文", "Research pipeline": "研究管线", "Evidence stream": "证据流", "Executive brief": "执行摘要", "Storyline": "叙事线", "Insights": "洞察", "Action items": "行动项", "Decisions": "决策", "Open questions": "待回答问题", "Entities": "实体", "Suggested next prompts": "建议追问", "Timeline": "时间线", "Severity mix": "严重度结构", "alert": "警报", "notable": "重要", "info": "信息", "Observation status": "观察状态", "Refresh state": "刷新状态", "Refresh reason": "刷新原因", "Coverage": "覆盖率", "Artifacts": "副产物", "Observed context": "已观察上下文", "File artifacts": "文件副产物", "File": "文件", "Status": "状态", "Note": "说明", "manual_refresh": "手动刷新", "first_observation": "首次观察", "artifact_changed": "文件副产物变化", "batch_turns": "轮次阈值", "batch_tokens": "上下文阈值", "model_salience": "模型显著性" },
@@ -136,6 +138,50 @@
     return asArray(items).reduce((acc, item) => { const sev = severityOf(item); acc[sev] = (acc[sev] || 0) + 1; return acc; }, {});
   }
 
+  // Academic numbering: build a caption node ("Fig. N" / "Table N") + text.
+  function captionInto(host, label, text) {
+    const num = el("span", "fignum"); num.textContent = label; host.appendChild(num);
+    if (text) host.appendChild(document.createTextNode(String(text)));
+    return host;
+  }
+  function figcaption(text) { return captionInto(el("figcaption", "figcaption"), "Fig. " + (++figSeq), tx(text)); }
+  function tableCaption(text) { return captionInto(document.createElement("caption"), "Table " + (++tblSeq), tx(text)); }
+  function chartNode(dom, props) { if (props && props.caption) dom.appendChild(figcaption(props.caption)); return dom; }
+
+  // Format the storyline like a paper abstract: bold lead-in sentence + body.
+  function renderAbstract(text) {
+    const s = String(text == null ? "" : text).trim();
+    const box = el("div", "abstract");
+    if (!s) return box;
+    const idx = s.search(/[.!?\u3002\uff01\uff1f]/);
+    if (idx > -1 && idx < 160) {
+      const lead = el("span", "lead"); lead.textContent = s.slice(0, idx + 1); box.appendChild(lead);
+      const rest = s.slice(idx + 1).trim();
+      if (rest) box.appendChild(document.createTextNode(" " + rest));
+    } else {
+      box.textContent = s;
+    }
+    return box;
+  }
+
+  // List: a definition list when items carry a summary, else compact bullets.
+  function renderList(node) {
+    const items = asArray((node.props || {}).data);
+    const structured = items.some((it) => it && typeof it === "object" && (it.summary || it.detail || it.value));
+    if (structured) {
+      const dl = el("dl", "dl");
+      items.forEach((it) => {
+        const obj = it && typeof it === "object";
+        dl.appendChild(el("dt", null, esc(obj ? (it.title || it.name || it.label || "") : it)));
+        dl.appendChild(el("dd", null, esc(obj ? (it.summary || it.detail || it.value || "") : "")));
+      });
+      return dl;
+    }
+    const ul = el("ul", "insight-list");
+    items.forEach((it) => ul.appendChild(el("li", null, esc(typeof it === "object" ? (it.title || it.summary || JSON.stringify(it)) : it))));
+    return ul;
+  }
+
   function renderGaugeValue(label, value) {
     const d = el("div", "stat gauge-stat");
     d.appendChild(el("div", "label", esc(tx(label || "Gauge"))));
@@ -187,7 +233,9 @@
 
   function renderTable(node) {
     const p = node.props || {}; const rows = asArray(p.data); const cols = asArray(p.columns);
-    const table = el("table", "data-table"); const head = document.createElement("thead"); const headRow = document.createElement("tr");
+    const table = el("table", "data-table");
+    if (p.caption) table.appendChild(tableCaption(p.caption));
+    const head = document.createElement("thead"); const headRow = document.createElement("tr");
     cols.forEach((c) => headRow.appendChild(el("th", null, esc(tx(c.label || c.key || c))))); head.appendChild(headRow); table.appendChild(head);
     const body = document.createElement("tbody"); rows.forEach((row) => { const tr = document.createElement("tr"); cols.forEach((c) => tr.appendChild(el("td", null, esc(row && row[c.key || c] != null ? row[c.key || c] : "")))); body.appendChild(tr); }); table.appendChild(body); return table;
   }
@@ -223,10 +271,8 @@
     Markdown: (n) => el("div", "md prose", esc((n.props || {}).text)),
     StoryPanel: (n) => { const p = n.props || {}; const d = el("div", "card story-panel");
       d.appendChild(el("div", "card-title", esc(tx(p.title || "Storyline"))));
-      d.appendChild(el("div", "md prose story-text", esc(p.text))); return d; },
-    List: (n) => { const items = ((n.props || {}).data) || []; const ul = el("ul", "insight-list");
-      asArray(items).forEach((it) => ul.appendChild(el("li", null, esc(typeof it === "object" ? (it.title || it.summary || JSON.stringify(it)) : it))));
-      return ul; },
+      d.appendChild(renderAbstract(p.text)); return d; },
+    List: renderList,
     SuggestionChips: (n) => { const items = ((n.props || {}).data) || []; const d = el("div", "chips");
       asArray(items).forEach((it) => d.appendChild(el("button", null, esc(it)))); return d; },
     Gauge: (n) => { const p = n.props || {}; return renderGaugeValue(p.label || "Gauge", p.data != null ? p.data : p.value); },
@@ -234,11 +280,11 @@
     Badge: (n) => { const p = n.props || {}; return el("span", "badge sev-" + String(p.tone || p.severity || "info").toLowerCase(), esc(tx(p.label || p.text || "info"))); },
     Table: renderTable,
     Timeline: renderTimeline,
-    BarChart: (n) => renderChartBars((n.props || {}).data, (n.props || {}).title || "Severity mix"),
-    AreaChart: (n) => renderSparkline((n.props || {}).data, (n.props || {}).title),
-    LineChart: (n) => renderSparkline((n.props || {}).data, (n.props || {}).title),
-    Sparkline: (n) => renderSparkline((n.props || {}).data, (n.props || {}).title),
-    PieChart: (n) => renderPie((n.props || {}).data, (n.props || {}).title || "Severity mix"),
+    BarChart: (n) => chartNode(renderChartBars((n.props || {}).data, (n.props || {}).title || "Severity mix"), n.props || {}),
+    AreaChart: (n) => chartNode(renderSparkline((n.props || {}).data, (n.props || {}).title), n.props || {}),
+    LineChart: (n) => chartNode(renderSparkline((n.props || {}).data, (n.props || {}).title), n.props || {}),
+    Sparkline: (n) => chartNode(renderSparkline((n.props || {}).data, (n.props || {}).title), n.props || {}),
+    PieChart: (n) => chartNode(renderPie((n.props || {}).data, (n.props || {}).title || "Severity mix"), n.props || {}),
     Quote: (n) => { const p = n.props || {}; const q = el("blockquote", "quote", esc(p.text)); if (p.source) q.appendChild(el("cite", null, esc(p.source))); return q; },
     CitationList: (n) => { const items = asArray((n.props || {}).data); const ol = el("ol", "citations"); items.forEach((it) => ol.appendChild(el("li", null, esc(it.label || it.title || it.url || it)))); return ol; },
     EntityGraph: (n) => { const items = asArray((n.props || {}).data); const d = el("div", "entity-cloud"); items.forEach((it) => d.appendChild(el("span", "badge", esc(it.name || it.title || it)))); return d; },
@@ -277,6 +323,7 @@
 
   function render(spec) {
     rootEl.innerHTML = "";
+    figSeq = 0; tblSeq = 0;
     (spec.root || []).forEach((n) => rootEl.appendChild(renderNode(n)));
     if (!(spec.root || []).length) rootEl.appendChild(el("div", "empty", esc(t("No content yet."))));
     document.title = spec.title ? spec.title + " \u00b7 LeapBoard" : "LeapBoard";

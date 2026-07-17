@@ -76,6 +76,18 @@ def test_bind_value_full_and_interpolated() -> None:
     assert bind_value("T: {{ finding.title }}", data) == "T: Spike"  # interpolation -> str
 
 
+def test_bind_value_multiple_placeholders_interpolate() -> None:
+    # Two placeholders + a literal must interpolate to a string, not be misread
+    # as a single bogus dotted path (which previously resolved to None).
+    data = {"observation": {"artifacts_included": 2, "artifact_count": 3}}
+    assert (
+        bind_value(
+            "{{ observation.artifacts_included }}/{{ observation.artifact_count }}", data
+        )
+        == "2/3"
+    )
+
+
 def test_render_template_repeat_and_bind() -> None:
     template = {
         "template": "demo",
