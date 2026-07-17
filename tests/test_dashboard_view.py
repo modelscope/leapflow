@@ -48,7 +48,7 @@ def _session_provider() -> _FakeProvider:
                  "story": "the arc",
                  "insights": [{"title": "i", "summary": "s", "severity": "notable"}],
                  "next_prompts": ["p"],
-                 "observation_status": {"refresh_reason": "artifact_changed", "context_coverage_pct": 90},
+                 "observation_status": {"refresh_reason": "artifact_changed", "context_scope": "text_and_artifacts"},
                  "artifact_context": [{"name": "report.md", "status": "included"}],
              }},
             {"finding_id": "x1", "watch_id": "w", "domain": "finance", "title": "noise", "severity": "info"},

@@ -30,7 +30,7 @@ _ANALYSIS = {
         "decisions": ["chose y"], "action_items": ["do x"], "open_questions": ["why?"],
         "entities": ["Alice"], "next_prompts": ["ask z"],
     },
-    "observation": {"context_coverage_pct": 90}, "artifact_context": [],
+    "observation": {"refresh_reason": "manual_refresh", "context_scope": "text_only"}, "artifact_context": [],
 }
 
 

@@ -74,8 +74,8 @@ class DashboardViewBuilder:
         session_watch = next((w for w in watches if str(w.get("domain")) == "session"), {})
         findings = await provider.findings(watch_id="", limit=50)
         session_findings = [f for f in findings if str(f.get("domain")) == "session"]
-        analysis = session_findings[0].get("payload") if session_findings else {}
-        observation = dict((analysis or {}).get("observation_status") or {})
+        analysis = dict(session_findings[0].get("payload") or {}) if session_findings else {}
+        observation = dict(analysis.get("observation_status") or {})
         if session_watch:
             observation.update({
                 "watch_state": session_watch.get("state", ""),
@@ -84,11 +84,25 @@ class DashboardViewBuilder:
                 "next_due_at": session_watch.get("next_due_at", 0),
                 "run_count": session_watch.get("run_count", 0),
             })
+        # De-weight process: fold any kind='process' insight into process_notes so
+        # tool mechanics never render as prominent insight cards.
+        insights = [i for i in (analysis.get("insights") or []) if isinstance(i, dict)]
+        process_notes = [str(n) for n in (analysis.get("process_notes") or []) if str(n).strip()]
+        kept_insights = []
+        for item in insights:
+            if str(item.get("kind", "")).lower() == "process":
+                note = str(item.get("summary") or item.get("title") or "").strip()
+                if note:
+                    process_notes.append(note)
+            else:
+                kept_insights.append(item)
+        analysis["insights"] = kept_insights
+        analysis["process_notes"] = process_notes
         data = {
             "title": "Session Analysis",
-            "analysis": analysis or {},
+            "analysis": analysis,
             "observation": observation,
-            "artifact_context": (analysis or {}).get("artifact_context") or [],
+            "artifact_context": analysis.get("artifact_context") or [],
             "findings": session_findings,
             "watch": session_watch,
         }

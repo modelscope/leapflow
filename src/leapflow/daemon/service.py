@@ -549,7 +549,8 @@ class RuntimeLeapService:
     ) -> dict[str, Any]:
         base: dict[str, Any] = {
             "story": "", "insights": [], "decisions": [], "action_items": [],
-            "open_questions": [], "entities": [], "next_prompts": [], "usage": {},
+            "open_questions": [], "entities": [], "next_prompts": [],
+            "process_notes": [], "series_intents": [], "usage": {},
         }
         ctx = self._ctx
         llm = getattr(ctx, "llm", None) if ctx is not None else None
@@ -1143,14 +1144,24 @@ class RuntimeLeapService:
 
 
 _SESSION_ANALYSIS_SYSTEM = (
-    "You are a session analyst. Read the conversation transcript and return STRICT "
-    "JSON only, with keys: story (string narrative of the session arc), insights "
-    "(array of {title, summary, severity in [info,notable,alert]}), decisions "
-    "(array of strings), action_items (array of strings), open_questions (array of "
-    "strings), entities (array of strings), next_prompts (array of strings). If a "
-    "Session file artifacts section is present, incorporate the artifact contents "
-    "as first-class evidence and mention generated files when they materially "
-    "change the analysis. Do not wrap the JSON in prose or code fences."
+    "You are a session analyst writing FOR THE USER (not for the agent). Read the "
+    "conversation transcript and return STRICT JSON only, with keys: story (a "
+    "user-facing narrative of the user's goals, findings, and outcomes — NOT a "
+    "replay of the agent's tool calls), insights (array of {title, summary, "
+    "severity in [info,notable,alert], kind in [finding,process]}), decisions "
+    "(array of strings), action_items (array of strings), open_questions (array "
+    "of strings), entities (array of strings), next_prompts (array of strings), "
+    "process_notes (array of strings), series_intents (array of {id, label, unit, "
+    "kind in [line,area,ohlc,distribution]}). "
+    "DE-WEIGHT the agent's own mechanics: tool usage, failures, retries, auth "
+    "errors, and script fixes are LOW-SIGNAL process. Omit them, or fold at most "
+    "one into insights with kind='process' and severity='info'; never emit them "
+    "as decisions or action_items unless the USER must act (e.g. provide an API "
+    "key). Put unavoidable process remarks in process_notes. In series_intents, "
+    "only NAME chart-worthy quantitative series that are actually present in the "
+    "data (labels/units); do NOT invent numbers — numeric values are extracted "
+    "separately. If a Session file artifacts section is present, treat artifact "
+    "contents as first-class evidence. Do not wrap the JSON in prose or code fences."
 )
 
 _SESSION_SALIENCE_SYSTEM = (

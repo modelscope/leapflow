@@ -25,6 +25,23 @@ layout:
                 props:
                   title: "Signal strength"
                   bind: analysis.insights
+      # Price action: real OHLC candlesticks, only when the session captured them.
+      - type: Section
+        when: analysis.charts.ohlc
+        props:
+          title: "Price action"
+          subtitle: "OHLC extracted from captured session market data."
+        children:
+          - type: CandlestickChart
+            props:
+              title: "Candlestick"
+              caption: "Open/high/low/close from captured tool output."
+              bind: analysis.charts.ohlc
+          - type: LineChart
+            when: analysis.charts.series
+            props:
+              title: "Series"
+              bind: analysis.charts.series
       - type: Section
         props:
           title: "Positions & actions"

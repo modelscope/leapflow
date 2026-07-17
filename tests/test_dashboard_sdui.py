@@ -129,7 +129,7 @@ def test_template_library_generic_renders_session_analysis() -> None:
         "insights": [{"title": "i", "summary": "s", "severity": "notable"}],
         "action_items": [], "decisions": [], "open_questions": [],
         "entities": ["Alice"], "next_prompts": ["ask"],
-    }, "observation": {"context_coverage_pct": 90}, "artifact_context": []})
+    }, "observation": {"refresh_reason": "manual_refresh", "context_scope": "text_only"}, "artifact_context": []})
     assert spec["title"] == "Session Analysis"
     flat: list[dict] = []
 

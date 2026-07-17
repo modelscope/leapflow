@@ -208,11 +208,9 @@ def test_session_template_renders_analysis() -> None:
         "next_prompts": ["ask z"],
     }, "observation": {
         "refresh_reason": "artifact_changed",
-        "context_coverage_pct": 90,
+        "context_scope": "text_and_artifacts",
         "artifacts_included": 1,
         "artifact_count": 1,
-        "observed_targets": ["conversation transcript", "file artifacts"],
-        "missing_items": [],
     }, "artifact_context": [{"name": "report.md", "status": "included", "reason": ""}]})
     flat: list[dict] = []
 
@@ -224,8 +222,8 @@ def test_session_template_renders_analysis() -> None:
     _walk(spec["root"])
     types = {n["type"] for n in flat}
     assert "StoryPanel" in types
-    # Coverage is shown once (as a KPI stat); the severity BarChart is the
-    # primary in-view visualization for the generic lens.
+    # The severity BarChart is the primary in-view visualization; the artifact
+    # Table appears only because artifact_context is non-empty here.
     assert "BarChart" in types
     assert "Table" in types
     assert len([n for n in flat if n["type"] == "InsightCard"]) == 1

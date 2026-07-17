@@ -4,7 +4,7 @@ title: "{{ title }}"
 domain: generic
 meta:
   title: "Session analysis"
-  description: "Default, general-purpose lens: full conversation intelligence with observation transparency."
+  description: "Default, general-purpose lens: user-facing conversation intelligence."
 # Refresh policy is consumed by the session producer; harmless elsewhere.
 refresh:
   batch_turns: 6
@@ -21,20 +21,16 @@ layout:
         children:
           - type: Stat
             props:
-              label: "Coverage"
-              value: "{{ observation.context_coverage_pct }}%"
-          - type: Stat
-            props:
-              label: "Artifacts"
-              value: "{{ observation.artifact_count }}"
-          - type: Stat
-            props:
               label: "Turns"
               value: "{{ analysis.usage.turns }}"
           - type: Stat
             props:
               label: "Tokens"
               value: "{{ analysis.usage.tokens }}"
+          - type: Stat
+            props:
+              label: "Artifacts"
+              value: "{{ observation.artifact_count }}"
       # 01 Executive brief: wide abstract beside the severity figure.
       - type: Section
         props:
@@ -55,44 +51,36 @@ layout:
                   title: "Severity mix"
                   caption: "Insight count by severity."
                   bind: analysis.insights
-      # 02 Observation: refresh trigger and the context folded in.
-      - type: Section
+      # File artifacts: only rendered when the session actually produced files.
+      - type: Card
+        when: artifact_context
         props:
-          title: "Observation"
-          subtitle: "Trigger and context"
+          title: "File artifacts"
+          kicker: "Observation"
         children:
-          - type: Grid
-            children:
-              - type: Card
-                props:
-                  title: "Observed context"
-                children:
-                  - type: Stat
-                    props:
-                      label: "Reason"
-                      value: "{{ observation.refresh_reason }}"
-                  - type: List
-                    props:
-                      bind: observation.observed_targets
-                  - type: List
-                    props:
-                      bind: observation.missing_items
-              - type: Card
-                props:
-                  title: "File artifacts"
-                children:
-                  - type: Table
-                    props:
-                      caption: "Session file artifacts."
-                      bind: artifact_context
-                      columns:
-                        - key: name
-                          label: File
-                        - key: status
-                          label: Status
-                        - key: reason
-                          label: Note
-      # 03 Insights: key observations, one card each (grid fills the width).
+          - type: Table
+            props:
+              caption: "Session file artifacts."
+              bind: artifact_context
+              columns:
+                - key: name
+                  label: File
+                - key: status
+                  label: Status
+                - key: reason
+                  label: Note
+      # Data series: its own titled section, only when the session captured
+      # numeric series. The chart names each line and cites its provenance.
+      - type: Section
+        when: analysis.charts.series
+        props:
+          title: "Series"
+        children:
+          - type: LineChart
+            props:
+              caption: "Extracted from this session's tool/file output (not model-generated)."
+              bind: analysis.charts.series
+      # Insights: key observations, one card each (grid fills the width).
       - type: Section
         props:
           title: "Insights"
@@ -108,7 +96,7 @@ layout:
                   summary: "{{ i.summary }}"
                   severity: "{{ i.severity }}"
                   bind: i
-      # 04 Operating agenda: decisions, actions, open questions.
+      # Operating agenda: decisions, actions, open questions.
       - type: Section
         props:
           title: "Operating agenda"
@@ -137,7 +125,7 @@ layout:
                   - type: List
                     props:
                       bind: analysis.open_questions
-      # 05 Context map: entities and recommended follow-ups.
+      # Context map: entities and recommended follow-ups.
       - type: Section
         props:
           title: "Context map"

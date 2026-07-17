@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Protocol, Sequence, runtime_checkable
 
+from leapflow.monitor.series_extractor import extract_charts
 from leapflow.monitor.types import Finding, ProducerContext, Severity
 
 logger = logging.getLogger(__name__)
@@ -107,30 +108,19 @@ def _observation_status(
 ) -> dict[str, Any]:
     included = [a for a in artifacts if a.get("status") == "included"]
     skipped = [a for a in artifacts if a.get("status") == "skipped"]
-    observed_targets = ["conversation transcript", "tool results"]
-    if artifacts:
-        observed_targets.append("file artifacts")
-    missing_items: list[str] = []
+    # A discrete, honest context label instead of an opaque coverage percentage.
+    # The client localizes the enum; values never leak untranslated into the UI.
     if not artifacts:
-        missing_items.append("No file-write artifacts detected in the current session yet.")
-    for artifact in skipped[:5]:
-        label = artifact.get("path") or artifact.get("name") or "artifact"
-        missing_items.append(f"{label}: {artifact.get('reason', 'not included')}")
-    coverage = 0.7
-    if included:
-        coverage += 0.2
-    if artifacts and not skipped:
-        coverage += 0.1
-    if skipped:
-        coverage -= min(0.3, len(skipped) * 0.08)
-    coverage = max(0.1, min(1.0, coverage))
+        context_scope = "text_only"
+    elif skipped:
+        context_scope = "partial_artifacts"
+    else:
+        context_scope = "text_and_artifacts"
     return {
         "state": "watching",
         "refresh_reason": reason,
         "last_refresh_at": now,
-        "observed_targets": observed_targets,
-        "context_coverage_pct": round(coverage * 100),
-        "missing_items": missing_items,
+        "context_scope": context_scope,
         "artifact_count": len(artifacts),
         "artifacts_included": len(included),
         "artifacts_skipped": len(skipped),
@@ -237,6 +227,13 @@ class SessionAnalysisProducer:
         analysis.setdefault("usage", {})
         analysis["usage"].update({"turns": turn_count, "tokens": token_count})
         analysis["artifact_context"] = artifacts
+        # Signal-driven, anti-hallucination charts: numbers come from captured
+        # tool/artifact outputs (never the model), keyed to the model's intents.
+        analysis["charts"] = extract_charts(
+            messages=messages,
+            artifacts=artifacts,
+            intents=analysis.get("series_intents"),
+        )
         analysis["observation_status"] = _observation_status(
             artifacts=artifacts,
             reason=reason,

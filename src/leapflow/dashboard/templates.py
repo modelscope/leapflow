@@ -113,13 +113,20 @@ def render_node(node: Any, data: Mapping[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(node, Mapping):
         return [{"type": "Markdown", "props": {"text": str(node)}}]
 
+    # ``when: <path>`` gates a node on non-empty data so empty panels (no file
+    # artifacts, no chart series, no process notes) are omitted entirely rather
+    # than rendered as blank cards.
+    when = node.get("when")
+    if isinstance(when, str) and when and not resolve_path(data, when):
+        return []
+
     repeat = node.get("repeat")
     if isinstance(repeat, str) and repeat:
         items = resolve_path(data, repeat)
         if not isinstance(items, (list, tuple)):
             return []
         as_name = str(node.get("as") or "item")
-        base = {key: value for key, value in node.items() if key not in ("repeat", "as")}
+        base = {key: value for key, value in node.items() if key not in ("repeat", "as", "when")}
         expanded: list[dict[str, Any]] = []
         for item in items:
             scope = dict(data)
