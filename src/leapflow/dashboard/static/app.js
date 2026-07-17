@@ -14,7 +14,7 @@
   const storedLocale = localStorage.getItem("leapboard.locale") || "";
   const browserLocale = (navigator.language || "en").slice(0, 2).toLowerCase();
   let locale = storedLocale || (["en", "zh", "fr", "es", "ar", "ru"].includes(browserLocale) ? browserLocale : "en");
-  let current = { action: params.get("action") || "home", target: params.get("target") || "" };
+  let current = { template: params.get("template") || "" };
 
   const I18N = {
     zh: { "Overview": "概览", "Session": "会话", "Language": "语言", "connecting…": "连接中…", "live": "实时", "reconnecting…": "重连中…", "Loading…": "加载中…", "No content yet.": "暂无内容。", "Failed to load view": "视图加载失败", "Action failed": "操作失败", "Candlestick": "K线", "Series": "序列", "Gauge": "仪表", "Custom": "自定义", "unknown": "未知", "Watch portfolio": "观察组合", "Refresh cadence": "刷新节奏", "Active watches": "活跃观察", "Recent findings": "最新发现", "Watches": "观察任务", "Findings": "发现", "Signals": "信号", "Watch": "观察", "Price action": "价格行为", "Signal mix": "信号结构", "Market brief": "市场简报", "Latest sentiment": "最新情绪", "Mentions": "提及", "Sentiment structure": "情绪结构", "Narrative pulse": "叙事脉搏", "New papers": "新论文", "Research pipeline": "研究管线", "Evidence stream": "证据流", "Executive brief": "执行摘要", "Storyline": "叙事线", "Insights": "洞察", "Action items": "行动项", "Decisions": "决策", "Open questions": "待回答问题", "Entities": "实体", "Suggested next prompts": "建议追问", "Timeline": "时间线", "Severity mix": "严重度结构", "alert": "警报", "notable": "重要", "info": "信息", "Observation status": "观察状态", "Refresh state": "刷新状态", "Refresh reason": "刷新原因", "Coverage": "覆盖率", "Artifacts": "副产物", "Observed context": "已观察上下文", "File artifacts": "文件副产物", "File": "文件", "Status": "状态", "Note": "说明", "manual_refresh": "手动刷新", "first_observation": "首次观察", "artifact_changed": "文件副产物变化", "batch_turns": "轮次阈值", "batch_tokens": "上下文阈值", "model_salience": "模型显著性" },
@@ -48,10 +48,28 @@
     try {
       const resp = await fetch(url.toString());
       if (!resp.ok) throw new Error("HTTP " + resp.status);
-      render(await resp.json());
+      const spec = await resp.json();
+      render(spec);
+      renderNav(spec.meta || {});
     } catch (err) {
       rootEl.innerHTML = '<div class="empty">' + esc(t("Failed to load view") + ": " + String(err)) + "</div>";
     }
+  }
+
+  // Template switcher: the current session, rendered through each lens.
+  function renderNav(meta) {
+    const nav = document.getElementById("nav");
+    if (!nav) return;
+    const names = Array.isArray(meta.templates) ? meta.templates : [];
+    const active = meta.active_template || "";
+    nav.innerHTML = "";
+    names.forEach((name) => {
+      const a = el("a", name === active ? "active" : "");
+      a.href = "#";
+      a.textContent = name;
+      a.addEventListener("click", (ev) => { ev.preventDefault(); fetchView({ template: name }); });
+      nav.appendChild(a);
+    });
   }
 
   async function postAction(action) {
@@ -73,8 +91,7 @@
   // nav actions are purely client-side (no server round-trip).
   function handleNav(action) {
     const p = action.params || {};
-    if (action.name === "openWatch" && p.target) fetchView({ action: "open", target: p.target });
-    else if (action.name === "openLink" && p.url) window.open(p.url, "_blank", "noopener");
+    if (action.name === "openLink" && p.url) window.open(p.url, "_blank", "noopener");
   }
 
   function esc(s) {
@@ -282,14 +299,11 @@
     ws.onclose = () => { statusEl.textContent = t("reconnecting…"); setTimeout(connectWS, 3000); };
     ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
-      if (msg.type === "monitor.finding") { toast(msg.payload || {}); if (current.action === "home") fetchView(); }
-      else if (msg.type === "watch.state") { if (current.action === "home") fetchView(); }
+      if (msg.type === "monitor.finding") { toast(msg.payload || {}); fetchView(); }
+      else if (msg.type === "watch.state") { fetchView(); }
       else if (msg.type === "view.replace" && msg.spec) { render(msg.spec); }
     };
   }
-
-  document.querySelectorAll("[data-action]").forEach((a) =>
-    a.addEventListener("click", (ev) => { ev.preventDefault(); fetchView({ action: a.dataset.action, target: a.dataset.action === "session" ? "session" : "" }); }));
 
   if (localeEl) {
     localeEl.addEventListener("change", () => {

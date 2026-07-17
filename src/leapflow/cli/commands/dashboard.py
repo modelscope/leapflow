@@ -56,12 +56,8 @@ def _open(args: argparse.Namespace, settings: object) -> int:
         print(f"dashboard: {exc}")
         return 1
 
-    action = getattr(args, "action", None) or "home"
-    url = launcher.build_url(state["bind"], state["port"], state["token"])
-    if action and action != "home":
-        url += f"&action={action}"
-        if action == "session":
-            url += "&target=session"
+    template = getattr(args, "template", "") or ""
+    url = launcher.build_view_url(state["bind"], state["port"], state["token"], template=template)
 
     auto_open = bool(getattr(settings, "dashboard_auto_open", True)) and not getattr(args, "no_open", False)
     if auto_open and launcher.open_in_browser(url):

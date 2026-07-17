@@ -93,7 +93,15 @@ class DashboardViewBuilder:
             "watch": session_watch,
         }
         name = select_template(template, self._templates.names())
-        return self._templates.render(name, data)
+        spec = self._templates.render(name, data)
+        # Expose the available lenses + the active one so the web client can
+        # render a template switcher without hardcoding template names.
+        if isinstance(spec, dict):
+            meta = spec.setdefault("meta", {})
+            if isinstance(meta, dict):
+                meta["templates"] = self._templates.names()
+                meta["active_template"] = name
+        return spec
 
 
 __all__ = [

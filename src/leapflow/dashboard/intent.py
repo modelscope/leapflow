@@ -13,8 +13,6 @@ import shlex
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-DEFAULT_TEMPLATE = "generic"
-
 
 @dataclass(frozen=True)
 class DashboardIntent:
@@ -41,4 +39,4 @@ class DashboardIntent:
         return cls(template=tokens[0].strip() if tokens else "")
 
 
-__all__ = ["DashboardIntent", "DEFAULT_TEMPLATE"]
+__all__ = ["DashboardIntent"]

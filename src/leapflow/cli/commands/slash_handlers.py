@@ -1747,84 +1747,73 @@ def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> N
     from rich.table import Table
 
     mode = str(payload.get("mode") or "")
-    if mode == "list":
-        watches = payload.get("watches") or []
-        if not watches:
-            console.system("No watches. Create one with /board new <domain>.")
-            return
-        table = Table(title="Watches", title_style="bold cyan", border_style="bright_black")
-        for col in ("id", "name", "domain", "trigger", "state", "muted", "runs", "findings"):
-            table.add_column(col)
-        for w in watches:
-            table.add_row(
-                str(w.get("watch_id", ""))[:8],
-                str(w.get("name", "")),
-                str(w.get("domain", "")),
-                str(w.get("trigger", "")),
-                str(w.get("state", "")),
-                "yes" if w.get("muted") else "",
-                str(w.get("run_count", 0)),
-                str(w.get("finding_count", 0)),
-            )
-        console.print(table)
-        return
-    if mode == "status":
-        by_state = payload.get("by_state") or {}
-        parts = ", ".join(f"{k}:{v}" for k, v in sorted(by_state.items())) or "none"
-        console.system(
-            f"Watches: {payload.get('count', 0)} ({parts}) · "
-            f"findings: {payload.get('findings_total', 0)} · "
-            f"domains: {', '.join(payload.get('domains') or []) or '-'}"
-        )
-        return
-    if mode == "armed":
-        w = payload.get("watch") or {}
-        console.success(
-            f"Armed watch {str(w.get('watch_id', ''))[:8]} · {w.get('domain')} · {w.get('trigger')}"
-        )
-        return
-    if mode == "control":
-        w = payload.get("watch") or {}
-        suffix = " (muted)" if w.get("muted") else ""
-        console.success(
-            f"{payload.get('action', 'update')}: {w.get('name')} "
-            f"[{str(w.get('watch_id', ''))[:8]}] -> {w.get('state')}{suffix}"
-        )
-        return
-    if mode == "refresh":
-        r = payload.get("result") or {}
-        console.success(
-            f"Refreshed {str(payload.get('watch_id', ''))[:8]} · "
-            f"{r.get('findings', 0)} finding(s), {r.get('emitted', 0)} pushed"
-        )
-        return
+
     if mode == "open":
+        # In the REPLs the browser is launched separately; this is a defensive
+        # text fallback for non-interactive callers.
         url = payload.get("url")
         if url:
-            console.system(f"Dashboard: {url}")
+            console.system(f"Opening board: {url}")
         elif payload.get("running"):
             console.system("Dashboard is running.")
         else:
             console.system(str(payload.get("hint") or "Run `leap board` to open the web view."))
-        return
-    if mode == "findings":
-        _render_findings_lines(console, payload.get("findings") or [])
+        if payload.get("note"):
+            console.system(str(payload["note"]))
         return
 
-
-def _render_findings_lines(console: "LeapConsole", findings: list) -> None:
-    if not findings:
-        console.system("No findings yet.")
+    if mode == "control":
+        console.success(str(payload.get("message") or payload.get("action") or "done"))
         return
-    markers = {"alert": "!!", "notable": " *", "info": " -"}
-    for f in findings[:50]:
-        sev = str(f.get("severity", "info"))
-        title = str(f.get("title", ""))
-        summary = str(f.get("summary", ""))
-        line = f"{markers.get(sev, ' -')} [{sev}] {title}"
-        if summary:
-            line += f" — {summary}"
-        console.system(line)
+
+    if mode == "status":
+        templates = payload.get("templates") or []
+        console.system(
+            f"Templates: {', '.join(templates) or '-'} (default: {payload.get('default', 'generic')})"
+        )
+        session = payload.get("session")
+        if isinstance(session, dict):
+            console.system(
+                f"Session: state={session.get('state')} "
+                f"runs={session.get('run_count', 0)} findings={session.get('finding_count', 0)}"
+            )
+        else:
+            console.system("Session: not observing yet — run /board to start it.")
+        return
+
+    if mode == "templates":
+        action = str(payload.get("action") or "list")
+        if action == "list":
+            items = payload.get("templates") or []
+            if not items:
+                console.system("No templates available.")
+                return
+            table = Table(title="Templates", title_style="bold cyan", border_style="bright_black")
+            for col in ("name", "source", "title"):
+                table.add_column(col)
+            for item in items:
+                table.add_row(
+                    str(item.get("name", "")),
+                    str(item.get("source", "")),
+                    str(item.get("title", "")),
+                )
+            console.print(table)
+            return
+        if action == "show":
+            detail = payload.get("detail") or {}
+            console.system(
+                f"{detail.get('name')} [{detail.get('source')}] — {detail.get('title')}"
+            )
+            if detail.get("description"):
+                console.system(str(detail["description"]))
+            return
+        # add / remove success
+        console.success(str(payload.get("message") or "done"))
+        return
+
+    message = payload.get("message")
+    if message:
+        console.system(str(message))
 
 
 def _render_status_view(console: "LeapConsole", payload: dict[str, Any]) -> None:

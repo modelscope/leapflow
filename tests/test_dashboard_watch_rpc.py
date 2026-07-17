@@ -257,3 +257,61 @@ async def test_board_templates_cannot_remove_builtin(tmp_path: Path) -> None:
     ctx = _templates_ctx(tmp_path / "tpl")
     result = await command_execute(ctx, "board templates", "remove generic")
     assert result["ok"] is False and "builtin" in result["message"].lower()
+
+
+class _CaptureConsole:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.printed: list[object] = []
+
+    def system(self, message: str) -> None:
+        self.lines.append(str(message))
+
+    def success(self, message: str) -> None:
+        self.lines.append(str(message))
+
+    def warning(self, message: str) -> None:
+        self.lines.append(str(message))
+
+    def print(self, obj: object) -> None:
+        self.printed.append(obj)
+
+
+def test_render_dashboard_payload_covers_new_modes() -> None:
+    """The TUI renderer must produce readable output for every new board mode
+    (regression guard: payload-only tests missed the stale renderer)."""
+    from leapflow.cli.commands.slash_handlers import render_command_payload
+
+    status = _CaptureConsole()
+    render_command_payload(status, {
+        "ok": True, "view": "dashboard", "mode": "status",
+        "templates": ["generic", "finance"], "default": "generic",
+        "session": {"state": "armed", "run_count": 2, "finding_count": 1},
+    })
+    text = " ".join(status.lines)
+    assert "generic" in text and "finance" in text and "armed" in text
+
+    control = _CaptureConsole()
+    render_command_payload(control, {
+        "ok": True, "view": "dashboard", "mode": "control", "action": "refresh",
+        "message": "Re-analyzing the current session; the board updates when it completes.",
+    })
+    assert any("Re-analyzing" in line for line in control.lines)
+
+    listing = _CaptureConsole()
+    render_command_payload(listing, {
+        "ok": True, "view": "dashboard", "mode": "templates",
+        "templates": [{"name": "generic", "source": "builtin", "title": "Session analysis"}],
+    })
+    assert len(listing.printed) == 1  # rendered as a table
+
+    added = _CaptureConsole()
+    render_command_payload(added, {
+        "ok": True, "view": "dashboard", "mode": "templates", "action": "add",
+        "message": "Registered template 'crypto'.",
+    })
+    assert any("crypto" in line for line in added.lines)
+
+    failed = _CaptureConsole()
+    render_command_payload(failed, {"ok": False, "message": "Could not add template: bad"})
+    assert any("Could not add" in line for line in failed.lines)

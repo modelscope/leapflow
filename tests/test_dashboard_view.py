@@ -92,6 +92,14 @@ async def test_builder_unknown_template_falls_back_to_generic() -> None:
     assert spec["title"] == "Session Analysis"
 
 
+async def test_builder_exposes_template_switcher_meta() -> None:
+    # The web client renders its lens switcher from this meta (no hardcoding).
+    builder = DashboardViewBuilder(TemplateLibrary())
+    spec = await builder.build(DashboardIntent(template="finance"), _session_provider())
+    assert spec["meta"]["active_template"] == "finance"
+    assert {"generic", "finance", "sentiment", "research"}.issubset(set(spec["meta"]["templates"]))
+
+
 # -- ViewHub fan-out ----------------------------------------------------------
 
 

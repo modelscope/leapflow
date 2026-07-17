@@ -273,8 +273,8 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser.add_argument("--internal", action="store_true", help=argparse.SUPPRESS)
 
     # leap board (LeapBoard monitoring dashboard)
-    dashboard_parser = subparsers.add_parser("board", help="Open or serve the LeapBoard monitoring dashboard")
-    dashboard_parser.add_argument("action", nargs="?", default="home", help="home | session | open")
+    dashboard_parser = subparsers.add_parser("board", help="Open the LeapBoard session analysis board")
+    dashboard_parser.add_argument("template", nargs="?", default="", help="Template lens to render (default: generic)")
     dashboard_parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     dashboard_parser.add_argument("--token", default="", help=argparse.SUPPRESS)
     dashboard_parser.add_argument("--port", type=int, default=0, help="Override the dashboard port")
