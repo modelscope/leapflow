@@ -224,6 +224,8 @@ def test_session_template_renders_analysis() -> None:
     _walk(spec["root"])
     types = {n["type"] for n in flat}
     assert "StoryPanel" in types
-    assert "ProgressBar" in types
+    # Coverage is shown once (as a KPI stat); the severity BarChart is the
+    # primary in-view visualization for the generic lens.
+    assert "BarChart" in types
     assert "Table" in types
     assert len([n for n in flat if n["type"] == "InsightCard"]) == 1

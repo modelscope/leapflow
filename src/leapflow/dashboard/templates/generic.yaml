@@ -14,64 +14,63 @@ layout:
     props:
       title: "{{ title }}"
     children:
-      # ── 01 Executive brief: metrics band, abstract, and severity figure ──
+      # KPI metric band: compact, hairline-divided, always-meaningful numbers.
+      - type: Row
+        props:
+          variant: metrics
+        children:
+          - type: Stat
+            props:
+              label: "Coverage"
+              value: "{{ observation.context_coverage_pct }}%"
+          - type: Stat
+            props:
+              label: "Artifacts"
+              value: "{{ observation.artifact_count }}"
+          - type: Stat
+            props:
+              label: "Turns"
+              value: "{{ analysis.usage.turns }}"
+          - type: Stat
+            props:
+              label: "Tokens"
+              value: "{{ analysis.usage.tokens }}"
+      # 01 Executive brief: wide abstract beside the severity figure.
       - type: Section
         props:
           title: "Executive brief"
-          subtitle: "Live coverage, the storyline as an abstract, and how insight severity is distributed."
+          subtitle: "Coverage · storyline · severity"
         children:
-          - type: Row
-            children:
-              - type: Stat
-                props:
-                  label: "Coverage"
-                  value: "{{ observation.context_coverage_pct }}%"
-              - type: Stat
-                props:
-                  label: "Artifacts"
-                  value: "{{ observation.artifacts_included }}/{{ observation.artifact_count }}"
-              - type: Stat
-                props:
-                  label: "Turns"
-                  value: "{{ analysis.usage.turns }}"
-              - type: Stat
-                props:
-                  label: "Tokens"
-                  value: "{{ analysis.usage.tokens }}"
           - type: Grid
+            props:
+              cols: 3
             children:
               - type: StoryPanel
                 props:
                   title: "Abstract"
                   text: "{{ analysis.story }}"
+                  span: 2
               - type: BarChart
                 props:
                   title: "Severity mix"
-                  caption: "Insight count by severity class."
+                  caption: "Insight count by severity."
                   bind: analysis.insights
-      # ── 02 Observation: what triggered the refresh and included context ──
+      # 02 Observation: refresh trigger and the context folded in.
       - type: Section
         props:
           title: "Observation"
-          subtitle: "Refresh trigger, coverage, and the file artifacts folded into this analysis."
+          subtitle: "Trigger and context"
         children:
           - type: Grid
             children:
               - type: Card
                 props:
-                  title: "Refresh state"
+                  title: "Observed context"
                 children:
                   - type: Stat
                     props:
                       label: "Reason"
                       value: "{{ observation.refresh_reason }}"
-                  - type: ProgressBar
-                    props:
-                      value: "{{ observation.context_coverage_pct }}"
-              - type: Card
-                props:
-                  title: "Observed context"
-                children:
                   - type: List
                     props:
                       bind: observation.observed_targets
@@ -84,7 +83,7 @@ layout:
                 children:
                   - type: Table
                     props:
-                      caption: "Session file artifacts and inclusion status."
+                      caption: "Session file artifacts."
                       bind: artifact_context
                       columns:
                         - key: name
@@ -93,11 +92,11 @@ layout:
                           label: Status
                         - key: reason
                           label: Note
-      # ── 03 Insights: key observations, carded and capped ──
+      # 03 Insights: key observations, one card each (grid fills the width).
       - type: Section
         props:
           title: "Insights"
-          subtitle: "Key observations, capped for fast scanning."
+          subtitle: "Key observations"
         children:
           - type: Grid
             children:
@@ -109,11 +108,11 @@ layout:
                   summary: "{{ i.summary }}"
                   severity: "{{ i.severity }}"
                   bind: i
-      # ── 04 Operating agenda: decisions, actions, open questions ──
+      # 04 Operating agenda: decisions, actions, open questions.
       - type: Section
         props:
           title: "Operating agenda"
-          subtitle: "Decisions, actions, and unresolved questions, separated for the next step."
+          subtitle: "Decisions and actions"
         children:
           - type: Grid
             children:
@@ -138,11 +137,11 @@ layout:
                   - type: List
                     props:
                       bind: analysis.open_questions
-      # ── 05 Context map: entities and recommended follow-ups ──
+      # 05 Context map: entities and recommended follow-ups.
       - type: Section
         props:
           title: "Context map"
-          subtitle: "Entities in play and recommended follow-up prompts."
+          subtitle: "Entities and follow-ups"
         children:
           - type: Grid
             children:

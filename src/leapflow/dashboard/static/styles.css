@@ -71,7 +71,16 @@ body {
 .section-subtitle { color: var(--muted); font-size: 11.5px; margin: 0 0 10px; max-width: 92ch; }
 
 /* ── Layout primitives (dense modular grid) ──────────────────────────────── */
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(224px, 1fr)); gap: 9px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 9px; align-items: start; }
+.grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.span-2 { grid-column: span 2; }
+.span-3 { grid-column: span 3; }
+@media (max-width: 760px) {
+  .grid, .grid[class*="cols-"] { grid-template-columns: 1fr; }
+  [class*="span-"] { grid-column: auto; }
+}
 .row { display: flex; gap: 9px; flex-wrap: wrap; }
 .col { display: flex; flex-direction: column; gap: 9px; }
 .board { display: flex; flex-direction: column; gap: 8px; }
@@ -87,13 +96,18 @@ body {
 .finding.sev-notable { border-left-color: var(--notable); }
 .finding.sev-info { border-left-color: var(--info); }
 .finding .sev { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
-.finding .summary { color: var(--muted); margin-top: 3px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.finding .summary { color: var(--muted); margin-top: 3px; }
 
 /* ── Metrics (KPI strip: a Row of Stats reads as a dense metric band) ────── */
 .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 0; padding: 8px 11px; min-width: 96px; flex: 1 1 96px; }
 .stat .label { color: var(--muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
 .stat .value { font-size: 20px; font-weight: 700; line-height: 1.15; margin-top: 2px; font-variant-numeric: tabular-nums; }
 .gauge-stat .value { color: var(--accent); }
+/* Metric band: a Row of Stats reads as one hairline-divided KPI strip. */
+.metric-strip { border: 1px solid var(--line); background: var(--panel); gap: 0; }
+.metric-strip .stat { border: 0; border-inline-start: 1px solid var(--line); border-radius: 0; flex: 1 1 120px; padding: 7px 13px; }
+.metric-strip .stat:first-child { border-inline-start: 0; }
+.metric-strip .stat .value { font-size: 18px; }
 
 /* ── Abstract: the storyline rendered as an academic serif column ────────── */
 .story-panel { border-top: 2px solid var(--accent); }
@@ -106,6 +120,7 @@ body {
 .dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; column-gap: 12px; row-gap: 3px; }
 .dl dt { font-weight: 600; color: var(--ink); }
 .dl dd { margin: 0; color: var(--muted); }
+.empty-inline { color: var(--faint); font-size: 12px; padding: 3px 0; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
 
 /* ── Figures + captions (academic numbering set by the renderer) ─────────── */
