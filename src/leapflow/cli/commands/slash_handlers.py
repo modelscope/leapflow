@@ -1208,7 +1208,23 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
         from leapflow.monitor import WatchSpec
 
         view = await monitors.arm_watch(WatchSpec.from_dict(_parse_watch_spec(rest_tokens)))
-        return {"ok": True, "view": "dashboard", "mode": "armed", "watch": view.to_dict()}
+        watch = view.to_dict()
+        # Creating a board is a "take me to it" action: report the armed watch as
+        # text and open its web view (the domain board that will fill in as it
+        # ticks). open_web keeps this decoupled from mode so the TUI can both
+        # render the confirmation and launch the browser.
+        payload: dict[str, Any] = {
+            "ok": True, "view": "dashboard", "mode": "armed", "watch": watch,
+            "open_web": True,
+        }
+        payload.update(
+            _board_web_directive(
+                getattr(ctx, "settings", None),
+                action="watch",
+                target=str(watch.get("watch_id", "")),
+            )
+        )
+        return payload
 
     if action in ("pause", "resume", "stop"):
         if not rest_tokens:
@@ -1256,7 +1272,6 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
                 "findings": [f.to_dict() for f in findings]}
 
     if action in ("open", "home", "session"):
-        from leapflow.dashboard import launcher
         from leapflow.dashboard.intent import DashboardIntent
 
         intent = DashboardIntent.from_args(rest)
@@ -1272,32 +1287,48 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
                 session_watch_id = await _ensure_session_watch_refresh(ctx, monitors)
             except Exception:
                 logger.debug("dashboard: session watch refresh failed", exc_info=True)
-        settings = getattr(ctx, "settings", None)
-        state = None
-        if settings is not None:
-            try:
-                state = launcher.server_running(settings)
-            except Exception:
-                state = None
         payload: dict[str, Any] = {
             "ok": True, "view": "dashboard", "mode": "open",
-            "action": intent.action, "intent": intent.to_dict(), "running": bool(state),
+            "intent": intent.to_dict(),
         }
+        payload.update(
+            _board_web_directive(
+                getattr(ctx, "settings", None),
+                action=intent.action,
+                target=intent.target,
+            )
+        )
         if session_watch_id:
             payload["watch_id"] = session_watch_id
-        if state:
-            url = launcher.build_url(state["bind"], state["port"], state["token"])
-            if intent.action != "home":
-                url += f"&action={intent.action}"
-                if intent.action == "session":
-                    url += "&target=session"
-            payload["url"] = url
-        else:
-            payload["hint"] = "Run `leap board` to open the web view."
         return payload
 
     return {"ok": False, "message": f"Unknown board subcommand: {action}. "
             "Try list|status|new|pause|resume|stop|mute|refresh|findings|open|session."}
+
+
+def _board_web_directive(settings: Any, *, action: str, target: str) -> dict[str, Any]:
+    """Build the web-open directive (running state + URL or install hint).
+
+    Shared by every board view so URL assembly (action + target) lives in one
+    place and both the daemon-running and not-yet-running cases are handled.
+    """
+    from leapflow.dashboard import launcher
+
+    directive: dict[str, Any] = {"action": action, "target": target}
+    state = None
+    if settings is not None:
+        try:
+            state = launcher.server_running(settings)
+        except Exception:
+            state = None
+    directive["running"] = bool(state)
+    if state:
+        directive["url"] = launcher.build_view_url(
+            state["bind"], state["port"], state["token"], action=action, target=target,
+        )
+    else:
+        directive["hint"] = "Run `leap board` to open the web view."
+    return directive
 
 
 def _is_app_command_name(name: str) -> bool:

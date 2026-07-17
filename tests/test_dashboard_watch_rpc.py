@@ -140,6 +140,49 @@ async def test_board_session_returns_watch_id_without_blocking(tmp_path: Path) -
     await asyncio.gather(*list(manager._background_tasks))
 
 
+async def test_board_new_opens_web_view_for_created_watch(tmp_path: Path) -> None:
+    """/board new must both confirm the armed watch (text) and open its web view
+    (open_web), focused on the freshly created watch."""
+    ctx = SimpleNamespace(monitors=_manager(tmp_path), settings=None, engine=None)
+
+    payload = await command_execute(ctx, "board new", "demo --name Market --trigger 5m")
+
+    assert payload["mode"] == "armed"  # still renders the confirmation text
+    assert payload["watch"]["name"] == "Market"
+    assert payload["open_web"] is True  # and launches the browser
+    assert payload["action"] == "watch"
+    assert payload["target"] == payload["watch"]["watch_id"]
+
+
+async def test_board_open_targets_the_requested_watch(tmp_path: Path) -> None:
+    """/board open <id> must carry the target so the web lands on the watch
+    detail, not the overview."""
+    manager = _manager(tmp_path)
+    view = await manager.arm_watch(WatchSpec(name="D", domain="demo"))
+    ctx = SimpleNamespace(monitors=manager, settings=None, engine=None)
+
+    payload = await command_execute(ctx, "board open", view.watch_id)
+
+    assert payload["mode"] == "open"
+    assert payload["action"] == "open"
+    assert payload["target"] == view.watch_id
+
+
+def test_build_view_url_propagates_action_and_target() -> None:
+    from leapflow.dashboard import launcher
+
+    assert (
+        launcher.build_view_url("127.0.0.1", 8765, "tok", action="watch", target="abc123")
+        == "http://127.0.0.1:8765/?token=tok&action=watch&target=abc123"
+    )
+    # Home is the default view and needs no action/target query params.
+    assert launcher.build_view_url("127.0.0.1", 8765, "tok") == "http://127.0.0.1:8765/?token=tok"
+    assert (
+        launcher.build_view_url("127.0.0.1", 8765, "tok", action="session", target="session")
+        == "http://127.0.0.1:8765/?token=tok&action=session&target=session"
+    )
+
+
 async def test_dashboard_command_scheduler_disabled(tmp_path: Path) -> None:
     ctx = SimpleNamespace(monitors=None)
     disabled = await command_execute(ctx, "board list", "")

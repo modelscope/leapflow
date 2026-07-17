@@ -165,6 +165,7 @@ async def _open_dashboard_view(settings: Any, console: Any, payload: dict[str, A
     from leapflow.dashboard import launcher
 
     action = str(payload.get("action") or "home")
+    target = str(payload.get("target") or "")
     url = payload.get("url")
     if not url:
         try:
@@ -172,11 +173,9 @@ async def _open_dashboard_view(settings: Any, console: Any, payload: dict[str, A
         except Exception as exc:
             console.warning(f"Could not start the dashboard server: {exc}")
             return
-        url = launcher.build_url(state["bind"], state["port"], state["token"])
-        if action != "home":
-            url += f"&action={action}"
-            if action == "session":
-                url += "&target=session"
+        url = launcher.build_view_url(
+            state["bind"], state["port"], state["token"], action=action, target=target,
+        )
     if launcher.open_in_browser(url):
         console.system(f"Opened dashboard in your browser: {url}")
     else:
@@ -782,8 +781,11 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 except Exception as exc:
                     console.warning(f"/{canonical} failed: {exc}")
                     return
-                if str(payload.get("view")) == "dashboard" and payload.get("mode") == "open":
-                    await _open_dashboard_view(ctx.settings, console, payload)
+                if str(payload.get("view")) == "dashboard":
+                    if payload.get("mode") == "open" or payload.get("open_web"):
+                        await _open_dashboard_view(ctx.settings, console, payload)
+                    if payload.get("mode") != "open":
+                        render_command_payload(console, payload)
                 else:
                     render_command_payload(console, payload)
                 return
@@ -1299,8 +1301,11 @@ async def cmd_interactive_daemon(
                 _apply_daemon_runtime_metadata({"host_backend": payload["result"]})
                 _update_status()
 
-            if str(payload.get("view")) == "dashboard" and payload.get("mode") == "open":
-                await _open_dashboard(payload)
+            if str(payload.get("view")) == "dashboard":
+                if payload.get("mode") == "open" or payload.get("open_web"):
+                    await _open_dashboard(payload)
+                if payload.get("mode") != "open":
+                    render_command_payload(console, payload)
                 return
 
             # Render: app-specific views use app renderer, others use generic

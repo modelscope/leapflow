@@ -77,6 +77,28 @@ def build_url(bind: str, port: int, token: str, path: str = "/") -> str:
     return f"http://{_host_for_bind(bind)}:{port}{path}{suffix}"
 
 
+def build_view_url(
+    bind: str,
+    port: int,
+    token: str,
+    *,
+    action: str = "home",
+    target: str = "",
+) -> str:
+    """Build a token-scoped URL that also selects a specific board view.
+
+    Single owner of the ``action``/``target`` query contract so every entry
+    (session open, watch detail, freshly-created board) lands on the intended
+    page instead of silently falling back to the overview.
+    """
+    url = build_url(bind, port, token)
+    if action and action != "home":
+        url += f"&action={action}"
+    if target:
+        url += f"&target={target}"
+    return url
+
+
 def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
     """Return True when a TCP connect to (host, port) succeeds quickly."""
     try:
@@ -171,6 +193,7 @@ __all__ = [
     "write_state",
     "clear_state",
     "build_url",
+    "build_view_url",
     "is_port_open",
     "server_running",
     "open_in_browser",
