@@ -291,7 +291,7 @@ class LeapApp:
         self._next_command_id += 1
         if self._is_duplicate_command_key(key):
             skipped = command.mark_skipped("duplicate queued/running command skipped")
-            self._console.command_card(skipped)
+            self._console.command_footer(skipped)
             self._sync_task_counts()
             self._invalidate()
             return skipped
@@ -368,7 +368,7 @@ class LeapApp:
                 break
             skipped = command.mark_skipped(reason)
             dropped.append(skipped)
-            self._console.command_card(skipped)
+            self._console.command_footer(skipped)
         self._sync_task_counts()
         self._invalidate()
         return dropped
@@ -384,7 +384,7 @@ class LeapApp:
                 break
             if command.id == command_id and dropped is None:
                 dropped = command.mark_skipped(reason)
-                self._console.command_card(dropped)
+                self._console.command_footer(dropped)
             else:
                 kept.append(command)
         for command in kept:
@@ -408,7 +408,7 @@ class LeapApp:
         self._active_terminal_reason = reason
         terminal = self._terminal_command(self._active_command, status, reason)
         self._active_command = terminal
-        self._console.command_card(terminal)
+        self._console.command_footer(terminal)
         task = self._active_dispatch_task
         if task is not None and not task.done():
             task.cancel()
@@ -709,7 +709,7 @@ class LeapApp:
                         await self._active_dispatch_task
                 if self._active_command is not None and self._active_terminal_status is None:
                     finished = self._active_command.mark_done()
-                    self._console.command_card(finished)
+                    self._console.command_footer(finished)
             except asyncio.CancelledError:
                 if self._active_command is not None and self._active_terminal_status is not None:
                     terminal = self._terminal_command(
@@ -718,14 +718,14 @@ class LeapApp:
                         self._active_terminal_reason or self._active_terminal_status.value,
                     )
                     if terminal.status != self._active_command.status:
-                        self._console.command_card(terminal)
+                        self._console.command_footer(terminal)
                 elif self._active_command is not None:
                     cancelled = self._active_command.mark_cancelled("cancelled by user")
-                    self._console.command_card(cancelled)
+                    self._console.command_footer(cancelled)
             except Exception as exc:
                 if self._active_command is not None:
                     failed = self._active_command.mark_failed(f"{type(exc).__name__}: {exc}")
-                    self._console.command_card(failed)
+                    self._console.command_footer(failed)
                 self._console.error(f"{exc}")
                 self._spinner_text = ""
                 self._tool_start_time = 0.0

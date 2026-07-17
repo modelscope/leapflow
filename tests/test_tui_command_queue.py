@@ -32,6 +32,11 @@ class _FakeConsole:
     def command_card(self, command: TuiCommand) -> None:
         self.cards.append(command)
 
+    def command_footer(self, command: TuiCommand) -> None:
+        # Terminal states render as a flat footer; record them alongside cards so
+        # lifecycle assertions track the command/status flow regardless of style.
+        self.cards.append(command)
+
     def error(self, message: str) -> None:
         self.errors.append(message)
 
@@ -478,6 +483,37 @@ def test_command_card_keeps_elapsed_in_title_not_body(monkeypatch) -> None:
     assert "done" in title
     assert "elapsed:" not in body
     assert "summarize the current project layout" in body
+
+
+def test_command_footer_renders_flat_leap_line(monkeypatch) -> None:
+    class CapturingConsole:
+        width = 100
+
+        def __init__(self) -> None:
+            self.rendered = []
+
+        def print(self, renderable) -> None:
+            self.rendered.append(renderable)
+
+    capture = CapturingConsole()
+    leap_console = LeapConsole(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    monkeypatch.setattr(leap_console, "_console", capture)
+
+    done = TuiCommand.create(command_id=13, text="/board stop 71e2ae20").mark_running().mark_done()
+    leap_console.command_footer(done)
+
+    # Flat footer, not a boxed Panel; mirrors the agent response label.
+    assert len(capture.rendered) == 1
+    from rich.panel import Panel
+    assert not isinstance(capture.rendered[0], Panel)
+    plain = capture.rendered[0].plain
+    assert plain.startswith(" |--  LEAP  #13 done")
+
+    # A never-run terminal state (e.g. skipped) omits the elapsed suffix.
+    capture.rendered.clear()
+    skipped = TuiCommand.create(command_id=14, text="/board status").mark_skipped("duplicate")
+    leap_console.command_footer(skipped)
+    assert capture.rendered[0].plain == " |--  LEAP  #14 skipped"
 
 
 def test_response_label_merges_done_command_status(monkeypatch) -> None:
