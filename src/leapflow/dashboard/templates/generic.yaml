@@ -2,9 +2,13 @@ template: generic
 version: 1
 title: "{{ title }}"
 domain: generic
-# Refresh policy is consumed by session/monitor producers; harmless elsewhere.
+meta:
+  title: "Session analysis"
+  description: "Default, general-purpose lens: full conversation intelligence with observation transparency."
+# Refresh policy is consumed by the session producer; harmless elsewhere.
 refresh:
   batch_turns: 6
+  use_model_salience: true
 layout:
   - type: Page
     props:
@@ -12,38 +16,132 @@ layout:
     children:
       - type: Section
         props:
-          title: "Executive brief"
-          subtitle: "A concise operating view of the active signal stream."
+          title: "Observation status"
+          subtitle: "LeapBoard continuously watches the transcript, tool results, and workspace file artifacts. This panel explains what triggered the latest refresh and what context was included."
         children:
-          - type: Row
+          - type: Grid
             children:
-              - type: Stat
+              - type: Card
                 props:
-                  label: "Findings"
-                  value: "{{ watch.finding_count }}"
-              - type: PieChart
+                  title: "Refresh state"
+                children:
+                  - type: Row
+                    children:
+                      - type: Stat
+                        props:
+                          label: "Refresh reason"
+                          value: "{{ observation.refresh_reason }}"
+                      - type: Stat
+                        props:
+                          label: "Coverage"
+                          value: "{{ observation.context_coverage_pct }}%"
+                      - type: Stat
+                        props:
+                          label: "Artifacts"
+                          value: "{{ observation.artifacts_included }}/{{ observation.artifact_count }}"
+                  - type: ProgressBar
+                    props:
+                      value: "{{ observation.context_coverage_pct }}"
+              - type: Card
                 props:
-                  title: "Severity mix"
-                  bind: findings
+                  title: "Observed context"
+                children:
+                  - type: List
+                    props:
+                      bind: observation.observed_targets
+                  - type: List
+                    props:
+                      bind: observation.missing_items
+              - type: Card
+                props:
+                  title: "File artifacts"
+                children:
+                  - type: Table
+                    props:
+                      bind: artifact_context
+                      columns:
+                        - key: name
+                          label: File
+                        - key: status
+                          label: Status
+                        - key: reason
+                          label: Note
       - type: Section
         props:
-          title: "Signal flow"
-          subtitle: "Latest observations, formatted for quick triage rather than long-form reading."
+          title: "Executive brief"
+          subtitle: "Conversation intelligence rendered like an analyst memo: storyline first, then implications."
         children:
-          - type: Board
-            props:
-              title: Findings
+          - type: Grid
             children:
-              - type: FindingCard
-                repeat: findings
-                as: f
+              - type: StoryPanel
                 props:
-                  title: "{{ f.title }}"
-                  summary: "{{ f.summary }}"
-                  severity: "{{ f.severity }}"
-                  bind: f
-                action:
-                  kind: intent
-                  name: drilldown
-                  params:
-                    finding_id: "{{ f.finding_id }}"
+                  title: "Storyline"
+                  text: "{{ analysis.story }}"
+              - type: BarChart
+                props:
+                  title: "Severity mix"
+                  bind: analysis.insights
+      - type: Section
+        props:
+          title: "Insights"
+          subtitle: "Key observations are carded and capped for fast reading."
+        children:
+          - type: Grid
+            children:
+              - type: InsightCard
+                repeat: analysis.insights
+                as: i
+                props:
+                  title: "{{ i.title }}"
+                  summary: "{{ i.summary }}"
+                  severity: "{{ i.severity }}"
+                  bind: i
+      - type: Section
+        props:
+          title: "Operating agenda"
+          subtitle: "Decisions, actions, and unresolved questions are separated so the next step is obvious."
+        children:
+          - type: Grid
+            children:
+              - type: Card
+                props:
+                  title: "Action items"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.action_items
+              - type: Card
+                props:
+                  title: "Decisions"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.decisions
+              - type: Card
+                props:
+                  title: "Open questions"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.open_questions
+      - type: Section
+        props:
+          title: "Context map"
+          subtitle: "Entities and recommended follow-ups keep the analysis actionable."
+        children:
+          - type: Grid
+            children:
+              - type: Card
+                props:
+                  title: "Entities"
+                children:
+                  - type: EntityGraph
+                    props:
+                      bind: analysis.entities
+              - type: Card
+                props:
+                  title: "Suggested next prompts"
+                children:
+                  - type: SuggestionChips
+                    props:
+                      bind: analysis.next_prompts

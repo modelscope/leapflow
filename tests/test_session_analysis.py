@@ -197,8 +197,8 @@ async def test_session_history_empty_without_context() -> None:
 
 def test_session_template_renders_analysis() -> None:
     lib = TemplateLibrary()
-    assert "session.analysis" in lib.names()
-    spec = lib.render("session.analysis", {"analysis": {
+    assert "generic" in lib.names()
+    spec = lib.render("generic", {"analysis": {
         "story": "the arc",
         "insights": [{"title": "t", "summary": "s", "severity": "notable"}],
         "action_items": ["do x"],

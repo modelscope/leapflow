@@ -58,15 +58,17 @@ def test_board_commands_resolve_as_engine_routed() -> None:
     routes them through command_execute instead of leaking to the LLM chat."""
     router = CommandRouter("daemon")
 
-    for cmd_text in ("/board", "/board session", "/board open", "/board list"):
+    for cmd_text in ("/board", "/board finance", "/board templates", "/board refresh", "/board status"):
         inv = router.parse(cmd_text)
         assert inv is not None, f"parse failed for {cmd_text}"
         assert inv.command.name.startswith("board"), cmd_text
         assert inv.command.client_local is False, f"{cmd_text} must be engine-routed"
 
-    session = router.parse("/board session")
-    assert session is not None
-    assert session.command.name == "board session"
+    # A bare template name resolves to the base `board` command (template = arg).
+    finance = router.parse("/board finance")
+    assert finance is not None and finance.command.name == "board" and finance.args == "finance"
+    # Reserved verbs resolve to their dedicated command.
+    assert router.parse("/board templates").command.name == "board templates"
 
 
 def test_plural_skill_tool_task_commands_are_not_registered() -> None:

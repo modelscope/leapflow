@@ -1,0 +1,69 @@
+template: finance
+version: 1
+title: "{{ title }}"
+domain: finance
+meta:
+  title: "Finance lens"
+  description: "Reframes the current-session analysis for financial decision-making: calls, actions, and exposures first."
+layout:
+  - type: Page
+    props:
+      title: "{{ title }}"
+    children:
+      - type: Section
+        props:
+          title: "Desk brief"
+          subtitle: "Storyline and signal strength before drilling into positions and actions."
+        children:
+          - type: Grid
+            children:
+              - type: StoryPanel
+                props:
+                  title: "Narrative"
+                  text: "{{ analysis.story }}"
+              - type: BarChart
+                props:
+                  title: "Signal strength"
+                  bind: analysis.insights
+      - type: Section
+        props:
+          title: "Positions & actions"
+          subtitle: "Decisions read as calls; action items as the execution checklist."
+        children:
+          - type: Grid
+            children:
+              - type: Card
+                props:
+                  title: "Calls (decisions)"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.decisions
+              - type: Card
+                props:
+                  title: "Execution checklist"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.action_items
+      - type: Section
+        props:
+          title: "Watchlist"
+          subtitle: "Entities in play and the open risks still to resolve."
+        children:
+          - type: Grid
+            children:
+              - type: Card
+                props:
+                  title: "Instruments & counterparties"
+                children:
+                  - type: EntityGraph
+                    props:
+                      bind: analysis.entities
+              - type: Card
+                props:
+                  title: "Open risks"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.open_questions

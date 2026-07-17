@@ -164,8 +164,7 @@ async def _open_dashboard_view(settings: Any, console: Any, payload: dict[str, A
     """
     from leapflow.dashboard import launcher
 
-    action = str(payload.get("action") or "home")
-    target = str(payload.get("target") or "")
+    template = str(payload.get("template") or "")
     url = payload.get("url")
     if not url:
         try:
@@ -174,17 +173,18 @@ async def _open_dashboard_view(settings: Any, console: Any, payload: dict[str, A
             console.warning(f"Could not start the dashboard server: {exc}")
             return
         url = launcher.build_view_url(
-            state["bind"], state["port"], state["token"], action=action, target=target,
+            state["bind"], state["port"], state["token"], template=template,
         )
     if launcher.open_in_browser(url):
         console.system(f"Opened dashboard in your browser: {url}")
     else:
         console.system(f"Dashboard ready (open manually): {url}")
-    watch_id = str(payload.get("watch_id") or "")
-    if watch_id:
+    note = str(payload.get("note") or "")
+    if note:
+        console.system(note)
+    if payload.get("watch_id"):
         console.system(
-            f"Session board watch {watch_id[:8]} is observing; "
-            "analysis streams to the board as it completes."
+            "Observing the current session; analysis streams to the board as it completes."
         )
 
 
@@ -782,10 +782,11 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                     console.warning(f"/{canonical} failed: {exc}")
                     return
                 if str(payload.get("view")) == "dashboard":
-                    if payload.get("mode") == "open" or payload.get("open_web"):
+                    if payload.get("mode") == "open":
                         await _open_dashboard_view(ctx.settings, console, payload)
-                    if payload.get("mode") != "open":
+                    else:
                         render_command_payload(console, payload)
+                    return
                 else:
                     render_command_payload(console, payload)
                 return
@@ -1302,9 +1303,9 @@ async def cmd_interactive_daemon(
                 _update_status()
 
             if str(payload.get("view")) == "dashboard":
-                if payload.get("mode") == "open" or payload.get("open_web"):
+                if payload.get("mode") == "open":
                     await _open_dashboard(payload)
-                if payload.get("mode") != "open":
+                else:
                     render_command_payload(console, payload)
                 return
 

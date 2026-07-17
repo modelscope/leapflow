@@ -1,115 +1,44 @@
-"""DashboardIntent: the single normalized request behind both entry doors.
+"""DashboardIntent: the single normalized request behind ``/board`` and the tool.
 
-Slash commands (``/board ...``) and the engine board tool both
-produce a ``DashboardIntent``, so there is one implementation with two front
-doors -- no duplicated routing and no keyword-matching taxonomy.
+LeapBoard always analyzes the *current session*; the only view dimension is the
+**template** (a rendering lens). Control verbs
+(``templates``/``refresh``/``pause``/``resume``/``stop``/``status``) are handled
+at the command layer, so the intent that reaches the view builder is simply a
+template name — empty means the default (``generic``).
 """
 
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Mapping
 
-KNOWN_ACTIONS = frozenset({
-    "open", "home", "session", "watch", "new", "list", "refresh",
-    "template", "close", "status", "pause", "resume", "stop", "mute", "findings",
-})
-_DEFAULT_ACTION = "open"
-_TARGET_ACTIONS = frozenset({
-    "watch", "refresh", "open", "pause", "resume", "stop", "mute", "findings",
-})
-_FLAG_KEYS = {
-    "--template": "template",
-    "--domain": "domain",
-    "--name": "name",
-    "--trigger": "trigger",
-    "--sensitivity": "sensitivity",
-}
+DEFAULT_TEMPLATE = "generic"
 
 
 @dataclass(frozen=True)
 class DashboardIntent:
-    """A normalized dashboard request from slash or natural-language entry."""
+    """A normalized dashboard request: which template to render the session with."""
 
-    action: str = _DEFAULT_ACTION
-    domain: str = ""
     template: str = ""
-    target: str = ""
-    params: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "action": self.action,
-            "domain": self.domain,
-            "template": self.template,
-            "target": self.target,
-            "params": dict(self.params),
-        }
+        return {"template": self.template}
 
     @classmethod
     def from_params(cls, data: Mapping[str, Any]) -> "DashboardIntent":
-        """Build an intent from structured tool/RPC params."""
+        """Build an intent from structured params (e.g. web ``?template=``)."""
         data = data if isinstance(data, Mapping) else {}
-        action = str(data.get("action", "") or "").strip().lower()
-        if action not in KNOWN_ACTIONS:
-            action = _DEFAULT_ACTION
-        return cls(
-            action=action,
-            domain=str(data.get("domain", "")).strip(),
-            template=str(data.get("template", "")).strip(),
-            target=str(data.get("target", "")).strip(),
-            params=dict(data.get("params") or {}),
-        )
+        return cls(template=str(data.get("template", "") or "").strip())
 
     @classmethod
     def from_args(cls, args: str) -> "DashboardIntent":
-        """Parse a slash argument string into an intent.
-
-        The first token is the action when recognized; otherwise it is treated
-        as a domain to create (``/board finance`` -> new finance watch).
-        """
+        """Parse a slash argument string; the first token is the template name."""
         try:
             tokens = shlex.split(args or "")
         except ValueError:
             tokens = (args or "").split()
-        if not tokens:
-            return cls(action="open")
-
-        first = tokens[0].lower()
-        if first in KNOWN_ACTIONS:
-            action, rest = first, tokens[1:]
-        else:
-            action, rest = "new", tokens
-
-        domain = template = target = ""
-        params: dict[str, Any] = {}
-        positional: list[str] = []
-        i = 0
-        while i < len(rest):
-            key = _FLAG_KEYS.get(rest[i])
-            if key and i + 1 < len(rest):
-                value = rest[i + 1]
-                if key == "template":
-                    template = value
-                elif key == "domain":
-                    domain = value
-                else:
-                    params[key] = value
-                i += 2
-            else:
-                positional.append(rest[i])
-                i += 1
-
-        if action == "new" and positional and not domain:
-            domain = positional[0]
-        elif action in _TARGET_ACTIONS and positional:
-            target = positional[0]
-        elif action == "template" and positional:
-            template = positional[0]
-        elif action == "session":
-            target = "session"
-        return cls(action=action, domain=domain, template=template, target=target, params=params)
+        return cls(template=tokens[0].strip() if tokens else "")
 
 
-__all__ = ["DashboardIntent", "KNOWN_ACTIONS"]
+__all__ = ["DashboardIntent", "DEFAULT_TEMPLATE"]

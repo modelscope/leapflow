@@ -530,7 +530,7 @@ Watch (leapd-hosted) ── observe → SNR filter → score → Finding ──�
 ```
 
 - **Continuous observation** — a board starts as a `Watch` in `leapd`. Scheduler triggers, manual `/board refresh`, and session-analysis batch thresholds all run the same observe→finding cycle; new findings are persisted, severity-gated, and pushed to browsers over WebSocket.
-- **Refresh model** — overview boards refresh when watch state or new findings arrive; session boards refresh as the conversation accumulates turns, when written workspace artifacts change, or when manual/model-salience triggers fire. Muted watches still persist findings but stop pushing notifications; paused/stopped watches stop observing.
+- **Refresh model** — the session board re-analyzes as the conversation accumulates turns, when written workspace artifacts change, or on manual `/board refresh`; `/board pause`/`stop` halt re-analysis until resumed. The chosen **template** only changes rendering, never what is analyzed (always the current session).
 - **Server-Driven UI** — each scenario is authored as a **YAML template** compiled into a validated **ViewSpec** over a fixed component catalog (cards, tables, charts, timelines, gauges, story panels…). Interactive components talk back through a bidirectional action protocol; unknown component types degrade gracefully, and bespoke visuals use a `Custom` escape hatch. The board never renders arbitrary HTML/JS.
 - **View client** — the board connects to `leapd` like the TUI does, with no privileged coupling. The web server is optional (`aiohttp`) and degrades with a clear install hint when absent.
 
@@ -552,46 +552,46 @@ The board binds to `127.0.0.1` with a per-session access token. Tune it through 
 
 ### Usage
 
-**Start / open** — from the TUI or shell:
+**Analyze the current session** — from the TUI or shell. LeapBoard always analyzes the *current session*; a **template** is just the lens it renders through (`generic` is the default; unknown names fall back to it):
 
 ```text
-/board                     open the board (session analysis if a conversation is active, else overview)
-/board session             open the current-session analysis board
+/board                 open the session board with the default (generic) template
+/board finance         render the same session analysis through the finance lens
+/board status          show observation state and available templates (text)
+/board refresh         re-analyze the current session now
+/board pause|resume    pause / resume automatic re-analysis
+/board stop            stop observing this session (any /board restarts it)
 ```
 
 ```bash
-leap board                 # ensure the server is running and open the browser
-leap board session         # open the session-analysis board
-leap board --no-open       # print the URL instead of opening a browser
+leap board             # ensure the server is running and open the browser
+leap board --no-open   # print the URL instead of opening a browser
 ```
 
-Executing any entry auto-launches your default browser at the token-scoped local URL. Inside the browser, the language switcher supports English, Chinese, French, Spanish, Arabic, and Russian.
+Executing any open entry auto-launches your default browser at the token-scoped local URL. Inside the browser, the language switcher supports English, Chinese, French, Spanish, Arabic, and Russian.
 
-**Create and manage watches** — inside the TUI:
+**Templates (view lenses)** — templates are the single view dimension, and you can add your own with one command:
 
 ```text
-/board new finance --name "AAPL watch" --trigger 5m
-/board list                list active watches
-/board findings            show recent findings
-/board refresh <id>        run one observation cycle now
-/board pause <id>          temporarily stop observation
-/board resume <id>         resume observation
-/board mute <id> [on|off]  keep observing but suppress push notifications
-/board stop <id>           end the watch and remove it from active refresh
+/board templates                  list built-in and custom templates
+/board templates add ./my.yaml    validate and register a custom lens (profile-scoped)
+/board templates show <id>        show a template's source and title
+/board templates remove <id>      remove a custom template (builtins stay)
 ```
 
-**Session context coverage** — `/board session` watches more than chat text. It also scans current-session `file_write` tool results and, when the path is inside the workspace and safe to read without approval, includes a capped/redacted file excerpt in the analysis. The board's **Observation status** panel shows refresh reason, coverage, observed targets, included/skipped file artifacts, and missing context notes. Skipped artifacts usually mean the file is outside the workspace, no longer exists, or is sensitive enough that background reads are intentionally blocked.
+A custom template is any SDUI YAML file. `add` validates it (rejecting templates that will not compile), copies it into `profiles/<profile>/dashboard/templates/`, and makes it immediately openable via `/board <id>`. Custom templates override built-ins of the same name.
 
-**Natural language** — just ask ("open a finance board", "analyze this conversation"); the agent opens or creates boards for you when the runtime can safely map the request to a board intent.
+**Session context coverage** — the session board watches more than chat text. It also scans current-session `file_write` tool results and, when the path is inside the workspace and safe to read without approval, includes a capped/redacted file excerpt in the analysis. The **Observation status** panel shows refresh reason, coverage, observed targets, included/skipped file artifacts, and missing context notes.
+
+**Natural language** — just ask ("analyze this conversation", "show the finance lens"); the agent opens the board with the right template when the runtime can safely map the request.
 
 ### Showcase
 
-- **Financial market watch** — monitor a symbol or source on an interval/condition; the board emphasizes price/action charts, severity mix, signal momentum, and capped evidence cards.
-- **Public-opinion (sentiment) watch** — track a brand or topic; sentiment direction, distribution, timeline, and representative mentions are shown as an analyst-style narrative pulse.
-- **Paper hunting** — watch arXiv / venues / authors / keywords; new papers flow through a research-pipeline layout with source links and clipped abstracts.
-- **Session analysis (built-in)** — after a few conversation turns, `/board session` opens a board that reads the transcript plus safe workspace file artifacts written during the session, then renders a storyline, insights, decisions, action items, open questions, an entity map, artifact coverage, and suggested next prompts — refreshing automatically as the conversation grows or artifacts change (batch threshold, optional model salience, or manual `/board refresh`).
+- **Session analysis (default `generic`)** — a storyline, insights, decisions, action items, open questions, an entity map, artifact coverage, and suggested next prompts; refreshes automatically as the conversation grows or workspace artifacts change.
+- **Finance / Sentiment / Research lenses** — the same session analysis, reframed: finance surfaces calls, an execution checklist, and exposures; sentiment surfaces the narrative pulse and themes; research surfaces open questions, evidence, and follow-ups.
+- **Custom lenses** — bring your own YAML template and open it with `/board <name>`; it renders the current session through your layout with zero code changes.
 
-> Adding a new scenario = one YAML template (plus an optional renderer) and a producer. The board core stays untouched — no domain branching, no hardcoded layouts.
+> Adding a lens = one YAML template dropped in (or `/board templates add`). The board core stays untouched — one analysis target, no domain branching, no hardcoded layouts.
 
 ---
 

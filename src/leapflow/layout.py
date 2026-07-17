@@ -205,6 +205,25 @@ class ApprovalLayout:
 
 
 @dataclass(frozen=True)
+class DashboardLayout:
+    """LeapBoard durable content paths (custom templates).
+
+    Discovery/runtime state (port, token, pid) is transient and lives with the
+    daemon runtime files, not here; this layout owns only durable, user-authored
+    board content so it can be backed up/synced independently.
+    """
+
+    root: Path
+
+    @property
+    def templates_dir(self) -> Path:
+        return self.root / "templates"
+
+    def ensure(self) -> None:
+        self.templates_dir.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass(frozen=True)
 class ProfileManifest:
     """First-class profile metadata."""
 
@@ -355,6 +374,16 @@ class ProfileLayout:
         return ApprovalLayout(self.root / "approval")
 
     @property
+    def dashboard(self) -> DashboardLayout:
+        return DashboardLayout(self.root / "dashboard")
+
+    @property
+    def dashboard_state_path(self) -> Path:
+        # Transient discovery state (port/token/pid/url), regenerated per launch
+        # and cleared on stop; grouped with the daemon runtime files.
+        return self.runtime_dir / "dashboard.json"
+
+    @property
     def audit_dir(self) -> Path:
         return self.root / "audit"
 
@@ -405,6 +434,7 @@ class ProfileLayout:
         self.secrets.ensure()
         self.gateway.ensure()
         self.approval.ensure()
+        self.dashboard.ensure()
         self.cache.ensure()
         _write_yaml_if_missing(self.manifest_path, ProfileManifest.default(self.profile_id).to_dict())
         for path in self.config_paths():

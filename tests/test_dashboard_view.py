@@ -26,7 +26,7 @@ class _FakeProvider:
         return items[:limit]
 
 
-def _finding_cards(spec: dict) -> list[dict]:
+def _flatten(spec: dict) -> list[dict]:
     flat: list[dict] = []
 
     def _walk(nodes: list) -> None:
@@ -35,72 +35,13 @@ def _finding_cards(spec: dict) -> list[dict]:
             _walk(node.get("children") or [])
 
     _walk(spec["root"])
-    return [n for n in flat if n["type"] == "FindingCard"]
+    return flat
 
 
-# ── select_template convention ─────────────────────────────────────────────
-
-
-def test_select_template_prefers_explicit_then_domain_then_generic() -> None:
-    names = ["generic", "finance.market", "session.analysis"]
-    assert select_template("finance", "", names) == "finance.market"
-    assert select_template("", "session.analysis", names) == "session.analysis"
-    assert select_template("unknown", "", names) == "generic"
-    assert select_template("finance", "missing", names) == "finance.market"
-
-
-# ── DashboardViewBuilder ────────────────────────────────────────────────────
-
-
-async def test_builder_overview_renders_findings() -> None:
-    provider = _FakeProvider(
-        watches=[{"watch_id": "w1", "name": "M", "domain": "finance", "state": "armed"}],
-        findings=[{"finding_id": "f1", "watch_id": "w1", "domain": "finance", "title": "spike", "severity": "alert"}],
-    )
-    builder = DashboardViewBuilder(TemplateLibrary())
-    spec = await builder.build(DashboardIntent(action="home"), provider)
-    assert spec["title"] == "LeapBoard"
-    assert len(_finding_cards(spec)) == 1
-
-
-async def test_builder_overview_lists_watch_lanes() -> None:
-    provider = _FakeProvider(
-        watches=[{"watch_id": "w1", "name": "Market", "domain": "finance",
-                  "trigger": "every 5m", "state": "armed", "finding_count": 3}],
-        findings=[],
-    )
-    builder = DashboardViewBuilder(TemplateLibrary())
-    spec = await builder.build(DashboardIntent(action="home"), provider)
-
-    flat: list[dict] = []
-
-    def _walk(nodes: list) -> None:
-        for node in nodes:
-            flat.append(node)
-            _walk(node.get("children") or [])
-
-    _walk(spec["root"])
-    types = {n["type"] for n in flat}
-    assert {"BarChart", "Timeline"}.issubset(types)
-    watch_cards = [n for n in flat if n["type"] == "Card" and n.get("action", {}).get("name") == "openWatch"]
-    assert len(watch_cards) == 1
-    assert watch_cards[0]["action"]["params"]["target"] == "w1"
-
-
-async def test_builder_watch_scopes_to_target() -> None:
-    provider = _FakeProvider(
-        watches=[{"watch_id": "abc123", "name": "Market", "domain": "finance", "state": "armed"}],
-        findings=[{"finding_id": "f1", "watch_id": "abc123", "domain": "finance", "title": "t", "severity": "notable"}],
-    )
-    builder = DashboardViewBuilder(TemplateLibrary())
-    spec = await builder.build(DashboardIntent(action="open", target="abc1"), provider)
-    assert spec["title"] == "Market"
-    assert len(_finding_cards(spec)) == 1
-
-
-async def test_builder_session_uses_analysis_payload() -> None:
-    provider = _FakeProvider(
-        watches=[{"watch_id": "s", "domain": "session", "state": "armed", "last_run_at": 10.0, "next_due_at": 20.0, "run_count": 2}],
+def _session_provider() -> _FakeProvider:
+    return _FakeProvider(
+        watches=[{"watch_id": "s", "domain": "session", "state": "armed",
+                  "last_run_at": 10.0, "next_due_at": 20.0, "run_count": 2}],
         findings=[
             {"finding_id": "s1", "watch_id": "s", "domain": "session", "title": "analysis",
              "severity": "notable", "payload": {
@@ -113,27 +54,45 @@ async def test_builder_session_uses_analysis_payload() -> None:
             {"finding_id": "x1", "watch_id": "w", "domain": "finance", "title": "noise", "severity": "info"},
         ],
     )
+
+
+# -- select_template: requested lens, else generic fallback -------------------
+
+
+def test_select_template_returns_requested_or_generic_fallback() -> None:
+    names = ["generic", "finance", "research"]
+    assert select_template("finance", names) == "finance"
+    assert select_template("", names) == "generic"
+    assert select_template("unknown", names) == "generic"
+
+
+# -- DashboardViewBuilder: one target (current session), template = lens ------
+
+
+async def test_builder_default_template_renders_session_analysis() -> None:
     builder = DashboardViewBuilder(TemplateLibrary())
-    spec = await builder.build(DashboardIntent(action="session"), provider)
+    spec = await builder.build(DashboardIntent(template=""), _session_provider())
+    assert spec["title"] == "Session Analysis"
+    types = {n["type"] for n in _flatten(spec)}
+    assert {"StoryPanel", "BarChart", "EntityGraph", "Table"}.issubset(types)
+    assert len([n for n in _flatten(spec) if n["type"] == "InsightCard"]) == 1
+
+
+async def test_builder_named_template_reframes_same_session() -> None:
+    builder = DashboardViewBuilder(TemplateLibrary())
+    spec = await builder.build(DashboardIntent(template="finance"), _session_provider())
+    types = {n["type"] for n in _flatten(spec)}
+    # The finance lens renders the same session analysis, reframed.
+    assert "StoryPanel" in types and "EntityGraph" in types
+
+
+async def test_builder_unknown_template_falls_back_to_generic() -> None:
+    builder = DashboardViewBuilder(TemplateLibrary())
+    spec = await builder.build(DashboardIntent(template="does-not-exist"), _session_provider())
     assert spec["title"] == "Session Analysis"
 
-    flat: list[dict] = []
 
-    def _walk(nodes: list) -> None:
-        for node in nodes:
-            flat.append(node)
-            _walk(node.get("children") or [])
-
-    _walk(spec["root"])
-    types = {n["type"] for n in flat}
-    assert "StoryPanel" in types
-    assert "BarChart" in types
-    assert "EntityGraph" in types
-    assert "Table" in types
-    assert len([n for n in flat if n["type"] == "InsightCard"]) == 1  # from analysis payload
-
-
-# ── ViewHub fan-out ─────────────────────────────────────────────────────────
+# -- ViewHub fan-out ----------------------------------------------------------
 
 
 async def test_view_hub_broadcast_and_unsubscribe() -> None:

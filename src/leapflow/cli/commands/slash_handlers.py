@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -1121,35 +1122,6 @@ async def command_execute(ctx: "Context", name: str, args: str = "") -> dict[str
     return {"ok": False, "message": f"Unknown command: /{name}"}
 
 
-def _parse_watch_spec(tokens: list[str]) -> dict[str, Any]:
-    """Parse ``<domain> [--name N --trigger EXPR --sensitivity S]`` into a spec dict."""
-    spec: dict[str, Any] = {"domain": tokens[0]}
-    flag_map = {"--name": "name", "--trigger": "trigger_expr", "--sensitivity": "sensitivity"}
-    i = 1
-    while i < len(tokens):
-        key = flag_map.get(tokens[i])
-        if key and i + 1 < len(tokens):
-            spec[key] = tokens[i + 1]
-            i += 2
-        else:
-            i += 1
-    spec.setdefault("name", spec["domain"])
-    return spec
-
-
-def _resolve_watch_id(monitors: Any, token: str) -> str:
-    """Accept a full watch id or a unique short prefix from the list view."""
-    try:
-        views = monitors.list_watches()
-    except Exception:
-        return token
-    for view in views:
-        if view.watch_id == token:
-            return token
-    matches = [view.watch_id for view in views if view.watch_id.startswith(token)]
-    return matches[0] if len(matches) == 1 else token
-
-
 async def _ensure_session_watch_refresh(ctx: "Context", monitors: Any) -> str:
     """Ensure an active session watch exists and trigger one analysis cycle.
 
@@ -1168,8 +1140,17 @@ async def _ensure_session_watch_refresh(ctx: "Context", monitors: Any) -> str:
     return watch_id
 
 
+_BOARD_VERBS = frozenset({"templates", "refresh", "pause", "resume", "stop", "status"})
+
+
 async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[str, Any]:
-    """Manage monitor watches from the TUI (data operations; web open is separate)."""
+    """Analyze the current session and render it through a template.
+
+    LeapBoard has a single analysis target — the current session. ``/board`` (or
+    ``/board <template>``) opens the web board with that template (``generic``
+    default; unknown names fall back to generic). Reserved verbs manage custom
+    templates and control the session observation.
+    """
     monitors = getattr(ctx, "monitors", None)
     sub = name.split(" ", 1)[1].strip() if " " in name else ""
     rest = (sub + ((" " + args) if args else "")).strip() if sub else args.strip()
@@ -1177,144 +1158,172 @@ async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[
         tokens = shlex.split(rest) if rest else []
     except ValueError:
         tokens = rest.split()
-    action = tokens[0].lower() if tokens else "open"
+    verb = tokens[0].lower() if tokens else ""
     rest_tokens = tokens[1:]
 
-    # Web-view actions (open/home/session) only need a client-side browser and
-    # the dashboard server; they must work even when this process hosts no
-    # monitor runtime (e.g. the in-process fallback REPL). Data operations below
-    # still require the runtime.
-    if monitors is None and action not in ("open", "home", "session"):
+    if verb == "templates":
+        return _execute_board_templates(ctx, rest_tokens)
+    if verb == "status":
+        return _execute_board_status(ctx, monitors)
+    if verb in ("refresh", "pause", "resume", "stop"):
+        return await _execute_board_control(ctx, monitors, verb)
+    # Anything else is a template name (empty = default): open the session board.
+    return await _execute_board_open(ctx, monitors, template=verb)
+
+
+async def _execute_board_open(ctx: "Context", monitors: Any, *, template: str) -> dict[str, Any]:
+    """Open the current-session board rendered with the requested template."""
+    library = _template_library(ctx)
+    names = set(library.names())
+    note = ""
+    effective = template
+    if template and template not in names:
+        note = f"Unknown template '{template}'; using 'generic'."
+        effective = ""
+    session_watch_id = ""
+    if monitors is not None:
+        try:
+            session_watch_id = await _ensure_session_watch_refresh(ctx, monitors)
+        except Exception:
+            logger.debug("dashboard: session watch refresh failed", exc_info=True)
+    payload: dict[str, Any] = {
+        "ok": True, "view": "dashboard", "mode": "open",
+    }
+    payload.update(_board_web_directive(getattr(ctx, "settings", None), template=effective))
+    if session_watch_id:
+        payload["watch_id"] = session_watch_id
+    if note:
+        payload["note"] = note
+    return payload
+
+
+async def _execute_board_control(ctx: "Context", monitors: Any, verb: str) -> dict[str, Any]:
+    """Control the single session observation: refresh / pause / resume / stop."""
+    if monitors is None:
         return {"ok": False, "message": "Monitor runtime is unavailable (scheduler disabled)."}
+    from leapflow.monitor.session_producer import ensure_session_watch, session_watch_params
 
-    if action in ("list", "ls"):
-        return {"ok": True, "view": "dashboard", "mode": "list",
-                "watches": [v.to_dict() for v in monitors.list_watches()]}
-
-    if action == "status":
-        watches = monitors.list_watches()
-        by_state: dict[str, int] = {}
-        findings_total = 0
-        for v in watches:
-            by_state[v.state] = by_state.get(v.state, 0) + 1
-            findings_total += v.finding_count
-        return {"ok": True, "view": "dashboard", "mode": "status",
-                "count": len(watches), "by_state": by_state, "findings_total": findings_total,
-                "domains": sorted({v.domain for v in watches})}
-
-    if action in ("new", "add", "arm"):
-        if not rest_tokens:
-            return {"ok": False, "message": "Usage: /board new <domain> [--name N --trigger EXPR --sensitivity S]"}
-        from leapflow.monitor import WatchSpec
-
-        view = await monitors.arm_watch(WatchSpec.from_dict(_parse_watch_spec(rest_tokens)))
-        watch = view.to_dict()
-        # Creating a board is a "take me to it" action: report the armed watch as
-        # text and open its web view (the domain board that will fill in as it
-        # ticks). open_web keeps this decoupled from mode so the TUI can both
-        # render the confirmation and launch the browser.
-        payload: dict[str, Any] = {
-            "ok": True, "view": "dashboard", "mode": "armed", "watch": watch,
-            "open_web": True,
-        }
-        payload.update(
-            _board_web_directive(
-                getattr(ctx, "settings", None),
-                action="watch",
-                target=str(watch.get("watch_id", "")),
-            )
-        )
-        return payload
-
-    if action in ("pause", "resume", "stop"):
-        if not rest_tokens:
-            return {"ok": False, "message": f"Usage: /board {action} <id>"}
-        watch_id = _resolve_watch_id(monitors, rest_tokens[0])
-        method = {"pause": monitors.pause_watch, "resume": monitors.resume_watch,
-                  "stop": monitors.stop_watch}[action]
-        view = method(watch_id)
-        if view is None:
-            return {"ok": False, "message": f"Watch not found: {rest_tokens[0]}"}
-        return {"ok": True, "view": "dashboard", "mode": "control", "action": action,
-                "watch": view.to_dict()}
-
-    if action == "mute":
-        if not rest_tokens:
-            return {"ok": False, "message": "Usage: /board mute <id> [on|off]"}
-        watch_id = _resolve_watch_id(monitors, rest_tokens[0])
-        muted = not (len(rest_tokens) > 1 and rest_tokens[1].lower() in ("off", "false", "0", "no"))
-        view = monitors.set_muted(watch_id, muted)
-        if view is None:
-            return {"ok": False, "message": f"Watch not found: {rest_tokens[0]}"}
-        return {"ok": True, "view": "dashboard", "mode": "control", "action": "mute",
-                "watch": view.to_dict()}
-
-    if action == "refresh":
-        if not rest_tokens:
-            return {"ok": False, "message": "Usage: /board refresh <id>"}
-        watch_id = _resolve_watch_id(monitors, rest_tokens[0])
-        result = await monitors.run_watch_once(watch_id)
-        return {"ok": bool(result.get("ok", False)), "view": "dashboard", "mode": "refresh",
-                "watch_id": watch_id, "result": result,
-                "message": None if result.get("ok") else str(result.get("error", "refresh failed"))}
-
-    if action == "findings":
-        positional = [t for t in rest_tokens if not t.startswith("--")]
-        watch_id = _resolve_watch_id(monitors, positional[0]) if positional else ""
-        limit = 20
-        if "--limit" in rest_tokens:
-            try:
-                limit = int(rest_tokens[rest_tokens.index("--limit") + 1])
-            except (ValueError, IndexError):
-                pass
-        findings = monitors.list_findings(watch_id=watch_id or None, limit=limit)
-        return {"ok": True, "view": "dashboard", "mode": "findings",
-                "findings": [f.to_dict() for f in findings]}
-
-    if action in ("open", "home", "session"):
-        from leapflow.dashboard.intent import DashboardIntent
-
-        intent = DashboardIntent.from_args(rest)
-        # Bare `/board` (open, no target): prefer the session view when there
-        # is an active conversation, otherwise the overview.
-        if intent.action == "open" and not intent.target:
-            engine = getattr(ctx, "engine", None)
-            if engine is not None and int(getattr(engine, "turn_count", 0) or 0) > 0:
-                intent = DashboardIntent(action="session", target="session")
-        session_watch_id = ""
-        if intent.action == "session" and monitors is not None:
-            try:
-                session_watch_id = await _ensure_session_watch_refresh(ctx, monitors)
-            except Exception:
-                logger.debug("dashboard: session watch refresh failed", exc_info=True)
-        payload: dict[str, Any] = {
-            "ok": True, "view": "dashboard", "mode": "open",
-            "intent": intent.to_dict(),
-        }
-        payload.update(
-            _board_web_directive(
-                getattr(ctx, "settings", None),
-                action=intent.action,
-                target=intent.target,
-            )
-        )
-        if session_watch_id:
-            payload["watch_id"] = session_watch_id
-        return payload
-
-    return {"ok": False, "message": f"Unknown board subcommand: {action}. "
-            "Try list|status|new|pause|resume|stop|mute|refresh|findings|open|session."}
+    watch_id = await ensure_session_watch(
+        monitors, params=session_watch_params(getattr(ctx, "settings", None))
+    )
+    if verb == "refresh":
+        monitors.schedule_watch_once(watch_id, force=True)
+        return {"ok": True, "view": "dashboard", "mode": "control", "action": "refresh",
+                "message": "Re-analyzing the current session; the board updates when it completes."}
+    method = {"pause": monitors.pause_watch, "resume": monitors.resume_watch,
+              "stop": monitors.stop_watch}[verb]
+    view = method(watch_id)
+    messages = {
+        "pause": "Paused session analysis; use /board resume to continue.",
+        "resume": "Resumed session analysis.",
+        "stop": "Stopped observing this session; /board restarts it.",
+    }
+    return {"ok": bool(view), "view": "dashboard", "mode": "control", "action": verb,
+            "watch": view.to_dict() if view else {}, "message": messages[verb]}
 
 
-def _board_web_directive(settings: Any, *, action: str, target: str) -> dict[str, Any]:
+def _execute_board_status(ctx: "Context", monitors: Any) -> dict[str, Any]:
+    """Return a compact status of the session observation and available templates."""
+    library = _template_library(ctx)
+    data: dict[str, Any] = {
+        "ok": True, "view": "dashboard", "mode": "status",
+        "templates": library.names(), "default": "generic",
+    }
+    if monitors is not None:
+        try:
+            session = next((v for v in monitors.list_watches() if v.domain == "session"), None)
+        except Exception:
+            session = None
+        if session is not None:
+            data["session"] = {
+                "state": session.state, "run_count": session.run_count,
+                "finding_count": session.finding_count, "last_run_at": session.last_run_at,
+            }
+    return data
+
+
+def _execute_board_templates(ctx: "Context", rest_tokens: list[str]) -> dict[str, Any]:
+    """Template hub: list / add / remove / show board templates."""
+    from leapflow.dashboard.templates import sanitize_template_id
+
+    library = _template_library(ctx)
+    op = rest_tokens[0].lower() if rest_tokens else "list"
+    args = rest_tokens[1:]
+
+    if op == "list":
+        items = [library.describe(name) or {"name": name} for name in library.names()]
+        return {"ok": True, "view": "dashboard", "mode": "templates",
+                "templates": items, "default": "generic"}
+
+    if op == "add":
+        positional = [t for t in args if not t.startswith("--")]
+        if not positional:
+            return {"ok": False, "message": "Usage: /board templates add <path.yaml> [--name id] [--force]"}
+        requested = _flag_value(args, "--name")
+        candidate = sanitize_template_id(requested or Path(positional[0]).stem)
+        if candidate in _BOARD_VERBS:
+            return {"ok": False, "message": f"'{candidate}' is a reserved board command; choose another --name."}
+        try:
+            installed = library.install(Path(positional[0]), name=requested, force="--force" in args)
+        except ValueError as exc:
+            return {"ok": False, "message": f"Could not add template: {exc}"}
+        return {"ok": True, "view": "dashboard", "mode": "templates", "action": "add",
+                "template": installed,
+                "message": f"Registered template '{installed}'. Open it with /board {installed}."}
+
+    if op == "remove":
+        if not args:
+            return {"ok": False, "message": "Usage: /board templates remove <id>"}
+        if library.source_of(args[0]) == "builtin":
+            return {"ok": False, "message": f"'{args[0]}' is a builtin template and cannot be removed."}
+        removed = library.uninstall(args[0])
+        return {"ok": bool(removed), "view": "dashboard", "mode": "templates", "action": "remove",
+                "message": f"Removed template '{args[0]}'." if removed else f"No custom template '{args[0]}'."}
+
+    if op == "show":
+        if not args:
+            return {"ok": False, "message": "Usage: /board templates show <id>"}
+        info = library.describe(args[0])
+        if info is None:
+            return {"ok": False, "message": f"Template not found: {args[0]}"}
+        return {"ok": True, "view": "dashboard", "mode": "templates", "action": "show", "detail": info}
+
+    return {"ok": False, "message": "Usage: /board templates [list|add|remove|show] ..."}
+
+
+def _template_library(ctx: "Context") -> Any:
+    """Build a TemplateLibrary bound to the profile's custom-template override dir."""
+    from leapflow.dashboard.templates import TemplateLibrary
+
+    override_dir = None
+    settings = getattr(ctx, "settings", None)
+    profile_layout = getattr(settings, "profile_layout", None) if settings is not None else None
+    if profile_layout is not None:
+        try:
+            override_dir = profile_layout.dashboard.templates_dir
+        except Exception:
+            override_dir = None
+    return TemplateLibrary(override_dir=override_dir)
+
+
+def _flag_value(tokens: list[str], flag: str) -> str:
+    """Return the value following ``flag`` in tokens, or '' when absent."""
+    if flag in tokens:
+        idx = tokens.index(flag)
+        if idx + 1 < len(tokens) and not tokens[idx + 1].startswith("--"):
+            return tokens[idx + 1]
+    return ""
+
+
+def _board_web_directive(settings: Any, *, template: str) -> dict[str, Any]:
     """Build the web-open directive (running state + URL or install hint).
 
-    Shared by every board view so URL assembly (action + target) lives in one
-    place and both the daemon-running and not-yet-running cases are handled.
+    Single owner of URL assembly so both the daemon-running and not-yet-running
+    cases carry the chosen template consistently.
     """
     from leapflow.dashboard import launcher
 
-    directive: dict[str, Any] = {"action": action, "target": target}
+    directive: dict[str, Any] = {"template": template or "generic"}
     state = None
     if settings is not None:
         try:
@@ -1324,7 +1333,7 @@ def _board_web_directive(settings: Any, *, action: str, target: str) -> dict[str
     directive["running"] = bool(state)
     if state:
         directive["url"] = launcher.build_view_url(
-            state["bind"], state["port"], state["token"], action=action, target=target,
+            state["bind"], state["port"], state["token"], template=template,
         )
     else:
         directive["hint"] = "Run `leap board` to open the web view."

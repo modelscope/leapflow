@@ -39,6 +39,12 @@ def generate_token() -> str:
 
 
 def state_path(settings: Any) -> Path:
+    layout = getattr(settings, "profile_layout", None)
+    if layout is not None:
+        try:
+            return layout.dashboard_state_path
+        except Exception:
+            pass
     return Path(settings.runtime_dir) / _STATE_FILE
 
 
@@ -82,20 +88,18 @@ def build_view_url(
     port: int,
     token: str,
     *,
-    action: str = "home",
-    target: str = "",
+    template: str = "",
 ) -> str:
-    """Build a token-scoped URL that also selects a specific board view.
+    """Build a token-scoped URL that selects a specific board template.
 
-    Single owner of the ``action``/``target`` query contract so every entry
-    (session open, watch detail, freshly-created board) lands on the intended
-    page instead of silently falling back to the overview.
+    The template is the single view dimension: the server always analyzes the
+    current session and renders it through the named template (default when
+    omitted). Single owner of the query contract so every entry lands on the
+    intended lens.
     """
     url = build_url(bind, port, token)
-    if action and action != "home":
-        url += f"&action={action}"
-    if target:
-        url += f"&target={target}"
+    if template:
+        url += f"&template={template}"
     return url
 
 

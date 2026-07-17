@@ -36,6 +36,9 @@ def _manager(tmp_path: Path, emit=None) -> MonitorManager:
     )
 
 
+# -- Service-level watch RPCs (transport for the monitor subsystem) -----------
+
+
 async def test_service_watch_rpc_roundtrip(tmp_path: Path) -> None:
     emitted: list[tuple[str, dict]] = []
     service = RuntimeLeapService(SimpleNamespace())
@@ -83,34 +86,6 @@ async def test_service_watch_unavailable_is_graceful() -> None:
     assert await service.watch_findings() == []
 
 
-async def test_dashboard_command_execute_flow(tmp_path: Path) -> None:
-    ctx = SimpleNamespace(monitors=_manager(tmp_path))
-
-    armed = await command_execute(ctx, "board new", "demo --name Market --trigger 5m")
-    assert armed["ok"] is True and armed["mode"] == "armed"
-    watch_id = armed["watch"]["watch_id"]
-    assert armed["watch"]["trigger"] == "every 5m"
-
-    listed = await command_execute(ctx, "board list", "")
-    assert listed["mode"] == "list" and len(listed["watches"]) == 1
-
-    status_payload = await command_execute(ctx, "board status", "")
-    assert status_payload["mode"] == "status" and status_payload["count"] == 1
-
-    # Short-prefix id resolution + manual refresh.
-    refreshed = await command_execute(ctx, "board refresh", watch_id[:8])
-    assert refreshed["mode"] == "refresh" and refreshed["ok"] is True
-
-    finds = await command_execute(ctx, "board findings", "")
-    assert finds["mode"] == "findings" and len(finds["findings"]) >= 1
-
-    paused = await command_execute(ctx, "board pause", watch_id[:8])
-    assert paused["watch"]["state"] == "suspended"
-
-    unknown = await command_execute(ctx, "board", "bogus")
-    assert unknown["ok"] is False
-
-
 async def test_schedule_watch_once_runs_in_background(tmp_path: Path) -> None:
     """schedule_watch_once must not block the caller yet still produce findings."""
     manager = _manager(tmp_path)
@@ -125,79 +100,160 @@ async def test_schedule_watch_once_runs_in_background(tmp_path: Path) -> None:
     assert manager.finding_store.count(watch_id=view.watch_id) >= 1
 
 
-async def test_board_session_returns_watch_id_without_blocking(tmp_path: Path) -> None:
-    """/board session arms the session watch, returns its id + open payload, and
-    schedules the (LLM-backed) analysis in the background instead of awaiting it."""
+# -- /board command: one target (current session), template = view lens -------
+
+
+async def test_board_bare_opens_session_with_default_template(tmp_path: Path) -> None:
+    """Bare /board analyzes the current session with the generic default and
+    schedules the (LLM-backed) analysis in the background."""
     manager = _manager(tmp_path)
     ctx = SimpleNamespace(monitors=manager, settings=None, engine=None)
 
-    payload = await command_execute(ctx, "board session", "")
+    payload = await command_execute(ctx, "board", "")
 
     assert payload["view"] == "dashboard" and payload["mode"] == "open"
-    assert payload["action"] == "session"
-    assert payload.get("watch_id")  # id surfaced to the user
+    assert payload["template"] == "generic"
+    assert payload.get("watch_id")  # session watch armed on demand
     assert len(manager._background_tasks) == 1  # analysis deferred, RPC returns fast
     await asyncio.gather(*list(manager._background_tasks))
 
 
-async def test_board_new_opens_web_view_for_created_watch(tmp_path: Path) -> None:
-    """/board new must both confirm the armed watch (text) and open its web view
-    (open_web), focused on the freshly created watch."""
-    ctx = SimpleNamespace(monitors=_manager(tmp_path), settings=None, engine=None)
-
-    payload = await command_execute(ctx, "board new", "demo --name Market --trigger 5m")
-
-    assert payload["mode"] == "armed"  # still renders the confirmation text
-    assert payload["watch"]["name"] == "Market"
-    assert payload["open_web"] is True  # and launches the browser
-    assert payload["action"] == "watch"
-    assert payload["target"] == payload["watch"]["watch_id"]
-
-
-async def test_board_open_targets_the_requested_watch(tmp_path: Path) -> None:
-    """/board open <id> must carry the target so the web lands on the watch
-    detail, not the overview."""
+async def test_board_named_template_opens_session_with_lens(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
-    view = await manager.arm_watch(WatchSpec(name="D", domain="demo"))
     ctx = SimpleNamespace(monitors=manager, settings=None, engine=None)
 
-    payload = await command_execute(ctx, "board open", view.watch_id)
+    payload = await command_execute(ctx, "board", "finance")
 
     assert payload["mode"] == "open"
-    assert payload["action"] == "open"
-    assert payload["target"] == view.watch_id
+    assert payload["template"] == "finance"
+    assert "note" not in payload  # finance is a real builtin lens
+    await asyncio.gather(*list(manager._background_tasks))
 
 
-def test_build_view_url_propagates_action_and_target() -> None:
-    from leapflow.dashboard import launcher
+async def test_board_unknown_template_falls_back_with_note(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    ctx = SimpleNamespace(monitors=manager, settings=None, engine=None)
 
-    assert (
-        launcher.build_view_url("127.0.0.1", 8765, "tok", action="watch", target="abc123")
-        == "http://127.0.0.1:8765/?token=tok&action=watch&target=abc123"
-    )
-    # Home is the default view and needs no action/target query params.
-    assert launcher.build_view_url("127.0.0.1", 8765, "tok") == "http://127.0.0.1:8765/?token=tok"
-    assert (
-        launcher.build_view_url("127.0.0.1", 8765, "tok", action="session", target="session")
-        == "http://127.0.0.1:8765/?token=tok&action=session&target=session"
-    )
+    payload = await command_execute(ctx, "board", "nope")
+
+    assert payload["mode"] == "open"
+    assert payload["template"] == "generic"  # degraded to default
+    assert "note" in payload and "nope" in payload["note"]
+    await asyncio.gather(*list(manager._background_tasks))
 
 
-async def test_dashboard_command_scheduler_disabled(tmp_path: Path) -> None:
-    ctx = SimpleNamespace(monitors=None)
-    disabled = await command_execute(ctx, "board list", "")
+async def test_board_status_and_templates_are_discoverable(tmp_path: Path) -> None:
+    ctx = SimpleNamespace(monitors=_manager(tmp_path), settings=None, engine=None)
+
+    status_payload = await command_execute(ctx, "board status", "")
+    assert status_payload["mode"] == "status"
+    assert "generic" in status_payload["templates"]
+    assert status_payload["default"] == "generic"
+
+    templates = await command_execute(ctx, "board templates", "")
+    assert templates["mode"] == "templates"
+    names = {t["name"] for t in templates["templates"]}
+    assert {"generic", "finance", "sentiment", "research"}.issubset(names)
+
+
+async def test_board_refresh_reanalyzes_session(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    ctx = SimpleNamespace(monitors=manager, settings=None, engine=None)
+
+    refreshed = await command_execute(ctx, "board refresh", "")
+    assert refreshed["mode"] == "control"
+    assert refreshed["action"] == "refresh" and refreshed["ok"] is True
+    await asyncio.gather(*list(manager._background_tasks))
+
+
+async def test_board_control_requires_monitor_runtime() -> None:
+    ctx = SimpleNamespace(monitors=None, settings=None, engine=None)
+    disabled = await command_execute(ctx, "board refresh", "")
     assert disabled["ok"] is False
     assert "unavailable" in disabled["message"].lower()
 
 
-async def test_dashboard_web_view_actions_work_without_monitor_runtime() -> None:
-    """open/home/session must open the web board even with no local monitor
-    runtime (the in-process fallback REPL), never leak back to chat."""
+async def test_board_opens_without_monitor_runtime() -> None:
+    """Bare /board and /board <template> open the web board even with no local
+    monitor runtime (the in-process fallback), never leaking back to chat."""
     ctx = SimpleNamespace(monitors=None, settings=None, engine=None)
-    for command in ("board session", "board open", "board home"):
-        payload = await command_execute(ctx, command, "")
-        assert payload["ok"] is True, command
+    for args in ("", "finance"):
+        payload = await command_execute(ctx, "board", args)
+        assert payload["ok"] is True, args
         assert payload["view"] == "dashboard"
         assert payload["mode"] == "open"
-    session_payload = await command_execute(ctx, "board session", "")
-    assert session_payload["action"] == "session"
+
+
+def test_build_view_url_carries_template() -> None:
+    from leapflow.dashboard import launcher
+
+    assert (
+        launcher.build_view_url("127.0.0.1", 8765, "tok", template="finance")
+        == "http://127.0.0.1:8765/?token=tok&template=finance"
+    )
+    # Default view needs no template query param.
+    assert launcher.build_view_url("127.0.0.1", 8765, "tok") == "http://127.0.0.1:8765/?token=tok"
+
+
+def _templates_ctx(templates_dir: Path) -> SimpleNamespace:
+    layout = SimpleNamespace(dashboard=SimpleNamespace(templates_dir=templates_dir))
+    return SimpleNamespace(monitors=None, engine=None,
+                           settings=SimpleNamespace(profile_layout=layout))
+
+
+_VALID_TEMPLATE = (
+    "template: crypto\n"
+    "title: '{{ title }}'\n"
+    "layout:\n"
+    "  - type: Page\n"
+    "    props:\n"
+    "      title: '{{ title }}'\n"
+    "    children:\n"
+    "      - type: StoryPanel\n"
+    "        props:\n"
+    "          title: Narrative\n"
+    "          text: '{{ analysis.story }}'\n"
+)
+
+
+async def test_board_templates_add_list_remove_flow(tmp_path: Path) -> None:
+    """A user points at any local YAML; it validates, installs into the profile
+    templates dir, becomes discoverable, and is removable."""
+    tpl_dir = tmp_path / "tpl"
+    ctx = _templates_ctx(tpl_dir)
+    src = tmp_path / "crypto.yaml"
+    src.write_text(_VALID_TEMPLATE, encoding="utf-8")
+
+    added = await command_execute(ctx, "board templates", f"add {src}")
+    assert added["ok"] is True and added["template"] == "crypto"
+    assert (tpl_dir / "crypto.yaml").exists()  # installed into the managed dir
+
+    listed = await command_execute(ctx, "board templates", "")
+    entry = next(t for t in listed["templates"] if t["name"] == "crypto")
+    assert entry["source"] == "user"
+
+    # The freshly added lens is immediately openable.
+    opened = await command_execute(ctx, "board", "crypto")
+    assert opened["mode"] == "open" and opened["template"] == "crypto" and "note" not in opened
+
+    removed = await command_execute(ctx, "board templates", "remove crypto")
+    assert removed["ok"] is True
+    assert not (tpl_dir / "crypto.yaml").exists()
+
+
+async def test_board_templates_add_rejects_invalid_and_reserved(tmp_path: Path) -> None:
+    ctx = _templates_ctx(tmp_path / "tpl")
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("just a string, not a template mapping", encoding="utf-8")
+    invalid = await command_execute(ctx, "board templates", f"add {bad}")
+    assert invalid["ok"] is False
+
+    reserved = await command_execute(ctx, "board templates", f"add {bad} --name refresh")
+    assert reserved["ok"] is False and "reserved" in reserved["message"].lower()
+
+
+async def test_board_templates_cannot_remove_builtin(tmp_path: Path) -> None:
+    ctx = _templates_ctx(tmp_path / "tpl")
+    result = await command_execute(ctx, "board templates", "remove generic")
+    assert result["ok"] is False and "builtin" in result["message"].lower()

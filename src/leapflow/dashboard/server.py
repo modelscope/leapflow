@@ -118,10 +118,7 @@ class DashboardServer:
         if not self._check_token(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         intent = DashboardIntent.from_params({
-            "action": request.query.get("action", "home"),
-            "domain": request.query.get("domain", ""),
             "template": request.query.get("template", ""),
-            "target": request.query.get("target", ""),
         })
         spec = await self._builder.build(intent, self._provider)
         return web.json_response(spec)
@@ -229,10 +226,20 @@ class DashboardServer:
 async def run_server(settings: Any, *, token: str, bind: str, port: int) -> int:
     """Connect to leapd and serve the dashboard until interrupted."""
     from leapflow.dashboard import launcher
+    from leapflow.dashboard.templates import TemplateLibrary
     from leapflow.daemon.client import ensure_daemon_client
 
     client = await ensure_daemon_client(settings)
-    server = DashboardServer(client=client, token=token, bind=bind, port=port)
+    # Profile-scoped custom templates take precedence over builtin ones.
+    override_dir = None
+    profile_layout = getattr(settings, "profile_layout", None)
+    if profile_layout is not None:
+        try:
+            override_dir = profile_layout.dashboard.templates_dir
+        except Exception:
+            override_dir = None
+    templates = TemplateLibrary(override_dir=override_dir)
+    server = DashboardServer(client=client, token=token, bind=bind, port=port, templates=templates)
     launcher.write_state(settings, {
         "port": port,
         "bind": bind,

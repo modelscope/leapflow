@@ -22,66 +22,55 @@ def _types(spec: dict) -> set[str]:
     return {n["type"] for n in _flatten(spec)}
 
 
-def test_domain_templates_are_available() -> None:
+_ANALYSIS = {
+    "title": "Session Analysis",
+    "analysis": {
+        "story": "the arc",
+        "insights": [{"title": "i", "summary": "s", "severity": "notable"}],
+        "decisions": ["chose y"], "action_items": ["do x"], "open_questions": ["why?"],
+        "entities": ["Alice"], "next_prompts": ["ask z"],
+    },
+    "observation": {"context_coverage_pct": 90}, "artifact_context": [],
+}
+
+
+def test_builtin_template_lenses_are_available() -> None:
     names = TemplateLibrary().names()
-    for name in ("finance.market", "sentiment.topic", "research.paper", "session.analysis", "generic"):
+    for name in ("finance", "sentiment", "research", "generic"):
         assert name in names
+    # Legacy watch-detail templates are gone; there is one target (the session).
+    for gone in ("finance.market", "sentiment.topic", "research.paper", "session.analysis", "overview"):
+        assert gone not in names
 
 
-def test_select_template_maps_domains_to_templates() -> None:
+def test_select_template_returns_requested_lens_or_generic() -> None:
     names = TemplateLibrary().names()
-    assert select_template("finance", "", names) == "finance.market"
-    assert select_template("sentiment", "", names) == "sentiment.topic"
-    assert select_template("research", "", names) == "research.paper"
+    assert select_template("finance", names) == "finance"
+    assert select_template("sentiment", names) == "sentiment"
+    assert select_template("research", names) == "research"
+    assert select_template("", names) == "generic"
+    assert select_template("nope", names) == "generic"
 
 
-def test_finance_template_uses_custom_candlestick() -> None:
-    lib = TemplateLibrary()
-    spec = lib.render("finance.market", {
-        "title": "AAPL", "watch": {"name": "AAPL", "finding_count": 2},
-        "findings": [
-            {"finding_id": "f1", "title": "volume spike", "summary": "3x", "severity": "alert",
-             "payload": {"ohlc": [[1, 2, 3, 4]]}},
-        ],
-    })
+def test_finance_lens_reframes_session_analysis() -> None:
+    spec = TemplateLibrary().render("finance", _ANALYSIS)
     types = _types(spec)
-    assert "Custom" in types  # escape-hatch candlestick component
-    assert "PieChart" in types
-    assert "Sparkline" in types
-    assert "Stat" in types
-    assert len([n for n in _flatten(spec) if n["type"] == "FindingCard"]) == 1
-    custom = next(n for n in _flatten(spec) if n["type"] == "Custom")
-    assert custom["props"]["render"] == "candlestick"
-    assert custom["props"]["data"]  # findings bound in
+    # Same session analysis, reframed as calls/actions/exposures.
+    assert {"StoryPanel", "BarChart", "EntityGraph", "List"}.issubset(types)
 
 
-def test_sentiment_template_binds_gauge_value() -> None:
-    lib = TemplateLibrary()
-    spec = lib.render("sentiment.topic", {
-        "title": "BrandX", "watch": {"finding_count": 1},
-        "findings": [{"finding_id": "s1", "title": "spike", "summary": "", "severity": "notable",
-                      "payload": {"sentiment": 0.82}}],
-    })
-    gauge = next(n for n in _flatten(spec) if n["type"] == "Gauge")
-    assert gauge["props"]["data"] == 0.82  # bound from findings[0].payload.sentiment
-    assert "PieChart" in _types(spec)
-    assert "LineChart" in _types(spec)
-
-
-def test_research_template_binds_paper_link_action() -> None:
-    lib = TemplateLibrary()
-    spec = lib.render("research.paper", {
-        "title": "arXiv cs.CL",
-        "findings": [{"finding_id": "p1", "title": "A paper", "summary": "abstract", "severity": "info",
-                      "payload": {"url": "http://arxiv.org/abs/x"}}],
-    })
-    cards = [n for n in _flatten(spec) if n["type"] == "FindingCard"]
+def test_sentiment_lens_reframes_session_analysis() -> None:
+    spec = TemplateLibrary().render("sentiment", _ANALYSIS)
     types = _types(spec)
-    assert "PieChart" in types
-    assert "Timeline" in types
-    assert len(cards) == 1
-    assert cards[0]["action"]["kind"] == "nav"
-    assert cards[0]["action"]["params"]["url"] == "http://arxiv.org/abs/x"
+    assert {"StoryPanel", "EntityGraph"}.issubset(types)
+    assert len([n for n in _flatten(spec) if n["type"] == "InsightCard"]) == 1
+
+
+def test_research_lens_reframes_session_analysis() -> None:
+    spec = TemplateLibrary().render("research", _ANALYSIS)
+    types = _types(spec)
+    assert {"StoryPanel", "EntityGraph", "SuggestionChips"}.issubset(types)
+    assert len([n for n in _flatten(spec) if n["type"] == "InsightCard"]) == 1
 
 
 def test_custom_component_is_in_catalog_and_survives_normalize() -> None:

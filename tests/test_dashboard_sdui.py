@@ -109,14 +109,16 @@ def test_render_template_repeat_missing_list_yields_no_children() -> None:
     assert spec["root"][0]["children"] == []
 
 
-def test_template_library_generic_renders_findings() -> None:
+def test_template_library_generic_renders_session_analysis() -> None:
     lib = TemplateLibrary()
     assert "generic" in lib.names()
-    spec = lib.render("generic", {"title": "Overview", "findings": [
-        {"finding_id": "1", "title": "x", "summary": "s", "severity": "alert"},
-    ]})
-    assert spec["title"] == "Overview"
-    # A FindingCard should have been produced somewhere in the tree.
+    spec = lib.render("generic", {"title": "Session Analysis", "analysis": {
+        "story": "arc",
+        "insights": [{"title": "i", "summary": "s", "severity": "notable"}],
+        "action_items": [], "decisions": [], "open_questions": [],
+        "entities": ["Alice"], "next_prompts": ["ask"],
+    }, "observation": {"context_coverage_pct": 90}, "artifact_context": []})
+    assert spec["title"] == "Session Analysis"
     flat: list[dict] = []
 
     def _walk(nodes: list) -> None:
@@ -125,9 +127,9 @@ def test_template_library_generic_renders_findings() -> None:
             _walk(n.get("children") or [])
 
     _walk(spec["root"])
-    finding_cards = [n for n in flat if n["type"] == "FindingCard"]
-    assert len(finding_cards) == 1
-    assert finding_cards[0]["action"]["kind"] == "intent"
+    types = {n["type"] for n in flat}
+    assert "StoryPanel" in types
+    assert len([n for n in flat if n["type"] == "InsightCard"]) == 1
 
 
 def test_template_library_unknown_falls_back_to_generic() -> None:
@@ -139,25 +141,12 @@ def test_template_library_unknown_falls_back_to_generic() -> None:
 # ── DashboardIntent (dual entry) ────────────────────────────────────────────
 
 
-def test_intent_from_args_action_first() -> None:
-    intent = DashboardIntent.from_args("session")
-    assert intent.action == "session" and intent.target == "session"
+def test_intent_from_args_first_token_is_template() -> None:
+    assert DashboardIntent.from_args("finance").template == "finance"
+    assert DashboardIntent.from_args("research extra tokens").template == "research"
+    assert DashboardIntent.from_args("").template == ""
 
 
-def test_intent_from_args_bare_domain_becomes_new() -> None:
-    intent = DashboardIntent.from_args("finance --name Market --trigger 5m")
-    assert intent.action == "new"
-    assert intent.domain == "finance"
-    assert intent.params == {"name": "Market", "trigger": "5m"}
-
-
-def test_intent_from_args_target_and_template() -> None:
-    assert DashboardIntent.from_args("open abc123").target == "abc123"
-    assert DashboardIntent.from_args("new research --template research.paper").template == "research.paper"
-
-
-def test_intent_from_params_normalizes_unknown_action() -> None:
-    intent = DashboardIntent.from_params({"action": "bogus", "domain": "x"})
-    assert intent.action == "open"
-    assert intent.domain == "x"
-    assert DashboardIntent.from_params({}).to_dict()["action"] == "open"
+def test_intent_from_params_reads_template() -> None:
+    assert DashboardIntent.from_params({"template": "research"}).template == "research"
+    assert DashboardIntent.from_params({}).to_dict() == {"template": ""}

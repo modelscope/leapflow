@@ -18,6 +18,12 @@ from leapflow.dashboard.viewspec import SCHEMA_VERSION, normalize_viewspec
 _INDEX_RE = re.compile(r"^(.*?)\[(\d+)\]$")
 _FULL_RE = re.compile(r"^\{\{\s*(.+?)\s*\}\}$")
 _PART_RE = re.compile(r"\{\{\s*(.+?)\s*\}\}")
+_TEMPLATE_ID_RE = re.compile(r"[^a-z0-9._-]+")
+
+
+def sanitize_template_id(raw: str) -> str:
+    """Normalize a user-supplied template id to a safe, filesystem-friendly slug."""
+    return _TEMPLATE_ID_RE.sub("-", str(raw).strip().lower()).strip("-._")
 
 # Inline fallback so rendering works even if no template files are present.
 _DEFAULT_GENERIC: dict[str, Any] = {
@@ -193,11 +199,105 @@ class TemplateLibrary:
         template = self.load(name) or self.load("generic") or _DEFAULT_GENERIC
         return render_template(template, data or {})
 
+    def builtin_names(self) -> list[str]:
+        """Return template names shipped with the package."""
+        found: set[str] = set()
+        if self._builtin.exists():
+            for path in self._builtin.glob("*.yaml"):
+                found.add(path.stem)
+        return sorted(found)
+
+    def user_names(self) -> list[str]:
+        """Return template names added by the user (override dir)."""
+        found: set[str] = set()
+        if self._override is not None and self._override.exists():
+            for path in self._override.glob("*.yaml"):
+                found.add(path.stem)
+        return sorted(found)
+
+    def source_of(self, name: str) -> str:
+        """Return 'user' for override templates, 'builtin' for shipped, else ''."""
+        if name in self.user_names():
+            return "user"
+        if name in self.builtin_names():
+            return "builtin"
+        return ""
+
+    def describe(self, name: str) -> Optional[dict[str, Any]]:
+        """Return compact metadata for one template, or None when absent."""
+        raw = self.load(name)
+        if raw is None:
+            return None
+        meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+        return {
+            "name": name,
+            "source": self.source_of(name),
+            "title": str(meta.get("title") or raw.get("title") or name),
+            "description": str(meta.get("description") or ""),
+        }
+
+    @staticmethod
+    def validate(raw: Any) -> Optional[str]:
+        """Return an error string when raw is not a renderable template, else None."""
+        if not isinstance(raw, dict):
+            return "template must be a YAML mapping"
+        if not any(key in raw for key in ("layout", "children", "type")):
+            return "template must define a 'layout'"
+        try:
+            render_template(raw, {})
+        except Exception as exc:  # noqa: BLE001 - surface why it will not compile
+            return f"template does not compile: {exc}"
+        return None
+
+    def install(self, source: Path, *, name: str = "", force: bool = False) -> str:
+        """Validate a YAML template and copy it into the override dir; return its id.
+
+        Raises ValueError on missing/unreadable source, invalid content, builtin
+        name collision (without force), or when no writable dir is configured.
+        """
+        import shutil
+
+        import yaml
+
+        if self._override is None:
+            raise ValueError("no writable template directory is configured")
+        src = Path(source).expanduser()
+        if not src.is_file():
+            raise ValueError(f"template file not found: {source}")
+        try:
+            raw = yaml.safe_load(src.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError, ValueError) as exc:
+            raise ValueError(f"cannot read template: {exc}") from exc
+        error = self.validate(raw)
+        if error:
+            raise ValueError(error)
+        template_id = sanitize_template_id(name or src.stem)
+        if not template_id:
+            raise ValueError("could not derive a valid template name")
+        if template_id in self.builtin_names() and not force:
+            raise ValueError(
+                f"'{template_id}' shadows a builtin template; pass --force to override"
+            )
+        self._override.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, self._override / f"{template_id}.yaml")
+        return template_id
+
+    def uninstall(self, name: str) -> bool:
+        """Remove a user template by id. Returns True when a file was removed."""
+        if self._override is None:
+            return False
+        path = self._override / f"{sanitize_template_id(name)}.yaml"
+        if path.exists():
+            path.unlink()
+            return True
+        return False
+
 
 __all__ = [
     "resolve_path",
     "bind_value",
     "render_node",
     "render_template",
+    "sanitize_template_id",
     "TemplateLibrary",
 ]

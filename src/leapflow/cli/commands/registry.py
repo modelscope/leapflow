@@ -133,19 +133,15 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("arm", "Schedule a skill for timed execution", "Scheduler", args_hint="<skill> <cron>"),
     CommandDef("task", "List scheduled tasks", "Scheduler"),
 
-    # Board & Monitors (LeapBoard)
-    CommandDef("board", "Open or manage monitoring boards and watches", "Board", args_hint="[open|session|list|status|new|pause|resume|stop|mute|refresh|findings] ...", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
-    CommandDef("board open", "Open the monitoring web board", "Board", args_hint="[watch-id]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
-    CommandDef("board session", "Open the current-session analysis board", "Board", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
-    CommandDef("board list", "List active watches", "Board"),
-    CommandDef("board status", "Show monitoring runtime status", "Board"),
-    CommandDef("board new", "Create a watch for a domain", "Board", args_hint="<domain> [--name --trigger --sensitivity]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
-    CommandDef("board pause", "Pause a watch", "Board", args_hint="<id>", effect=CommandEffect.SESSION),
-    CommandDef("board resume", "Resume a watch", "Board", args_hint="<id>", effect=CommandEffect.SESSION),
-    CommandDef("board stop", "Stop a watch", "Board", args_hint="<id>", effect=CommandEffect.SESSION),
-    CommandDef("board mute", "Mute or unmute a watch", "Board", args_hint="<id> [on|off]", effect=CommandEffect.SESSION),
-    CommandDef("board refresh", "Run a watch once now", "Board", args_hint="<id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
-    CommandDef("board findings", "Show recent findings", "Board", args_hint="[id] [--limit N]"),
+    # Board & Monitors (LeapBoard) — one analysis target (current session),
+    # rendered through a selectable template lens.
+    CommandDef("board", "Analyze the current session; optionally pick a template lens", "Board", args_hint="[<template> | templates|refresh|pause|resume|stop|status]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board templates", "List, add, remove, or show board templates", "Board", args_hint="[list|add <path.yaml> [--name id] [--force]|remove <id>|show <id>]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board refresh", "Re-analyze the current session now", "Board", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board pause", "Pause automatic session analysis", "Board", effect=CommandEffect.SESSION),
+    CommandDef("board resume", "Resume automatic session analysis", "Board", effect=CommandEffect.SESSION),
+    CommandDef("board stop", "Stop observing the current session", "Board", effect=CommandEffect.SESSION),
+    CommandDef("board status", "Show session observation status and templates", "Board"),
 )
 
 # ── Derived structures ───────────────────────────────────────────────
