@@ -1813,6 +1813,26 @@ def _ago(ts: Any) -> str:
     return f"{delta // 86400}d ago"
 
 
+def _board_page_url() -> str:
+    """Best-effort token-scoped URL of the running board page, or '' when none.
+
+    The client owns the dashboard server, so the status renderer resolves the
+    live URL here (from discovery state) for users to copy; any failure or a
+    not-running server yields an empty string rather than raising.
+    """
+    try:
+        from leapflow.config import get_settings
+        from leapflow.dashboard import launcher
+
+        state = launcher.server_running(get_settings())
+        if not state:
+            return ""
+        return launcher.build_view_url(state["bind"], state["port"], state["token"])
+    except Exception:
+        logger.debug("dashboard: board page url lookup failed", exc_info=True)
+        return ""
+
+
 def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
     from rich.table import Table
 
@@ -1841,9 +1861,13 @@ def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> N
         )
         watches = payload.get("watches") or []
         if watches:
+            board_url = _board_page_url()
             table = Table(title="Watches", title_style="bold cyan", border_style="bright_black")
-            for col in ("id", "name", "domain", "state", "runs", "findings", "muted", "last run"):
+            for col in ("id", "name", "domain", "state", "runs", "findings", "last run"):
                 table.add_column(col)
+            # Full token URL of the board page, kept whole (folded, never cropped)
+            # so users can copy it straight from the table.
+            table.add_column("url", overflow="fold")
             for w in watches:
                 table.add_row(
                     str(w.get("watch_id", ""))[:8],
@@ -1852,8 +1876,8 @@ def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> N
                     str(w.get("state", "")),
                     str(w.get("run_count", 0)),
                     str(w.get("finding_count", 0)),
-                    "yes" if w.get("muted") else "",
                     _ago(w.get("last_run_at", 0)),
+                    board_url,
                 )
             console.print(table)
         else:

@@ -336,6 +336,9 @@ def test_render_dashboard_payload_covers_new_modes() -> None:
     })
     assert any("generic" in line and "finance" in line for line in status.lines)  # templates line
     assert len(status.printed) == 1  # watches table
+    headers = [str(c.header) for c in status.printed[0].columns]
+    assert "muted" not in headers  # muted column removed
+    assert headers[-1] == "url"  # copyable board url added after 'last run'
     assert any("Spike detected" in line for line in status.lines)  # findings detail
 
     control = _CaptureConsole()
