@@ -1182,6 +1182,22 @@ def test_leap_typo_command_suggests_instead_of_chatting(monkeypatch, capsys) -> 
     assert "leap daemon status" in err
 
 
+def test_leap_typo_suggestion_preserves_leading_global_flags(monkeypatch, capsys) -> None:
+    from leapflow.cli import cli
+
+    async def fake_daemon_main(args):  # pragma: no cover - must not run
+        return 0
+
+    monkeypatch.setattr(cli, "_async_daemon_main", fake_daemon_main)
+
+    # Replacing only the typo token keeps leading global flags in the suggestion
+    # (the old join dropped everything before the command).
+    code = cli.main(["--debug", "deamon", "status"])
+
+    assert code == 2
+    assert "leap --debug daemon status" in capsys.readouterr().err
+
+
 def test_leap_long_freetext_near_miss_still_chats(monkeypatch) -> None:
     from leapflow.cli import cli
 

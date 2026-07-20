@@ -88,5 +88,8 @@ def test_mask_secret_reveals_only_a_short_suffix() -> None:
     assert _mask_secret("sk-1234567890abc") == "***abc"
     # Too short to safely reveal any characters.
     assert _mask_secret("short") == "***"
+    # Hardened threshold: even an 8-char secret is fully masked (revealing 3 of
+    # 8 would expose too much of a short secret).
+    assert _mask_secret("12345678") == "***"
     # Never leaks the full value.
     assert "1234567890" not in _mask_secret("sk-1234567890abc")

@@ -636,8 +636,9 @@ def _mask_secret(raw: str) -> str:
     text = str(raw or "").strip()
     if not text:
         return "missing"
-    # Reveal last 3 chars only when the secret is long enough to remain safe.
-    suffix = text[-3:] if len(text) >= 8 else ""
+    # Reveal the last 3 chars only for secrets long enough that the suffix leaves
+    # ample entropy masked; short secrets (< 16 chars) are fully masked.
+    suffix = text[-3:] if len(text) >= 16 else ""
     return f"***{suffix}" if suffix else "***"
 
 

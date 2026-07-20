@@ -18,6 +18,7 @@ import os
 import uuid
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from leapflow.dashboard.hub import ViewHub
 from leapflow.dashboard.intent import DashboardIntent
@@ -31,6 +32,8 @@ STATIC_DIR = Path(__file__).parent / "static"
 _MONITOR_EVENTS = frozenset({EVENT_FINDING, EVENT_WATCH_STATE, EVENT_ERROR, EVENT_HEARTBEAT})
 # Only these RPCs may be triggered by browser actions (least privilege).
 _ALLOWED_RPC = frozenset({"watch.pause", "watch.resume", "watch.stop", "watch.refresh", "watch.mute"})
+# Exact loopback hosts accepted in the Origin header (see _check_origin).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 class DashboardServer:
@@ -98,7 +101,13 @@ class DashboardServer:
         origin = request.headers.get("Origin")
         if not origin:
             return True  # non-browser or same-origin requests carry no Origin
-        return "127.0.0.1" in origin or "localhost" in origin
+        # Parse the host out of the Origin and match it exactly: a substring test
+        # ("127.0.0.1" in origin) is bypassable by hosts like attacker127.0.0.1.com.
+        try:
+            hostname = urlparse(origin).hostname
+        except ValueError:
+            return False
+        return hostname in _LOOPBACK_HOSTS
 
     # ── Handlers ─────────────────────────────────────────────────────────────
 

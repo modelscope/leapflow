@@ -6,11 +6,24 @@ Pure text parsing: no network, no code execution, no invented numbers.
 from __future__ import annotations
 
 from leapflow.dashboard.templates import render_template
-from leapflow.monitor.series_extractor import extract_charts
+from leapflow.monitor.series_extractor import _num, extract_charts
 
 
 def _artifact(text: str) -> dict:
     return {"status": "included", "name": "data", "content_excerpt": text}
+
+
+def test_num_parses_floats_including_trailing_dot() -> None:
+    # Trailing-dot floats (e.g. '1.') are valid and must parse; inf/nan/garbage reject.
+    assert _num("1.") == 1.0
+    assert _num("1.5") == 1.5
+    assert _num(".5") == 0.5
+    assert _num("-3") == -3.0
+    assert _num("1e3") == 1000.0
+    assert _num("1,234.5") == 1234.5
+    assert _num("abc") is None
+    assert _num("") is None
+    assert _num("inf") is None
 
 
 def test_json_number_array_becomes_a_series() -> None:

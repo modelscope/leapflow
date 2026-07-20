@@ -276,7 +276,9 @@ def _num(value: Any) -> Optional[float]:
         return float(value)
     if isinstance(value, str):
         cleaned = value.strip().replace(",", "").replace("%", "").replace("$", "")
-        if re.fullmatch(r"[-+]?\d*\.?\d+([eE][-+]?\d+)?", cleaned or ""):
+        # Accept ints, decimals, leading-dot (.5) and trailing-dot (1.) floats,
+        # with an optional exponent; reject inf/nan/garbage before float().
+        if re.fullmatch(r"[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?", cleaned or ""):
             try:
                 return float(cleaned)
             except ValueError:

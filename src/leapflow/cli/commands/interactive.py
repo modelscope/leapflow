@@ -115,16 +115,21 @@ async def _stop_board_watches_on_exit(client: "DaemonClient", console: Any) -> N
     except Exception:
         return
     active = [w for w in watches if isinstance(w, dict) and _is_active_watch(w)]
+    watch_ids = [wid for wid in (str(w.get("watch_id", "")) for w in active) if wid]
+    if not watch_ids:
+        return
+    # Stop concurrently so exit is bounded by a single timeout, not the sum of
+    # one per watch; keep per-watch diagnostics for any that fail.
+    results = await asyncio.gather(
+        *(asyncio.wait_for(client.watch_stop(wid), timeout=1.0) for wid in watch_ids),
+        return_exceptions=True,
+    )
     stopped = 0
-    for watch in active:
-        watch_id = str(watch.get("watch_id", ""))
-        if not watch_id:
-            continue
-        try:
-            await asyncio.wait_for(client.watch_stop(watch_id), timeout=1.0)
+    for wid, result in zip(watch_ids, results):
+        if isinstance(result, Exception):
+            logger.debug("interactive: failed to stop board watch %s", wid, exc_info=result)
+        else:
             stopped += 1
-        except Exception:
-            logger.debug("interactive: failed to stop board watch %s", watch_id, exc_info=True)
     if stopped:
         console.system(f"Stopped {stopped} board watch(es) on exit.")
 

@@ -100,6 +100,49 @@ def test_ensure_server_requires_aiohttp(tmp_path: Path, monkeypatch: pytest.Monk
         launcher.ensure_server(settings)
 
 
+def test_retire_stale_server_skips_kill_when_pid_unverified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Guards PID reuse: without a positive identity match the recorded pid is
+    # never signaled (it may now be an unrelated process); state is still cleared.
+    settings = _settings(tmp_path)
+    launcher.write_state(settings, {"port": 8765, "bind": "127.0.0.1", "token": "t", "pid": 4242})
+    monkeypatch.setattr(launcher, "is_port_open", lambda *a, **k: True)
+    monkeypatch.setattr(launcher, "_pid_is_dashboard_server", lambda pid: False)
+    killed: list[int] = []
+    monkeypatch.setattr(launcher.os, "kill", lambda pid, sig: killed.append(pid))
+    launcher._retire_stale_server(settings)
+    assert killed == []
+    assert launcher.load_state(settings) is None
+
+
+def test_retire_stale_server_signals_verified_dashboard_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A positively identified dashboard pid is signaled exactly once to free the port.
+    settings = _settings(tmp_path)
+    launcher.write_state(settings, {"port": 8765, "bind": "127.0.0.1", "token": "t", "pid": 4242})
+    opens = iter([True, False])  # open for the guard, closed right after the signal
+    monkeypatch.setattr(launcher, "is_port_open", lambda *a, **k: next(opens, False))
+    monkeypatch.setattr(launcher, "_pid_is_dashboard_server", lambda pid: True)
+    killed: list[int] = []
+    monkeypatch.setattr(launcher.os, "kill", lambda pid, sig: killed.append(pid))
+    launcher._retire_stale_server(settings)
+    assert killed == [4242]
+    assert launcher.load_state(settings) is None
+
+
+def test_check_origin_matches_loopback_host_exactly() -> None:
+    # A substring test would accept attacker127.0.0.1.com / localhost.evil.com;
+    # we parse the Origin and match its hostname exactly against the loopback set.
+    check = DashboardServer._check_origin
+    assert check(SimpleNamespace(headers={})) is True  # no Origin -> allow
+    for origin in ("http://127.0.0.1:8765", "http://localhost:8765", "http://[::1]:8765"):
+        assert check(SimpleNamespace(headers={"Origin": origin})) is True
+    for origin in ("http://attacker127.0.0.1.com", "http://localhost.attacker.com", "https://evil.com"):
+        assert check(SimpleNamespace(headers={"Origin": origin})) is False
+
+
 # ── DashboardServer.dispatch_action (allow-listed, transport-free) ───────────
 
 

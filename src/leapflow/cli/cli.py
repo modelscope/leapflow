@@ -361,7 +361,11 @@ def main(argv: list[str] | None = None) -> int:
         if len(non_flag_tokens) <= 3:
             suggestion = _suggest_known_command(first_token, known_commands)
             if suggestion is not None:
-                corrected = " ".join(["leap", suggestion, *effective_argv[first_pos + 1:]])
+                # Replace only the mistyped token so preceding global flags
+                # (e.g. --profile dev) and trailing args are preserved.
+                corrected_argv = list(effective_argv)
+                corrected_argv[first_pos] = suggestion
+                corrected = " ".join(["leap", *corrected_argv])
                 sys.stderr.write(
                     f"leap: '{first_token}' is not a leap command. "
                     f"Did you mean '{suggestion}'?\n"

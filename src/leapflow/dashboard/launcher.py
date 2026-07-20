@@ -171,12 +171,33 @@ def _find_free_port(bind: str, start: int, *, span: int = 20) -> int:
     return start
 
 
+def _pid_is_dashboard_server(pid: int) -> bool:
+    """Best-effort confirm ``pid`` is our dashboard server before signaling it.
+
+    Guards against PID reuse: a recorded pid may since belong to an unrelated
+    process. Verification uses psutil when available; without it we cannot prove
+    identity portably, so we return False and let the caller fall back to a free
+    port rather than risk terminating an innocent process.
+    """
+    try:
+        import psutil  # optional dependency; absent in minimal installs
+    except ImportError:
+        return False
+    try:
+        cmdline = " ".join(psutil.Process(pid).cmdline())
+    except (psutil.Error, OSError):
+        return False
+    return "leapflow" in cmdline and "board" in cmdline and "--serve" in cmdline
+
+
 def _retire_stale_server(settings: Any) -> None:
     """Best-effort retire a stale dashboard server recorded in discovery state.
 
     Called only after ``server_running`` rejected the state (dead server or a
-    token the server no longer accepts). Signals the recorded pid so the port
-    frees for a fresh, trusted server, then drops the stale state file.
+    token the server no longer accepts). Signals the recorded pid *only when it
+    is verifiably our dashboard server* (guarding against PID reuse); otherwise
+    it leaves the process alone and lets ``ensure_server`` pick a free port.
+    Always drops the stale state file.
     """
     state = load_state(settings)
     if not state:
@@ -184,7 +205,7 @@ def _retire_stale_server(settings: Any) -> None:
     port = int(state.get("port") or 0)
     bind = str(state.get("bind") or getattr(settings, "dashboard_bind", "127.0.0.1"))
     pid = int(state.get("pid") or 0)
-    if port and pid > 0 and is_port_open(bind, port):
+    if port and pid > 0 and is_port_open(bind, port) and _pid_is_dashboard_server(pid):
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
