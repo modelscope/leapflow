@@ -6,13 +6,18 @@ All display logic uses ``LeapConsole`` for consistent theming.
 
 from __future__ import annotations
 
+import logging
 import os
 import shlex
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from leapflow.cli.context import Context
     from leapflow.cli.tui_app.console import LeapConsole
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_tool_payload(ctx: "Context") -> dict[str, Any]:
@@ -1112,7 +1117,277 @@ async def command_execute(ctx: "Context", name: str, args: str = "") -> dict[str
         return await _execute_scheduler_arm(ctx, args)
     if name == "task":
         return _execute_scheduler_task(ctx)
+    if name == "board" or name.startswith("board "):
+        return await _execute_dashboard(ctx, name, args)
     return {"ok": False, "message": f"Unknown command: /{name}"}
+
+
+async def _ensure_session_watch_refresh(ctx: "Context", monitors: Any) -> str:
+    """Ensure an active session watch exists and trigger one analysis cycle.
+
+    The analysis producer is LLM-backed and can take tens of seconds, so it is
+    scheduled in the background: arming the watch and opening the board must be
+    instant and must never block the command RPC past its timeout. The board
+    receives the resulting finding over WebSocket when the cycle completes.
+    Returns the session watch id.
+    """
+    from leapflow.monitor.session_producer import ensure_session_watch, session_watch_params
+
+    watch_id = await ensure_session_watch(
+        monitors, params=session_watch_params(getattr(ctx, "settings", None))
+    )
+    monitors.schedule_watch_once(watch_id, force=True)
+    return watch_id
+
+
+_BOARD_VERBS = frozenset({"templates", "refresh", "pause", "resume", "stop", "status"})
+
+# States in which a watch can still be paused/resumed/stopped (i.e. not terminal).
+_BOARD_CONTROLLABLE_STATES = frozenset(
+    {"armed", "watching", "due", "confirming", "executing", "suspended"}
+)
+
+
+async def _execute_dashboard(ctx: "Context", name: str, args: str = "") -> dict[str, Any]:
+    """Analyze the current session and render it through a template.
+
+    LeapBoard has a single analysis target — the current session. ``/board``
+    opens the default (``generic``) lens; ``/board <template>`` opens a known
+    lens. Reserved verbs manage templates and the session observation. Any other
+    token is an unknown command and is rejected (never silently coerced).
+    """
+    monitors = getattr(ctx, "monitors", None)
+    sub = name.split(" ", 1)[1].strip() if " " in name else ""
+    rest = (sub + ((" " + args) if args else "")).strip() if sub else args.strip()
+    try:
+        tokens = shlex.split(rest) if rest else []
+    except ValueError:
+        tokens = rest.split()
+    verb = tokens[0].lower() if tokens else ""
+    rest_tokens = tokens[1:]
+
+    if verb == "templates":
+        return _execute_board_templates(ctx, rest_tokens)
+    if verb == "status":
+        return _execute_board_status(ctx, monitors)
+    if verb in ("refresh", "pause", "resume", "stop"):
+        return await _execute_board_control(
+            ctx, monitors, verb, target=rest_tokens[0] if rest_tokens else "",
+        )
+    if not verb:
+        return await _execute_board_open(ctx, monitors, template="")
+    # A non-empty, non-verb token must name a known template lens; otherwise it
+    # is an unknown command and is rejected rather than coerced to generic.
+    if verb in set(_template_library(ctx).names()):
+        return await _execute_board_open(ctx, monitors, template=verb)
+    return {
+        "ok": False,
+        "message": (
+            f"Unknown board command: '{verb}'. Use /board for the session board, "
+            "/board <template> for a lens (see /board templates), or "
+            "/board templates|refresh|pause|resume|stop|status."
+        ),
+    }
+
+
+async def _execute_board_open(ctx: "Context", monitors: Any, *, template: str) -> dict[str, Any]:
+    """Open the current-session board rendered with the requested template.
+
+    ``template`` is guaranteed to be empty (default) or a known lens by the
+    dispatcher, so there is no silent fallback here.
+    """
+    session_watch_id = ""
+    if monitors is not None:
+        try:
+            session_watch_id = await _ensure_session_watch_refresh(ctx, monitors)
+        except Exception:
+            logger.debug("dashboard: session watch refresh failed", exc_info=True)
+    # The client owns the dashboard server lifecycle (it spawns/validates it off
+    # the event loop), so the daemon only conveys the chosen lens here.
+    payload: dict[str, Any] = {
+        "ok": True, "view": "dashboard", "mode": "open", "template": template or "generic",
+    }
+    if session_watch_id:
+        payload["watch_id"] = session_watch_id
+    return payload
+
+
+async def _execute_board_control(
+    ctx: "Context", monitors: Any, verb: str, *, target: str = "",
+) -> dict[str, Any]:
+    """Control a board observation: refresh / pause / resume / stop.
+
+    Without ``target`` the verb applies to the current session watch (``refresh``
+    starts it if absent; the others require an existing one). With ``target`` it
+    applies to the watch whose id — a full id or a unique prefix, as shown by
+    ``/board status`` — matches, so ``/board stop <id>`` stops that watch.
+    """
+    if monitors is None:
+        return {"ok": False, "message": "Monitor runtime is unavailable (scheduler disabled)."}
+
+    if target:
+        watch_id = _resolve_watch_id(monitors, target)
+        if not watch_id:
+            return {"ok": False,
+                    "message": f"No board watch matches '{target}'. Run /board status to see ids."}
+    elif verb == "refresh":
+        from leapflow.monitor.session_producer import ensure_session_watch, session_watch_params
+        watch_id = await ensure_session_watch(
+            monitors, params=session_watch_params(getattr(ctx, "settings", None))
+        )
+    else:
+        watch_id = _find_session_watch_id(monitors)
+        if not watch_id:
+            return {"ok": False,
+                    "message": f"No active session board to {verb}. Run /board to start one."}
+
+    if verb == "refresh":
+        monitors.schedule_watch_once(watch_id, force=True)
+        return {"ok": True, "view": "dashboard", "mode": "control", "action": "refresh",
+                "watch_id": watch_id,
+                "message": "Re-analyzing the current session; the board updates when it completes."}
+
+    method = {"pause": monitors.pause_watch, "resume": monitors.resume_watch,
+              "stop": monitors.stop_watch}[verb]
+    view = method(watch_id)
+    if view is None:
+        return {"ok": False, "message": f"Watch not found: {watch_id[:8]}."}
+    label = view.name or watch_id[:8]
+    messages = {
+        "pause": f"Paused {label}; use /board resume to continue.",
+        "resume": f"Resumed {label}.",
+        "stop": f"Stopped {label}; run /board to start again.",
+    }
+    return {"ok": True, "view": "dashboard", "mode": "control", "action": verb,
+            "watch": view.to_dict(), "message": messages[verb]}
+
+
+def _resolve_watch_id(monitors: Any, target: str) -> str:
+    """Resolve a watch id from an exact id or a unique prefix (as /board status shows)."""
+    target = target.strip()
+    if not target:
+        return ""
+    try:
+        views = list(monitors.list_watches())
+    except Exception:
+        return ""
+    for view in views:
+        if view.watch_id == target:
+            return view.watch_id
+    prefix_matches = [view.watch_id for view in views if view.watch_id.startswith(target)]
+    return prefix_matches[0] if len(prefix_matches) == 1 else ""
+
+
+def _find_session_watch_id(monitors: Any) -> str:
+    """Return the current controllable session watch id, or empty when none is active."""
+    try:
+        views = list(monitors.list_watches())
+    except Exception:
+        return ""
+    for view in views:
+        if view.domain == "session" and view.state in _BOARD_CONTROLLABLE_STATES:
+            return view.watch_id
+    return ""
+
+
+def _execute_board_status(ctx: "Context", monitors: Any) -> dict[str, Any]:
+    """Return session-observation status: watch detail + recent findings + lenses.
+
+    Fields:
+      - ``templates`` / ``default``: available lenses and the default.
+      - ``watches``: every watch with state, run/finding counts, and last-run age.
+      - ``findings``: recent findings (severity, title, summary, age) across watches.
+    """
+    library = _template_library(ctx)
+    data: dict[str, Any] = {
+        "ok": True, "view": "dashboard", "mode": "status",
+        "templates": library.names(), "default": "generic",
+        "watches": [], "findings": [],
+    }
+    if monitors is None:
+        return data
+    try:
+        data["watches"] = [v.to_dict() for v in monitors.list_watches()]
+    except Exception:
+        logger.debug("dashboard: watch list unavailable", exc_info=True)
+    try:
+        data["findings"] = [f.to_dict() for f in monitors.list_findings(limit=20)]
+    except Exception:
+        logger.debug("dashboard: finding list unavailable", exc_info=True)
+    return data
+
+
+def _execute_board_templates(ctx: "Context", rest_tokens: list[str]) -> dict[str, Any]:
+    """Template hub: list / add / remove / show board templates."""
+    from leapflow.dashboard.templates import sanitize_template_id
+
+    library = _template_library(ctx)
+    op = rest_tokens[0].lower() if rest_tokens else "list"
+    args = rest_tokens[1:]
+
+    if op == "list":
+        items = [library.describe(name) or {"name": name} for name in library.names()]
+        return {"ok": True, "view": "dashboard", "mode": "templates",
+                "templates": items, "default": "generic"}
+
+    if op == "add":
+        positional = [t for t in args if not t.startswith("--")]
+        if not positional:
+            return {"ok": False, "message": "Usage: /board templates add <path.yaml> [--name id] [--force]"}
+        requested = _flag_value(args, "--name")
+        candidate = sanitize_template_id(requested or Path(positional[0]).stem)
+        if candidate in _BOARD_VERBS:
+            return {"ok": False, "message": f"'{candidate}' is a reserved board command; choose another --name."}
+        try:
+            installed = library.install(Path(positional[0]), name=requested, force="--force" in args)
+        except ValueError as exc:
+            return {"ok": False, "message": f"Could not add template: {exc}"}
+        return {"ok": True, "view": "dashboard", "mode": "templates", "action": "add",
+                "template": installed,
+                "message": f"Registered template '{installed}'. Open it with /board {installed}."}
+
+    if op == "remove":
+        if not args:
+            return {"ok": False, "message": "Usage: /board templates remove <id>"}
+        if library.source_of(args[0]) == "builtin":
+            return {"ok": False, "message": f"'{args[0]}' is a builtin template and cannot be removed."}
+        removed = library.uninstall(args[0])
+        return {"ok": bool(removed), "view": "dashboard", "mode": "templates", "action": "remove",
+                "message": f"Removed template '{args[0]}'." if removed else f"No custom template '{args[0]}'."}
+
+    if op == "show":
+        if not args:
+            return {"ok": False, "message": "Usage: /board templates show <id>"}
+        info = library.describe(args[0])
+        if info is None:
+            return {"ok": False, "message": f"Template not found: {args[0]}"}
+        return {"ok": True, "view": "dashboard", "mode": "templates", "action": "show", "detail": info}
+
+    return {"ok": False, "message": "Usage: /board templates [list|add|remove|show] ..."}
+
+
+def _template_library(ctx: "Context") -> Any:
+    """Build a TemplateLibrary bound to the profile's custom-template override dir."""
+    from leapflow.dashboard.templates import TemplateLibrary
+
+    override_dir = None
+    settings = getattr(ctx, "settings", None)
+    profile_layout = getattr(settings, "profile_layout", None) if settings is not None else None
+    if profile_layout is not None:
+        try:
+            override_dir = profile_layout.dashboard.templates_dir
+        except Exception:
+            override_dir = None
+    return TemplateLibrary(override_dir=override_dir)
+
+
+def _flag_value(tokens: list[str], flag: str) -> str:
+    """Return the value following ``flag`` in tokens, or '' when absent."""
+    if flag in tokens:
+        idx = tokens.index(flag)
+        if idx + 1 < len(tokens) and not tokens[idx + 1].startswith("--"):
+            return tokens[idx + 1]
+    return ""
 
 
 def _is_app_command_name(name: str) -> bool:
@@ -1509,10 +1784,155 @@ def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> N
     if view == "task":
         _render_task_view(console, payload)
         return
+    if view == "dashboard":
+        _render_dashboard_view(console, payload)
+        return
 
     msg = payload.get("message")
     if msg:
         console.success(str(msg))
+
+
+def _ago(ts: Any) -> str:
+    """Format an epoch timestamp as a compact relative age (e.g. '2m ago')."""
+    import time
+
+    try:
+        value = float(ts or 0)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return "never"
+    delta = max(0, int(time.time() - value))
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
+def _board_page_url() -> str:
+    """Best-effort token-scoped URL of the running board page, or '' when none.
+
+    The client owns the dashboard server, so the status renderer resolves the
+    live URL here (from discovery state) for users to copy; any failure or a
+    not-running server yields an empty string rather than raising.
+    """
+    try:
+        from leapflow.config import get_settings
+        from leapflow.dashboard import launcher
+
+        state = launcher.server_running(get_settings())
+        if not state:
+            return ""
+        return launcher.build_view_url(state["bind"], state["port"], state["token"])
+    except Exception:
+        logger.debug("dashboard: board page url lookup failed", exc_info=True)
+        return ""
+
+
+def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    from rich.table import Table
+
+    mode = str(payload.get("mode") or "")
+
+    if mode == "open":
+        # In the REPLs the browser is launched separately; this is a defensive
+        # text fallback for non-interactive callers.
+        url = payload.get("url")
+        if url:
+            console.system(f"Opening board: {url}")
+        elif payload.get("running"):
+            console.system("Dashboard is running.")
+        else:
+            console.system(str(payload.get("hint") or "Run `leap board` to open the web view."))
+        return
+
+    if mode == "control":
+        console.success(str(payload.get("message") or payload.get("action") or "done"))
+        return
+
+    if mode == "status":
+        templates = payload.get("templates") or []
+        console.system(
+            f"Templates: {', '.join(templates) or '-'} (default: {payload.get('default', 'generic')})"
+        )
+        watches = payload.get("watches") or []
+        if watches:
+            board_url = _board_page_url()
+            table = Table(title="Watches", title_style="bold cyan", border_style="bright_black")
+            for col in ("id", "name", "domain", "state", "runs", "findings", "last run"):
+                table.add_column(col)
+            # Full token URL of the board page, kept whole (folded, never cropped)
+            # so users can copy it straight from the table.
+            table.add_column("url", overflow="fold")
+            for w in watches:
+                table.add_row(
+                    str(w.get("watch_id", ""))[:8],
+                    str(w.get("name", "")),
+                    str(w.get("domain", "")),
+                    str(w.get("state", "")),
+                    str(w.get("run_count", 0)),
+                    str(w.get("finding_count", 0)),
+                    _ago(w.get("last_run_at", 0)),
+                    board_url,
+                )
+            console.print(table)
+        else:
+            console.system("Watches: none active — run /board to start session analysis.")
+        findings = payload.get("findings") or []
+        if findings:
+            console.system(f"Recent findings ({len(findings)}):")
+            markers = {"alert": "!!", "notable": " *", "info": " -"}
+            for f in findings[:20]:
+                sev = str(f.get("severity", "info"))
+                line = f"  {markers.get(sev, ' -')} [{sev}] {str(f.get('title', ''))}"
+                summary = str(f.get("summary", ""))
+                if summary:
+                    line += f" \u2014 {summary}"
+                age = _ago(f.get("ts", 0))
+                if age:
+                    line += f"  ({age})"
+                console.system(line)
+        else:
+            console.system("Findings: none yet.")
+        return
+
+    if mode == "templates":
+        action = str(payload.get("action") or "list")
+        if action == "list":
+            items = payload.get("templates") or []
+            if not items:
+                console.system("No templates available.")
+                return
+            table = Table(title="Templates", title_style="bold cyan", border_style="bright_black")
+            for col in ("name", "source", "title"):
+                table.add_column(col)
+            for item in items:
+                table.add_row(
+                    str(item.get("name", "")),
+                    str(item.get("source", "")),
+                    str(item.get("title", "")),
+                )
+            console.print(table)
+            return
+        if action == "show":
+            detail = payload.get("detail") or {}
+            console.system(
+                f"{detail.get('name')} [{detail.get('source')}] — {detail.get('title')}"
+            )
+            if detail.get("description"):
+                console.system(str(detail["description"]))
+            return
+        # add / remove success
+        console.success(str(payload.get("message") or "done"))
+        return
+
+    message = payload.get("message")
+    if message:
+        console.system(str(message))
 
 
 def _render_status_view(console: "LeapConsole", payload: dict[str, Any]) -> None:

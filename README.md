@@ -5,6 +5,7 @@
 
 ### News
 
+- **2026-07-16**: **LeapBoard** — general-purpose monitoring web dashboard (Watch→Finding + Server-Driven UI); `/board` entry, live session analysis, and finance/sentiment/research templates.
 - **2026-07-16**: v0.0.4 released — protocol-driven recovery coordinator with budget-constrained strategies, unified error classification, checkpoint-based cross-turn resumption, structured audit trail, and tool execution idempotency ledger.
 - **2026-07-15**: v0.0.3 released — layered YAML config, Path/Profile/Cache layouts, encrypted secret refs, DuckDB cache indexing, `leap config`, and robustness hardening.
 - **2026-07-15**: v0.0.2 released — TUI, Gateway/App Connector, Hub sync, Scheduler, Workflow Copilot, and runtime hardening.
@@ -110,25 +111,43 @@ uv run leap --help
 
 ### 2. Configure Your LLM
 
-If you already have an API key, base URL, and model name, save them through the unified config command:
+Launch the interactive TUI and configure your provider with the built-in `/config` command. It stores the API key in the local secret vault and writes only a `secret://` reference into durable config:
 
 ```bash
+leap
+```
+
+Inside the TUI (subcommands, keys, and values all auto-complete as you type):
+
+```text
+/config llm set --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 --model qwen3.7-plus --api-key sk-...
+/config show llm.model       # verify the model and base URL
+/config show llm.api_key     # confirm the key is stored (shown masked, e.g. ***abc)
+```
+
+Changes hot-reload the active session when possible, so you can start chatting right away.
+
+<details>
+<summary>More: configure from the shell (CLI)</summary>
+
+The same control plane is available as `leap config` for terminals, scripts, or CI. Use `--ask-api-key` for a secure masked prompt, or `--api-key` to pass it explicitly:
+
+```bash
+# Interactive, secure key prompt:
 leap config llm set \
   --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
   --model qwen3.7-plus \
   --ask-api-key
-```
 
-Paste your API key when prompted. LeapFlow stores the key in the local secret vault and writes only a `secret://` reference into durable config.
-
-For scripts or CI, pass the key explicitly through the same config control plane:
-
-```bash
+# Non-interactive (scripts/CI):
 leap config llm set \
   --base-url https://api.openai.com/v1 \
   --model gpt-4o \
   --api-key "$OPENAI_API_KEY"
 ```
+
+LeapFlow stores the key in the local secret vault and writes only a `secret://` reference into durable config.
+</details>
 
 ### 3. Install Execution Backend (macOS only)
 
@@ -511,6 +530,89 @@ For deployment environments, provision platform credentials through the same gat
 
 ---
 
+## LeapBoard — Monitoring Dashboard
+
+> **Signals into insight.**
+
+**LeapBoard** extends LeapFlow's Observe/Orient boundary into a general-purpose, always-on monitoring surface. Launch independent, persistent **watches** — for financial-market anomalies, public-opinion (sentiment) shifts, new research papers, or your own live conversation — and each one continuously observes its source, filters signal from noise, and surfaces **findings** (typed, scored, with evidence) onto a real-time web board.
+
+It is domain-neutral by design: finance, sentiment, research, and session analysis differ only by a small YAML template and their finding payload — never by branching in core code.
+
+### How it works
+
+```
+Watch (leapd-hosted) ── observe → SNR filter → score → Finding ──▶ NotificationBus
+        ▲                                                              │ push
+        └── trigger / manual refresh / session batch / salience ───────┘
+  YAML template ─▶ ViewSpec (validated) ─▶ Web board (SDUI) ◀── WebSocket
+```
+
+- **Continuous observation** — a board starts as a `Watch` in `leapd`. Scheduler triggers, manual `/board refresh`, and session-analysis batch thresholds all run the same observe→finding cycle; new findings are persisted, severity-gated, and pushed to browsers over WebSocket.
+- **Refresh model** — the session board re-analyzes as the conversation accumulates turns, when written workspace artifacts change, or on manual `/board refresh`; `/board pause`/`stop` halt re-analysis until resumed. The chosen **template** only changes rendering, never what is analyzed (always the current session).
+- **Server-Driven UI** — each scenario is authored as a **YAML template** compiled into a validated **ViewSpec** over a fixed component catalog (cards, tables, charts, timelines, gauges, story panels…). Interactive components talk back through a bidirectional action protocol; unknown component types degrade gracefully, and bespoke visuals use a `Custom` escape hatch. The board never renders arbitrary HTML/JS.
+- **View client** — the board connects to `leapd` like the TUI does, with no privileged coupling. The web server is optional (`aiohttp`) and degrades with a clear install hint when absent.
+
+### Install & enable
+
+```bash
+pip install 'leapflow[dashboard]'   # adds the optional aiohttp web server
+```
+
+The board binds to `127.0.0.1` with a per-session access token. Tune it through `leap config`:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `dashboard.enabled` | `true` | Enable the local monitoring web board |
+| `dashboard.bind` | `127.0.0.1` | Bind address (keep loopback) |
+| `dashboard.port` | `8765` | Web server port |
+| `dashboard.auto_open` | `true` | Open the default browser automatically |
+| `monitor.session_batch_turns` | `6` | Re-analyze the session every N new turns |
+
+### Usage
+
+**Analyze the current session** — from the TUI or shell. LeapBoard always analyzes the *current session*; a **template** is just the lens it renders through (`generic` is the default; an unrecognized name is rejected rather than silently coerced):
+
+```text
+/board                 open the session board with the default (generic) template
+/board finance         render the same session analysis through the finance lens
+/board status          show watch state, recent findings, and available templates
+/board refresh         re-analyze now (append an id to target a specific watch)
+/board pause|resume    pause / resume analysis (append an id to target a watch)
+/board stop            stop the current session, or `/board stop <id>` a specific watch
+```
+
+```bash
+leap board             # ensure the server is running and open the browser
+leap board --no-open   # print the URL instead of opening a browser
+```
+
+Executing any open entry auto-launches your default browser at the token-scoped local URL. Inside the browser, the language switcher supports English, Chinese, French, Spanish, Arabic, and Russian.
+
+**Templates (view lenses)** — templates are the single view dimension, and you can add your own with one command:
+
+```text
+/board templates                  list built-in and custom templates
+/board templates add ./my.yaml    validate and register a custom lens (profile-scoped)
+/board templates show <id>        show a template's source and title
+/board templates remove <id>      remove a custom template (builtins stay)
+```
+
+A custom template is any SDUI YAML file. `add` validates it (rejecting templates that will not compile), copies it into `profiles/<profile>/dashboard/templates/`, and makes it immediately openable via `/board <id>`. Custom templates override built-ins of the same name.
+
+**Session context coverage** — the session board watches more than chat text. It also scans current-session `file_write` tool results and, when the path is inside the workspace and safe to read without approval, includes a capped/redacted file excerpt in the analysis. The **Observation status** panel shows refresh reason, coverage, observed targets, included/skipped file artifacts, and missing context notes.
+
+**Natural language** — just ask ("analyze this conversation", "show the finance lens"); the agent opens the board with the right template when the runtime can safely map the request.
+
+### Showcase
+
+- **Session analysis (default `generic`)** — a storyline, insights, decisions, action items, open questions, an entity map, artifact coverage, and suggested next prompts; refreshes automatically as the conversation grows or workspace artifacts change.
+- **Finance / Sentiment / Research lenses** — the same session analysis, reframed: finance surfaces calls, an execution checklist, and exposures; sentiment surfaces the narrative pulse and themes; research surfaces open questions, evidence, and follow-ups.
+- **Custom lenses** — bring your own YAML template and open it with `/board <name>`; it renders the current session through your layout with zero code changes.
+
+> Adding a lens = one YAML template dropped in (or `/board templates add`). The board core stays untouched — one analysis target, no domain branching, no hardcoded layouts.
+
+---
+
 ## Safety & Approval
 
 LeapFlow enforces a **layered safety architecture** that balances autonomy with human oversight. The goal is minimal interruption — the agent asks for permission only when an action carries real consequences.
@@ -768,6 +870,8 @@ uv run pytest -k "test_world_model" -q            # By keyword
 | `learning/` | Skill distillation, parameterization, and maturity lifecycle |
 | `skills/` | Skill library, runtime execution, and self-evolution (Loop γ) |
 | `copilot/` | Workflow-level next-step prediction and proactive suggestion |
+| `monitor/` | Domain-neutral Watch→Finding monitoring runtime (leapd-hosted scheduler, findings store) |
+| `dashboard/` | LeapBoard — Server-Driven UI web board (ViewSpec catalog, YAML templates, WebSocket fan-out) |
 | `analysis/` | Six-layer denoising pipeline for trajectory refinement |
 | `engine/` | Session orchestration and ReAct execution loop |
 | `memory/` | Three-tier event-driven memory (working → episodic → long-term) |

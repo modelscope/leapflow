@@ -1079,6 +1079,73 @@ async def test_daemon_tui_exit_prompt_keeps_daemon_by_default_for_other_clients(
     assert any("kept running" in message for message in console.systems)
 
 
+@pytest.mark.asyncio
+async def test_daemon_tui_exit_stops_all_board_watches(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from leapflow.cli.commands import interactive as interactive_module
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    class Client:
+        async def status(self):
+            return {"pid": 1234, "connected_clients": 0}
+
+        async def watch_list(self):
+            return [
+                {"watch_id": "session-watch", "name": "Session", "domain": "session", "state": "armed", "client_coupled": True},
+                {"watch_id": "market-watch", "name": "Market", "domain": "finance", "state": "executing", "client_coupled": False},
+            ]
+
+        async def watch_stop(self, watch_id: str):
+            calls.append(("watch_stop", watch_id))
+            return {"watch_id": watch_id, "state": "done"}
+
+        async def shutdown(self):
+            calls.append(("shutdown",))
+
+    class Console:
+        def __init__(self) -> None:
+            self.systems: list[str] = []
+            self.warnings: list[str] = []
+
+        def system(self, message: str) -> None:
+            self.systems.append(message)
+
+        def warning(self, message: str) -> None:
+            self.warnings.append(message)
+
+    class Settings:
+        profile_dir = tmp_path
+        runtime_dir = tmp_path / "runtime"
+
+    async def yes(prompt: str) -> bool:
+        prompts.append(prompt)
+        return True
+
+    def record_stop(runtime_dir, **kwargs):
+        calls.append(("stop_daemon", runtime_dir, kwargs))
+        return lifecycle_module.StopDaemonResult(pid=1234, stopped=True, forced=True)
+
+    calls = []
+    prompts: list[str] = []
+    monkeypatch.setattr(interactive_module, "_ask_yes_no_default_yes", yes)
+    monkeypatch.setattr(lifecycle_module, "stop_daemon", record_stop)
+    console = Console()
+
+    await interactive_module._prompt_stop_daemon_on_exit(Client(), Settings(), console)
+
+    # Every active board watch is stopped on exit, regardless of coupling.
+    assert ("watch_stop", "session-watch") in calls
+    assert ("watch_stop", "market-watch") in calls
+    assert any("Stopped 2 board watch(es) on exit." in message for message in console.systems)
+    stop_call = next(call for call in calls if call[0] == "stop_daemon")
+    assert stop_call[2]["force"] is True
+    assert prompts == ["Stop leapd now (pid=1234)? [Y/n]: "]
+    assert console.systems[-1] == "leapd stopped (forced with SIGKILL)."
+
+
+
 def test_leap_prompt_uses_daemon_chat_route(monkeypatch) -> None:
     from leapflow.cli import cli
 
@@ -1093,6 +1160,60 @@ def test_leap_prompt_uses_daemon_chat_route(monkeypatch) -> None:
 
     assert cli.main(["hello", "world"]) == 0
     assert captured == {"command": "chat", "prompt": "hello world"}
+
+
+def test_leap_typo_command_suggests_instead_of_chatting(monkeypatch, capsys) -> None:
+    from leapflow.cli import cli
+
+    called = {"chat": False}
+
+    async def fake_daemon_main(args):  # pragma: no cover - must not run
+        called["chat"] = True
+        return 0
+
+    monkeypatch.setattr(cli, "_async_daemon_main", fake_daemon_main)
+
+    code = cli.main(["deamon", "status"])
+
+    assert code == 2  # usage error, not a chat turn
+    assert called["chat"] is False  # never spawned a daemon or asked the LLM
+    err = capsys.readouterr().err
+    assert "Did you mean 'daemon'" in err
+    assert "leap daemon status" in err
+
+
+def test_leap_typo_suggestion_preserves_leading_global_flags(monkeypatch, capsys) -> None:
+    from leapflow.cli import cli
+
+    async def fake_daemon_main(args):  # pragma: no cover - must not run
+        return 0
+
+    monkeypatch.setattr(cli, "_async_daemon_main", fake_daemon_main)
+
+    # Replacing only the typo token keeps leading global flags in the suggestion
+    # (the old join dropped everything before the command).
+    code = cli.main(["--debug", "deamon", "status"])
+
+    assert code == 2
+    assert "leap --debug daemon status" in capsys.readouterr().err
+
+
+def test_leap_long_freetext_near_miss_still_chats(monkeypatch) -> None:
+    from leapflow.cli import cli
+
+    captured = {}
+
+    async def fake_daemon_main(args):
+        captured["command"] = args.command
+        captured["prompt"] = args.prompt
+        return 0
+
+    monkeypatch.setattr(cli, "_async_daemon_main", fake_daemon_main)
+
+    # First word is a near-miss of `daemon`, but a full sentence is genuine chat
+    # and must not be hijacked by the did-you-mean guard.
+    assert cli.main(["deamon", "is", "a", "background", "process"]) == 0
+    assert captured == {"command": "chat", "prompt": "deamon is a background process"}
 
 
 @pytest.mark.asyncio

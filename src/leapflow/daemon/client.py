@@ -195,6 +195,56 @@ class DaemonClient:
         )
         return dict(result or {})
 
+    # ── Watch runtime (monitor subsystem) ──
+
+    async def watch_arm(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Arm a monitor watch on the daemon. Returns its runtime view."""
+        return dict(await self.request("watch.arm", {"spec": spec}) or {})
+
+    async def watch_list(self) -> list[dict[str, Any]]:
+        """List daemon-hosted watches."""
+        return list(await self.request("watch.list") or [])
+
+    async def watch_get(self, watch_id: str) -> dict[str, Any]:
+        """Return a single watch view."""
+        return dict(await self.request("watch.get", {"watch_id": watch_id}) or {})
+
+    async def watch_pause(self, watch_id: str) -> dict[str, Any]:
+        """Suspend a watch until resumed."""
+        return dict(await self.request("watch.pause", {"watch_id": watch_id}) or {})
+
+    async def watch_resume(self, watch_id: str) -> dict[str, Any]:
+        """Re-arm a suspended watch."""
+        return dict(await self.request("watch.resume", {"watch_id": watch_id}) or {})
+
+    async def watch_stop(self, watch_id: str) -> dict[str, Any]:
+        """Terminally stop a watch."""
+        return dict(await self.request("watch.stop", {"watch_id": watch_id}) or {})
+
+    async def watch_mute(self, watch_id: str, *, muted: bool = True) -> dict[str, Any]:
+        """Toggle whether a watch's findings are pushed."""
+        return dict(await self.request("watch.mute", {"watch_id": watch_id, "muted": muted}) or {})
+
+    async def watch_refresh(self, watch_id: str) -> dict[str, Any]:
+        """Run one observation cycle immediately."""
+        return dict(await self.request("watch.refresh", {"watch_id": watch_id}) or {})
+
+    async def watch_findings(
+        self, *, watch_id: str = "", limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Return persisted findings, newest first."""
+        return list(await self.request(
+            "watch.findings", {"watch_id": watch_id, "limit": limit, "offset": offset}
+        ) or [])
+
+    async def session_history(self, *, limit: int = 200) -> dict[str, Any]:
+        """Return the current conversation transcript and counts."""
+        return dict(await self.request("session.history", {"limit": limit}) or {})
+
+    async def session_analyze(self) -> dict[str, Any]:
+        """Ensure a session-analysis watch and run one analysis cycle now."""
+        return dict(await self.request("session.analyze") or {})
+
     async def shutdown(self) -> None:
         """Request graceful daemon shutdown."""
         await self.request("daemon.shutdown")

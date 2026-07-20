@@ -29,7 +29,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -200,8 +200,21 @@ def stop_daemon(
     grace_timeout_s: float = 0.0,
     poll_interval_s: float = 0.1,
     force_timeout_s: float = 2.0,
+    on_progress: Callable[[str], None] | None = None,
 ) -> StopDaemonResult:
-    """Stop leapd as a bounded transaction and verify final state."""
+    """Stop leapd as a bounded transaction and verify final state.
+
+    ``on_progress`` receives short, human-readable step messages so callers can
+    keep the user informed while a slow shutdown escalates from graceful wait to
+    SIGTERM to SIGKILL.
+    """
+    def _notify(message: str) -> None:
+        if on_progress is not None:
+            try:
+                on_progress(message)
+            except Exception:  # noqa: BLE001 - progress reporting must never break stop
+                pass
+
     info = DaemonInfo.discover(runtime_dir)
     pid = info.pid
     if not info.is_running:
@@ -211,11 +224,13 @@ def stop_daemon(
     deadline = time.time() + max(0.1, timeout_s)
     interval = max(0.01, poll_interval_s)
     if grace_timeout_s > 0:
+        _notify(f"Waiting up to {grace_timeout_s:.0f}s for graceful shutdown...")
         grace_deadline = min(deadline, time.time() + grace_timeout_s)
         if _wait_until_stopped(runtime_dir, deadline=grace_deadline, interval_s=interval):
             stale_cleaned = cleanup_stale(runtime_dir)
             return StopDaemonResult(pid=pid, stopped=True, stale_cleaned=stale_cleaned)
 
+    _notify(f"Sending SIGTERM to pid {pid}...")
     signal_sent = send_signal(runtime_dir, signal.SIGTERM)
     if not signal_sent and not DaemonInfo.discover(runtime_dir).is_running:
         stale_cleaned = cleanup_stale(runtime_dir)
@@ -229,6 +244,7 @@ def stop_daemon(
 
     forced = False
     if force:
+        _notify(f"Still running; escalating to SIGKILL (force) and waiting up to {force_timeout_s:.0f}s...")
         forced = send_signal(runtime_dir, signal.SIGKILL)
         kill_deadline = time.time() + max(0.1, force_timeout_s)
         if forced and _wait_until_stopped(runtime_dir, deadline=kill_deadline, interval_s=interval):
@@ -315,12 +331,30 @@ def _read_meta(path: Path) -> Optional[dict]:
 
 
 def _process_alive(pid: int) -> bool:
-    """Check if a process with the given PID exists."""
+    """Return True if the process with the given PID is still running.
+
+    A daemon spawned by the current process lingers as an unreaped zombie after
+    it exits (including after ``SIGKILL``); ``os.kill(pid, 0)`` still succeeds
+    for zombies, which would make a successful stop look like a failure. Reap
+    our own exited children first so a terminated daemon is correctly reported
+    as gone. For processes that are not our children, reaping is a no-op and we
+    fall back to the ``os.kill`` liveness probe.
+    """
+    try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+        if reaped == pid:
+            return False  # our child has exited and was just reaped
+    except (ChildProcessError, OSError):
+        pass  # not our child, or already reaped by subprocess/init
     try:
         os.kill(pid, 0)
-        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
     except OSError:
         return False
+    return True
 
 
 def _sock_healthy(sock_path: Path) -> bool:

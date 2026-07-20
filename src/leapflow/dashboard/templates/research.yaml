@@ -1,0 +1,66 @@
+template: research
+version: 1
+title: "{{ title }}"
+domain: research
+meta:
+  title: "Research lens"
+  description: "Reframes the current-session analysis for inquiry: open questions and follow-ups first, evidence and references alongside."
+layout:
+  - type: Page
+    props:
+      title: "{{ title }}"
+    children:
+      - type: Section
+        props:
+          title: "Inquiry brief"
+          subtitle: "The line of investigation and where the open questions concentrate."
+        children:
+          - type: Grid
+            children:
+              - type: StoryPanel
+                props:
+                  title: "Line of inquiry"
+                  text: "{{ analysis.story }}"
+              - type: Card
+                props:
+                  title: "Open questions"
+                children:
+                  - type: List
+                    props:
+                      bind: analysis.open_questions
+      - type: Section
+        props:
+          title: "Findings"
+          subtitle: "Insights carded as evidence, capped for fast review."
+        children:
+          - type: Grid
+            children:
+              - type: InsightCard
+                repeat: analysis.insights
+                as: i
+                props:
+                  title: "{{ i.title }}"
+                  summary: "{{ i.summary }}"
+                  severity: "{{ i.severity }}"
+                  bind: i
+      - type: Section
+        props:
+          title: "References & follow-ups"
+          subtitle: "Entities as references, and recommended next prompts to advance the work."
+        children:
+          - type: Grid
+            children:
+              - type: Card
+                props:
+                  title: "References (entities)"
+                children:
+                  - type: EntityGraph
+                    props:
+                      bind: analysis.entities
+              - type: Card
+                props:
+                  title: "Follow-ups"
+                children:
+                  - type: SuggestionChips
+                    props:
+                      bind: analysis.next_prompts

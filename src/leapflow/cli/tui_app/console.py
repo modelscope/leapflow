@@ -26,6 +26,17 @@ from leapflow.cli.tui_app.theme import ResolvedTheme, Theme
 _COMMAND_CARD_MIN_SUMMARY = 32
 _COMMAND_CARD_PADDING = 24
 
+# Terminal (finished) command statuses -> footer label style. Shared by the
+# agent response label and the standalone slash-command footer so every command
+# ends with the same `` |--  LEAP  #N status`` marker instead of a boxed card.
+_COMMAND_STATUS_STYLES: dict[TuiCommandStatus, str] = {
+    TuiCommandStatus.DONE: "leap.success",
+    TuiCommandStatus.BLOCKED: "leap.warning",
+    TuiCommandStatus.FAILED: "leap.error",
+    TuiCommandStatus.CANCELLED: "leap.warning",
+    TuiCommandStatus.SKIPPED: "leap.warning",
+}
+
 
 def _format_card_elapsed(seconds: float) -> str:
     """Format command-card elapsed time without consuming a body line."""
@@ -180,6 +191,60 @@ class LeapConsole:
             title=title,
             title_align="left",
             border_style=border_styles[command.status],
+            padding=(0, 1),
+        ))
+
+    def command_footer(self, command: TuiCommand) -> None:
+        """Render a finished command's terminal state as a flat LEAP footer line.
+
+        Every slash command ends with the same `` |--  LEAP  #N status  elapsed``
+        marker used by the agent response label — no boxed terminal card.
+        """
+        from leapflow.cli.tui_app.stream import _format_elapsed
+
+        style = _COMMAND_STATUS_STYLES.get(command.status, "leap.dim")
+        label = Text()
+        label.append(" |--  ", style="leap.border")
+        label.append("LEAP", style="leap.accent")
+        label.append(f"  {command.label} {command.status.value}", style=style)
+        if command.elapsed_s > 0:
+            label.append(f"  {_format_elapsed(command.elapsed_s)}", style="leap.dim")
+        self._console.print(label)
+
+    def monitor_card(self, finding: Mapping[str, Any]) -> None:
+        """Render a compact, non-blocking card for a pushed monitor finding."""
+        severity = str(finding.get("severity", "info"))
+        border = {
+            "alert": "leap.error",
+            "notable": "leap.warning",
+            "info": "leap.border",
+        }.get(severity, "leap.border")
+        domain = str(finding.get("domain", ""))
+        watch_id = str(finding.get("watch_id", ""))[:8]
+        title_text = str(finding.get("title", "")) or "(finding)"
+        summary = str(finding.get("summary", ""))
+
+        body = Text(title_text, style="bold")
+        if summary:
+            body.append("\n")
+            body.append(summary, style="leap.muted")
+        actions = finding.get("suggested_actions") or []
+        if actions:
+            labels = ", ".join(str(a.get("label") or a.get("name")) for a in actions[:3])
+            body.append("\n")
+            body.append(f"actions: {labels}", style="leap.dim")
+
+        head = Text()
+        head.append("◉ ", style=border)
+        head.append(domain or "monitor", style="bold")
+        if watch_id:
+            head.append(f"  [{watch_id}]", style="leap.dim")
+        head.append(f"  {severity}", style=border)
+        self._console.print(Panel(
+            body,
+            title=head,
+            title_align="left",
+            border_style=border,
             padding=(0, 1),
         ))
 
@@ -392,14 +457,7 @@ class LeapConsole:
         label.append(" |--  ", style="leap.border")
         label.append("LEAP", style="leap.accent")
         if command is not None:
-            command_styles = {
-                TuiCommandStatus.DONE: "leap.success",
-                TuiCommandStatus.BLOCKED: "leap.warning",
-                TuiCommandStatus.FAILED: "leap.error",
-                TuiCommandStatus.CANCELLED: "leap.warning",
-                TuiCommandStatus.SKIPPED: "leap.warning",
-            }
-            command_style = command_styles.get(command.status, "leap.dim")
+            command_style = _COMMAND_STATUS_STYLES.get(command.status, "leap.dim")
             label.append(f"  {command.label} {command.status.value}", style=command_style)
         elapsed_str = _format_elapsed(elapsed_s)
         label.append(f"  {elapsed_str}", style="leap.dim")

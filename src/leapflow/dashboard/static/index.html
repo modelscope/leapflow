@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LeapBoard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;800&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">Leap<span class="brand-mark-strong">Board</span></span>
+      <span class="brand-slogan">Signals into insight.</span>
+    </div>
+    <span class="brand-divider" aria-hidden="true"></span>
+    <nav class="nav" id="nav"></nav>
+    <label class="locale-label" for="locale-switch" data-i18n="Language">Language</label>
+    <select id="locale-switch" class="locale-switch" aria-label="Language">
+      <option value="en">EN</option>
+      <option value="zh">中文</option>
+      <option value="fr">FR</option>
+      <option value="es">ES</option>
+      <option value="ar">العربية</option>
+      <option value="ru">RU</option>
+    </select>
+    <span id="status" class="status" data-i18n="connecting…">connecting…</span>
+  </header>
+  <main id="root" class="root"><div class="empty" data-i18n="Loading…">Loading…</div></main>
+  <div id="toasts" class="toasts"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

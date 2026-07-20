@@ -132,6 +132,16 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     # Scheduler
     CommandDef("arm", "Schedule a skill for timed execution", "Scheduler", args_hint="<skill> <cron>"),
     CommandDef("task", "List scheduled tasks", "Scheduler"),
+
+    # Board & Monitors (LeapBoard) — one analysis target (current session),
+    # rendered through a selectable template lens.
+    CommandDef("board", "Analyze the current session; optionally pick a template lens", "Board", args_hint="[<template> | templates|refresh|pause|resume|stop|status]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board templates", "List, add, remove, or show board templates", "Board", args_hint="[list|add <path.yaml> [--name id] [--force]|remove <id>|show <id>]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board refresh", "Re-analyze the current session (or a watch by id) now", "Board", args_hint="[<id>]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board pause", "Pause session analysis (or a watch by id)", "Board", args_hint="[<id>]", effect=CommandEffect.SESSION),
+    CommandDef("board resume", "Resume session analysis (or a watch by id)", "Board", args_hint="[<id>]", effect=CommandEffect.SESSION),
+    CommandDef("board stop", "Stop the current session (or a watch by id)", "Board", args_hint="[<id>]", effect=CommandEffect.SESSION),
+    CommandDef("board status", "Show watch state, recent findings, and templates", "Board"),
 )
 
 # ── Derived structures ───────────────────────────────────────────────

@@ -70,6 +70,20 @@ class UnixRpcServer:
         """Return the current number of connected clients."""
         return self._active_connections
 
+    def has_keepalive_work(self) -> bool:
+        """Return True when the service has work that must keep the daemon alive.
+
+        Persistent monitor watches must survive client disconnects, so an armed
+        watch counts as activity for the idle-shutdown watchdog.
+        """
+        checker = getattr(self._service, "has_active_watches", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
     async def serve_forever(self) -> None:
         """Start listening and serve until cancelled."""
         self._runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -311,7 +325,8 @@ async def _watch_idle_shutdown(
             server.runtime_dir,
             ttl_s=max_lease_age,
         )
-        if server.active_connections > 0 or has_lease:
+        keepalive = getattr(server, "has_keepalive_work", None)
+        if server.active_connections > 0 or has_lease or (callable(keepalive) and keepalive()):
             last_active = asyncio.get_running_loop().time()
         elif asyncio.get_running_loop().time() - last_active >= idle_timeout_s:
             logger.info("daemon: idle timeout reached; shutting down")

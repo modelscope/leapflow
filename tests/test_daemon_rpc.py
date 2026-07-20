@@ -1028,6 +1028,72 @@ def test_stop_daemon_force_escalates_after_timeout(monkeypatch, tmp_path) -> Non
     assert signals == [lifecycle_module.signal.SIGTERM, lifecycle_module.signal.SIGKILL]
 
 
+def test_stop_daemon_narrates_progress(monkeypatch, tmp_path) -> None:
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    running = lifecycle_module.DaemonInfo(
+        pid=4885,
+        sock_path=tmp_path / "runtime" / "leapd.sock",
+        start_time=None,
+        is_running=True,
+        is_healthy=False,
+    )
+    monkeypatch.setattr(lifecycle_module.DaemonInfo, "discover", staticmethod(lambda runtime_dir: running))
+    monkeypatch.setattr(lifecycle_module, "send_signal", lambda runtime_dir, sig: True)
+
+    messages: list[str] = []
+    result = lifecycle_module.stop_daemon(
+        tmp_path / "runtime",
+        timeout_s=0.05,
+        force=True,
+        grace_timeout_s=0.05,
+        force_timeout_s=0.05,
+        poll_interval_s=0.01,
+        on_progress=messages.append,
+    )
+
+    assert result.timed_out is True
+    # Every escalation step is narrated so the wait is transparent, not silent.
+    assert any("graceful" in m.lower() for m in messages)
+    assert any("SIGTERM" in m for m in messages)
+    assert any("SIGKILL" in m for m in messages)
+
+
+def test_process_alive_reaps_exited_child_as_dead() -> None:
+    import subprocess
+    import sys
+    import time
+
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    # A child spawned by this process becomes an unreaped zombie once it exits;
+    # os.kill(pid, 0) still succeeds for zombies. _process_alive must reap it and
+    # report it as dead so a SIGKILL'd daemon is not seen as "still running".
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])  # noqa: S603 - trusted argv
+    deadline = time.time() + 5.0
+    alive = True
+    while time.time() < deadline:
+        alive = lifecycle_module._process_alive(proc.pid)
+        if not alive:
+            break
+        time.sleep(0.05)
+    proc.returncode = 0  # already reaped by _process_alive; silence Popen.__del__
+
+    assert alive is False
+
+
+def test_process_alive_false_for_reaped_pid() -> None:
+    import subprocess
+    import sys
+
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])  # noqa: S603 - trusted argv
+    proc.wait()  # fully reaped; pid no longer exists
+
+    assert lifecycle_module._process_alive(proc.pid) is False
+
+
 def test_daemon_restart_stops_and_starts(monkeypatch, tmp_path) -> None:
     from leapflow.cli.commands import daemon as daemon_module
 

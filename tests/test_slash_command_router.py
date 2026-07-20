@@ -53,6 +53,24 @@ def test_command_router_client_local_commands() -> None:
         assert inv is not None, f"parse failed for {cmd_text}"
         assert inv.command.client_local is False, f"{cmd_text} should NOT be client_local"
 
+def test_board_commands_resolve_as_engine_routed() -> None:
+    """Board commands must resolve as non-client-local so the in-process REPL
+    routes them through command_execute instead of leaking to the LLM chat."""
+    router = CommandRouter("daemon")
+
+    for cmd_text in ("/board", "/board finance", "/board templates", "/board refresh", "/board status"):
+        inv = router.parse(cmd_text)
+        assert inv is not None, f"parse failed for {cmd_text}"
+        assert inv.command.name.startswith("board"), cmd_text
+        assert inv.command.client_local is False, f"{cmd_text} must be engine-routed"
+
+    # A bare template name resolves to the base `board` command (template = arg).
+    finance = router.parse("/board finance")
+    assert finance is not None and finance.command.name == "board" and finance.args == "finance"
+    # Reserved verbs resolve to their dedicated command.
+    assert router.parse("/board templates").command.name == "board templates"
+
+
 def test_plural_skill_tool_task_commands_are_not_registered() -> None:
     router = CommandRouter("daemon")
 

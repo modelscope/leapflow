@@ -98,6 +98,8 @@ class StatusBar:
         self.context_state: str = "baseline"
         self.running_tasks: int = 0
         self.queued_tasks: int = 0
+        self.watch_count: int = 0
+        self.alert_count: int = 0
         self.last_turn_elapsed: float = 0.0
         self._turn_start: float = 0.0
         self._session_start: float = time.monotonic()
@@ -137,6 +139,21 @@ class StatusBar:
             else:
                 task_text = f"running:{self.running_tasks} queued:{self.queued_tasks} "
             parts.append(("class:status-bar.strong", task_text))
+            parts.append(("class:status-bar.dim", "│ "))
+
+        if self.watch_count or self.alert_count:
+            if narrow:
+                mon_text = f"◉{self.watch_count}"
+                if self.alert_count:
+                    mon_text += f"!{self.alert_count}"
+                mon_text += " "
+            else:
+                mon_text = f"◉ {self.watch_count} watch"
+                if self.alert_count:
+                    mon_text += f" · {self.alert_count} alert"
+                mon_text += " "
+            mon_cls = "class:status-bar.warn" if self.alert_count else "class:status-bar.strong"
+            parts.append((mon_cls, mon_text))
             parts.append(("class:status-bar.dim", "│ "))
 
         if self.model_name and not narrow:
@@ -247,3 +264,12 @@ class StatusBar:
         """Update task counters shown in the status bar."""
         self.running_tasks = max(0, running)
         self.queued_tasks = max(0, queued)
+
+    def update_monitor_counts(
+        self, *, watches: Optional[int] = None, alerts: Optional[int] = None
+    ) -> None:
+        """Update the monitor watch/alert counters shown in the status bar."""
+        if watches is not None:
+            self.watch_count = max(0, watches)
+        if alerts is not None:
+            self.alert_count = max(0, alerts)

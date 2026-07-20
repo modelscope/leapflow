@@ -32,6 +32,11 @@ class _FakeConsole:
     def command_card(self, command: TuiCommand) -> None:
         self.cards.append(command)
 
+    def command_footer(self, command: TuiCommand) -> None:
+        # Terminal states render as a flat footer; record them alongside cards so
+        # lifecycle assertions track the command/status flow regardless of style.
+        self.cards.append(command)
+
     def error(self, message: str) -> None:
         self.errors.append(message)
 
@@ -296,6 +301,26 @@ def test_slash_completer_guides_config_subcommands_keys_and_values() -> None:
     assert [completion.text for completion in values] == ["true", "false"]
 
 
+def test_slash_completer_guides_config_llm_and_secret_subcommands() -> None:
+    completer = SlashCommandCompleter((("config", "View or update runtime configuration"),))
+
+    llm_actions = list(completer.get_completions(Document("/config llm ", len("/config llm ")), None))
+    assert {"show", "set"} <= {completion.text for completion in llm_actions}
+
+    llm_flags = list(completer.get_completions(Document("/config llm set ", len("/config llm set ")), None))
+    flag_texts = {completion.text for completion in llm_flags}
+    assert {"--model", "--base-url", "--api-key"} <= flag_texts
+
+    llm_flag_prefix = list(completer.get_completions(Document("/config llm set --mo", len("/config llm set --mo")), None))
+    assert [completion.text for completion in llm_flag_prefix] == ["--model"]
+
+    secret_actions = list(completer.get_completions(Document("/config secret ", len("/config secret ")), None))
+    assert {"list", "set", "get", "delete"} <= {completion.text for completion in secret_actions}
+
+    secret_prefix = list(completer.get_completions(Document("/config secret de", len("/config secret de")), None))
+    assert [completion.text for completion in secret_prefix] == ["delete"]
+
+
 def test_slash_completer_does_not_pollute_natural_language() -> None:
     completer = SlashCommandCompleter((("help", "Show available commands"),))
 
@@ -458,6 +483,37 @@ def test_command_card_keeps_elapsed_in_title_not_body(monkeypatch) -> None:
     assert "done" in title
     assert "elapsed:" not in body
     assert "summarize the current project layout" in body
+
+
+def test_command_footer_renders_flat_leap_line(monkeypatch) -> None:
+    class CapturingConsole:
+        width = 100
+
+        def __init__(self) -> None:
+            self.rendered = []
+
+        def print(self, renderable) -> None:
+            self.rendered.append(renderable)
+
+    capture = CapturingConsole()
+    leap_console = LeapConsole(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    monkeypatch.setattr(leap_console, "_console", capture)
+
+    done = TuiCommand.create(command_id=13, text="/board stop 71e2ae20").mark_running().mark_done()
+    leap_console.command_footer(done)
+
+    # Flat footer, not a boxed Panel; mirrors the agent response label.
+    assert len(capture.rendered) == 1
+    from rich.panel import Panel
+    assert not isinstance(capture.rendered[0], Panel)
+    plain = capture.rendered[0].plain
+    assert plain.startswith(" |--  LEAP  #13 done")
+
+    # A never-run terminal state (e.g. skipped) omits the elapsed suffix.
+    capture.rendered.clear()
+    skipped = TuiCommand.create(command_id=14, text="/board status").mark_skipped("duplicate")
+    leap_console.command_footer(skipped)
+    assert capture.rendered[0].plain == " |--  LEAP  #14 skipped"
 
 
 def test_response_label_merges_done_command_status(monkeypatch) -> None:

@@ -119,6 +119,11 @@ _FIELD_DESCRIPTIONS = {
     "visual.track_enabled": "Enable screenshot-based visual perception for the active profile.",
     "recording.mode": "Default recording pipeline used during teaching and observation.",
     "scheduler.tick_seconds": "Scheduler polling interval in seconds.",
+    "dashboard.enabled": "Enable the local monitoring web dashboard.",
+    "dashboard.bind": "Address the dashboard web server binds to (keep loopback).",
+    "dashboard.port": "TCP port for the local dashboard web server.",
+    "dashboard.auto_open": "Open the default browser automatically when launching the dashboard.",
+    "dashboard.token_ref": "Secret ref for the local dashboard access token.",
     "stream.output": "Stream assistant tokens and progress in interactive sessions.",
     "verbose.progress": "Show inline execution progress for tools and runtime steps.",
 }
@@ -146,6 +151,8 @@ _SECTION_CATEGORIES = {
     "mock": "Runtime",
     "log": "Runtime",
     "scheduler": "Scheduler",
+    "dashboard": "Dashboard",
+    "monitor": "Dashboard",
     "copilot": "Copilot",
     "react": "Execution Loop",
     "tool": "Execution Loop",
@@ -166,7 +173,7 @@ _VALUE_HINTS = {
     "signal.channels": "all or comma-separated channel names",
 }
 
-_PARTIAL_RELOAD_SECTIONS = frozenset({"runtime", "mock", "gateway", "hub", "scheduler", "observer", "cua", "use"})
+_PARTIAL_RELOAD_SECTIONS = frozenset({"runtime", "mock", "gateway", "hub", "scheduler", "observer", "cua", "use", "dashboard"})
 
 _PROFILE_FILE_BY_SECTION = {
     "llm": "llm.yaml",
@@ -333,7 +340,7 @@ class ConfigService:
             raise ValueError(f"Unknown config key: {key}")
         if spec.secret:
             value = str(getattr(self._settings, spec.setting_name or "", "") or "")
-            return ConfigValueView(normalized, "set" if value.strip() else "missing", secret=True)
+            return ConfigValueView(normalized, _mask_secret(value), secret=True)
         value = getattr(self._settings, spec.setting_name or "", None)
         return ConfigValueView(normalized, _format_value(value), secret=False)
 
@@ -619,6 +626,20 @@ def _coerce_value(value: object, value_type: Any) -> object:
     if text.startswith("{") or text.startswith("["):
         return yaml.safe_load(text)
     return text
+
+
+def _mask_secret(raw: str) -> str:
+    """Render a secret as a masked hint (e.g. ``***3ab``), never the full value.
+
+    Empty secrets render as ``missing``; short values are fully masked.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return "missing"
+    # Reveal the last 3 chars only for secrets long enough that the suffix leaves
+    # ample entropy masked; short secrets (< 16 chars) are fully masked.
+    suffix = text[-3:] if len(text) >= 16 else ""
+    return f"***{suffix}" if suffix else "***"
 
 
 def _format_value(value: object) -> str:

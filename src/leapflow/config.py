@@ -406,6 +406,20 @@ class Settings:
     scheduler_grace_seconds: float = 120.0
     scheduler_default_tier: str = "auto"  # auto | local | cloud
 
+    # ── Dashboard (monitoring web view) ──
+    dashboard_enabled: bool = True
+    dashboard_bind: str = "127.0.0.1"
+    dashboard_port: int = 8765
+    dashboard_auto_open: bool = True
+    dashboard_token_ref: str = ""  # secret ref for the local dashboard access token
+
+    # ── Session analysis dashboard (domain=session watch) ──
+    monitor_session_batch_turns: int = 6
+    monitor_session_batch_tokens: int = 4000
+    monitor_session_use_model_salience: bool = False
+    monitor_session_debounce_s: float = 15.0
+    monitor_session_max_refresh_per_min: int = 4
+
     @property
     def profile_dir(self) -> Path:
         """Root directory for the active profile."""
@@ -829,6 +843,20 @@ def _build_settings_from_env(
     scheduler_grace_seconds = float(os.getenv("LEAPFLOW_SCHEDULER_GRACE_SECONDS", "120.0"))
     scheduler_default_tier = os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_TIER", "auto")
 
+    # Dashboard
+    dashboard_enabled = _bool("LEAPFLOW_DASHBOARD_ENABLED", "true")
+    dashboard_bind = os.getenv("LEAPFLOW_DASHBOARD_BIND", "127.0.0.1").strip() or "127.0.0.1"
+    dashboard_port = int(os.getenv("LEAPFLOW_DASHBOARD_PORT", "8765"))
+    dashboard_auto_open = _bool("LEAPFLOW_DASHBOARD_AUTO_OPEN", "true")
+    dashboard_token_ref = os.getenv("LEAPFLOW_DASHBOARD_TOKEN_REF", "").strip()
+
+    # Session analysis dashboard
+    monitor_session_batch_turns = int(os.getenv("LEAPFLOW_MONITOR_SESSION_BATCH_TURNS", "6"))
+    monitor_session_batch_tokens = int(os.getenv("LEAPFLOW_MONITOR_SESSION_BATCH_TOKENS", "4000"))
+    monitor_session_use_model_salience = _bool("LEAPFLOW_MONITOR_SESSION_USE_MODEL_SALIENCE", "false")
+    monitor_session_debounce_s = float(os.getenv("LEAPFLOW_MONITOR_SESSION_DEBOUNCE_S", "15.0"))
+    monitor_session_max_refresh_per_min = int(os.getenv("LEAPFLOW_MONITOR_SESSION_MAX_REFRESH_PER_MIN", "4"))
+
     settings = Settings(
         llm_api_key=api_key,
         llm_base_url=base_url.rstrip("/"),
@@ -1060,6 +1088,17 @@ def _build_settings_from_env(
         scheduler_tick_seconds=scheduler_tick_seconds,
         scheduler_grace_seconds=scheduler_grace_seconds,
         scheduler_default_tier=scheduler_default_tier,
+        # Dashboard
+        dashboard_enabled=dashboard_enabled,
+        dashboard_bind=dashboard_bind,
+        dashboard_port=dashboard_port,
+        dashboard_auto_open=dashboard_auto_open,
+        dashboard_token_ref=dashboard_token_ref,
+        monitor_session_batch_turns=monitor_session_batch_turns,
+        monitor_session_batch_tokens=monitor_session_batch_tokens,
+        monitor_session_use_model_salience=monitor_session_use_model_salience,
+        monitor_session_debounce_s=monitor_session_debounce_s,
+        monitor_session_max_refresh_per_min=monitor_session_max_refresh_per_min,
     )
 
     if not settings.llm_api_key:

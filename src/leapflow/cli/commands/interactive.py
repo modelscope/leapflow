@@ -30,6 +30,8 @@ _CLI_EVENT_SOURCE = "interactive_repl"
 
 _last_hint: Optional["PredictionCandidate"] = None
 
+_WATCH_EXIT_ACTIVE_STATES = frozenset({"armed", "watching", "due", "confirming", "executing"})
+
 
 def _is_app_command(canonical: str) -> bool:
     """Return true only for `/app` or `/app ...`, not `/apple`."""
@@ -51,6 +53,7 @@ async def _prompt_stop_daemon_on_exit(
         "leapd runs in the background; stop/restart it after reinstalling LeapFlow "
         "to load new code."
     )
+    await _stop_board_watches_on_exit(client, console)
     connected_clients = daemon_status.get("connected_clients")
     other_clients = 0
     try:
@@ -71,25 +74,96 @@ async def _prompt_stop_daemon_on_exit(
     from leapflow.daemon.lifecycle import stop_daemon
 
     runtime_dir = settings.runtime_dir
-    console.system(f"Stopping leapd (pid={pid})...")
+    console.system(f"Stopping leapd (pid={pid}); requesting graceful shutdown...")
     graceful_requested = False
     try:
-        await asyncio.wait_for(client.shutdown(), timeout=2.0)
+        await asyncio.wait_for(client.shutdown(), timeout=3.0)
         graceful_requested = True
     except Exception:
         graceful_requested = False
+    # The user confirmed the stop, so escalate all the way to SIGKILL if needed.
+    # Patience over surprise: use generous windows and narrate every step so the
+    # wait is transparent rather than a silent stall.
     result = await asyncio.to_thread(
         stop_daemon,
         runtime_dir,
-        timeout_s=5.0,
-        grace_timeout_s=1.0 if graceful_requested else 0.0,
+        timeout_s=8.0,
+        force=True,
+        grace_timeout_s=3.0 if graceful_requested else 0.0,
+        force_timeout_s=6.0,
+        on_progress=console.system,
     )
     if result.stopped:
-        console.system("leapd stopped.")
+        suffix = " (forced with SIGKILL)" if result.forced else ""
+        console.system(f"leapd stopped{suffix}.")
     else:
         console.warning(
-            f"leapd did not stop within the exit window (pid={result.pid}). "
-            "Run `leap daemon stop --force` if it remains unhealthy."
+            f"leapd could not be stopped even after SIGKILL (pid={result.pid}). "
+            "It may be blocked on the OS (e.g. disk I/O); run "
+            f"`kill -9 {result.pid}` if it stays unhealthy."
+        )
+
+
+async def _stop_board_watches_on_exit(client: "DaemonClient", console: Any) -> None:
+    """Stop every active board watch before exiting so none linger in leapd.
+
+    LeapBoard watches are tied to the interactive session, so leaving the TUI
+    tears them down; a brief line tells the user what was stopped.
+    """
+    try:
+        watches = await asyncio.wait_for(client.watch_list(), timeout=1.5)
+    except Exception:
+        return
+    active = [w for w in watches if isinstance(w, dict) and _is_active_watch(w)]
+    watch_ids = [wid for wid in (str(w.get("watch_id", "")) for w in active) if wid]
+    if not watch_ids:
+        return
+    # Stop concurrently so exit is bounded by a single timeout, not the sum of
+    # one per watch; keep per-watch diagnostics for any that fail.
+    results = await asyncio.gather(
+        *(asyncio.wait_for(client.watch_stop(wid), timeout=1.0) for wid in watch_ids),
+        return_exceptions=True,
+    )
+    stopped = 0
+    for wid, result in zip(watch_ids, results):
+        if isinstance(result, Exception):
+            logger.debug("interactive: failed to stop board watch %s", wid, exc_info=result)
+        else:
+            stopped += 1
+    if stopped:
+        console.system(f"Stopped {stopped} board watch(es) on exit.")
+
+
+def _is_active_watch(watch: dict[str, Any]) -> bool:
+    return str(watch.get("state", "")) in _WATCH_EXIT_ACTIVE_STATES
+
+
+async def _open_dashboard_view(settings: Any, console: Any, payload: dict[str, Any]) -> None:
+    """Open the web dashboard on the user's machine (client-side).
+
+    Shared by both the in-process and daemon-backed REPLs so a single owner
+    handles server discovery, URL assembly, and the browser-open UX.
+    """
+    from leapflow.dashboard import launcher
+
+    template = str(payload.get("template") or "")
+    url = payload.get("url")
+    if not url:
+        try:
+            state = await asyncio.to_thread(launcher.ensure_server, settings)
+        except Exception as exc:
+            console.warning(f"Could not start the dashboard server: {exc}")
+            return
+        url = launcher.build_view_url(
+            state["bind"], state["port"], state["token"], template=template,
+        )
+    if launcher.open_in_browser(url):
+        console.system(f"Opened dashboard in your browser: {url}")
+    else:
+        console.system(f"Dashboard ready (open manually): {url}")
+    if payload.get("watch_id"):
+        console.system(
+            "Observing the current session; analysis streams to the board as it completes."
         )
 
 
@@ -267,6 +341,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     from leapflow.config_service import ConfigService
     from leapflow.cli.commands.router import CommandRouter, render_command_result
     from leapflow.cli.commands.slash_handlers import (
+        command_execute,
         handle_status,
         handle_tool,
         handle_usage,
@@ -275,6 +350,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         handle_clear,
         handle_gateway,
         handle_app,
+        render_command_payload,
     )
     from leapflow.utils.terminal_io import TerminalIOProvider
     from leapflow.engine.session import SessionMode
@@ -674,6 +750,26 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 )
                 return
 
+            # Registered engine command with no in-process fast path (e.g.
+            # /board): route through the shared command_execute contract so a
+            # recognized slash command never leaks into the LLM chat stream.
+            # Client-local commands are handled above or via task-control.
+            if not cmd_def.client_local:
+                try:
+                    payload = await command_execute(ctx, canonical, cmd_args)
+                except Exception as exc:
+                    console.warning(f"/{canonical} failed: {exc}")
+                    return
+                if str(payload.get("view")) == "dashboard":
+                    if payload.get("mode") == "open":
+                        await _open_dashboard_view(ctx.settings, console, payload)
+                    else:
+                        render_command_payload(console, payload)
+                    return
+                else:
+                    render_command_payload(console, payload)
+                return
+
         if _learning:
             ctx.imitation.end_control_input()
 
@@ -847,13 +943,10 @@ async def cmd_interactive_daemon(
     from leapflow.cli.banner import display_rich_banner
     from leapflow.cli.commands.registry import completion_entries
     from leapflow.config_service import ConfigService
-    from leapflow.cli.commands.router import CommandRouter, render_command_result
+    from leapflow.cli.commands.router import CommandRouter
     from leapflow.cli.commands.slash_handlers import (
         render_app_payload,
         render_command_payload,
-        render_model_payload,
-        render_tool_payload,
-        render_usage_payload,
     )
     from leapflow.cli.tui_app import (
         LeapApp,
@@ -1121,6 +1214,10 @@ async def cmd_interactive_daemon(
     # Session mode tracking for teaching — daemon-side state mirrored here
     daemon_session_mode = "idle"
 
+    async def _open_dashboard(payload: dict) -> None:
+        """Open the web dashboard on the user's machine (client-side)."""
+        await _open_dashboard_view(settings, console, payload)
+
     async def handle_input(text: str) -> None:
         nonlocal daemon_session_mode
 
@@ -1183,6 +1280,13 @@ async def cmd_interactive_daemon(
             if payload.get("view") == "host" and payload.get("result"):
                 _apply_daemon_runtime_metadata({"host_backend": payload["result"]})
                 _update_status()
+
+            if str(payload.get("view")) == "dashboard":
+                if payload.get("mode") == "open":
+                    await _open_dashboard(payload)
+                else:
+                    render_command_payload(console, payload)
+                return
 
             # Render: app-specific views use app renderer, others use generic
             view = str(payload.get("view") or "")
@@ -1342,11 +1446,22 @@ async def cmd_interactive_daemon(
         """Subscribe to daemon notifications and render them in TUI."""
         nonlocal daemon_session_mode
         from leapflow.daemon.client import DaemonUnavailableError
+
+        async def _refresh_watch_count() -> None:
+            try:
+                watches = await bridge.client.watch_list()
+            except Exception:
+                return
+            active = sum(1 for w in watches if w.get("state") in ("armed", "watching"))
+            status.update_monitor_counts(watches=active)
+            app.invalidate()
+
         while True:
             try:
                 # Reset stale state on each (re)connection attempt
                 status.distill_phase = ""
                 status.distill_progress = 0.0
+                await _refresh_watch_count()
                 async for event in bridge.client.subscribe_notifications():
                     event_type = event.get("event_type", "")
                     payload = event.get("payload") or {}
@@ -1381,6 +1496,15 @@ async def cmd_interactive_daemon(
                         else:
                             console.system("Distillation complete — no skills produced (insufficient signal)")
                         app.invalidate()
+                    elif event_type == "monitor.finding":
+                        console.monitor_card(payload)
+                        if str(payload.get("severity")) == "alert":
+                            status.update_monitor_counts(alerts=status.alert_count + 1)
+                        app.invalidate()
+                    elif event_type == "watch.state":
+                        await _refresh_watch_count()
+                    elif event_type == "monitor.error":
+                        logger.debug("monitor error notification: %s", payload)
             except (DaemonUnavailableError, OSError, asyncio.IncompleteReadError):
                 await asyncio.sleep(3.0)
             except asyncio.CancelledError:
