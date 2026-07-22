@@ -140,7 +140,12 @@ def test_leap_app_style_builder_accepts_resolved_theme(tmp_path) -> None:
     )
 
     assert app._build_style() is not None
-    assert app._input_area.window.height.max == 4
+    # Input height is adaptive (a callable), floored at the original 4 rows and
+    # capped to a fraction of the terminal; it stays content-sized.
+    height = app._input_area.window.height
+    resolved = height() if callable(height) else height
+    assert resolved.min == 1
+    assert resolved.max >= 4
     assert app._input_area.window.dont_extend_height() is True
 
 

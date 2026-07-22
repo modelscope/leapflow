@@ -14,12 +14,20 @@ from prompt_toolkit.auto_suggest import Suggestion
 from prompt_toolkit.completion import Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import to_plain_text
-from leapflow.cli.tui_app.app import LeapApp, _DynamicPlaceholderProcessor
+from leapflow.cli.tui_app.app import LeapApp, _DynamicPlaceholderProcessor, _compute_input_cap
 from leapflow.cli.tui_app.console import LeapConsole
 from leapflow.cli.tui_app.command import TuiCommand, TuiCommandStatus
 from leapflow.cli.tui_app.input import SlashCommandCompleter
 from leapflow.cli.tui_app.stream import StreamRenderer, _sanitize_final_response
 from leapflow.cli.tui_app.theme import _LIGHT, resolve_theme
+
+
+def test_compute_input_cap_scales_with_terminal_and_floors_at_four() -> None:
+    # Grows to ~45% of the terminal, reserves room for chrome, never below 4.
+    assert _compute_input_cap(24) == 10
+    assert _compute_input_cap(60) == 27
+    assert _compute_input_cap(10) == 4
+    assert _compute_input_cap(8) == 4
 
 
 class _FakeConsole:

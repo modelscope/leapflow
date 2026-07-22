@@ -87,6 +87,12 @@ def _format_inline_duration(seconds: float) -> str:
     return f"{minutes}m{seconds - minutes * 60:.0f}s"
 
 
+def _compute_input_cap(rows: int) -> int:
+    """Max visible input rows: grow with content up to ~45% of the terminal,
+    leaving room for the status chrome and some transcript; never below 4."""
+    return max(4, min(int(rows * 0.45), rows - 6))
+
+
 class _DynamicPlaceholderProcessor(Processor):
     """Render the input prompt and contextual placeholder text."""
 
@@ -740,6 +746,16 @@ class LeapApp:
 
     # ── Layout construction ──────────────────────────────────────────
 
+    def _input_height(self) -> Dimension:
+        """Content-sized input height, capped adaptively to the terminal size.
+
+        Long, wrapped input stays visible far longer than a fixed cap while the
+        status chrome and some transcript remain on screen; a one-line draft
+        still renders as a single row (dont_extend_height keeps it content-sized).
+        """
+        rows = shutil.get_terminal_size((80, 24)).lines
+        return Dimension(min=1, max=_compute_input_cap(rows), preferred=1)
+
     def _build_input_area(
         self, commands: Sequence[tuple[str, str]], config_fields: Sequence[object]
     ) -> TextArea:
@@ -747,7 +763,7 @@ class LeapApp:
         ref = self
 
         area = TextArea(
-            height=Dimension(min=1, max=4, preferred=1),
+            height=self._input_height,
             prompt="",
             style="class:input-area",
             multiline=True,
@@ -922,6 +938,14 @@ class LeapApp:
         @kb.add(Keys.Right)
         def _(event):
             ref._move_right_or_accept_suggestion(event.current_buffer)
+
+        @kb.add(Keys.ControlX, Keys.ControlE)
+        def _(event):
+            # Compose long input in $EDITOR (buffer round-trips via tempfile_suffix);
+            # the edited text returns to the prompt for review before submit.
+            if ref._approval_modal is not None:
+                return
+            event.current_buffer.open_in_editor(validate_and_handle=False)
 
         @kb.add(Keys.BracketedPaste)
         def _(event):
