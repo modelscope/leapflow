@@ -8,7 +8,7 @@ import logging
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
@@ -16,6 +16,9 @@ from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
 from leapflow.platform.protocol import HostRpc, Methods
 from leapflow.config import Settings
 from leapflow.engine.budget import BudgetConfig, BudgetStatus, IterationBudget
+from leapflow.engine.prefix_commitment import PrefixCommitmentController
+from leapflow.engine.research_ledger import ResearchLedger
+from leapflow.engine.agent_loop import AgentLoopFrame
 from leapflow.engine.context_compressor import CompressorConfig, ContextCompressor
 from leapflow.engine.context_control import (
     ContextBudgetEstimator,
@@ -45,7 +48,7 @@ from leapflow.engine.message_sanitizer import MessageSanitizer
 from leapflow.engine.prompt_cache import CacheStrategy
 from leapflow.engine.stale_stream import StaleStreamError, stale_guarded_stream, build_continuation_prompt
 from leapflow.engine.turn_recovery import TurnRecoveryState
-from leapflow.engine.turn_usage import TurnUsageTracker
+from leapflow.engine.turn_usage import TurnUsageTracker, cost_ceiling_exceeded, build_adaptive_learning_signal
 from leapflow.engine.recovery_coordinator import RecoveryCoordinator
 from leapflow.engine.recovery_budget import RecoveryBudget
 from leapflow.engine.unified_classifier import UnifiedErrorClassifier
@@ -82,6 +85,7 @@ from leapflow.security.permission_failures import (
     is_permission_hard_stop_payload,
 )
 from leapflow.storage.skill_library import SkillLibraryStore
+from leapflow.storage.reentry_store import build_reentry_trigger
 from leapflow.skills.registry import Skill, SkillRegistry
 from leapflow.tools.name_resolver import ToolRegistry, ToolResolution
 
@@ -890,45 +894,39 @@ class AgentEngine:
 
         # State-machine loop infrastructure (config-driven)
         self._budget_config = BudgetConfig(
-            max_iterations=settings.react_max_iterations,
+            max_iterations=settings.agent_iter_floor,
             soft_limit=settings.react_soft_limit,
             warning_threshold=settings.react_warning_threshold,
+            iter_ceiling=settings.agent_iter_ceiling,
+            scale_k=settings.agent_budget_scale_k,
         )
+        # S3-L3: baseline difficulty weight, kept as the rollback/recompute anchor
+        # so calibration never compounds and reset is exact.
+        self._baseline_scale_k = settings.agent_budget_scale_k
+        # S3-L4: calibrated finalize-posture threshold (None = use configured baseline).
+        self._calibrated_finalizing_ratio: Optional[float] = None
+        # S3 periodic re-calibration (opt-in): evolution store + root-turn counter.
+        self._calibration_store: Optional[Any] = None
+        self._turns_since_calibration = 0
         self._error_classifier = ErrorClassifier(
             recovery_map=build_recovery_map(
                 transient_max_retries=settings.error_transient_max_retries,
                 rate_limit_base_delay=settings.error_rate_limit_base_delay,
             )
         )
-        ctx_len = settings.llm_context_length
-        self._compressor = ContextCompressor(CompressorConfig(
-            token_budget=max(1, int(ctx_len * settings.context_hard_limit_ratio)),
-            context_length=ctx_len,
-            threshold=settings.compress_threshold,
-            keep_tail=settings.compress_keep_tail,
-            max_output_chars=settings.max_tool_output_chars,
-        ))
+        self._compressor = self._new_compressor()
         self._context_controller = ContextWindowController(
             estimator=ContextBudgetEstimator(),
             hard_limit_ratio=settings.context_hard_limit_ratio,
             warning_ratio=settings.context_warning_ratio,
         )
-        self._context_governance_controller = ContextGovernanceController(
-            evidence_builder=ToolEvidenceBuilder(
-                max_content_chars=settings.tool_evidence_max_chars,
-                context_length=ctx_len,
-            ),
-            repeated_read_limit=settings.repeated_read_limit,
-            convergence_round=settings.long_task_convergence_round,
-            posture_config=ContextPostureConfig(
-                expanded_ratio=settings.context_expanded_ratio,
-                finalizing_ratio=settings.context_finalizing_ratio,
-                expanded_evidence_threshold=settings.context_expanded_evidence_threshold,
-                expanded_tool_call_threshold=settings.context_expanded_tool_call_threshold,
-                research_source_threshold=settings.context_research_source_threshold,
-                research_evidence_threshold=settings.context_research_evidence_threshold,
-            ),
-        )
+        self._context_governance_controller = self._new_governance()
+        self._prefix_commitment = PrefixCommitmentController()
+        self._research_ledger = ResearchLedger()
+        self._research_ledger_store: Optional[Any] = None
+        self._reentry_store: Optional[Any] = None
+        self._active_frame: Optional[AgentLoopFrame] = None
+        self._full_tools_tokens: int | None = None
         self._last_context_snapshot: dict[str, Any] = {}
         self._last_disclosure_metadata: dict[str, Any] = {}
         self._current_task_contract: TaskContract | None = None
@@ -1004,35 +1002,13 @@ class AgentEngine:
         self._llm = llm
         self._vlm = vlm
         self._classifier = classifier
-        ctx_len = settings.llm_context_length
-        self._compressor = ContextCompressor(CompressorConfig(
-            token_budget=max(1, int(ctx_len * settings.context_hard_limit_ratio)),
-            context_length=ctx_len,
-            threshold=settings.compress_threshold,
-            keep_tail=settings.compress_keep_tail,
-            max_output_chars=settings.max_tool_output_chars,
-        ))
+        self._compressor = self._new_compressor()
         self._context_controller = ContextWindowController(
             estimator=ContextBudgetEstimator(),
             hard_limit_ratio=settings.context_hard_limit_ratio,
             warning_ratio=settings.context_warning_ratio,
         )
-        self._context_governance_controller = ContextGovernanceController(
-            evidence_builder=ToolEvidenceBuilder(
-                max_content_chars=settings.tool_evidence_max_chars,
-                context_length=ctx_len,
-            ),
-            repeated_read_limit=settings.repeated_read_limit,
-            convergence_round=settings.long_task_convergence_round,
-            posture_config=ContextPostureConfig(
-                expanded_ratio=settings.context_expanded_ratio,
-                finalizing_ratio=settings.context_finalizing_ratio,
-                expanded_evidence_threshold=settings.context_expanded_evidence_threshold,
-                expanded_tool_call_threshold=settings.context_expanded_tool_call_threshold,
-                research_source_threshold=settings.context_research_source_threshold,
-                research_evidence_threshold=settings.context_research_evidence_threshold,
-            ),
-        )
+        self._context_governance_controller = self._new_governance()
         self._skill_merger = SkillMerger(
             registry=self._registry,
             llm=llm,
@@ -1281,6 +1257,24 @@ class AgentEngine:
         self._conversation_store = store
         self._tool_execution_ledger.reset(store=store)
 
+    def set_research_ledger_store(self, store: Any) -> None:
+        """Inject the research-ledger persistence store (S1, optional).
+
+        Wires the ledger change-listener so each note is persisted per session
+        (durable Orient). Without a store, the ledger degrades gracefully to
+        per-turn in-memory state.
+        """
+        self._research_ledger_store = store
+        self._research_ledger.set_change_listener(self._persist_research_ledger)
+
+    def set_reentry_store(self, store: Any) -> None:
+        """Inject the re-entry store (S2, optional).
+
+        Absent => ``schedule_reentry`` reports "not configured". Registration is
+        additionally gated by ``agent_reentry_enabled`` (default off).
+        """
+        self._reentry_store = store
+
     def load_session(self, session_id: str) -> bool:
         """Resume a previous session by loading messages from DuckDB.
 
@@ -1357,10 +1351,24 @@ class AgentEngine:
 
     def _begin_turn_context(self, user_text: str) -> None:
         """Reset turn-scoped state and build the stable task contract."""
+        self._maybe_periodic_recalibration()
         self._memory_context_snapshot = None
         self._last_context_snapshot = {}
         self._last_disclosure_metadata = {}
         self._context_governance_controller.reset_turn_scope()
+        self._prefix_commitment.reset()
+        if self._research_ledger_store is not None and self._current_session_id:
+            self._research_ledger.load_state(
+                self._research_ledger_store.load(self._current_session_id)
+            )
+        else:
+            self._research_ledger.reset()
+        try:
+            from leapflow.tools.registry_bootstrap import set_research_ledger, set_reentry_scheduler
+            set_research_ledger(self._research_ledger)
+            set_reentry_scheduler(self._schedule_reentry)
+        except ImportError:
+            pass
         self._current_task_contract = self._build_task_contract(user_text)
         self._current_turn_id = self._current_task_contract.task_id
         self._current_command_id = self._current_task_contract.task_id
@@ -1653,6 +1661,15 @@ class AgentEngine:
         context_length = self._active_context_length()
         token_count = self._context_controller.estimator.estimate_messages(messages)
         prepared = self._compressor.compress(messages, token_count=token_count)
+        if (
+            getattr(self._settings, "agent_compression_writeback", False)
+            and len(prepared) < len(messages)
+        ):
+            # E-3 (CL-8): persist the structural compression so append-only frozen
+            # segments stay byte-stable across rounds -> continuous prefix-cache
+            # reuse. The volatile notices appended below are NOT written back; the
+            # recent raw tail is preserved by the compressor. Opt-in (default off).
+            messages[:] = prepared
         prepared = self._ensure_task_contract_message(prepared)
         compression_trace = self._compressor.last_trace.as_dict()
         prepared = self._compressor.preflight_check(prepared, context_length=context_length)
@@ -1672,10 +1689,17 @@ class AgentEngine:
             decision.snapshot,
             round_number=round_number,
         )
-        convergence = self._context_governance_controller.convergence_notice(round_number)
-        for notice in (warning, convergence):
+        open_questions = self._ledger_open_questions()
+        convergence = self._context_governance_controller.convergence_notice(
+            round_number, open_questions=open_questions,
+        )
+        cost_notice = self._cost_ceiling_notice()
+        for notice in (warning, convergence, cost_notice):
             if notice:
                 prepared = [*prepared, build_user_message_text(notice)]
+        ledger_block = self._research_ledger.render()
+        if ledger_block:
+            prepared = [*prepared, build_user_message_text(ledger_block)]
         prepared = self._ensure_task_contract_message(prepared)
         snapshot = self._context_controller.estimator.snapshot(
             prepared,
@@ -1685,6 +1709,7 @@ class AgentEngine:
         governance = self._context_governance_controller.snapshot(
             context_ratio=snapshot.ratio,
             round_number=round_number,
+            open_questions=open_questions,
         ).as_dict()
         compressed = decision.compressed or bool(compression_trace.get("stages_applied"))
         self._last_context_tokens = snapshot.total_tokens
@@ -1701,6 +1726,9 @@ class AgentEngine:
             "compression_savings_ratio": compression_trace.get("savings_ratio", 0.0),
             "compression_saved_tokens": compression_trace.get("saved_tokens", 0),
             "context_governance": governance,
+            "difficulty": governance.get("difficulty", 0.0),
+            "cumulative_effective_tokens": self._usage_tracker.summary().effective_prompt_tokens(),
+            "open_questions": open_questions,
             "context_posture": governance.get("posture", "baseline"),
             "context_signal": governance.get("dominant_signal", ""),
             "context_guidance": governance.get("guidance", ""),
@@ -1712,6 +1740,277 @@ class AgentEngine:
         if compressed:
             self._usage_tracker.mark_compression()
         return prepared
+
+    def recalibrate_difficulty(self, store: Any) -> Any:
+        """S3-L3: apply offline calibration (S3-L2) to the difficulty weight.
+
+        Bounded, gated, and reversible: reads recent turn signals from the
+        evolution store and — only when ``agent.calibration_enabled`` — installs a
+        clamped ``scale_k`` derived from the *baseline* weight. Default-off, so
+        budget behavior is byte-identical unless explicitly enabled. Returns the
+        ``CalibrationResult`` for observability.
+        """
+        from leapflow.learning.difficulty_calibration import (
+            CalibrationResult,
+            apply_calibration,
+            build_calibration_report_from_store,
+        )
+
+        enabled = bool(getattr(self._settings, "agent_calibration_enabled", False))
+        if not enabled or store is None:
+            return CalibrationResult(
+                self._baseline_scale_k, self._budget_config.scale_k, False,
+                "calibration disabled" if not enabled else "no evolution store",
+            )
+        try:
+            report = build_calibration_report_from_store(store)
+        except Exception:
+            logger.debug("difficulty calibration: report build failed", exc_info=True)
+            return CalibrationResult(
+                self._baseline_scale_k, self._budget_config.scale_k, False, "report build failed",
+            )
+        result = apply_calibration(
+            self._baseline_scale_k, report, enabled=True,
+            min_confidence=float(getattr(self._settings, "agent_calibration_min_confidence", 0.3)),
+        )
+        if result.applied:
+            self._budget_config = replace(self._budget_config, scale_k=result.effective_k)
+            logger.info(
+                "difficulty calibration applied: scale_k %.3f -> %.3f (%s)",
+                self._baseline_scale_k, result.effective_k, result.reason,
+            )
+        return result
+
+    def reset_calibration(self) -> None:
+        """Revert any applied difficulty calibration to the configured baseline."""
+        self._budget_config = replace(self._budget_config, scale_k=self._baseline_scale_k)
+
+    def recalibrate_thresholds(self, store: Any) -> Any:
+        """S3-L4: tune the finalize posture threshold from stored signals.
+
+        Same bounded/gated/reversible contract as :meth:`recalibrate_difficulty`,
+        applied to ``context_finalizing_ratio`` (clamped to a safe band) and
+        derived from the configured baseline. Default-off; rebuilds the governance
+        controller so subsequent frames observe the calibrated threshold.
+        """
+        from leapflow.learning.difficulty_calibration import (
+            CalibrationResult,
+            apply_calibration,
+            build_threshold_report_from_store,
+        )
+
+        baseline = self._settings.context_finalizing_ratio
+        current = self._calibrated_finalizing_ratio or baseline
+        enabled = bool(getattr(self._settings, "agent_calibration_enabled", False))
+        if not enabled or store is None:
+            return CalibrationResult(
+                baseline, current, False,
+                "calibration disabled" if not enabled else "no evolution store",
+            )
+        try:
+            report = build_threshold_report_from_store(store)
+        except Exception:
+            logger.debug("threshold calibration: report build failed", exc_info=True)
+            return CalibrationResult(baseline, current, False, "report build failed")
+        result = apply_calibration(
+            baseline, report, enabled=True,
+            min_confidence=float(getattr(self._settings, "agent_calibration_min_confidence", 0.3)),
+            k_min=0.6, k_max=0.98,
+        )
+        if result.applied:
+            self._calibrated_finalizing_ratio = result.effective_k
+            self._context_governance_controller = self._new_governance()
+            logger.info(
+                "threshold calibration applied: finalizing_ratio %.3f -> %.3f (%s)",
+                baseline, result.effective_k, result.reason,
+            )
+        return result
+
+    def reset_threshold_calibration(self) -> None:
+        """Revert any applied finalize-threshold calibration to the baseline."""
+        self._calibrated_finalizing_ratio = None
+        self._context_governance_controller = self._new_governance()
+
+    def set_calibration_store(self, store: Any) -> None:
+        """Install the evolution store used for periodic S3 re-calibration."""
+        self._calibration_store = store
+
+    def _maybe_periodic_recalibration(self) -> None:
+        """S3-L3/L4 periodic re-calibration (opt-in via agent.calibration_interval_turns).
+
+        The one-shot startup calibration already applies the learned adjustment;
+        when a positive interval is set, re-run every N *root* turns so calibration
+        tracks accumulating outcome data. Default 0 = one-shot only (no periodic).
+        Bounded/gated/reversible like the underlying recalibration; never raises.
+        """
+        if not getattr(self._settings, "agent_calibration_enabled", False):
+            return
+        interval = int(getattr(self._settings, "agent_calibration_interval_turns", 0) or 0)
+        if interval <= 0 or self._calibration_store is None:
+            return
+        self._turns_since_calibration += 1
+        if self._turns_since_calibration < interval:
+            return
+        self._turns_since_calibration = 0
+        try:
+            self.recalibrate_difficulty(self._calibration_store)
+            self.recalibrate_thresholds(self._calibration_store)
+        except Exception:
+            logger.debug("periodic recalibration failed", exc_info=True)
+
+    def _widen_budget_for_difficulty(self, budget: IterationBudget) -> None:
+        """Raise the elastic iteration cap to match the observed difficulty.
+
+        Reads the difficulty produced by the most recent ``_prepare_llm_messages``
+        governance snapshot and retargets the budget toward the difficulty-scaled
+        ceiling. No-op for fixed budgets and for difficulty 0 (baseline floor).
+        This is how a hard task earns a wider horizon while a simple task stays
+        near the floor and relies on self-stop / answer-ready convergence.
+        """
+        difficulty = float(self._last_context_snapshot.get("difficulty", 0.0) or 0.0)
+        budget.retarget(budget.elastic_max(difficulty))
+
+    def _ledger_open_questions(self) -> int | None:
+        """Ledger sufficiency signal for convergence: None when the ledger is
+        inactive/empty (fall back to the marginal heuristic), else the current
+        open-question count. A positive count suppresses early answer-ready
+        convergence so a long task with tracked open work is never cut short.
+        """
+        ledger = self._research_ledger
+        return None if ledger.is_empty else ledger.open_question_count
+
+    def orientation_view(self, *, now: Optional[float] = None) -> Any:
+        """Read-only unified orientation across immediate/working/long-term layers (S4-D1).
+
+        Observe-only aggregation of existing state: the current research ledger
+        forms the working layer (findings / open questions / next step). Changes
+        no state; usable by dashboards, diagnostics, and future autonomy phases.
+        """
+        from leapflow.world_model.orientation import build_orientation_from_ledger
+
+        return build_orientation_from_ledger(
+            self._research_ledger.to_state(),
+            now=now if now is not None else time.time(),
+        )
+
+    def _persist_research_ledger(self) -> None:
+        """Persist the ledger for the active session (best-effort; S1 durable Orient).
+
+        Fired as the ledger change-listener after each note. No-op when no store
+        is wired or no session is established yet.
+        """
+        store = self._research_ledger_store
+        session_id = self._current_session_id
+        if store is None or not session_id:
+            return
+        store.save(session_id, self._research_ledger.to_state())
+
+    def _schedule_reentry(
+        self,
+        *,
+        kind: str = "time",
+        reason: str = "",
+        delay_seconds: Any = 0.0,
+        event_match: Any = None,
+        max_reentries: Any = 1,
+        deadline_seconds: Any = 0.0,
+    ) -> Dict[str, Any]:
+        """Register a re-entry trigger seeded with the current orientation (S2 N2).
+
+        Gated by ``agent_reentry_enabled`` (default off). Only persists a trigger
+        (Orient snapshot = research-ledger state + task contract + reason); the
+        actual wake-up dispatch is a later phase (N3+).
+        """
+        if not getattr(self._settings, "agent_reentry_enabled", False):
+            return {"ok": False, "error": "re-entry is disabled (set agent.reentry_enabled=true)"}
+        if self._reentry_store is None:
+            return {"ok": False, "error": "re-entry store not configured"}
+        contract = self._current_task_contract
+        task_id = contract.task_id if contract else (self._current_session_id or "task")
+        try:
+            trigger = build_reentry_trigger(
+                task_id=task_id,
+                session_id=self._current_session_id or "",
+                ledger_state=self._research_ledger.to_state(),
+                task_contract=asdict(contract) if contract else {},
+                continuation_summary=reason,
+                kind=kind,
+                delay_seconds=float(delay_seconds or 0.0),
+                event_match=dict(event_match or {}),
+                max_reentries=int(max_reentries or 1),
+                deadline_seconds=float(deadline_seconds or 0.0),
+            )
+            self._reentry_store.save(trigger)
+        except Exception as exc:
+            return {"ok": False, "error": f"failed to schedule re-entry: {exc}"}
+        return {
+            "ok": True,
+            "trigger_id": trigger.trigger_id,
+            "kind": trigger.kind,
+            "due_at": trigger.due_at,
+            "note": "registered; wake-up dispatch activates in a later phase",
+        }
+
+    def _cost_ceiling_notice(self) -> str:
+        """Soft finalize nudge when cumulative effective cost crosses the ceiling.
+
+        Opt-in safety companion to the elastic iteration cap: bounds runaway cost
+        on large-context long tasks. Soft (a nudge, not a hard stop) so no work is
+        lost; the iteration ceiling remains the hard bound. Disabled by default
+        (``agent_cost_ceiling_context_multiple`` = 0).
+        """
+        multiple = float(getattr(self._settings, "agent_cost_ceiling_context_multiple", 0.0) or 0.0)
+        if multiple <= 0:
+            return ""
+        effective = self._usage_tracker.summary().effective_prompt_tokens()
+        if not cost_ceiling_exceeded(
+            effective_prompt_tokens=effective,
+            context_length=self._active_context_length(),
+            context_multiple=multiple,
+        ):
+            return ""
+        return (
+            "SYSTEM: Cumulative cost budget reached. Synthesize and provide the final "
+            "answer now from the evidence already gathered; do not start new exploratory "
+            "tool calls unless strictly required."
+        )
+
+    def _full_tool_schema_tokens(self) -> int:
+        """Cached token estimate of the full tool catalog schema (static per process)."""
+        if self._full_tools_tokens is None:
+            from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS
+            self._full_tools_tokens = self._context_controller.estimator.estimate_tools(TOOL_DEFINITIONS)
+        return self._full_tools_tokens
+
+    def _evaluate_prefix_commitment(self, budget: IterationBudget) -> None:
+        """Evaluate the adaptive prefix-commitment decision (observe-only, W2 slice 2).
+
+        Computes whether the task should commit to a stable, cacheable prefix and
+        records the decision in the context snapshot for observability. Does not
+        yet enforce (freeze disclosure / lock tools / cache-aware compression) --
+        that is W2 slice 3. Reuses the token counts already produced by
+        ``_prepare_llm_messages`` plus the post-retarget budget headroom, so it is
+        cheap (no re-estimation of the message body) and changes no behavior.
+        """
+        snap = self._last_context_snapshot
+        if not snap:
+            return
+        difficulty = float(snap.get("difficulty", 0.0) or 0.0)
+        posture = str(snap.get("context_posture") or "baseline")
+        message_tokens = int(snap.get("message_tokens", 0) or 0)
+        disclosed_tool_tokens = int(snap.get("tool_schema_tokens", 0) or 0)
+        est_full = message_tokens + self._full_tool_schema_tokens()
+        est_pcd = message_tokens + disclosed_tool_tokens
+        state = self._prefix_commitment.evaluate(
+            difficulty=difficulty,
+            posture=posture,
+            round_number=budget.used,
+            remaining_rounds=budget.remaining,
+            est_full_prefix_tokens=est_full,
+            est_pcd_prefix_tokens=est_pcd,
+        )
+        snap["prefix_commitment"] = state.as_dict()
+        snap["prefix_committed"] = state.committed
 
     def _record_provider_usage(self, model: str, usage: Dict[str, Any]) -> None:
         """Prefer provider prompt usage when available and learn observed limits."""
@@ -2223,15 +2522,195 @@ class AgentEngine:
 
     # ── Unified Tool Loop (chat scenarios) ───────────────────────────────
 
+    def _new_compressor(self) -> ContextCompressor:
+        """Fresh context compressor (per engine, or per isolated child frame)."""
+        ctx_len = self._settings.llm_context_length
+        return ContextCompressor(CompressorConfig(
+            token_budget=max(1, int(ctx_len * self._settings.context_hard_limit_ratio)),
+            context_length=ctx_len,
+            threshold=self._settings.compress_threshold,
+            keep_tail=self._settings.compress_keep_tail,
+            max_output_chars=self._settings.max_tool_output_chars,
+        ))
+
+    def _new_governance(self) -> ContextGovernanceController:
+        """Fresh context-governance controller (per engine, or per child frame)."""
+        ctx_len = self._settings.llm_context_length
+        return ContextGovernanceController(
+            evidence_builder=ToolEvidenceBuilder(
+                max_content_chars=self._settings.tool_evidence_max_chars,
+                context_length=ctx_len,
+            ),
+            repeated_read_limit=self._settings.repeated_read_limit,
+            convergence_round=self._settings.long_task_convergence_round,
+            posture_config=ContextPostureConfig(
+                expanded_ratio=self._settings.context_expanded_ratio,
+                finalizing_ratio=(
+                    getattr(self, "_calibrated_finalizing_ratio", None)
+                    or self._settings.context_finalizing_ratio
+                ),
+                expanded_evidence_threshold=self._settings.context_expanded_evidence_threshold,
+                expanded_tool_call_threshold=self._settings.context_expanded_tool_call_threshold,
+                research_source_threshold=self._settings.context_research_source_threshold,
+                research_evidence_threshold=self._settings.context_research_evidence_threshold,
+            ),
+        )
+
+    def _build_child_frame(
+        self,
+        user_text: str,
+        *,
+        depth: int,
+        tool_filter: "frozenset[str] | None" = None,
+        enable_thinking: bool = False,
+        parent_session_id: Optional[str] = None,
+    ) -> AgentLoopFrame:
+        """Build an isolated child frame with fresh per-turn subsystems.
+
+        A recursive subagent runs the same ``_run_agent_loop`` on this frame; the
+        fresh budget/recovery/governance/ledger/commitment/usage/compressor keep
+        its OODA loop from contaminating the parent frame's state.
+        """
+        return AgentLoopFrame(
+            user_text=user_text,
+            depth=depth,
+            budget=IterationBudget.for_react(self._budget_config),
+            recovery=TurnRecoveryState(),
+            governance=self._new_governance(),
+            ledger=ResearchLedger(),
+            commitment=PrefixCommitmentController(),
+            usage_tracker=TurnUsageTracker(),
+            compressor=self._new_compressor(),
+            tool_filter=tool_filter,
+            enable_thinking=enable_thinking,
+            parent_session_id=parent_session_id,
+        )
+
+    def _install_frame(self, frame: AgentLoopFrame) -> Dict[str, Any]:
+        """Install a frame's per-turn subsystems as the engine's active state.
+
+        Returns the previous per-turn state for restoration. This lets a child
+        frame run the full loop on the shared engine while the parent frame's
+        subsystems stay untouched (see ``_run_child_frame``).
+        """
+        saved: Dict[str, Any] = {
+            "governance": self._context_governance_controller,
+            "ledger": self._research_ledger,
+            "commitment": self._prefix_commitment,
+            "usage": self._usage_tracker,
+            "compressor": self._compressor,
+            "coordinator": self._recovery_coordinator,
+            "snapshot": self._last_context_snapshot,
+            "categories": self._last_turn_tool_categories,
+            "frame": self._active_frame,
+        }
+        self._context_governance_controller = frame.governance
+        self._research_ledger = frame.ledger
+        self._prefix_commitment = frame.commitment
+        self._usage_tracker = frame.usage_tracker
+        self._compressor = frame.compressor
+        if frame.recovery_coordinator is not None:
+            self._recovery_coordinator = frame.recovery_coordinator
+        self._last_context_snapshot = frame.last_context_snapshot
+        self._last_turn_tool_categories = frame.last_turn_tool_categories
+        self._active_frame = frame
+        return saved
+
+    def _restore_per_turn_state(self, saved: Dict[str, Any]) -> None:
+        """Restore per-turn state previously saved by ``_install_frame``."""
+        self._context_governance_controller = saved["governance"]
+        self._research_ledger = saved["ledger"]
+        self._prefix_commitment = saved["commitment"]
+        self._usage_tracker = saved["usage"]
+        self._compressor = saved["compressor"]
+        self._recovery_coordinator = saved["coordinator"]
+        self._last_context_snapshot = saved["snapshot"]
+        self._last_turn_tool_categories = saved["categories"]
+        self._active_frame = saved["frame"]
+
+    async def _run_child_frame(self, frame: AgentLoopFrame) -> str:
+        """Run a recursive subagent's isolated frame through the full loop.
+
+        Swaps the engine's per-turn state to the child frame for the duration of
+        the child loop, then restores the parent's state — so recursion is fully
+        state-isolated without duplicating the loop body.
+        """
+        saved = self._install_frame(frame)
+        try:
+            return await self._run_agent_loop(frame)
+        finally:
+            self._restore_per_turn_state(saved)
+
+    async def _run_subagent_goal(
+        self,
+        goal: str,
+        *,
+        depth: int,
+        tool_filter: "frozenset[str] | None" = None,
+        enable_thinking: bool = False,
+    ) -> str:
+        """Run a subagent goal as an isolated child frame through the full loop.
+
+        Bridge for ``EngineFrameSubagentExecutor`` (opt-in full-loop subagents):
+        the child frame's fresh subsystems + per-frame swap keep the subagent
+        from contaminating the parent turn's state.
+        """
+        frame = self._build_child_frame(
+            goal, depth=depth, tool_filter=tool_filter, enable_thinking=enable_thinking,
+        )
+        return await self._run_child_frame(frame)
+
+    def _build_frame(
+        self, user_text: str, enable_thinking: bool, budget: Any, recovery: Any,
+    ) -> AgentLoopFrame:
+        """Bundle per-frame state around the given budget/recovery.
+
+        The root frame wraps the engine's (freshly reset) per-turn subsystems so
+        loop-path reads through ``self._active_frame`` are byte-equivalent to the
+        singletons; recursive subagents (later) build frames with fresh subsystems.
+        """
+        return AgentLoopFrame(
+            user_text=user_text,
+            enable_thinking=enable_thinking,
+            budget=budget,
+            recovery=recovery,
+            governance=self._context_governance_controller,
+            ledger=self._research_ledger,
+            commitment=self._prefix_commitment,
+            usage_tracker=self._usage_tracker,
+            compressor=self._compressor,
+        )
+
+    def _build_root_frame(self, user_text: str, *, enable_thinking: bool = False) -> AgentLoopFrame:
+        """Build the top-level (depth-0) agent-loop frame for a turn."""
+        return self._build_frame(
+            user_text, enable_thinking,
+            IterationBudget.for_react(self._budget_config),
+            TurnRecoveryState(),
+        )
+
     async def _unified_tool_loop(
         self, user_text: str, *, enable_thinking: bool = False
     ) -> str:
-        """Unified chat+tool loop: LLM dynamically decides tools vs direct response.
+        """Entry adapter: build the root frame and run the unified agent loop."""
+        return await self._run_agent_loop(
+            self._build_root_frame(user_text, enable_thinking=enable_thinking)
+        )
 
-        Uses native OpenAI tool_calls when provider supports them, falls back to
-        text-based parsing. Injects working memory for multi-turn coherence.
-        Reuses IterationBudget, ErrorClassifier, ContextCompressor, MessageHealer.
+    async def _run_agent_loop(self, frame: AgentLoopFrame) -> str:
+        """Unified adaptive OODA loop over an isolated per-frame state.
+
+        Per-frame execution state (budget, recovery) lives on ``frame`` so the
+        same loop serves the top-level turn (root frame) and, in a later phase,
+        recursive subagents (deeper frames with their own budget). Capabilities
+        remain engine methods; the LLM dynamically decides tools vs direct reply.
         """
+        user_text = frame.user_text
+        enable_thinking = frame.enable_thinking
+        budget = frame.budget
+        recovery = frame.recovery
+        self._active_frame = frame
+
         # Detect slash command → inject skill context
         if user_text.startswith("/"):
             slash_name = user_text.split()[0][1:]  # Remove leading /
@@ -2243,11 +2722,23 @@ class AgentEngine:
 
         from leapflow.tools.registry_bootstrap import TOOL_DEFINITIONS, TOOL_HANDLERS
 
-        budget = IterationBudget.for_react(self._budget_config)
+        # A restricted frame (e.g. a subagent) is offered only its permitted
+        # tools; the root frame (tool_filter=None) sees the full registry.
+        tool_defs = TOOL_DEFINITIONS
+        tool_handlers = TOOL_HANDLERS
+        if frame.tool_filter is not None:
+            tool_defs = [
+                td for td in TOOL_DEFINITIONS
+                if td.get("function", {}).get("name", "") in frame.tool_filter
+            ]
+            tool_handlers = {
+                name: fn for name, fn in TOOL_HANDLERS.items() if name in frame.tool_filter
+            }
+
         trace = ExecutionTrace()
         assembly = await self._assemble_unified_prompt(
             user_text,
-            tool_definitions=TOOL_DEFINITIONS,
+            tool_definitions=tool_defs,
             enable_thinking=enable_thinking,
             slash_command=user_text.startswith("/"),
         )
@@ -2265,7 +2756,6 @@ class AgentEngine:
 
         content = ""
         fatal_error: Optional[str] = None
-        recovery = TurnRecoveryState()
         # P3: Initialize recovery coordinator for this turn
         recovery_budget = RecoveryBudget()
         recovery_budget.start_deadline()
@@ -2284,7 +2774,7 @@ class AgentEngine:
         self._cancel_requested = False
         _signal_watermark = [time.time()]
 
-        session_id = self._ensure_session(user_text)
+        session_id = self._ensure_session_for_frame(frame, user_text)
 
         while not budget.exhausted:
             if self._cancel_requested:
@@ -2303,6 +2793,8 @@ class AgentEngine:
                 tools=tools_kwarg.get("tools"),
                 round_number=budget.used,
             )
+            self._widen_budget_for_difficulty(budget)
+            self._evaluate_prefix_commitment(budget)
 
             try:
                 resp = await self._llm.achat(
@@ -2435,7 +2927,7 @@ class AgentEngine:
                 self._persist_message(session_id, "assistant", "", tool_calls=assistant_msg.get("tool_calls"))
 
                 results = await self._execute_tools_concurrent(
-                    native_calls, TOOL_HANDLERS, trace=trace, messages=messages,
+                    native_calls, tool_handlers, trace=trace, messages=messages,
                 )
                 self._record_tool_call_categories(native_calls)
                 tools_kwarg = self._merge_expanded_tool_schemas(tools_kwarg, results)
@@ -2459,7 +2951,7 @@ class AgentEngine:
                 )
                 if retryable_unknown and not unknown_tool_retry_used:
                     unknown_tool_retry_used = True
-                    tools_kwarg = self._expand_tools_kwarg_full(tools_kwarg, TOOL_DEFINITIONS)
+                    tools_kwarg = self._expand_tools_kwarg_full(tools_kwarg, tool_defs)
                     use_native_tools = bool(tools_kwarg)
                     messages.append(build_user_message_text(_unknown_tool_retry_prompt(retryable_unknown)))
                     continue
@@ -2512,7 +3004,7 @@ class AgentEngine:
             })
             _show_progress("executing", tool_name)
             result = await self._execute_tool_with_ledger(
-                normalized_tool_call, TOOL_HANDLERS, tool_call_id=f"text-{budget.used}",
+                normalized_tool_call, tool_handlers, tool_call_id=f"text-{budget.used}",
             )
             _clear_indicator()
             self._emit_chat_event("tool_result", {
@@ -2591,10 +3083,13 @@ class AgentEngine:
                     "SYSTEM: Approaching limit. Provide final answer now."
                 ))
 
-        if self._memory_manager and self._settings.memory_integration_enabled:
+        # Turn-end learning/memory-sync are top-level-turn concerns; a recursive
+        # child frame (subagent) must not pollute the parent's evolution/memory
+        # (its result flows back via SubagentResult) nor leak background tasks.
+        if getattr(self._active_frame, "is_root", True) and self._memory_manager and self._settings.memory_integration_enabled:
             asyncio.create_task(self._sync_turn_safe(messages))
 
-        if self._evolution is not None and content:
+        if getattr(self._active_frame, "is_root", True) and self._evolution is not None and content:
             asyncio.create_task(self._post_turn_review(messages, content))
 
         llm = self._llm
@@ -2660,6 +3155,7 @@ class AgentEngine:
             skill_name = tool_actions[0]["tool"] if tool_actions else "unknown"
             episode_context = {"final_content_preview": final_content[:200]}
             episode_context.update(self._usage_tracker.to_learning_signal())
+            episode_context.update(build_adaptive_learning_signal(self._last_context_snapshot or {}))
             episode = self._evolution.record_episode(
                 skill_name=f"turn_{skill_name}",
                 actions=tool_actions[:10],
@@ -2775,6 +3271,7 @@ class AgentEngine:
         content = ""
         fatal_error: Optional[str] = None
         turn_recovery = TurnRecoveryState()
+        self._active_frame = self._build_frame(user_text, enable_thinking, budget, turn_recovery)
         # Initialize recovery coordinator for stream turn
         recovery_budget = RecoveryBudget()
         recovery_budget.start_deadline()
@@ -2812,6 +3309,8 @@ class AgentEngine:
                 tools=tools_kwarg.get("tools") if use_native_tools else None,
                 round_number=budget.used,
             )
+            self._widen_budget_for_difficulty(budget)
+            self._evaluate_prefix_commitment(budget)
 
             content = ""
 
@@ -3247,10 +3746,13 @@ class AgentEngine:
                     "SYSTEM: Approaching limit. Provide final answer now."
                 ))
 
-        if self._memory_manager and self._settings.memory_integration_enabled:
+        # Turn-end learning/memory-sync are top-level-turn concerns; a recursive
+        # child frame (subagent) must not pollute the parent's evolution/memory
+        # (its result flows back via SubagentResult) nor leak background tasks.
+        if getattr(self._active_frame, "is_root", True) and self._memory_manager and self._settings.memory_integration_enabled:
             asyncio.create_task(self._sync_turn_safe(messages))
 
-        if self._evolution is not None and content:
+        if getattr(self._active_frame, "is_root", True) and self._evolution is not None and content:
             asyncio.create_task(self._post_turn_review(messages, content))
 
         llm = self._llm
@@ -3803,11 +4305,39 @@ class AgentEngine:
                     actions=actions,
                     outcome=outcome,
                     reward=reward,
-                    context={"steps": trace.step_count, "tokens": trace.total_tokens},
+                    context={
+                        "steps": trace.step_count,
+                        "tokens": trace.total_tokens,
+                        **build_adaptive_learning_signal(self._last_context_snapshot or {}),
+                    },
                 )
                 logger.debug("evolution.record_episode outcome=%s actions=%d", outcome, len(actions))
         except Exception:
             pass  # never fail the main loop
+
+    def _ensure_session_for_frame(self, frame: AgentLoopFrame, user_text: str) -> Optional[str]:
+        """Resolve the persistence session for a loop frame (S4-E isolation).
+
+        Root frames reuse the turn's conversation session; a recursive child
+        frame (subagent) gets its *own* isolated ``sub_`` session so its
+        transcript is persisted separately and never mixes into the parent
+        turn's conversation.
+        """
+        if frame.is_root:
+            return self._ensure_session(user_text)
+        if not self._conversation_store or not self._settings.session_persistence_enabled:
+            return None
+        try:
+            import uuid as _uuid
+            child_session = f"sub_{_uuid.uuid4().hex[:12]}"
+            title = user_text[:80].replace("\n", " ").strip() or "subagent"
+            self._conversation_store.create_session(
+                child_session, title=title, model=self._settings.llm_model, source="subagent",
+            )
+            return child_session
+        except Exception:
+            logger.debug("child session creation failed; skipping child persistence", exc_info=True)
+            return None
 
     def _ensure_session(self, user_text: str) -> Optional[str]:
         """Create or reuse a conversation session. Returns session_id or None."""

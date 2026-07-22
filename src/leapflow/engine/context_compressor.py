@@ -107,6 +107,7 @@ class CompressorConfig:
     trim_budget_activation_ratio: float = _TRIM_BUDGET_ACTIVATION_RATIO
     summarize_threshold_messages: int = 16
     summarize_keep_recent: int = 6
+    summarize_append_only: bool = True
     archive_threshold_messages: int = 24
     archive_keep_recent: int = 8
     drop_threshold_messages: int = 32
@@ -382,11 +383,13 @@ class SummarizeStage:
         keep_recent: int = 6,
         summarize_fn: Optional[SummarizeFn] = None,
         summary_target_ratio: float = 0.2,
+        append_only: bool = True,
     ) -> None:
         self._threshold = threshold_messages
         self._keep_recent = keep_recent
         self._summarize_fn = summarize_fn
         self._summary_target_ratio = summary_target_ratio
+        self._append_only = append_only
         self._previous_summary: Optional[str] = None
         self._compression_count: int = 0
         self._last_savings_ratio: float = 1.0
@@ -435,23 +438,37 @@ class SummarizeStage:
     def _partition(
         self, messages: List[Dict[str, Any]]
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Split messages into head (system), tail (recent), middle (compressible)."""
+        """Split messages into head (system), tail (recent), middle (compressible).
+
+        Append-only mode freezes already-produced summary segments into the head
+        so each history window is summarized exactly once (no summary-of-summary
+        drift; frozen segments stay byte-stable and cacheable). Only newly
+        accumulated turns become the compressible middle.
+        """
         head = [m for m in messages[:2] if m.get("role") == "system"] or messages[:1]
         head_count = len(head)
 
-        tail_start = max(head_count, len(messages) - self._keep_recent)
+        frozen_count = 0
+        if self._append_only:
+            idx = head_count
+            while idx < len(messages) and messages[idx].get("_compressed_summary"):
+                frozen_count += 1
+                idx += 1
+        stable_count = head_count + frozen_count
+
+        tail_start = max(stable_count, len(messages) - self._keep_recent)
         tail_start = self._align_boundary_backward(messages, tail_start)
 
-        if self._compression_count > 0:
+        if self._append_only or self._compression_count > 0:
             protect_first_n = 0
         else:
             protect_first_n = min(2, len(messages) - head_count)
 
-        middle_start = head_count + protect_first_n
+        middle_start = stable_count + protect_first_n
         middle_start = self._align_boundary_forward(messages, middle_start)
 
         if middle_start >= tail_start:
-            return head, messages[head_count:], []
+            return head + messages[head_count:stable_count], messages[stable_count:], []
 
         middle = messages[middle_start:tail_start]
         tail = messages[tail_start:]
@@ -463,7 +480,7 @@ class SummarizeStage:
         if self._summarize_fn is not None:
             try:
                 turns_text = self._format_turns_for_summary(middle)
-                if self._previous_summary:
+                if self._previous_summary and not self._append_only:
                     prompt = _ITERATIVE_PROMPT.format(
                         previous_summary=self._previous_summary,
                         new_turns=turns_text,
@@ -791,6 +808,7 @@ class ContextCompressor:
                 threshold_messages=config.summarize_threshold_messages,
                 keep_recent=config.summarize_keep_recent,
                 summarize_fn=config.summarize_fn,
+                append_only=config.summarize_append_only,
             ),
             "archive": ArchiveStage(
                 threshold_messages=config.archive_threshold_messages,

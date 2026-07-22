@@ -35,6 +35,9 @@ class RuntimeLeapService:
         self._mock_host = mock_host
         self._ctx: Any | None = None
         self._monitors: Any | None = None
+        self._reentry_task: "asyncio.Task[Any] | None" = None
+        self._reentry_stop: "asyncio.Event | None" = None
+        self._reentry_service: Any | None = None
         self._engine_lock = asyncio.Lock()
         self._started_at = time.time()
         self._client_count: Callable[[], int] = lambda: 0
@@ -69,6 +72,7 @@ class RuntimeLeapService:
         self._install_learn_notifications(ctx)
         self._ctx = ctx
         await self._start_monitors(ctx)
+        await self._start_reentry_driver(ctx)
 
     async def _start_monitors(self, ctx: Any) -> None:
         """Build and start the daemon-hosted monitor runtime (watches)."""
@@ -150,6 +154,85 @@ class RuntimeLeapService:
                 for watch in active[:5]
             ],
         }
+
+    async def _start_reentry_driver(self, ctx: Any) -> None:
+        """Start the background re-entry service (S2 N3b + N4 + N5).
+
+        Dispatches due TIME triggers periodically and matches inbound gateway
+        EVENT triggers, always as *isolated subagents* (fresh context -> no
+        interactive-engine / working-memory / session pollution), serialized via
+        ``_engine_lock``. Gated by ``agent_reentry_enabled`` (default off) plus a
+        global-budget backstop. Best-effort: never blocks startup.
+        """
+        try:
+            store = getattr(ctx, "_reentry_store", None)
+            manager = getattr(ctx, "_subagent_manager", None)
+            if store is None or manager is None:
+                return
+            from leapflow.scheduler.reentry_service import ReentryService
+
+            # SO3: governed proactive delivery (wired only when enabled; default off).
+            send_governor = None
+            send_fn = None
+            request_approval = None
+            if getattr(self._settings, "agent_reentry_send_enabled", False):
+                from leapflow.scheduler.reentry_send import SendGovernor, SendRateLimiter
+                from leapflow.security.send_trust import SendTrustLedger
+                send_governor = SendGovernor(
+                    trust=SendTrustLedger(
+                        verified_at=int(getattr(self._settings, "agent_reentry_send_verified_at", 3)),
+                    ),
+                    rate=SendRateLimiter(
+                        per_hour=int(getattr(self._settings, "agent_reentry_send_rate_per_hour", 4)),
+                    ),
+                    enabled=True,
+                    global_budget=int(getattr(self._settings, "agent_reentry_send_global_budget", 50)),
+                )
+                gw = getattr(ctx, "gateway_server", None)
+                send_fn = getattr(gw, "send_message", None) if gw is not None else None
+                request_approval = self._request_approval
+
+            service = ReentryService(
+                store=store,
+                manager=manager,
+                settings=self._settings,
+                engine_lock=self._engine_lock,
+                notify=lambda event_type, **kw: self.notification_bus.emit_event(event_type, **kw),
+                global_budget=int(getattr(self._settings, "agent_reentry_global_budget", 100) or 0),
+                send_governor=send_governor,
+                send_fn=send_fn,
+                request_approval=request_approval,
+            )
+            self._reentry_service = service
+            # N4: observe inbound gateway messages for EVENT-trigger matches.
+            try:
+                setattr(ctx, "_reentry_event_observer", service.on_gateway_message)
+            except Exception:
+                logger.debug("daemon: reentry event observer wiring failed", exc_info=True)
+
+            interval = max(5.0, float(getattr(self._settings, "agent_reentry_tick_seconds", 30.0) or 30.0))
+            self._reentry_stop = asyncio.Event()
+
+            async def _loop() -> None:
+                stop = self._reentry_stop
+                assert stop is not None
+                while not stop.is_set():
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=interval)
+                        break  # stop signalled
+                    except (asyncio.TimeoutError, TimeoutError):
+                        pass
+                    if stop.is_set():
+                        break
+                    try:
+                        await service.tick()
+                    except Exception:
+                        logger.debug("reentry service tick failed", exc_info=True)
+
+            self._reentry_task = asyncio.create_task(_loop(), name="leapd-reentry-driver")
+            logger.debug("daemon: re-entry service started (interval=%.0fs)", interval)
+        except Exception:
+            logger.debug("daemon: re-entry service start skipped", exc_info=True)
 
     @property
     def context(self) -> Any:
@@ -822,6 +905,17 @@ class RuntimeLeapService:
             return
         ctx = self._ctx
         self._ctx = None
+        if self._reentry_stop is not None:
+            self._reentry_stop.set()
+        if self._reentry_task is not None:
+            try:
+                await asyncio.wait_for(self._reentry_task, timeout=5.0)
+            except (asyncio.TimeoutError, TimeoutError):
+                self._reentry_task.cancel()
+            except Exception:
+                logger.debug("daemon: reentry task stop failed", exc_info=True)
+            self._reentry_task = None
+        self._reentry_stop = None
         if self._monitors is not None:
             try:
                 await self._monitors.stop()

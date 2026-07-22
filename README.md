@@ -76,6 +76,24 @@ The **Execution Layer** provides native OS interactions — screen capture, acce
 
 ---
 
+## Adaptive-Depth Execution (Toward Infinite OODA)
+
+LeapFlow's agent loop adapts its **depth** to each task's difficulty and can — under strict governance — extend beyond a single turn. Rather than a fixed iteration cap, the loop treats depth and autonomy as *signal-driven, bounded gradients*: a hard task earns a wider budget and a research posture while a simple one stays short; long tasks keep a persistent research ledger; recursive subagents run the *same* adaptive loop on isolated frames; and outcome data can self-calibrate the difficulty thresholds. "Infinite" capability comes from **composing bounded OODA frames**, never from removing a frame's bounds — so every step stays accountable, inspectable, and safe.
+
+Defaults benefit every session automatically (adaptive depth); the rest is **opt-in and off by default**:
+
+| Capability | Config key (`leap config set …`) |
+|---|---|
+| Full adaptive loop for delegated subagents | `agent.subagent_full_loop` |
+| Event-driven re-entry (resume on time/event) | `agent.reentry_enabled` |
+| Online difficulty/threshold self-calibration | `agent.calibration_enabled` (+ `agent.calibration_interval_turns`) |
+| Governed proactive outbound (trust + approval) | `agent.reentry_send_enabled` |
+| Cache-stable compression write-back | `agent.compression_writeback` |
+
+Inspect the agent's layered orientation and pending re-entries anytime with the read-only **`/orient`** command. Design methodology: [`docs/design/adaptive_depth_ooda.md`](docs/design/adaptive_depth_ooda.md).
+
+---
+
 ## Prerequisites
 
 | Component | Version | Purpose |

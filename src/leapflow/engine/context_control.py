@@ -29,6 +29,7 @@ _EVIDENCE_TOOLS = frozenset({
 _POSTURE_BASELINE = "baseline"
 _POSTURE_EXPANDED = "expanded"
 _POSTURE_RESEARCH = "research"
+_POSTURE_EXPANDING = "expanding"
 _POSTURE_CONVERGING = "converging"
 _POSTURE_FINALIZING = "finalizing"
 
@@ -471,6 +472,37 @@ class ContextPostureConfig:
     expanded_tool_call_threshold: int = 3
     research_source_threshold: int = 3
     research_evidence_threshold: int = 5
+    # Bidirectional posture: high-end expansion arm + low-end answer-ready arm.
+    expand_difficulty_threshold: float = 0.55
+    expand_context_ceiling: float = 0.70
+    answer_ready_min_round: int = 2
+
+
+@dataclass(frozen=True)
+class DifficultyConfig:
+    """Weights and saturation denominators for the continuous difficulty signal.
+
+    Difficulty is a bounded [0, 1] estimate of how hard / long-horizon the active
+    task is, derived only from structural exploration-ledger signals (breadth,
+    evidence volume, friction, persistence, marginal growth, tool activity). It
+    drives the elastic iteration budget and the expansion arm of the posture
+    ladder. All denominators and weights are configurable; nothing here reads the
+    user's free-form text.
+    """
+
+    d_sources: int = 6
+    d_evidence: int = 10
+    d_rounds: int = 12
+    d_marginal: float = 1.0
+    d_tool_calls: int = 8
+    marginal_window: int = 3
+    ema_alpha: float = 0.4
+    w_breadth: float = 0.15
+    w_volume: float = 0.15
+    w_friction: float = 0.15
+    w_persistence: float = 0.15
+    w_marginal: float = 0.20
+    w_activity: float = 0.20
 
 
 @dataclass(frozen=True)
@@ -486,6 +518,7 @@ class ExplorationSnapshot:
     should_converge: bool = False
     convergence_reason: str = ""
     guidance: str = ""
+    difficulty: float = 0.0
 
     def as_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable snapshot for daemon/TUI metadata."""
@@ -499,6 +532,7 @@ class ExplorationSnapshot:
             "should_converge": self.should_converge,
             "convergence_reason": self.convergence_reason,
             "guidance": self.guidance,
+            "difficulty": self.difficulty,
         }
 
 
@@ -510,6 +544,7 @@ class ContextGovernanceController:
     repeated_read_limit: int = 2
     convergence_round: int = 12
     posture_config: ContextPostureConfig = field(default_factory=ContextPostureConfig)
+    difficulty_config: DifficultyConfig = field(default_factory=DifficultyConfig)
     evidence_tools: frozenset[str] = _EVIDENCE_TOOLS
     research_source_threshold: int | None = None
     research_evidence_threshold: int | None = None
@@ -523,11 +558,19 @@ class ContextGovernanceController:
                 expanded_tool_call_threshold=self.posture_config.expanded_tool_call_threshold,
                 research_source_threshold=self.research_source_threshold or self.posture_config.research_source_threshold,
                 research_evidence_threshold=self.research_evidence_threshold or self.posture_config.research_evidence_threshold,
+                expand_difficulty_threshold=self.posture_config.expand_difficulty_threshold,
+                expand_context_ceiling=self.posture_config.expand_context_ceiling,
+                answer_ready_min_round=self.posture_config.answer_ready_min_round,
             )
         self._reads: dict[str, int] = {}
         self._sources_seen: set[str] = set()
         self._tool_counts: dict[str, int] = {}
         self._evidence_count = 0
+        self._tool_failures = 0
+        self._difficulty_prev = 0.0
+        self._difficulty_ema_round = -1
+        self._evidence_by_round: dict[int, int] = {}
+        self._evidence_round_hwm = -1
 
     def reset_turn_scope(self) -> None:
         """Clear per-turn exploration state so posture never leaks across tasks."""
@@ -535,12 +578,19 @@ class ContextGovernanceController:
         self._sources_seen.clear()
         self._tool_counts.clear()
         self._evidence_count = 0
+        self._tool_failures = 0
+        self._difficulty_prev = 0.0
+        self._difficulty_ema_round = -1
+        self._evidence_by_round.clear()
+        self._evidence_round_hwm = -1
 
     reset_task_scope = reset_turn_scope
 
     def compact_tool_result(self, tool_name: str, arguments: Dict[str, Any] | None, result: Any) -> Any:
         """Return evidence and update the session exploration ledger."""
         self._tool_counts[tool_name] = self._tool_counts.get(tool_name, 0) + 1
+        if isinstance(result, dict) and result.get("ok") is False:
+            self._tool_failures += 1
         if tool_name in self.evidence_tools:
             self._evidence_count += 1
         if tool_name in {"file_read", "gp_file_read"}:
@@ -579,31 +629,119 @@ class ContextGovernanceController:
                 metadata["context_guidance"] = ledger.guidance
         return metadata
 
-    def snapshot(self, *, context_ratio: float = 0.0, round_number: int = 0) -> ExplorationSnapshot:
-        """Return the current adaptive-governance posture without exposing a mode."""
+    def _marginal_evidence(self, round_number: int) -> float:
+        """Recent per-round growth in evidence volume (idempotent within a round).
+
+        Records the current evidence count for ``round_number`` (only when the
+        round advances, so out-of-order / stale peeks -- e.g. a round-0
+        ``tool_metadata`` snapshot interleaved with authoritative round-N calls
+        -- never overwrite an earlier round's baseline), then measures growth
+        against the level ~one window of rounds earlier. A positive value means
+        the task is still surfacing new evidence ("there is more to dig").
+        """
+        if round_number > self._evidence_round_hwm:
+            self._evidence_by_round[round_number] = self._evidence_count
+            self._evidence_round_hwm = round_number
+        if not self._evidence_by_round:
+            return 0.0
+        window = max(1, self.difficulty_config.marginal_window)
+        past_round = round_number - window
+        earlier = [r for r in self._evidence_by_round if r <= past_round]
+        baseline_round = max(earlier) if earlier else min(self._evidence_by_round)
+        delta = self._evidence_count - self._evidence_by_round[baseline_round]
+        return max(0.0, delta / window)
+
+    def _compute_difficulty(
+        self,
+        *,
+        round_number: int,
+        sources_seen: int,
+        tool_calls: int,
+        repeated_reads: int,
+        marginal: float,
+    ) -> float:
+        """Continuous [0, 1] task-difficulty estimate from structural signals only.
+
+        EMA smoothing is applied at most once per round (idempotent to repeated
+        snapshot() calls in the same round) so difficulty rises/falls smoothly.
+        """
+        cfg = self.difficulty_config
+        breadth_n = min(sources_seen / cfg.d_sources, 1.0) if cfg.d_sources > 0 else 0.0
+        volume_n = min(self._evidence_count / cfg.d_evidence, 1.0) if cfg.d_evidence > 0 else 0.0
+        repeat_ratio = min(repeated_reads / max(1, self.repeated_read_limit), 1.0)
+        fail_rate = self._tool_failures / max(1, tool_calls)
+        friction_n = min(0.5 * repeat_ratio + 0.5 * fail_rate, 1.0)
+        persistence_n = min(round_number / cfg.d_rounds, 1.0) if cfg.d_rounds > 0 else 0.0
+        marginal_n = min(marginal / cfg.d_marginal, 1.0) if cfg.d_marginal > 0 else 0.0
+        activity_n = min(tool_calls / cfg.d_tool_calls, 1.0) if cfg.d_tool_calls > 0 else 0.0
+        raw = (
+            cfg.w_breadth * breadth_n
+            + cfg.w_volume * volume_n
+            + cfg.w_friction * friction_n
+            + cfg.w_persistence * persistence_n
+            + cfg.w_marginal * marginal_n
+            + cfg.w_activity * activity_n
+        )
+        raw = max(0.0, min(1.0, raw))
+        if round_number > self._difficulty_ema_round:
+            alpha = cfg.ema_alpha
+            self._difficulty_prev = alpha * raw + (1.0 - alpha) * self._difficulty_prev
+            self._difficulty_ema_round = round_number
+        return self._difficulty_prev
+
+    def snapshot(self, *, context_ratio: float = 0.0, round_number: int = 0, open_questions: int | None = None) -> ExplorationSnapshot:
+        """Return the current adaptive-governance posture without exposing a mode.
+
+        The posture ladder is bidirectional and difficulty-aware. Priority order,
+        safety-first: (1) finalizing on context pressure, (2) converging on
+        repeat-read loops, (3) EXPANDING when difficulty is high and context is
+        healthy (a hard task earns a wider horizon), (4) converging on long
+        low-difficulty exploration, then (5) research / expanded / baseline. A
+        low-end "answer-ready" arm nudges early finalization for simple tasks
+        without inflating disclosure.
+        """
         cfg = self.posture_config
         repeated_reads = sum(1 for count in self._reads.values() if count > self.repeated_read_limit)
         tool_calls = sum(self._tool_counts.values())
         sources_seen = len(self._sources_seen)
+        marginal = self._marginal_evidence(round_number)
+        difficulty = self._compute_difficulty(
+            round_number=round_number,
+            sources_seen=sources_seen,
+            tool_calls=tool_calls,
+            repeated_reads=repeated_reads,
+            marginal=marginal,
+        )
         dominant_signal = ""
         posture = _POSTURE_BASELINE
         guidance = ""
         convergence_reason = ""
+
+        expand_ok = (
+            difficulty >= cfg.expand_difficulty_threshold
+            and context_ratio < cfg.expand_context_ceiling
+            and marginal > 0.0
+        )
 
         if context_ratio >= cfg.finalizing_ratio:
             posture = _POSTURE_FINALIZING
             dominant_signal = "context-critical"
             convergence_reason = "context budget is critical"
             guidance = "finalize with existing evidence"
-        elif repeated_reads > 0 or round_number >= self.convergence_round:
+        elif repeated_reads > 0:
             posture = _POSTURE_CONVERGING
-            dominant_signal = "repeat-read" if repeated_reads > 0 else "long-exploration"
-            convergence_reason = "repeat reads detected" if repeated_reads > 0 else "exploration round limit reached"
-            guidance = (
-                "switch to complementary sources, outlines, symbols, or bounded ranges"
-                if repeated_reads > 0 else
-                "deduplicate evidence and prefer targeted reads"
-            )
+            dominant_signal = "repeat-read"
+            convergence_reason = "repeat reads detected"
+            guidance = "switch to complementary sources, outlines, symbols, or bounded ranges"
+        elif expand_ok:
+            posture = _POSTURE_EXPANDING
+            dominant_signal = "high-difficulty"
+            guidance = "broaden investigation, decompose, or delegate; iteration budget widened"
+        elif round_number >= self.convergence_round:
+            posture = _POSTURE_CONVERGING
+            dominant_signal = "long-exploration"
+            convergence_reason = "exploration round limit reached"
+            guidance = "deduplicate evidence and prefer targeted reads"
         elif sources_seen >= cfg.research_source_threshold or self._evidence_count >= cfg.research_evidence_threshold:
             posture = _POSTURE_RESEARCH
             dominant_signal = "multi-source" if sources_seen >= cfg.research_source_threshold else "evidence-volume"
@@ -614,6 +752,26 @@ class ContextGovernanceController:
             guidance = "prefer outline, symbols, or range reads before raw content"
 
         should_converge = posture in {_POSTURE_CONVERGING, _POSTURE_FINALIZING}
+        # Low-end symmetric arm: a low-difficulty turn that already gathered
+        # evidence and is no longer surfacing new evidence should finalize early.
+        # It keeps posture at baseline/expanded so disclosure stays minimal (a
+        # simple task must never be pushed into full disclosure). When a research
+        # ledger is active with unresolved open questions, this early convergence
+        # is suppressed -- tracked open work means the task is not done, so a long
+        # task is never cut short (open_questions: None = no ledger signal).
+        if (
+            not should_converge
+            and posture in {_POSTURE_BASELINE, _POSTURE_EXPANDED}
+            and self._evidence_count >= 1
+            and marginal <= 0.0
+            and difficulty < cfg.expand_difficulty_threshold
+            and round_number >= cfg.answer_ready_min_round
+            and (open_questions is None or open_questions == 0)
+        ):
+            should_converge = True
+            convergence_reason = "answer-ready"
+            guidance = "you likely have enough evidence; if the question is answered, provide the final answer now"
+
         return ExplorationSnapshot(
             posture=posture,
             sources_seen=sources_seen,
@@ -624,11 +782,12 @@ class ContextGovernanceController:
             should_converge=should_converge,
             convergence_reason=convergence_reason,
             guidance=guidance,
+            difficulty=round(difficulty, 4),
         )
 
-    def convergence_notice(self, round_number: int) -> str:
+    def convergence_notice(self, round_number: int, *, open_questions: int | None = None) -> str:
         """Return a notice that nudges synthesis after excessive exploration."""
-        snapshot = self.snapshot(round_number=round_number)
+        snapshot = self.snapshot(round_number=round_number, open_questions=open_questions)
         if not snapshot.should_converge:
             return ""
         if snapshot.dominant_signal == "repeat-read":
@@ -637,6 +796,11 @@ class ContextGovernanceController:
                 "Do not reread the same raw source again. Pivot to complementary project evidence: "
                 "directory outline, symbols, bounded line ranges, adjacent modules, tests, docs, or synthesize "
                 "from the evidence already gathered if enough context exists."
+            )
+        if snapshot.convergence_reason == "answer-ready":
+            return (
+                "SYSTEM: You likely have enough evidence to answer. If the user's request is "
+                "already addressed, provide the final answer now instead of gathering more."
             )
         reason = snapshot.convergence_reason or snapshot.dominant_signal or "context pressure"
         return (

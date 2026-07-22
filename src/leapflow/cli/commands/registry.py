@@ -92,6 +92,7 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("model", "Show or switch active model", "Chat", args_hint="[model_name]", requires_llm=True),
     CommandDef("config", "View or update runtime configuration", "Chat", args_hint="[show|list|keys|sources|get|set|unset|llm|secret] ...", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
     CommandDef("usage", "Show token usage for current session", "Chat", requires_llm=True),
+    CommandDef("orient", "Show the agent's unified orientation (layered) and pending re-entries", "Chat", effect=CommandEffect.READ_ONLY),
 
     # Teaching
     CommandDef("teach start", "Start teaching mode", "Teaching", aliases=("teach",), args_hint="[goal]"),

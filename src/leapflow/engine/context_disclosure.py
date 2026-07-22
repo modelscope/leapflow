@@ -196,7 +196,7 @@ class DisclosurePlanner:
         manifests = self.manifests or build_capability_manifests(tool_definitions)
         manifest_by_name = {m.name: m for m in manifests if m.name}
 
-        if runtime.slash_command or runtime.context_posture in {"research", "converging", "finalizing"} or runtime.recent_failure:
+        if runtime.slash_command or runtime.context_posture in {"research", "expanding", "converging", "finalizing"} or runtime.recent_failure:
             return self.full_plan(tool_definitions, runtime, _full_reason(runtime))
 
         core_defs, core_names = _core_whitelist(tool_definitions, manifest_by_name)

@@ -106,3 +106,35 @@ def test_command_router_unsupported_always_returns_none() -> None:
     assert invocation is not None
     assert invocation.command.name == "skill show"
     assert router.unsupported_result(invocation) is None
+
+
+def test_orient_command_is_registered_and_read_only() -> None:
+    """E-1: /orient is a registered, read-only, engine-routed observability command."""
+    from leapflow.cli.commands.registry import CommandEffect
+
+    router = CommandRouter("daemon")
+    invocation = router.parse("/orient")
+    assert invocation is not None
+    assert invocation.command.name == "orient"
+    assert invocation.command.effect == CommandEffect.READ_ONLY
+    assert invocation.command.client_local is False   # routed through command_execute in both modes
+
+
+def test_build_orient_payload_renders_layers_and_guards_missing_engine() -> None:
+    from types import SimpleNamespace
+
+    from leapflow.cli.commands.slash_handlers import build_orient_payload
+    from leapflow.world_model.orientation import aggregate_orientation
+
+    # Graceful when no engine yet.
+    assert build_orient_payload(SimpleNamespace(engine=None))["ok"] is False
+
+    fake_engine = SimpleNamespace(
+        orientation_view=lambda: aggregate_orientation(
+            working=["finding A", "[open] does B cache?"], now=0.0,
+        ),
+    )
+    payload = build_orient_payload(SimpleNamespace(engine=fake_engine, _reentry_store=None))
+    assert payload["ok"] is True
+    assert "finding A" in payload["message"]
+    assert payload["orientation"]["total"] == 2

@@ -28,6 +28,26 @@ _RETRYABLE_ERRORS = (
 )
 
 
+def _extract_cached_tokens(usage: Any) -> int:
+    """Best-effort cached-prompt-token count across OpenAI-compatible providers.
+
+    Recognizes OpenAI (``usage.prompt_tokens_details.cached_tokens``) and
+    DeepSeek (``usage.prompt_cache_hit_tokens``) prefix-cache reporting. Returns
+    0 when the provider reports no prefix-cache hit, so effective-cost accounting
+    degrades gracefully on providers without cache telemetry.
+    """
+    cached = 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is not None:
+        value = getattr(details, "cached_tokens", None)
+        if isinstance(value, int) and value > 0:
+            cached = value
+    hit = getattr(usage, "prompt_cache_hit_tokens", None)
+    if isinstance(hit, int) and hit > cached:
+        cached = hit
+    return cached
+
+
 @dataclass(frozen=True)
 class _ProviderProfile:
     """Provider-specific behavior flags."""
@@ -213,6 +233,9 @@ class OpenAIChat(LLMProvider):
                 v = getattr(u, k, None)
                 if isinstance(v, int):
                     usage_map[k] = v
+            cached = _extract_cached_tokens(u)
+            if cached:
+                usage_map["cached_tokens"] = cached
         usage_map["latency_ms"] = dt_ms
 
         # Extract native tool_calls from the response message
@@ -290,6 +313,9 @@ class OpenAIChat(LLMProvider):
                     v = getattr(u, k, None)
                     if isinstance(v, int):
                         usage_map[k] = v
+                cached = _extract_cached_tokens(u)
+                if cached:
+                    usage_map["cached_tokens"] = cached
 
         dt_ms = int((time.monotonic() - t0) * 1000)
         usage_map.setdefault("latency_ms", dt_ms)
@@ -410,6 +436,9 @@ class OpenAIChat(LLMProvider):
                 v = getattr(u, k, None)
                 if isinstance(v, int):
                     usage_map[k] = v
+            cached = _extract_cached_tokens(u)
+            if cached:
+                usage_map["cached_tokens"] = cached
         usage_map["latency_ms"] = dt_ms
 
         # Extract native tool_calls from the response message (sync path)
@@ -484,6 +513,9 @@ class OpenAIChat(LLMProvider):
                     v = getattr(u, k, None)
                     if isinstance(v, int):
                         usage_map[k] = v
+                cached = _extract_cached_tokens(u)
+                if cached:
+                    usage_map["cached_tokens"] = cached
 
         dt_ms = int((time.monotonic() - t0) * 1000)
         usage_map.setdefault("latency_ms", dt_ms)

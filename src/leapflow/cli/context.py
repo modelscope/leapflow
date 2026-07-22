@@ -7,7 +7,6 @@ import os
 import re
 import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -1650,6 +1649,18 @@ class Context:
         async def _on_gateway_event_with_bridge(event: object) -> None:
             await _on_gateway_event(event)
             await self._gateway_event_bridge.on_gateway_event(event)
+            # N4: observe inbound messages for re-entry EVENT-trigger matches
+            # (independent of agent activation; matcher is set by the daemon).
+            observer = getattr(self, "_reentry_event_observer", None)
+            if observer is not None and isinstance(event, GatewayMessageReceived):
+                try:
+                    await observer(
+                        platform=event.source.platform,
+                        chat=event.source.chat_id,
+                        text=event.text,
+                    )
+                except Exception:
+                    logger.debug("reentry event observer failed", exc_info=True)
 
         self.gateway_server = GatewayServer(
             settings.profile_layout,
@@ -1782,6 +1793,24 @@ class Context:
         except Exception:
             logger.warning("ConversationStore initialization failed", exc_info=True)
 
+        # ── Initialize ResearchLedgerStore (S1 durable Orient) ──
+        self._research_ledger_store = None
+        try:
+            from leapflow.storage.research_ledger_store import ResearchLedgerStore
+            self._research_ledger_store = ResearchLedgerStore(self._db_holder)
+            logger.info("ResearchLedgerStore initialized")
+        except Exception:
+            logger.warning("ResearchLedgerStore initialization failed", exc_info=True)
+
+        # ── Initialize ReentryStore (S2 event-driven re-entry) ──
+        self._reentry_store = None
+        try:
+            from leapflow.storage.reentry_store import ReentryStore
+            self._reentry_store = ReentryStore(self._db_holder)
+            logger.info("ReentryStore initialized")
+        except Exception:
+            logger.warning("ReentryStore initialization failed", exc_info=True)
+
         if self._conversation_store and hasattr(self, "_gateway_router"):
             self._gateway_router._persistence = self._conversation_store
 
@@ -1841,6 +1870,14 @@ class Context:
         if self._conversation_store:
             self.engine.set_conversation_store(self._conversation_store)
 
+        # ── Wire ResearchLedgerStore into engine (S1 durable Orient) ──
+        if self._research_ledger_store:
+            self.engine.set_research_ledger_store(self._research_ledger_store)
+
+        # ── Wire ReentryStore into engine (S2 event-driven re-entry) ──
+        if self._reentry_store:
+            self.engine.set_reentry_store(self._reentry_store)
+
         # ── Wire SubagentManager + delegate_task tool ──
         try:
             from leapflow.engine.subagent import DefaultSubagentExecutor, SubagentManager
@@ -1848,13 +1885,27 @@ class Context:
                 TOOL_DEFINITIONS as _TD, TOOL_HANDLERS as _TH,
                 set_subagent_manager,
             )
-            sub_executor = DefaultSubagentExecutor(
-                llm=self.llm,
-                tool_handlers=_TH,
-                tool_definitions=_TD,
-                settings=settings,
+            if getattr(settings, "agent_subagent_full_loop", False):
+                # Opt-in: subagents run the engine's full adaptive loop on an
+                # isolated child frame (state-isolated via per-frame swap).
+                from leapflow.engine.subagent import EngineFrameSubagentExecutor
+                sub_executor = EngineFrameSubagentExecutor(
+                    run_child=self.engine._run_subagent_goal,
+                    tool_names=list(_TH.keys()),
+                    settings=settings,
+                )
+            else:
+                sub_executor = DefaultSubagentExecutor(
+                    llm=self.llm,
+                    tool_handlers=_TH,
+                    tool_definitions=_TD,
+                    settings=settings,
+                )
+            self._subagent_manager = SubagentManager(
+                executor=sub_executor,
+                max_depth=settings.agent_subagent_max_depth,
+                max_concurrent=settings.agent_subagent_max_concurrent,
             )
-            self._subagent_manager = SubagentManager(executor=sub_executor)
             set_subagent_manager(self._subagent_manager)
             logger.info("SubagentManager wired with delegate_task tool")
         except Exception:
@@ -1885,6 +1936,19 @@ class Context:
             self._evolution._persistent_store = self._evolution_store
         except Exception:
             logger.debug("EvolutionStore initialization skipped", exc_info=True)
+
+        # ── S3-L3/L4: one-shot difficulty + threshold calibration at startup (default off) ──
+        try:
+            if getattr(settings, "agent_calibration_enabled", False) and self._evolution_store is not None:
+                self.engine.set_calibration_store(self._evolution_store)   # enable periodic re-calibration
+                diff_result = self.engine.recalibrate_difficulty(self._evolution_store)
+                if getattr(diff_result, "applied", False):
+                    logger.info("Difficulty calibration applied at startup: %s", getattr(diff_result, "reason", ""))
+                thr_result = self.engine.recalibrate_thresholds(self._evolution_store)
+                if getattr(thr_result, "applied", False):
+                    logger.info("Threshold calibration applied at startup: %s", getattr(thr_result, "reason", ""))
+        except Exception:
+            logger.debug("Difficulty/threshold calibration skipped", exc_info=True)
 
         # ── Wire tool loop guardrails ──
         try:

@@ -16,6 +16,7 @@ Fits leapflow's architecture:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import time
 import uuid
@@ -28,11 +29,27 @@ _MAX_SPAWN_DEPTH = 2
 _MAX_CONCURRENT_CHILDREN = 3
 _SUMMARY_MAX_CHARS = 4000
 
+# Depth of the subagent frame currently executing, propagated across the await
+# chain so a nested delegate_task can compute its child's depth. 0 = top level.
+_current_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "leapflow_subagent_depth", default=0
+)
+
+
+def current_subagent_depth() -> int:
+    """Depth of the subagent frame currently executing (0 = top-level turn)."""
+    return _current_depth.get()
+
+
+# delegate_task is intentionally NOT blocked here: recursion is gated by depth in
+# build_subagent_tool_filter + SubagentManager (a child is only offered/allowed
+# while it stays within max_depth). Blocking it outright would disable recursion.
 DELEGATE_BLOCKED_TOOLS: FrozenSet[str] = frozenset({
-    "delegate_task", "gp_delegate_task",
     "memory_write", "gp_memory_write",
     "send_message", "gp_send_message",
     "clarify", "gp_clarify",
+    "research_note", "gp_research_note",
+    "schedule_reentry", "gp_schedule_reentry",
 })
 
 
@@ -128,6 +145,7 @@ class SubagentManager:
 
         async with self._semaphore:
             t0 = time.monotonic()
+            depth_token = _current_depth.set(config.depth)
             try:
                 result = await self._executor.execute_subagent(config)
                 result = self._trim_summary(result, config.summary_max_chars)
@@ -148,6 +166,8 @@ class SubagentManager:
                     elapsed_s=time.monotonic() - t0,
                     error=str(e),
                 )
+            finally:
+                _current_depth.reset(depth_token)
 
             if self._on_complete:
                 try:
@@ -218,6 +238,10 @@ class DefaultSubagentExecutor:
 
         available_tools = build_subagent_tool_filter(
             list(self._tool_handlers.keys()), config,
+            max_depth=(
+                getattr(self._settings, "agent_subagent_max_depth", _MAX_SPAWN_DEPTH)
+                if self._settings is not None else _MAX_SPAWN_DEPTH
+            ),
         )
         filtered_handlers = {
             name: self._tool_handlers[name]
@@ -253,7 +277,33 @@ class DefaultSubagentExecutor:
             else _SUMMARY_MAX_CHARS
         )
 
-        for _ in range(config.max_iterations):
+        # Adaptive depth: a fresh elastic budget widened by an independent
+        # difficulty signal, so a hard sub-task earns more iterations while a
+        # simple one stays short (reuses the W1 budget + governance components).
+        from leapflow.engine.budget import BudgetConfig, BudgetStatus, IterationBudget
+        from leapflow.engine.context_control import (
+            ContextGovernanceController,
+            ToolEvidenceBuilder,
+        )
+
+        floor = config.max_iterations
+        if self._settings is not None:
+            cfg_iters = getattr(self._settings, "agent_subagent_max_iterations", 0)
+            if cfg_iters > 0:
+                floor = cfg_iters
+        budget = IterationBudget.for_react(
+            BudgetConfig(max_iterations=floor, iter_ceiling=floor * 2)
+        )
+        governance = ContextGovernanceController(
+            evidence_builder=ToolEvidenceBuilder(max_content_chars=result_budget),
+        )
+        round_no = 0
+
+        import json as _json_sub
+        while True:
+            if budget.consume() == BudgetStatus.EXHAUSTED:
+                break
+            round_no += 1
             try:
                 resp = await self._llm.achat(
                     messages, stream=False, enable_thinking=False,
@@ -273,7 +323,6 @@ class DefaultSubagentExecutor:
             if not native_calls:
                 break
 
-            import json as _json_sub
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": content}
             assistant_msg["tool_calls"] = [
                 {
@@ -291,12 +340,17 @@ class DefaultSubagentExecutor:
                 else:
                     try:
                         result = await handler(tc.arguments)
+                        governance.compact_tool_result(tc.name, tc.arguments, result)
                         result_text = _json_sub.dumps(result, default=str, ensure_ascii=False)
                     except Exception as e:
                         result_text = _json_sub.dumps({"ok": False, "error": str(e)})
                 result_text = result_text[:result_budget]
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
                 tool_call_count += 1
+
+            # widen the frame's budget toward its difficulty (bounded by ceiling)
+            difficulty = governance.snapshot(round_number=round_no).difficulty
+            budget.retarget(budget.elastic_max(difficulty))
 
         return SubagentResult(
             session_id=session_id,
@@ -311,17 +365,76 @@ class DefaultSubagentExecutor:
 def build_subagent_tool_filter(
     parent_tools: List[str],
     config: SubagentConfig,
+    *,
+    max_depth: int = _MAX_SPAWN_DEPTH,
 ) -> List[str]:
     """Compute the effective tool list for a subagent.
 
-    Intersection of parent tools minus blocked tools, optionally filtered by allowed_tools.
+    Intersection of parent tools minus blocked tools, optionally filtered by
+    allowed_tools. delegate_task is offered only while a child would stay within
+    the depth budget (child_depth = config.depth + 1 < max_depth).
     """
     available = set(parent_tools) - config.blocked_tools
 
     if config.allowed_tools is not None:
         available = available & config.allowed_tools
 
-    if config.depth >= _MAX_SPAWN_DEPTH - 1:
+    if config.depth + 1 >= max_depth:
         available -= {"delegate_task", "gp_delegate_task"}
 
     return sorted(available)
+
+
+class EngineFrameSubagentExecutor:
+    """SubagentExecutor that runs the engine's full adaptive OODA loop on an
+    isolated child frame (opt-in via ``agent.subagent_full_loop``).
+
+    Where :class:`DefaultSubagentExecutor` runs a deliberately lightweight loop,
+    this delegates to the engine's own ``_run_child_frame`` so the subagent gains
+    the full loop (progressive disclosure, compression, recovery, research
+    ledger) while staying state-isolated via the engine's per-frame state swap.
+    Tool access is still restricted by :func:`build_subagent_tool_filter`, and
+    recursion depth stays gated by the shared ``_current_depth`` contract.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_child: Callable[..., Any],
+        tool_names: List[str],
+        settings: Any = None,
+    ) -> None:
+        self._run_child = run_child
+        self._tool_names = list(tool_names)
+        self._settings = settings
+
+    async def execute_subagent(self, config: SubagentConfig) -> SubagentResult:
+        """Run an isolated subagent via the engine's full loop."""
+        session_id = f"sub_{uuid.uuid4().hex[:12]}"
+        t0 = time.monotonic()
+        max_depth = (
+            getattr(self._settings, "agent_subagent_max_depth", _MAX_SPAWN_DEPTH)
+            if self._settings is not None else _MAX_SPAWN_DEPTH
+        )
+        available = build_subagent_tool_filter(self._tool_names, config, max_depth=max_depth)
+        goal = config.goal
+        if config.context:
+            goal = f"{config.goal}\n\nContext:\n{config.context}"
+        try:
+            summary = await self._run_child(
+                goal,
+                depth=config.depth,
+                tool_filter=frozenset(available),
+                enable_thinking=False,
+            )
+        except Exception as exc:  # isolate subagent failure from the parent loop
+            return SubagentResult(
+                session_id=session_id, goal=config.goal,
+                summary=f"Subagent error: {exc}", status="failed",
+                elapsed_s=time.monotonic() - t0, error=str(exc),
+            )
+        return SubagentResult(
+            session_id=session_id, goal=config.goal,
+            summary=(summary or "")[:config.summary_max_chars],
+            status="completed", elapsed_s=time.monotonic() - t0,
+        )

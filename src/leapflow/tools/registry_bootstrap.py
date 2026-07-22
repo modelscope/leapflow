@@ -266,6 +266,63 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    # ── Research ledger (durable long-task state; mechanism 5) ──
+    {
+        "type": "function",
+        "function": {
+            "name": "research_note",
+            "description": (
+                "Record a compact, structured note about the current task's state so it "
+                "survives context compression on long / multi-step tasks. Use for durable "
+                "findings, open questions still to resolve, decisions / excluded paths, and "
+                "the immediate next step. One concise sentence per note."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["finding", "open_question", "resolved", "decision", "next_step"],
+                        "description": "finding | open_question | resolved (closes a matching open question) | decision | next_step",
+                    },
+                    "text": {"type": "string", "description": "One concise sentence."},
+                },
+                "required": ["kind", "text"],
+            },
+        },
+        "x_leapflow": {"category": "memory", "risk_level": "read_only", "requires_approval": False, "schema_cost": "medium"},
+    },
+    # ── Event-driven re-entry (S2) ──
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_reentry",
+            "description": (
+                "Register a re-entry so this task can resume later from its current "
+                "orientation (findings / open questions / next step). Use when work must "
+                "pause and continue after a delay (kind=time) or when a matching platform "
+                "event arrives (kind=event), instead of finishing now. The research-ledger "
+                "state is carried over automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["time", "event"],
+                        "description": "time = resume after delay_seconds; event = resume when a matching platform event arrives",
+                    },
+                    "reason": {"type": "string", "description": "One concise sentence: what to continue and why (carried into the resumed turn)."},
+                    "delay_seconds": {"type": "number", "description": "kind=time: seconds from now to resume."},
+                    "event_match": {"type": "object", "description": "kind=event: match filter, e.g. platform / chat / keyword."},
+                    "max_reentries": {"type": "integer", "description": "Max times this may resume (default 1)."},
+                    "deadline_seconds": {"type": "number", "description": "Optional: abandon the re-entry after this many seconds."},
+                },
+                "required": ["kind", "reason"],
+            },
+        },
+        "x_leapflow": {"category": "memory", "risk_level": "read_only", "requires_approval": False, "schema_cost": "medium"},
+    },
     # ── Capability discovery (Tier 1 structural gate) ──
     # Lets the model expand a heavier tool category (hub/gateway/delegate) into
     # full native schemas on demand, instead of the runtime guessing from text
@@ -513,6 +570,71 @@ TOOL_HANDLERS["gp_memory_search"] = _memory_search_handler
 TOOL_HANDLERS["gp_memory_add"] = _memory_add_handler
 
 
+# ────────────────────────────────────────────────────
+# Research-ledger tool late-binding: delegates to the engine's per-task
+# ResearchLedger when installed; fails gracefully when not.
+# ────────────────────────────────────────────────────
+
+_research_ledger_ref: Any = None
+
+
+def set_research_ledger(ledger: Any) -> None:
+    """Install the active ResearchLedger for research_note dispatch."""
+    global _research_ledger_ref
+    _research_ledger_ref = ledger
+
+
+async def _research_note_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    if _research_ledger_ref is None:
+        return {"ok": False, "error": "Research ledger not initialized"}
+    ok = _research_ledger_ref.note(params.get("kind", ""), params.get("text", ""))
+    if not ok:
+        return {
+            "ok": False,
+            "error": "invalid note: kind must be one of finding|open_question|resolved|decision|next_step and text must be non-empty",
+        }
+    return {"ok": True, "open_questions": _research_ledger_ref.open_question_count}
+
+
+TOOL_HANDLERS["research_note"] = _research_note_handler
+TOOL_HANDLERS["gp_research_note"] = _research_note_handler
+
+
+# ────────────────────────────────────────────────────
+# Re-entry scheduling (S2) late-binding: delegates to the engine's
+# _schedule_reentry when installed; gated by config + persisted engine-side.
+# ────────────────────────────────────────────────────
+
+_reentry_scheduler_ref: Any = None
+
+
+def set_reentry_scheduler(scheduler: Any) -> None:
+    """Install the engine's re-entry scheduler callable for schedule_reentry."""
+    global _reentry_scheduler_ref
+    _reentry_scheduler_ref = scheduler
+
+
+async def _schedule_reentry_handler(params: Dict[str, Any]) -> Dict[str, Any]:
+    if _reentry_scheduler_ref is None:
+        return {"ok": False, "error": "Re-entry scheduling not initialized"}
+    try:
+        result = _reentry_scheduler_ref(
+            kind=str(params.get("kind", "time")),
+            reason=str(params.get("reason", "")),
+            delay_seconds=params.get("delay_seconds", 0.0),
+            event_match=params.get("event_match") or {},
+            max_reentries=params.get("max_reentries", 1),
+            deadline_seconds=params.get("deadline_seconds", 0.0),
+        )
+        return result if isinstance(result, dict) else {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+TOOL_HANDLERS["schedule_reentry"] = _schedule_reentry_handler
+TOOL_HANDLERS["gp_schedule_reentry"] = _schedule_reentry_handler
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Subagent delegation (late-binding like memory tools)
 # ─────────────────────────────────────────────────────────────────────
@@ -530,10 +652,11 @@ async def _delegate_task_handler(params: Dict[str, Any]) -> Dict[str, Any]:
     if _subagent_manager_ref is None:
         return {"ok": False, "error": "Subagent system not configured"}
     try:
-        from leapflow.engine.subagent import SubagentConfig
+        from leapflow.engine.subagent import SubagentConfig, current_subagent_depth
         config = SubagentConfig(
             goal=params.get("goal", ""),
             context=params.get("context", ""),
+            depth=current_subagent_depth() + 1,
         )
         result = await _subagent_manager_ref.delegate(config)
         return {"ok": result.status == "completed", "summary": result.summary, "status": result.status}
