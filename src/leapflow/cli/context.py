@@ -1950,11 +1950,20 @@ class Context:
         except Exception:
             logger.debug("Difficulty/threshold calibration skipped", exc_info=True)
 
-        # ── Wire tool loop guardrails ──
+        # ── Wire tool loop guardrails (progress-aware; thresholds from config) ──
         try:
-            from leapflow.engine.tool_guardrails import CompositeGuardrail
-            self.engine._guardrail = CompositeGuardrail()
-            logger.debug("Tool loop guardrails enabled")
+            if getattr(settings, "guardrail_enabled", True):
+                from leapflow.engine.tool_guardrails import CompositeGuardrail
+                self.engine._guardrail = CompositeGuardrail(
+                    max_repeats=settings.guardrail_max_repeats,
+                    stagnation_window=settings.guardrail_stagnation_window,
+                    min_success_rate=settings.guardrail_min_success_rate,
+                    max_consecutive_same=settings.guardrail_max_consecutive_same,
+                )
+                logger.debug("Tool loop guardrails enabled")
+            else:
+                self.engine._guardrail = None
+                logger.debug("Tool loop guardrails disabled by config")
         except Exception:
             logger.debug("Tool guardrails setup skipped", exc_info=True)
 

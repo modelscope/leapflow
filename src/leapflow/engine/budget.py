@@ -36,6 +36,7 @@ class BudgetConfig:
     soft_limit: int = 14
     warning_threshold: int = 10
     iter_ceiling: int = 0
+    hard_cap: int = 0
     scale_k: float = 1.0
     max_refunds: int = 0
     soft_ratio: float = 0.8
@@ -48,6 +49,17 @@ class BudgetConfig:
     def ceiling(self) -> int:
         """Absolute upper bound on iterations (elastic ceiling or fixed cap)."""
         return self.iter_ceiling if self.iter_ceiling > self.max_iterations else self.max_iterations
+
+    @property
+    def absolute_ceiling(self) -> int:
+        """Hard upper bound including progress-gated extensions.
+
+        The difficulty-scaled ``retarget`` is bounded by :attr:`ceiling`; the
+        progress-gated :meth:`IterationBudget.grant_extension` may push the
+        effective cap past the elastic ceiling up to this absolute backstop
+        (``hard_cap`` when set, else just the elastic ceiling — no extension).
+        """
+        return max(self.hard_cap, self.ceiling) if self.hard_cap > 0 else self.ceiling
 
     @property
     def elastic(self) -> bool:
@@ -73,7 +85,15 @@ class IterationBudget:
     def consume(self) -> BudgetStatus:
         """Consume one iteration. Returns current budget status."""
         self._consumed += 1
-        used = self._consumed - self._refunded
+        return self._tier(self._consumed - self._refunded)
+
+    def status(self) -> BudgetStatus:
+        """Current tier WITHOUT consuming (for progress-gated re-checks after a
+        :meth:`grant_extension`)."""
+        return self._tier(self._consumed - self._refunded)
+
+    def _tier(self, used: int) -> BudgetStatus:
+        """Map current usage to a budget tier against the effective cap."""
         if used >= self._effective_max:
             return BudgetStatus.EXHAUSTED
         if self._config.elastic:
@@ -110,11 +130,30 @@ class IterationBudget:
         """Raise the effective cap toward a new target (monotonic, bounded).
 
         Never lowers below what is already consumed or below the baseline, and
-        never exceeds the configured ceiling.
+        never exceeds the configured (elastic) ceiling. This is the
+        difficulty-driven widening; progress-gated widening past the elastic
+        ceiling goes through :meth:`grant_extension`.
         """
         floor = max(self._config.max_iterations, self.used)
         candidate = min(int(new_max), self._config.ceiling)
         self._effective_max = max(self._effective_max, candidate, floor)
+
+    @property
+    def can_extend(self) -> bool:
+        """Whether the effective cap can still grow toward the absolute ceiling."""
+        return self._effective_max < self._config.absolute_ceiling
+
+    def grant_extension(self, step: int) -> None:
+        """Progress-gated widening of the effective cap past the elastic ceiling.
+
+        Distinct from :meth:`retarget` (bounded by the elastic ceiling): this is
+        called by the loop only when the task is productively unfinished, and
+        pushes the effective cap up to the absolute hard cap so a genuinely long
+        task is bounded by real resources (and the hard cap) rather than by a
+        fixed iteration count. No-op once the absolute ceiling is reached.
+        """
+        step = max(1, int(step))
+        self._effective_max = min(self._effective_max + step, self._config.absolute_ceiling)
 
     @property
     def remaining(self) -> int:

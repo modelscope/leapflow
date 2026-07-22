@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -96,29 +96,47 @@ class StagnationGuard:
     def check(self, history: List[Dict[str, Any]]) -> GuardrailViolation:
         tool_results = [
             m for m in history[-self._window * 3:]
-            if m.get("role") in ("tool", "user")
+            if self._is_tool_result_message(m)
         ]
         if len(tool_results) < self._window:
             return GuardrailViolation(violated=False)
 
+        recent = tool_results[-self._window:]
         successes = 0
-        for msg in tool_results[-self._window:]:
+        for msg in recent:
             content = msg.get("content", "")
             if not isinstance(content, str):
                 continue
             if self._is_success_result(content):
                 successes += 1
 
-        rate = successes / self._window
+        rate = successes / len(recent)
         if rate < self._min_rate:
             return GuardrailViolation(
                 violated=True,
-                reason=f"Low tool success rate ({rate:.0%}) in last {self._window} calls",
+                reason=f"Low tool success rate ({rate:.0%}) in last {len(recent)} calls",
                 severity="warning",
                 suggestion="Most recent tool calls are failing. Reassess your approach.",
             )
 
         return GuardrailViolation(violated=False)
+
+    @staticmethod
+    def _is_tool_result_message(msg: Dict[str, Any]) -> bool:
+        """Whether a message is a genuine tool result (not injected context).
+
+        Only native ``tool`` messages and text-mode ``Tool result (...)`` user
+        messages count. Injected user/system context (live signals, research
+        ledger, convergence/cost notices, memory) is excluded so the success
+        rate is not diluted by non-tool messages on a context-heavy long task.
+        """
+        role = msg.get("role")
+        if role == "tool":
+            return True
+        if role == "user":
+            content = msg.get("content", "")
+            return isinstance(content, str) and content.lstrip().startswith("Tool result (")
+        return False
 
     @staticmethod
     def _is_success_result(content: str) -> bool:
@@ -165,7 +183,7 @@ class DominationGuard:
                 violated=True,
                 reason=f"Tool '{tail[0]}' used {self._threshold} times consecutively",
                 severity="warning",
-                suggestion=f"Consider using a different tool or providing the answer directly.",
+                suggestion="Consider using a different tool or providing the answer directly.",
             )
 
         return GuardrailViolation(violated=False)

@@ -17,9 +17,7 @@ from leapflow.engine.engine import (
     _tool_args_metadata,
     build_default_registry,
 )
-from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.intent_classifier import Intent
-from leapflow.engine.scheduler import TaskScheduler
 from leapflow.engine.task_graph import (
     GraphValidationError,
     RetryPolicy,
@@ -534,6 +532,215 @@ def test_compression_writeback_off_leaves_history_intact() -> None:
             lt.close()
 
 
+def _adaptive_engine(td):
+    from conftest import make_settings
+    from leapflow.platform.mock import MockBridge
+    settings = make_settings(td)
+    rpc = MockBridge()
+    llm = StubLLM(["x"])
+    wm = WorkingMemoryProvider(max_tokens=1024)
+    lt = SemanticMemoryProvider(source=settings.duckdb_path)
+    imm = EpisodicMemoryProvider()
+    reg = build_default_registry(rpc, llm, wm, lt)
+    engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, _FixedClassifier("complex"))
+    return engine, lt, settings
+
+
+def test_progress_gated_budget_extension_decision() -> None:
+    """P0: extend the budget only when productively unfinished (open ledger work,
+    not stalled, within resources); stop when stalled or the ledger is complete.
+    """
+    from leapflow.engine.agent_loop import AgentLoopFrame
+
+    with tempfile.TemporaryDirectory() as td:
+        engine, lt, settings = _adaptive_engine(td)
+        try:
+            frame = AgentLoopFrame(user_text="x")
+            # Open question + not stalled + resources ok -> extend.
+            engine._research_ledger.note("open_question", "How does X cache?")
+            frame.stalled_rounds = 0
+            assert engine._should_extend_budget(frame) is True
+            # Stalled beyond threshold -> stop (let it converge).
+            frame.stalled_rounds = settings.agent_stall_rounds
+            assert engine._should_extend_budget(frame) is False
+            # Ledger reports completion (0 open questions) -> stop.
+            frame.stalled_rounds = 0
+            engine._research_ledger.note("resolved", "How does X cache")
+            assert engine._research_ledger.open_question_count == 0
+            assert engine._should_extend_budget(frame) is False
+        finally:
+            lt.close()
+
+
+def test_update_progress_and_stall_tracks_progress() -> None:
+    """P0: stall counter increments when the progress marker is unchanged and
+    resets when new evidence/ledger progress appears."""
+    from leapflow.engine.agent_loop import AgentLoopFrame
+
+    with tempfile.TemporaryDirectory() as td:
+        engine, lt, _ = _adaptive_engine(td)
+        try:
+            frame = AgentLoopFrame(user_text="x")
+            engine._last_context_snapshot = {"context_governance": {"evidence_count": 1, "sources_seen": 1}}
+            engine._update_progress_and_stall(frame)     # first marker recorded
+            assert frame.stalled_rounds == 0
+            engine._update_progress_and_stall(frame)     # unchanged -> stall++
+            assert frame.stalled_rounds == 1
+            engine._update_progress_and_stall(frame)
+            assert frame.stalled_rounds == 2
+            # New evidence surfaces -> progress -> reset.
+            engine._last_context_snapshot = {"context_governance": {"evidence_count": 9, "sources_seen": 3}}
+            engine._update_progress_and_stall(frame)
+            assert frame.stalled_rounds == 0
+        finally:
+            lt.close()
+
+
+def test_stagnation_guard_ignores_injected_context() -> None:
+    """Guardrail fix: StagnationGuard counts only genuine tool results, not
+    injected user context (ledger/live signals/memory), so a context-heavy long
+    task with successful tools is not falsely flagged as stagnating."""
+    from leapflow.engine.tool_guardrails import StagnationGuard
+
+    guard = StagnationGuard(window=5, min_success_rate=0.5)
+    history: list = []
+    for i in range(5):
+        history.append({"role": "tool", "content": '{"ok": true, "n": %d}' % i})
+        history.append({"role": "user", "content": "MEMORY_CONTEXT: prior experience ..."})
+        history.append({"role": "user", "content": "## Research Ledger (task state) ..."})
+
+    assert guard.check(history).violated is False   # noise excluded; all tools succeeded
+
+
+def test_stagnation_guard_flags_genuine_tool_failures() -> None:
+    from leapflow.engine.tool_guardrails import StagnationGuard
+
+    guard = StagnationGuard(window=5, min_success_rate=0.5)
+    history = [{"role": "tool", "content": '{"ok": false, "error": "boom"}'} for _ in range(6)]
+    assert guard.check(history).violated is True    # genuine failures -> flagged
+
+
+def test_guardrail_halt_suppressed_while_progressing() -> None:
+    """Guardrail is progress-aware: a halt/nudge is suppressed while the task is
+    advancing (stall counter 0) and only escalates once the task is stalled."""
+    from leapflow.engine.agent_loop import AgentLoopFrame
+    from leapflow.engine.tool_guardrails import GuardrailViolation
+
+    class _HaltGuard:
+        def check(self, history):
+            return GuardrailViolation(violated=True, reason="loop", severity="halt", suggestion="stop")
+
+        def reset(self):
+            pass
+
+    with tempfile.TemporaryDirectory() as td:
+        engine, lt, _ = _adaptive_engine(td)
+        try:
+            engine._guardrail = _HaltGuard()
+            frame = AgentLoopFrame(user_text="x")
+            engine._active_frame = frame
+            msgs = [{"role": "user", "content": "x"}]
+
+            frame.stalled_rounds = 0
+            assert engine._check_guardrail(msgs) is None      # progressing -> halt suppressed
+            frame.stalled_rounds = 2
+            assert engine._check_guardrail(msgs) == "halt"     # stalled -> halt fires
+        finally:
+            lt.close()
+
+
+def _with_coordinator(engine):
+    from leapflow.engine.recovery_budget import RecoveryBudget
+    from leapflow.engine.recovery_coordinator import RecoveryCoordinator
+    from leapflow.engine.recovery_strategies import default_strategies
+    engine._recovery_coordinator = RecoveryCoordinator(
+        strategies=default_strategies(), budget=RecoveryBudget(total_recovery_actions=12),
+    )
+    return engine._recovery_coordinator
+
+
+def test_recoverable_tool_failures_feed_back_never_break() -> None:
+    """TF: many consecutive recoverable tool failures are fed back for autonomous
+    diagnosis (no halt) — no blanket count-based break."""
+    with tempfile.TemporaryDirectory() as td:
+        engine, lt, _ = _adaptive_engine(td)
+        try:
+            _with_coordinator(engine)
+            failed = [("shell_run", {"ok": False, "error": "boom", "retryable": True})] * 10
+            assert engine._evaluate_tool_failures(failed, turn_id=1) is None   # never halts
+        finally:
+            lt.close()
+
+
+def test_recoverable_tool_failures_do_not_spend_recovery_budget() -> None:
+    """TF: tool failures are agent-level observations, not infrastructure recovery,
+    so feeding them back must not deplete the shared system recovery budget."""
+    with tempfile.TemporaryDirectory() as td:
+        engine, lt, _ = _adaptive_engine(td)
+        try:
+            coord = _with_coordinator(engine)
+            before = coord.budget.remaining()
+            engine._evaluate_tool_failures(
+                [("shell_run", {"ok": False, "error": "x", "retryable": True})] * 8, turn_id=1,
+            )
+            assert coord.budget.remaining() == before   # zero-cost feedback
+        finally:
+            lt.close()
+
+
+def test_non_recoverable_tool_failure_halts_via_coordinator() -> None:
+    """TF: only a genuinely non-recoverable failure (e.g. permission denied) halts
+    the turn — routed through the single recovery decision point."""
+    with tempfile.TemporaryDirectory() as td:
+        engine, lt, _ = _adaptive_engine(td)
+        try:
+            _with_coordinator(engine)
+            perm = [("gateway_send", {
+                "ok": False,
+                "failure_class": "authorization",
+                "error": "permission denied",
+                "execution_policy": "external_side_effect",
+            })]
+            reason = engine._evaluate_tool_failures(perm, turn_id=1)
+            assert reason is not None and reason != ""
+        finally:
+            lt.close()
+
+
+def test_turn_recovery_rearm_after_progress_content_only() -> None:
+    """P1-A: progress re-arms content-level one-shots (so a long task can recover
+    again) but keeps storm-prone infrastructure one-shots strict for the turn."""
+    from leapflow.engine.turn_recovery import TurnRecoveryState
+
+    rec = TurnRecoveryState()
+    assert rec.try_length_continuation() is True    # content one-shot fires
+    assert rec.try_length_continuation() is False   # exhausted within the streak
+    assert rec.try_provider_failover() is True      # infra one-shot fires
+
+    assert rec.rearm_after_progress() is True        # progress re-arms content guards
+    assert rec.try_length_continuation() is True     # available again
+    assert rec.try_compress() is True                # content guard re-armed too
+    assert rec.try_provider_failover() is False      # infra stays strict
+
+    # No-op (returns False) when no content guard had been used.
+    assert TurnRecoveryState().rearm_after_progress() is False
+
+
+def test_should_stop_after_tool_result_is_policy_driven() -> None:
+    """P1-B: the side-effect batch-stop gate is driven by the declared
+    execution_policy, not a hardcoded tool-name list."""
+    from leapflow.engine.engine import _should_stop_after_tool_result
+
+    # Any mutating/side-effect policy failure stops the batch…
+    assert _should_stop_after_tool_result("any_tool", {"ok": False, "execution_policy": "external_side_effect"}) is True
+    assert _should_stop_after_tool_result("any_tool", {"ok": False, "execution_policy": "mutating_once"}) is True
+    # …while a read-only failure does not — even for a tool that used to be in the
+    # hardcoded side-effect name list (proves it is now policy-driven).
+    assert _should_stop_after_tool_result("shell_run", {"ok": False, "execution_policy": "read_only"}) is False
+    # A non-failure never stops the batch.
+    assert _should_stop_after_tool_result("gateway_send", {"ok": True}) is False
+
+
 @pytest.mark.asyncio
 async def test_exact_canonical_tool_names_execute_without_guessing() -> None:
     """Only exact canonical tool names (plus case/separator formatting) execute."""
@@ -1031,52 +1238,6 @@ async def test_unknown_tool_in_stream_triggers_structured_retry() -> None:
             assert tool_events[1].metadata["ok"] is False
             assert tool_events[1].metadata["error_type"] == "unknown_tool"
             assert "resolved_from" not in tool_events[1].metadata
-        finally:
-            lt.close()
-
-
-@pytest.mark.asyncio
-async def test_dag_execution_end_to_end() -> None:
-    """DAG planner/scheduler: direct invocation produces graph summary."""
-    with tempfile.TemporaryDirectory() as td:
-        settings = make_settings(td)
-        from leapflow.platform.mock import MockBridge
-
-        rpc = MockBridge()
-        llm = StubLLM([])
-        wm = WorkingMemoryProvider(max_tokens=1024)
-        lt = SemanticMemoryProvider(source=settings.duckdb_path)
-        imm = EpisodicMemoryProvider()
-
-        planned = TaskGraph(goal="organize downloads")
-        planned.add_node(_node("step1", action="file_organizer"))
-        planned.add_node(_node("step2", action="clipboard_manager", depends_on=["step1"]))
-
-        executed = TaskGraph(goal="organize downloads")
-        executed.add_node(_node("step1", action="file_organizer"))
-        executed.add_node(_node("step2", action="clipboard_manager", depends_on=["step1"]))
-        executed.mark_completed("step1", "listed files")
-        executed.mark_completed("step2", "organized")
-
-        mock_planner = AsyncMock(spec=GraphPlanner)
-        mock_planner.plan.return_value = planned
-
-        mock_scheduler = AsyncMock(spec=TaskScheduler)
-        mock_scheduler.execute_graph.return_value = executed
-
-        try:
-            reg = build_default_registry(rpc, llm, wm, lt)
-            classifier = _FixedClassifier("complex")
-            engine = AgentEngine(
-                settings, rpc, llm, wm, lt, imm, reg, classifier,
-                graph_planner=mock_planner,
-                scheduler=mock_scheduler,
-            )
-            # Call _handle_complex_task directly (DAG is internal machinery)
-            out = await engine._handle_complex_task("Organize my downloads folder")
-            assert "organize downloads" in out
-            mock_planner.plan.assert_awaited_once()
-            mock_scheduler.execute_graph.assert_awaited_once()
         finally:
             lt.close()
 

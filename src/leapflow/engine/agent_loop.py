@@ -54,6 +54,12 @@ class AgentLoopFrame:
     # Per-turn observability / continuity state, reassigned during the loop.
     last_context_snapshot: Dict[str, Any] = field(default_factory=dict)
     last_turn_tool_categories: FrozenSet[str] = frozenset()
+    # Progress-gated continuation state (P0): a fingerprint of task progress
+    # (ledger findings/questions/decisions + governance evidence/sources) and a
+    # count of consecutive rounds without progress. Drives budget extension vs
+    # convergence so a productive long task continues while a stalled one stops.
+    progress_marker: tuple = ()
+    stalled_rounds: int = 0
     # ``None`` tool_filter means "all tools available"; a set restricts to it.
     tool_filter: Optional[FrozenSet[str]] = None
     enable_thinking: bool = False

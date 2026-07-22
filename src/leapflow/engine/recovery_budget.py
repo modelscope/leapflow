@@ -110,8 +110,14 @@ class RecoveryBudget:
         return self._rotations_used < self.max_credential_rotations
 
     def is_deadline_exceeded(self) -> bool:
-        """Whether the wall-clock deadline for this turn has been exceeded."""
-        if self._deadline_start == 0.0:
+        """Whether the wall-clock deadline for this turn has been exceeded.
+
+        A non-positive ``turn_deadline_s`` means *no* wall-clock deadline
+        (unlimited): recovery is then bounded only by the action-count budget, so
+        a long-running task is never denied recovery for a late transient error
+        merely because wall-clock time has elapsed.
+        """
+        if self._deadline_start == 0.0 or self.turn_deadline_s <= 0:
             return False
         elapsed = time.monotonic() - self._deadline_start
         return elapsed > self.turn_deadline_s

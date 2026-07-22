@@ -55,6 +55,7 @@ from leapflow.engine.unified_classifier import UnifiedErrorClassifier
 from leapflow.engine.recovery_decision import RecoveryAction, RecoveryDecision
 from leapflow.engine.recovery_strategies import default_strategies
 from leapflow.engine.recovery_audit import JsonlAuditSink, create_audit_entry
+from leapflow.engine.failure_envelope import Recoverability
 from leapflow.engine.recovery_checkpoint import RecoveryCheckpoint, InMemoryCheckpointStore
 from leapflow.engine.tool_concurrency import (
     DefaultConcurrencyPolicy,
@@ -77,7 +78,6 @@ from leapflow.memory.providers.semantic import SemanticMemoryProvider
 from leapflow.memory.providers.working import WorkingMemoryProvider
 from leapflow.memory.providers.evolution import EvolutionMemoryProvider
 from leapflow.memory.manager import MemoryManager
-from leapflow.prompts.templates import REACT_SYSTEM_TEMPLATE
 from leapflow.learning.active_learning import SkillMerger
 from leapflow.skills.builtin import app_launcher, clipboard_manager, file_organizer
 from leapflow.security.permission_failures import (
@@ -282,17 +282,6 @@ def _is_permission_hard_stop_payload(payload: Dict[str, Any]) -> bool:
 
 
 _SIDE_EFFECT_STOP_POLICIES = frozenset({"external_side_effect", "mutating_once", "mutating_idempotent"})
-_SIDE_EFFECT_STOP_TOOLS = frozenset({
-    "shell_run",
-    "scm_sync",
-    "platform_action",
-    "platform_connect",
-    "gateway_send",
-    "gateway_connect",
-    "hub_push",
-    "hub_pull",
-    "hub_sync",
-})
 
 
 def _tool_result_counts_as_failure(payload: Dict[str, Any]) -> bool:
@@ -319,14 +308,19 @@ def _tool_failure_text(payload: Dict[str, Any]) -> str:
 
 
 def _should_stop_after_tool_result(tool_name: str, payload: Dict[str, Any]) -> bool:
-    """Return whether a failed side-effect result must stop the current tool batch."""
+    """Return whether a failed side-effect result must stop the current tool batch.
+
+    Side-effect determination is policy-driven: the execution ledger injects an
+    ``execution_policy`` (derived from registry metadata — risk level, mutation,
+    idempotency) into every executed tool result, so a mutating/side-effecting
+    tool is identified by its declared policy rather than a hardcoded tool-name
+    list. This keeps the safety gate general and free of vendor-specific names.
+    """
     if _is_permission_hard_stop_payload(payload):
         return True
     if not _tool_result_counts_as_failure(payload):
         return False
-    policy = str(payload.get("execution_policy") or "")
-    normalized_name = str(tool_name or "").removeprefix("gp_")
-    return policy in _SIDE_EFFECT_STOP_POLICIES or normalized_name in _SIDE_EFFECT_STOP_TOOLS
+    return str(payload.get("execution_policy") or "") in _SIDE_EFFECT_STOP_POLICIES
 
 
 def _skipped_after_failure_result(blocking_tool: str, blocking_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -714,19 +708,6 @@ class StreamEvent:
     metadata: Optional[Dict[str, Any]] = None
 
 
-@dataclass
-class _LoopContext:
-    """Mutable state carried across state machine transitions."""
-
-    messages: List[Dict[str, Any]]
-    last_content: str = ""
-    last_action: Optional[Dict[str, Any]] = None
-    last_observation: Any = None
-    last_error: Optional[Exception] = None
-    consecutive_failures: int = 0
-    prefetch_done: bool = False  # track whether memory prefetch ran this loop
-
-
 @dataclass(frozen=True)
 class _PromptAssembly:
     """Resolved prompt pieces for a unified-loop turn."""
@@ -898,6 +879,7 @@ class AgentEngine:
             soft_limit=settings.react_soft_limit,
             warning_threshold=settings.react_warning_threshold,
             iter_ceiling=settings.agent_iter_ceiling,
+            hard_cap=settings.agent_iter_hard_cap,
             scale_k=settings.agent_budget_scale_k,
         )
         # S3-L3: baseline difficulty weight, kept as the rollback/recompute anchor
@@ -1186,14 +1168,76 @@ class AgentEngine:
         if not violation.violated:
             return None
         logger.warning("guardrail: %s", violation.reason)
-        if violation.severity == "halt":
+        # Progress-aware: while the task is still advancing (stall counter at 0),
+        # a detected repetition/domination is producing progress -> never halt,
+        # and the finalize/diversify nudge is suppressed so legitimate batch or
+        # sequential work on a long task is not cut short. Only when the task is
+        # ALSO stalled does the guardrail escalate to a halt (or emit a nudge).
+        frame = self._active_frame
+        stalled = bool(frame is not None and getattr(frame, "stalled_rounds", 0) >= 1)
+        if violation.severity == "halt" and stalled:
             messages.append(build_user_message_text(
                 f"SYSTEM GUARDRAIL: {violation.reason}. {violation.suggestion}"
             ))
             return "halt"
+        if not stalled:
+            return None  # productive: neither halt nor nudge
         messages.append(build_user_message_text(
             f"SYSTEM WARNING: {violation.reason}. {violation.suggestion}"
         ))
+        return None
+
+    def _evaluate_tool_failures(
+        self, failed_items: List[tuple[str, Dict[str, Any]]], *, turn_id: int,
+    ) -> Optional[str]:
+        """Single recovery decision point for tool-result failures.
+
+        A tool failure is an OBSERVATION for autonomous diagnosis: the failed
+        result is already in the message history and is fed back to the LLM,
+        which reasons about it and retries or changes approach on the next round.
+        There is NO blanket count-based break — a task that fails then fixes keeps
+        going; a genuinely stuck failure loop is bounded by the iteration budget,
+        progress-based stall detection, and the progress-aware guardrail.
+
+        Each failure is classified into a FailureEnvelope. The turn halts ONLY
+        for a non-recoverable failure (e.g. permission denied), routed through
+        the coordinator for the terminal decision + audit. Recoverable failures
+        are fed back and audited as a zero-cost decision so they never spend the
+        system recovery budget (reserved for infrastructure recovery). Returns a
+        halt reason when the turn must stop, else None.
+        """
+        coordinator = self._recovery_coordinator
+        if coordinator is None:
+            return None
+        session_id = getattr(self, "_current_session_id", "") or ""
+        for tool_name, result in failed_items:
+            if not isinstance(result, dict):
+                continue
+            envelope = self._unified_classifier.classify_tool_result(
+                result, tool_name=tool_name,
+                execution_policy=result.get("execution_policy", "read_only"),
+            )
+            if envelope is None:
+                continue
+            if envelope.recoverability == Recoverability.NON_RECOVERABLE:
+                decision = coordinator.evaluate(envelope)
+                self._audit_sink.record(create_audit_entry(
+                    envelope, decision, coordinator.budget,
+                    session_id=session_id, turn_id=turn_id,
+                ))
+                return decision.reason or f"Non-recoverable tool failure ({envelope.category})"
+            # Recoverable: fed back to the agent (zero-cost, no recovery budget spent).
+            feedback = RecoveryDecision.create(
+                envelope=envelope,
+                action=RecoveryAction.SKIP_AND_CONTINUE,
+                reason="Tool failure fed back to the agent for autonomous diagnosis and retry",
+                strategy_key="tool_feedback",
+                budget_cost=0,
+            )
+            self._audit_sink.record(create_audit_entry(
+                feedback.envelope, feedback, coordinator.budget,
+                session_id=session_id, turn_id=turn_id,
+            ))
         return None
 
     def set_tool_timeouts(self, timeouts: Dict[str, float]) -> None:
@@ -1870,6 +1914,75 @@ class AgentEngine:
         difficulty = float(self._last_context_snapshot.get("difficulty", 0.0) or 0.0)
         budget.retarget(budget.elastic_max(difficulty))
 
+    def _task_progress_marker(self) -> tuple:
+        """Fingerprint of task progress for stall detection (P0).
+
+        Combines the research-ledger shape (findings / open questions /
+        decisions / next step) with governance evidence breadth (evidence count,
+        distinct sources). A change between rounds means the task advanced; an
+        unchanged marker across rounds indicates a stall. Works for ledger-using
+        tasks and, via governance signals, for tasks that never call research_note.
+        """
+        d = self._research_ledger.as_dict()
+        gov = self._last_context_snapshot.get("context_governance", {}) or {}
+        return (
+            len(d.get("findings", [])),
+            len(d.get("open_questions", [])),
+            len(d.get("decisions", [])),
+            d.get("next_step", ""),
+            int(gov.get("evidence_count", 0) or 0),
+            int(gov.get("sources_seen", 0) or 0),
+        )
+
+    def _update_progress_and_stall(self, frame: AgentLoopFrame) -> None:
+        """Advance the frame's stall counter: reset on progress, else increment."""
+        marker = self._task_progress_marker()
+        if marker == frame.progress_marker:
+            frame.stalled_rounds += 1
+        else:
+            frame.stalled_rounds = 0
+            frame.progress_marker = marker
+            # Genuine progress: re-arm content-level recovery one-shots so a long
+            # task can recover again later (e.g. multiple max_tokens continuations
+            # or force-compressions across a long turn). Storm-prone infrastructure
+            # one-shots stay strict (bounded by the RecoveryBudget instead).
+            if frame.recovery is not None:
+                frame.recovery.rearm_after_progress()
+
+    def _within_resource_limits(self) -> bool:
+        """Whether real resource budgets (cost) still allow continuation.
+
+        The absolute iteration hard cap is enforced by the budget itself; this
+        guards the *cost* ceiling when configured (0 disables). Context pressure
+        is handled separately by the finalizing posture.
+        """
+        multiple = float(getattr(self._settings, "agent_cost_ceiling_context_multiple", 0.0) or 0.0)
+        if multiple <= 0:
+            return True
+        effective = self._usage_tracker.summary().effective_prompt_tokens()
+        ceiling = multiple * float(self._active_context_length() or 0)
+        return ceiling <= 0 or effective < ceiling
+
+    def _should_extend_budget(self, frame: AgentLoopFrame) -> bool:
+        """Progress-gated continuation decision (P0).
+
+        Extend the iteration budget past the elastic ceiling only when the task
+        is *productively unfinished*: within resource limits, still making
+        progress (not stalled), and not already signalled complete by the ledger
+        (zero open questions). A stalled, complete, or resource-exhausted task is
+        allowed to converge and stop — so a productive long task continues while a
+        spinning one halts.
+        """
+        if not self._within_resource_limits():
+            return False
+        stall_rounds = int(getattr(self._settings, "agent_stall_rounds", 6) or 6)
+        if frame.stalled_rounds >= stall_rounds:
+            return False
+        open_q = self._ledger_open_questions()
+        if open_q is not None and open_q == 0:
+            return False
+        return True
+
     def _ledger_open_questions(self) -> int | None:
         """Ledger sufficiency signal for convergence: None when the ledger is
         inactive/empty (fall back to the marginal heuristic), else the current
@@ -2149,377 +2262,6 @@ class AgentEngine:
             logger.debug("app connector prompt section unavailable", exc_info=True)
             return ""
 
-    # ── Complex Task Handling (DAG path) ─────────────────────────────
-
-    async def _handle_complex_task(self, user_goal: str) -> str:
-        """Handle complex multi-step tasks via DAG planning and execution.
-
-        Flow: GraphPlanner → TaskScheduler → summary report.
-        Falls back to ReAct loop on planning failure.
-        """
-        assert self._graph_planner is not None
-        assert self._scheduler is not None
-
-        try:
-            _log_progress("Building execution plan...")
-            graph = await self._graph_planner.plan(user_goal)
-            self._wm.remember_event(
-                "dag_plan", graph.summary(), {"nodes": len(graph.nodes)}
-            )
-            node_names = [n.name for n in list(graph.nodes.values())[:10]]
-            _log_progress(f"Execution plan ready: {len(graph.nodes)} steps — {', '.join(node_names)}")
-            graph = await self._scheduler.execute_graph(graph)
-            _log_progress("Plan execution complete")
-            return graph.summary()
-        except (ValueError, Exception) as e:
-            _log_progress(f"DAG planning failed ({e}), falling back to ReAct loop")
-            logger.warning("audit.dag_fallback reason=%s", e)
-            return await self._fallback_react(user_goal)
-
-    async def _fallback_react(self, user_text: str) -> str:
-        """Fallback to ReAct loop when DAG planning/execution fails."""
-        steps = await self._plan_steps(user_text)
-        self._wm.remember_event("plan", " | ".join(steps), {"steps": steps})
-        return await self._react_loop(user_text, steps)
-
-    async def _plan_steps(self, user_goal: str) -> List[str]:
-        """Generate flat step list via LLM for the ReAct loop."""
-        catalog = self._registry.describe()
-        messages = [
-            build_system_message(
-                "Return STRICT JSON: {\"steps\":[\"...\", ...]} with 3-7 steps for the goal. "
-                f"Available skills:\n{catalog}"
-            ),
-            build_user_message_text(user_goal),
-        ]
-        try:
-            resp = await self._llm.achat(messages, stream=False, enable_thinking=False)
-            raw = (resp.content or "").strip()
-            start = raw.find("{")
-            end = raw.rfind("}")
-            blob = raw[start : end + 1] if start != -1 and end != -1 else raw
-            data = json.loads(blob)
-            steps = [str(x) for x in list(data.get("steps") or [])]
-            return steps[:10]
-        except Exception:
-            logger.debug("plan_steps failed", exc_info=True)
-            return [user_goal]
-
-    async def _react_loop(
-        self,
-        user_text: str,
-        steps: List[str],
-        *,
-        enable_thinking: bool = False,
-    ) -> str:
-        """State-machine driven ReAct loop (async shell, sync semantics)."""
-        budget = IterationBudget.for_react(self._budget_config)
-        trace = ExecutionTrace()
-        ctx = _LoopContext(messages=self._build_loop_messages(user_text, steps))
-        state = ExecutionMode.PREPARING
-
-        while state != ExecutionMode.COMPLETE:
-            state = await self._loop_step(
-                state, ctx, budget, trace,
-                user_text=user_text,
-                enable_thinking=enable_thinking,
-            )
-
-        # Fire-and-forget: emit learning signal to the evolution ring
-        if trace.has_learning_signal:
-            asyncio.create_task(self._emit_execution_trace(trace))
-
-        # Sync conversation turn to long-term memory (non-blocking)
-        if self._memory_manager and self._settings.memory_integration_enabled:
-            asyncio.create_task(self._sync_turn_safe(ctx.messages))
-
-        logger.info(
-            "react_loop.complete steps=%d tokens=%d success=%s",
-            trace.step_count, trace.total_tokens, trace.success,
-        )
-        return ctx.last_content or "Stopped after step budget."
-
-    # ── State Machine Core ──────────────────────────────────────────────
-
-    async def _loop_step(  # noqa: C901 (state machine dispatch)
-        self,
-        state: ExecutionMode,
-        ctx: _LoopContext,
-        budget: IterationBudget,
-        trace: ExecutionTrace,
-        *,
-        user_text: str,
-        enable_thinking: bool,
-    ) -> ExecutionMode:
-        """Execute one state transition. Returns the next state."""
-
-        if state == ExecutionMode.PREPARING:
-            return await self._state_preparing(ctx, budget, trace, user_text=user_text)
-
-        if state == ExecutionMode.REASONING:
-            return await self._state_reasoning(ctx, trace, enable_thinking=enable_thinking)
-
-        if state == ExecutionMode.ROUTING:
-            return self._state_routing(ctx, trace)
-
-        if state == ExecutionMode.ACTING:
-            return await self._state_acting(ctx, trace, user_text=user_text)
-
-        if state == ExecutionMode.OBSERVING:
-            return self._state_observing(ctx, budget, trace)
-
-        if state == ExecutionMode.RECOVERING:
-            return await self._state_recovering(ctx, budget, trace)
-
-        # Fallback: unreachable unless enum extended
-        trace.record(ExecutionMode.COMPLETE, error="invalid_state")
-        return ExecutionMode.COMPLETE
-
-    # ── State Handlers ──────────────────────────────────────────────────
-
-    async def _state_preparing(
-        self, ctx: _LoopContext, budget: IterationBudget, trace: ExecutionTrace,
-        *, user_text: str = "",
-    ) -> ExecutionMode:
-        """Budget check + memory prefetch + message healing + compression."""
-        status = budget.consume()
-
-        if status == BudgetStatus.EXHAUSTED:
-            trace.record(ExecutionMode.COMPLETE, error="budget_exhausted")
-            ctx.last_content = self._budget_exhausted_response(ctx.messages)
-            return ExecutionMode.COMPLETE
-
-        # Prefetch memory context on first iteration (non-blocking with timeout)
-        if not ctx.prefetch_done and self._memory_manager and self._settings.memory_integration_enabled:
-            ctx.prefetch_done = True
-            try:
-                entries = await asyncio.wait_for(
-                    self._memory_manager.prefetch(
-                        user_text, limit=self._settings.memory_prefetch_limit,
-                    ),
-                    timeout=self._settings.memory_prefetch_timeout_s,
-                )
-                if entries:
-                    context_lines = [e.content for e in entries if e.content]
-                    if context_lines:
-                        memory_block = (
-                            "MEMORY_CONTEXT (relevant past experiences):\n"
-                            + "\n".join(f"- {line}" for line in context_lines)
-                        )
-                        ctx.messages.append(build_user_message_text(memory_block))
-                        logger.debug("memory.prefetch injected %d entries", len(context_lines))
-            except asyncio.TimeoutError:
-                logger.debug("memory.prefetch timed out (%.1fs)", self._settings.memory_prefetch_timeout_s)
-            except Exception:
-                logger.debug("memory.prefetch failed", exc_info=True)
-
-        # Heal and compress
-        ctx.messages = self._healer.heal(ctx.messages)
-        ctx.messages = self._compressor.compress(ctx.messages)
-
-        # Inject convergence hint near soft limit
-        if status == BudgetStatus.SOFT_LIMIT:
-            ctx.messages.append(build_user_message_text(
-                "SYSTEM: Approaching iteration limit. Please converge and provide final answer."
-            ))
-
-        remaining = budget.remaining
-        _log_progress(f"Thinking (budget {remaining} remaining)...")
-        return ExecutionMode.REASONING
-
-    async def _state_reasoning(
-        self, ctx: _LoopContext, trace: ExecutionTrace, *, enable_thinking: bool
-    ) -> ExecutionMode:
-        """LLM call — the only await in the hot path."""
-        t0 = time.perf_counter()
-        try:
-            resp = await self._llm.achat(
-                ctx.messages + self._wm.as_chat_messages(),
-                stream=False,
-                enable_thinking=enable_thinking,
-            )
-            latency = (time.perf_counter() - t0) * 1000
-            content = (resp.content or "").strip()
-            tokens = getattr(resp, "usage_tokens", 0)
-            trace.record(ExecutionMode.REASONING, tokens_used=tokens, latency_ms=latency)
-
-            if resp.thinking_content:
-                logger.debug("audit.thinking chars=%s", len(resp.thinking_content))
-
-            ctx.last_content = content
-            self._wm.remember_chat(build_assistant_message(content))
-            ctx.messages.append(build_assistant_message(content))
-            return ExecutionMode.ROUTING
-
-        except Exception as exc:
-            trace.record(ExecutionMode.RECOVERING, error=str(exc))
-            ctx.last_error = exc
-            return ExecutionMode.RECOVERING
-
-    def _state_routing(self, ctx: _LoopContext, trace: ExecutionTrace) -> ExecutionMode:
-        """Parse LLM output and decide: final answer, action, or raw text."""
-        content = ctx.last_content
-
-        try:
-            obj = _extract_json_object(content)
-        except Exception:
-            # No parseable JSON — treat as final answer
-            logger.info("audit.react_no_json; returning assistant text")
-            trace.record(ExecutionMode.COMPLETE)
-            return ExecutionMode.COMPLETE
-
-        action = obj.get("action") or {}
-        a_type = str(action.get("type", "")).strip()
-
-        # Final answer
-        if a_type == "answer" and str(action.get("name")) == "final":
-            payload = action.get("payload") or {}
-            ans = str(payload.get("text") or payload.get("content") or "").strip()
-            ctx.last_content = ans or content
-            trace.record(ExecutionMode.COMPLETE)
-            return ExecutionMode.COMPLETE
-
-        if not a_type:
-            # No action type — treat content as final answer
-            trace.record(ExecutionMode.COMPLETE)
-            return ExecutionMode.COMPLETE
-
-        # Prepare prediction loop (world model)
-        action_name = str(action.get("name", a_type)).strip()
-        predicted_effect = str(obj.get("predicted_effect", "")).strip()
-        if predicted_effect:
-            self._wm.remember_event(
-                "react_prediction",
-                f"action={action_name}, predicted={predicted_effect}",
-                {"action": action_name},
-            )
-
-        ctx.last_action = action
-        return ExecutionMode.ACTING
-
-    async def _state_acting(
-        self, ctx: _LoopContext, trace: ExecutionTrace, *, user_text: str
-    ) -> ExecutionMode:
-        """Execute the parsed action via skill/bridge."""
-        action = ctx.last_action or {}
-        action_name = str(action.get("name", action.get("type", ""))).strip()
-        action_payload = action.get("payload") or {}
-
-        payload_hint = json.dumps(action_payload, ensure_ascii=False)
-        if len(payload_hint) > 200:
-            payload_hint = payload_hint[:200] + "..."
-        _log_progress(f"Executing action: {action_name} — {payload_hint}")
-
-        # Prediction loop pre-snapshot
-        a_type = str(action.get("type", "")).strip()
-        predicted_effect = ""
-        # Extract predicted_effect from original JSON if available
-        try:
-            obj = _extract_json_object(ctx.last_content)
-            predicted_effect = str(obj.get("predicted_effect", "")).strip()
-        except Exception:
-            pass
-
-        react_prediction = None
-        pl = self._registry.prediction_loop
-        if predicted_effect and pl is not None and pl.enabled:
-            react_prediction = pl.create_from_react_prediction(
-                action_desc=f"{a_type}:{action_name}",
-                predicted_effect=predicted_effect,
-            )
-            await pl.capture_pre_snapshot()
-
-        t0 = time.perf_counter()
-        observation = await self._execute_action(action, user_text)
-        latency = (time.perf_counter() - t0) * 1000
-
-        # Prediction loop verification
-        if react_prediction is not None and pl is not None:
-            await pl.verify_prediction(react_prediction)
-
-        trace.record(
-            ExecutionMode.ACTING,
-            action=action,
-            observation=observation if isinstance(observation, dict) else {"result": str(observation)},
-            latency_ms=latency,
-        )
-        ctx.last_observation = observation
-        return ExecutionMode.OBSERVING
-
-    def _state_observing(
-        self, ctx: _LoopContext, budget: IterationBudget, trace: ExecutionTrace
-    ) -> ExecutionMode:
-        """Evaluate observation and feed back into messages."""
-        observation = ctx.last_observation
-        is_error = isinstance(observation, dict) and not observation.get("ok", True)
-
-        if is_error:
-            ctx.consecutive_failures += 1
-            error_detail = (
-                observation.get("error", "unknown error")
-                if isinstance(observation, dict)
-                else str(observation)
-            )
-            category = self._error_classifier.classify_tool_error(observation)
-            max_tool_failures = self._settings.max_consecutive_tool_failures
-
-            if category == ErrorCategory.PERMANENT or ctx.consecutive_failures >= max_tool_failures:
-                _log_progress(f"{ctx.consecutive_failures} consecutive failures — stopping")
-                trace.record(ExecutionMode.COMPLETE, error="max_tool_failures")
-                ctx.last_content = self._error_response(observation)
-                return ExecutionMode.COMPLETE
-
-            _log_progress(f"Action failed ({ctx.consecutive_failures}/3): {error_detail}")
-            budget.refund("tool_failure")
-            error_obs = json.dumps(
-                {"observation": observation, "recovery_hint": "Previous action failed. Try an alternative approach."},
-                ensure_ascii=False,
-            )
-            ctx.messages.append(build_user_message_text(error_obs))
-            self._wm.remember_event("react_error", str(error_detail)[:200], {})
-            return ExecutionMode.PREPARING
-
-        # Success
-        ctx.consecutive_failures = 0
-        obs_summary = str(observation)
-        if len(obs_summary) > 300:
-            obs_summary = obs_summary[:300] + "..."
-        _log_progress(f"Observation: {obs_summary}")
-        obs_text = json.dumps({"observation": observation}, ensure_ascii=False)
-        ctx.messages.append(build_user_message_text(obs_text))
-        self._wm.remember_event("react_observation", obs_text, {})
-        return ExecutionMode.PREPARING
-
-    async def _state_recovering(
-        self, ctx: _LoopContext, budget: IterationBudget, trace: ExecutionTrace
-    ) -> ExecutionMode:
-        """Handle LLM/network errors with classified recovery."""
-        exc = ctx.last_error
-        if exc is None:
-            trace.record(ExecutionMode.COMPLETE, error="unknown_recovery")
-            return ExecutionMode.COMPLETE
-
-        category = self._error_classifier.classify(exc)
-        recovery = self._error_classifier.get_recovery(category)
-
-        if recovery.retry and ctx.consecutive_failures < recovery.max_retries:
-            ctx.consecutive_failures += 1
-            if recovery.backoff:
-                delay = jittered_backoff(ctx.consecutive_failures, base=recovery.base_delay)
-                await asyncio.sleep(delay)
-            if recovery.compress:
-                ctx.messages = self._compressor.force_compress(ctx.messages)
-            logger.warning(
-                "react_loop.recovery category=%s attempt=%d",
-                category.value, ctx.consecutive_failures,
-            )
-            return ExecutionMode.PREPARING
-
-        # Unrecoverable
-        trace.record(ExecutionMode.COMPLETE, error=str(exc))
-        ctx.last_content = f"Error: {exc}"
-        return ExecutionMode.COMPLETE
-
     # ── Unified Tool Loop (chat scenarios) ───────────────────────────────
 
     def _new_compressor(self) -> ContextCompressor:
@@ -2757,7 +2499,11 @@ class AgentEngine:
         content = ""
         fatal_error: Optional[str] = None
         # P3: Initialize recovery coordinator for this turn
-        recovery_budget = RecoveryBudget()
+        recovery_budget = RecoveryBudget(
+            turn_deadline_s=self._settings.recovery_turn_deadline_s,
+            total_recovery_actions=self._settings.recovery_total_actions,
+            max_retry_per_category=self._settings.recovery_max_retry_per_category,
+        )
         recovery_budget.start_deadline()
         self._recovery_coordinator = RecoveryCoordinator(
             strategies=default_strategies(),
@@ -2783,7 +2529,21 @@ class AgentEngine:
 
             status = budget.consume()
             if status == BudgetStatus.EXHAUSTED:
-                break
+                # Progress-gated continuation: a productively-unfinished task
+                # (open ledger work, still progressing, within resource limits)
+                # extends past the elastic ceiling toward the hard cap instead of
+                # terminating; a stalled/complete/over-budget task stops here.
+                if budget.can_extend and self._should_extend_budget(frame):
+                    budget.grant_extension(self._settings.agent_iter_extension_step)
+                    if budget.status() == BudgetStatus.EXHAUSTED:
+                        break  # absolute hard cap reached
+                    logger.info(
+                        "unified_loop: budget extended (progress-gated) to %d (stalled=%d)",
+                        budget.effective_max, frame.stalled_rounds,
+                    )
+                    status = budget.status()
+                else:
+                    break
 
             self._inject_live_signals(messages, _signal_watermark)
 
@@ -2794,6 +2554,7 @@ class AgentEngine:
                 round_number=budget.used,
             )
             self._widen_budget_for_difficulty(budget)
+            self._update_progress_and_stall(frame)
             self._evaluate_prefix_commitment(budget)
 
             try:
@@ -2956,10 +2717,16 @@ class AgentEngine:
                     messages.append(build_user_message_text(_unknown_tool_retry_prompt(retryable_unknown)))
                     continue
 
-                failures = self._count_consecutive_tool_failures(messages)
-                recovery.consecutive_tool_failures = failures
-                if failures >= self._settings.max_consecutive_tool_failures:
-                    logger.warning("unified_loop: %d consecutive tool failures, stopping", failures)
+                halt_reason = self._evaluate_tool_failures(
+                    [
+                        (item.get("name") or "", item["result"])
+                        for item in results
+                        if isinstance(item.get("result"), dict) and _tool_result_counts_as_failure(item["result"])
+                    ],
+                    turn_id=budget.used,
+                )
+                if halt_reason:
+                    fatal_error = halt_reason
                     break
 
                 # Guardrail check after tool execution
@@ -2970,7 +2737,7 @@ class AgentEngine:
                     f"[Called: {', '.join(tc.name for tc in native_calls)}]"
                 ))
 
-                if status == BudgetStatus.SOFT_LIMIT:
+                if status == BudgetStatus.SOFT_LIMIT and not self._should_extend_budget(frame):
                     messages.append(build_user_message_text(
                         "SYSTEM: Approaching limit. Provide final answer now."
                     ))
@@ -3043,42 +2810,21 @@ class AgentEngine:
                 )
                 break
 
-            # Classify tool failures through coordinator for audit and decision
-            if (
-                isinstance(result, dict)
-                and not result.get("ok", True)
-                and result.get("counts_as_failure") is not False
-            ):
-                tool_envelope = self._unified_classifier.classify_tool_result(
-                    result, tool_name=tool_name,
-                    execution_policy=result.get("execution_policy", "read_only"),
-                )
-                if tool_envelope is not None:
-                    tool_decision = self._recovery_coordinator.evaluate(tool_envelope)
-                    self._audit_sink.record(create_audit_entry(
-                        tool_envelope, tool_decision, self._recovery_coordinator.budget,
-                        session_id=getattr(self, '_current_session_id', '') or '',
-                        turn_id=budget.used,
-                    ))
-                    if tool_decision.action in (RecoveryAction.HALT_CLEAN, RecoveryAction.HALT_WITH_CHECKPOINT):
-                        fatal_error = tool_decision.reason
-                        break
-                    # Other actions: let LLM handle (append result to messages as before)
-
             if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
                 unknown_tool_retry_used = True
                 messages.append(build_user_message_text(_unknown_tool_retry_prompt(result)))
                 continue
 
-            if is_error and recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
-                logger.warning("unified_loop: %d consecutive tool failures, stopping",
-                               recovery.consecutive_tool_failures)
-                break
+            if is_error:
+                halt_reason = self._evaluate_tool_failures([(tool_name, result)], turn_id=budget.used)
+                if halt_reason:
+                    fatal_error = halt_reason
+                    break
 
             if self._check_guardrail(messages) == "halt":
                 break
 
-            if status == BudgetStatus.SOFT_LIMIT:
+            if status == BudgetStatus.SOFT_LIMIT and not self._should_extend_budget(self._active_frame):
                 messages.append(build_user_message_text(
                     "SYSTEM: Approaching limit. Provide final answer now."
                 ))
@@ -3109,7 +2855,7 @@ class AgentEngine:
         fallback = (
             _app_onboarding_recovery_message(messages)
             or _last_tool_failures_recovery_message(messages)
-            or "I've reached my processing limit."
+            or self._budget_exhausted_response(messages)
         )
         self._emit_chat_event("response", {"content": fallback[:500]})
         return fallback
@@ -3273,7 +3019,11 @@ class AgentEngine:
         turn_recovery = TurnRecoveryState()
         self._active_frame = self._build_frame(user_text, enable_thinking, budget, turn_recovery)
         # Initialize recovery coordinator for stream turn
-        recovery_budget = RecoveryBudget()
+        recovery_budget = RecoveryBudget(
+            turn_deadline_s=self._settings.recovery_turn_deadline_s,
+            total_recovery_actions=self._settings.recovery_total_actions,
+            max_retry_per_category=self._settings.recovery_max_retry_per_category,
+        )
         recovery_budget.start_deadline()
         self._recovery_coordinator = RecoveryCoordinator(
             strategies=default_strategies(),
@@ -3299,7 +3049,20 @@ class AgentEngine:
 
             status = budget.consume()
             if status == BudgetStatus.EXHAUSTED:
-                break
+                # Progress-gated continuation (mirrors _run_agent_loop): extend a
+                # productively-unfinished task past the elastic ceiling toward the
+                # hard cap; a stalled/complete/over-budget task stops here.
+                if budget.can_extend and self._should_extend_budget(self._active_frame):
+                    budget.grant_extension(self._settings.agent_iter_extension_step)
+                    if budget.status() == BudgetStatus.EXHAUSTED:
+                        break  # absolute hard cap reached
+                    logger.info(
+                        "unified_loop_stream: budget extended (progress-gated) to %d",
+                        budget.effective_max,
+                    )
+                    status = budget.status()
+                else:
+                    break
 
             self._inject_live_signals(messages, _signal_watermark)
 
@@ -3310,6 +3073,7 @@ class AgentEngine:
                 round_number=budget.used,
             )
             self._widen_budget_for_difficulty(budget)
+            self._update_progress_and_stall(self._active_frame)
             self._evaluate_prefix_commitment(budget)
 
             content = ""
@@ -3463,16 +3227,22 @@ class AgentEngine:
                         )
                         break
 
-                    failures = self._count_consecutive_tool_failures(messages)
-                    turn_recovery.consecutive_tool_failures = failures
                     if retryable_unknown and not unknown_tool_retry_used:
                         unknown_tool_retry_used = True
                         tools_kwarg = self._expand_tools_kwarg_full(tools_kwarg, TOOL_DEFINITIONS)
                         use_native_tools = bool(tools_kwarg)
                         messages.append(build_user_message_text(_unknown_tool_retry_prompt(retryable_unknown)))
                         continue
-                    if failures >= self._settings.max_consecutive_tool_failures:
-                        logger.warning("unified_loop_stream: %d consecutive tool failures, stopping", failures)
+                    halt_reason = self._evaluate_tool_failures(
+                        [
+                            (item.get("name") or "", item["result"])
+                            for item in results
+                            if isinstance(item.get("result"), dict) and _tool_result_counts_as_failure(item["result"])
+                        ],
+                        turn_id=budget.used,
+                    )
+                    if halt_reason:
+                        fatal_error = halt_reason
                         break
 
                     if self._check_guardrail(messages) == "halt":
@@ -3481,7 +3251,7 @@ class AgentEngine:
                     self._wm.remember_chat(build_assistant_message(
                         f"[Called: {', '.join(tc.name for tc in native_calls)}]"
                     ))
-                    if status == BudgetStatus.SOFT_LIMIT:
+                    if status == BudgetStatus.SOFT_LIMIT and not self._should_extend_budget(self._active_frame):
                         messages.append(build_user_message_text(
                             "SYSTEM: Approaching limit. Provide final answer now."
                         ))
@@ -3733,15 +3503,16 @@ class AgentEngine:
                 messages.append(build_user_message_text(_unknown_tool_retry_prompt(result)))
                 continue
 
-            if is_error and turn_recovery.consecutive_tool_failures >= self._settings.max_consecutive_tool_failures:
-                logger.warning("unified_loop_stream: %d consecutive tool failures, stopping",
-                               turn_recovery.consecutive_tool_failures)
-                break
+            if is_error:
+                halt_reason = self._evaluate_tool_failures([(tool_name, result)], turn_id=budget.used)
+                if halt_reason:
+                    fatal_error = halt_reason
+                    break
 
             if self._check_guardrail(messages) == "halt":
                 break
 
-            if status == BudgetStatus.SOFT_LIMIT:
+            if status == BudgetStatus.SOFT_LIMIT and not self._should_extend_budget(self._active_frame):
                 messages.append(build_user_message_text(
                     "SYSTEM: Approaching limit. Provide final answer now."
                 ))
@@ -3771,7 +3542,7 @@ class AgentEngine:
                 _app_onboarding_recovery_message(messages)
                 or _last_tool_failures_recovery_message(messages)
                 or fatal_error
-                or "I've reached my processing limit."
+                or self._budget_exhausted_response(messages)
             )
             self._emit_chat_event("response", {"content": fallback[:500]})
             yield StreamEvent(type="final", content=fallback)
@@ -4243,40 +4014,27 @@ class AgentEngine:
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
-    def _build_loop_messages(self, user_text: str, steps: List[str]) -> List[Dict[str, Any]]:
-        """Build initial messages for the ReAct loop."""
-        skill_catalog = self._registry.describe_with_params()
-
-        # Append memory tool descriptions if available
-        memory_tools_desc = ""
-        if self._memory_manager and self._settings.memory_integration_enabled:
-            schemas = self._memory_manager.get_tool_schemas()
-            if schemas:
-                tool_lines = []
-                for s in schemas:
-                    tool_lines.append(f"  - {s.name}: {s.description}")
-                memory_tools_desc = (
-                    "\n\nMEMORY TOOLS (type=\"memory\"):\n"
-                    + "\n".join(tool_lines)
-                )
-
-        system_prompt = REACT_SYSTEM_TEMPLATE.format(skill_catalog=skill_catalog)
-        if memory_tools_desc:
-            system_prompt += memory_tools_desc
-
-        return [
-            build_system_message(system_prompt),
-            build_user_message_text(
-                "GOAL:\n"
-                f"{user_text}\n\n"
-                "CONTEXT:\n"
-                f"- plan_steps: {json.dumps(steps, ensure_ascii=False)}\n"
-            ),
-        ]
-
     def _budget_exhausted_response(self, messages: List[Dict[str, Any]]) -> str:
-        """Generate response when budget is exhausted."""
-        return "I've reached my reasoning step limit. Here's my best answer based on progress so far."
+        """Response when the iteration hard cap is reached.
+
+        When the research ledger shows unfinished work, surface the remaining
+        open-question count and next step so the stop is informative and
+        continuable (not a bare dead-stop); otherwise the plain notice.
+        """
+        base = "I've reached my reasoning step limit. Here's my best answer based on progress so far."
+        led = self._research_ledger
+        if led.is_empty or led.open_question_count == 0:
+            return base
+        d = led.as_dict()
+        parts = [
+            base,
+            "",
+            f"Note: {led.open_question_count} open question(s) remain — the task is not fully complete.",
+        ]
+        next_step = d.get("next_step", "")
+        if next_step:
+            parts.append(f"Suggested next step: {next_step}")
+        return "\n".join(parts)
 
     @staticmethod
     def _error_response(observation: Any) -> str:

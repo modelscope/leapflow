@@ -108,6 +108,33 @@ class TurnRecoveryState:
         self._multimodal_strip = True
         return True
 
+    def rearm_after_progress(self) -> bool:
+        """Re-arm content-level one-shot recovery guards after genuine progress.
+
+        A long task is a single turn spanning many iterations, and legitimately
+        needs the same *content* recovery more than once — e.g. several max_tokens
+        continuations or context force-compressions across the turn. Once the
+        task has made progress (so it is not in a recovery storm), these guards
+        are re-armed so recovery stays available for the rest of the turn.
+
+        Infrastructure-level one-shots (native->text fallback, provider failover,
+        credential rotation) stay strict for the whole turn — they are storm-prone
+        and are already bounded separately by the RecoveryBudget. Returns True if
+        any guard was actually re-armed.
+        """
+        rearmed = (
+            self._compressed or self._length_continuation or self._format_recovery
+            or self._image_shrunk or self._multimodal_strip or self._thinking_disabled
+        )
+        if rearmed:
+            self._compressed = False
+            self._length_continuation = False
+            self._format_recovery = False
+            self._image_shrunk = False
+            self._multimodal_strip = False
+            self._thinking_disabled = False
+        return rearmed
+
     def record_api_error(self, category: Optional[str] = None) -> int:
         """Increment API error counter. Returns new count."""
         self.consecutive_api_errors += 1

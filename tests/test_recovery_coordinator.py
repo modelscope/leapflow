@@ -342,6 +342,16 @@ class TestRecoveryBudget:
         # Deadline not started — should never be exceeded
         assert budget.is_deadline_exceeded() is False
 
+    def test_zero_deadline_is_unlimited(self) -> None:
+        # A non-positive deadline means unlimited wall-clock time (P0'): a long
+        # task is never denied recovery for a late error; the action-count budget
+        # remains the bound.
+        budget = RecoveryBudget(turn_deadline_s=0.0)
+        budget.start_deadline()
+        time.sleep(0.02)
+        assert budget.is_deadline_exceeded() is False
+        assert budget.can_afford(1) is True
+
     def test_transform_failover_rotation_tracking(self) -> None:
         budget = RecoveryBudget(
             max_transform_attempts=1,

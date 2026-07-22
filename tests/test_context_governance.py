@@ -104,6 +104,79 @@ def test_context_compressor_records_transparent_trace() -> None:
     assert trace["savings_ratio"] > 0
 
 
+def test_no_drop_on_message_count_when_budget_has_room() -> None:
+    """Regression: many messages on a large-context budget must NOT be dropped.
+
+    The old count-based Drop fired at >32 messages and nuked context to a handful,
+    losing all findings. Compression is now token-utilization driven, so a large
+    window holds many messages untouched.
+    """
+    config = CompressorConfig(
+        token_budget=100_000,
+        context_length=1_000_000,
+        token_count_fn=lambda text: max(1, len(str(text)) // 4),
+    )
+    compressor = ContextCompressor(config)
+    messages = [{"role": "system", "content": "sys"}]
+    for i in range(40):
+        messages.append({"role": "user", "content": f"finding {i}: value_{i}"})
+        messages.append({"role": "assistant", "content": f"noted {i}"})
+
+    result = compressor.compress(messages)
+
+    assert len(result) == len(messages)                       # nothing dropped
+    joined = " ".join(str(m.get("content", "")) for m in result)
+    assert "finding 0:" in joined and "finding 39:" in joined  # early + late preserved
+    assert not any("dropped" in str(m.get("content", "")) for m in result)
+
+
+def test_drop_is_token_driven_and_preserves_summary_and_recent() -> None:
+    """Drop fires only near the token budget and preserves system + frozen summary
+    + recent tail, dropping only the uncompressed middle."""
+    config = CompressorConfig(
+        token_budget=1_000,
+        context_length=4_000,
+        token_count_fn=lambda text: max(1, len(str(text))),
+        enabled_stages=["drop"],
+    )
+    compressor = ContextCompressor(config)
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "FROZEN SUMMARY of earlier work", "_compressed_summary": True},
+    ]
+    for _ in range(20):
+        messages.append({"role": "user", "content": "X" * 100})  # ~2000 tokens >> budget*0.95
+
+    result = compressor.compress(messages)
+
+    assert result[0]["role"] == "system"                                   # prefix kept
+    assert any(m.get("_compressed_summary") for m in result)               # frozen summary kept
+    assert any("dropped" in str(m.get("content", "")) for m in result)     # drop notice present
+    assert len(result) < len(messages)                                     # middle dropped
+
+
+def test_summarize_fires_before_drop_under_pressure() -> None:
+    """Under moderate pressure the gentle Summarize stage compresses (producing a
+    structured summary) so the last-resort Drop never fires."""
+    config = CompressorConfig(
+        token_budget=10_000,
+        context_length=40_000,
+        summarize_threshold_messages=6,
+        token_count_fn=lambda text: max(1, len(str(text))),
+        enabled_stages=["summarize", "drop"],
+    )
+    compressor = ContextCompressor(config)
+    messages = [{"role": "system", "content": "sys"}]
+    for i in range(30):
+        messages.append({"role": "user", "content": f"turn {i}: " + "Y" * 300})
+
+    result = compressor.compress(messages)
+
+    assert any(m.get("_compressed_summary") for m in result)               # summarize produced a summary
+    assert not any("dropped" in str(m.get("content", "")) for m in result)  # drop did not fire
+    assert len(result) < len(messages)                                     # middle compressed
+
+
 def test_tool_evidence_builder_compacts_file_read_content() -> None:
     builder = ToolEvidenceBuilder(max_content_chars=240)
     result = {

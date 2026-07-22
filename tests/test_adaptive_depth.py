@@ -73,6 +73,60 @@ def test_elastic_max_is_monotonic_and_bounded() -> None:
         prev = value
 
 
+# ── Progress-gated continuation: extension past the elastic ceiling (P0) ──
+
+
+def test_grant_extension_pushes_past_ceiling_to_hard_cap() -> None:
+    """P0: progress-gated extension widens the cap past the elastic ceiling up to
+    the absolute hard cap, so a genuinely long task is bounded by progress and
+    resources rather than a fixed iteration count."""
+    cfg = BudgetConfig(max_iterations=12, iter_ceiling=80, hard_cap=200, scale_k=1.0)
+    budget = IterationBudget.for_react(cfg)
+    budget.retarget(budget.elastic_max(1.0))     # difficulty widens to the ceiling
+    assert budget.effective_max == 80
+    assert budget.can_extend is True             # 80 < 200 absolute ceiling
+
+    budget.grant_extension(25)
+    assert budget.effective_max == 105
+    for _ in range(20):
+        budget.grant_extension(25)               # saturate toward the hard cap
+    assert budget.effective_max == 200           # capped at hard_cap
+    assert budget.can_extend is False
+
+
+def test_difficulty_retarget_bounded_by_ceiling_not_hard_cap() -> None:
+    """Difficulty widening stays bounded by the elastic ceiling; only the
+    progress-gated extension may go past it toward the hard cap."""
+    cfg = BudgetConfig(max_iterations=12, iter_ceiling=80, hard_cap=200, scale_k=1.0)
+    budget = IterationBudget.for_react(cfg)
+    budget.retarget(999)
+    assert budget.effective_max == 80
+    assert budget.can_extend is True             # progress extension still available
+
+
+def test_no_hard_cap_means_no_progress_extension() -> None:
+    cfg = BudgetConfig(max_iterations=12, iter_ceiling=80)   # hard_cap defaults to 0
+    budget = IterationBudget.for_react(cfg)
+    budget.retarget(budget.elastic_max(1.0))
+    assert budget.effective_max == 80
+    assert budget.can_extend is False            # absolute_ceiling == elastic ceiling
+    budget.grant_extension(25)
+    assert budget.effective_max == 80            # no-op past the ceiling
+
+
+def test_status_is_side_effect_free_and_extension_clears_exhaustion() -> None:
+    budget = IterationBudget.for_react(
+        BudgetConfig(max_iterations=5, iter_ceiling=40, hard_cap=100, scale_k=1.0)
+    )
+    assert budget.status() == BudgetStatus.OK
+    assert budget.used == 0                       # status() consumes nothing
+    for _ in range(5):
+        budget.consume()                          # exhaust the floor cap
+    assert budget.status() == BudgetStatus.EXHAUSTED
+    budget.grant_extension(25)                    # progress-gated widening
+    assert budget.status() != BudgetStatus.EXHAUSTED
+
+
 def test_elastic_budget_capped_at_floor_without_retarget() -> None:
     budget = IterationBudget.for_react(
         BudgetConfig(max_iterations=12, iter_ceiling=80, scale_k=1.0)
