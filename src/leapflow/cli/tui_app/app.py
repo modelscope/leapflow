@@ -39,7 +39,7 @@ from typing import (
 from prompt_toolkit import Application
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.filters import Condition
-from prompt_toolkit.formatted_text.utils import fragment_list_len
+from prompt_toolkit.formatted_text.utils import fragment_list_len, fragment_list_width
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
@@ -51,6 +51,7 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import Processor, Transformation
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style as PTStyle
+from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import TextArea
 
 from leapflow.cli.tui_app.approval_modal import ApprovalModal, request_is_expired
@@ -91,6 +92,45 @@ def _compute_input_cap(rows: int) -> int:
     """Max visible input rows: grow with content up to ~45% of the terminal,
     leaving room for the status chrome and some transcript; never below 4."""
     return max(4, min(int(rows * 0.45), rows - 6))
+
+
+def _wrapped_display_rows(line: str, width: int) -> int:
+    """Return display rows needed for one logical line at a given cell width."""
+    width = max(1, int(width))
+    if not line:
+        return 1
+    rows = 1
+    used = 0
+    for char in line:
+        char_width = max(0, get_cwidth(char))
+        if char_width == 0:
+            continue
+        if used and used + char_width > width:
+            rows += 1
+            used = 0
+        if char_width > width:
+            rows += 1 if used else 0
+            used = 0
+            continue
+        used += char_width
+    return rows
+
+
+def _estimate_input_rows(text: str, columns: int, *, prompt_width: int = 0) -> int:
+    """Estimate wrapped display rows for the input buffer.
+
+    The first logical line loses cells to the rendered prompt prefix. Later
+    logical lines use the full input width. Width is display-cell based, so CJK
+    wide characters count as two cells.
+    """
+    columns = max(1, int(columns))
+    if not text:
+        return 1
+    total = 0
+    for index, line in enumerate(str(text).split("\n")):
+        line_width = columns if index else max(1, columns - max(0, prompt_width))
+        total += _wrapped_display_rows(line, line_width)
+    return max(1, total)
 
 
 class _DynamicPlaceholderProcessor(Processor):
@@ -746,6 +786,34 @@ class LeapApp:
 
     # ── Layout construction ──────────────────────────────────────────
 
+    def _current_input_text(self) -> str:
+        input_area = getattr(self, "_input_area", None)
+        buffer = getattr(input_area, "buffer", None)
+        return str(getattr(buffer, "text", "") or "")
+
+    def _input_visual_rows(self, columns: int) -> int:
+        prompt_width = fragment_list_width(self._prompt_fragments())
+        return _estimate_input_rows(
+            self._current_input_text(),
+            columns,
+            prompt_width=prompt_width,
+        )
+
+    def _input_hidden_rows(self) -> int:
+        terminal = shutil.get_terminal_size((80, 24))
+        cap = _compute_input_cap(terminal.lines)
+        return max(0, self._input_visual_rows(terminal.columns) - cap)
+
+    def _input_overflow_hint(self) -> list[tuple[str, str]]:
+        hidden_rows = self._input_hidden_rows()
+        if hidden_rows <= 0:
+            return []
+        suffix = "row" if hidden_rows == 1 else "rows"
+        return [(
+            "class:hint",
+            f"↑ {hidden_rows} more input {suffix} hidden · Ctrl+X Ctrl+E edit full draft",
+        )]
+
     def _input_height(self) -> Dimension:
         """Content-sized input height, capped adaptively to the terminal size.
 
@@ -753,8 +821,10 @@ class LeapApp:
         status chrome and some transcript remain on screen; a one-line draft
         still renders as a single row (dont_extend_height keeps it content-sized).
         """
-        rows = shutil.get_terminal_size((80, 24)).lines
-        return Dimension(min=1, max=_compute_input_cap(rows), preferred=1)
+        terminal = shutil.get_terminal_size((80, 24))
+        cap = _compute_input_cap(terminal.lines)
+        preferred = min(cap, max(1, self._input_visual_rows(terminal.columns)))
+        return Dimension(min=1, max=cap, preferred=preferred)
 
     def _build_input_area(
         self, commands: Sequence[tuple[str, str]], config_fields: Sequence[object]
@@ -812,11 +882,19 @@ class LeapApp:
             ),
             filter=has_approval,
         )
+        input_overflows = Condition(lambda: self._input_hidden_rows() > 0)
+
+        input_hint = Window(
+            content=FormattedTextControl(self._input_overflow_hint),
+            height=1,
+            style="class:hint",
+        )
         root = HSplit([
             ConditionalContainer(spinner, filter=no_approval),
             approval_panel,
             ConditionalContainer(status_gap, filter=no_approval),
             status_bar,
+            ConditionalContainer(input_hint, filter=no_approval & input_overflows),
             ConditionalContainer(self._input_area, filter=no_approval),
         ])
         layout = Layout(
