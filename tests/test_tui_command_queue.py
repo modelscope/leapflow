@@ -78,6 +78,44 @@ def test_input_overflow_hint_reports_hidden_rows(monkeypatch) -> None:
     assert "Ctrl+X Ctrl+E" in hint
 
 
+def test_input_height_pinned_small_while_agent_running(monkeypatch) -> None:
+    """While a task streams, the input area holds a stable small region so the
+    reserved bottom area does not thrash the scroll region under patch_stdout
+    (the terminal-crash cause). Adaptive sizing is idle-only.
+    """
+    app, _console, _status = _make_app()
+    monkeypatch.setattr(
+        app_module.shutil,
+        "get_terminal_size",
+        lambda _fallback=(80, 24): terminal_size((20, 24)),
+    )
+    app._input_area.buffer.text = "测" * 40   # long input that would grow the area when idle
+    app.agent_running = True                    # streaming -> pin to a stable footprint
+
+    height = app._input_area.window.height
+    resolved = height() if callable(height) else height
+
+    assert resolved.max == 4            # pre-regression stable cap, not the adaptive 45%
+    assert resolved.preferred == 1      # no scroll-region reshaping mid-stream
+
+
+def test_input_overflow_hint_omits_editor_while_running(monkeypatch) -> None:
+    app, _console, _status = _make_app()
+    monkeypatch.setattr(
+        app_module.shutil,
+        "get_terminal_size",
+        lambda _fallback=(80, 24): terminal_size((10, 10)),
+    )
+    app._input_area.buffer.text = "测" * 30
+    app.agent_running = True
+
+    hint = to_plain_text(app._input_overflow_hint())
+
+    assert "more input" in hint and "hidden" in hint
+    assert "Ctrl+X Ctrl+E" not in hint   # editor disabled while streaming -> not advertised
+    assert "idle" in hint
+
+
 class _FakeConsole:
     def __init__(self) -> None:
         self.cards: list[TuiCommand] = []

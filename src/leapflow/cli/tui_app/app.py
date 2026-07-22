@@ -799,9 +799,22 @@ class LeapApp:
             prompt_width=prompt_width,
         )
 
+    def _effective_input_cap(self, lines: int) -> int:
+        """Max visible input rows for the current run-state.
+
+        While a task streams output, hold a small, stable cap: a dynamic or large
+        reserved region reshapes the scroll region under ``patch_stdout`` on
+        every redraw and can crash the terminal (macOS Terminal in particular).
+        Adaptive, content-sized sizing resumes once the task finishes (idle),
+        when the input area is the sole owner of the TTY.
+        """
+        if self._agent_running:
+            return 4
+        return _compute_input_cap(lines)
+
     def _input_hidden_rows(self) -> int:
         terminal = shutil.get_terminal_size((80, 24))
-        cap = _compute_input_cap(terminal.lines)
+        cap = self._effective_input_cap(terminal.lines)
         return max(0, self._input_visual_rows(terminal.columns) - cap)
 
     def _input_overflow_hint(self) -> list[tuple[str, str]]:
@@ -809,20 +822,27 @@ class LeapApp:
         if hidden_rows <= 0:
             return []
         suffix = "row" if hidden_rows == 1 else "rows"
+        # The external editor is disabled while a task streams (single TTY owner),
+        # so don't advertise it then.
+        action = "full view resumes when idle" if self._agent_running else "Ctrl+X Ctrl+E edit full draft"
         return [(
             "class:hint",
-            f"↑ {hidden_rows} more input {suffix} hidden · Ctrl+X Ctrl+E edit full draft",
+            f"↑ {hidden_rows} more input {suffix} hidden · {action}",
         )]
 
     def _input_height(self) -> Dimension:
-        """Content-sized input height, capped adaptively to the terminal size.
+        """Content-sized input height, capped to the terminal size when idle.
 
-        Long, wrapped input stays visible far longer than a fixed cap while the
-        status chrome and some transcript remain on screen; a one-line draft
-        still renders as a single row (dont_extend_height keeps it content-sized).
+        While a task streams output the height is pinned to a small, stable
+        region (min=1, max=4, preferred=1) so the reserved bottom area does not
+        thrash the scroll region under ``patch_stdout`` mid-stream — a cause of
+        terminal crashes. When idle the height tracks wrapped content up to an
+        adaptive cap; a one-line draft still renders as a single row.
         """
         terminal = shutil.get_terminal_size((80, 24))
-        cap = _compute_input_cap(terminal.lines)
+        cap = self._effective_input_cap(terminal.lines)
+        if self._agent_running:
+            return Dimension(min=1, max=cap, preferred=1)
         preferred = min(cap, max(1, self._input_visual_rows(terminal.columns)))
         return Dimension(min=1, max=cap, preferred=preferred)
 
@@ -1019,9 +1039,12 @@ class LeapApp:
 
         @kb.add(Keys.ControlX, Keys.ControlE)
         def _(event):
-            # Compose long input in $EDITOR (buffer round-trips via tempfile_suffix);
-            # the edited text returns to the prompt for review before submit.
-            if ref._approval_modal is not None:
+            # Compose long input in $EDITOR only when idle. Spawning an external
+            # editor (alternate screen + raw mode) while a task streams output
+            # through patch_stdout makes two owners contend for the TTY and can
+            # crash the terminal; the editor becomes available again the moment
+            # the task finishes. (buffer round-trips via tempfile_suffix.)
+            if ref._approval_modal is not None or ref._agent_running:
                 return
             event.current_buffer.open_in_editor(validate_and_handle=False)
 
