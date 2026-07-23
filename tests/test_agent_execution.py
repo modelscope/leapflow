@@ -151,6 +151,12 @@ async def test_child_frame_runs_isolated_from_parent() -> None:
             parent_compressor = engine._compressor
             assert engine._active_frame is None
 
+            # Per-turn identity must also be scoped to the frame (saved/restored
+            # around the child), so a child cannot leak its ids to the parent.
+            engine._current_session_id = "parent-sess"
+            engine._current_turn_id = "parent-turn"
+            engine._current_command_id = "parent-cmd"
+
             # A child frame must have fresh, distinct subsystems.
             child = engine._build_child_frame("do a subtask", depth=1)
             assert child.governance is not parent_governance
@@ -168,6 +174,10 @@ async def test_child_frame_runs_isolated_from_parent() -> None:
             assert engine._prefix_commitment is parent_commitment
             assert engine._compressor is parent_compressor
             assert engine._active_frame is None
+            # Per-turn ids restored to the parent's after the child run.
+            assert engine._current_session_id == "parent-sess"
+            assert engine._current_turn_id == "parent-turn"
+            assert engine._current_command_id == "parent-cmd"
         finally:
             lt.close()
 

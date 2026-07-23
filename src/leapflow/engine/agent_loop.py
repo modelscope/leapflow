@@ -64,6 +64,13 @@ class AgentLoopFrame:
     tool_filter: Optional[FrozenSet[str]] = None
     enable_thinking: bool = False
     parent_session_id: Optional[str] = None
+    # Per-turn identity carried on the frame so a turn's state is fully
+    # self-contained (foundation for per-turn concurrency isolation). Populated
+    # at frame build; ``_cancel_requested`` is intentionally NOT here — it is a
+    # cross-frame signal that must propagate into a running child.
+    session_id: str = ""
+    turn_id: str = ""
+    command_id: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property

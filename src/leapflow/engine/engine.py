@@ -964,6 +964,11 @@ class AgentEngine:
         # Cancellation: tracks active task for interrupt support
         self._active_task: Optional[asyncio.Task] = None
         self._cancel_requested = False
+        # Per-turn identity, set at turn start; initialized so reads and the
+        # subagent frame save/restore never hit an unset attribute.
+        self._current_session_id: str = ""
+        self._current_turn_id: str = ""
+        self._current_command_id: str = ""
 
         # Tool loop guardrails (injected by CLI)
         self._guardrail: Optional[Any] = None
@@ -2506,6 +2511,13 @@ class AgentEngine:
             "coordinator": self._recovery_coordinator,
             "snapshot": self._last_context_snapshot,
             "categories": self._last_turn_tool_categories,
+            # Per-turn identity is turn-start-set and non-propagating, so it is
+            # scoped to the frame (a child that reassigns it must not leak to the
+            # parent). NOTE: _cancel_requested is deliberately NOT saved here — it
+            # is a cross-frame signal that must propagate into a running child.
+            "session_id": self._current_session_id,
+            "turn_id": self._current_turn_id,
+            "command_id": self._current_command_id,
             "frame": self._active_frame,
         }
         self._context_governance_controller = frame.governance
@@ -2530,6 +2542,9 @@ class AgentEngine:
         self._recovery_coordinator = saved["coordinator"]
         self._last_context_snapshot = saved["snapshot"]
         self._last_turn_tool_categories = saved["categories"]
+        self._current_session_id = saved["session_id"]
+        self._current_turn_id = saved["turn_id"]
+        self._current_command_id = saved["command_id"]
         self._active_frame = saved["frame"]
 
     async def _run_child_frame(self, frame: AgentLoopFrame) -> str:
@@ -2583,6 +2598,9 @@ class AgentEngine:
             commitment=self._prefix_commitment,
             usage_tracker=self._usage_tracker,
             compressor=self._compressor,
+            session_id=self._current_session_id,
+            turn_id=self._current_turn_id,
+            command_id=self._current_command_id,
         )
 
     def _build_root_frame(self, user_text: str, *, enable_thinking: bool = False) -> AgentLoopFrame:

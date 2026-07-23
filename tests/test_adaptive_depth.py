@@ -1067,6 +1067,10 @@ def test_agent_loop_frame_carries_mutable_per_turn_state() -> None:
     assert frame.last_context_snapshot["difficulty"] == 0.5
     assert frame.recovery_coordinator is None            # optional until built by the engine
     assert frame.last_turn_tool_categories == frozenset()
+    # Per-turn identity is carried on the frame (foundation for isolation).
+    assert frame.session_id == "" and frame.turn_id == "" and frame.command_id == ""
+    ided = AgentLoopFrame(user_text="q", session_id="s1", turn_id="t1", command_id="c1")
+    assert (ided.session_id, ided.turn_id, ided.command_id) == ("s1", "t1", "c1")
 
 
 # ── W4-A1: depth-gated subagent recursion (default-equivalent) ──
