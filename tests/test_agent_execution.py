@@ -120,6 +120,66 @@ async def test_react_loop_tool_then_answer() -> None:
             lt.close()
 
 
+@pytest.mark.xfail(
+    reason=(
+        "P1 Stage 3 acceptance criterion: true per-turn CONCURRENCY isolation. The engine "
+        "currently shares per-turn substrate across a single instance (active frame, working "
+        "memory, prompt assembly), so two turns run concurrently on one engine cross-contaminate. "
+        "The daemon deliberately serializes turns via _engine_lock today (P0 gives the waiting "
+        "client immediate 'queued' feedback). This test documents the target: concurrent turns "
+        "must not leak each other's content. Un-xfail when Stage 3 lands N>1 isolation."
+    ),
+    strict=False,
+)
+@pytest.mark.asyncio
+async def test_concurrent_engine_turns_are_isolated() -> None:
+    import json as _json
+    from leapflow.engine.engine import AgentEngine, build_default_registry
+    from leapflow.llm.base import LLMChatResponse, LLMProvider
+    from leapflow.platform.mock import MockBridge
+
+    class _EchoLLM(LLMProvider):
+        async def achat(self, messages, *, stream=True, enable_thinking=False, **kwargs):
+            user = ""
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    user = str(m.get("content") or "")
+                    break
+            payload = {"thought": "d", "action": {"type": "answer", "name": "final", "payload": {"text": user}}}
+            return LLMChatResponse(content=_json.dumps(payload))
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            if False:
+                yield ""
+
+    class _Simple:
+        def classify(self, *a, **k):
+            return "simple"
+
+        async def aclassify(self, *a, **k):
+            return "simple"
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        rpc = MockBridge()
+        llm = _EchoLLM()
+        wm = WorkingMemoryProvider(max_tokens=1024)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, _Simple())
+            out_a, out_b = await asyncio.gather(
+                engine._unified_tool_loop("MARKER-AAA-111"),
+                engine._unified_tool_loop("MARKER-BBB-222"),
+            )
+            # Each turn must reflect only its own input (no cross-contamination).
+            assert "111" in out_a and "222" not in out_a
+            assert "222" in out_b and "111" not in out_b
+        finally:
+            lt.close()
+
+
 @pytest.mark.asyncio
 async def test_child_frame_runs_isolated_from_parent() -> None:
     """RB4: a recursive child frame runs the full loop without contaminating the
