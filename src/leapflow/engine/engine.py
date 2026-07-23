@@ -4293,6 +4293,11 @@ class AgentEngine:
             import uuid as _uuid
             if self._current_session_id is None:
                 self._current_session_id = _uuid.uuid4().hex[:16]
+            # Create the session row if it does not exist yet. This covers a
+            # freshly-minted id and a client-provided id alike (e.g. a distinct
+            # per-TUI session bound by the daemon), so persistence works no matter
+            # who chose the id.
+            if self._conversation_store.get_session(self._current_session_id) is None:
                 title = user_text[:80].replace("\n", " ").strip()
                 self._conversation_store.create_session(
                     self._current_session_id, title=title,

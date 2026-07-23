@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
 from leapflow.cli.commands.run import _print_execution_result
@@ -965,7 +966,11 @@ async def cmd_interactive_daemon(
     status = StatusBar(theme)
     exit_stats = SessionExitStats()
     command_router = CommandRouter("daemon")
-    active_session_id = str(resume_id or "")
+    # A fresh TUI (no --resume) gets its own distinct session id so that two
+    # concurrent TUI clients route to isolated per-session engines on the daemon
+    # (bounded by daemon.max_concurrent_turns) instead of converging on one
+    # shared session and serializing. --resume keeps the requested id.
+    active_session_id = str(resume_id or "") or uuid.uuid4().hex[:16]
     turn_count = 0
     runtime_model_name = str(getattr(settings, "llm_model", ""))
     runtime_context_length = int(getattr(settings, "llm_context_length", 0) or 0)

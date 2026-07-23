@@ -112,3 +112,43 @@ async def test_concurrent_session_engines_are_isolated() -> None:
             assert "222" in out_b and "111" not in out_b
         finally:
             lt.close()
+
+
+def test_ensure_session_creates_a_provided_session_id() -> None:
+    """A daemon-bound (client-owned) session id is created-if-not-exists, so a
+    distinct per-TUI session persists even though the engine did not mint it."""
+    from types import SimpleNamespace
+
+    with tempfile.TemporaryDirectory() as td:
+        base, lt = _build_base_engine(td, _EchoLLM())
+        try:
+            class _Store:
+                def __init__(self) -> None:
+                    self.created: list = []
+                    self._sessions: dict = {}
+                    self.messages: list = []
+
+                def get_session(self, sid):
+                    return self._sessions.get(sid)
+
+                def create_session(self, sid, **kw):
+                    self._sessions[sid] = SimpleNamespace(session_id=sid)
+                    self.created.append(sid)
+                    return self._sessions[sid]
+
+                def append_message(self, sid, role, content, **kw):
+                    self.messages.append((sid, role))
+
+            store = _Store()
+            base._conversation_store = store
+            base._settings = SimpleNamespace(session_persistence_enabled=True, llm_model="m")
+            # Simulate the daemon binding the engine to a client-provided id.
+            base._current_session_id = "client-owned-id"
+            assert base._ensure_session("hello there") == "client-owned-id"
+            assert store.created == ["client-owned-id"]        # created for the provided id
+            assert ("client-owned-id", "user") in store.messages
+            # A second turn reuses the existing session (no duplicate create).
+            base._ensure_session("second message")
+            assert store.created == ["client-owned-id"]
+        finally:
+            lt.close()

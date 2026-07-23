@@ -404,6 +404,14 @@ class RuntimeLeapService:
                     exec_ctx = await self._ensure_session_registry(engine).acquire(session_id)
                     engine = exec_ctx.engine
                     session_lock = exec_ctx.lock
+                    # Bind the engine to the routed session so it runs and
+                    # persists under that id (the engine creates the row if new).
+                    # Isolated engines are pre-bound by the factory; this also
+                    # binds the primary (base) engine to the first session that
+                    # claims it, keeping the routing key, the engine's session,
+                    # persistence, and the returned metadata all consistent.
+                    if getattr(engine, "_current_session_id", None) != session_id:
+                        engine._current_session_id = session_id
 
                 # Serialize turns within one session (a conversation is
                 # sequential); different sessions run concurrently up to the

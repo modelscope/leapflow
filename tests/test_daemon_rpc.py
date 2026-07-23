@@ -623,6 +623,46 @@ async def test_client_engine_chat_forwards_session_id(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_engine_chat_binds_engine_to_routed_session() -> None:
+    """P3 activation: a routed turn binds its engine to the routed session_id so
+    routing key, engine session, persistence and metadata stay consistent (e.g.
+    a fresh client-owned id claiming the primary/base engine)."""
+    from types import SimpleNamespace
+
+    from leapflow.daemon.service import RuntimeLeapService
+    from leapflow.daemon.session_registry import SessionExecutionContext
+    from leapflow.engine import StreamEvent
+
+    class MarkEngine:
+        def __init__(self) -> None:
+            self._current_session_id = ""  # unbound
+
+        async def run_stream(self, message: str, *, enable_thinking: bool = False, request_id: str = ""):
+            yield StreamEvent(type="final", content="ok")
+
+    session_engine = MarkEngine()
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(llm_context_length=100)
+            self.engine = MarkEngine()
+
+        def reload_runtime_config_if_changed(self) -> bool:
+            return False
+
+    class FakeRegistry:
+        async def acquire(self, sid: str) -> SessionExecutionContext:
+            return SessionExecutionContext(sid, session_engine)
+
+    service = RuntimeLeapService(SimpleNamespace(llm_context_length=100))
+    service._ctx = FakeContext()
+    service._session_registry = FakeRegistry()
+
+    _ = [c async for c in service.engine_chat("hi", request_id="r", session_id="S9")]
+    assert session_engine._current_session_id == "S9"  # bound to the routed session
+
+
+@pytest.mark.asyncio
 async def test_daemon_shutdown_rpc_triggers_server_stop() -> None:
     class ShutdownService(_FakeService):
         def __init__(self) -> None:
