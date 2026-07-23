@@ -580,6 +580,49 @@ async def test_concurrent_sessions_run_in_parallel_when_admission_allows() -> No
 
 
 @pytest.mark.asyncio
+async def test_client_engine_chat_forwards_session_id(monkeypatch) -> None:
+    """P3-4 activation: the client forwards session_id in the RPC params when set,
+    and omits it when empty (so the daemon routes the turn to the right session)."""
+    import json as _json
+    from pathlib import Path
+
+    from leapflow.daemon import client as client_mod
+    from leapflow.daemon.client import DaemonClient
+
+    captured: dict = {}
+
+    class _FakeWriter:
+        pass
+
+    async def fake_open(self):
+        return (object(), _FakeWriter())
+
+    async def fake_send(writer, text):
+        captured["req"] = _json.loads(text)
+
+    async def fake_read(self, reader):
+        return {"id": captured["req"]["id"]}  # matches request id, no error → loop breaks
+
+    async def fake_close(writer):
+        return None
+
+    monkeypatch.setattr(DaemonClient, "_open", fake_open)
+    monkeypatch.setattr(DaemonClient, "_read_payload", fake_read)
+    monkeypatch.setattr(client_mod, "_send", fake_send)
+    monkeypatch.setattr(client_mod, "_close_writer", fake_close)
+
+    client = DaemonClient(Path("/tmp/leapd-test.sock"))
+
+    _ = [e async for e in client.engine_chat("hi", session_id="sess-X")]
+    assert captured["req"]["params"]["session_id"] == "sess-X"
+    assert captured["req"]["params"]["message"] == "hi"
+
+    captured.clear()
+    _ = [e async for e in client.engine_chat("hi")]
+    assert "session_id" not in captured["req"]["params"]  # omitted when empty
+
+
+@pytest.mark.asyncio
 async def test_daemon_shutdown_rpc_triggers_server_stop() -> None:
     class ShutdownService(_FakeService):
         def __init__(self) -> None:

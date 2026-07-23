@@ -1147,7 +1147,7 @@ async def cmd_interactive_daemon(
         saw_real_event = False
         turn_completed = False
         try:
-            async for event in bridge.client.engine_chat(prompt_text):
+            async for event in bridge.client.engine_chat(prompt_text, session_id=active_session_id):
                 metadata = event.metadata or {}
                 is_heartbeat = event.type == "status" and metadata.get("heartbeat")
                 if not is_heartbeat:

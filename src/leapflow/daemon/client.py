@@ -62,11 +62,21 @@ class DaemonClient:
         message: str,
         *,
         enable_thinking: bool = False,
+        session_id: str = "",
     ) -> AsyncIterator[StreamEvent]:
-        """Stream chat events from the daemon-owned AgentEngine."""
+        """Stream chat events from the daemon-owned AgentEngine.
+
+        ``session_id`` routes the turn to that session's engine, so distinct
+        sessions (e.g. two TUI clients) run concurrently and isolated when the
+        daemon admits concurrency (daemon.max_concurrent_turns > 1). Empty means
+        the daemon's current session (single-session behavior unchanged).
+        """
+        params: dict[str, Any] = {"message": message, "enable_thinking": enable_thinking}
+        if session_id:
+            params["session_id"] = session_id
         request = RpcRequest(
             method="engine.chat",
-            params={"message": message, "enable_thinking": enable_thinking},
+            params=params,
         )
         reader, writer = await self._open()
         try:
