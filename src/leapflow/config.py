@@ -354,6 +354,8 @@ class Settings:
     tools_test_command: str = ""  # empty => auto-detect (pytest/npm/go/cargo)
     tools_lint_command: str = ""  # empty => auto-detect (ruff/eslint/go vet/clippy)
     tools_terminal_session_enabled: bool = False  # persistent shell sessions (opt-in, high risk)
+    tools_verify_edits: bool = True  # post-edit syntax check (advisory) for edit_file/file_write
+    agent_validate_tool_args: bool = True  # pre-execution required-argument validation + self-repair
     context_hard_limit_ratio: float = 0.92
     context_warning_ratio: float = 0.75
     tool_evidence_max_chars: int = 1200
@@ -821,6 +823,8 @@ def _build_settings_from_env(
     tools_test_command = os.getenv("LEAPFLOW_TOOLS_TEST_COMMAND", "").strip()
     tools_lint_command = os.getenv("LEAPFLOW_TOOLS_LINT_COMMAND", "").strip()
     tools_terminal_session_enabled = os.getenv("LEAPFLOW_TOOLS_TERMINAL_SESSION_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+    tools_verify_edits = os.getenv("LEAPFLOW_TOOLS_VERIFY_EDITS", "1").strip().lower() in ("1", "true", "yes")
+    agent_validate_tool_args = os.getenv("LEAPFLOW_AGENT_VALIDATE_TOOL_ARGS", "1").strip().lower() in ("1", "true", "yes")
     context_hard_limit_ratio = float(os.getenv("LEAPFLOW_CONTEXT_HARD_LIMIT_RATIO", "0.92"))
     context_warning_ratio = float(os.getenv("LEAPFLOW_CONTEXT_WARNING_RATIO", "0.75"))
     tool_evidence_max_chars = int(os.getenv("LEAPFLOW_TOOL_EVIDENCE_MAX_CHARS", "1200"))
@@ -1137,6 +1141,8 @@ def _build_settings_from_env(
         tools_test_command=tools_test_command,
         tools_lint_command=tools_lint_command,
         tools_terminal_session_enabled=tools_terminal_session_enabled,
+        tools_verify_edits=tools_verify_edits,
+        agent_validate_tool_args=agent_validate_tool_args,
         context_hard_limit_ratio=context_hard_limit_ratio,
         context_warning_ratio=context_warning_ratio,
         tool_evidence_max_chars=tool_evidence_max_chars,

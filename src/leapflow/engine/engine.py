@@ -323,6 +323,88 @@ def _should_stop_after_tool_result(tool_name: str, payload: Dict[str, Any]) -> b
     return str(payload.get("execution_policy") or "") in _SIDE_EFFECT_STOP_POLICIES
 
 
+def _validate_tool_arguments(spec: Any, args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Pre-execution argument check against a tool's declared required params.
+
+    Returns a structured ``invalid_arguments`` result (for in-turn self-repair) if
+    a required parameter key is absent, else ``None``. Presence-only (an empty but
+    present value is the handler's concern) to avoid rejecting legitimately empty
+    values. The result is marked non-failing and carries no execution_policy, so it
+    neither trips the side-effect batch-stop gate nor penalizes failure budgets —
+    the model simply sees the missing fields plus the accepted schema and retries.
+    """
+    if spec is None:
+        return None
+    required = getattr(spec, "required", frozenset()) or frozenset()
+    if not required:
+        return None
+    missing = [name for name in required if name not in args]
+    if not missing:
+        return None
+    accepted = sorted((getattr(spec, "parameters", frozenset()) or frozenset()) | set(required))
+    tool_name = str(getattr(spec, "name", "") or "")
+    return {
+        "ok": False,
+        "error": f"Invalid arguments for {tool_name}: missing required parameter(s): {', '.join(sorted(missing))}",
+        "error_type": "invalid_arguments",
+        "tool_name": tool_name,
+        "missing": sorted(missing),
+        "required": sorted(required),
+        "accepted_parameters": accepted,
+        "retryable": True,
+        "counts_as_failure": False,
+    }
+
+
+def _head_tail_truncate(text: str, allow: int) -> str:
+    """Keep the head and tail of a long string with an explicit elision marker.
+
+    The tail of stdout/stderr/tracebacks/test output usually holds the actual
+    error, so a naive head-only cut discards the most useful part.
+    """
+    if len(text) <= allow:
+        return text
+    keep = max(40, allow - 40)  # leave room for the marker
+    head = (keep * 2) // 3
+    tail = keep - head
+    elided = len(text) - head - tail
+    return f"{text[:head]}\n… [{elided} chars elided] …\n{text[-tail:]}"
+
+
+def _truncate_result_for_budget(payload: Any, budget: int) -> str:
+    """Serialize a tool result to JSON within ``budget``, preserving structure.
+
+    When over budget, shrink the largest string fields with head+tail truncation
+    (so the tail error survives) rather than a naive cut of the whole JSON string,
+    which drops the tail and can emit invalid JSON. A final hard cut is only a
+    last-resort safety net. Never raises.
+    """
+    try:
+        text = json.dumps(payload, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(payload)[:budget]
+    if len(text) <= budget:
+        return text
+    if isinstance(payload, dict):
+        shrunk = dict(payload)
+        while True:
+            over = len(json.dumps(shrunk, default=str, ensure_ascii=False)) - budget
+            if over <= 0:
+                break
+            candidates = [(k, v) for k, v in shrunk.items() if isinstance(v, str) and len(v) > 160]
+            if not candidates:
+                break
+            key, value = max(candidates, key=lambda kv: len(kv[1]))
+            allow = max(120, len(value) - over - 60)
+            if allow >= len(value):
+                break
+            shrunk[key] = _head_tail_truncate(value, allow)
+        text = json.dumps(shrunk, default=str, ensure_ascii=False)
+    if len(text) > budget:
+        text = text[:budget]
+    return text
+
+
 def _skipped_after_failure_result(blocking_tool: str, blocking_result: Dict[str, Any]) -> Dict[str, Any]:
     """Build a non-failure result for a tool skipped because an earlier side effect failed."""
     return {
@@ -2792,7 +2874,7 @@ class AgentEngine:
             else:
                 recovery.record_tool_success()
             result_payload = self._compact_tool_result(tool_name, tool_arguments, result)
-            result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
+            result_text = _truncate_result_for_budget(result_payload, result_budget)
             messages.append(build_user_message_text(
                 f"Tool result ({tool_name}):\n{result_text}"
             ))
@@ -3480,7 +3562,7 @@ class AgentEngine:
                 turn_recovery.record_tool_success()
 
             result_payload = self._compact_tool_result(tool_name, tool_arguments, result)
-            result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
+            result_text = _truncate_result_for_budget(result_payload, result_budget)
             messages.append(build_user_message_text(
                 f"Tool result ({tool_name}):\n{result_text}"
             ))
@@ -3642,7 +3724,7 @@ class AgentEngine:
                     observation=result if isinstance(result, dict) else {"result": str(result)},
                 )
                 result_payload = self._compact_tool_result(normalized_name, tc.arguments, result)
-                result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
+                result_text = _truncate_result_for_budget(result_payload, result_budget)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
                 self._persist_message(
                     self._current_session_id, "tool", result_text,
@@ -3719,7 +3801,7 @@ class AgentEngine:
                         observation=error_result,
                     )
                     result_payload = self._compact_tool_result(ctc.name, ctc.arguments, error_result)
-                    result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
+                    result_text = _truncate_result_for_budget(result_payload, result_budget)
                 else:
                     _print_tool_result(ctc.name, result, enabled=self._settings.verbose_progress)
                     trace.record(
@@ -3728,7 +3810,7 @@ class AgentEngine:
                         observation=result if isinstance(result, dict) else {"result": str(result)},
                     )
                     result_payload = self._compact_tool_result(ctc.name, ctc.arguments, result)
-                    result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
+                    result_text = _truncate_result_for_budget(result_payload, result_budget)
                 effective_result = error_result if isinstance(result, Exception) else result
                 messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
                 self._persist_message(
@@ -3779,7 +3861,7 @@ class AgentEngine:
                 observation=result if isinstance(result, dict) else {"result": str(result)},
             )
             result_payload = self._compact_tool_result(ctc.name, ctc.arguments, result)
-            result_text = json.dumps(result_payload, default=str, ensure_ascii=False)[:result_budget]
+            result_text = _truncate_result_for_budget(result_payload, result_budget)
             messages.append({"role": "tool", "tool_call_id": ctc.id, "content": result_text})
             self._persist_message(
                 self._current_session_id, "tool", result_text,
@@ -3829,6 +3911,11 @@ class AgentEngine:
         tool_name = resolution.normalized_name
         spec = registry.specs.get(tool_name)
         policy = execution_policy_for(tool_name, spec)
+        if getattr(self._settings, "agent_validate_tool_args", True):
+            invalid_args = _validate_tool_arguments(spec, args)
+            if invalid_args is not None:
+                logger.info("tool_args_invalid: tool=%s missing=%s", tool_name, invalid_args.get("missing"))
+                return invalid_args
         session_id = self._current_session_id or "ephemeral"
         turn_id = self._current_turn_id or f"turn-{self._session_turn_count}"
         command_id = self._current_command_id or turn_id

@@ -100,6 +100,7 @@ LeapFlow ships a first-class coding toolset so the agent can *locate → read �
 
 | Tool | Purpose | Governance |
 |---|---|---|
+| `repo_map` | Compact project orientation: languages, detected test/lint commands, top-level structure, entry points, VCS branch | read-only |
 | `code_search` | Regex search across a tree (ripgrep-backed, structured `path:line:col`, optional `context_lines`); skips VCS/dep/build dirs | read-only |
 | `file_find` | Locate files by recursive glob (e.g. `**/test_*.py`) | read-only |
 | `edit_file` | Targeted **anchored** search-replace (unique-anchor or `replace_all`, `dry_run`) or apply a unified **`diff`** — a missing/ambiguous anchor is rejected, never a partial write | mutating · approval + path gate |

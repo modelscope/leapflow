@@ -365,10 +365,17 @@ class ToolEvidenceBuilder:
         return evidence
 
     def _compact_error(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        compact: Dict[str, Any] = {
             "ok": False,
             "error": self._head_tail(str(result.get("error", "unknown error")), self._max_content_chars),
         }
+        # Preserve structured repair/recovery hints so the model can self-correct
+        # in-turn: invalid_arguments -> missing/accepted_parameters; edit_file
+        # anchor errors -> match_count; code_search -> error_type; etc.
+        for key in ("error_type", "retryable", "missing", "accepted_parameters", "required", "match_count", "failure_code"):
+            if key in result:
+                compact[key] = self._compact_value(result[key])
+        return compact
 
     def _app_connector_evidence(self, result: Dict[str, Any]) -> Dict[str, Any]:
         ok = bool(result.get("ok", True))

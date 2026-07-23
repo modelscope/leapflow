@@ -144,6 +144,8 @@ _FIELD_DESCRIPTIONS = {
     "tools.test_command": "Explicit command for the test_run tool (empty => auto-detect pytest/npm/go/cargo from project markers).",
     "tools.lint_command": "Explicit command for the lint_check tool (empty => auto-detect ruff/eslint/go vet/clippy from project markers).",
     "tools.terminal_session_enabled": "Enable persistent terminal sessions (terminal_open/send/read/close/list). Off by default: a persistent shell runs arbitrary interactive input; enabling is the operator opt-in. Sessions are bounded (max count, idle TTL) with process-group cleanup.",
+    "tools.verify_edits": "After edit_file/file_write, run an advisory syntax check on the written file (Python via AST) and attach syntax_ok/syntax_error to the result. Advisory only — it never blocks the write; the model sees a broken edit immediately and can fix it.",
+    "agent.validate_tool_args": "Validate a tool call's required arguments before execution; a missing required parameter returns a structured invalid_arguments result (with the accepted schema) for in-turn self-repair instead of an opaque handler error. Does not count as a failure and never trips the batch-stop gate.",
     "agent.cost_ceiling_context_multiple": "Optional cumulative effective-cost ceiling as a multiple of context length (0 disables; a soft finalize nudge, the iteration cap stays the hard bound).",
     "agent.subagent_max_depth": "Maximum delegation depth for subagents (governs recursive task decomposition).",
     "agent.subagent_max_concurrent": "Maximum concurrent child subagents per delegation batch.",

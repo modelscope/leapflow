@@ -11,6 +11,7 @@ Safety layers:
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import json
 import logging
@@ -53,6 +54,35 @@ def _safe_int(value: Any, default: int, *, minimum: int = 1, maximum: int | None
     if maximum is not None:
         parsed = min(maximum, parsed)
     return parsed
+
+
+# ── post-edit verification (advisory syntax check; never blocks the write) ──
+_VERIFY_EDITS = True
+
+
+def set_edit_verification(enabled: bool) -> None:
+    """Enable/disable the advisory post-edit syntax check (from settings)."""
+    global _VERIFY_EDITS
+    _VERIFY_EDITS = bool(enabled)
+
+
+def _verify_syntax(target: Path, content: str) -> Dict[str, Any]:
+    """Advisory syntax check of just-written content. Returns {} when not applicable.
+
+    Never blocks the write — it only annotates the result so the model sees a
+    broken edit (e.g. a Python SyntaxError) immediately and can repair it.
+    """
+    if not _VERIFY_EDITS:
+        return {}
+    if target.suffix.lower() == ".py":
+        try:
+            ast.parse(content)
+            return {"syntax_ok": True}
+        except SyntaxError as exc:
+            return {"syntax_ok": False, "syntax_error": f"{exc.msg} (line {exc.lineno})"}
+        except ValueError as exc:  # e.g. null bytes
+            return {"syntax_ok": False, "syntax_error": str(exc)}
+    return {}
 
 
 def _line_window(lines: list[str], *, start_line: int, max_lines: int) -> tuple[list[str], int, int]:
@@ -352,10 +382,12 @@ async def file_write(params: Dict[str, Any]) -> Dict[str, Any]:
                 f.write(content)
         else:
             target.write_text(content)
+        syntax = _verify_syntax(target, content) if mode != "append" else {}
         return {
             "ok": True,
             "path": str(target),
             "bytes_written": len(content.encode()),
+            **syntax,
             **_sensitivity_metadata(sensitivity),
         }
     except Exception as e:
@@ -773,5 +805,6 @@ async def edit_file(params: Dict[str, Any]) -> Dict[str, Any]:
         "edits_applied": len(edits),
         "replacements": total_replacements,
         "bytes_written": len(content.encode()),
+        **_verify_syntax(target, content),
         **_sensitivity_metadata(sensitivity),
     }

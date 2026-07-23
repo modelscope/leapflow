@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 
 from leapflow.tools import file_operations as fo
-from leapflow.tools.file_operations import code_search, edit_file, file_find
+from leapflow.tools.file_operations import code_search, edit_file, file_find, file_write
 from leapflow.tools.code_intel import code_intel
 
 
@@ -372,3 +372,44 @@ def test_edit_file_invalid_diff_is_rejected(tmp_path) -> None:
     result = _run(edit_file({"path": str(f), "diff": "not a diff, no hunks"}))
     assert result["ok"] is False and result["error_type"] == "invalid_diff"
     assert f.read_text() == "x\n"
+
+
+# ── B1: advisory post-edit syntax verification ──
+
+def test_edit_file_flags_broken_python_syntax(tmp_path) -> None:
+    f = tmp_path / "m.py"
+    f.write_text("x = 1\n")
+    result = _run(edit_file({"path": str(f), "edits": [{"original_text": "x = 1", "new_text": "def broken(:"}]}))
+    assert result["ok"] is True and result["changed"] is True  # write is not blocked
+    assert result["syntax_ok"] is False and "syntax_error" in result
+
+
+def test_edit_file_valid_python_syntax_ok(tmp_path) -> None:
+    f = tmp_path / "m.py"
+    f.write_text("x = 1\n")
+    result = _run(edit_file({"path": str(f), "edits": [{"original_text": "x = 1", "new_text": "x = 2"}]}))
+    assert result["ok"] is True and result["syntax_ok"] is True
+
+
+def test_edit_file_non_python_has_no_syntax_field(tmp_path) -> None:
+    f = tmp_path / "m.txt"
+    f.write_text("hello\n")
+    result = _run(edit_file({"path": str(f), "edits": [{"original_text": "hello", "new_text": "world"}]}))
+    assert result["ok"] is True and "syntax_ok" not in result
+
+
+def test_file_write_python_syntax_ok(tmp_path) -> None:
+    f = tmp_path / "n.py"
+    result = _run(file_write({"path": str(f), "content": "def ok():\n    return 1\n"}))
+    assert result["ok"] is True and result["syntax_ok"] is True
+
+
+def test_verify_edits_toggle_off(tmp_path) -> None:
+    fo.set_edit_verification(False)
+    try:
+        f = tmp_path / "m.py"
+        f.write_text("x = 1\n")
+        result = _run(edit_file({"path": str(f), "edits": [{"original_text": "x = 1", "new_text": "def broken(:"}]}))
+        assert result["ok"] is True and "syntax_ok" not in result
+    finally:
+        fo.set_edit_verification(True)

@@ -18,6 +18,7 @@ from leapflow.tools.file_operations import (
 )
 from leapflow.tools.scm_tools import scm_sync, git_query, git_write
 from leapflow.tools.code_intel import code_intel
+from leapflow.tools.repo_map import repo_map
 from leapflow.tools.dev_tools import test_run, lint_check
 from leapflow.tools.terminal_session import (
     terminal_open,
@@ -209,6 +210,24 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "operation": {"type": "string", "enum": ["symbols"], "description": "Analysis operation (default: symbols)"},
                 },
                 "required": ["path"],
+            },
+            "x_leapflow": {"category": "file", "risk_level": "read_only", "schema_cost": "low", "requires_approval": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "repo_map",
+            "description": (
+                "Compact project orientation for a repository root: languages, detected test/lint "
+                "commands, top-level structure, entry points, manifest, and VCS branch. Call this "
+                "first when entering an unfamiliar codebase. Read-only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Repository root (default: current dir)"},
+                },
             },
             "x_leapflow": {"category": "file", "risk_level": "read_only", "schema_cost": "low", "requires_approval": False},
         },
@@ -752,6 +771,14 @@ _BRIDGE_TOOLS = [
             "operation": "string (optional) — 'symbols' (default)",
         },
         "handler": code_intel,
+    },
+    {
+        "name": "gp_repo_map",
+        "description": "Compact project orientation (languages, test/lint commands, structure, entry points, VCS).",
+        "parameters": {
+            "path": "string (optional) — repository root (default: .)",
+        },
+        "handler": repo_map,
     },
     {
         "name": "gp_shell_run",

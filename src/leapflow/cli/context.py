@@ -1991,6 +1991,8 @@ class Context:
             )
             from leapflow.tools.terminal_session import set_terminal_sessions_enabled
             set_terminal_sessions_enabled(bool(getattr(settings, "tools_terminal_session_enabled", False)))
+            from leapflow.tools.file_operations import set_edit_verification
+            set_edit_verification(bool(getattr(settings, "tools_verify_edits", True)))
         except Exception:
             logger.debug("dev/terminal tool config wiring skipped", exc_info=True)
 
