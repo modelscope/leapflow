@@ -325,6 +325,7 @@ class Settings:
     agent_subagent_max_depth: int = 2
     agent_subagent_max_concurrent: int = 3
     agent_subagent_max_iterations: int = 15
+    agent_max_parallel_tools: int = 8  # Max tool calls run in parallel within one response's batch
     agent_subagent_full_loop: bool = False
     agent_calibration_enabled: bool = False
     agent_calibration_min_confidence: float = 0.3
@@ -811,6 +812,7 @@ def _build_settings_from_env(
     agent_subagent_max_depth = int(os.getenv("LEAPFLOW_AGENT_SUBAGENT_MAX_DEPTH", "2"))
     agent_subagent_max_concurrent = int(os.getenv("LEAPFLOW_AGENT_SUBAGENT_MAX_CONCURRENT", "3"))
     agent_subagent_max_iterations = int(os.getenv("LEAPFLOW_AGENT_SUBAGENT_MAX_ITERATIONS", "15"))
+    agent_max_parallel_tools = int(os.getenv("LEAPFLOW_AGENT_MAX_PARALLEL_TOOLS", "8"))
     agent_subagent_full_loop = os.getenv("LEAPFLOW_AGENT_SUBAGENT_FULL_LOOP", "0").strip().lower() in ("1", "true", "yes")
     agent_calibration_enabled = os.getenv("LEAPFLOW_AGENT_CALIBRATION_ENABLED", "0").strip().lower() in ("1", "true", "yes")
     agent_calibration_min_confidence = float(os.getenv("LEAPFLOW_AGENT_CALIBRATION_MIN_CONFIDENCE", "0.3"))
@@ -1136,6 +1138,7 @@ def _build_settings_from_env(
         agent_subagent_max_depth=agent_subagent_max_depth,
         agent_subagent_max_concurrent=agent_subagent_max_concurrent,
         agent_subagent_max_iterations=agent_subagent_max_iterations,
+        agent_max_parallel_tools=agent_max_parallel_tools,
         agent_subagent_full_loop=agent_subagent_full_loop,
         agent_calibration_enabled=agent_calibration_enabled,
         agent_calibration_min_confidence=agent_calibration_min_confidence,

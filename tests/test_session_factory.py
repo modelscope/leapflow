@@ -152,3 +152,35 @@ def test_ensure_session_creates_a_provided_session_id() -> None:
             assert store.created == ["client-owned-id"]
         finally:
             lt.close()
+
+
+@pytest.mark.asyncio
+async def test_parallel_tools_are_bounded_by_max_parallel() -> None:
+    """TC-P1: read-only tools in one batch run concurrently but never exceed
+    agent.max_parallel_tools in flight at once."""
+    from dataclasses import replace
+
+    from leapflow.engine.execution_trace import ExecutionTrace
+    from leapflow.engine.tool_concurrency import ToolCall
+
+    with tempfile.TemporaryDirectory() as td:
+        base, lt = _build_base_engine(td, _EchoLLM())
+        try:
+            base._settings = replace(base._settings, agent_max_parallel_tools=2)
+            in_flight = 0
+            peak = 0
+
+            async def _stub(tool_call_dict, handlers, *, tool_call_id):
+                nonlocal in_flight, peak
+                in_flight += 1
+                peak = max(peak, in_flight)
+                await asyncio.sleep(0.02)
+                in_flight -= 1
+                return {"ok": True}
+
+            base._execute_tool_with_ledger = _stub  # type: ignore[assignment]
+            calls = [ToolCall(id=f"c{i}", name="file_read", arguments={"path": f"/x{i}.py"}) for i in range(5)]
+            await base._execute_tools_concurrent(calls, {}, trace=ExecutionTrace(), messages=[])
+            assert peak == 2  # 5 read-only calls, capped at 2 concurrent
+        finally:
+            lt.close()

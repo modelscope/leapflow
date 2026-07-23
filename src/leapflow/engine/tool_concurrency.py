@@ -1,17 +1,29 @@
-"""Tool concurrency policy — determines which tool calls can execute in parallel.
+"""Tool concurrency policy — metadata-driven parallel/sequential partitioning.
 
-Design (inspired by hermes tool_dispatch_helpers):
-- Three-tier classification: always-parallel, path-scoped, always-sequential
-- Path overlap detection prevents concurrent writes to same file subtree
-- MCP tools get parallel safety from registry metadata
-- Configurable via constructor injection (OCP)
+Parallel-safety is derived from the SAME registry metadata that already drives
+the idempotency ledger and the side-effect batch-stop gate
+(``execution_policy_for``), rather than from a hardcoded tool-name list:
+
+- ``read_only``            -> parallel (pure reads never conflict)
+- ``mutating_idempotent``  -> path-scoped: parallel iff its file path does not
+                              overlap another concurrent write in the batch
+- ``mutating_once`` / ``external_side_effect`` -> sequential
+- unknown / unregistered   -> sequential (conservative default; a new tool never
+                              auto-parallelizes just because it is unlisted)
+
+A tool's concurrency behavior therefore follows from its declared ``x_leapflow``
+metadata, keeping this in lockstep with approval, idempotency, and batch-stop —
+one source of truth, and it generalizes to any new tool (including MCP tools
+that declare their metadata) with no name enumeration to maintain.
 """
 from __future__ import annotations
 
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, Protocol, Sequence, Tuple, runtime_checkable
+from typing import Any, Callable, Optional, Protocol, Sequence, Tuple, runtime_checkable
+
+from leapflow.engine.tool_execution import execution_policy_for
 
 logger = logging.getLogger(__name__)
 
@@ -40,46 +52,10 @@ class ToolConcurrencyPolicy(Protocol):
         ...
 
 
-# Tools that are always safe to parallelize (pure reads, no side effects).
-# Names MUST match actual tool names from registry_bootstrap.py:
-#   gp_file_read, gp_file_list, gp_text_search, gp_skills_list, gp_skill_view,
-#   gp_time_get, gp_env_info, plus their unprefixed aliases.
-_DEFAULT_PARALLEL_SAFE: FrozenSet[str] = frozenset({
-    "gp_file_read", "gp_file_list", "gp_text_search",
-    "gp_skills_list", "gp_skill_view",
-    "gp_time_get", "gp_env_info",
-    "gp_web_search", "gp_web_extract",
-    "gp_session_search", "gp_memory_search",
-    "file_read", "file_list", "text_search",
-    "skills_list", "skill_view",
-    "time_get", "env_info",
-    "web_search", "web_extract",
-    "session_search", "memory_search",
-})
-
-# Tools where parallelism depends on non-overlapping file paths
-_DEFAULT_PATH_SCOPED: FrozenSet[str] = frozenset({
-    "gp_file_write", "gp_text_replace",
-    "file_write", "text_replace",
-})
-
-# Tools that must never run in parallel (side effects, user interaction, shell,
-# or external platform authorization boundaries where one failure can block the
-# rest of the turn).
-_DEFAULT_NEVER_PARALLEL: FrozenSet[str] = frozenset({
-    "gp_shell_run", "shell_run",
-    "gp_scm_sync", "scm_sync",
-    "clarify", "gp_clarify",
-    "delegate_task", "gp_delegate_task",
-    "memory_add", "gp_memory_add",
-    "platform_action", "gp_platform_action",
-    "platform_connect", "gp_platform_connect",
-    "gateway_send", "gp_gateway_send",
-    "gateway_connect", "gp_gateway_connect",
-    "hub_push", "gp_hub_push",
-    "hub_pull", "gp_hub_pull",
-    "hub_sync", "gp_hub_sync",
-})
+# ``spec_lookup(tool_name) -> spec | None`` returns the registry metadata object
+# (a ``ToolSpec`` with risk_level / mutates_state / effect_scope /
+# idempotency_scope) for a normalized tool name, or None when unregistered.
+SpecLookup = Callable[[str], Any]
 
 
 def _paths_overlap(left: str, right: str) -> bool:
@@ -99,7 +75,7 @@ def _paths_overlap(left: str, right: str) -> bool:
     )
 
 
-def _extract_path(arguments: Dict[str, Any]) -> str:
+def _extract_path(arguments: dict[str, Any]) -> str:
     """Extract path from tool call arguments."""
     for key in ("path", "file_path", "target", "filename"):
         val = arguments.get(key)
@@ -109,31 +85,16 @@ def _extract_path(arguments: Dict[str, Any]) -> str:
 
 
 class DefaultConcurrencyPolicy:
-    """Three-tier concurrency policy with path overlap detection.
+    """Metadata-driven concurrency partition (see module docstring).
 
-    Tier 1: Always-parallel tools (pure reads)
-    Tier 2: Path-scoped tools (parallel iff paths don't overlap)
-    Tier 3: Always-sequential (stateful/interactive)
-
-    MCP tools are parallel-safe unless registered otherwise.
+    ``spec_lookup`` is injected (dependency inversion) so this module never
+    imports the registry directly; when it is absent or returns None the tool is
+    treated as sequential, so parallelism is strictly opt-in via declared
+    read-only / path-scoped-idempotent metadata.
     """
 
-    def __init__(
-        self,
-        *,
-        parallel_safe: FrozenSet[str] | None = None,
-        path_scoped: FrozenSet[str] | None = None,
-        never_parallel: FrozenSet[str] | None = None,
-        stateful_prefixes: FrozenSet[str] | None = None,
-        mcp_parallel_safe: FrozenSet[str] | None = None,
-    ) -> None:
-        self._parallel_safe = parallel_safe or _DEFAULT_PARALLEL_SAFE
-        self._path_scoped = path_scoped or _DEFAULT_PATH_SCOPED
-        self._never_parallel = never_parallel or _DEFAULT_NEVER_PARALLEL
-        self._stateful_prefixes = stateful_prefixes or frozenset({
-            "shell", "batch_", "clipboard",
-        })
-        self._mcp_parallel_safe = mcp_parallel_safe or frozenset()
+    def __init__(self, *, spec_lookup: Optional[SpecLookup] = None) -> None:
+        self._spec_lookup = spec_lookup
 
     def partition(
         self, tool_calls: Sequence[ToolCall]
@@ -146,35 +107,21 @@ class DefaultConcurrencyPolicy:
         concurrent_paths: list[str] = []
 
         for tc in tool_calls:
-            if tc.name in self._never_parallel:
-                sequential.append(tc)
-                continue
-
-            if tc.name in self._parallel_safe:
+            policy = self._policy_for(tc.name)
+            if policy == "read_only":
                 concurrent.append(tc)
-                continue
-
-            if tc.name.startswith("mcp_"):
-                if tc.name in self._mcp_parallel_safe or self._is_mcp_read(tc):
-                    concurrent.append(tc)
-                else:
-                    sequential.append(tc)
-                continue
-
-            if tc.name in self._path_scoped:
+            elif policy == "mutating_idempotent":
+                # Path-scoped: safe to parallelize only when this write's path
+                # does not overlap another write already in the concurrent group.
                 path = _extract_path(tc.arguments)
-                if path and any(_paths_overlap(path, ep) for ep in concurrent_paths):
-                    sequential.append(tc)
-                else:
+                if path and not any(_paths_overlap(path, ep) for ep in concurrent_paths):
                     concurrent.append(tc)
-                    if path:
-                        concurrent_paths.append(path)
-                continue
-
-            if self._is_stateful(tc.name):
-                sequential.append(tc)
+                    concurrent_paths.append(path)
+                else:
+                    sequential.append(tc)
             else:
-                concurrent.append(tc)
+                # mutating_once / external_side_effect / unknown -> sequential.
+                sequential.append(tc)
 
         logger.debug(
             "tool_concurrency.partition concurrent=%d sequential=%d",
@@ -183,13 +130,19 @@ class DefaultConcurrencyPolicy:
         )
         return concurrent, sequential
 
-    def _is_stateful(self, tool_name: str) -> bool:
-        if tool_name in self._never_parallel:
-            return True
-        return any(tool_name.startswith(prefix) for prefix in self._stateful_prefixes)
+    def _policy_for(self, name: str) -> Optional[str]:
+        """Return the tool's execution policy from registry metadata.
 
-    @staticmethod
-    def _is_mcp_read(tc: ToolCall) -> bool:
-        """Heuristic: MCP tools with 'read', 'get', 'list', 'search' are likely read-only."""
-        name_lower = tc.name.lower()
-        return any(verb in name_lower for verb in ("read", "get", "list", "search", "fetch", "query"))
+        Returns None for an unregistered / unresolvable tool, which the caller
+        treats as sequential (conservative default).
+        """
+        if self._spec_lookup is None:
+            return None
+        try:
+            spec = self._spec_lookup(name)
+        except Exception:  # a lookup failure must never break tool dispatch
+            logger.debug("tool_concurrency: spec_lookup failed for %s", name, exc_info=True)
+            return None
+        if spec is None:
+            return None
+        return execution_policy_for(name, spec)

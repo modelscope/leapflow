@@ -113,6 +113,18 @@ def _normalize_tool_name(tool_name: str) -> str:
     return _default_tool_registry().normalize_name(tool_name)
 
 
+def _concurrency_spec_lookup(tool_name: str) -> Any:
+    """Return the registry ToolSpec for a (possibly gp_-prefixed) tool name.
+
+    Injected into the tool concurrency policy so parallel-safety is classified
+    from the same registry metadata that drives idempotency and the batch-stop
+    gate (one source of truth). Returns None for an unregistered tool, which the
+    policy treats as sequential.
+    """
+    specs = _default_tool_registry().specs
+    return specs.get(tool_name) or specs.get(tool_name.removeprefix("gp_"))
+
+
 def _normalize_tool_call(tool_call: Dict[str, Any]) -> Dict[str, Any]:
     """Return a resolved tool call while preserving the original tool name."""
     original_name = str(tool_call.get("name", ""))
@@ -946,7 +958,8 @@ class AgentEngine:
 
         # Tool concurrency policy (None = sequential fallback)
         self._concurrency_policy: Optional[ToolConcurrencyPolicy] = (
-            concurrency_policy if concurrency_policy is not None else DefaultConcurrencyPolicy()
+            concurrency_policy if concurrency_policy is not None
+            else DefaultConcurrencyPolicy(spec_lookup=_concurrency_spec_lookup)
         )
 
         # Session persistence (injected by CLI)
@@ -3864,8 +3877,12 @@ class AgentEngine:
             len(sequential),
         )
 
-        # Execute concurrent group via asyncio.gather
+        # Execute concurrent group via asyncio.gather, bounded so a large batch
+        # does not fan out unbounded IO/subprocess load.
         if concurrent:
+            max_parallel = max(1, int(getattr(self._settings, "agent_max_parallel_tools", 8) or 8))
+            _parallel_sem = asyncio.Semaphore(max_parallel)
+
             async def _run_one(ctc: ConcurrentToolCall) -> Dict[str, Any]:
                 original_name = original_names_by_id.get(str(ctc.id), ctc.name)
                 tool_call_dict = {
@@ -3874,9 +3891,10 @@ class AgentEngine:
                     "original_tool_name": original_name,
                     "normalized_tool_name": ctc.name,
                 }
-                return await self._execute_tool_with_ledger(
-                    tool_call_dict, handlers, tool_call_id=str(ctc.id),
-                )
+                async with _parallel_sem:
+                    return await self._execute_tool_with_ledger(
+                        tool_call_dict, handlers, tool_call_id=str(ctc.id),
+                    )
 
             gather_results = await asyncio.gather(
                 *[_run_one(ctc) for ctc in concurrent],

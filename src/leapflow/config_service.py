@@ -151,6 +151,7 @@ _FIELD_DESCRIPTIONS = {
     "daemon.session_idle_ttl_s": "Idle seconds after which a non-primary session execution context is evicted (0 disables idle eviction).",
     "agent.cost_ceiling_context_multiple": "Optional cumulative effective-cost ceiling as a multiple of context length (0 disables; a soft finalize nudge, the iteration cap stays the hard bound).",
     "agent.subagent_max_depth": "Maximum delegation depth for subagents (governs recursive task decomposition).",
+    "agent.max_parallel_tools": "Maximum tool calls executed in parallel within a single LLM response's batch (metadata-classified read-only / non-overlapping idempotent tools). Bounds the asyncio.gather fan-out so a large batch does not overwhelm IO; 1 forces sequential execution.",
     "agent.subagent_max_concurrent": "Maximum concurrent child subagents per delegation batch.",
     "agent.subagent_max_iterations": "Iteration budget for each delegated subagent's tool loop.",
     "agent.subagent_full_loop": "Run delegated subagents through the engine's full adaptive OODA loop on an isolated child frame (progressive disclosure, compression, recovery, research ledger) instead of the lightweight loop; state-isolated and depth-gated (default off).",
