@@ -25,6 +25,13 @@ class TurnAdmission:
         self._n = max(1, int(max_concurrent_turns))
         self._sem = asyncio.Semaphore(self._n)
         self._exclusive_lock = asyncio.Lock()
+        # Runtime metrics for TUI/daemon visibility. ``_slots_in_use`` counts
+        # both active turns and exclusive maintenance drains; ``_active_turns``
+        # counts user agent turns only. All mutations happen on the daemon event
+        # loop, so no extra thread lock is needed.
+        self._slots_in_use = 0
+        self._active_turns = 0
+        self._waiting_turns = 0
 
     @property
     def max_concurrent(self) -> int:
@@ -34,13 +41,39 @@ class TurnAdmission:
         """True when no turn slot is free (all N slots in use)."""
         return self._sem.locked()
 
+    def snapshot(self) -> dict[str, int | bool]:
+        """Return a structured runtime snapshot for status/UI reporting."""
+        available = max(0, self._n - self._slots_in_use)
+        return {
+            "max_concurrent": self._n,
+            "active": max(0, self._active_turns),
+            "waiting": max(0, self._waiting_turns),
+            "available": available,
+            "slots_in_use": max(0, self._slots_in_use),
+            "locked": self.locked(),
+        }
+
     @asynccontextmanager
     async def turn_slot(self) -> AsyncIterator[None]:
         """Acquire one turn slot (blocks when all N are in use)."""
-        await self._sem.acquire()
+        queued = self.locked()
+        if queued:
+            self._waiting_turns += 1
+        try:
+            await self._sem.acquire()
+        except BaseException:
+            if queued:
+                self._waiting_turns = max(0, self._waiting_turns - 1)
+            raise
+        if queued:
+            self._waiting_turns = max(0, self._waiting_turns - 1)
+        self._slots_in_use += 1
+        self._active_turns += 1
         try:
             yield
         finally:
+            self._active_turns = max(0, self._active_turns - 1)
+            self._slots_in_use = max(0, self._slots_in_use - 1)
             self._sem.release()
 
     @asynccontextmanager
@@ -51,10 +84,12 @@ class TurnAdmission:
             try:
                 for _ in range(self._n):
                     await self._sem.acquire()
+                    self._slots_in_use += 1
                     acquired += 1
                 yield
             finally:
                 for _ in range(acquired):
+                    self._slots_in_use = max(0, self._slots_in_use - 1)
                     self._sem.release()
 
     def exclusive_gate(self) -> "_ExclusiveGate":

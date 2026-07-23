@@ -374,6 +374,9 @@ def render_config_payload(console: "LeapConsole", payload: dict[str, Any]) -> No
         console.success(str(payload.get("message") or "Config updated."))
         for key in payload.get("changed_keys") or []:
             console.system(f"  {key}")
+        warnings = payload.get("warnings") or []
+        for warning in warnings:
+            console.warning(str(warning))
         if payload.get("reloaded"):
             console.system("Configuration reloaded for this session.")
         return
@@ -469,6 +472,7 @@ def _config_mutation_payload(ctx: "Context", service: Any, result: Any) -> dict[
         "mode": "mutation",
         "message": result.message,
         "changed_keys": list(result.changed_keys),
+        "warnings": list(getattr(result, "warnings", ()) or ()),
         "reloaded": reloaded,
         "model": ctx.settings.llm_model,
     }

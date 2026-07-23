@@ -69,6 +69,17 @@ async def test_config_slash_updates_model_and_hot_reloads(tmp_path) -> None:
         assert detail["field"]["type"] == "int"
         assert detail["field"]["description"]
 
+        daemon_detail = await command_execute(ctx, "config", "show daemon.max_concurrent_turns")
+        assert daemon_detail["ok"] is True
+        assert daemon_detail["field"]["value"] == "3"
+        assert daemon_detail["field"]["hot_reload"] == "restart-required"
+        assert "restart" in daemon_detail["field"]["description"].lower()
+
+        daemon_mutation = await command_execute(ctx, "config", "set daemon.max_concurrent_turns 4")
+        assert daemon_mutation["ok"] is True
+        assert daemon_mutation["warnings"]
+        assert "leap daemon restart" in daemon_mutation["warnings"][0]
+
         class RecordingConsole:
             def __init__(self) -> None:
                 self.rendered: list[object] = []
@@ -81,15 +92,19 @@ async def test_config_slash_updates_model_and_hot_reloads(tmp_path) -> None:
             def system(self, message: str) -> None:
                 self.systems.append(message)
 
+            def success(self, message: str) -> None:
+                self.systems.append(message)
+
             def warning(self, message: str) -> None:
                 self.warnings.append(message)
 
         console = RecordingConsole()
         render_config_payload(console, fields)  # type: ignore[arg-type]
         render_config_payload(console, detail)  # type: ignore[arg-type]
+        render_config_payload(console, daemon_mutation)  # type: ignore[arg-type]
         assert len(console.rendered) == 2
         assert any("/config show <key>" in message for message in console.systems)
-        assert console.warnings == []
+        assert any("leap daemon restart" in message for message in console.warnings)
     finally:
         await ctx.cleanup()
 
@@ -251,6 +266,14 @@ def test_config_cli_secret_and_llm_set(monkeypatch, tmp_path, capsys) -> None:
 
     assert config_module.cmd_config(argparse.Namespace(config_action="set", key="memory.working_max_tokens", value="12000", scope="profile")) == 0
     assert config_module.cmd_config(argparse.Namespace(config_action="set", key="visual.track_enabled", value="true", scope="profile")) == 0
+    assert config_module.cmd_config(argparse.Namespace(config_action="show", key="daemon.max_concurrent_turns")) == 0
+    daemon_show = capsys.readouterr().out
+    assert "reload: restart-required" in daemon_show
+    assert "value: 3" in daemon_show
+    assert config_module.cmd_config(argparse.Namespace(config_action="set", key="daemon.max_concurrent_turns", value="4", scope="profile")) == 0
+    daemon_set = capsys.readouterr().out
+    assert "daemon.max_concurrent_turns" in daemon_set
+    assert "leap daemon restart" in daemon_set
     assert config_module.cmd_config(argparse.Namespace(config_action="set", key="llm.api_key", value="sk-workspace", scope="workspace")) == 2
     assert "does not support scope: workspace" in capsys.readouterr().out
     assert config_module.cmd_config(argparse.Namespace(config_action="unset", key="llm.api_key", scope="workspace")) == 2

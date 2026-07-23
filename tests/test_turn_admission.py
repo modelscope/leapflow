@@ -42,8 +42,14 @@ async def test_n2_allows_two_concurrent_turns() -> None:
     await asyncio.sleep(0.02)
     assert set(running) == {"A", "B"}   # both turns run concurrently
     assert adm.locked() is True         # both slots in use
+    snapshot = adm.snapshot()
+    assert snapshot["max_concurrent"] == 2
+    assert snapshot["active"] == 2
+    assert snapshot["available"] == 0
+    assert snapshot["waiting"] == 0
     await asyncio.gather(t1, t2)
     assert adm.locked() is False
+    assert adm.snapshot()["active"] == 0
 
 
 @pytest.mark.asyncio
@@ -82,4 +88,39 @@ async def test_exclusive_gate_drains_all_slots() -> None:
     gate = adm.exclusive_gate()
     async with gate:
         assert adm.locked() is True     # exclusive drained every slot
+        snapshot = adm.snapshot()
+        assert snapshot["active"] == 0
+        assert snapshot["available"] == 0
     assert adm.locked() is False
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reports_waiting_turns_when_capacity_full() -> None:
+    adm = TurnAdmission(1)
+    release = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def holder() -> None:
+        async with adm.turn_slot():
+            entered.set()
+            await release.wait()
+
+    async def waiter() -> None:
+        async with adm.turn_slot():
+            pass
+
+    t1 = asyncio.create_task(holder())
+    await entered.wait()
+    t2 = asyncio.create_task(waiter())
+    await asyncio.sleep(0.02)
+
+    snapshot = adm.snapshot()
+    assert snapshot["max_concurrent"] == 1
+    assert snapshot["active"] == 1
+    assert snapshot["available"] == 0
+    assert snapshot["waiting"] == 1
+    assert snapshot["locked"] is True
+
+    release.set()
+    await asyncio.gather(t1, t2)
+    assert adm.snapshot()["waiting"] == 0

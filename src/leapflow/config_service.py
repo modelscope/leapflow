@@ -146,7 +146,7 @@ _FIELD_DESCRIPTIONS = {
     "tools.terminal_session_enabled": "Enable persistent terminal sessions (terminal_open/send/read/close/list). Off by default: a persistent shell runs arbitrary interactive input; enabling is the operator opt-in. Sessions are bounded (max count, idle TTL) with process-group cleanup.",
     "tools.verify_edits": "After edit_file/file_write, run an advisory syntax check on the written file (Python via AST) and attach syntax_ok/syntax_error to the result. Advisory only — it never blocks the write; the model sees a broken edit immediately and can fix it.",
     "agent.validate_tool_args": "Validate a tool call's required arguments before execution; a missing required parameter returns a structured invalid_arguments result (with the accepted schema) for in-turn self-repair instead of an opaque handler error. Does not count as a failure and never trips the batch-stop gate.",
-    "daemon.max_concurrent_turns": "Maximum agent turns the daemon runs concurrently across sessions (Stage 3). 1 (default) = today's behavior: turns are serialized. N>1 runs turns of different sessions in parallel on isolated per-session engines (turns within one session stay serialized).",
+    "daemon.max_concurrent_turns": "Maximum agent turns the daemon runs concurrently across sessions (Stage 3). 3 (default) lets several fresh TUI sessions run in parallel on isolated per-session engines; set to 1 for strict serialized fallback. Changes require `leap daemon restart`.",
     "daemon.max_live_sessions": "Maximum per-session execution contexts the daemon keeps live (bounds memory); the least-recently-active non-primary session is evicted beyond this.",
     "daemon.session_idle_ttl_s": "Idle seconds after which a non-primary session execution context is evicted (0 disables idle eviction).",
     "agent.cost_ceiling_context_multiple": "Optional cumulative effective-cost ceiling as a multiple of context length (0 disables; a soft finalize nudge, the iteration cap stays the hard bound).",
@@ -215,6 +215,7 @@ _VALUE_HINTS = {
 }
 
 _PARTIAL_RELOAD_SECTIONS = frozenset({"runtime", "mock", "gateway", "hub", "scheduler", "observer", "cua", "use", "dashboard"})
+_RESTART_REQUIRED_SECTIONS = frozenset({"daemon"})
 
 _PROFILE_FILE_BY_SECTION = {
     "llm": "llm.yaml",
@@ -401,7 +402,13 @@ class ConfigService:
         section[spec.name] = coerced
         data[spec.section] = section
         _write_yaml_atomic(path, data)
-        return ConfigMutationResult(True, f"Updated {normalized}", (normalized,), path)
+        return ConfigMutationResult(
+            True,
+            f"Updated {normalized}",
+            (normalized,),
+            path,
+            _restart_warnings(spec),
+        )
 
     def unset(self, key: str, *, scope: ConfigScope = "profile") -> ConfigMutationResult:
         normalized = _normalize_key(key)
@@ -416,7 +423,13 @@ class ConfigService:
         section.pop(spec.name, None)
         data[spec.section] = section
         _write_yaml_atomic(path, data)
-        return ConfigMutationResult(True, f"Unset {normalized}", (normalized,), path)
+        return ConfigMutationResult(
+            True,
+            f"Unset {normalized}",
+            (normalized,),
+            path,
+            _restart_warnings(spec),
+        )
 
     def configure_llm(
         self,
@@ -525,13 +538,28 @@ class ConfigService:
 
 
 def _with_metadata(spec: ConfigFieldSpec) -> ConfigFieldSpec:
+    if spec.section in _RESTART_REQUIRED_SECTIONS:
+        reload_semantics = "restart-required"
+    elif spec.section in _PARTIAL_RELOAD_SECTIONS:
+        reload_semantics = "partial"
+    else:
+        reload_semantics = "yes"
     return replace(
         spec,
         category=_category_for_spec(spec),
         description=_FIELD_DESCRIPTIONS.get(spec.key, _default_description(spec.key)),
         value_hint=_VALUE_HINTS.get(spec.key, _default_value_hint(spec)),
-        hot_reload="partial" if spec.section in _PARTIAL_RELOAD_SECTIONS else "yes",
+        hot_reload=reload_semantics,
         examples=_examples_for_key(spec.key),
+    )
+
+
+def _restart_warnings(spec: ConfigFieldSpec) -> tuple[str, ...]:
+    if spec.hot_reload != "restart-required":
+        return ()
+    return (
+        f"{spec.key} requires `leap daemon restart` to take effect; "
+        "the running leapd keeps its previous value until restarted.",
     )
 
 

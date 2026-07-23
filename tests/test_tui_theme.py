@@ -376,3 +376,22 @@ def test_status_bar_shows_adaptive_context_state(monkeypatch) -> None:
     rendered = "".join(text for _, text in status())
     assert "80%" in rendered
     assert "research" in rendered
+
+
+def test_status_bar_shows_daemon_turn_admission(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "leapflow.cli.tui_app.status.shutil.get_terminal_size",
+        lambda: terminal_size((120, 24)),
+    )
+    status = StatusBar(resolve_theme(_LIGHT, terminal_bg="#FFFFFF"))
+    status.update(
+        daemon_turn_active=3,
+        daemon_turn_max=4,
+        daemon_turn_waiting=1,
+        running_tasks=1,
+        queued_tasks=0,
+    )
+
+    rendered = "".join(text for _, text in status())
+    assert "local:1/1" in rendered
+    assert "daemon:3/4 waiting:1" in rendered

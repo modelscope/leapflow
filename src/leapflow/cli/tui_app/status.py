@@ -98,6 +98,9 @@ class StatusBar:
         self.context_state: str = "baseline"
         self.running_tasks: int = 0
         self.queued_tasks: int = 0
+        self.daemon_turn_active: int = 0
+        self.daemon_turn_max: int = 0
+        self.daemon_turn_waiting: int = 0
         self.watch_count: int = 0
         self.alert_count: int = 0
         self.last_turn_elapsed: float = 0.0
@@ -137,8 +140,26 @@ class StatusBar:
             if narrow:
                 task_text = f"r{self.running_tasks} q{self.queued_tasks} "
             else:
-                task_text = f"running:{self.running_tasks} queued:{self.queued_tasks} "
+                task_text = f"local:{self.running_tasks}/{self.running_tasks + self.queued_tasks} "
             parts.append(("class:status-bar.strong", task_text))
+            parts.append(("class:status-bar.dim", "│ "))
+
+        if self.daemon_turn_max > 0:
+            active = max(0, self.daemon_turn_active)
+            cap = max(1, self.daemon_turn_max)
+            waiting = max(0, self.daemon_turn_waiting)
+            daemon_cls = "class:status-bar.warn" if waiting or active >= cap else "class:status-bar.strong"
+            if narrow:
+                daemon_text = f"d{active}/{cap}"
+                if waiting:
+                    daemon_text += f"w{waiting}"
+                daemon_text += " "
+            else:
+                daemon_text = f"daemon:{active}/{cap}"
+                if waiting:
+                    daemon_text += f" waiting:{waiting}"
+                daemon_text += " "
+            parts.append((daemon_cls, daemon_text))
             parts.append(("class:status-bar.dim", "│ "))
 
         if self.watch_count or self.alert_count:
@@ -237,6 +258,9 @@ class StatusBar:
         context_state: Optional[str] = None,
         running_tasks: Optional[int] = None,
         queued_tasks: Optional[int] = None,
+        daemon_turn_active: Optional[int] = None,
+        daemon_turn_max: Optional[int] = None,
+        daemon_turn_waiting: Optional[int] = None,
     ) -> None:
         """Selectively update status fields."""
         if mode is not None:
@@ -259,6 +283,12 @@ class StatusBar:
             self.running_tasks = running_tasks
         if queued_tasks is not None:
             self.queued_tasks = queued_tasks
+        if daemon_turn_active is not None:
+            self.daemon_turn_active = max(0, daemon_turn_active)
+        if daemon_turn_max is not None:
+            self.daemon_turn_max = max(0, daemon_turn_max)
+        if daemon_turn_waiting is not None:
+            self.daemon_turn_waiting = max(0, daemon_turn_waiting)
 
     def update_task_counts(self, *, running: int, queued: int) -> None:
         """Update task counters shown in the status bar."""

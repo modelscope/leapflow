@@ -49,11 +49,11 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 0
         if action == "set":
             result = service.set(str(args.key), args.value, scope=getattr(args, "scope", "profile"))
-            _print_result(result.message, result.changed_keys)
+            _print_result(result.message, result.changed_keys, result.warnings)
             return 0
         if action == "unset":
             result = service.unset(str(args.key), scope=getattr(args, "scope", "profile"))
-            _print_result(result.message, result.changed_keys)
+            _print_result(result.message, result.changed_keys, result.warnings)
             return 0
         if action == "llm":
             return _cmd_llm(service, args)
@@ -84,11 +84,11 @@ def _cmd_llm(service: ConfigService, args: argparse.Namespace) -> int:
             max_retries=getattr(args, "max_retries", None),
             scope=getattr(args, "scope", "profile"),
         )
-        _print_result(result.message, result.changed_keys)
+        _print_result(result.message, result.changed_keys, result.warnings)
         return 0 if result.ok else 1
     if llm_action == "key":
         result = service.configure_llm(ask_api_key=True, scope=getattr(args, "scope", "profile"))
-        _print_result(result.message, result.changed_keys)
+        _print_result(result.message, result.changed_keys, result.warnings)
         return 0
     print(f"Unknown llm config action: {llm_action}")
     return 2
@@ -172,7 +172,13 @@ def _field_to_dict(item: Any) -> dict[str, Any]:
     }
 
 
-def _print_result(message: str, changed_keys: tuple[str, ...]) -> None:
+def _print_result(
+    message: str,
+    changed_keys: tuple[str, ...],
+    warnings: tuple[str, ...] = (),
+) -> None:
     print(message)
     for key in changed_keys:
         print(f"  {key}")
+    for warning in warnings:
+        print(f"warning: {warning}")

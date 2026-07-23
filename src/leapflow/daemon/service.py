@@ -63,7 +63,7 @@ class RuntimeLeapService:
         self._reentry_stop: "asyncio.Event | None" = None
         self._reentry_service: Any | None = None
         self._turn_admission = TurnAdmission(
-            int(getattr(settings, "daemon_max_concurrent_turns", 1) or 1)
+            int(getattr(settings, "daemon_max_concurrent_turns", 3) or 3)
         )
         self._session_registry: Any | None = None  # lazy per-session engine registry (Stage 3)
         self._started_at = time.time()
@@ -327,6 +327,14 @@ class RuntimeLeapService:
             )
         return self._session_registry
 
+    def _turn_admission_status(self, *, queued_delta: int = 0) -> dict[str, Any]:
+        """Return daemon turn-admission capacity metrics for clients/status."""
+        snapshot = dict(self._turn_admission.snapshot())
+        if queued_delta:
+            snapshot["waiting"] = max(0, int(snapshot.get("waiting", 0) or 0) + queued_delta)
+        snapshot["active_request_ids"] = sorted(self._active_engines)
+        return snapshot
+
     async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
         request_id = str(kwargs.get("request_id") or uuid.uuid4().hex[:12])
         # Turns are admitted up to daemon.max_concurrent_turns. When every slot
@@ -335,17 +343,24 @@ class RuntimeLeapService:
         # it blocks. The request is then queued and starts when a slot frees;
         # /cancel interrupts a running task.
         if self._turn_admission.locked():
+            admission = self._turn_admission_status(queued_delta=1)
+            active = int(admission.get("active", 0) or 0)
+            cap = int(admission.get("max_concurrent", 1) or 1)
+            waiting = int(admission.get("waiting", 0) or 0)
             yield StreamChunk(
                 request_id=request_id,
                 content=(
-                    "leapd is at capacity — your request is queued and will start "
-                    "when a running task finishes. Use /cancel to interrupt a task, or wait."
+                    f"leapd turn capacity is full ({active}/{cap}); "
+                    f"your request is waiting for a daemon slot (waiting:{waiting}). "
+                    "To raise the cap, run `leap config set daemon.max_concurrent_turns N` "
+                    "then `leap daemon restart`. Use `/cancel` to interrupt running work."
                 ),
                 event_type="status",
                 metadata={
                     "request_id": request_id,
                     "queued": True,
                     "active_request_id": self._active_engine_request_id or "",
+                    "turn_admission": admission,
                 },
             )
         async with self._turn_admission.turn_slot():
@@ -869,6 +884,7 @@ class RuntimeLeapService:
             "runtime_executable": sys.executable,
             "runtime_version": self._runtime_version(),
             "pending_approvals": len(self._approval_pending),
+            "turn_admission": self._turn_admission_status(),
             "watch_summary": watch_summary,
             "host_backend": self._host_backend_status(ctx),
         }

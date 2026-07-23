@@ -978,6 +978,9 @@ async def cmd_interactive_daemon(
     runtime_context_state = "baseline"
     runtime_daemon_pid = ""
     runtime_host_online = False
+    runtime_turn_active = 0
+    runtime_turn_max = 0
+    runtime_turn_waiting = 0
     client_lease = ClientLease(
         settings.runtime_dir,
         kind="tui",
@@ -987,6 +990,7 @@ async def cmd_interactive_daemon(
     def _apply_daemon_runtime_metadata(metadata: dict[str, Any]) -> None:
         nonlocal active_session_id, runtime_model_name, runtime_context_length
         nonlocal runtime_context_used, runtime_context_state, runtime_daemon_pid, runtime_host_online
+        nonlocal runtime_turn_active, runtime_turn_max, runtime_turn_waiting
         if metadata.get("pid"):
             runtime_daemon_pid = str(metadata["pid"])
         if metadata.get("session_id"):
@@ -1013,6 +1017,14 @@ async def cmd_interactive_daemon(
         host = metadata.get("host_backend")
         if isinstance(host, dict):
             runtime_host_online = _host_started(host)
+        admission = metadata.get("turn_admission")
+        if isinstance(admission, dict):
+            try:
+                runtime_turn_active = max(0, int(admission.get("active", 0) or 0))
+                runtime_turn_max = max(0, int(admission.get("max_concurrent", 0) or 0))
+                runtime_turn_waiting = max(0, int(admission.get("waiting", 0) or 0))
+            except (TypeError, ValueError):
+                pass
 
     def _set_active_session_id(session_id: str) -> None:
         nonlocal active_session_id
@@ -1040,6 +1052,9 @@ async def cmd_interactive_daemon(
             context_used=runtime_context_used,
             context_max=runtime_context_length,
             context_state=runtime_context_state,
+            daemon_turn_active=runtime_turn_active,
+            daemon_turn_max=runtime_turn_max,
+            daemon_turn_waiting=runtime_turn_waiting,
         )
         app.prompt_mode = effective_mode
 
@@ -1079,6 +1094,19 @@ async def cmd_interactive_daemon(
             f"connected={daemon_status.get('connected_clients', 0)} "
             f"volatile={daemon_status.get('volatile')}"
         )
+        admission = daemon_status.get("turn_admission")
+        if isinstance(admission, dict):
+            active = int(admission.get("active", 0) or 0)
+            cap = int(admission.get("max_concurrent", 0) or 0)
+            waiting = int(admission.get("waiting", 0) or 0)
+            available = int(admission.get("available", 0) or 0)
+            console.system(
+                f"Daemon turns: active={active}/{cap} "
+                f"available={available} waiting={waiting}"
+            )
+            active_ids = [str(item) for item in admission.get("active_request_ids") or []]
+            if active_ids:
+                console.system(f"Active turn request ids: {', '.join(active_ids)}")
         db_path = daemon_status.get("db_path")
         if db_path:
             console.system(f"DB: {db_path}")

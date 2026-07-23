@@ -80,6 +80,17 @@ def _print_runtime_status(status: dict) -> None:
         f"{status.get('model')} "
         f"context={status.get('context_used', 0)}/{status.get('llm_context_length', 0)}"
     )
+    admission = status.get("turn_admission")
+    if isinstance(admission, dict):
+        print(
+            "turns: "
+            f"active={admission.get('active', 0)}/{admission.get('max_concurrent', 0)} "
+            f"available={admission.get('available', 0)} "
+            f"waiting={admission.get('waiting', 0)}"
+        )
+        active_ids = [str(item) for item in admission.get("active_request_ids") or []]
+        if active_ids:
+            print(f"active_request_ids: {', '.join(active_ids)}")
     if status.get("session_id"):
         print(f"session: {status['session_id']}")
     if status.get("runtime_version"):
