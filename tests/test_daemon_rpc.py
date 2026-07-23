@@ -269,23 +269,21 @@ async def test_runtime_service_prunes_completed_engine_request_replay_records() 
 
 @pytest.mark.asyncio
 async def test_engine_chat_emits_queued_status_when_busy() -> None:
-    """When the engine lock is already held (another turn running), a waiting
-    client gets an immediate 'queued' status instead of a silent hang."""
+    """When the daemon is at capacity (all turn slots busy), a waiting client
+    gets an immediate 'queued' status instead of a silent hang."""
     from types import SimpleNamespace
     from leapflow.daemon.service import RuntimeLeapService
 
     service = RuntimeLeapService(SimpleNamespace(llm_context_length=100))
-    await service._engine_lock.acquire()  # simulate another turn holding the engine
     service._active_engine_request_id = "busy-req"
-    try:
+    # Drain all turn-admission slots to simulate the daemon at capacity.
+    async with service._turn_admission.exclusive():
         agen = service.engine_chat("who are you", request_id="req-2")
         first = await agen.__anext__()
         assert first.event_type == "status"
         assert first.metadata.get("queued") is True
         assert first.metadata.get("active_request_id") == "busy-req"
-        await agen.aclose()  # generator is paused awaiting the lock; clean it up
-    finally:
-        service._engine_lock.release()
+        await agen.aclose()  # generator is paused awaiting a slot; clean it up
 
 
 @pytest.mark.asyncio
@@ -530,6 +528,55 @@ async def test_engine_cancel_targets_active_turn_engines() -> None:
     # Untargeted cancel hits all active turns.
     assert await service.engine_cancel() is True
     assert eng_a.cancelled == 2 and eng_b.cancelled == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sessions_run_in_parallel_when_admission_allows() -> None:
+    """P3-4: with daemon.max_concurrent_turns=2, two sessions' turns run in
+    parallel. Each engine only completes once the other turn has also started,
+    so a serialized daemon (N=1) would time out — proving real concurrency."""
+    from types import SimpleNamespace
+
+    from leapflow.daemon.service import RuntimeLeapService
+    from leapflow.daemon.session_registry import SessionExecutionContext
+    from leapflow.engine import StreamEvent
+
+    started = {"A": asyncio.Event(), "B": asyncio.Event()}
+
+    class ConcEngine:
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+            self._current_session_id = tag
+
+        async def run_stream(self, message: str, *, enable_thinking: bool = False, request_id: str = ""):
+            started[self.tag].set()
+            other = "B" if self.tag == "A" else "A"
+            await asyncio.wait_for(started[other].wait(), 1.0)  # requires both to be running
+            yield StreamEvent(type="final", content=f"{self.tag}:done")
+
+    engines = {"A": ConcEngine("A"), "B": ConcEngine("B")}
+
+    class FakeRegistry:
+        async def acquire(self, sid: str) -> SessionExecutionContext:
+            return SessionExecutionContext(sid, engines[sid])
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(llm_context_length=100)
+            self.engine = engines["A"]
+
+        def reload_runtime_config_if_changed(self) -> bool:
+            return False
+
+    service = RuntimeLeapService(SimpleNamespace(llm_context_length=100, daemon_max_concurrent_turns=2))
+    service._ctx = FakeContext()
+    service._session_registry = FakeRegistry()
+
+    async def run(sid: str, rid: str) -> list[str]:
+        return [c.content async for c in service.engine_chat("hi", request_id=rid, session_id=sid) if c.content]
+
+    out_a, out_b = await asyncio.wait_for(asyncio.gather(run("A", "rA"), run("B", "rB")), 3.0)
+    assert out_a == ["A:done"] and out_b == ["B:done"]
 
 
 @pytest.mark.asyncio

@@ -122,12 +122,13 @@ async def test_react_loop_tool_then_answer() -> None:
 
 @pytest.mark.xfail(
     reason=(
-        "P1 Stage 3 acceptance criterion: true per-turn CONCURRENCY isolation. The engine "
-        "currently shares per-turn substrate across a single instance (active frame, working "
-        "memory, prompt assembly), so two turns run concurrently on one engine cross-contaminate. "
-        "The daemon deliberately serializes turns via _engine_lock today (P0 gives the waiting "
-        "client immediate 'queued' feedback). This test documents the target: concurrent turns "
-        "must not leak each other's content. Un-xfail when Stage 3 lands N>1 isolation."
+        "Documents a SINGLE shared engine's limitation: two turns run concurrently on one "
+        "engine instance cross-contaminate, because per-turn substrate (active frame, working "
+        "memory, prompt assembly) lives on that instance. Stage 3 resolves concurrency with "
+        "Approach D — the daemon runs each session on its OWN engine (build_session_engine) "
+        "bounded by TurnAdmission — rather than isolating a single shared engine, so this stays "
+        "xfail intentionally. The positive proof is test_concurrent_session_engines_are_isolated "
+        "(separate per-session engines run concurrent turns with no cross-contamination)."
     ),
     strict=False,
 )

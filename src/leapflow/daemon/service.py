@@ -17,6 +17,7 @@ from typing import Any
 
 from leapflow.daemon.lease import ClientLeaseSnapshot
 from leapflow.daemon.protocol import StreamChunk
+from leapflow.daemon.turn_admission import TurnAdmission
 from leapflow.engine import StreamEvent
 from leapflow.memory.protocol import MemoryEntry, MemoryQuery
 
@@ -48,7 +49,9 @@ class RuntimeLeapService:
         self._reentry_task: "asyncio.Task[Any] | None" = None
         self._reentry_stop: "asyncio.Event | None" = None
         self._reentry_service: Any | None = None
-        self._engine_lock = asyncio.Lock()
+        self._turn_admission = TurnAdmission(
+            int(getattr(settings, "daemon_max_concurrent_turns", 1) or 1)
+        )
         self._session_registry: Any | None = None  # lazy per-session engine registry (Stage 3)
         self._started_at = time.time()
         self._client_count: Callable[[], int] = lambda: 0
@@ -174,7 +177,8 @@ class RuntimeLeapService:
         Dispatches due TIME triggers periodically and matches inbound gateway
         EVENT triggers, always as *isolated subagents* (fresh context -> no
         interactive-engine / working-memory / session pollution), serialized via
-        ``_engine_lock``. Gated by ``agent_reentry_enabled`` (default off) plus a
+        the turn-admission gate (exclusive with all turns). Gated by
+        ``agent_reentry_enabled`` (default off) plus a
         global-budget backstop. Best-effort: never blocks startup.
         """
         try:
@@ -209,7 +213,7 @@ class RuntimeLeapService:
                 store=store,
                 manager=manager,
                 settings=self._settings,
-                engine_lock=self._engine_lock,
+                engine_lock=self._turn_admission.exclusive_gate(),
                 notify=lambda event_type, **kw: self.notification_bus.emit_event(event_type, **kw),
                 global_budget=int(getattr(self._settings, "agent_reentry_global_budget", 100) or 0),
                 send_governor=send_governor,
@@ -312,17 +316,17 @@ class RuntimeLeapService:
 
     async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
         request_id = str(kwargs.get("request_id") or uuid.uuid4().hex[:12])
-        # The single engine serializes turns via _engine_lock. If it is already
-        # busy with another turn (a long task can hold it for minutes), tell the
-        # waiting client immediately instead of leaving it on a silent "thinking"
-        # spinner while it blocks on the lock. The request is then queued and
-        # starts when the active turn finishes; /cancel interrupts the running one.
-        if self._engine_lock.locked():
+        # Turns are admitted up to daemon.max_concurrent_turns. When every slot
+        # is busy (a long task can hold one for minutes), tell the waiting client
+        # immediately instead of leaving it on a silent "thinking" spinner while
+        # it blocks. The request is then queued and starts when a slot frees;
+        # /cancel interrupts a running task.
+        if self._turn_admission.locked():
             yield StreamChunk(
                 request_id=request_id,
                 content=(
-                    "leapd is busy running another task — your request is queued and will start "
-                    "when it finishes. Use /cancel to interrupt the running task, or wait."
+                    "leapd is at capacity — your request is queued and will start "
+                    "when a running task finishes. Use /cancel to interrupt a task, or wait."
                 ),
                 event_type="status",
                 metadata={
@@ -331,7 +335,7 @@ class RuntimeLeapService:
                     "active_request_id": self._active_engine_request_id or "",
                 },
             )
-        async with self._engine_lock:
+        async with self._turn_admission.turn_slot():
             self._prune_engine_request_ledger()
             existing = self._engine_request_ledger.get(request_id)
             if existing and existing.get("status") == "completed":
@@ -385,8 +389,8 @@ class RuntimeLeapService:
                 # reuses the base engine (single-session daemon unchanged);
                 # additional distinct sessions run on isolated per-session
                 # engines so their working memory / per-turn state never
-                # cross-contaminate. Turns remain globally serialized here
-                # (_engine_lock); bounded cross-session concurrency is P3-4.
+                # cross-contaminate. Turns are admitted by TurnAdmission (bounded
+                # by daemon.max_concurrent_turns) and serialized within a session.
                 # Un-sessioned turns keep using the base engine directly, which
                 # is also the primary session's engine, so the two stay
                 # consistent through a ""→real session_id transition.
@@ -395,9 +399,11 @@ class RuntimeLeapService:
                     or getattr(engine, "_current_session_id", "")
                     or ""
                 )
+                session_lock: asyncio.Lock | None = None
                 if session_id:
                     exec_ctx = await self._ensure_session_registry(engine).acquire(session_id)
                     engine = exec_ctx.engine
+                    session_lock = exec_ctx.lock
 
                 enable_thinking = bool(kwargs.get("enable_thinking", False))
                 approval_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
@@ -405,6 +411,11 @@ class RuntimeLeapService:
                 route_token = _approval_route.set((approval_queue, request_id))
                 self._active_engine_request_id = request_id
                 self._active_engines[request_id] = engine
+                # Serialize turns within one session (a conversation is
+                # sequential); different sessions run concurrently up to the
+                # global turn-admission bound.
+                if session_lock is not None:
+                    await session_lock.acquire()
                 try:
                     sig = inspect.signature(engine.run_stream)
                     if "request_id" in sig.parameters:
@@ -430,6 +441,8 @@ class RuntimeLeapService:
                     _approval_route.reset(route_token)
                     self._active_engine_request_id = previous_request_id
                     self._active_engines.pop(request_id, None)
+                    if session_lock is not None:
+                        session_lock.release()
             except Exception:
                 request_record["status"] = "failed"
                 request_record["completed_at"] = time.time()
@@ -845,7 +858,7 @@ class RuntimeLeapService:
 
     async def host_start(self) -> dict[str, Any]:
         """Start daemon-owned CuaDriver without resetting chat state."""
-        async with self._engine_lock:
+        async with self._turn_admission.exclusive():
             ctx = self.context
             start = getattr(ctx, "host_backend_start", None)
             if not callable(start):
@@ -854,7 +867,7 @@ class RuntimeLeapService:
 
     async def host_stop(self) -> dict[str, Any]:
         """Stop daemon-owned CuaDriver without shutting down leapd."""
-        async with self._engine_lock:
+        async with self._turn_admission.exclusive():
             ctx = self.context
             stop = getattr(ctx, "host_backend_stop", None)
             if not callable(stop):
@@ -863,7 +876,7 @@ class RuntimeLeapService:
 
     async def host_restart(self) -> dict[str, Any]:
         """Restart daemon-owned CuaDriver without resetting chat state."""
-        async with self._engine_lock:
+        async with self._turn_admission.exclusive():
             ctx = self.context
             restart = getattr(ctx, "host_backend_restart", None)
             if not callable(restart):
