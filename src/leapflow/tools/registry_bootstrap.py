@@ -54,12 +54,16 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "file_list",
-            "description": "List files and directories at a given path.",
+            "description": (
+                "List files and directories at a given path. Use depth=1 or depth=2 to get a "
+                "recursive tree in one call instead of listing each sub-directory separately."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Directory path (default: current dir)"},
-                    "pattern": {"type": "string", "description": "Glob pattern (default: *)"},
+                    "pattern": {"type": "string", "description": "Glob pattern for flat listing (default: *; ignored when depth > 0)"},
+                    "depth": {"type": "integer", "description": "Recursion depth: 0 = flat one-level listing (default), 1-5 = recursive tree skipping VCS/deps dirs"},
                 },
             },
         },
@@ -694,10 +698,14 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
 _BRIDGE_TOOLS = [
     {
         "name": "gp_file_list",
-        "description": "List files and directories at a given path.",
+        "description": (
+            "List files and directories at a given path. Use depth=1 or depth=2 to get a "
+            "recursive tree in one call instead of listing each sub-directory separately."
+        ),
         "parameters": {
             "path": "string (optional) — directory path to list (default: .)",
-            "pattern": "string (optional) — glob pattern to filter (default: *)",
+            "pattern": "string (optional) — glob pattern for flat listing (default: *; ignored when depth > 0)",
+            "depth": "integer (optional) — recursion depth: 0 = flat (default), 1-5 = recursive tree skipping VCS/deps",
         },
         "handler": file_list,
     },

@@ -374,10 +374,12 @@ def _head_tail_truncate(text: str, allow: int) -> str:
 def _truncate_result_for_budget(payload: Any, budget: int) -> str:
     """Serialize a tool result to JSON within ``budget``, preserving structure.
 
-    When over budget, shrink the largest string fields with head+tail truncation
-    (so the tail error survives) rather than a naive cut of the whole JSON string,
-    which drops the tail and can emit invalid JSON. A final hard cut is only a
-    last-resort safety net. Never raises.
+    Pass 1 – prune list fields (e.g. file_list entries): drop tail elements
+    and annotate ``<key>_omitted`` so the LLM knows how many were removed.
+    Pass 2 – shrink the largest string fields with head+tail truncation so
+    the tail error / trace survives.  The final fallback emits a minimal
+    valid-JSON sentinel; a raw string cut that leaves invalid JSON is never
+    returned.  Never raises.
     """
     try:
         text = json.dumps(payload, default=str, ensure_ascii=False)
@@ -387,6 +389,32 @@ def _truncate_result_for_budget(payload: Any, budget: int) -> str:
         return text
     if isinstance(payload, dict):
         shrunk = dict(payload)
+
+        # Pass 1: prune list fields until the result fits.
+        # This handles file_list / file_find payloads that carry many entries.
+        for key in list(shrunk):
+            v = shrunk[key]
+            if not isinstance(v, list) or not v:
+                continue
+            orig_len = len(v)
+            # Estimate target entry count from a small sample to minimise
+            # iterations; then fine-tune with a tight while-loop.
+            sample = json.dumps(v[:min(4, orig_len)], default=str, ensure_ascii=False)
+            chars_per = max(1, len(sample) / min(4, orig_len))
+            empty_payload = {**shrunk, key: [], key + "_omitted": orig_len}
+            overhead = len(json.dumps(empty_payload, default=str, ensure_ascii=False))
+            target = max(0, int((budget - overhead) / chars_per))
+            shrunk[key] = v[:target]
+            if target < orig_len:
+                shrunk[key + "_omitted"] = orig_len - target
+            # Fine-tune (estimation may be off by ±1 entry).
+            while shrunk[key] and len(json.dumps(shrunk, default=str, ensure_ascii=False)) > budget:
+                shrunk[key] = shrunk[key][:-1]
+                shrunk[key + "_omitted"] = orig_len - len(shrunk[key])
+            if len(json.dumps(shrunk, default=str, ensure_ascii=False)) <= budget:
+                return json.dumps(shrunk, default=str, ensure_ascii=False)
+
+        # Pass 2: shrink the largest string fields with head+tail truncation.
         while True:
             over = len(json.dumps(shrunk, default=str, ensure_ascii=False)) - budget
             if over <= 0:
@@ -399,10 +427,24 @@ def _truncate_result_for_budget(payload: Any, budget: int) -> str:
             if allow >= len(value):
                 break
             shrunk[key] = _head_tail_truncate(value, allow)
+
         text = json.dumps(shrunk, default=str, ensure_ascii=False)
-    if len(text) > budget:
-        text = text[:budget]
-    return text
+        if len(text) <= budget:
+            return text
+
+        # Sentinel: emit minimal valid JSON rather than a raw string cut that
+        # leaves the LLM with an unparseable fragment.
+        sentinel = json.dumps({
+            "ok": payload.get("ok"),
+            "kind": payload.get("kind", ""),
+            "truncated": True,
+            "original_chars": len(text),
+            "budget_chars": budget,
+        }, default=str, ensure_ascii=False)
+        return sentinel
+
+    # Non-dict: hard string cut is unavoidable; the LLM sees a partial raw value.
+    return text[:budget]
 
 
 def _skipped_after_failure_result(blocking_tool: str, blocking_result: Dict[str, Any]) -> Dict[str, Any]:

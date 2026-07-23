@@ -159,12 +159,19 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
         except ImportError:
             pass
 
-        return {
+        result: Dict[str, Any] = {
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
             "stdout": stdout_text,
             "stderr": stderr_text,
         }
+        if proc.returncode != 0:
+            # Surface a concrete error: the tail of stderr holds the real cause
+            # (e.g. the last line of a Python traceback), so downstream never has
+            # to fall back to a bare "unknown error".
+            detail = stderr_text.strip() or stdout_text.strip()
+            result["error"] = detail[-800:] if detail else f"Command failed with exit code {proc.returncode}"
+        return result
     except asyncio.TimeoutError:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # type: ignore[possibly-undefined]

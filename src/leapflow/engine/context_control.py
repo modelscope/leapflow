@@ -303,15 +303,81 @@ class ToolEvidenceBuilder:
 
     def _file_list_evidence(self, result: Dict[str, Any]) -> Dict[str, Any]:
         entries = result.get("entries", [])
-        compact_entries = entries[: self._max_items] if isinstance(entries, list) else []
+        tree = result.get("tree")
+
+        if tree is not None:
+            # Depth > 0: flatten the nested tree to compact indented path strings
+            # so the LLM receives a readable structure without verbose dicts.
+            flat: List[str] = []
+            self._flatten_tree_nodes(tree, prefix="", out=flat, limit=self._max_items)
+            return {
+                "ok": True,
+                "kind": "file_list_evidence",
+                "path": result.get("path", ""),
+                "depth": result.get("depth", 1),
+                "tree": flat,
+                "total_entries": result.get("total_entries", len(flat)),
+                "truncated": bool(result.get("truncated", False)),
+            }
+
+        # Flat listing (depth=0): compact entry strings instead of verbose
+        # {name, type, size} dicts — ~3× more entries per token budget.
+        all_compact = [
+            self._compact_entry(e) for e in entries
+        ] if isinstance(entries, list) else []
+        visible = all_compact[: self._max_items]
         return {
             "ok": True,
             "kind": "file_list_evidence",
             "path": result.get("path", ""),
-            "entries": compact_entries,
-            "entry_count": result.get("entry_count", len(entries) if isinstance(entries, list) else 0),
-            "truncated": bool(result.get("truncated", False) or (isinstance(entries, list) and len(entries) > len(compact_entries))),
+            "entries": visible,
+            "entry_count": result.get("entry_count", len(all_compact)),
+            "truncated": bool(
+                result.get("truncated", False) or
+                (isinstance(entries, list) and len(entries) > len(visible))
+            ),
         }
+
+    @staticmethod
+    def _compact_entry(entry: Any) -> str:
+        """Render a {name, type, size} dict as a short token-efficient string."""
+        if not isinstance(entry, dict):
+            return str(entry)
+        name = str(entry.get("name", ""))
+        if entry.get("type") == "dir":
+            return f"{name}/"
+        size = entry.get("size")
+        if size is not None:
+            if size >= 1_000_000:
+                return f"{name} ({size / 1_000_000:.1f}MB)"
+            if size >= 1_000:
+                return f"{name} ({size / 1_000:.0f}KB)"
+            return f"{name} ({size}B)"
+        return name
+
+    def _flatten_tree_nodes(
+        self, nodes: Any, *, prefix: str, out: List[str], limit: int
+    ) -> None:
+        """Recursively flatten a tree structure to indented compact strings."""
+        if not isinstance(nodes, list):
+            return
+        for node in nodes:
+            if len(out) >= limit:
+                break
+            if not isinstance(node, dict):
+                continue
+            name = str(node.get("name", ""))
+            if node.get("type") == "dir":
+                summary = node.get("summary", "")
+                label = f"{prefix}{name}/" + (f" [{summary}]" if summary else "")
+                out.append(label)
+                children = node.get("children")
+                if isinstance(children, list):
+                    self._flatten_tree_nodes(
+                        children, prefix=prefix + "  ", out=out, limit=limit
+                    )
+            else:
+                out.append(prefix + self._compact_entry(node))
 
     def _shell_evidence(self, result: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -375,6 +441,17 @@ class ToolEvidenceBuilder:
         for key in ("error_type", "retryable", "missing", "accepted_parameters", "required", "match_count", "failure_code"):
             if key in result:
                 compact[key] = self._compact_value(result[key])
+        # Diagnostic output matters MOST on failure: preserve stdout/stderr
+        # (head+tail so the tail traceback survives) and the exit code, so the
+        # agent can see the actual error (e.g. a Python traceback from a failed
+        # shell_run) and fix its cause instead of a bare "unknown error".
+        for key in ("stdout", "stderr"):
+            value = result.get(key)
+            if value:
+                compact[key] = self._head_tail(str(value), self._max_content_chars)
+        for key in ("returncode", "exit_code"):
+            if key in result:
+                compact[key] = result[key]
         return compact
 
     def _app_connector_evidence(self, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -609,7 +686,12 @@ class ContextGovernanceController:
         elif tool_name in {"file_list", "gp_file_list"}:
             path = str((arguments or {}).get("path") or (result.get("path") if isinstance(result, dict) else ""))
             if path:
-                self._sources_seen.add(str(Path(path).expanduser()))
+                key = str(Path(path).expanduser())
+                # Track repeated directory listings alongside repeated file reads:
+                # both are evidence of an agent struggling to make progress, and
+                # both should push the posture toward converging.
+                self._reads[key] = self._reads.get(key, 0) + 1
+                self._sources_seen.add(key)
         return self.evidence_builder.build(tool_name, arguments, result)
 
     def tool_metadata(self, tool_name: str, arguments: Dict[str, Any] | None, result: Any) -> Dict[str, Any]:
@@ -619,6 +701,15 @@ class ContextGovernanceController:
             metadata["context_evidence"] = True
         if tool_name in {"file_read", "gp_file_read"}:
             path = str((arguments or {}).get("path") or "")
+            if path:
+                count = self._reads.get(str(Path(path).expanduser()), 0)
+                metadata["read_count"] = count
+                metadata["repeat_read"] = count > self.repeated_read_limit
+        if tool_name in {"file_list", "gp_file_list"}:
+            # Expose the same repeat_read signal for directories so the UI and
+            # the agent loop can surface the same converging guidance as for
+            # repeated file reads.
+            path = str((arguments or {}).get("path") or (result.get("path") if isinstance(result, dict) else ""))
             if path:
                 count = self._reads.get(str(Path(path).expanduser()), 0)
                 metadata["read_count"] = count

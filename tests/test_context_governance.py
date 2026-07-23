@@ -19,7 +19,7 @@ from leapflow.engine.context_control import (
     LongTaskContextController,
     ToolEvidenceBuilder,
 )
-from leapflow.tools.file_operations import file_read
+from leapflow.tools.file_operations import file_list, file_read
 
 
 class _NoopCompressor:
@@ -608,3 +608,164 @@ def test_compressor_estimate_tokens_is_cjk_aware() -> None:
     tokens_latin = ContextCompressor._estimate_tokens(messages_latin)
 
     assert tokens_cjk > tokens_latin
+
+
+# ── file_list repeated-listing → converging (P0 fix) ────────────────────────
+
+
+def test_file_list_repeated_listing_triggers_converging() -> None:
+    """Repeated file_list of the same directory is tracked like repeated file_read
+    and should push the posture toward converging."""
+    controller = LongTaskContextController(
+        evidence_builder=ToolEvidenceBuilder(),
+        repeated_read_limit=1,
+        convergence_round=20,
+    )
+    args = {"path": "/proj"}
+    result = {"ok": True, "path": "/proj", "entries": [], "entry_count": 0}
+
+    controller.compact_tool_result("file_list", args, result)
+    controller.compact_tool_result("file_list", args, result)  # second listing
+
+    metadata = controller.tool_metadata("file_list", args, result)
+    # file_list is tracked as a read, so repeat_read should fire
+    assert metadata.get("repeat_read") is True
+    snap = controller.snapshot(round_number=2)
+    assert snap.repeated_reads == 1
+    notice = controller.convergence_notice(2)
+    assert "repeated reads" in notice
+
+
+# ── file_list compact entry format (P1 fix) ──────────────────────────────
+
+
+def test_file_list_evidence_entries_are_compact_strings() -> None:
+    """file_list entries must be rendered as token-efficient strings, not verbose dicts."""
+    builder = ToolEvidenceBuilder()
+    result = {
+        "ok": True,
+        "path": "/proj",
+        "entries": [
+            {"name": "app.py", "type": "file", "size": 5120},
+            {"name": "config.py", "type": "file", "size": 512},
+            {"name": "src", "type": "dir", "size": None},
+        ],
+        "entry_count": 3,
+        "truncated": False,
+    }
+    evidence = builder.build("file_list", {"path": "/proj"}, result)
+
+    assert evidence["kind"] == "file_list_evidence"
+    entries = evidence["entries"]
+    assert all(isinstance(e, str) for e in entries), "entries must be strings, not dicts"
+    # Directories end with '/'
+    assert any(e.endswith("/") for e in entries)
+    # File sizes are embedded: 5120 bytes = 5KB
+    assert any("5KB" in e for e in entries)
+    assert any("512B" in e for e in entries)
+
+
+def test_file_list_evidence_tree_flattened_to_strings() -> None:
+    """depth > 0 tree output must be flattened to compact indented strings."""
+    builder = ToolEvidenceBuilder()
+    result = {
+        "ok": True,
+        "path": "/proj",
+        "depth": 2,
+        "tree": [
+            {"name": "src", "type": "dir", "children": [
+                {"name": "app.py", "type": "file", "size": 1000},
+            ]},
+            {"name": "tests", "type": "dir", "summary": "5 items"},
+        ],
+        "total_entries": 4,
+        "truncated": False,
+    }
+    evidence = builder.build("file_list", {"path": "/proj"}, result)
+
+    assert evidence["kind"] == "file_list_evidence"
+    assert evidence["depth"] == 2
+    tree = evidence["tree"]
+    assert all(isinstance(line, str) for line in tree)
+    assert any("src/" in line for line in tree)
+    assert any("app.py" in line for line in tree)
+    assert any("tests/" in line and "5 items" in line for line in tree)
+
+
+# ── file_list depth functional tests (P1 fix) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_file_list_depth0_flat_listing(tmp_path) -> None:
+    """depth=0 (default) behaves exactly like the original flat listing."""
+    (tmp_path / "a.py").write_text("x")
+    (tmp_path / "b.py").write_text("y")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "c.py").write_text("z")
+
+    result = await file_list({"path": str(tmp_path), "depth": 0})
+
+    assert result["ok"] is True
+    assert "entries" in result
+    names = [e["name"] for e in result["entries"]]
+    assert "a.py" in names and "b.py" in names and "sub" in names
+    # depth=0: sub/c.py must NOT appear at the top level
+    assert "c.py" not in names
+
+
+@pytest.mark.asyncio
+async def test_file_list_depth1_includes_immediate_children(tmp_path) -> None:
+    """depth=1 returns a tree that includes the root's direct sub-directories
+    as named entries (with an item-count summary) but does not recurse further."""
+    (tmp_path / "a.py").write_text("x")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "c.py").write_text("z")
+
+    result = await file_list({"path": str(tmp_path), "depth": 1})
+
+    assert result["ok"] is True
+    assert "tree" in result
+    assert result["depth"] == 1
+    names = [e["name"] for e in result["tree"]]
+    assert "sub" in names
+    # depth=1 directories carry a summary, not children
+    sub_entry = next(e for e in result["tree"] if e["name"] == "sub")
+    assert "children" not in sub_entry
+
+
+@pytest.mark.asyncio
+async def test_file_list_depth2_recurses_into_subdirs(tmp_path) -> None:
+    """depth=2 expands child directories and exposes their contents."""
+    sub = tmp_path / "pkg"
+    sub.mkdir()
+    (sub / "module.py").write_text("x")
+
+    result = await file_list({"path": str(tmp_path), "depth": 2})
+
+    assert result["ok"] is True
+    assert "tree" in result
+    pkg_entry = next((e for e in result["tree"] if e["name"] == "pkg"), None)
+    assert pkg_entry is not None
+    children = pkg_entry.get("children", [])
+    child_names = [c["name"] for c in children]
+    assert "module.py" in child_names
+
+
+@pytest.mark.asyncio
+async def test_file_list_skips_search_skip_dirs(tmp_path) -> None:
+    """VCS/dependency directories (.git, node_modules, .venv) are never expanded."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("git")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("x")
+
+    result = await file_list({"path": str(tmp_path), "depth": 2})
+
+    assert result["ok"] is True
+    git_entry = next((e for e in result["tree"] if e["name"] == ".git"), None)
+    assert git_entry is not None
+    # .git must be flagged skipped and must NOT have children
+    assert git_entry.get("skipped") is True
+    assert "children" not in git_entry

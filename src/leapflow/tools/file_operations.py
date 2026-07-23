@@ -170,10 +170,73 @@ def _is_unsupported_leapflow_config_probe(path: Path) -> bool:
     return len(parts) >= 2 and parts[-2:] == (".leapflow", "config.json")
 
 
+def _list_tree(
+    root: Path,
+    *,
+    depth: int,
+    budget: List[int],
+) -> List[Dict[str, Any]]:
+    """Recursively list a directory tree up to ``depth`` levels deep.
+
+    ``budget`` is a one-element mutable list containing the remaining entry
+    count; it is shared across all recursive calls so the total never exceeds
+    ``_FILE_LIST_LIMIT``.  VCS/dependency/build directories are skipped.
+    """
+    entries: List[Dict[str, Any]] = []
+    try:
+        # Directories first, then files, both sorted by name.
+        items = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except (PermissionError, OSError):
+        return entries
+
+    for item in items:
+        if budget[0] <= 0:
+            break
+        entry: Dict[str, Any] = {"name": item.name}
+        if item.is_dir():
+            entry["type"] = "dir"
+            if item.name in _SEARCH_SKIP_DIRS:
+                entry["skipped"] = True
+                entries.append(entry)
+                budget[0] -= 1
+            elif depth > 1:
+                budget[0] -= 1
+                children = _list_tree(item, depth=depth - 1, budget=budget)
+                if children:
+                    entry["children"] = children
+                entries.append(entry)
+            else:
+                # depth == 1: list sub-directory name only; add item count hint.
+                budget[0] -= 1
+                try:
+                    sub_count = sum(1 for _ in item.iterdir())
+                    if sub_count:
+                        entry["summary"] = f"{sub_count} items"
+                except OSError:
+                    pass
+                entries.append(entry)
+        else:
+            entry["type"] = "file"
+            try:
+                entry["size"] = item.stat().st_size
+            except OSError:
+                pass
+            entries.append(entry)
+            budget[0] -= 1
+    return entries
+
+
 async def file_list(params: Dict[str, Any]) -> Dict[str, Any]:
-    """List directory contents with optional glob pattern."""
+    """List directory contents with optional glob pattern or recursion depth.
+
+    ``depth=0`` (default) lists one level using the supplied ``pattern``
+    glob — the original flat behaviour.  ``depth >= 1`` performs a recursive
+    tree listing up to that many levels deep, skipping VCS / dependency dirs
+    and capping total entries at ``_FILE_LIST_LIMIT``.
+    """
     path = params.get("path", ".")
     pattern = params.get("pattern", "*")
+    depth = _safe_int(params.get("depth", 0), 0, minimum=0, maximum=5)
 
     target = Path(path).expanduser().resolve()
     if not target.exists():
@@ -181,21 +244,35 @@ async def file_list(params: Dict[str, Any]) -> Dict[str, Any]:
     if not target.is_dir():
         return {"ok": False, "error": f"Not a directory: {path}"}
 
-    entries = []
-    for item in sorted(target.glob(pattern)):
-        entries.append({
-            "name": item.name,
-            "type": "dir" if item.is_dir() else "file",
-            "size": item.stat().st_size if item.is_file() else None,
-        })
+    if depth == 0:
+        # Original flat listing with glob support (backward-compatible).
+        entries = []
+        for item in sorted(target.glob(pattern)):
+            entries.append({
+                "name": item.name,
+                "type": "dir" if item.is_dir() else "file",
+                "size": item.stat().st_size if item.is_file() else None,
+            })
+        visible = entries[:_FILE_LIST_LIMIT]
+        return {
+            "ok": True,
+            "path": str(target),
+            "entries": visible,
+            "entry_count": len(entries),
+            "truncated": len(entries) > len(visible),
+        }
 
-    visible = entries[:_FILE_LIST_LIMIT]
+    # Recursive tree listing.
+    budget: List[int] = [_FILE_LIST_LIMIT]
+    tree = _list_tree(target, depth=depth, budget=budget)
+    total = _FILE_LIST_LIMIT - budget[0]
     return {
         "ok": True,
         "path": str(target),
-        "entries": visible,
-        "entry_count": len(entries),
-        "truncated": len(entries) > len(visible),
+        "depth": depth,
+        "tree": tree,
+        "total_entries": total,
+        "truncated": budget[0] <= 0,
     }
 
 

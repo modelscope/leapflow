@@ -7,6 +7,7 @@ Both are pure module functions, exercised directly.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 from leapflow.engine.engine import (
@@ -90,7 +91,29 @@ def test_head_tail_truncate_short_text_unchanged() -> None:
     assert _head_tail_truncate("short", 200) == "short"
 
 
-# ── compaction preserves structured repair hints (A1 reaches the model) ──
+def test_truncate_list_field_pruned_and_annotated() -> None:
+    """List fields (e.g. file_list entries) must be pruned, not string-cut."""
+    entries = [{"name": f"file_{i}.py", "type": "file", "size": 1000} for i in range(80)]
+    payload = {"ok": True, "kind": "file_list_evidence", "path": "/proj", "entries": entries, "entry_count": 80}
+    text = _truncate_result_for_budget(payload, 1000)
+    obj = json.loads(text)  # must be valid JSON — not a raw string cut
+    assert obj["ok"] is True
+    assert len(obj["entries"]) < 80           # entries were pruned
+    assert "entries_omitted" in obj           # omission count is explicit
+    assert obj["entries_omitted"] + len(obj["entries"]) == 80
+
+
+def test_truncate_over_budget_dict_never_returns_malformed_json() -> None:
+    """When every shrinking strategy fails, a valid sentinel dict is returned."""
+    # A dict where string truncation alone cannot bring it under budget because
+    # the overhead fields themselves exceed the budget.
+    payload = {"ok": True, "kind": "file_list_evidence", "entries": [], "entry_count": 0,
+               "irreducible": "x" * 100}
+    text = _truncate_result_for_budget(payload, 80)  # budget is tiny
+    # Must parse as JSON (no raw cut)
+    obj = json.loads(text)
+    assert isinstance(obj, dict)
+
 
 def test_compaction_preserves_invalid_argument_repair_hints() -> None:
     from leapflow.engine.context_control import ToolEvidenceBuilder
@@ -116,3 +139,44 @@ def test_compaction_preserves_anchor_not_unique_match_count() -> None:
     result = {"ok": False, "error": "not unique", "error_type": "anchor_not_unique", "match_count": 3}
     compact = builder.build("edit_file", {}, result)
     assert compact["error_type"] == "anchor_not_unique" and compact["match_count"] == 3
+
+
+# ── failure visibility: stdout/stderr survive compaction; shell_run sets error ──
+
+def test_compact_error_preserves_shell_output() -> None:
+    """A failed shell result must keep stderr (the traceback) + returncode so the
+    agent can diagnose the cause instead of seeing a bare 'unknown error'."""
+    from leapflow.engine.context_control import ToolEvidenceBuilder
+    builder = ToolEvidenceBuilder()
+    failed = {
+        "ok": False,
+        "returncode": 1,
+        "stdout": "partial output",
+        "stderr": "Traceback (most recent call last):\n  ...\nModuleNotFoundError: No module named 'yfinance'",
+        "error": "ModuleNotFoundError: No module named 'yfinance'",
+    }
+    compact = builder.build("shell_run", {}, failed)
+    assert compact["ok"] is False and compact["returncode"] == 1
+    assert "ModuleNotFoundError" in compact["stderr"]   # traceback preserved
+    assert "yfinance" in compact["error"]
+
+
+def test_compact_error_preserves_stderr_without_error_field() -> None:
+    from leapflow.engine.context_control import ToolEvidenceBuilder
+    builder = ToolEvidenceBuilder()
+    result = {"ok": False, "returncode": 2, "stdout": "", "stderr": "boom: the real error"}
+    compact = builder.build("shell_run", {}, result)
+    assert "boom: the real error" in compact["stderr"] and compact["returncode"] == 2
+
+
+def test_shell_run_populates_error_on_failure() -> None:
+    from leapflow.tools.shell_tools import shell_run
+    result = asyncio.run(shell_run({"command": "echo BOOM_ERR 1>&2; exit 2"}))
+    assert result["ok"] is False and result["returncode"] == 2
+    assert "BOOM_ERR" in result["error"] and "BOOM_ERR" in result["stderr"]
+
+
+def test_shell_run_success_has_no_error_field() -> None:
+    from leapflow.tools.shell_tools import shell_run
+    result = asyncio.run(shell_run({"command": "echo ok"}))
+    assert result["ok"] is True and "error" not in result and "ok" in result["stdout"]
