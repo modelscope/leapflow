@@ -343,3 +343,32 @@ def test_code_intel_unsupported_operation(tmp_path) -> None:
     f = tmp_path / "m.py"
     f.write_text("x = 1\n")
     assert _run(code_intel({"path": str(f), "operation": "definition"}))["ok"] is False
+
+
+# ── polish: code_search context_lines + edit_file unified-diff mode ──
+
+def test_code_search_context_lines(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(fo, "ripgrep_path", lambda: None)  # deterministic Python backend
+    (tmp_path / "a.py").write_text("line1\nline2\nNEEDLE\nline4\nline5\n")
+    result = _run(code_search({"pattern": "NEEDLE", "path": str(tmp_path), "context_lines": 2}))
+    assert result["ok"] is True and result["match_count"] == 1
+    match = result["matches"][0]
+    assert match["context_before"] == ["line1", "line2"]
+    assert match["context_after"] == ["line4", "line5"]
+
+
+def test_edit_file_apply_unified_diff(tmp_path) -> None:
+    f = tmp_path / "m.py"
+    f.write_text("alpha\nbeta\ngamma\n")
+    diff = "--- a/m.py\n+++ b/m.py\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n"
+    result = _run(edit_file({"path": str(f), "diff": diff}))
+    assert result["ok"] is True and result["changed"] is True
+    assert f.read_text() == "alpha\nBETA\ngamma\n"
+
+
+def test_edit_file_invalid_diff_is_rejected(tmp_path) -> None:
+    f = tmp_path / "m.py"
+    f.write_text("x\n")
+    result = _run(edit_file({"path": str(f), "diff": "not a diff, no hunks"}))
+    assert result["ok"] is False and result["error_type"] == "invalid_diff"
+    assert f.read_text() == "x\n"

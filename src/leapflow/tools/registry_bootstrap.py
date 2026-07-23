@@ -16,7 +16,7 @@ from leapflow.tools.file_operations import (
     file_read,
     file_write,
 )
-from leapflow.tools.scm_tools import scm_sync, git_query
+from leapflow.tools.scm_tools import scm_sync, git_query, git_write
 from leapflow.tools.code_intel import code_intel
 from leapflow.tools.dev_tools import test_run, lint_check
 from leapflow.tools.terminal_session import (
@@ -128,6 +128,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                     "ignore_case": {"type": "boolean", "description": "Case-insensitive match (default: false)"},
                     "multiline": {"type": "boolean", "description": "Let . span newlines / match across lines (default: false)"},
                     "max_results": {"type": "integer", "description": "Max matches to return (default: 200)"},
+                    "context_lines": {"type": "integer", "description": "Lines of context before/after each match (default: 0, max 10)"},
                 },
                 "required": ["pattern"],
             },
@@ -163,7 +164,8 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "(use file_write to create/overwrite). Each edit is {original_text, new_text, "
                 "replace_all?}; original_text must match exactly and uniquely (or set replace_all) "
                 "— a non-unique or missing anchor is rejected so files are never corrupted. Set "
-                "dry_run to preview. Far cheaper and safer than rewriting a whole file."
+                "dry_run to preview. Alternatively pass a unified 'diff' to apply its hunks as "
+                "anchored edits. Far cheaper and safer than rewriting a whole file."
             ),
             "parameters": {
                 "type": "object",
@@ -183,8 +185,9 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                         },
                     },
                     "dry_run": {"type": "boolean", "description": "Preview without writing (default: false)"},
+                    "diff": {"type": "string", "description": "Unified diff to apply (alternative to edits; each hunk applied as an anchored edit)"},
                 },
-                "required": ["path", "edits"],
+                "required": ["path"],
             },
             "x_leapflow": {"category": "file", "risk_level": "mutating", "schema_cost": "medium", "requires_approval": True},
         },
@@ -288,6 +291,31 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "required": ["action"],
             },
             "x_leapflow": {"category": "scm", "risk_level": "read_only", "schema_cost": "medium", "requires_approval": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_write",
+            "description": (
+                "Mutating git actions: action=commit (message, stage_all), branch (create+switch), "
+                "checkout (switch; create=true for -b). Approval-gated. Use scm_sync for pull/push "
+                "and git_query for reads."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["commit", "branch", "checkout"], "description": "Git write action"},
+                    "cwd": {"type": "string", "description": "Repository working directory (optional)"},
+                    "message": {"type": "string", "description": "commit: commit message (required for commit)"},
+                    "stage_all": {"type": "boolean", "description": "commit: stage all changes first (default: true)"},
+                    "name": {"type": "string", "description": "branch: new branch name"},
+                    "ref": {"type": "string", "description": "checkout: ref/branch to switch to"},
+                    "create": {"type": "boolean", "description": "checkout: create the branch (-b) (default: false)"},
+                },
+                "required": ["action"],
+            },
+            "x_leapflow": {"category": "scm", "risk_level": "high", "schema_cost": "medium", "requires_approval": True, "idempotency_scope": "session"},
         },
     },
     {
@@ -690,6 +718,7 @@ _BRIDGE_TOOLS = [
             "ignore_case": "boolean (optional) — case-insensitive (default: false)",
             "multiline": "boolean (optional) — match across lines (default: false)",
             "max_results": "integer (optional) — max matches (default: 200)",
+            "context_lines": "integer (optional) — context lines around each match (default 0, max 10)",
         },
         "handler": code_search,
     },
@@ -705,10 +734,11 @@ _BRIDGE_TOOLS = [
     },
     {
         "name": "gp_edit_file",
-        "description": "Apply anchored search-replace edits to an existing text file (dry_run supported).",
+        "description": "Apply anchored search-replace edits (or a unified diff) to an existing text file (dry_run supported).",
         "parameters": {
             "path": "string (required) — file path to edit",
-            "edits": "array (required) — list of {original_text, new_text, replace_all?}",
+            "edits": "array (optional) — list of {original_text, new_text, replace_all?}",
+            "diff": "string (optional) — unified diff to apply (alternative to edits)",
             "dry_run": "boolean (optional) — preview without writing (default: false)",
         },
         "handler": edit_file,
@@ -761,6 +791,21 @@ _BRIDGE_TOOLS = [
             "stat": "boolean (optional) — log include --stat",
         },
         "handler": git_query,
+    },
+    {
+        "name": "gp_git_write",
+        "description": "Mutating git: commit/branch/checkout (approval-gated).",
+        "parameters": {
+            "action": "string (required) — commit|branch|checkout",
+            "cwd": "string (optional) — repository working directory",
+            "message": "string — commit message (required for commit)",
+            "stage_all": "boolean (optional) — commit: stage all first (default true)",
+            "name": "string — branch: new branch name",
+            "ref": "string — checkout: ref to switch to",
+            "create": "boolean (optional) — checkout: create branch (-b)",
+        },
+        "handler": git_write,
+        "mutates_state": True,
     },
     {
         "name": "gp_time_get",

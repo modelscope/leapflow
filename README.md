@@ -94,6 +94,38 @@ Inspect the agent's layered orientation and pending re-entries anytime with the 
 
 ---
 
+## Built-in Coding Tools
+
+LeapFlow ships a first-class coding toolset so the agent can *locate → read → edit → verify* code precisely instead of rewriting whole files or shelling out blindly. Every tool is registered with governance metadata (`x_leapflow`) so it flows through the existing idempotency, approval, redaction, path-sensitivity, and audit paths.
+
+| Tool | Purpose | Governance |
+|---|---|---|
+| `code_search` | Regex search across a tree (ripgrep-backed, structured `path:line:col`, optional `context_lines`); skips VCS/dep/build dirs | read-only |
+| `file_find` | Locate files by recursive glob (e.g. `**/test_*.py`) | read-only |
+| `edit_file` | Targeted **anchored** search-replace (unique-anchor or `replace_all`, `dry_run`) or apply a unified **`diff`** — a missing/ambiguous anchor is rejected, never a partial write | mutating · approval + path gate |
+| `code_intel` | Document symbols (outline): Python via exact **AST**, other languages via heuristic | read-only |
+| `git_query` | Structured read-only git: `diff` / `log` / `status` / `branch` / `show` | read-only |
+| `git_write` | Mutating git: `commit` / `branch` / `checkout` | mutating · approval |
+| `test_run` | Run the test suite (auto-detect pytest/npm/go/cargo); structured pass/fail | verify (via governed shell) |
+| `lint_check` | Run the linter (auto-detect ruff/eslint/go vet/clippy); structured issues | verify (via governed shell) |
+| `terminal_session` | Persistent shell sessions (`open`/`send`/`read`/`close`/`list`) for REPLs/dev servers | **off by default** · opt-in · approval |
+
+**Notes**
+
+- **Seamless search:** `code_search` always works with zero install via a pure-Python fallback; when [ripgrep](https://github.com/BurntSushi/ripgrep) is present it is used for speed, and a best-effort background install (macOS/Homebrew, no sudo) is attempted otherwise. A manual-install hint is surfaced if it stays unavailable.
+- **`test_run`/`lint_check` semantics:** `ok=true` means the *runner executed* — a failing suite is informative feedback (`success`/`clean`), not a tool error.
+- **Persistent terminals** are long-lived resources kept separate from one-shot execution (Transport-Lifecycle Separation); enabling is the operator opt-in and sessions are bounded with process-group cleanup.
+
+Config keys (all via `leap config set …` / TUI `/config`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `tools.ripgrep_autoinstall` | `true` | Best-effort seamless ripgrep provisioning (fallback + manual hint regardless) |
+| `tools.test_command` / `tools.lint_command` | *(auto-detect)* | Override the test/lint command |
+| `tools.terminal_session_enabled` | `false` | Enable persistent terminal sessions (high-risk, opt-in) |
+
+---
+
 ## Prerequisites
 
 | Component | Version | Purpose |

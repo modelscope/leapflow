@@ -17,6 +17,7 @@ _MAX_OUTPUT_CHARS = 10_000
 _DEFAULT_TIMEOUT_S = 120.0
 _ALLOWED_ACTIONS = frozenset({"status", "pull", "push", "pull_then_push"})
 _QUERY_ACTIONS = frozenset({"diff", "log", "status", "branch", "show"})
+_WRITE_ACTIONS = frozenset({"commit", "branch", "checkout"})
 _LOG_FORMAT = "%h%x1f%an%x1f%ad%x1f%s"  # unit-separator delimited, safe for parsing
 
 
@@ -339,3 +340,69 @@ async def git_query(params: Dict[str, Any], runner: GitRunner | None = None) -> 
         payload["current_branch"] = current
         payload["branches"] = branches
     return payload
+
+
+async def git_write(params: Dict[str, Any], runner: GitRunner | None = None) -> Dict[str, Any]:
+    """Mutating git actions: commit, branch (create+switch), checkout (switch).
+
+    Mutating and approval-gated by the loop. Refs are sanitized; the commit
+    message is passed as an argv element (never through a shell) and is not echoed
+    back in the command string. Use scm_sync for pull/push and git_query for reads.
+    """
+    action = str(params.get("action") or "").strip().lower()
+    if action not in _WRITE_ACTIONS:
+        return {"ok": False, "error": f"Unsupported git write action: {action}", "failure_code": "unsupported_git_write"}
+
+    cwd = _workspace(params.get("cwd"))
+    if not cwd.exists() or not cwd.is_dir():
+        return {"ok": False, "error": f"Working directory not found: {cwd}", "failure_code": "path_not_found", "cwd": str(cwd)}
+
+    timeout_s = min(float(params.get("timeout") or _DEFAULT_TIMEOUT_S), _DEFAULT_TIMEOUT_S)
+    run = runner or _run_git
+    completed_steps: list[Dict[str, Any]] = []
+
+    if action == "commit":
+        message = str(params.get("message") or "").strip()
+        if not message:
+            return {"ok": False, "error": "commit requires a non-empty message.", "failure_code": "missing_message", "cwd": str(cwd)}
+        if params.get("stage_all", True):
+            add_args = ("add", "-A")
+            add_result = await run(add_args, cwd, timeout_s)
+            if add_result.returncode != 0:
+                return _failure_payload(action=action, cwd=cwd, step="add", args=add_args, result=add_result, completed_steps=completed_steps)
+            completed_steps.append(_step_payload("add", add_args, add_result))
+        commit_args = ("commit", "-m", message)
+        commit_result = await run(commit_args, cwd, timeout_s)
+        if commit_result.returncode != 0:
+            return _failure_payload(action=action, cwd=cwd, step="commit", args=("commit", "-m", "<message>"), result=commit_result, completed_steps=completed_steps)
+        completed_steps.append(_step_payload("commit", ("commit", "-m", "<message>"), commit_result))
+    elif action == "branch":
+        name = _safe_ref(params.get("name") or params.get("ref") or "", field="name")
+        if not name:
+            return {"ok": False, "error": "branch requires a name.", "failure_code": "missing_branch_name", "cwd": str(cwd)}
+        args = ("checkout", "-b", name)
+        result = await run(args, cwd, timeout_s)
+        if result.returncode != 0:
+            return _failure_payload(action=action, cwd=cwd, step="branch", args=args, result=result, completed_steps=completed_steps)
+        completed_steps.append(_step_payload("branch", args, result))
+    else:  # checkout
+        ref = _safe_ref(params.get("ref") or params.get("name") or "", field="ref")
+        if not ref:
+            return {"ok": False, "error": "checkout requires a ref.", "failure_code": "missing_ref", "cwd": str(cwd)}
+        args = ("checkout", "-b", ref) if params.get("create") else ("checkout", ref)
+        result = await run(args, cwd, timeout_s)
+        if result.returncode != 0:
+            return _failure_payload(action=action, cwd=cwd, step="checkout", args=args, result=result, completed_steps=completed_steps)
+        completed_steps.append(_step_payload("checkout", args, result))
+
+    return {
+        "ok": True,
+        "tool": "git_write",
+        "scm": "git",
+        "action": action,
+        "cwd": str(cwd),
+        "completed": True,
+        "completed_steps": completed_steps,
+        "stdout": "\n".join(step.get("stdout", "") for step in completed_steps if step.get("stdout")),
+        "stderr": "\n".join(step.get("stderr", "") for step in completed_steps if step.get("stderr")),
+    }

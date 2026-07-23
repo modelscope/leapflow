@@ -503,6 +503,28 @@ def _code_search_python(
     return results, False
 
 
+def _enrich_context(matches: List[Dict[str, Any]], context_lines: int) -> None:
+    """Attach context_before/context_after lines to each match (files read once)."""
+    cache: Dict[str, List[str]] = {}
+    for match in matches:
+        path = match.get("path")
+        line = match.get("line")
+        if not path or not line:
+            continue
+        lines = cache.get(path)
+        if lines is None:
+            try:
+                lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+            except (OSError, ValueError):
+                lines = []
+            cache[path] = lines
+        if not lines:
+            continue
+        idx = line - 1
+        match["context_before"] = lines[max(0, idx - context_lines):idx]
+        match["context_after"] = lines[idx + 1: idx + 1 + context_lines]
+
+
 async def code_search(params: Dict[str, Any]) -> Dict[str, Any]:
     """Search file *contents* by regex across a directory tree (ripgrep-backed,
     Python fallback). Read-only; VCS/dependency/build/cache dirs are skipped and
@@ -520,6 +542,7 @@ async def code_search(params: Dict[str, Any]) -> Dict[str, Any]:
         params.get("max_results", _CODE_SEARCH_MAX_RESULTS),
         _CODE_SEARCH_MAX_RESULTS, minimum=1, maximum=2000,
     )
+    context_lines = _safe_int(params.get("context_lines", 0), 0, minimum=0, maximum=10)
     rg = ripgrep_path()
     try:
         if rg:
@@ -532,10 +555,15 @@ async def code_search(params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": f"Search timed out after {_SEARCH_TIMEOUT_S}s"}
     except Exception as exc:  # noqa: BLE001 - surface as structured error
         return {"ok": False, "error": str(exc)}
+    if context_lines > 0:
+        _enrich_context(results, context_lines)
     try:
         from leapflow.security.redact import redact_sensitive_text
         for item in results:
             item["text"] = redact_sensitive_text(item.get("text", ""))
+            if "context_before" in item:
+                item["context_before"] = [redact_sensitive_text(line) for line in item["context_before"]]
+                item["context_after"] = [redact_sensitive_text(line) for line in item["context_after"]]
     except ImportError:
         pass
     payload: Dict[str, Any] = {
@@ -596,6 +624,40 @@ async def file_find(params: Dict[str, Any]) -> Dict[str, Any]:
 
 # ── edit_file: targeted, anchored search-replace edits ──
 
+def _hunks_to_edits(diff_text: str) -> List[Dict[str, str]]:
+    """Convert a unified diff into anchored (original_text, new_text) edits.
+
+    Each hunk becomes one edit: original_text = context + removed lines, new_text
+    = context + added lines. Applied via the same unique-anchor replace as manual
+    edits, so a hunk whose context is missing/ambiguous is rejected (never a
+    partial/fuzzy apply). File headers (---/+++) and @@ ranges are ignored.
+    """
+    edits: List[Dict[str, str]] = []
+    old_lines: List[str] = []
+    new_lines: List[str] = []
+    in_hunk = False
+    for raw in diff_text.splitlines():
+        if raw.startswith("@@"):
+            if in_hunk and (old_lines or new_lines):
+                edits.append({"original_text": "\n".join(old_lines), "new_text": "\n".join(new_lines)})
+            old_lines, new_lines, in_hunk = [], [], True
+            continue
+        if raw.startswith(("---", "+++")):
+            continue
+        if not in_hunk:
+            continue
+        if raw.startswith("-"):
+            old_lines.append(raw[1:])
+        elif raw.startswith("+"):
+            new_lines.append(raw[1:])
+        elif raw.startswith(" "):
+            old_lines.append(raw[1:])
+            new_lines.append(raw[1:])
+    if in_hunk and (old_lines or new_lines):
+        edits.append({"original_text": "\n".join(old_lines), "new_text": "\n".join(new_lines)})
+    return edits
+
+
 async def edit_file(params: Dict[str, Any]) -> Dict[str, Any]:
     """Apply targeted, anchored search-replace edits to an existing text file.
 
@@ -609,6 +671,10 @@ async def edit_file(params: Dict[str, Any]) -> Dict[str, Any]:
     if not path:
         return {"ok": False, "error": "Missing required parameter: path"}
     edits = params.get("edits")
+    if not edits and params.get("diff"):
+        edits = _hunks_to_edits(str(params.get("diff") or ""))
+        if not edits:
+            return {"ok": False, "error": "Could not parse any hunks from the provided diff.", "error_type": "invalid_diff"}
     if not edits and (params.get("original_text") is not None or params.get("old_text") is not None):
         edits = [{
             "original_text": params.get("original_text", params.get("old_text", "")),

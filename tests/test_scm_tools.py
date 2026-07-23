@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from leapflow.tools.scm_tools import GitCommandResult, scm_sync, git_query
+from leapflow.tools.scm_tools import GitCommandResult, scm_sync, git_query, git_write
 
 
 @pytest.mark.asyncio
@@ -133,3 +133,55 @@ async def test_git_query_reports_failure(tmp_path) -> None:
 
     assert result["ok"] is False and result["failed_step"] == "status"
     assert "not a git repository" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_git_write_commit_stages_then_commits(tmp_path) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    async def fake_runner(args, cwd, timeout_s):
+        commands.append(tuple(args))
+        return GitCommandResult(returncode=0, stdout="ok", stderr="")
+
+    result = await git_write({"action": "commit", "cwd": str(tmp_path), "message": "feat: x"}, runner=fake_runner)
+
+    assert result["ok"] is True and result["tool"] == "git_write"
+    assert commands == [("add", "-A"), ("commit", "-m", "feat: x")]
+
+
+@pytest.mark.asyncio
+async def test_git_write_commit_requires_message(tmp_path) -> None:
+    result = await git_write({"action": "commit", "cwd": str(tmp_path)})
+    assert result["ok"] is False and result["failure_code"] == "missing_message"
+
+
+@pytest.mark.asyncio
+async def test_git_write_branch_creates_and_switches(tmp_path) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    async def fake_runner(args, cwd, timeout_s):
+        commands.append(tuple(args))
+        return GitCommandResult(returncode=0, stdout="", stderr="")
+
+    result = await git_write({"action": "branch", "cwd": str(tmp_path), "name": "feature/x"}, runner=fake_runner)
+
+    assert result["ok"] is True and commands == [("checkout", "-b", "feature/x")]
+
+
+@pytest.mark.asyncio
+async def test_git_write_checkout_switches(tmp_path) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    async def fake_runner(args, cwd, timeout_s):
+        commands.append(tuple(args))
+        return GitCommandResult(returncode=0, stdout="", stderr="")
+
+    result = await git_write({"action": "checkout", "cwd": str(tmp_path), "ref": "main"}, runner=fake_runner)
+
+    assert result["ok"] is True and commands == [("checkout", "main")]
+
+
+@pytest.mark.asyncio
+async def test_git_write_unsupported_action(tmp_path) -> None:
+    result = await git_write({"action": "rebase", "cwd": str(tmp_path)})
+    assert result["ok"] is False and result["failure_code"] == "unsupported_git_write"
