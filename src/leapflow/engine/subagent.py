@@ -31,6 +31,18 @@ _SUMMARY_MAX_CHARS = 4000
 
 # Depth of the subagent frame currently executing, propagated across the await
 # chain so a nested delegate_task can compute its child's depth. 0 = top level.
+#
+# Safe by construction: set() and reset() (in SubagentManager.delegate below)
+# execute inside the same call with no Task boundary in between --
+# execute_subagent() (including EngineFrameSubagentExecutor's full-loop path,
+# engine.py::_run_child_frame) resolves to a single value without ever
+# yielding back through the parent engine's run_stream() generator. It
+# therefore never crosses a per-chunk asyncio.create_task() boundary the way
+# the daemon's leapd_approval_route once did (see the contract note on that
+# ContextVar in daemon/service.py). If a future executor lets a subagent's
+# progress stream back out through run_stream() before it completes, re-verify
+# this invariant and, if violated, pin a shared contextvars.Context the same
+# way server.py::_dispatch_stream does.
 _current_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
     "leapflow_subagent_depth", default=0
 )

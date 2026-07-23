@@ -33,6 +33,19 @@ _PATH_RE = re.compile(r'(?P<key>path|file_path)["\'=:\s]+(?P<value>[^"\'\n|]+)')
 # reads it deep inside tool execution to route an approval prompt to the correct
 # turn. Because concurrent turns run in separate tasks, the ContextVar isolates
 # them without a single shared slot (which would misroute under N>1).
+#
+# CONTRACT: whoever drives the async generator that performs this var's
+# set()/reset() pair (``engine_chat`` below) across more than one resumption
+# MUST keep every resumption inside a single, shared ``contextvars.Context``.
+# ``ContextVar.reset()`` validates the Context *object identity* recorded at
+# set()-time; resuming the generator inside a freshly copied Context (the
+# default behavior of a bare ``asyncio.create_task(...)`` call) raises
+# "was created in a different Context". ``server.py::_dispatch_stream``
+# satisfies this by capturing one ``ctx = contextvars.copy_context()`` per
+# stream and passing ``context=ctx`` to every per-chunk task it creates for
+# that stream. Any new code that re-drives ``engine_chat`` (or another
+# generator touching this var) across multiple Task resumptions must do the
+# same, or route this state by an explicit key (e.g. request_id) instead.
 _approval_route: "contextvars.ContextVar[tuple[asyncio.Queue[StreamChunk], str] | None]" = (
     contextvars.ContextVar("leapd_approval_route", default=None)
 )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -193,9 +194,21 @@ class UnixRpcServer:
     ) -> None:
         stream = None
         pending: asyncio.Task | None = None
+        # Pin every per-chunk task driving this one stream to a single, shared
+        # Context. asyncio.create_task() defaults to copying the *current*
+        # context on each call, so re-creating ``pending`` per chunk (needed
+        # below to interleave heartbeats via asyncio.wait(..., timeout=...))
+        # would otherwise hand the streamed generator a fresh Context every
+        # time it resumes. A ContextVar.set()/reset() pair inside that
+        # generator (e.g. the daemon's per-turn approval routing) binds its
+        # token to the Context active at set()-time; resetting it from a
+        # different Context object raises "was created in a different
+        # Context". Sharing one Context across all chunks keeps such
+        # set()/reset() pairs valid for the whole life of the stream.
+        ctx = contextvars.copy_context()
         try:
             stream = method(**params)
-            pending = asyncio.create_task(anext(stream))
+            pending = asyncio.create_task(anext(stream), context=ctx)
             while True:
                 done, _ = await asyncio.wait({pending}, timeout=self._stream_heartbeat_s)
                 if not done:
@@ -214,7 +227,7 @@ class UnixRpcServer:
                     metadata=chunk.metadata,
                 ).to_notification()
                 await _write_json(writer, notification.to_json())
-                pending = asyncio.create_task(anext(stream))
+                pending = asyncio.create_task(anext(stream), context=ctx)
         except Exception as exc:
             if pending is not None and not pending.done():
                 pending.cancel()

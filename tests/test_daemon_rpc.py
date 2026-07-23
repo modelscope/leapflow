@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -63,6 +64,29 @@ class _SlowFirstChunkService(_FakeService):
         await asyncio.sleep(0.08)
         yield StreamChunk(request_id="", content=f"slow {message}", event_type="chunk")
         yield StreamChunk(request_id="", content="done", event_type="final")
+
+
+_TEST_ROUTE: "contextvars.ContextVar[str | None]" = contextvars.ContextVar("test_route", default=None)
+
+
+class _ContextVarStreamingService(_FakeService):
+    """Mimics engine_chat's per-turn ContextVar routing across many yields.
+
+    Regression fixture for the ``_dispatch_stream`` per-chunk asyncio.Task
+    pattern invalidating a ContextVar set()/reset() pair spanning a
+    multi-chunk stream ("was created in a different Context").
+    """
+
+    async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+        token = _TEST_ROUTE.set("active")
+        try:
+            for i in range(5):
+                # Must stay "active" on every chunk, not just the first, proving
+                # the shared Context is visible across the whole stream.
+                seen = _TEST_ROUTE.get()
+                yield StreamChunk(request_id="", content=f"{i}:{seen}", event_type="chunk")
+        finally:
+            _TEST_ROUTE.reset(token)  # must not raise "different Context"
 
 
 class _RequestIdCaptureService(_FakeService):
@@ -363,6 +387,32 @@ async def test_daemon_client_stream_heartbeat_prevents_idle_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_stream_keeps_contextvar_token_valid_across_chunks() -> None:
+    """Regression: per-chunk asyncio.create_task() must not invalidate a
+    ContextVar set()/reset() pair spanning a multi-chunk stream (previously
+    raised ValueError: ... was created in a different Context).
+    """
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        server, task, runtime_dir = await _start_server(
+            Path(root) / "runtime", service=_ContextVarStreamingService(),
+        )
+        client = DaemonClient(runtime_dir / "leapd.sock")
+        events = []
+        try:
+            async for event in client.engine_chat("hi"):
+                events.append(event)
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert [e.content for e in events] == [f"{i}:active" for i in range(5)]
+
+
+@pytest.mark.asyncio
 async def test_client_lease_blocks_daemon_idle_shutdown(tmp_path) -> None:
     from leapflow.daemon.lease import ClientLease, read_active_client_leases
     from leapflow.daemon.server import _watch_idle_shutdown
@@ -577,6 +627,111 @@ async def test_concurrent_sessions_run_in_parallel_when_admission_allows() -> No
 
     out_a, out_b = await asyncio.wait_for(asyncio.gather(run("A", "rA"), run("B", "rB")), 3.0)
     assert out_a == ["A:done"] and out_b == ["B:done"]
+
+
+@pytest.mark.asyncio
+async def test_two_daemon_clients_stream_concurrently_through_dispatch_stream() -> None:
+    """End-to-end (real UnixRpcServer socket + real _dispatch_stream) proof that
+    two concurrently-streaming sessions -- the exact path two live TUI instances
+    take -- survive _dispatch_stream's per-chunk asyncio.create_task pattern:
+    neither stream crashes with "was created in a different Context", each
+    session's mid-stream approval request routes to its own client only, and
+    the turns genuinely overlap (proving real concurrency, not serialization
+    that happens to look fine).
+
+    test_concurrent_approvals_route_to_their_own_queues and
+    test_concurrent_sessions_run_in_parallel_when_admission_allows both
+    exercise the service layer directly (engine_chat consumed by a plain
+    ``async for``) and never drive it through _dispatch_stream's per-chunk
+    asyncio.create_task(anext(stream)) recreation -- the exact mechanism that
+    broke leapd_approval_route. This test closes that coverage gap.
+    """
+    from types import SimpleNamespace
+
+    from leapflow.daemon.service import RuntimeLeapService
+    from leapflow.daemon.session_registry import SessionExecutionContext
+    from leapflow.engine import StreamEvent
+    from leapflow.security.actions import ActionDescriptor
+    from leapflow.security.approval import ApprovalRequest
+
+    started = {"A": asyncio.Event(), "B": asyncio.Event()}
+
+    class ConcApprovalEngine:
+        """Yields multiple chunks and raises a mid-stream approval request, so
+        _dispatch_stream must recreate several per-chunk tasks while the
+        approval route stays valid on every one of them."""
+
+        def __init__(self, tag: str, service: RuntimeLeapService) -> None:
+            self.tag = tag
+            self._current_session_id = tag
+            self._service = service
+
+        async def run_stream(self, message: str, *, enable_thinking: bool = False, request_id: str = ""):
+            yield StreamEvent(type="chunk", content=f"{self.tag}:start")
+            started[self.tag].set()
+            other = "B" if self.tag == "A" else "A"
+            # Both turns must be in flight at once -- proves real overlap, not
+            # accidental serialization that happens to dodge the bug.
+            await asyncio.wait_for(started[other].wait(), 2.0)
+            decision = await self._service._request_approval(
+                ApprovalRequest(
+                    category="shell.command", detail=self.tag,
+                    action=ActionDescriptor.shell(f"echo {self.tag}"),
+                )
+            )
+            yield StreamEvent(type="chunk", content=f"{self.tag}:approval={decision}")
+            yield StreamEvent(type="final", content=f"{self.tag}:done")
+
+    service = RuntimeLeapService(SimpleNamespace(llm_context_length=100, daemon_max_concurrent_turns=2))
+    engines = {"A": ConcApprovalEngine("A", service), "B": ConcApprovalEngine("B", service)}
+
+    class FakeRegistry:
+        async def acquire(self, sid: str) -> SessionExecutionContext:
+            return SessionExecutionContext(sid, engines[sid])
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(llm_context_length=100)
+            self.engine = engines["A"]
+
+        def reload_runtime_config_if_changed(self) -> bool:
+            return False
+
+    service._ctx = FakeContext()
+    service._session_registry = FakeRegistry()
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
+        server, task, runtime_dir = await _start_server(Path(root) / "runtime", service=service)
+
+        async def consume(session_id: str, decision: str) -> list[str]:
+            client = DaemonClient(runtime_dir / "leapd.sock")
+            contents: list[str] = []
+            async for event in client.engine_chat("hi", session_id=session_id):
+                if event.type == "approval_request":
+                    pending_id = event.metadata["approval"]["pending_id"]
+                    await service.approval_resolve(pending_id, decision)
+                    continue
+                contents.append(event.content)
+            return contents
+
+        try:
+            out_a, out_b = await asyncio.wait_for(
+                asyncio.gather(consume("A", "allow"), consume("B", "deny")), 5.0,
+            )
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    # Each stream saw only its own chunks, in order, with its own approval
+    # decision (no crash, no cross-session approval leakage); both are only
+    # reachable at all if the mutual wait above succeeded, which requires true
+    # concurrent overlap rather than accidental serialization.
+    assert out_a == ["A:start", "A:approval=allow", "A:done"]
+    assert out_b == ["B:start", "B:approval=deny", "B:done"]
 
 
 @pytest.mark.asyncio
