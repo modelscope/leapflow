@@ -39,6 +39,7 @@ class RuntimeLeapService:
         self._reentry_stop: "asyncio.Event | None" = None
         self._reentry_service: Any | None = None
         self._engine_lock = asyncio.Lock()
+        self._session_registry: Any | None = None  # lazy per-session engine registry (Stage 3)
         self._started_at = time.time()
         self._client_count: Callable[[], int] = lambda: 0
         self._client_leases: Callable[[], list[ClientLeaseSnapshot]] = lambda: []
@@ -272,6 +273,31 @@ class RuntimeLeapService:
         current = getattr(engine, "_current_session_id", "") if engine else ""
         return {"found": found, "session_id": str(current or session_id)}
 
+    def _ensure_session_registry(self, base_engine: Any) -> Any:
+        """Lazily build the per-session engine registry around the base engine.
+
+        The first session reuses ``base_engine`` (single-session daemon
+        unchanged); additional sessions get isolated engines via the P3-1
+        factory with a fresh working memory of the same capacity.
+        """
+        if self._session_registry is None:
+            from leapflow.daemon.session_registry import SessionRegistry
+            from leapflow.engine.session_factory import build_session_engine
+            from leapflow.memory import WorkingMemoryProvider
+            base_wm = getattr(base_engine, "_wm", None)
+            max_tokens = int(getattr(base_wm, "_max_tokens", 8192) or 8192)
+            s = self._settings
+            self._session_registry = SessionRegistry(
+                base_engine=base_engine,
+                build_engine=lambda base, sid, wm: build_session_engine(
+                    base, session_id=sid, working_memory=wm
+                ),
+                build_working_memory=lambda: WorkingMemoryProvider(max_tokens=max_tokens),
+                max_sessions=int(getattr(s, "daemon_max_live_sessions", 16) or 16),
+                idle_ttl_s=float(getattr(s, "daemon_session_idle_ttl_s", 1800.0) or 1800.0),
+            )
+        return self._session_registry
+
     async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
         request_id = str(kwargs.get("request_id") or uuid.uuid4().hex[:12])
         # The single engine serializes turns via _engine_lock. If it is already
@@ -343,6 +369,23 @@ class RuntimeLeapService:
                 engine = getattr(ctx, "engine", None)
                 if engine is None:
                     raise RuntimeError("leapd engine is not initialized")
+                # Route the turn to its session's engine. The primary session
+                # reuses the base engine (single-session daemon unchanged);
+                # additional distinct sessions run on isolated per-session
+                # engines so their working memory / per-turn state never
+                # cross-contaminate. Turns remain globally serialized here
+                # (_engine_lock); bounded cross-session concurrency is P3-4.
+                # Un-sessioned turns keep using the base engine directly, which
+                # is also the primary session's engine, so the two stay
+                # consistent through a ""→real session_id transition.
+                session_id = str(
+                    kwargs.get("session_id")
+                    or getattr(engine, "_current_session_id", "")
+                    or ""
+                )
+                if session_id:
+                    exec_ctx = await self._ensure_session_registry(engine).acquire(session_id)
+                    engine = exec_ctx.engine
 
                 enable_thinking = bool(kwargs.get("enable_thinking", False))
                 approval_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()

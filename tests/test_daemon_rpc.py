@@ -186,6 +186,62 @@ async def test_runtime_service_replays_duplicate_engine_request_without_rerun() 
 
 
 @pytest.mark.asyncio
+async def test_engine_chat_routes_turn_to_session_engine() -> None:
+    """P3-2b: engine_chat runs the turn on the session's engine (registry route).
+
+    A non-empty session_id is routed through the registry; an un-sessioned turn
+    keeps using the base engine directly (single-session daemon unchanged).
+    """
+    from types import SimpleNamespace
+
+    from leapflow.daemon.service import RuntimeLeapService
+    from leapflow.daemon.session_registry import SessionExecutionContext
+    from leapflow.engine import StreamEvent
+
+    class MarkEngine:
+        def __init__(self, tag: str, session_id: str = "") -> None:
+            self.tag = tag
+            self._current_session_id = session_id
+
+        async def run_stream(self, message: str, *, enable_thinking: bool = False, request_id: str = ""):
+            yield StreamEvent(type="chunk", content=f"{self.tag}:{message}")
+            yield StreamEvent(type="final", content="done")
+
+    base = MarkEngine("BASE")
+    session_engine = MarkEngine("SESSION", session_id="S1")
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(llm_context_length=100)
+            self.engine = base
+
+        def reload_runtime_config_if_changed(self) -> bool:
+            return False
+
+    class FakeRegistry:
+        def __init__(self) -> None:
+            self.acquired: list[str] = []
+
+        async def acquire(self, sid: str) -> SessionExecutionContext:
+            self.acquired.append(sid)
+            return SessionExecutionContext(sid, session_engine)
+
+    service = RuntimeLeapService(SimpleNamespace(llm_context_length=100))
+    service._ctx = FakeContext()
+    service._session_registry = FakeRegistry()  # pre-injected → _ensure returns it
+
+    # Non-empty session_id → routed to the session engine.
+    routed = [c async for c in service.engine_chat("hi", request_id="r1", session_id="S1")]
+    assert service._session_registry.acquired == ["S1"]
+    assert [c.content for c in routed if c.content] == ["SESSION:hi", "done"]
+
+    # Un-sessioned turn (no session_id, base has none) → base engine, no route.
+    unrouted = [c async for c in service.engine_chat("yo", request_id="r2")]
+    assert service._session_registry.acquired == ["S1"]  # unchanged: registry not consulted
+    assert [c.content for c in unrouted if c.content] == ["BASE:yo", "done"]
+
+
+@pytest.mark.asyncio
 async def test_runtime_service_prunes_completed_engine_request_replay_records() -> None:
     from types import SimpleNamespace
 
