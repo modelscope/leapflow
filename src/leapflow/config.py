@@ -416,6 +416,11 @@ class Settings:
     default_tool_timeout_s: float = 120.0  # Default per-tool execution timeout
     daemon_request_ledger_ttl_s: float = 600.0  # Replay cache retention for completed engine requests
     daemon_request_ledger_max_entries: int = 128  # Maximum completed engine requests kept for replay
+    # Concurrent turn execution (Stage 3). N=1 = today's behavior (turns serialized);
+    # N>1 runs turns of different sessions concurrently on isolated per-session engines.
+    daemon_max_concurrent_turns: int = 1
+    daemon_max_live_sessions: int = 16
+    daemon_session_idle_ttl_s: float = 1800.0
     circuit_breaker_threshold: int = 5  # Consecutive failures before circuit opens
     circuit_breaker_cooldown_s: float = 60.0  # Circuit breaker cooldown period
 
@@ -878,6 +883,9 @@ def _build_settings_from_env(
     default_tool_timeout_s = float(os.getenv("LEAPFLOW_DEFAULT_TOOL_TIMEOUT_S", "120.0"))
     daemon_request_ledger_ttl_s = float(os.getenv("LEAPFLOW_DAEMON_REQUEST_LEDGER_TTL_S", "600.0"))
     daemon_request_ledger_max_entries = int(os.getenv("LEAPFLOW_DAEMON_REQUEST_LEDGER_MAX_ENTRIES", "128"))
+    daemon_max_concurrent_turns = int(os.getenv("LEAPFLOW_DAEMON_MAX_CONCURRENT_TURNS", "1"))
+    daemon_max_live_sessions = int(os.getenv("LEAPFLOW_DAEMON_MAX_LIVE_SESSIONS", "16"))
+    daemon_session_idle_ttl_s = float(os.getenv("LEAPFLOW_DAEMON_SESSION_IDLE_TTL_S", "1800.0"))
     circuit_breaker_threshold = int(os.getenv("LEAPFLOW_CIRCUIT_BREAKER_THRESHOLD", "5"))
     circuit_breaker_cooldown_s = float(os.getenv("LEAPFLOW_CIRCUIT_BREAKER_COOLDOWN_S", "60.0"))
 
@@ -1195,6 +1203,9 @@ def _build_settings_from_env(
         default_tool_timeout_s=default_tool_timeout_s,
         daemon_request_ledger_ttl_s=daemon_request_ledger_ttl_s,
         daemon_request_ledger_max_entries=daemon_request_ledger_max_entries,
+        daemon_max_concurrent_turns=daemon_max_concurrent_turns,
+        daemon_max_live_sessions=daemon_max_live_sessions,
+        daemon_session_idle_ttl_s=daemon_session_idle_ttl_s,
         circuit_breaker_threshold=circuit_breaker_threshold,
         circuit_breaker_cooldown_s=circuit_breaker_cooldown_s,
         # Signal Fusion
