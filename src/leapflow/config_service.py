@@ -140,6 +140,7 @@ _FIELD_DESCRIPTIONS = {
     "guardrail.max_consecutive_same": "Consecutive uses of the same tool that trigger a diversify nudge (suppressed while progressing, so batch/sequential work is not penalized).",
     "guardrail.stagnation_window": "Window of recent genuine tool results over which the low-success-rate stagnation warning is computed.",
     "guardrail.min_success_rate": "Minimum tool success rate within the stagnation window before a stagnation warning is emitted.",
+    "tools.ripgrep_autoinstall": "Best-effort seamless ripgrep auto-install for code_search when missing (macOS/Homebrew, no sudo, background, non-fatal). code_search always works via the pure-Python fallback regardless; disabling this just skips the accelerator install and shows a manual hint.",
     "agent.cost_ceiling_context_multiple": "Optional cumulative effective-cost ceiling as a multiple of context length (0 disables; a soft finalize nudge, the iteration cap stays the hard bound).",
     "agent.subagent_max_depth": "Maximum delegation depth for subagents (governs recursive task decomposition).",
     "agent.subagent_max_concurrent": "Maximum concurrent child subagents per delegation batch.",

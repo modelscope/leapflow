@@ -8,7 +8,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from leapflow.tools.file_operations import file_list, file_read, file_write
+from leapflow.tools.file_operations import (
+    code_search,
+    edit_file,
+    file_find,
+    file_list,
+    file_read,
+    file_write,
+)
 from leapflow.tools.scm_tools import scm_sync
 from leapflow.tools.shell_tools import shell_run
 from leapflow.tools.system_tools import env_info, time_get
@@ -91,6 +98,86 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 },
                 "required": ["path", "content"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_search",
+            "description": (
+                "Search file CONTENTS by regex across a directory tree (ripgrep-backed). "
+                "Prefer this over shell_run grep: faster, skips VCS/dependency/build dirs, "
+                "and returns structured path:line:column matches. Use file_read for the "
+                "surrounding context of a hit."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern to search for"},
+                    "path": {"type": "string", "description": "Base directory (default: current dir)"},
+                    "glob": {"type": "string", "description": "Filter files by glob, e.g. *.py"},
+                    "ignore_case": {"type": "boolean", "description": "Case-insensitive match (default: false)"},
+                    "multiline": {"type": "boolean", "description": "Let . span newlines / match across lines (default: false)"},
+                    "max_results": {"type": "integer", "description": "Max matches to return (default: 200)"},
+                },
+                "required": ["pattern"],
+            },
+            "x_leapflow": {"category": "file", "risk_level": "read_only", "schema_cost": "low", "requires_approval": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_find",
+            "description": (
+                "Find files by a recursive glob pattern under a base path (e.g. '**/test_*.py' "
+                "or '*.md'). Prefer this over shell_run find; skips VCS/dependency/build dirs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "glob": {"type": "string", "description": "Glob pattern, recursive (e.g. *.py, **/conftest.py)"},
+                    "path": {"type": "string", "description": "Base directory (default: current dir)"},
+                    "max_results": {"type": "integer", "description": "Max files to return (default: 500)"},
+                },
+                "required": ["glob"],
+            },
+            "x_leapflow": {"category": "file", "risk_level": "read_only", "schema_cost": "low", "requires_approval": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Apply targeted, anchored search-replace edits to an EXISTING text file "
+                "(use file_write to create/overwrite). Each edit is {original_text, new_text, "
+                "replace_all?}; original_text must match exactly and uniquely (or set replace_all) "
+                "— a non-unique or missing anchor is rejected so files are never corrupted. Set "
+                "dry_run to preview. Far cheaper and safer than rewriting a whole file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to edit"},
+                    "edits": {
+                        "type": "array",
+                        "description": "List of edits, applied in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "original_text": {"type": "string", "description": "Exact text to replace (unique unless replace_all)"},
+                                "new_text": {"type": "string", "description": "Replacement text"},
+                                "replace_all": {"type": "boolean", "description": "Replace every occurrence (default: false)"},
+                            },
+                            "required": ["original_text", "new_text"],
+                        },
+                    },
+                    "dry_run": {"type": "boolean", "description": "Preview without writing (default: false)"},
+                },
+                "required": ["path", "edits"],
+            },
+            "x_leapflow": {"category": "file", "risk_level": "mutating", "schema_cost": "medium", "requires_approval": True},
         },
     },
     {
@@ -418,6 +505,40 @@ _BRIDGE_TOOLS = [
             "mode": "string (optional) — 'overwrite' (default) or 'append'",
         },
         "handler": file_write,
+        "mutates_state": True,
+    },
+    {
+        "name": "gp_code_search",
+        "description": "Search file contents by regex across a directory tree (ripgrep-backed, structured results).",
+        "parameters": {
+            "pattern": "string (required) — regex pattern",
+            "path": "string (optional) — base directory (default: .)",
+            "glob": "string (optional) — filter files by glob, e.g. *.py",
+            "ignore_case": "boolean (optional) — case-insensitive (default: false)",
+            "multiline": "boolean (optional) — match across lines (default: false)",
+            "max_results": "integer (optional) — max matches (default: 200)",
+        },
+        "handler": code_search,
+    },
+    {
+        "name": "gp_file_find",
+        "description": "Find files by recursive glob under a base path.",
+        "parameters": {
+            "glob": "string (required) — recursive glob, e.g. **/test_*.py",
+            "path": "string (optional) — base directory (default: .)",
+            "max_results": "integer (optional) — max files (default: 500)",
+        },
+        "handler": file_find,
+    },
+    {
+        "name": "gp_edit_file",
+        "description": "Apply anchored search-replace edits to an existing text file (dry_run supported).",
+        "parameters": {
+            "path": "string (required) — file path to edit",
+            "edits": "array (required) — list of {original_text, new_text, replace_all?}",
+            "dry_run": "boolean (optional) — preview without writing (default: false)",
+        },
+        "handler": edit_file,
         "mutates_state": True,
     },
     {

@@ -1967,6 +1967,21 @@ class Context:
         except Exception:
             logger.debug("Tool guardrails setup skipped", exc_info=True)
 
+        # ── Seamless ripgrep provisioning for code_search (best-effort, background) ──
+        # code_search always works via the pure-Python fallback; this just tries to
+        # provision the faster ripgrep backend without blocking startup or searches.
+        try:
+            if getattr(settings, "tools_ripgrep_autoinstall", True):
+                import threading
+                from leapflow.tools.file_operations import ensure_ripgrep_available
+                threading.Thread(
+                    target=ensure_ripgrep_available,
+                    kwargs={"autoinstall": True},
+                    daemon=True,
+                ).start()
+        except Exception:
+            logger.debug("ripgrep background provisioning skipped", exc_info=True)
+
         # ── Wire Smart Approval (auxiliary LLM for command risk) ──
         if self.auxiliary is not None:
             try:

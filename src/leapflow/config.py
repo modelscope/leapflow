@@ -347,6 +347,10 @@ class Settings:
     compress_keep_tail: int = 4
     max_tool_output_chars: int = 2000
     max_tool_result_chars: int = 3000  # Per-tool result truncation for LLM context
+    # code_search: best-effort seamless ripgrep auto-install (macOS/Homebrew, no
+    # sudo) when missing; always falls back to the pure-Python search + a manual
+    # install hint, so search works with zero install regardless.
+    tools_ripgrep_autoinstall: bool = True
     context_hard_limit_ratio: float = 0.92
     context_warning_ratio: float = 0.75
     tool_evidence_max_chars: int = 1200
@@ -810,6 +814,7 @@ def _build_settings_from_env(
     compress_keep_tail = int(os.getenv("LEAPFLOW_COMPRESS_KEEP_TAIL", "4"))
     max_tool_output_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_OUTPUT_CHARS", "2000"))
     max_tool_result_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_RESULT_CHARS", "3000"))
+    tools_ripgrep_autoinstall = os.getenv("LEAPFLOW_TOOLS_RIPGREP_AUTOINSTALL", "1").strip().lower() in ("1", "true", "yes")
     context_hard_limit_ratio = float(os.getenv("LEAPFLOW_CONTEXT_HARD_LIMIT_RATIO", "0.92"))
     context_warning_ratio = float(os.getenv("LEAPFLOW_CONTEXT_WARNING_RATIO", "0.75"))
     tool_evidence_max_chars = int(os.getenv("LEAPFLOW_TOOL_EVIDENCE_MAX_CHARS", "1200"))
@@ -1122,6 +1127,7 @@ def _build_settings_from_env(
         compress_keep_tail=compress_keep_tail,
         max_tool_output_chars=max_tool_output_chars,
         max_tool_result_chars=max_tool_result_chars,
+        tools_ripgrep_autoinstall=tools_ripgrep_autoinstall,
         context_hard_limit_ratio=context_hard_limit_ratio,
         context_warning_ratio=context_warning_ratio,
         tool_evidence_max_chars=tool_evidence_max_chars,
