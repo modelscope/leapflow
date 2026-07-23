@@ -21,6 +21,20 @@ logger = logging.getLogger(__name__)
 _MAX_STDOUT = 10_000
 _MAX_STDERR = 5_000
 _DEFAULT_TIMEOUT = 30.0
+# Internal ceiling for the shell process timeout. Raised from the original
+# hard-coded 120 s; injectable at startup via set_max_shell_timeout so
+# long-running builds and tests are no longer unconditionally killed.
+_max_shell_timeout_s: float = 300.0
+
+
+def set_max_shell_timeout(seconds: float) -> None:
+    """Set the maximum shell-process timeout (clamping ceiling, not the default).
+
+    Called at engine / application startup from settings so operators can
+    tune the ceiling without touching source code.
+    """
+    global _max_shell_timeout_s
+    _max_shell_timeout_s = max(10.0, float(seconds))
 
 
 @runtime_checkable
@@ -121,7 +135,7 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a shell command with timeout protection and safety layers."""
     command = params.get("command", "")
     cwd = params.get("cwd") or None
-    timeout = min(float(params.get("timeout", _DEFAULT_TIMEOUT)), 120.0)
+    timeout = min(float(params.get("timeout", _DEFAULT_TIMEOUT)), _max_shell_timeout_s)
 
     if not command:
         return {"ok": False, "error": "Missing required parameter: command"}

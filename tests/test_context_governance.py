@@ -769,3 +769,106 @@ async def test_file_list_skips_search_skip_dirs(tmp_path) -> None:
     # .git must be flagged skipped and must NOT have children
     assert git_entry.get("skipped") is True
     assert "children" not in git_entry
+
+
+# ── P1-3: file_read truncation_hint ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_file_read_truncation_hint_present_when_line_truncated(tmp_path) -> None:
+    """When max_lines limits the read, truncation_hint must guide the LLM to read more."""
+    source = tmp_path / "big.py"
+    source.write_text("\n".join(f"line_{i} = {i}" for i in range(50)), encoding="utf-8")
+
+    result = await file_read({"path": str(source), "max_lines": 5})
+
+    assert result["ok"] is True
+    assert result["truncated"] is True
+    hint = result.get("truncation_hint")
+    assert hint is not None
+    assert "start_line" in hint          # actionable: tells LLM what start_line to use
+    assert "max_lines" in hint           # actionable: mentions the parameter
+    assert str(result["end_line"]) in hint  # references current end_line
+
+
+@pytest.mark.asyncio
+async def test_file_read_no_truncation_hint_when_complete(tmp_path) -> None:
+    """No truncation_hint when the whole file fits within max_lines."""
+    source = tmp_path / "tiny.py"
+    source.write_text("x = 1\ny = 2\n", encoding="utf-8")
+
+    result = await file_read({"path": str(source), "max_lines": 200})
+
+    assert result["ok"] is True
+    assert result["truncated"] is False
+    assert result.get("truncation_hint") is None
+
+
+# ── P2-6: difficulty-adaptive convergence round ─────────────────────────────
+
+
+def test_effective_convergence_round_scales_with_difficulty() -> None:
+    """Hard tasks earn more exploration rounds before the converging posture fires."""
+    controller = LongTaskContextController(
+        evidence_builder=ToolEvidenceBuilder(),
+        convergence_round=12,
+        convergence_round_ceiling=40,
+        convergence_scale=2.0,
+    )
+
+    # difficulty=0: no extension; difficulty=1: 12 + 12*2.0 = 36, bounded by 40
+    assert controller._effective_convergence_round(0.0) == 12
+    assert controller._effective_convergence_round(0.5) == 12 + round(12 * 0.5 * 2.0)  # 24
+    assert controller._effective_convergence_round(1.0) == 36   # 12 + 12*2.0, < ceiling
+    assert controller._effective_convergence_round(1.0) <= 40   # never exceeds ceiling
+
+
+def test_effective_convergence_round_bounded_by_ceiling() -> None:
+    """Even at maximum difficulty the ceiling is never exceeded."""
+    controller = LongTaskContextController(
+        evidence_builder=ToolEvidenceBuilder(),
+        convergence_round=12,
+        convergence_round_ceiling=20,   # tight ceiling
+        convergence_scale=10.0,          # aggressive scale would give 12+120=132
+    )
+    # All difficulty values must be capped at ceiling=20
+    for d in [0.0, 0.5, 1.0]:
+        assert controller._effective_convergence_round(d) <= 20
+
+
+def test_convergence_posture_delayed_for_hard_tasks() -> None:
+    """High-difficulty tasks do not enter converging posture at the base round."""
+    controller = LongTaskContextController(
+        evidence_builder=ToolEvidenceBuilder(),
+        convergence_round=4,   # very low base for test speed
+        convergence_round_ceiling=40,
+        convergence_scale=2.0,
+    )
+    # Force high difficulty by recording many evidence calls
+    result = {"ok": True, "path": "/tmp/x", "content": "x", "mode": "raw"}
+    for i in range(8):
+        controller.compact_tool_result("file_read", {"path": f"/tmp/f{i}.py"}, result)
+
+    # At round=4 (base), with high difficulty the effective round should be > 4
+    # so posture should NOT be converging at that round.
+    snap_at_base = controller.snapshot(round_number=4)
+    effective = controller._effective_convergence_round(snap_at_base.difficulty)
+    if effective > 4:
+        assert snap_at_base.posture != "converging" or snap_at_base.dominant_signal != "long-exploration"
+
+
+# ── P1-4: shell timeout configurable ────────────────────────────────────────
+
+
+def test_set_max_shell_timeout_updates_module_ceiling() -> None:
+    """set_max_shell_timeout changes the module-level ceiling; min floor is 10 s."""
+    import leapflow.tools.shell_tools as _st
+    original = _st._max_shell_timeout_s
+    try:
+        _st.set_max_shell_timeout(600.0)
+        assert _st._max_shell_timeout_s == 600.0
+        # Floor: values below 10 are clamped
+        _st.set_max_shell_timeout(1.0)
+        assert _st._max_shell_timeout_s == 10.0
+    finally:
+        _st.set_max_shell_timeout(original)

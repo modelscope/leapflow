@@ -1058,6 +1058,21 @@ class AgentEngine:
         self._checkpoint_store = InMemoryCheckpointStore()
         self._audit_sink = JsonlAuditSink()  # In-memory; path-based if layout available
 
+        # Apply startup-time tool configuration derived from settings.
+        self._configure_tool_defaults()
+
+    def _configure_tool_defaults(self) -> None:
+        """Wire settings-derived values into module-level tool defaults at start-up.
+
+        Kept in its own method so child frames and test fixtures can call it
+        without re-running the full ``__init__`` body.
+        """
+        try:
+            from leapflow.tools.shell_tools import set_max_shell_timeout
+            set_max_shell_timeout(self._settings.max_shell_timeout_s)
+        except Exception:  # noqa: BLE001 - optional; defaults remain if import fails
+            logger.debug("_configure_tool_defaults: shell_tools not available")
+
     # ── Optional strategy setters (config-driven) ────────────────────────
 
     def set_cache_strategy(self, strategy: CacheStrategy | None) -> None:
@@ -1761,7 +1776,14 @@ class AgentEngine:
         return {"tools": existing}
 
     def _build_session_summary_context(self, *, max_messages: int) -> str:
-        """Return a compact local session summary without retrieval or extra LLM calls."""
+        """Return a structured local session summary without retrieval or extra LLM calls.
+
+        Structured format preserves more signal per turn compared to a flat
+        180-char single-line preview:
+        - User turns: full first line up to 400 chars (preserves intent).
+        - Assistant turns with tool calls: tool names + brief outcome.
+        - Assistant prose turns: content preview up to 300 chars.
+        """
         messages = self._wm.as_chat_messages()
         summary_lines: list[str] = []
         for message in messages[-max(0, max_messages):]:
@@ -1776,9 +1798,23 @@ class AgentEngine:
                 )
             elif not isinstance(content, str):
                 content = str(content)
-            preview = _single_line_preview(content, limit=180)
-            if preview:
-                summary_lines.append(f"- {role}: {preview}")
+
+            if role == "user":
+                # Preserve full user intent: first meaningful line, up to 400 chars.
+                first_line = content.strip().split("\n")[0][:400]
+                if first_line:
+                    summary_lines.append(f"- [user] {first_line}")
+            elif content.startswith("[Called:"):
+                # Working-memory stores tool-calling turns as "[Called: t1, t2]"
+                # summary strings.  Extract and preserve the tool list concisely.
+                called_text = content[8:].rstrip("]").strip()[:200]
+                summary_lines.append(f"- [assistant] called: {called_text}")
+            else:
+                # Assistant prose: single-line preview up to 300 chars.
+                preview = _single_line_preview(content, limit=300)
+                if preview:
+                    summary_lines.append(f"- [assistant] {preview}")
+
         if not summary_lines:
             return ""
         return "\n## Recent Session Summary\n" + "\n".join(summary_lines) + "\n"
@@ -2409,6 +2445,8 @@ class AgentEngine:
             ),
             repeated_read_limit=self._settings.repeated_read_limit,
             convergence_round=self._settings.long_task_convergence_round,
+            convergence_round_ceiling=self._settings.convergence_round_ceiling,
+            convergence_scale=self._settings.convergence_scale,
             posture_config=ContextPostureConfig(
                 expanded_ratio=self._settings.context_expanded_ratio,
                 finalizing_ratio=(
@@ -4326,7 +4364,7 @@ class AgentEngine:
             )
             if entries:
                 parts.append("## Recent Context\n" + "\n".join(
-                    f"- [{e.kind.value}] {e.content[:100]}" for e in entries
+                    f"- [{e.kind.value}] {e.content[:500]}" for e in entries
                 ))
         except asyncio.TimeoutError:
             logger.debug(

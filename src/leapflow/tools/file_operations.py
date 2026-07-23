@@ -394,6 +394,16 @@ async def file_read(params: Dict[str, Any]) -> Dict[str, Any]:
             "selected_lines": len(content.splitlines()) if content else 0,
             "mode": mode,
             "truncated": raw_truncated or line_truncated,
+            # Explicit truncation hint: when truncated, the LLM can read the
+            # remaining content by passing start_line=end_line+1 or increasing
+            # max_lines (up to 2000 for raw mode).
+            "truncation_hint": (
+                f"Showing lines {selected_start}-{selected_end} of {len(lines)} "
+                f"(applied max_lines={max_lines}). "
+                f"Read more with start_line={selected_end + 1} "
+                f"or increase max_lines."
+                if line_truncated else None
+            ),
             **_sensitivity_metadata(sensitivity),
         }
     except Exception as e:

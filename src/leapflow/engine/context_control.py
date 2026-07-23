@@ -627,6 +627,11 @@ class ContextGovernanceController:
     evidence_builder: ToolEvidenceBuilder
     repeated_read_limit: int = 2
     convergence_round: int = 12
+    # Difficulty-adaptive convergence: the effective round at which long-exploration
+    # converging kicks in is scaled by observed difficulty.  A hard task earns more
+    # exploration rounds; the ceiling prevents truly stuck tasks from running forever.
+    convergence_round_ceiling: int = 40
+    convergence_scale: float = 2.0
     posture_config: ContextPostureConfig = field(default_factory=ContextPostureConfig)
     difficulty_config: DifficultyConfig = field(default_factory=DifficultyConfig)
     evidence_tools: frozenset[str] = _EVIDENCE_TOOLS
@@ -669,6 +674,18 @@ class ContextGovernanceController:
         self._evidence_round_hwm = -1
 
     reset_task_scope = reset_turn_scope
+
+    def _effective_convergence_round(self, difficulty: float) -> int:
+        """Scale the convergence round with task difficulty, bounded by a ceiling.
+
+        At difficulty=0 returns the base ``convergence_round`` unchanged.
+        At difficulty=1 the effective round rises by ``convergence_scale`` ×
+        the base, capped at ``convergence_round_ceiling``.  This gives hard
+        tasks proportionally more exploration while still converging them
+        eventually.
+        """
+        extension = round(self.convergence_round * max(0.0, min(1.0, difficulty)) * self.convergence_scale)
+        return min(self.convergence_round_ceiling, self.convergence_round + extension)
 
     def compact_tool_result(self, tool_name: str, arguments: Dict[str, Any] | None, result: Any) -> Any:
         """Return evidence and update the session exploration ledger."""
@@ -835,10 +852,14 @@ class ContextGovernanceController:
             posture = _POSTURE_EXPANDING
             dominant_signal = "high-difficulty"
             guidance = "broaden investigation, decompose, or delegate; iteration budget widened"
-        elif round_number >= self.convergence_round:
+        elif round_number >= self._effective_convergence_round(difficulty):
+            effective_round = self._effective_convergence_round(difficulty)
             posture = _POSTURE_CONVERGING
             dominant_signal = "long-exploration"
-            convergence_reason = "exploration round limit reached"
+            convergence_reason = (
+                f"exploration round limit reached (base {self.convergence_round}, "
+                f"effective {effective_round} at difficulty {difficulty:.2f})"
+            )
             guidance = "deduplicate evidence and prefer targeted reads"
         elif sources_seen >= cfg.research_source_threshold or self._evidence_count >= cfg.research_evidence_threshold:
             posture = _POSTURE_RESEARCH

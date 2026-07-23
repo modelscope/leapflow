@@ -345,7 +345,7 @@ class Settings:
     # Context Compression
     compress_threshold: int = 16
     compress_keep_tail: int = 4
-    max_tool_output_chars: int = 2000
+    max_tool_output_chars: int = 3000
     max_tool_result_chars: int = 3000  # Per-tool result truncation for LLM context
     # code_search: best-effort seamless ripgrep auto-install (macOS/Homebrew, no
     # sudo) when missing; always falls back to the pure-Python search + a manual
@@ -361,6 +361,15 @@ class Settings:
     tool_evidence_max_chars: int = 1200
     repeated_read_limit: int = 2
     long_task_convergence_round: int = 12
+    # Adaptive convergence ceiling: on high-difficulty tasks the effective
+    # convergence round scales up (convergence_round * (1 + difficulty *
+    # convergence_scale)), bounded by this ceiling so genuinely stuck tasks
+    # still eventually converge.
+    convergence_round_ceiling: int = 40
+    convergence_scale: float = 2.0
+    # Shell safety ceiling: the internal shell-run process timeout is clamped
+    # here so individual shell calls can safely run beyond 2 minutes.
+    max_shell_timeout_s: float = 300.0
     context_expanded_ratio: float = 0.60
     context_finalizing_ratio: float = 0.90
     context_expanded_evidence_threshold: int = 2
@@ -817,7 +826,7 @@ def _build_settings_from_env(
     # Context Compression
     compress_threshold = int(os.getenv("LEAPFLOW_COMPRESS_THRESHOLD", "16"))
     compress_keep_tail = int(os.getenv("LEAPFLOW_COMPRESS_KEEP_TAIL", "4"))
-    max_tool_output_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_OUTPUT_CHARS", "2000"))
+    max_tool_output_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_OUTPUT_CHARS", "3000"))
     max_tool_result_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_RESULT_CHARS", "3000"))
     tools_ripgrep_autoinstall = os.getenv("LEAPFLOW_TOOLS_RIPGREP_AUTOINSTALL", "1").strip().lower() in ("1", "true", "yes")
     tools_test_command = os.getenv("LEAPFLOW_TOOLS_TEST_COMMAND", "").strip()
@@ -830,6 +839,9 @@ def _build_settings_from_env(
     tool_evidence_max_chars = int(os.getenv("LEAPFLOW_TOOL_EVIDENCE_MAX_CHARS", "1200"))
     repeated_read_limit = int(os.getenv("LEAPFLOW_REPEATED_READ_LIMIT", "2"))
     long_task_convergence_round = int(os.getenv("LEAPFLOW_LONG_TASK_CONVERGENCE_ROUND", "12"))
+    convergence_round_ceiling = int(os.getenv("LEAPFLOW_CONVERGENCE_ROUND_CEILING", "40"))
+    convergence_scale = float(os.getenv("LEAPFLOW_CONVERGENCE_SCALE", "2.0"))
+    max_shell_timeout_s = float(os.getenv("LEAPFLOW_MAX_SHELL_TIMEOUT_S", "300.0"))
     context_expanded_ratio = float(os.getenv("LEAPFLOW_CONTEXT_EXPANDED_RATIO", "0.60"))
     context_finalizing_ratio = float(os.getenv("LEAPFLOW_CONTEXT_FINALIZING_RATIO", "0.90"))
     context_expanded_evidence_threshold = int(os.getenv("LEAPFLOW_CONTEXT_EXPANDED_EVIDENCE_THRESHOLD", "2"))
@@ -1148,6 +1160,9 @@ def _build_settings_from_env(
         tool_evidence_max_chars=tool_evidence_max_chars,
         repeated_read_limit=repeated_read_limit,
         long_task_convergence_round=long_task_convergence_round,
+        convergence_round_ceiling=convergence_round_ceiling,
+        convergence_scale=convergence_scale,
+        max_shell_timeout_s=max_shell_timeout_s,
         context_expanded_ratio=context_expanded_ratio,
         context_finalizing_ratio=context_finalizing_ratio,
         context_expanded_evidence_threshold=context_expanded_evidence_threshold,
