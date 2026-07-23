@@ -351,6 +351,9 @@ class Settings:
     # sudo) when missing; always falls back to the pure-Python search + a manual
     # install hint, so search works with zero install regardless.
     tools_ripgrep_autoinstall: bool = True
+    tools_test_command: str = ""  # empty => auto-detect (pytest/npm/go/cargo)
+    tools_lint_command: str = ""  # empty => auto-detect (ruff/eslint/go vet/clippy)
+    tools_terminal_session_enabled: bool = False  # persistent shell sessions (opt-in, high risk)
     context_hard_limit_ratio: float = 0.92
     context_warning_ratio: float = 0.75
     tool_evidence_max_chars: int = 1200
@@ -815,6 +818,9 @@ def _build_settings_from_env(
     max_tool_output_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_OUTPUT_CHARS", "2000"))
     max_tool_result_chars = int(os.getenv("LEAPFLOW_MAX_TOOL_RESULT_CHARS", "3000"))
     tools_ripgrep_autoinstall = os.getenv("LEAPFLOW_TOOLS_RIPGREP_AUTOINSTALL", "1").strip().lower() in ("1", "true", "yes")
+    tools_test_command = os.getenv("LEAPFLOW_TOOLS_TEST_COMMAND", "").strip()
+    tools_lint_command = os.getenv("LEAPFLOW_TOOLS_LINT_COMMAND", "").strip()
+    tools_terminal_session_enabled = os.getenv("LEAPFLOW_TOOLS_TERMINAL_SESSION_ENABLED", "0").strip().lower() in ("1", "true", "yes")
     context_hard_limit_ratio = float(os.getenv("LEAPFLOW_CONTEXT_HARD_LIMIT_RATIO", "0.92"))
     context_warning_ratio = float(os.getenv("LEAPFLOW_CONTEXT_WARNING_RATIO", "0.75"))
     tool_evidence_max_chars = int(os.getenv("LEAPFLOW_TOOL_EVIDENCE_MAX_CHARS", "1200"))
@@ -1128,6 +1134,9 @@ def _build_settings_from_env(
         max_tool_output_chars=max_tool_output_chars,
         max_tool_result_chars=max_tool_result_chars,
         tools_ripgrep_autoinstall=tools_ripgrep_autoinstall,
+        tools_test_command=tools_test_command,
+        tools_lint_command=tools_lint_command,
+        tools_terminal_session_enabled=tools_terminal_session_enabled,
         context_hard_limit_ratio=context_hard_limit_ratio,
         context_warning_ratio=context_warning_ratio,
         tool_evidence_max_chars=tool_evidence_max_chars,

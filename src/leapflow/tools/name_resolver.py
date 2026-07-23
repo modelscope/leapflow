@@ -36,6 +36,13 @@ _READ_ONLY_TOOLS = {
     "skills_list",
     "skill_view",
     "memory_search",
+    # Verification/inspection tools: read-oriented for the loop even though some
+    # names contain a mutating signal (e.g. test_run) or execute via a gated
+    # underlying tool (test_run/lint_check delegate to the shell_run gate).
+    "test_run",
+    "lint_check",
+    "terminal_read",
+    "terminal_list",
 }
 _MUTATING_NAME_SIGNALS = (
     "write",

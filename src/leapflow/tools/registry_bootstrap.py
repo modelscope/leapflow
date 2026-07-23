@@ -18,6 +18,14 @@ from leapflow.tools.file_operations import (
 )
 from leapflow.tools.scm_tools import scm_sync, git_query
 from leapflow.tools.code_intel import code_intel
+from leapflow.tools.dev_tools import test_run, lint_check
+from leapflow.tools.terminal_session import (
+    terminal_open,
+    terminal_send,
+    terminal_read,
+    terminal_close,
+    terminal_list,
+)
 from leapflow.tools.shell_tools import shell_run
 from leapflow.tools.system_tools import env_info, time_get
 from leapflow.tools.text_tools import text_replace, text_search
@@ -509,6 +517,124 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "test_run",
+            "description": (
+                "Run the project's test suite and return structured results (framework, passed/"
+                "failed counts, failing tests). Auto-detects the runner (pytest/npm/go/cargo) or "
+                "uses a configured/explicit command; executes via the governed shell. ok=true means "
+                "the runner executed — see 'success' for pass/fail."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Explicit test command (optional; overrides auto-detect)"},
+                    "cwd": {"type": "string", "description": "Working directory (default: current dir)"},
+                    "timeout": {"type": "number", "description": "Timeout seconds (default 120, max 120)"},
+                },
+            },
+            "x_leapflow": {"category": "dev", "risk_level": "read_only", "schema_cost": "low", "requires_approval": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lint_check",
+            "description": (
+                "Run the project's linter and return a structured clean/issue result. Auto-detects "
+                "the linter (ruff/eslint/go vet/clippy) or uses a configured/explicit command; "
+                "executes via the governed shell. ok=true means the linter ran — see 'clean'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Explicit lint command (optional; overrides auto-detect)"},
+                    "cwd": {"type": "string", "description": "Working directory (default: current dir)"},
+                    "timeout": {"type": "number", "description": "Timeout seconds (default 120, max 120)"},
+                },
+            },
+            "x_leapflow": {"category": "dev", "risk_level": "read_only", "schema_cost": "low", "requires_approval": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal_open",
+            "description": (
+                "Open a PERSISTENT shell session (REPL/dev server/watch), returning a session_id "
+                "for terminal_send/read/close. Disabled unless tools.terminal_session_enabled is "
+                "set. For one-shot commands use shell_run instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Optional initial command to run in the session"},
+                    "cwd": {"type": "string", "description": "Working directory (default: current dir)"},
+                    "shell": {"type": "string", "description": "Shell to launch (default: $SHELL or /bin/bash)"},
+                },
+            },
+            "x_leapflow": {"category": "terminal", "risk_level": "high", "schema_cost": "medium", "requires_approval": True, "effect_scope": "external"},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal_send",
+            "description": "Send a line of input to a persistent terminal session and return output captured shortly after.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Session id from terminal_open"},
+                    "input": {"type": "string", "description": "Line of input to send"},
+                    "wait": {"type": "number", "description": "Seconds to wait for output before reading (default 0.3, max 10)"},
+                },
+                "required": ["session_id"],
+            },
+            "x_leapflow": {"category": "terminal", "risk_level": "high", "schema_cost": "low", "requires_approval": True, "effect_scope": "external"},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal_read",
+            "description": "Drain buffered output from a persistent terminal session (optionally waiting briefly first).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Session id from terminal_open"},
+                    "wait": {"type": "number", "description": "Seconds to wait before draining (default 0, max 10)"},
+                },
+                "required": ["session_id"],
+            },
+            "x_leapflow": {"category": "terminal", "risk_level": "read_only", "schema_cost": "low", "requires_approval": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal_close",
+            "description": "Terminate a persistent terminal session and release its process group.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Session id from terminal_open"},
+                },
+                "required": ["session_id"],
+            },
+            "x_leapflow": {"category": "terminal", "risk_level": "medium", "schema_cost": "low", "requires_approval": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "terminal_list",
+            "description": "List active persistent terminal sessions.",
+            "parameters": {"type": "object", "properties": {}},
+            "x_leapflow": {"category": "terminal", "risk_level": "read_only", "schema_cost": "low", "requires_approval": False},
+        },
+    },
 ] + HUB_TOOL_DEFINITIONS + GATEWAY_TOOL_DEFINITIONS
 
 
@@ -685,6 +811,72 @@ _BRIDGE_TOOLS = [
             "name": "string (required) — skill name to view",
         },
         "handler": skill_view,
+    },
+    {
+        "name": "gp_test_run",
+        "description": "Run the project's test suite; structured pass/fail (auto-detect or explicit command).",
+        "parameters": {
+            "command": "string (optional) — explicit test command (overrides auto-detect)",
+            "cwd": "string (optional) — working directory",
+            "timeout": "number (optional) — timeout seconds (default 120)",
+        },
+        "handler": test_run,
+    },
+    {
+        "name": "gp_lint_check",
+        "description": "Run the project's linter; structured clean/issue result (auto-detect or explicit command).",
+        "parameters": {
+            "command": "string (optional) — explicit lint command (overrides auto-detect)",
+            "cwd": "string (optional) — working directory",
+            "timeout": "number (optional) — timeout seconds (default 120)",
+        },
+        "handler": lint_check,
+    },
+    {
+        "name": "gp_terminal_open",
+        "description": "Open a persistent shell session (disabled unless tools.terminal_session_enabled).",
+        "parameters": {
+            "command": "string (optional) — initial command",
+            "cwd": "string (optional) — working directory",
+            "shell": "string (optional) — shell to launch",
+        },
+        "handler": terminal_open,
+        "mutates_state": True,
+    },
+    {
+        "name": "gp_terminal_send",
+        "description": "Send input to a persistent terminal session and return output.",
+        "parameters": {
+            "session_id": "string (required) — session id from terminal_open",
+            "input": "string (optional) — line of input",
+            "wait": "number (optional) — seconds to wait for output (default 0.3)",
+        },
+        "handler": terminal_send,
+        "mutates_state": True,
+    },
+    {
+        "name": "gp_terminal_read",
+        "description": "Drain buffered output from a persistent terminal session.",
+        "parameters": {
+            "session_id": "string (required) — session id from terminal_open",
+            "wait": "number (optional) — seconds to wait before draining (default 0)",
+        },
+        "handler": terminal_read,
+    },
+    {
+        "name": "gp_terminal_close",
+        "description": "Terminate a persistent terminal session.",
+        "parameters": {
+            "session_id": "string (required) — session id from terminal_open",
+        },
+        "handler": terminal_close,
+        "mutates_state": True,
+    },
+    {
+        "name": "gp_terminal_list",
+        "description": "List active persistent terminal sessions.",
+        "parameters": {},
+        "handler": terminal_list,
     },
 ] + HUB_BRIDGE_TOOLS + GATEWAY_BRIDGE_TOOLS
 

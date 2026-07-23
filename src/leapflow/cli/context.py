@@ -1982,6 +1982,18 @@ class Context:
         except Exception:
             logger.debug("ripgrep background provisioning skipped", exc_info=True)
 
+        # ── Wire developer verification + terminal-session tool config ──
+        try:
+            from leapflow.tools.dev_tools import set_dev_commands
+            set_dev_commands(
+                test_command=getattr(settings, "tools_test_command", "") or "",
+                lint_command=getattr(settings, "tools_lint_command", "") or "",
+            )
+            from leapflow.tools.terminal_session import set_terminal_sessions_enabled
+            set_terminal_sessions_enabled(bool(getattr(settings, "tools_terminal_session_enabled", False)))
+        except Exception:
+            logger.debug("dev/terminal tool config wiring skipped", exc_info=True)
+
         # ── Wire Smart Approval (auxiliary LLM for command risk) ──
         if self.auxiliary is not None:
             try:
