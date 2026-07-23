@@ -405,17 +405,21 @@ class RuntimeLeapService:
                     engine = exec_ctx.engine
                     session_lock = exec_ctx.lock
 
+                # Serialize turns within one session (a conversation is
+                # sequential); different sessions run concurrently up to the
+                # global turn-admission bound. Acquire the session lock BEFORE
+                # setting up per-turn state so the try/finally below always cleans
+                # it up: everything between here and ``try`` is synchronous, so a
+                # cancellation can only occur during this await (before any state
+                # is registered) or inside the try (covered by finally).
+                if session_lock is not None:
+                    await session_lock.acquire()
                 enable_thinking = bool(kwargs.get("enable_thinking", False))
                 approval_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
                 previous_request_id = self._active_engine_request_id
                 route_token = _approval_route.set((approval_queue, request_id))
                 self._active_engine_request_id = request_id
                 self._active_engines[request_id] = engine
-                # Serialize turns within one session (a conversation is
-                # sequential); different sessions run concurrently up to the
-                # global turn-admission bound.
-                if session_lock is not None:
-                    await session_lock.acquire()
                 try:
                     sig = inspect.signature(engine.run_stream)
                     if "request_id" in sig.parameters:

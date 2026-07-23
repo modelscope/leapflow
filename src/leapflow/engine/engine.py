@@ -965,8 +965,11 @@ class AgentEngine:
         self._active_task: Optional[asyncio.Task] = None
         self._cancel_requested = False
         # Per-turn identity, set at turn start; initialized so reads and the
-        # subagent frame save/restore never hit an unset attribute.
-        self._current_session_id: str = ""
+        # subagent frame save/restore never hit an unset attribute. NOTE:
+        # _current_session_id is intentionally NOT re-initialized here — it is set
+        # to None at the top of __init__, and the session-creation path relies on
+        # that ``is None`` sentinel to mint a new session id, so overriding it to
+        # "" would silently disable conversation persistence.
         self._current_turn_id: str = ""
         self._current_command_id: str = ""
 
