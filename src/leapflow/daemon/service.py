@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import json
 import logging
@@ -26,6 +27,15 @@ _MAX_SESSION_ARTIFACT_CHARS = 6000
 _MAX_SESSION_ARTIFACT_TOTAL_CHARS = 16000
 _PATH_RE = re.compile(r'(?P<key>path|file_path)["\'=:\s]+(?P<value>[^"\'\n|]+)')
 
+# Per-turn approval routing. Each running turn sets this to (its approval queue,
+# its request_id) inside its own asyncio task; the globally-shared approval gate
+# reads it deep inside tool execution to route an approval prompt to the correct
+# turn. Because concurrent turns run in separate tasks, the ContextVar isolates
+# them without a single shared slot (which would misroute under N>1).
+_approval_route: "contextvars.ContextVar[tuple[asyncio.Queue[StreamChunk], str] | None]" = (
+    contextvars.ContextVar("leapd_approval_route", default=None)
+)
+
 
 class RuntimeLeapService:
     """LeapService implementation backed by a single initialized Context."""
@@ -44,8 +54,10 @@ class RuntimeLeapService:
         self._client_count: Callable[[], int] = lambda: 0
         self._client_leases: Callable[[], list[ClientLeaseSnapshot]] = lambda: []
         self._approval_pending: dict[str, dict[str, Any]] = {}
-        self._approval_event_queue: asyncio.Queue[StreamChunk] | None = None
         self._active_engine_request_id: str = ""
+        # request_id -> the engine actually running that turn (may be a
+        # per-session engine, not the base), so cancel targets the right one.
+        self._active_engines: dict[str, Any] = {}
         self._engine_request_ledger: dict[str, dict[str, Any]] = {}
         self._request_ledger_ttl_s = max(1.0, float(getattr(settings, "daemon_request_ledger_ttl_s", 600.0) or 600.0))
         self._request_ledger_max_entries = max(1, int(getattr(settings, "daemon_request_ledger_max_entries", 128) or 128))
@@ -389,10 +401,10 @@ class RuntimeLeapService:
 
                 enable_thinking = bool(kwargs.get("enable_thinking", False))
                 approval_queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
-                previous_queue = self._approval_event_queue
                 previous_request_id = self._active_engine_request_id
-                self._approval_event_queue = approval_queue
+                route_token = _approval_route.set((approval_queue, request_id))
                 self._active_engine_request_id = request_id
+                self._active_engines[request_id] = engine
                 try:
                     sig = inspect.signature(engine.run_stream)
                     if "request_id" in sig.parameters:
@@ -415,23 +427,39 @@ class RuntimeLeapService:
                     request_record["completed_at"] = time.time()
                     self._prune_engine_request_ledger()
                 finally:
-                    self._approval_event_queue = previous_queue
+                    _approval_route.reset(route_token)
                     self._active_engine_request_id = previous_request_id
+                    self._active_engines.pop(request_id, None)
             except Exception:
                 request_record["status"] = "failed"
                 request_record["completed_at"] = time.time()
                 self._prune_engine_request_ledger()
                 raise
 
-    async def engine_cancel(self) -> bool:
-        ctx = self.context
-        engine = getattr(ctx, "engine", None)
-        if engine is not None and hasattr(engine, "cancel"):
-            result = engine.cancel()
-            if hasattr(result, "__await__"):
-                await result
-            return True
-        return False
+    async def engine_cancel(self, request_id: str = "") -> bool:
+        # Cancel the running turn's own engine (which may be a per-session
+        # engine, not the base). With a request_id, target that specific turn;
+        # without one, cancel all active turns (at N=1 that is the single one).
+        targets: list[Any] = []
+        if request_id:
+            eng = self._active_engines.get(request_id)
+            if eng is not None:
+                targets = [eng]
+        else:
+            targets = list(self._active_engines.values())
+        if not targets:
+            ctx = self.context
+            eng = getattr(ctx, "engine", None)
+            if eng is not None:
+                targets = [eng]
+        cancelled = False
+        for eng in targets:
+            if eng is not None and hasattr(eng, "cancel"):
+                result = eng.cancel()
+                if hasattr(result, "__await__"):
+                    await result
+                cancelled = True
+        return cancelled
 
     async def skill_execute(self, skill_name: str, params: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError("skill.execute is not available in this daemon phase")
@@ -1214,11 +1242,12 @@ class RuntimeLeapService:
         return [dict(item.get("request") or {}) for item in self._approval_pending.values()]
 
     async def _request_approval(self, request: Any) -> str:
-        queue = self._approval_event_queue
-        if queue is None:
+        route = _approval_route.get()
+        if route is None:
             return "deny"
+        queue, active_request_id = route
         pending_id = str(getattr(request, "request_id", "") or uuid.uuid4().hex)
-        request_id = self._active_engine_request_id or pending_id
+        request_id = active_request_id or pending_id
         payload = request.to_dict()
         payload["pending_id"] = pending_id
         payload["request_id"] = request_id

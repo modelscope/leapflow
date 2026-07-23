@@ -113,9 +113,13 @@ class DaemonClient:
         finally:
             await _close_writer(writer)
 
-    async def engine_cancel(self) -> bool:
-        """Request cancellation of the daemon-owned active engine turn."""
-        result = await self.request("engine.cancel")
+    async def engine_cancel(self, request_id: str = "") -> bool:
+        """Request cancellation of the daemon-owned active engine turn.
+
+        With ``request_id`` the daemon targets that specific turn; without one it
+        cancels the active turn(s) (at N=1 the single running turn).
+        """
+        result = await self.request("engine.cancel", {"request_id": request_id} if request_id else None)
         return bool(result)
 
     async def session_resume(self, session_id: str) -> dict[str, Any]:

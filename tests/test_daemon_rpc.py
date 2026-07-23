@@ -465,6 +465,74 @@ async def test_runtime_service_streams_pending_approval_and_resolves(tmp_path) -
 
 
 @pytest.mark.asyncio
+async def test_concurrent_approvals_route_to_their_own_queues() -> None:
+    """P3-3: two turns requesting approval concurrently each receive their prompt
+    on their own queue (ContextVar isolation) and resolve independently."""
+    from types import SimpleNamespace
+
+    from leapflow.daemon.service import RuntimeLeapService, _approval_route
+    from leapflow.security.actions import ActionDescriptor
+    from leapflow.security.approval import ApprovalRequest
+
+    service = RuntimeLeapService(SimpleNamespace(llm_context_length=100))
+
+    async def turn(queue, rid):
+        token = _approval_route.set((queue, rid))
+        try:
+            req = ApprovalRequest(
+                category="shell.command", detail=rid, action=ActionDescriptor.shell(rid)
+            )
+            return await service._request_approval(req)
+        finally:
+            _approval_route.reset(token)
+
+    qA: asyncio.Queue = asyncio.Queue()
+    qB: asyncio.Queue = asyncio.Queue()
+    tA = asyncio.create_task(turn(qA, "reqA"))
+    tB = asyncio.create_task(turn(qB, "reqB"))
+
+    promptA = await asyncio.wait_for(qA.get(), 1.0)
+    promptB = await asyncio.wait_for(qB.get(), 1.0)
+    # Each prompt landed on its own queue with its own request_id (no cross-delivery).
+    assert promptA.metadata["request_id"] == "reqA"
+    assert promptB.metadata["request_id"] == "reqB"
+    assert qA.empty() and qB.empty()
+
+    await service.approval_resolve(promptA.metadata["approval"]["pending_id"], "allow")
+    await service.approval_resolve(promptB.metadata["approval"]["pending_id"], "deny")
+    assert await asyncio.wait_for(tA, 1.0) == "allow"
+    assert await asyncio.wait_for(tB, 1.0) == "deny"
+
+
+@pytest.mark.asyncio
+async def test_engine_cancel_targets_active_turn_engines() -> None:
+    """P3-3: cancel targets the running turn's own engine, by request_id or all."""
+    from types import SimpleNamespace
+
+    from leapflow.daemon.service import RuntimeLeapService
+
+    service = RuntimeLeapService(SimpleNamespace(llm_context_length=100))
+
+    class CancelEngine:
+        def __init__(self) -> None:
+            self.cancelled = 0
+
+        def cancel(self) -> None:
+            self.cancelled += 1
+
+    eng_a, eng_b = CancelEngine(), CancelEngine()
+    service._active_engines = {"reqA": eng_a, "reqB": eng_b}
+
+    # Targeted cancel hits only that request's engine.
+    assert await service.engine_cancel("reqA") is True
+    assert eng_a.cancelled == 1 and eng_b.cancelled == 0
+
+    # Untargeted cancel hits all active turns.
+    assert await service.engine_cancel() is True
+    assert eng_a.cancelled == 2 and eng_b.cancelled == 1
+
+
+@pytest.mark.asyncio
 async def test_daemon_shutdown_rpc_triggers_server_stop() -> None:
     class ShutdownService(_FakeService):
         def __init__(self) -> None:

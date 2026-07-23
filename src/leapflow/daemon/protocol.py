@@ -171,8 +171,8 @@ class LeapService(Protocol):
         """Chat with the engine (streaming). Yields StreamChunks."""
         ...
 
-    async def engine_cancel(self) -> bool:
-        """Cancel the currently running engine task."""
+    async def engine_cancel(self, request_id: str = "") -> bool:
+        """Cancel the currently running engine task (optionally a specific request)."""
         ...
 
     async def skill_execute(self, skill_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
