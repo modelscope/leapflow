@@ -212,6 +212,54 @@ async def test_runtime_service_prunes_completed_engine_request_replay_records() 
 
 
 @pytest.mark.asyncio
+async def test_engine_chat_emits_queued_status_when_busy() -> None:
+    """When the engine lock is already held (another turn running), a waiting
+    client gets an immediate 'queued' status instead of a silent hang."""
+    from types import SimpleNamespace
+    from leapflow.daemon.service import RuntimeLeapService
+
+    service = RuntimeLeapService(SimpleNamespace(llm_context_length=100))
+    await service._engine_lock.acquire()  # simulate another turn holding the engine
+    service._active_engine_request_id = "busy-req"
+    try:
+        agen = service.engine_chat("who are you", request_id="req-2")
+        first = await agen.__anext__()
+        assert first.event_type == "status"
+        assert first.metadata.get("queued") is True
+        assert first.metadata.get("active_request_id") == "busy-req"
+        await agen.aclose()  # generator is paused awaiting the lock; clean it up
+    finally:
+        service._engine_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_engine_chat_no_queued_status_when_idle() -> None:
+    from types import SimpleNamespace
+    from leapflow.daemon.service import RuntimeLeapService
+    from leapflow.engine import StreamEvent
+
+    class FakeEngine:
+        _current_session_id = "s1"
+
+        async def run_stream(self, message: str, *, enable_thinking: bool = False, request_id: str = ""):
+            yield StreamEvent(type="final", content="ok")
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(llm_context_length=100)
+            self.engine = FakeEngine()
+
+        def reload_runtime_config_if_changed(self) -> bool:
+            return False
+
+    service = RuntimeLeapService(SimpleNamespace(llm_context_length=100))
+    service._ctx = FakeContext()
+    chunks = [chunk async for chunk in service.engine_chat("hi", request_id="req-idle")]
+    assert chunks  # produced output
+    assert not any(chunk.metadata.get("queued") for chunk in chunks)  # no queued status when idle
+
+
+@pytest.mark.asyncio
 async def test_daemon_client_can_cancel_engine_turn() -> None:
     with tempfile.TemporaryDirectory(prefix="lfd-", dir="/tmp") as root:
         service = _FakeService()
@@ -865,19 +913,25 @@ async def test_runtime_service_serializes_engine_chat_streams(tmp_path) -> None:
     first, second = await asyncio.gather(collect("one"), collect("two"))
     status = await service.status()
 
-    assert [event.content for event in first] == ["start:one", "done:one"]
-    assert [event.content for event in second] == ["start:two", "done:two"]
-    assert first[0].metadata["context_used"] == 2_048
-    assert first[0].metadata["context_budget_snapshot"]["total_tokens"] == 2_048
-    assert first[0].metadata["context_budget_snapshot"]["tool_schema_tokens"] == 248
-    assert first[0].metadata["llm_context_length"] == 16_000
-    assert first[0].metadata["context_posture"] == "research"
-    assert first[0].metadata["context_signal"] == "multi-source"
-    assert first[0].metadata["context_guidance"] == "maintain research ledger and synthesize findings"
-    assert first[0].metadata["compression_reason"] == "threshold-triggered"
-    assert first[0].metadata["compression_savings_ratio"] == 0.25
-    assert first[0].metadata["session_id"] == "sess-daemon"
-    assert second[0].metadata["context_used"] == 2_048
+    # The blocked turn now receives an immediate 'queued' status chunk before it
+    # acquires the engine lock; filter those out to assert on the engine stream.
+    first_engine = [event for event in first if not event.metadata.get("queued")]
+    second_engine = [event for event in second if not event.metadata.get("queued")]
+    assert [event.content for event in first_engine] == ["start:one", "done:one"]
+    assert [event.content for event in second_engine] == ["start:two", "done:two"]
+    # Exactly one turn was queued behind the other (single engine, serialized).
+    assert sum(1 for event in first + second if event.metadata.get("queued")) == 1
+    assert first_engine[0].metadata["context_used"] == 2_048
+    assert first_engine[0].metadata["context_budget_snapshot"]["total_tokens"] == 2_048
+    assert first_engine[0].metadata["context_budget_snapshot"]["tool_schema_tokens"] == 248
+    assert first_engine[0].metadata["llm_context_length"] == 16_000
+    assert first_engine[0].metadata["context_posture"] == "research"
+    assert first_engine[0].metadata["context_signal"] == "multi-source"
+    assert first_engine[0].metadata["context_guidance"] == "maintain research ledger and synthesize findings"
+    assert first_engine[0].metadata["compression_reason"] == "threshold-triggered"
+    assert first_engine[0].metadata["compression_savings_ratio"] == 0.25
+    assert first_engine[0].metadata["session_id"] == "sess-daemon"
+    assert second_engine[0].metadata["context_used"] == 2_048
     assert status["context_used"] == 2_048
     assert status["context_budget_snapshot"]["total_tokens"] == 2_048
     assert status["context_posture"] == "research"

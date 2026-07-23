@@ -274,6 +274,25 @@ class RuntimeLeapService:
 
     async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
         request_id = str(kwargs.get("request_id") or uuid.uuid4().hex[:12])
+        # The single engine serializes turns via _engine_lock. If it is already
+        # busy with another turn (a long task can hold it for minutes), tell the
+        # waiting client immediately instead of leaving it on a silent "thinking"
+        # spinner while it blocks on the lock. The request is then queued and
+        # starts when the active turn finishes; /cancel interrupts the running one.
+        if self._engine_lock.locked():
+            yield StreamChunk(
+                request_id=request_id,
+                content=(
+                    "leapd is busy running another task — your request is queued and will start "
+                    "when it finishes. Use /cancel to interrupt the running task, or wait."
+                ),
+                event_type="status",
+                metadata={
+                    "request_id": request_id,
+                    "queued": True,
+                    "active_request_id": self._active_engine_request_id or "",
+                },
+            )
         async with self._engine_lock:
             self._prune_engine_request_ledger()
             existing = self._engine_request_ledger.get(request_id)
