@@ -16,6 +16,8 @@ from leapflow.security.redact import redact_sensitive_text
 _MAX_OUTPUT_CHARS = 10_000
 _DEFAULT_TIMEOUT_S = 120.0
 _ALLOWED_ACTIONS = frozenset({"status", "pull", "push", "pull_then_push"})
+_QUERY_ACTIONS = frozenset({"diff", "log", "status", "branch", "show"})
+_LOG_FORMAT = "%h%x1f%an%x1f%ad%x1f%s"  # unit-separator delimited, safe for parsing
 
 
 @dataclass(frozen=True)
@@ -239,3 +241,101 @@ async def scm_sync(params: Dict[str, Any], runner: GitRunner | None = None) -> D
         "stdout": "\n".join(step.get("stdout", "") for step in completed_steps if step.get("stdout")),
         "stderr": "\n".join(step.get("stderr", "") for step in completed_steps if step.get("stderr")),
     }
+
+
+def _parse_log_entries(stdout: str) -> list[Dict[str, Any]]:
+    """Parse unit-separator delimited git log lines into structured entries."""
+    entries: list[Dict[str, Any]] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\x1f")
+        if len(parts) >= 4:
+            entries.append({"hash": parts[0], "author": parts[1], "date": parts[2], "subject": parts[3]})
+    return entries
+
+
+def _parse_branches(stdout: str) -> tuple[str, list[str]]:
+    """Parse ``git branch -a`` output into (current, all-branches)."""
+    current = ""
+    branches: list[str] = []
+    for line in stdout.splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        if name.startswith("* "):
+            name = name[2:].strip()
+            current = name
+        branches.append(name)
+    return current, branches
+
+
+async def git_query(params: Dict[str, Any], runner: GitRunner | None = None) -> Dict[str, Any]:
+    """Read-only structured git inspection: diff, log, status, branch, show.
+
+    Prefer this over shell_run for reading repository state — output is clipped,
+    secret-redacted, and (for log/branch) parsed into structured fields. Never
+    mutates the repo; use scm_sync for pull/push.
+    """
+    action = str(params.get("action") or "status").strip().lower()
+    if action not in _QUERY_ACTIONS:
+        return {"ok": False, "error": f"Unsupported git query action: {action}", "failure_code": "unsupported_git_query"}
+
+    cwd = _workspace(params.get("cwd"))
+    if not cwd.exists() or not cwd.is_dir():
+        return {"ok": False, "error": f"Working directory not found: {cwd}", "failure_code": "path_not_found", "cwd": str(cwd)}
+
+    timeout_s = min(float(params.get("timeout") or _DEFAULT_TIMEOUT_S), _DEFAULT_TIMEOUT_S)
+    run = runner or _run_git
+    ref = _safe_ref(params.get("ref") or "", field="ref")
+    path = str(params.get("path") or "").strip()
+    if path.startswith("-"):
+        return {"ok": False, "error": f"Invalid path: {path}", "failure_code": "invalid_path"}
+
+    if action == "diff":
+        args: list[str] = ["diff", "--no-color"]
+        if params.get("staged"):
+            args.append("--staged")
+        if ref:
+            args.append(ref)
+    elif action == "log":
+        try:
+            max_count = max(1, min(int(params.get("max_count", 20)), 200))
+        except (TypeError, ValueError):
+            max_count = 20
+        args = ["log", f"-n{max_count}", f"--pretty=format:{_LOG_FORMAT}", "--date=short", "--no-color"]
+        if params.get("stat"):
+            args.append("--stat")
+        if ref:
+            args.append(ref)
+    elif action == "branch":
+        args = ["branch", "-a", "--no-color"]
+    elif action == "show":
+        args = ["show", "--stat", "--no-color", ref or "HEAD"]
+    else:  # status
+        args = ["status", "--short", "--branch"]
+    if path and action in {"diff", "log"}:
+        args += ["--", path]
+
+    result = await run(tuple(args), cwd, timeout_s)
+    if result.returncode != 0:
+        return _failure_payload(action=action, cwd=cwd, step=action, args=args, result=result, completed_steps=[])
+
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "tool": "git_query",
+        "scm": "git",
+        "action": action,
+        "cwd": str(cwd),
+        "command": "git " + " ".join(args),
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+    if action == "log":
+        payload["entries"] = _parse_log_entries(result.stdout)
+        payload["entry_count"] = len(payload["entries"])
+    elif action == "branch":
+        current, branches = _parse_branches(result.stdout)
+        payload["current_branch"] = current
+        payload["branches"] = branches
+    return payload

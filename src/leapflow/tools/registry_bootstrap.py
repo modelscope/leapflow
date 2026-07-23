@@ -16,7 +16,8 @@ from leapflow.tools.file_operations import (
     file_read,
     file_write,
 )
-from leapflow.tools.scm_tools import scm_sync
+from leapflow.tools.scm_tools import scm_sync, git_query
+from leapflow.tools.code_intel import code_intel
 from leapflow.tools.shell_tools import shell_run
 from leapflow.tools.system_tools import env_info, time_get
 from leapflow.tools.text_tools import text_replace, text_search
@@ -183,6 +184,27 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "code_intel",
+            "description": (
+                "Precise document symbols (outline) for a source file: classes, functions, and "
+                "methods with line ranges. Python uses an exact AST parse; other languages use a "
+                "keyword-prefix scan. Prefer over file_read mode=symbols for accurate navigation "
+                "before editing. Read-only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Source file to analyze"},
+                    "operation": {"type": "string", "enum": ["symbols"], "description": "Analysis operation (default: symbols)"},
+                },
+                "required": ["path"],
+            },
+            "x_leapflow": {"category": "file", "risk_level": "read_only", "schema_cost": "low", "requires_approval": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "shell_run",
             "description": "Execute a shell command with timeout protection.",
             "parameters": {
@@ -233,6 +255,31 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
                 "idempotency_scope": "session",
                 "summary": "Typed git status/pull/push with explicit current-branch push semantics.",
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_query",
+            "description": (
+                "Read-only structured git inspection: action=diff|log|status|branch|show. "
+                "Prefer over shell_run for reading repo state — output is clipped, redacted, and "
+                "log/branch are parsed into structured fields. Use scm_sync for pull/push."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["diff", "log", "status", "branch", "show"], "description": "Git read action"},
+                    "cwd": {"type": "string", "description": "Repository working directory (optional)"},
+                    "ref": {"type": "string", "description": "A single git ref (e.g. HEAD~1, a branch/commit); ranges not allowed"},
+                    "path": {"type": "string", "description": "Limit diff/log to this path (optional)"},
+                    "staged": {"type": "boolean", "description": "diff: show staged changes (default: false)"},
+                    "max_count": {"type": "integer", "description": "log: max entries (default 20, max 200)"},
+                    "stat": {"type": "boolean", "description": "log: include --stat (default: false)"},
+                },
+                "required": ["action"],
+            },
+            "x_leapflow": {"category": "scm", "risk_level": "read_only", "schema_cost": "medium", "requires_approval": False},
         },
     },
     {
@@ -542,6 +589,15 @@ _BRIDGE_TOOLS = [
         "mutates_state": True,
     },
     {
+        "name": "gp_code_intel",
+        "description": "Precise document symbols (classes/functions/methods with line ranges); Python via AST.",
+        "parameters": {
+            "path": "string (required) — source file to analyze",
+            "operation": "string (optional) — 'symbols' (default)",
+        },
+        "handler": code_intel,
+    },
+    {
         "name": "gp_shell_run",
         "description": "Execute a shell command with timeout protection.",
         "parameters": {
@@ -565,6 +621,20 @@ _BRIDGE_TOOLS = [
         },
         "handler": scm_sync,
         "mutates_state": True,
+    },
+    {
+        "name": "gp_git_query",
+        "description": "Read-only structured git inspection (diff/log/status/branch/show).",
+        "parameters": {
+            "action": "string (required) — diff|log|status|branch|show",
+            "cwd": "string (optional) — repository working directory",
+            "ref": "string (optional) — single git ref (no ranges)",
+            "path": "string (optional) — limit diff/log to this path",
+            "staged": "boolean (optional) — diff staged changes",
+            "max_count": "integer (optional) — log max entries (default 20)",
+            "stat": "boolean (optional) — log include --stat",
+        },
+        "handler": git_query,
     },
     {
         "name": "gp_time_get",

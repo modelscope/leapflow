@@ -10,6 +10,7 @@ import asyncio
 
 from leapflow.tools import file_operations as fo
 from leapflow.tools.file_operations import code_search, edit_file, file_find
+from leapflow.tools.code_intel import code_intel
 
 
 def _run(coro):
@@ -290,3 +291,55 @@ def test_ensure_ripgrep_is_cached(monkeypatch) -> None:
 def test_ripgrep_install_hint_macos(monkeypatch) -> None:
     monkeypatch.setattr(fo.sys, "platform", "darwin")
     assert fo.ripgrep_install_hint() == "brew install ripgrep"
+
+
+# ── code_intel: precise document symbols (ast for Python, heuristic otherwise) ──
+
+def test_code_intel_python_ast_symbols(tmp_path) -> None:
+    f = tmp_path / "m.py"
+    f.write_text(
+        "import os\n"
+        "\n"
+        "class Foo:\n"
+        "    def method_a(self):\n"
+        "        return 1\n"
+        "\n"
+        "def top_level(x, y):\n"
+        "    return x + y\n"
+    )
+    result = _run(code_intel({"path": str(f)}))
+    assert result["ok"] is True and result["engine"] == "ast" and result["language"] == "py"
+    by_name = {s["name"]: s for s in result["symbols"]}
+    assert by_name["Foo"]["kind"] == "class" and by_name["Foo"]["line"] == 3
+    assert by_name["method_a"]["kind"] == "method" and by_name["method_a"]["parent"] == "Foo"
+    assert by_name["top_level"]["kind"] == "function" and by_name["top_level"]["line"] == 7
+    assert "def top_level(x, y):" in by_name["top_level"]["signature"]
+
+
+def test_code_intel_non_python_heuristic(tmp_path) -> None:
+    f = tmp_path / "m.js"
+    f.write_text("function foo() {\n  return 1;\n}\nconst bar = 2;\n")
+    result = _run(code_intel({"path": str(f)}))
+    assert result["ok"] is True and result["engine"] == "heuristic"
+    assert 1 in {s["line"] for s in result["symbols"]}   # 'function foo' line
+
+
+def test_code_intel_invalid_python_falls_back(tmp_path) -> None:
+    f = tmp_path / "bad.py"
+    f.write_text("def broken(:\n    pass\n")  # syntax error -> heuristic fallback, not failure
+    result = _run(code_intel({"path": str(f)}))
+    assert result["ok"] is True and result["engine"] == "heuristic-fallback"
+
+
+def test_code_intel_missing_path() -> None:
+    assert _run(code_intel({}))["ok"] is False
+
+
+def test_code_intel_file_not_found(tmp_path) -> None:
+    assert _run(code_intel({"path": str(tmp_path / "nope.py")}))["ok"] is False
+
+
+def test_code_intel_unsupported_operation(tmp_path) -> None:
+    f = tmp_path / "m.py"
+    f.write_text("x = 1\n")
+    assert _run(code_intel({"path": str(f), "operation": "definition"}))["ok"] is False
