@@ -1,3 +1,3 @@
 """Version information for leapflow."""
 
-__version__ = "0.0.9+main"
+__version__ = "0.0.9"
