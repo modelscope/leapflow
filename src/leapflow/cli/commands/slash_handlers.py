@@ -1521,6 +1521,22 @@ async def build_plugin_payload(ctx: "Context", args: str) -> dict[str, Any]:
                     "generation": fiber.generation if fiber else None,
                 },
             }
+            descriptor = getattr(plugin, "descriptor", None)
+            if descriptor is not None and hasattr(descriptor, "to_dict"):
+                descriptor_data = descriptor.to_dict()
+                response["dsh"] = {
+                    "source_kind": descriptor_data.get("source_kind"),
+                    "bundle_sha256": descriptor_data.get("bundle_sha256"),
+                    "entry_point": descriptor_data.get("entry_point"),
+                    "verdict": (
+                        "partial"
+                        if descriptor_data.get("client_components")
+                        else "adaptable"
+                    ),
+                    "limitations": descriptor_data.get("limitations", []),
+                    "client_components": descriptor_data.get("client_components", []),
+                    "runtime": "node",
+                }
             # Additive trust info
             try:
                 from leapflow.learning.plugin_advisor import get_default_advisor
@@ -1679,6 +1695,19 @@ def render_plugin_payload(console: "LeapConsole", payload: dict[str, Any]) -> No
         deps = payload.get("dependencies") or []
         if deps:
             info.append(f"Deps:        {', '.join(deps)}\n")
+        dsh = payload.get("dsh") or {}
+        if dsh:
+            info.append(f"Runtime:     {dsh.get('runtime', 'node')}\n")
+            info.append(f"Source:      {dsh.get('source_kind', 'unknown')}\n")
+            info.append(f"Verdict:     {dsh.get('verdict', 'adaptable')}\n")
+            for limitation in dsh.get("limitations") or []:
+                info.append(f"Limitation:  {limitation}\n")
+            for component in dsh.get("client_components") or []:
+                info.append(
+                    f"Client:      {component.get('name', 'client')} "
+                    f"({component.get('status', 'unsupported')}) — "
+                    f"{component.get('reason', '')}\n"
+                )
         tools = payload.get("tools") or []
         if tools:
             info.append(f"Tools ({len(tools)}):")

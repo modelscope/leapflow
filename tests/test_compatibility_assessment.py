@@ -335,7 +335,7 @@ class TestPipelineE2E:
         assert report.target_protocol == "ToolPlugin"
         assert report.rejection_reason is None
         assert report.manifest.name == "@deepseek-ai/dsh-web-search"
-        assert report.is_installable() is True
+        assert report.is_installable() is False  # manifest-only: runtime discovery not proven
 
     def test_dsh_agent_loop_incompatible(self) -> None:
         """DSH agent-loop plugin produces INCOMPATIBLE with rejection reason."""
@@ -372,7 +372,7 @@ class TestPipelineE2E:
         assert report.adapter_spec.target_protocol == "LLMProviderPlugin"
         assert report.adapter_spec.bridge_type == "json_rpc_bridge"
         assert len(report.adaptation_notes) > 0
-        assert report.is_installable() is True
+        assert report.is_installable() is False  # manifest-only: runtime discovery not proven
 
     def test_pipeline_short_circuit_on_incompatible(self) -> None:
         """INCOMPATIBLE at stage 2 stops pipeline (only 2 stages recorded)."""
@@ -581,8 +581,8 @@ class TestInterfaceAnalyzer:
         assert result.passed is False
         assert result.verdict == Verdict.INCOMPATIBLE
 
-    def test_empty_interfaces_assumed_compatible(self) -> None:
-        """Plugin with no declared interfaces assumed compatible (benefit of doubt)."""
+    def test_empty_native_interfaces_defer_to_import_validation(self) -> None:
+        """A native plugin with no interfaces is validated by its real import path."""
         from leapflow.learning.compatibility.stages.interface_analyzer import InterfaceAnalyzer
 
         manifest = PluginManifestInput(
@@ -595,7 +595,29 @@ class TestInterfaceAnalyzer:
         )]
         result = InterfaceAnalyzer().assess(manifest, prior)
         assert result.passed is True
-        assert result.evidence["match_type"] == "assumed"
+        assert result.verdict is None
+        assert result.evidence["match_type"] == "native_import_required"
+
+    def test_empty_foreign_interfaces_require_runtime_discovery(self) -> None:
+        """An empty DSH interface list is a candidate, never native compatibility proof."""
+        from leapflow.learning.compatibility.stages.interface_analyzer import InterfaceAnalyzer
+
+        manifest = PluginManifestInput(
+            name="test",
+            version="1.0.0",
+            category="tools",
+            declared_interfaces=[],
+            source_language="javascript",
+            source_format="dsh",
+        )
+        prior = [StageResult(
+            stage_name="category_resolver", passed=True,
+            evidence={"target_protocol": "ToolPlugin"},
+        )]
+        result = InterfaceAnalyzer().assess(manifest, prior)
+        assert result.passed is True
+        assert result.verdict == Verdict.ADAPTABLE
+        assert result.evidence["match_type"] == "runtime_discovery_required"
 
     def test_fuzzy_match_tool_interface(self) -> None:
         """Fuzzy substring matching catches tool-like interfaces."""
@@ -671,17 +693,32 @@ class TestDependencyChecker:
         result = DependencyChecker().assess(manifest, [])
         assert result.passed is True
 
-    def test_unknown_deps_satisfiable(self) -> None:
-        """Unknown external packages default to satisfiable."""
+    def test_unknown_native_deps_defer_to_runtime_binding(self) -> None:
+        """Native manifests may name runtime dependencies injected by the host."""
+        from leapflow.learning.compatibility.stages.dependency_checker import DependencyChecker
+
+        manifest = PluginManifestInput(
+            name="test", version="1.0.0", category="tools",
+            declared_dependencies=["custom_runtime_service"],
+        )
+        result = DependencyChecker().assess(manifest, [])
+        assert result.passed is True
+        assert result.verdict is None
+
+    def test_unknown_dsh_dependencies_are_blocking(self) -> None:
+        """An unknown npm dependency cannot be assumed present in the Node sandbox."""
         from leapflow.learning.compatibility.stages.dependency_checker import DependencyChecker
 
         manifest = PluginManifestInput(
             name="test", version="1.0.0", category="tools",
             declared_dependencies=["lodash", "moment"],
+            source_language="typescript",
+            source_format="dsh",
         )
         result = DependencyChecker().assess(manifest, [])
-        assert result.passed is True
-        assert result.verdict is None  # All satisfiable
+        assert result.passed is False
+        assert result.verdict == Verdict.INCOMPATIBLE
+        assert result.evidence["blocking"] == ["lodash", "moment"]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -963,8 +1000,8 @@ class TestVerdictSynthesizer:
 class TestFullPipelineP1:
     """Full pipeline tests exercising all 6 stages."""
 
-    def test_dsh_web_tool_all_6_stages(self) -> None:
-        """DSH web tool passes all 6 stages → COMPATIBLE."""
+    def test_dsh_web_tool_with_unknown_npm_dependency_is_blocked(self) -> None:
+        """Manifest-only DSH packages cannot assume unknown npm dependencies exist."""
         raw = {
             "name": "@deepseek-ai/dsh-web-search",
             "version": "0.1.0",
@@ -979,14 +1016,13 @@ class TestFullPipelineP1:
             "dependencies": {"node-fetch": "^3.0.0"},
         }
         report = assess_plugin(raw)
-        # Web tool with network perm and typescript: should be ADAPTABLE
-        # (typescript bridge + medium risk is acceptable)
-        assert report.final_verdict in (Verdict.COMPATIBLE, Verdict.ADAPTABLE)
-        assert report.is_installable() is True
-        assert len(report.stages) == 6
+        assert report.final_verdict == Verdict.INCOMPATIBLE
+        assert report.is_installable() is False
+        assert report.stages[-1].stage_name == "dependency_checker"
+        assert "node-fetch" in report.stages[-1].evidence["blocking"]
 
-    def test_dsh_llm_plugin_all_stages(self) -> None:
-        """DSH LLM plugin runs all 6 stages and produces ADAPTABLE."""
+    def test_dsh_llm_plugin_with_unknown_npm_dependency_is_blocked(self) -> None:
+        """Foreign provider packages also require a self-contained pre-built bundle."""
         raw = {
             "name": "@deepseek-ai/dsh-llm-openai",
             "version": "0.2.0",
@@ -1001,10 +1037,10 @@ class TestFullPipelineP1:
             "dependencies": {"node-fetch": "^3.0.0"},
         }
         report = assess_plugin(raw)
-        assert report.final_verdict == Verdict.ADAPTABLE
+        assert report.final_verdict == Verdict.INCOMPATIBLE
         assert report.target_protocol == "LLMProviderPlugin"
-        assert report.adapter_spec is not None
-        assert len(report.stages) == 6
+        assert report.adapter_spec is None
+        assert report.stages[-1].stage_name == "dependency_checker"
 
     def test_blocking_deps_short_circuits_at_stage4(self) -> None:
         """Plugin with blocking deps short-circuits at stage 4."""
@@ -1084,7 +1120,7 @@ class TestFullPipelineP1:
         }
         report = assess_plugin(raw)
         assert report.final_verdict == Verdict.ADAPTABLE
-        assert report.is_installable() is True
+        assert report.is_installable() is False  # manifest-only: runtime discovery not proven
         assert report.adapter_spec is not None
         assert len(report.stages) == 6
 
@@ -1192,7 +1228,7 @@ class TestInstallGate:
 
         result = await plugin._install_from_marketplace_with_gate("test_plugin", "agent-loop-pkg")
         assert result["ok"] is False
-        assert "INCOMPATIBLE" in result["error"]
+        assert "not installable" in result["error"]
         assert result.get("verdict") == "incompatible"
 
     @pytest.mark.asyncio
@@ -1226,8 +1262,8 @@ class TestInstallGate:
         assert result["ok"] is True
 
     @pytest.mark.asyncio
-    async def test_marketplace_no_manifest_still_proceeds(self) -> None:
-        """If resolve_manifest fails, gate degrades gracefully and proceeds."""
+    async def test_marketplace_no_manifest_fails_closed(self) -> None:
+        """A missing compatibility manifest blocks installation."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from leapflow.plugins.tool_plugins.self_management import SelfManagementPlugin
@@ -1243,8 +1279,10 @@ class TestInstallGate:
             mock_install.return_value = {"ok": True, "action": "install"}
             result = await plugin._install_from_marketplace_with_gate("test_plugin", "some-pkg")
 
-        # Should proceed to install despite gate failure
-        assert result["ok"] is True
+        # The decision-bearing manifest is unavailable, so installation is not attempted.
+        assert result["ok"] is False
+        assert result["failure_code"] == "compatibility_manifest_unavailable"
+        mock_install.assert_not_awaited()
 
 # ═══════════════════════════════════════════════════════════════════
 # P2: File-Path Manifest Loading Tests
@@ -1297,7 +1335,7 @@ class TestFilePathManifestLoading:
         assert isinstance(manifest_file, Path)
         report = assess_plugin(manifest_file)
 
-        assert report.is_installable() is True
+        assert report.is_installable() is False  # manifest-only: runtime discovery not proven
         assert report.manifest.name == "@deepseek-ai/dsh-web-search"
 
     def test_nonexistent_file_incompatible(self, tmp_path) -> None:
@@ -1511,116 +1549,62 @@ class TestManifestConverter:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# P2: Adapter Generator Tests
+# P2: Runtime-discovered Adapter Wrapper Tests
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _sample_adapter_inputs():
-    """Build a representative (AdapterSpec, PluginManifestInput) pair."""
+def _runtime_adapter_inputs(tmp_path):
+    """Build a real runtime descriptor rather than inventing tools from a manifest."""
+    from leapflow.learning.compatibility.source_inspector import hash_source_files
+    from leapflow.plugins.dsh.descriptor import (
+        DshPluginDescriptor,
+        DshToolDescriptor,
+        _sha256_file,
+    )
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "index.cjs").write_text("module.exports={apply(){}}", encoding="utf-8")
+    source_files = ("index.cjs",)
+    descriptor = DshPluginDescriptor(
+        plugin_id="dsh_web_search_bridge",
+        name="@deepseek-ai/dsh-web-search",
+        source_kind="dsh_package",
+        bundle_root=str(bundle),
+        entry_point="index.cjs",
+        bundle_sha256=hash_source_files(bundle, source_files),
+        runtime_sha256=_sha256_file(bundle / "index.cjs"),
+        source_files=source_files,
+        tools=(
+            DshToolDescriptor(
+                name="web_search",
+                description="Search the web through a restricted DSH worker.",
+                parameters_schema={"type": "object", "properties": {}},
+            ),
+        ),
+        permissions=("network.outbound",),
+    )
     spec = AdapterSpec(
         source_interface="web",
         target_protocol="ToolPlugin",
         bridge_type="json_rpc_bridge",
-        shim_methods=["config"],
-        estimated_complexity="low",
     )
     manifest = PluginManifestInput(
         name="@deepseek-ai/dsh-web-search",
         version="0.1.0",
         category="web",
-        declared_interfaces=["web_search", "web_fetch"],
-        source_language="typescript",
-        raw_manifest={"main": "dist/index.js"},
+        source_language="javascript",
+        raw_manifest={"x_leapflow_runtime_descriptor": descriptor.to_dict()},
         source_format="dsh",
     )
     return spec, manifest
 
 
 class TestAdapterGeneratorTemplate:
-    """Tests for generate_adapter_template() (no LLM)."""
+    """Adapters are generated only from verified runtime discovery output."""
 
-    def test_template_produces_valid_python(self, tmp_path) -> None:
-        """The generated template is syntactically valid Python (py_compile)."""
-        import py_compile
-
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-        )
-
-        spec, manifest = _sample_adapter_inputs()
-        code = generate_adapter_template(spec, manifest)
-
-        out = tmp_path / "generated_adapter.py"
-        out.write_text(code, encoding="utf-8")
-        # Raises PyCompileError if the output is not valid Python.
-        py_compile.compile(str(out), doraise=True)
-
-    def test_template_compiles_with_compile_builtin(self) -> None:
-        """The generated template compiles via the compile() builtin."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-        )
-
-        spec, manifest = _sample_adapter_inputs()
-        code = generate_adapter_template(spec, manifest)
-        # Should not raise
-        compile(code, "<generated>", "exec")
-
-    def test_template_class_name_and_plugin_id(self) -> None:
-        """Output contains the correct class name and plugin_id."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-        )
-
-        spec, manifest = _sample_adapter_inputs()
-        code = generate_adapter_template(spec, manifest)
-
-        assert "class DshWebSearchBridgePlugin:" in code
-        assert 'return "dsh_web_search_bridge"' in code
-
-    def test_template_declares_handler_per_interface(self) -> None:
-        """Each declared interface has a ToolMetadata entry and handler."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-        )
-
-        spec, manifest = _sample_adapter_inputs()
-        code = generate_adapter_template(spec, manifest)
-
-        assert 'name="web_search"' in code
-        assert 'name="web_fetch"' in code
-        assert "async def _handle_web_search(" in code
-        assert "async def _handle_web_fetch(" in code
-
-    def test_template_notes_auto_generated_and_source(self) -> None:
-        """Docstring notes it is auto-generated and names the wrapped plugin."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-        )
-
-        spec, manifest = _sample_adapter_inputs()
-        code = generate_adapter_template(spec, manifest)
-
-        assert "auto-generated" in code.lower()
-        assert "@deepseek-ai/dsh-web-search" in code
-
-    def test_template_uses_sandbox_host_bridge(self) -> None:
-        """Handlers delegate to a SandboxHost subprocess bridge."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-        )
-
-        spec, manifest = _sample_adapter_inputs()
-        code = generate_adapter_template(spec, manifest)
-
-        assert "from leapflow.plugins.sandbox.sandbox_host import SandboxHost" in code
-        assert "self._invoke_bridge(" in code
-
-    def test_template_no_interfaces_falls_back_to_invoke(self) -> None:
-        """With no declared interfaces, a single 'invoke' tool is generated."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-        )
+    def test_static_manifest_cannot_generate_an_executable_adapter(self) -> None:
+        from leapflow.learning.compatibility.adapter_generator import generate_adapter_template
 
         spec = AdapterSpec(
             source_interface="tools",
@@ -1628,230 +1612,43 @@ class TestAdapterGeneratorTemplate:
             bridge_type="json_rpc_bridge",
         )
         manifest = PluginManifestInput(
-            name="dsh-empty",
+            name="dsh-static-only",
             version="1.0.0",
             category="tools",
-            declared_interfaces=[],
-            source_language="typescript",
+            source_language="javascript",
+            raw_manifest={"main": "index.js"},
         )
-        code = generate_adapter_template(spec, manifest)
-        compile(code, "<generated>", "exec")
-        assert 'name="invoke"' in code
-        assert "async def _handle_invoke(" in code
+        with pytest.raises(ValueError, match="restricted runtime discovery"):
+            generate_adapter_template(spec, manifest)
 
-    def test_template_sanitizes_interface_names(self) -> None:
-        """Interface names with dots/dashes become valid handler identifiers."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-        )
-
-        spec = AdapterSpec(
-            source_interface="tools",
-            target_protocol="ToolPlugin",
-            bridge_type="json_rpc_bridge",
-        )
-        manifest = PluginManifestInput(
-            name="dsh-weird",
-            version="1.0.0",
-            category="tools",
-            declared_interfaces=["fs.read-file"],
-            source_language="typescript",
-        )
-        code = generate_adapter_template(spec, manifest)
-        compile(code, "<generated>", "exec")
-        assert "async def _handle_fs_read_file(" in code
-        # The declared tool name is preserved verbatim on the ToolMetadata.
-        assert 'name="fs.read-file"' in code
-
-    def test_template_instantiable_and_conforms(self) -> None:
-        """The generated class can be exec'd, instantiated, and conforms."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-        )
+    @pytest.mark.asyncio
+    async def test_runtime_descriptor_produces_valid_installable_wrapper(self, tmp_path) -> None:
+        from leapflow.learning.compatibility.adapter_generator import generate_adapter_template
+        from leapflow.learning.plugin_generator import PluginValidator
         from leapflow.plugins.protocol import ToolPlugin
 
-        spec, manifest = _sample_adapter_inputs()
+        spec, manifest = _runtime_adapter_inputs(tmp_path)
         code = generate_adapter_template(spec, manifest)
-
         namespace: dict = {}
         exec(compile(code, "<generated>", "exec"), namespace)
-        cls = namespace["DshWebSearchBridgePlugin"]
-        instance = cls()
-        assert instance.plugin_id == "dsh_web_search_bridge"
-        assert instance.category == "bridge"
-        assert len(instance.tools) == 2
-        assert isinstance(instance, ToolPlugin)
+        plugin = namespace["plugin"]
 
+        assert isinstance(plugin, ToolPlugin)
+        assert plugin.plugin_id == "dsh_web_search_bridge"
+        assert [tool.name for tool in plugin.tools] == ["web_search"]
+        validation = await PluginValidator().validate(plugin.plugin_id, code)
+        assert validation.ok is True, validation.error
 
-class TestAdapterGeneratorLLM:
-    """Tests for generate_adapter_with_llm() (optional enhancement)."""
-
-    def test_no_provider_returns_template(self) -> None:
-        """When llm_provider is None, output equals the template."""
+    def test_llm_provider_cannot_rewrite_security_boundary(self, tmp_path) -> None:
         from leapflow.learning.compatibility.adapter_generator import (
             generate_adapter_template,
             generate_adapter_with_llm,
         )
 
-        spec, manifest = _sample_adapter_inputs()
-        template = generate_adapter_template(spec, manifest)
-        result = generate_adapter_with_llm(spec, manifest, None)
-        assert result == template
-
-    def test_llm_provider_refines_template(self) -> None:
-        """A fake provider returning valid code is used over the template."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_with_llm,
-        )
-
-        refined = (
-            "# refined by llm\n"
-            "class RefinedAdapter:\n"
-            "    pass\n"
-        )
-
-        class FakeProvider:
+        class Provider:
             def generate(self, prompt: str) -> str:
-                return "```python\n" + refined + "```"
+                return "raise RuntimeError('untrusted replacement')"
 
-        spec, manifest = _sample_adapter_inputs()
-        result = generate_adapter_with_llm(spec, manifest, FakeProvider())
-        assert "RefinedAdapter" in result
-        assert "```" not in result
-
-    def test_llm_invalid_code_falls_back(self) -> None:
-        """A provider returning code that does not compile falls back."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-            generate_adapter_with_llm,
-        )
-
-        class BrokenProvider:
-            def generate(self, prompt: str) -> str:
-                return "def broken( : this is not python"
-
-        spec, manifest = _sample_adapter_inputs()
-        template = generate_adapter_template(spec, manifest)
-        result = generate_adapter_with_llm(spec, manifest, BrokenProvider())
-        assert result == template
-
-    def test_llm_empty_output_falls_back(self) -> None:
-        """A provider returning empty output falls back to template."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-            generate_adapter_with_llm,
-        )
-
-        class EmptyProvider:
-            def generate(self, prompt: str) -> str:
-                return "   "
-
-        spec, manifest = _sample_adapter_inputs()
-        template = generate_adapter_template(spec, manifest)
-        result = generate_adapter_with_llm(spec, manifest, EmptyProvider())
-        assert result == template
-
-    def test_llm_provider_raises_falls_back(self) -> None:
-        """A provider that raises degrades gracefully to the template."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-            generate_adapter_with_llm,
-        )
-
-        class RaisingProvider:
-            def generate(self, prompt: str) -> str:
-                raise RuntimeError("provider down")
-
-        spec, manifest = _sample_adapter_inputs()
-        template = generate_adapter_template(spec, manifest)
-        result = generate_adapter_with_llm(spec, manifest, RaisingProvider())
-        assert result == template
-
-    def test_llm_unsupported_provider_falls_back(self) -> None:
-        """A provider with no supported generation method falls back."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-            generate_adapter_with_llm,
-        )
-
-        class NoMethodProvider:
-            pass
-
-        spec, manifest = _sample_adapter_inputs()
-        template = generate_adapter_template(spec, manifest)
-        result = generate_adapter_with_llm(spec, manifest, NoMethodProvider())
-        assert result == template
-
-    def test_llm_async_achat_provider(self) -> None:
-        """An async achat-style provider is supported."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_with_llm,
-        )
-
-        refined = "class AsyncRefined:\n    pass\n"
-
-        class AsyncProvider:
-            async def achat(self, messages, stream=False):
-                return refined
-
-        spec, manifest = _sample_adapter_inputs()
-        result = generate_adapter_with_llm(spec, manifest, AsyncProvider())
-        assert "AsyncRefined" in result
-
-
-class TestAdapterGeneratorEscaping:
-    """Special characters in manifest fields must still produce valid Python."""
-
-    def test_adapter_template_handles_special_chars_in_name(self) -> None:
-        """Plugin names/interfaces with dots, quotes, slashes produce valid Python."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-        )
-
-        spec = AdapterSpec(
-            source_interface="io.read",
-            target_protocol="ToolPlugin",
-            bridge_type="json_rpc_bridge",
-            shim_methods=["io.read-file", 'say"hello'],
-            estimated_complexity="medium",
-        )
-        manifest = PluginManifestInput(
-            name='@org/dsh-io.tools"v2',
-            version="1.0",
-            category="tools",
-            declared_interfaces=["io.read-file", 'say"hello', "weird\nname"],
-            source_language="typescript",
-            raw_manifest={"main": 'bridge".js'},
-        )
-        code = generate_adapter_template(spec, manifest)
-        # The internal compile() guard already ran; this asserts it end-to-end.
-        compile(code, "<test>", "exec")  # Must not raise
-        assert "class Dsh" in code
-        assert "plugin_id" in code
-
-    def test_adapter_template_special_chars_instantiable(self) -> None:
-        """The escaped adapter can be exec'd and instantiated without error."""
-        from leapflow.learning.compatibility.adapter_generator import (
-            generate_adapter_template,
-        )
-
-        spec = AdapterSpec(
-            source_interface="io.read",
-            target_protocol="ToolPlugin",
-            bridge_type="json_rpc_bridge",
-            estimated_complexity="low",
-        )
-        manifest = PluginManifestInput(
-            name='@org/dsh-io.tools"v2',
-            version="1.0",
-            category="tools",
-            declared_interfaces=["io.read-file", 'say"hello'],
-            source_language="typescript",
-        )
-        code = generate_adapter_template(spec, manifest)
-        namespace: dict = {}
-        exec(compile(code, "<test>", "exec"), namespace)
-        cls = namespace["DshIoToolsV2BridgePlugin"]
-        instance = cls()
-        assert instance.plugin_id == "dsh_io_tools_v2_bridge"
-        assert len(instance.tools) == 2
+        spec, manifest = _runtime_adapter_inputs(tmp_path)
+        deterministic = generate_adapter_template(spec, manifest)
+        assert generate_adapter_with_llm(spec, manifest, Provider()) == deterministic

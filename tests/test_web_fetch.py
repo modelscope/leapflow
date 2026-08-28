@@ -359,6 +359,30 @@ def test_html_fetch_extracts_text_and_links(monkeypatch) -> None:
     assert result["extractor"] == "stdlib"
 
 
+def test_raw_text_fetch_honours_the_approved_encoding_override(monkeypatch) -> None:
+    body = "中文报价".encode("gb18030")
+    transport = _FakeTransport(_outcome(content_type="text/plain", body=body))
+    _install(monkeypatch, transport)
+
+    result = _run(
+        {"url": PUBLIC_URL, "extract": "raw_text", "encoding": "gb18030"}
+    )
+
+    assert result["ok"] is True
+    assert result["text"] == "中文报价"
+
+
+def test_raw_text_fetch_rejects_arbitrary_encoding(monkeypatch) -> None:
+    transport = _FakeTransport(_outcome(content_type="text/plain", body=b"unused"))
+    _install(monkeypatch, transport)
+
+    result = _run({"url": PUBLIC_URL, "extract": "raw_text", "encoding": "utf-16"})
+
+    assert result["ok"] is False
+    assert result["error_type"] == "invalid_encoding"
+    assert transport.requests == []
+
+
 def test_binary_content_is_not_returned_inline(monkeypatch) -> None:
     transport = _FakeTransport(
         _outcome(content_type="application/pdf", body=b"%PDF-1.7 binary...")

@@ -17,10 +17,9 @@ from leapflow.learning.compatibility.protocol import (
 )
 
 # ═══════════════════════════════════════════════════════════════════════
-# Permission → SecurityRisk mapping.
-# Uses substring matching for flexibility with varied naming conventions.
-# ═══════════════════════════════════════════════════════════════════════
-
+# Permission identifiers are a stable protocol boundary and are matched exactly.
+# Substring matching made names such as ``read_secrets`` look LOW because they
+# contained ``read``. Unknown permissions are HIGH and require review.
 _PERMISSION_RISK_MAP: dict[str, SecurityRisk] = {
     # LOW risk — read-only operations
     "fs.read": SecurityRisk.LOW,
@@ -36,8 +35,7 @@ _PERMISSION_RISK_MAP: dict[str, SecurityRisk] = {
     "network.outbound": SecurityRisk.MEDIUM,
     "network_outbound": SecurityRisk.MEDIUM,
     "network.connect": SecurityRisk.MEDIUM,
-    "http": SecurityRisk.MEDIUM,
-    "net": SecurityRisk.MEDIUM,
+    "compat.shell.curl_get": SecurityRisk.MEDIUM,
     # HIGH risk — shell execution and process management
     "shell.execute": SecurityRisk.HIGH,
     "shell_execute": SecurityRisk.HIGH,
@@ -77,20 +75,10 @@ _RISK_ORDER: dict[SecurityRisk, int] = {
 
 
 def _classify_permission(permission: str) -> SecurityRisk:
-    """Classify a single permission string to a risk level."""
-    perm_lower = permission.lower().strip()
-
-    # Exact match
-    if perm_lower in _PERMISSION_RISK_MAP:
-        return _PERMISSION_RISK_MAP[perm_lower]
-
-    # Substring match
-    for known, risk in _PERMISSION_RISK_MAP.items():
-        if known in perm_lower or perm_lower in known:
-            return risk
-
-    # Default: MEDIUM for unknown permissions (conservative)
-    return SecurityRisk.MEDIUM
+    """Classify one exact, normalized permission identifier."""
+    return _PERMISSION_RISK_MAP.get(
+        permission.lower().strip(), SecurityRisk.HIGH
+    )
 
 
 class SecurityClassifier:
@@ -108,17 +96,27 @@ class SecurityClassifier:
         - Aggregate to highest risk level across all permissions
         """
         permissions = manifest.permissions
+        is_foreign_runtime = manifest.source_language.lower().strip() in {
+            "typescript", "javascript", "rust", "go"
+        }
         if not permissions:
+            isolation = "sandbox" if is_foreign_runtime else "in_process"
+            verdict = Verdict.ADAPTABLE if is_foreign_runtime else None
             return StageResult(
                 stage_name=self.stage_name,
                 passed=True,
-                verdict=None,
-                details="No permissions declared; low risk",
+                verdict=verdict,
+                details=(
+                    "No permissions declared; foreign source still requires sandbox isolation"
+                    if is_foreign_runtime
+                    else "No permissions declared; low risk"
+                ),
                 evidence={
                     "permissions": [],
                     "risk_level": SecurityRisk.LOW.value,
-                    "isolation": "in_process",
+                    "isolation": isolation,
                     "classification": {},
+                    "recommendation": isolation,
                 },
             )
 
@@ -131,7 +129,7 @@ class SecurityClassifier:
             if _RISK_ORDER[risk] > _RISK_ORDER[highest_risk]:
                 highest_risk = risk
 
-        isolation = _ISOLATION_RECOMMENDATION[highest_risk]
+        isolation = "sandbox" if is_foreign_runtime else _ISOLATION_RECOMMENDATION[highest_risk]
 
         # Determine if source is untrusted (DSH format without verification)
         is_untrusted = manifest.source_format == "dsh"
@@ -157,14 +155,14 @@ class SecurityClassifier:
                 evidence={**evidence, "recommendation": "reject"},
             )
 
-        # HIGH risk → passed but recommend sandbox
-        if highest_risk in (SecurityRisk.HIGH, SecurityRisk.CRITICAL):
+        # HIGH risk or any foreign runtime requires sandbox isolation.
+        if highest_risk in (SecurityRisk.HIGH, SecurityRisk.CRITICAL) or is_foreign_runtime:
             return StageResult(
                 stage_name=self.stage_name,
                 passed=True,
                 verdict=Verdict.ADAPTABLE,
                 details=(
-                    f"Risk level {highest_risk.value}; recommend sandbox isolation. "
+                    f"Risk level {highest_risk.value}; sandbox isolation is required. "
                     f"Permissions: {permissions}"
                 ),
                 evidence={**evidence, "recommendation": "sandbox"},

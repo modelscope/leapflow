@@ -107,20 +107,32 @@ class InterfaceAnalyzer:
 
         declared = manifest.declared_interfaces
 
-        # If no interfaces declared, give benefit of the doubt
+        # Missing interfaces are not evidence of compatibility. JavaScript/Cordis
+        # plugins often register tools dynamically, so the restricted Node worker
+        # must discover the real public surface before installation. For native
+        # manifests, absence is still a partial contract rather than an assumed
+        # match.
         if not declared:
+            requires_discovery = manifest.source_language.lower().strip() in {
+                "typescript", "javascript", "rust", "go"
+            }
             return StageResult(
                 stage_name=self.stage_name,
                 passed=True,
-                verdict=None,
+                verdict=Verdict.ADAPTABLE if requires_discovery else None,
                 details=(
-                    f"No interfaces declared; assuming compatibility with {target_protocol} "
-                    "(manifest does not list explicit interfaces)"
+                    f"No interfaces declared for {target_protocol}; restricted runtime "
+                    "discovery is required before the plugin is installable"
+                    if requires_discovery
+                    else f"No interfaces declared; native {target_protocol} validation is deferred to import"
                 ),
                 evidence={
                     "target_protocol": target_protocol,
                     "declared_interfaces": [],
-                    "match_type": "assumed",
+                    "match_type": (
+                        "runtime_discovery_required" if requires_discovery else "native_import_required"
+                    ),
+                    "requires_runtime_discovery": requires_discovery,
                 },
             )
 

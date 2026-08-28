@@ -16,14 +16,21 @@ Stages:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Union
 
 from leapflow.learning.compatibility.protocol import (
     CompatibilityReport,
+    ComponentStatus,
+    ExecutionPlan,
     PluginManifestInput,
     StageResult,
     Verdict,
+)
+from leapflow.learning.compatibility.source_inspector import (
+    SourceInspectionError,
+    inspect_plugin_source,
 )
 from leapflow.learning.compatibility.stages.category_resolver import CategoryResolver
 from leapflow.learning.compatibility.stages.manifest_parser import ManifestParser
@@ -45,30 +52,43 @@ def assess_plugin(
     stages: list[StageResult] = []
     parser = ManifestParser()
     resolver = CategoryResolver()
+    execution_plan: ExecutionPlan | None = None
 
-    # ── Stage 0: Normalize file-path inputs into a raw manifest dict ──
-    # A Path object or a path-like string is read from disk as JSON,
-    # then flows through the standard dict path below. A string that is
-    # not path-like is an unsupported input format.
+    # ── Stage 0: Inspect real source bundles before manifest parsing ──
+    # Directory inputs and package/meta manifests describe executable source,
+    # not just metadata. Static inspection is side-effect free: it bounds and
+    # hashes the bundle but never evaluates JavaScript.
     if isinstance(manifest, (str, Path)):
-        loaded = _load_manifest_from_path(manifest)
-        if isinstance(loaded, CompatibilityReport):
-            return loaded
-        manifest = loaded
+        candidate = Path(manifest).expanduser()
+        if candidate.is_dir() or candidate.name in {"package.json", "meta.json"}:
+            try:
+                inspection = inspect_plugin_source(candidate)
+            except SourceInspectionError as exc:
+                return _incompatible_report(str(exc))
+            manifest = inspection.manifest
+            execution_plan = inspection.execution_plan
+        else:
+            loaded = _load_manifest_from_path(manifest)
+            if isinstance(loaded, CompatibilityReport):
+                return loaded
+            manifest = loaded
 
     # ── Stage 1: Parse manifest ──────────────────────────────────────
     if isinstance(manifest, PluginManifestInput):
         parsed_manifest = manifest
         parse_result = parser.assess(parsed_manifest, [])
         if not parse_result.passed:
-            return CompatibilityReport(
-                manifest=parsed_manifest,
-                stages=[parse_result],
-                final_verdict=Verdict.INCOMPATIBLE,
-                target_protocol=None,
-                rejection_reason=parse_result.details,
-                adaptation_notes=[],
-                adapter_spec=None,
+            return _finalize_source_report(
+                CompatibilityReport(
+                    manifest=parsed_manifest,
+                    stages=[parse_result],
+                    final_verdict=Verdict.INCOMPATIBLE,
+                    target_protocol=None,
+                    rejection_reason=parse_result.details,
+                    adaptation_notes=[],
+                    adapter_spec=None,
+                ),
+                execution_plan,
             )
     elif isinstance(manifest, dict):
         parse_result = ManifestParser.parse_raw(manifest)
@@ -112,12 +132,15 @@ def assess_plugin(
 
     # Short-circuit on INCOMPATIBLE
     if category_result.verdict == Verdict.INCOMPATIBLE:
-        return CompatibilityReport(
-            manifest=parsed_manifest,
-            stages=stages,
-            final_verdict=Verdict.INCOMPATIBLE,
-            target_protocol=None,
-            rejection_reason=category_result.details,
+        return _finalize_source_report(
+            CompatibilityReport(
+                manifest=parsed_manifest,
+                stages=stages,
+                final_verdict=Verdict.INCOMPATIBLE,
+                target_protocol=None,
+                rejection_reason=category_result.details,
+            ),
+            execution_plan,
         )
 
     # ── Stages 3-6: Deep analysis ───────────────────────────────────
@@ -140,24 +163,30 @@ def assess_plugin(
     interface_result = InterfaceAnalyzer().assess(parsed_manifest, stages)
     stages.append(interface_result)
     if interface_result.verdict == Verdict.INCOMPATIBLE:
-        return CompatibilityReport(
-            manifest=parsed_manifest,
-            stages=stages,
-            final_verdict=Verdict.INCOMPATIBLE,
-            target_protocol=category_result.evidence.get("target_protocol"),
-            rejection_reason=interface_result.details,
+        return _finalize_source_report(
+            CompatibilityReport(
+                manifest=parsed_manifest,
+                stages=stages,
+                final_verdict=Verdict.INCOMPATIBLE,
+                target_protocol=category_result.evidence.get("target_protocol"),
+                rejection_reason=interface_result.details,
+            ),
+            execution_plan,
         )
 
     # Stage 4: Dependency check
     dep_result = DependencyChecker().assess(parsed_manifest, stages)
     stages.append(dep_result)
     if dep_result.verdict == Verdict.INCOMPATIBLE:
-        return CompatibilityReport(
-            manifest=parsed_manifest,
-            stages=stages,
-            final_verdict=Verdict.INCOMPATIBLE,
-            target_protocol=category_result.evidence.get("target_protocol"),
-            rejection_reason=dep_result.details,
+        return _finalize_source_report(
+            CompatibilityReport(
+                manifest=parsed_manifest,
+                stages=stages,
+                final_verdict=Verdict.INCOMPATIBLE,
+                target_protocol=category_result.evidence.get("target_protocol"),
+                rejection_reason=dep_result.details,
+            ),
+            execution_plan,
         )
 
     # Stage 5: Execution model analysis
@@ -165,28 +194,75 @@ def assess_plugin(
     stages.append(exec_result)
     # Execution model never produces INCOMPATIBLE, but defensive check
     if exec_result.verdict == Verdict.INCOMPATIBLE:
-        return CompatibilityReport(
-            manifest=parsed_manifest,
-            stages=stages,
-            final_verdict=Verdict.INCOMPATIBLE,
-            target_protocol=category_result.evidence.get("target_protocol"),
-            rejection_reason=exec_result.details,
+        return _finalize_source_report(
+            CompatibilityReport(
+                manifest=parsed_manifest,
+                stages=stages,
+                final_verdict=Verdict.INCOMPATIBLE,
+                target_protocol=category_result.evidence.get("target_protocol"),
+                rejection_reason=exec_result.details,
+            ),
+            execution_plan,
         )
 
     # Stage 6: Security classification
     security_result = SecurityClassifier().assess(parsed_manifest, stages)
     stages.append(security_result)
     if security_result.verdict == Verdict.INCOMPATIBLE:
-        return CompatibilityReport(
-            manifest=parsed_manifest,
-            stages=stages,
-            final_verdict=Verdict.INCOMPATIBLE,
-            target_protocol=category_result.evidence.get("target_protocol"),
-            rejection_reason=security_result.details,
+        return _finalize_source_report(
+            CompatibilityReport(
+                manifest=parsed_manifest,
+                stages=stages,
+                final_verdict=Verdict.INCOMPATIBLE,
+                target_protocol=category_result.evidence.get("target_protocol"),
+                rejection_reason=security_result.details,
+            ),
+            execution_plan,
         )
 
     # ── Final verdict synthesis ──────────────────────────────────────
-    return synthesize_verdict(parsed_manifest, stages)
+    report = synthesize_verdict(parsed_manifest, stages)
+    if execution_plan is not None:
+        report = _attach_source_plan(report, execution_plan)
+    return report
+
+
+def _finalize_source_report(
+    report: CompatibilityReport, plan: ExecutionPlan | None
+) -> CompatibilityReport:
+    """Preserve source evidence on every verdict, including short-circuit rejection."""
+    return _attach_source_plan(report, plan) if plan is not None else report
+
+
+def _attach_source_plan(
+    report: CompatibilityReport, plan: ExecutionPlan
+) -> CompatibilityReport:
+    """Attach a static execution plan without claiming runtime readiness."""
+    if report.final_verdict == Verdict.INCOMPATIBLE:
+        return replace(report, execution_plan=plan)
+    if plan.blockers:
+        return replace(
+            report,
+            final_verdict=Verdict.INCOMPATIBLE,
+            rejection_reason="; ".join(plan.blockers),
+            adapter_spec=None,
+            execution_plan=plan,
+        )
+    has_unsupported = any(
+        component.status == ComponentStatus.UNSUPPORTED
+        for component in plan.components
+    )
+    final_verdict = Verdict.PARTIAL if has_unsupported else Verdict.ADAPTABLE
+    notes = list(report.adaptation_notes)
+    for limitation in plan.limitations:
+        if limitation not in notes:
+            notes.append(limitation)
+    return replace(
+        report,
+        final_verdict=final_verdict,
+        adaptation_notes=notes,
+        execution_plan=plan,
+    )
 
 
 def _incompatible_report(reason: str) -> CompatibilityReport:

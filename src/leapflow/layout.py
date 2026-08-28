@@ -374,6 +374,11 @@ class ProfileLayout:
         return self.root / "plugins"
 
     @property
+    def dsh_plugins_dir(self) -> Path:
+        """Profile-owned source bundles for restricted DSH bridge plugins."""
+        return self.plugins_dir / "dsh"
+
+    @property
     def plugin_proposals_path(self) -> Path:
         # Profile-scoped review queue for capability-gap → plugin proposals.
         # It is durable user/profile state, not runtime scratch.
@@ -467,6 +472,7 @@ class ProfileLayout:
             self.global_memory_dir,
             self.skills_dir,
             self.plugins_dir,
+            self.dsh_plugins_dir,
             self.audit_dir,
             self.history_dir,
             self.runtime_dir,

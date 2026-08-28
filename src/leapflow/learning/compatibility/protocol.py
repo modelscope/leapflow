@@ -46,6 +46,82 @@ class SecurityRisk(Enum):
     CRITICAL = "critical"
 
 
+class PluginSourceKind(Enum):
+    """Foreign plugin source layouts understood by the compatibility layer."""
+
+    MANIFEST_ONLY = "manifest_only"
+    DSH_PACKAGE = "dsh_package"
+    CORDIS_DYNAMIC_EXPORT = "cordis_dynamic_export"
+    LEAPFLOW_NATIVE = "leapflow_native"
+
+
+class ComponentKind(Enum):
+    """Independently assessed pieces of a foreign plugin bundle."""
+
+    HOST = "host"
+    CLIENT = "client"
+
+
+class ComponentStatus(Enum):
+    """Whether one component can execute in the current LeapFlow runtime."""
+
+    CANDIDATE = "candidate"
+    RUNTIME_READY = "runtime_ready"
+    UNSUPPORTED = "unsupported"
+    BLOCKED = "blocked"
+
+
+@dataclass(frozen=True)
+class ComponentCompatibility:
+    """Compatibility verdict for one source component."""
+
+    name: str
+    kind: ComponentKind
+    status: ComponentStatus
+    reason: str
+    entry_point: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ExecutionPlan:
+    """Concrete bridge plan attached to a compatibility report.
+
+    Static assessment produces candidate components. Runtime discovery replaces
+    the host component with RUNTIME_READY only after a restricted Node worker has
+    loaded the source and returned valid public tool descriptors.
+    """
+
+    source_kind: PluginSourceKind
+    source_root: str = ""
+    entry_point: str = ""
+    runtime: str = ""
+    bundle_sha256: str = ""
+    source_files: tuple[str, ...] = ()
+    requires_discovery: bool = False
+    dependencies: tuple[str, ...] = ()
+    permissions: tuple[str, ...] = ()
+    components: tuple[ComponentCompatibility, ...] = ()
+    blockers: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
+
+    @property
+    def runtime_ready(self) -> bool:
+        return any(
+            component.kind == ComponentKind.HOST
+            and component.status == ComponentStatus.RUNTIME_READY
+            for component in self.components
+        )
+
+    @property
+    def installable_candidate(self) -> bool:
+        return not self.blockers and any(
+            component.kind == ComponentKind.HOST
+            and component.status in {ComponentStatus.CANDIDATE, ComponentStatus.RUNTIME_READY}
+            for component in self.components
+        )
+
+
 @dataclass(frozen=True)
 class PluginManifestInput:
     """Unified input format for assessment — normalizes DSH package.json
@@ -97,9 +173,26 @@ class CompatibilityReport:
     rejection_reason: Optional[str] = None
     adaptation_notes: list[str] = field(default_factory=list)
     adapter_spec: Optional[AdapterSpec] = None
+    execution_plan: Optional[ExecutionPlan] = None
 
     def is_installable(self) -> bool:
-        """Whether this plugin can be installed (with or without adaptation)."""
+        """Whether this report proves a plugin is ready for installation.
+
+        Manifest-only reports preserve the historical enum-based answer. Source
+        bundles are stricter: an untrusted JavaScript bundle becomes installable
+        only after restricted runtime discovery has produced a real host tool.
+        Static ADAPTABLE/PARTIAL is a candidate, never proof of executability.
+        """
+        if self.execution_plan is not None:
+            return (
+                self.final_verdict in (Verdict.ADAPTABLE, Verdict.PARTIAL)
+                and not self.execution_plan.blockers
+                and self.execution_plan.runtime_ready
+            )
+        if self.manifest.source_format == "dsh":
+            # A package.json-shaped dict can be classified, but no source has
+            # been bounded, hashed or executed. It is not an install artifact.
+            return False
         return self.final_verdict in (
             Verdict.COMPATIBLE,
             Verdict.ADAPTABLE,

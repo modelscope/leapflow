@@ -396,6 +396,22 @@ class SelfManagementPlugin:
                     "generation": fiber.generation if fiber else None,
                 },
             }
+            descriptor = getattr(plugin, "descriptor", None)
+            if descriptor is not None and hasattr(descriptor, "to_dict"):
+                descriptor_data = descriptor.to_dict()
+                response["dsh"] = {
+                    "source_kind": descriptor_data.get("source_kind"),
+                    "bundle_sha256": descriptor_data.get("bundle_sha256"),
+                    "entry_point": descriptor_data.get("entry_point"),
+                    "verdict": (
+                        "partial"
+                        if descriptor_data.get("client_components")
+                        else "adaptable"
+                    ),
+                    "limitations": descriptor_data.get("limitations", []),
+                    "client_components": descriptor_data.get("client_components", []),
+                    "runtime": "node",
+                }
 
             # Learning-driven trust and recommendation (purely additive)
             try:
@@ -587,22 +603,46 @@ class SelfManagementPlugin:
     # ── Compatibility assessment (read-only) ─────────────────
 
     async def _assess_compatibility_handler(
-        self, manifest: dict = None, **kwargs: Any
+        self,
+        manifest: dict | None = None,
+        source_path: str = "",
+        **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Assess whether a foreign plugin manifest is compatible with LeapFlow."""
+        """Assess a foreign manifest or real DSH source bundle."""
         if manifest is None:
             manifest = kwargs.get("manifest")
-        if not manifest or not isinstance(manifest, dict):
-            return {"ok": False, "error": "manifest parameter is required (dict)"}
+        source_path = str(source_path or kwargs.get("source_path") or "")
+        if manifest and source_path:
+            return {"ok": False, "error": "Provide either manifest or source_path, not both"}
+        if not source_path and (not manifest or not isinstance(manifest, dict)):
+            return {
+                "ok": False,
+                "error": "manifest (dict) or source_path (DSH bundle directory) is required",
+            }
+        if source_path:
+            from pathlib import Path
+
+            from leapflow.tools.execution_context import require_workspace_access
+
+            scope_error = await require_workspace_access(
+                Path(source_path).expanduser().resolve(),
+                operation="assess_compatibility source",
+                effect="read",
+            )
+            if scope_error:
+                return scope_error
 
         try:
             from leapflow.learning.compatibility import assess_plugin
 
-            report = assess_plugin(manifest)
+            report = assess_plugin(source_path or manifest)
+            plan = report.execution_plan
             return {
                 "ok": True,
                 "final_verdict": report.final_verdict.value,
                 "is_installable": report.is_installable(),
+                "installable_candidate": bool(plan and plan.installable_candidate),
+                "runtime_ready": bool(plan and plan.runtime_ready),
                 "target_protocol": report.target_protocol,
                 "rejection_reason": report.rejection_reason,
                 "adaptation_notes": report.adaptation_notes,
@@ -615,6 +655,7 @@ class SelfManagementPlugin:
                 }
                 if report.adapter_spec
                 else None,
+                "execution_plan": self._compatibility_plan_payload(plan),
                 "stages": [
                     {
                         "stage_name": s.stage_name,
@@ -627,9 +668,37 @@ class SelfManagementPlugin:
                 "manifest_name": report.manifest.name,
                 "manifest_version": report.manifest.version,
             }
-        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+        except (ImportError, AttributeError, OSError, TypeError, ValueError) as exc:
             logger.warning("assess_compatibility failed: %s", exc, exc_info=True)
             return {"ok": False, "error": f"Assessment failed: {exc}"}
+
+    @staticmethod
+    def _compatibility_plan_payload(plan: Any) -> Dict[str, Any] | None:
+        if plan is None:
+            return None
+        return {
+            "source_kind": plan.source_kind.value,
+            "source_root": plan.source_root,
+            "entry_point": plan.entry_point,
+            "runtime": plan.runtime,
+            "bundle_sha256": plan.bundle_sha256,
+            "source_files": list(plan.source_files),
+            "requires_discovery": plan.requires_discovery,
+            "runtime_ready": plan.runtime_ready,
+            "blockers": list(plan.blockers),
+            "limitations": list(plan.limitations),
+            "components": [
+                {
+                    "name": item.name,
+                    "kind": item.kind.value,
+                    "status": item.status.value,
+                    "reason": item.reason,
+                    "entry_point": item.entry_point,
+                    "metadata": dict(item.metadata),
+                }
+                for item in plan.components
+            ],
+        }
 
     # ── State-mutating (requires approval) ─────────────────
 
@@ -638,32 +707,78 @@ class SelfManagementPlugin:
         plugin_id: str = "",
         code: str = "",
         marketplace_name: str = "",
+        source_path: str = "",
         proposal_id: str = "",
         version_label: str = "",
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Install a plugin from validated code or marketplace, then load it. REQUIRES approval.
-
-        Two modes:
-        - code: install directly from a validated code string (from plugin_generate)
-        - marketplace_name: install from the configured marketplace
-
-        Installed code is written into the profile-scoped plugins directory
-        (ProfileLayout.plugins_dir) and loaded dynamically — never into the
-        read-only Python package directory. Before a plugin is made live it is
-        smoke-tested in an isolated subprocess (SandboxHost). Any failure path
-        rolls back cleanly: no half-initialized fiber and no orphaned file.
-        """
+        """Install Python code/marketplace content or a real DSH source bundle."""
         proposal = None
         if proposal_id:
             proposal = self._proposal_store().get(proposal_id)
             if proposal is None:
                 return {"ok": False, "error": f"Plugin proposal '{proposal_id}' not found"}
             plugin_id = plugin_id or proposal.plugin_id
-        if not plugin_id:
-            return {"ok": False, "error": "plugin_id is required unless proposal_id is provided"}
+        source_path = str(source_path or kwargs.get("source_path") or "")
+        modes = sum(bool(value) for value in (code, marketplace_name, source_path))
+        if modes != 1:
+            return {
+                "ok": False,
+                "error": "Provide exactly one of code, marketplace_name, or source_path",
+            }
 
-        approved, denial = await self._check_approval("install", plugin_id, proposal_id=proposal_id)
+        source_metadata: dict[str, Any] = {}
+        if source_path:
+            try:
+                from pathlib import Path
+
+                from leapflow.learning.compatibility import assess_plugin, inspect_plugin_source
+                from leapflow.plugins.dsh import normalize_plugin_id
+                from leapflow.tools.execution_context import require_workspace_access
+
+                scope_error = await require_workspace_access(
+                    Path(source_path).expanduser().resolve(),
+                    operation="plugin_install source",
+                    effect="read",
+                )
+                if scope_error:
+                    return scope_error
+                inspection = inspect_plugin_source(source_path)
+                report = assess_plugin(source_path)
+                plan = report.execution_plan
+                if plan is None or not plan.installable_candidate:
+                    return {
+                        "ok": False,
+                        "error": report.rejection_reason or "; ".join(plan.blockers if plan else ()),
+                        "verdict": report.final_verdict.value,
+                    }
+                plugin_id = normalize_plugin_id(plugin_id or inspection.manifest.name)
+                source_metadata = {
+                    "source_kind": plan.source_kind.value,
+                    "source_path": str(Path(source_path).expanduser().resolve()),
+                    "bundle_sha256": plan.bundle_sha256,
+                    "verdict": report.final_verdict.value,
+                    "permissions": list(plan.permissions),
+                    "limitations": list(plan.limitations),
+                    "components": [
+                        {
+                            "name": item.name,
+                            "kind": item.kind.value,
+                            "status": item.status.value,
+                            "reason": item.reason,
+                        }
+                        for item in plan.components
+                    ],
+                }
+            except (ImportError, OSError, TypeError, ValueError) as exc:
+                return {"ok": False, "error": f"DSH source assessment failed: {exc}"}
+
+        if not plugin_id:
+            return {"ok": False, "error": "plugin_id is required unless source_path or proposal_id is provided"}
+
+        approved, denial = await self._check_approval(
+            "install", plugin_id, proposal_id=proposal_id, metadata=source_metadata,
+        )
         if not approved:
             return {"ok": False, "error": denial, "requires_approval": True}
 
@@ -684,7 +799,14 @@ class SelfManagementPlugin:
             return {"ok": False, "error": "Provide either code or marketplace_name, not both"}
 
         try:
-            if code:
+            if source_path:
+                result = await self._install_from_dsh_source(
+                    plugin_id,
+                    source_path,
+                    version_label=version_label,
+                    expected_bundle_sha256=str(source_metadata.get("bundle_sha256") or ""),
+                )
+            elif code:
                 result = await self._install_from_code(
                     plugin_id, code, proposal=proposal, version_label=version_label
                 )
@@ -692,7 +814,7 @@ class SelfManagementPlugin:
                 # Run compatibility gate for marketplace installs (BLOCKING)
                 result = await self._install_from_marketplace_with_gate(plugin_id, marketplace_name)
             else:
-                return {"ok": False, "error": "Must provide either code or marketplace_name"}
+                return {"ok": False, "error": "Must provide code, marketplace_name, or source_path"}
             if proposal_id:
                 result["proposal_id"] = proposal_id
                 if result.get("ok"):
@@ -823,6 +945,155 @@ class SelfManagementPlugin:
             )
         return result
 
+    def _resolve_dsh_install_dir(self) -> "Path":
+        """Resolve the profile-owned directory for DSH source bundles."""
+        from pathlib import Path
+
+        from leapflow.config import get_settings
+
+        if self._plugin_install_dir:
+            return Path(self._plugin_install_dir) / "dsh"
+        settings = get_settings()
+        profile_layout = getattr(settings, "profile_layout", None)
+        if profile_layout is not None:
+            return profile_layout.dsh_plugins_dir
+        raise RuntimeError("profile_layout is required for DSH plugin storage")
+
+    async def _install_from_dsh_source(
+        self,
+        plugin_id: str,
+        source_path: str,
+        *,
+        version_label: str = "",
+        expected_bundle_sha256: str = "",
+    ) -> Dict[str, Any]:
+        """Install a real DSH bundle through restricted Node discovery."""
+        import os
+        import shutil
+        import uuid
+
+        from leapflow.config import get_settings
+        from leapflow.learning.plugin_generator import PluginValidator
+        from leapflow.plugins.dsh import prepare_dsh_installation
+        from leapflow.plugins.dsh.bundle import promote_staging_bundle
+
+        install_dir = self._resolve_install_dir()
+        dsh_dir = self._resolve_dsh_install_dir()
+        settings = get_settings()
+        prepared = await prepare_dsh_installation(
+            source_path,
+            plugin_id=plugin_id,
+            plugins_dir=install_dir,
+            dsh_plugins_dir=dsh_dir,
+            settings=settings,
+        )
+        if (
+            expected_bundle_sha256
+            and prepared.descriptor.bundle_sha256 != expected_bundle_sha256
+        ):
+            prepared.cleanup()
+            return {
+                "ok": False,
+                "error": "DSH source changed after approval; installation was not attempted",
+                "failure_code": "source_changed_after_approval",
+            }
+        promoted = False
+        committed = False
+        descriptor_path = prepared.final_root / "descriptor.json"
+        try:
+            install_dir.mkdir(parents=True, exist_ok=True)
+            promote_staging_bundle(prepared.staging_root, prepared.final_root)
+            promoted = True
+            descriptor_temp = descriptor_path.with_name(
+                f".{descriptor_path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                descriptor_temp.write_text(prepared.descriptor.to_json(), encoding="utf-8")
+                os.replace(descriptor_temp, descriptor_path)
+            finally:
+                descriptor_temp.unlink(missing_ok=True)
+
+            validator = PluginValidator()
+            validation = await validator.validate(
+                prepared.plugin_id, prepared.wrapper_source
+            )
+            if not validation.ok:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"DSH wrapper failed validation at stage '{validation.stage}': "
+                        f"{validation.error}"
+                    ),
+                }
+
+            temp_wrapper = prepared.wrapper_path.with_name(
+                f".{prepared.wrapper_path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                temp_wrapper.write_text(prepared.wrapper_source, encoding="utf-8")
+                os.replace(temp_wrapper, prepared.wrapper_path)
+            finally:
+                temp_wrapper.unlink(missing_ok=True)
+
+            result = self._register_inprocess(
+                prepared.plugin_id, prepared.plugin_id, prepared.wrapper_path
+            )
+            if not result.get("ok"):
+                return result
+            try:
+                version_info = self._version_store().record_source(
+                    prepared.plugin_id,
+                    prepared.wrapper_path,
+                    version=version_label,
+                    metadata={
+                        "source": "dsh_source",
+                        "bundle_sha256": prepared.descriptor.bundle_sha256,
+                        "source_kind": prepared.descriptor.source_kind,
+                        "descriptor_path": str(descriptor_path),
+                        "verdict": prepared.compatibility.final_verdict.value,
+                        "limitations": list(prepared.descriptor.limitations),
+                        "installed_tools": [
+                            tool.name for tool in prepared.descriptor.tools
+                        ],
+                    },
+                )
+                result["version"] = version_info.get("version", "")
+            except (RuntimeError, OSError, ValueError, AttributeError) as exc:
+                logger.debug("DSH version recording skipped: %s", exc, exc_info=True)
+            result.update(
+                {
+                    "source_kind": prepared.descriptor.source_kind,
+                    "bundle_sha256": prepared.descriptor.bundle_sha256,
+                    "descriptor_path": str(descriptor_path),
+                    "installed_tools": [tool.name for tool in prepared.descriptor.tools],
+                    "verdict": prepared.compatibility.final_verdict.value,
+                    "limitations": list(prepared.descriptor.limitations),
+                    "client_components": list(prepared.descriptor.client_components),
+                }
+            )
+            committed = True
+            return result
+        finally:
+            prepared.cleanup()
+            if promoted and not committed:
+                # Installation is a single transaction from the user's point of
+                # view. A validation/registration failure must leave neither a
+                # wrapper nor a managed bundle (and no partially registered fiber).
+                try:
+                    from leapflow.plugins import get_scoped_registry
+
+                    scoped = get_scoped_registry()
+                    if scoped.get_fiber(prepared.plugin_id) is not None:
+                        scoped.dispose_plugin(prepared.plugin_id, prune_metadata=True)
+                except (ImportError, KeyError, RuntimeError, AttributeError):
+                    logger.debug(
+                        "DSH install rollback found no live fiber for %s",
+                        prepared.plugin_id,
+                        exc_info=True,
+                    )
+                self._safe_unlink(prepared.wrapper_path)
+                shutil.rmtree(prepared.final_root, ignore_errors=True)
+
     async def _install_from_marketplace_with_gate(
         self, plugin_id: str, marketplace_name: str
     ) -> Dict[str, Any]:
@@ -842,32 +1113,87 @@ class SelfManagementPlugin:
                 ),
             }
 
-        # Resolve manifest for compatibility check
+        # Resolve manifest for compatibility check. Installation never proceeds
+        # when the decision-bearing manifest is unavailable: a compatibility
+        # gate that cannot run must not become an open door.
         try:
             manifest_data = client.resolve_manifest(marketplace_name)
-        except (OSError, ValueError, RuntimeError, AttributeError):
-            manifest_data = None
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+            logger.warning(
+                "Marketplace manifest resolution failed for %s: %s",
+                marketplace_name,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": (
+                    f"Compatibility manifest for '{marketplace_name}' could not be resolved; "
+                    "installation was not attempted"
+                ),
+                "failure_code": "compatibility_manifest_unavailable",
+            }
+        if not isinstance(manifest_data, dict):
+            return {
+                "ok": False,
+                "error": (
+                    f"Compatibility manifest for '{marketplace_name}' is missing or invalid; "
+                    "installation was not attempted"
+                ),
+                "failure_code": "compatibility_manifest_unavailable",
+            }
 
         compatibility_notes: list[str] = []
-        if manifest_data and isinstance(manifest_data, dict):
-            try:
-                from leapflow.learning.compatibility import assess_plugin
+        try:
+            from leapflow.learning.compatibility import assess_plugin
 
-                report = assess_plugin(manifest_data)
-                if not report.is_installable():
-                    return {
-                        "ok": False,
-                        "error": (
-                            f"Compatibility gate: plugin '{marketplace_name}' is INCOMPATIBLE "
-                            f"with LeapFlow. Reason: {report.rejection_reason}"
-                        ),
-                        "verdict": report.final_verdict.value,
-                        "rejection_reason": report.rejection_reason,
-                    }
-                if report.adaptation_notes:
-                    compatibility_notes = list(report.adaptation_notes)
-            except (ImportError, AttributeError, TypeError, ValueError):
-                pass  # Degrade gracefully — proceed without gate
+            report = assess_plugin(manifest_data)
+            if report.final_verdict.value == "incompatible":
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Compatibility gate: plugin '{marketplace_name}' is not installable "
+                        f"by the Python marketplace path. Reason: {report.rejection_reason}"
+                    ),
+                    "verdict": report.final_verdict.value,
+                    "rejection_reason": report.rejection_reason,
+                }
+            if report.manifest.source_language.lower() in {"javascript", "typescript"}:
+                return {
+                    "ok": False,
+                    "error": (
+                        "DSH marketplace bundles are not supported in P0; install a local "
+                        "pre-built source bundle with plugin_install(source_path=...)"
+                    ),
+                    "failure_code": "dsh_marketplace_unsupported",
+                }
+            if not report.is_installable():
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Compatibility gate: plugin '{marketplace_name}' is not installable "
+                        f"by the Python marketplace path. Reason: {report.rejection_reason or 'runtime compatibility not proven'}"
+                    ),
+                    "verdict": report.final_verdict.value,
+                    "rejection_reason": report.rejection_reason,
+                }
+            if report.adaptation_notes:
+                compatibility_notes = list(report.adaptation_notes)
+        except (ImportError, AttributeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Compatibility gate failed closed for %s: %s",
+                marketplace_name,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": (
+                    f"Compatibility gate failed for '{marketplace_name}'; "
+                    "installation was not attempted"
+                ),
+                "failure_code": "compatibility_gate_failed",
+            }
 
         result = await self._install_from_marketplace(plugin_id, marketplace_name)
         if compatibility_notes and result.get("ok"):
@@ -1125,6 +1451,7 @@ class SelfManagementPlugin:
             return None, "Installed module has no 'plugin' attribute"
         try:
             setattr(plugin_obj, "__leapflow_plugin_path__", str(path))
+            setattr(plugin_obj, "__leapflow_plugin_module__", module_name)
         except Exception:
             logger.debug(
                 "Cannot attach plugin source path metadata for %s", module_name, exc_info=True
@@ -1260,6 +1587,24 @@ class SelfManagementPlugin:
         self, plugin_id: str, version: str, **kwargs: Any
     ) -> Dict[str, Any]:
         """Rollback a profile plugin to a recorded source snapshot and reload it."""
+        try:
+            from leapflow.plugins.dsh import normalize_plugin_id
+
+            is_dsh = (
+                normalize_plugin_id(plugin_id) == plugin_id
+                and (self._resolve_dsh_install_dir() / plugin_id).is_dir()
+            )
+        except (ImportError, ValueError):
+            is_dsh = False
+        if is_dsh:
+            return {
+                "ok": False,
+                "error": (
+                    "DSH bundle rollback is not supported in P0; reinstall the desired "
+                    "source bundle after removing the current plugin"
+                ),
+                "failure_code": "dsh_rollback_unsupported",
+            }
         approved, denial = await self._check_approval("rollback", plugin_id)
         if not approved:
             return {"ok": False, "error": denial, "requires_approval": True}
@@ -1313,7 +1658,12 @@ class SelfManagementPlugin:
             return {"ok": False, "error": f"Enable failed: {exc}"}
 
     async def _check_approval(
-        self, action: str, plugin_id: str, *, proposal_id: str = ""
+        self,
+        action: str,
+        plugin_id: str,
+        *,
+        proposal_id: str = "",
+        metadata: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         """Consult the plugin approval gate. Returns (approved, denial_message).
 
@@ -1359,6 +1709,7 @@ class SelfManagementPlugin:
                     "risk_level": "high",
                     "category": "self_modification",
                     "proposal_id": proposal_id,
+                    **(metadata or {}),
                 },
             )
             result = await self._plugin_approval_gate.evaluate(descriptor)
@@ -1493,19 +1844,45 @@ class SelfManagementPlugin:
         try:
             import sys
 
-            from leapflow.plugins import get_scoped_registry
+            from leapflow.plugins import get_registry, get_scoped_registry
 
             scoped = get_scoped_registry()
             source_path = scoped.get_plugin_file(plugin_id)
             module_path = scoped.get_plugin_module(plugin_id)
+            plugin = get_registry().get_plugin(plugin_id)
+            dsh_bundle = None
+            try:
+                from leapflow.plugins.dsh import normalize_plugin_id
+
+                if normalize_plugin_id(plugin_id) == plugin_id:
+                    dsh_bundle = self._resolve_dsh_install_dir().resolve() / plugin_id
+            except (ImportError, ValueError):
+                pass
+            descriptor = getattr(plugin, "descriptor", None) if plugin is not None else None
+            if descriptor is not None:
+                raw_root = str(getattr(descriptor, "bundle_root", "") or "")
+                if raw_root:
+                    candidate = Path(raw_root).expanduser().resolve()
+                    managed_root = self._resolve_dsh_install_dir().resolve()
+                    try:
+                        candidate.relative_to(managed_root)
+                    except ValueError:
+                        candidate = None
+                    if candidate is not None:
+                        dsh_bundle = candidate
             fiber = scoped.dispose_plugin(plugin_id, prune_metadata=True)
             if module_path:
                 sys.modules.pop(module_path, None)
             source_deleted = False
             if delete_source:
+                import shutil
+
                 target = source_path or (self._resolve_install_dir() / f"{plugin_id}.py")
                 if target.exists():
                     target.unlink()
+                    source_deleted = True
+                if dsh_bundle is not None and dsh_bundle.is_dir():
+                    shutil.rmtree(dsh_bundle)
                     source_deleted = True
             return {
                 "ok": True,
@@ -1652,20 +2029,24 @@ class SelfManagementPlugin:
             ToolMetadata(
                 name="assess_compatibility",
                 description=(
-                    "Assess whether a foreign plugin manifest is compatible with "
-                    "LeapFlow's plugin architecture. Returns a structured compatibility "
-                    "report with verdict (COMPATIBLE/ADAPTABLE/PARTIAL/INCOMPATIBLE), "
-                    "target protocol mapping, and adaptation notes."
+                    "Assess whether a foreign plugin manifest or real DSH source bundle "
+                    "is compatible with LeapFlow. A source bundle assessment is static: "
+                    "runtime_ready stays false until restricted Node discovery during "
+                    "plugin_install. Returns component-level verdicts and limitations."
                 ),
                 parameters_schema={
                     "type": "object",
                     "properties": {
                         "manifest": {
                             "type": "object",
-                            "description": "The plugin manifest to assess (LeapFlow or DSH format).",
+                            "description": "Plugin manifest to assess (LeapFlow or package.json-like DSH format). Mutually exclusive with source_path.",
+                        },
+                        "source_path": {
+                            "type": "string",
+                            "description": "Path to a DSH package directory or dynamic Cordis export (meta.json + host.js). Mutually exclusive with manifest.",
                         },
                     },
-                    "required": ["manifest"],
+                    "required": [],
                 },
                 handler=self._assess_compatibility_handler,
                 x_leapflow={
@@ -1723,13 +2104,12 @@ class SelfManagementPlugin:
             ToolMetadata(
                 name="plugin_install",
                 description=(
-                    "Install a plugin either from validated code (produced by "
-                    "plugin_generate) or from the configured marketplace, then "
-                    "load it into the live registry. Writes to the profile-scoped "
-                    "plugins directory (never the read-only package dir), "
-                    "re-validates code, and runs an isolated sandbox smoke test "
-                    "before the plugin is made live. REQUIRES APPROVAL — this "
-                    "mutates the filesystem and the process-global plugin registry."
+                    "Install a plugin from exactly one source: validated Python code, "
+                    "the configured Python marketplace, or a real DSH source bundle. "
+                    "DSH bundles run restricted Node discovery before registration; "
+                    "only public host tools are installed and client UI limitations are "
+                    "reported. Writes profile-scoped state and mutates the process-global "
+                    "registry. REQUIRES APPROVAL."
                 ),
                 parameters_schema={
                     "type": "object",
@@ -1744,7 +2124,11 @@ class SelfManagementPlugin:
                         },
                         "marketplace_name": {
                             "type": "string",
-                            "description": "Marketplace entry name to install from. Mutually exclusive with code.",
+                            "description": "Python marketplace entry name. Mutually exclusive with code and source_path.",
+                        },
+                        "source_path": {
+                            "type": "string",
+                            "description": "Local DSH package or dynamic Cordis export directory. Mutually exclusive with code and marketplace_name.",
                         },
                         "proposal_id": {
                             "type": "string",
@@ -1765,7 +2149,7 @@ class SelfManagementPlugin:
                     "requires_approval": True,
                     "effect_scope": "persistent",
                     "idempotency_scope": "session",
-                    "summary": "install a plugin from validated code or marketplace (approval required)",
+                    "summary": "install a Python or restricted DSH plugin (approval required)",
                 },
                 mutates_state=True,
                 provides_capabilities=("plugin.install",),

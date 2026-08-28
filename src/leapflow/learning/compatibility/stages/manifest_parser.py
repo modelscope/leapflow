@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, List
 
-from leapflow.learning.compatibility.protocol import PluginManifestInput, StageResult, Verdict
+from leapflow.learning.compatibility.protocol import PluginManifestInput, StageResult
 
 
 class ManifestParser:
@@ -116,7 +116,7 @@ class ManifestParser:
             )
 
         # Extract category from keywords, dsh metadata section, or leapflow section
-        category = _extract_dsh_category(raw)
+        category = extract_dsh_category(raw)
 
         # Extract dependencies
         deps_raw = raw.get("dependencies", {})
@@ -231,19 +231,20 @@ class ManifestParser:
         )
 
 
-def _extract_dsh_category(raw: dict[str, Any]) -> str:
-    """Extract category from DSH manifest using multiple heuristics.
+def extract_dsh_category(raw: dict[str, Any]) -> str:
+    """Extract a category from explicit metadata or a package-name taxonomy match.
 
-    Priority:
-    1. Explicit category in dsh/leapflow metadata section
-    2. First relevant keyword from keywords array
-    3. Inferred from package name prefix (dsh-<category>-*)
-    4. Fallback to empty string
+    Multi-segment architecture categories such as ``agent-loop`` must stay intact:
+    reducing ``dsh-agent-loop`` to ``agent`` bypasses the explicit non-pluggable
+    boundary. Known taxonomy keys therefore win before the legacy first-segment
+    fallback used for uncatalogued packages.
     """
     # 1. Explicit metadata
     metadata = raw.get("dsh", raw.get("leapflow", {}))
     if isinstance(metadata, dict) and metadata.get("category"):
-        return metadata["category"]
+        return str(metadata["category"])
+    if raw.get("category"):
+        return str(raw["category"])
 
     # 2. Keywords
     keywords = raw.get("keywords", [])
@@ -254,16 +255,28 @@ def _extract_dsh_category(raw: dict[str, Any]) -> str:
                 return kw
         return ""
 
-    # 3. Package name heuristic
+    # 3. Package name heuristic. Match the longest known category first so
+    # architecture boundaries such as agent-loop are not weakened to "agent".
     name = raw.get("name", "")
     if isinstance(name, str):
-        # Strip org prefix like @deepseek-ai/
         if "/" in name:
             name = name.split("/", 1)[1]
-        # Strip dsh- prefix and take first segment
-        if name.startswith("dsh-"):
-            parts = name[4:].split("-", 1)
-            if parts:
+        had_dsh_prefix = name.startswith("dsh-")
+        if had_dsh_prefix:
+            name = name[4:]
+        from leapflow.learning.compatibility.taxonomy import PLUGGABILITY_TAXONOMY
+
+        for category in sorted(PLUGGABILITY_TAXONOMY, key=len, reverse=True):
+            if (
+                name == category
+                or name.startswith(f"{category}-")
+                or name.endswith(f"-{category}")
+                or f"-{category}-" in f"-{name}-"
+            ):
+                return category
+        if had_dsh_prefix:
+            parts = name.split("-", 1)
+            if parts and parts[0]:
                 return parts[0]
 
     return ""

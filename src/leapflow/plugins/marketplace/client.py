@@ -82,6 +82,13 @@ class MarketplaceClient:
         """List all available plugins from the source."""
         return self._source.list_manifests()
 
+    def resolve_manifest(self, name: str) -> Dict[str, Any] | None:
+        """Return one manifest as a plain mapping for compatibility assessment."""
+        from dataclasses import asdict
+
+        manifest = next((item for item in self._source.list_manifests() if item.name == name), None)
+        return asdict(manifest) if manifest is not None else None
+
     def install(
         self,
         name: str,

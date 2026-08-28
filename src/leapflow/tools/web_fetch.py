@@ -377,10 +377,14 @@ async def _approve_fetch(target: NetworkTarget) -> str:
     )
 
 
-def _decode_text(body: bytes, content_type: str) -> str:
-    """Decode a body to text using the declared charset when present."""
+def _decode_text(
+    body: bytes, content_type: str, *, preferred_encoding: str = ""
+) -> str:
+    """Decode a body using an approved override, then the declared charset."""
+    encodings = [preferred_encoding] if preferred_encoding else []
     match = re.search(r"charset=([\w\-]+)", content_type or "", re.IGNORECASE)
-    encodings = [match.group(1)] if match else []
+    if match and match.group(1).lower() not in {item.lower() for item in encodings}:
+        encodings.append(match.group(1))
     encodings += ["utf-8", "latin-1"]
     for encoding in encodings:
         try:
@@ -537,6 +541,14 @@ async def web_fetch(params: Dict[str, Any]) -> Dict[str, Any]:
         max_bytes = min(int(params.get("max_bytes") or settings.web_max_bytes), _MAX_BYTES_CEILING)
     except (TypeError, ValueError):
         max_bytes = int(settings.web_max_bytes)
+    encoding = str(params.get("encoding") or "").strip().lower()
+    if encoding not in {"", "gb18030"}:
+        return {
+            "ok": False,
+            "error": "web_fetch encoding override must be 'gb18030'",
+            "error_type": "invalid_encoding",
+            "retryable": False,
+        }
     max_redirects = max(0, int(getattr(settings, "web_max_redirects", 5)))
 
     # Redirects are followed here rather than inside a transport so that every hop
@@ -670,12 +682,19 @@ def _build_result(
     kind = kind_for_content_type(outcome.content_type)
     result["kind"] = kind
 
+    preferred_encoding = str(params.get("encoding") or "")
     if not result["ok"]:
         # An HTTP error is the answer, not a crash: name the status and let the
         # model decide, with a body excerpt because error pages explain why.
         excerpt = ""
         if kind != KIND_BINARY:
-            excerpt = _redact(_decode_text(outcome.body, outcome.content_type))[:600]
+            excerpt = _redact(
+                _decode_text(
+                    outcome.body,
+                    outcome.content_type,
+                    preferred_encoding=preferred_encoding,
+                )
+            )[:600]
         result["error"] = f"HTTP {outcome.status} from {target.origin}"
         result["error_type"] = "http_error"
         result["retryable"] = outcome.status in _RETRY_STATUSES
@@ -700,6 +719,15 @@ def _build_result(
             settings=settings,
         )
 
+    body_text = _decode_text(
+        outcome.body,
+        outcome.content_type,
+        preferred_encoding=preferred_encoding,
+    )
+    if str(params.get("extract") or "").lower() == "raw_text":
+        result["text"] = _redact(body_text)
+        return result
+
     if kind == KIND_BINARY:
         # Binary never enters the transcript. When it was cached, hand back the
         # path so file-oriented tools can take over instead of a dead end.
@@ -718,8 +746,6 @@ def _build_result(
                 "endpoint, or ask the user how this file should be handled."
             )
         return result
-
-    body_text = _decode_text(outcome.body, outcome.content_type)
 
     if kind == KIND_JSON:
         data, error = decode_json(body_text)

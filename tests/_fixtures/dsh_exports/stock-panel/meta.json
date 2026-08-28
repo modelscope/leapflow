@@ -1,0 +1,8 @@
+{
+  "name": "Fixture Stock Panel",
+  "purpose": "Hermetic Cordis export fixture with one public tool and one UI slot.",
+  "plugin": {
+    "kind": "new",
+    "idPrefix": "stock"
+  }
+}

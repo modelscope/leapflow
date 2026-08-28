@@ -184,6 +184,11 @@ _FIELD_DESCRIPTIONS = {
     "signal.noise_path_fragments": "Path fragments treated as monitor/display noise for fs.change events, e.g. OS caches and tool state directories.",
     "signal.noise_dir_names": "Directory names treated as monitor/display noise for fs.change events.",
     "signal.noise_suffixes": "Filename suffixes treated as transient fs.change noise, e.g. WAL/SHM/journal/temp/log files.",
+    "plugins.dsh_invoke_timeout_s": "Maximum seconds for one restricted DSH tool invocation; requires daemon restart.",
+    "plugins.dsh_discovery_timeout_s": "Maximum seconds for restricted DSH runtime discovery; requires daemon restart.",
+    "plugins.dsh_max_message_bytes": "Maximum bytes in one DSH worker NDJSON protocol message; requires daemon restart.",
+    "plugins.dsh_max_stderr_bytes": "Bounded diagnostic stderr tail retained from one DSH worker; requires daemon restart.",
+    "plugins.dsh_max_memory_mb": "V8 old-space ceiling in megabytes for each DSH worker process; requires daemon restart.",
 }
 
 _SECTION_CATEGORIES = {
@@ -197,6 +202,7 @@ _SECTION_CATEGORIES = {
     "attention": "Perception",
     "recording": "Recording",
     "video": "Recording",
+    "plugins": "Plugins",
     "learnability": "Learning",
     "learn": "Learning",
     "skill": "Skills",
@@ -241,7 +247,7 @@ _VALUE_HINTS = {
 }
 
 _PARTIAL_RELOAD_SECTIONS = frozenset({"runtime", "mock", "gateway", "hub", "scheduler", "observer", "cua", "use", "dashboard"})
-_RESTART_REQUIRED_SECTIONS = frozenset({"daemon"})
+_RESTART_REQUIRED_SECTIONS = frozenset({"daemon", "plugins"})
 
 _PROFILE_FILE_BY_SECTION = {
     "llm": "llm.yaml",

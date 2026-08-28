@@ -1,0 +1,830 @@
+{
+  "experiment": "native_dsh_plugin_compatibility",
+  "generated_at": "20260827-173327",
+  "ok": true,
+  "passed": 10,
+  "total": 10,
+  "isolated_profile_root": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/profile",
+  "environment": {
+    "node_path": "/opt/homebrew/bin/node",
+    "node_version": "v25.2.1",
+    "harness_root": "/Users/jason/work/github/deepseek-harness",
+    "harness_git_head": "2df279bfd21e1985ebfa85c3afd21790d918c2ab",
+    "user_config_probe": {
+      "data_root": "/Users/jason/.leapflow",
+      "read_only": true,
+      "llm_requests": 0,
+      "loaded": true,
+      "profile": "default",
+      "model": "qwen3.7-plus",
+      "base_url_configured": true,
+      "credential_reference_present": true,
+      "config_files": [
+        "/Users/jason/.leapflow/config/user.yaml",
+        "/Users/jason/.leapflow/profiles/default/config/llm.yaml"
+      ],
+      "parse_errors": [],
+      "cache_root": "/Users/jason/.leapflow/profiles/default/cache",
+      "cache_available": true,
+      "cache_top_level_entries": 4,
+      "reuse_policy": "read-only YAML/existence probe; secret references are not resolved or copied"
+    }
+  },
+  "cases": [
+    {
+      "case_id": "native_dynamic_reverse",
+      "title": "Real dynamic host tool copied from the DSH runner conformance suite.",
+      "source": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/sources/native_dynamic_reverse",
+      "source_reference": "packages/extensions/cordis-host-runner/tests/helpers.ts#REVERSE_TOOL_CODE",
+      "expected_verdict": "adaptable",
+      "expected_error": "",
+      "lifecycle": "install",
+      "expected_tool": "reverse_text",
+      "expected_value": "wolfpael",
+      "source_sha256": "39ea7a2973a4c2d2105db2deb2dd430fcb3d7c6fbef1db797a0b8e5ef0532789",
+      "static": {
+        "source_kind": "cordis_dynamic_export",
+        "verdict": "adaptable",
+        "installable": false,
+        "installable_candidate": true,
+        "category": "tools",
+        "dependencies": [],
+        "permissions": [],
+        "blockers": [],
+        "limitations": [],
+        "components": [
+          {
+            "kind": "host",
+            "status": "candidate",
+            "reason": "Dynamic Cordis host requires restricted runtime discovery"
+          }
+        ],
+        "rejection_reason": ""
+      },
+      "lifecycle_evidence": {
+        "install": {
+          "ok": true,
+          "action": "install",
+          "plugin_id": "native_dynamic_reverse",
+          "installed_tools": [
+            "reverse_text"
+          ],
+          "state": "active",
+          "version": "native-exp-v1",
+          "source_kind": "cordis_dynamic_export",
+          "bundle_sha256": "39ea7a2973a4c2d2105db2deb2dd430fcb3d7c6fbef1db797a0b8e5ef0532789",
+          "descriptor_path": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/profile/plugins/dsh/native_dynamic_reverse/descriptor.json",
+          "verdict": "adaptable",
+          "limitations": [],
+          "client_components": []
+        },
+        "invoke": {
+          "ok": true,
+          "result": "wolfpael"
+        },
+        "status": {
+          "ok": true,
+          "plugin_id": "native_dynamic_reverse",
+          "category": "bridge",
+          "dependencies": [],
+          "tools": [
+            {
+              "name": "reverse_text",
+              "description": "Reverse a string."
+            }
+          ],
+          "fiber": {
+            "state": "active",
+            "generation": 1
+          },
+          "dsh": {
+            "source_kind": "cordis_dynamic_export",
+            "bundle_sha256": "39ea7a2973a4c2d2105db2deb2dd430fcb3d7c6fbef1db797a0b8e5ef0532789",
+            "entry_point": "host.runtime.cjs",
+            "verdict": "adaptable",
+            "limitations": [],
+            "client_components": [],
+            "runtime": "node"
+          }
+        },
+        "restart_invoke": {
+          "ok": true,
+          "result": "wolfpael"
+        },
+        "reload": {
+          "ok": true,
+          "action": "reload",
+          "plugin_id": "native_dynamic_reverse",
+          "new_generation": 2,
+          "state": "active",
+          "version": ""
+        },
+        "remove": {
+          "ok": true,
+          "action": "remove",
+          "plugin_id": "native_dynamic_reverse",
+          "state": "disposed",
+          "source_path": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/profile/plugins/native_dynamic_reverse.py",
+          "source_deleted": true
+        },
+        "cleanup": {
+          "wrapper_absent": true,
+          "bundle_absent": true,
+          "registry_absent": true
+        }
+      },
+      "approval_requests": 3,
+      "approval_evidence": [
+        {
+          "kind": "platform.action",
+          "effect": "write",
+          "resource": "plugin_management:install",
+          "bundle_sha256": "39ea7a2973a4c2d2105db2deb2dd430fcb3d7c6fbef1db797a0b8e5ef0532789",
+          "verdict": "adaptable"
+        },
+        {
+          "kind": "platform.action",
+          "effect": "write",
+          "resource": "plugin_management:reload",
+          "bundle_sha256": "",
+          "verdict": ""
+        },
+        {
+          "kind": "platform.action",
+          "effect": "write",
+          "resource": "plugin_management:remove",
+          "bundle_sha256": "",
+          "verdict": ""
+        }
+      ],
+      "elapsed_ms": 311.805,
+      "ok": true,
+      "failures": []
+    },
+    {
+      "case_id": "native_dynamic_reverse_partial",
+      "title": "Real dynamic host tool with a skipped browser half.",
+      "source": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/sources/native_dynamic_reverse_partial",
+      "source_reference": "packages/extensions/cordis-host-runner/tests/helpers.ts#REVERSE_TOOL_CODE",
+      "expected_verdict": "partial",
+      "expected_error": "",
+      "lifecycle": "install",
+      "expected_tool": "reverse_text",
+      "expected_value": "wolfpael",
+      "source_sha256": "89db83d73e1f6afdb97a721684ec9c427fcd9a04c0ee5f6919af527fa2cd906a",
+      "static": {
+        "source_kind": "cordis_dynamic_export",
+        "verdict": "partial",
+        "installable": false,
+        "installable_candidate": true,
+        "category": "tools",
+        "dependencies": [],
+        "permissions": [],
+        "blockers": [],
+        "limitations": [
+          "client.js UI was detected and will be skipped; only safe host tools can be installed"
+        ],
+        "components": [
+          {
+            "kind": "host",
+            "status": "candidate",
+            "reason": "Dynamic Cordis host requires restricted runtime discovery"
+          },
+          {
+            "kind": "client",
+            "status": "unsupported",
+            "reason": "Cordis React/slots client UI is not executable in LeapFlow P0"
+          }
+        ],
+        "rejection_reason": ""
+      },
+      "lifecycle_evidence": {
+        "install": {
+          "ok": true,
+          "action": "install",
+          "plugin_id": "native_dynamic_reverse_partial",
+          "installed_tools": [
+            "reverse_text"
+          ],
+          "state": "active",
+          "version": "native-exp-v1",
+          "source_kind": "cordis_dynamic_export",
+          "bundle_sha256": "89db83d73e1f6afdb97a721684ec9c427fcd9a04c0ee5f6919af527fa2cd906a",
+          "descriptor_path": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/profile/plugins/dsh/native_dynamic_reverse_partial/descriptor.json",
+          "verdict": "partial",
+          "limitations": [
+            "client.js UI was detected and will be skipped; only safe host tools can be installed"
+          ],
+          "client_components": [
+            {
+              "name": "client",
+              "status": "unsupported",
+              "reason": "Cordis React/slots client UI is not executable in LeapFlow P0",
+              "slots": []
+            }
+          ]
+        },
+        "invoke": {
+          "ok": true,
+          "result": "wolfpael"
+        },
+        "status": {
+          "ok": true,
+          "plugin_id": "native_dynamic_reverse_partial",
+          "category": "bridge",
+          "dependencies": [],
+          "tools": [
+            {
+              "name": "reverse_text",
+              "description": "Reverse a string."
+            }
+          ],
+          "fiber": {
+            "state": "active",
+            "generation": 3
+          },
+          "dsh": {
+            "source_kind": "cordis_dynamic_export",
+            "bundle_sha256": "89db83d73e1f6afdb97a721684ec9c427fcd9a04c0ee5f6919af527fa2cd906a",
+            "entry_point": "host.runtime.cjs",
+            "verdict": "partial",
+            "limitations": [
+              "client.js UI was detected and will be skipped; only safe host tools can be installed"
+            ],
+            "client_components": [
+              {
+                "name": "client",
+                "status": "unsupported",
+                "reason": "Cordis React/slots client UI is not executable in LeapFlow P0",
+                "slots": []
+              }
+            ],
+            "runtime": "node"
+          }
+        },
+        "restart_invoke": {
+          "ok": true,
+          "result": "wolfpael"
+        },
+        "reload": {
+          "ok": true,
+          "action": "reload",
+          "plugin_id": "native_dynamic_reverse_partial",
+          "new_generation": 4,
+          "state": "active",
+          "version": ""
+        },
+        "remove": {
+          "ok": true,
+          "action": "remove",
+          "plugin_id": "native_dynamic_reverse_partial",
+          "state": "disposed",
+          "source_path": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/profile/plugins/native_dynamic_reverse_partial.py",
+          "source_deleted": true
+        },
+        "cleanup": {
+          "wrapper_absent": true,
+          "bundle_absent": true,
+          "registry_absent": true
+        }
+      },
+      "approval_requests": 3,
+      "approval_evidence": [
+        {
+          "kind": "platform.action",
+          "effect": "write",
+          "resource": "plugin_management:install",
+          "bundle_sha256": "89db83d73e1f6afdb97a721684ec9c427fcd9a04c0ee5f6919af527fa2cd906a",
+          "verdict": "partial"
+        },
+        {
+          "kind": "platform.action",
+          "effect": "write",
+          "resource": "plugin_management:reload",
+          "bundle_sha256": "",
+          "verdict": ""
+        },
+        {
+          "kind": "platform.action",
+          "effect": "write",
+          "resource": "plugin_management:remove",
+          "bundle_sha256": "",
+          "verdict": ""
+        }
+      ],
+      "elapsed_ms": 299.581,
+      "ok": true,
+      "failures": []
+    },
+    {
+      "case_id": "adapted_prebuilt_reverse",
+      "title": "Real dynamic fixture adapted into a self-contained pre-built DSH package.",
+      "source": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/sources/adapted_prebuilt_reverse",
+      "source_reference": "packages/extensions/cordis-host-runner/tests/helpers.ts#REVERSE_TOOL_CODE",
+      "expected_verdict": "adaptable",
+      "expected_error": "",
+      "lifecycle": "install",
+      "expected_tool": "reverse_text",
+      "expected_value": "wolfpael",
+      "source_sha256": "3fa4be60a2bf1393f2fe365975f2bd8029c21e025fa5fbcb7bc701682520fe32",
+      "static": {
+        "source_kind": "dsh_package",
+        "verdict": "adaptable",
+        "installable": false,
+        "installable_candidate": true,
+        "category": "tools",
+        "dependencies": [],
+        "permissions": [],
+        "blockers": [],
+        "limitations": [],
+        "components": [
+          {
+            "kind": "host",
+            "status": "candidate",
+            "reason": "Pre-built JavaScript entry requires restricted Node runtime discovery"
+          }
+        ],
+        "rejection_reason": ""
+      },
+      "lifecycle_evidence": {
+        "install": {
+          "ok": true,
+          "action": "install",
+          "plugin_id": "adapted_prebuilt_reverse",
+          "installed_tools": [
+            "reverse_text"
+          ],
+          "state": "active",
+          "version": "native-exp-v1",
+          "source_kind": "dsh_package",
+          "bundle_sha256": "3fa4be60a2bf1393f2fe365975f2bd8029c21e025fa5fbcb7bc701682520fe32",
+          "descriptor_path": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/profile/plugins/dsh/adapted_prebuilt_reverse/descriptor.json",
+          "verdict": "adaptable",
+          "limitations": [],
+          "client_components": []
+        },
+        "invoke": {
+          "ok": true,
+          "result": "wolfpael"
+        },
+        "status": {
+          "ok": true,
+          "plugin_id": "adapted_prebuilt_reverse",
+          "category": "bridge",
+          "dependencies": [],
+          "tools": [
+            {
+              "name": "reverse_text",
+              "description": "Reverse a string."
+            }
+          ],
+          "fiber": {
+            "state": "active",
+            "generation": 5
+          },
+          "dsh": {
+            "source_kind": "dsh_package",
+            "bundle_sha256": "3fa4be60a2bf1393f2fe365975f2bd8029c21e025fa5fbcb7bc701682520fe32",
+            "entry_point": "index.cjs",
+            "verdict": "adaptable",
+            "limitations": [],
+            "client_components": [],
+            "runtime": "node"
+          }
+        },
+        "restart_invoke": {
+          "ok": true,
+          "result": "wolfpael"
+        },
+        "reload": {
+          "ok": true,
+          "action": "reload",
+          "plugin_id": "adapted_prebuilt_reverse",
+          "new_generation": 6,
+          "state": "active",
+          "version": ""
+        },
+        "remove": {
+          "ok": true,
+          "action": "remove",
+          "plugin_id": "adapted_prebuilt_reverse",
+          "state": "disposed",
+          "source_path": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/profile/plugins/adapted_prebuilt_reverse.py",
+          "source_deleted": true
+        },
+        "cleanup": {
+          "wrapper_absent": true,
+          "bundle_absent": true,
+          "registry_absent": true
+        }
+      },
+      "approval_requests": 3,
+      "approval_evidence": [
+        {
+          "kind": "platform.action",
+          "effect": "write",
+          "resource": "plugin_management:install",
+          "bundle_sha256": "3fa4be60a2bf1393f2fe365975f2bd8029c21e025fa5fbcb7bc701682520fe32",
+          "verdict": "adaptable"
+        },
+        {
+          "kind": "platform.action",
+          "effect": "write",
+          "resource": "plugin_management:reload",
+          "bundle_sha256": "",
+          "verdict": ""
+        },
+        {
+          "kind": "platform.action",
+          "effect": "write",
+          "resource": "plugin_management:remove",
+          "bundle_sha256": "",
+          "verdict": ""
+        }
+      ],
+      "elapsed_ms": 291.955,
+      "ok": true,
+      "failures": []
+    },
+    {
+      "case_id": "native-agent-loop",
+      "title": "Native agent-loop package must not replace LeapFlow's OODA loop.",
+      "source": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/sources/native-agent-loop",
+      "source_reference": "packages/core/agent-loop",
+      "expected_verdict": "incompatible",
+      "expected_error": "single hardened OODA execution loop",
+      "lifecycle": "reject",
+      "expected_tool": "",
+      "expected_value": null,
+      "source_sha256": "5ab52a2087cea5bd11747206e5c401a0138c14b92f2d45a9326a12e6ac2e5550",
+      "static": {
+        "source_kind": "dsh_package",
+        "verdict": "incompatible",
+        "installable": false,
+        "installable_candidate": false,
+        "category": "agent-loop",
+        "dependencies": [
+          "@deepseek-ai/cordis",
+          "@deepseek-ai/dsh-agent",
+          "@deepseek-ai/dsh-invariants",
+          "@deepseek-ai/dsh-llm",
+          "@deepseek-ai/dsh-scope",
+          "@deepseek-ai/dsh-session",
+          "@deepseek-ai/dsh-session-persistence",
+          "@deepseek-ai/dsh-settings",
+          "@deepseek-ai/dsh-system-prompt",
+          "@deepseek-ai/dsh-tools",
+          "@deepseek-ai/schemastery"
+        ],
+        "permissions": [
+          "unknown.service.agents",
+          "unknown.service.llm",
+          "unknown.service.sessionPersistence",
+          "unknown.service.sessions",
+          "unknown.service.systemPrompt"
+        ],
+        "blockers": [
+          "P0 does not install npm dependencies; provide a self-contained pre-built bundle",
+          "P0 does not expose required DSH host service: agents",
+          "P0 does not expose required DSH host service: llm",
+          "P0 does not expose required DSH host service: sessionPersistence",
+          "P0 does not expose required DSH host service: sessions",
+          "P0 does not expose required DSH host service: systemPrompt"
+        ],
+        "limitations": [],
+        "components": [
+          {
+            "kind": "host",
+            "status": "candidate",
+            "reason": "Pre-built JavaScript entry requires restricted Node runtime discovery"
+          }
+        ],
+        "rejection_reason": "LeapFlow engine is a single hardened OODA execution loop with PCD; replacing it breaks session safety, recovery, and context invariants"
+      },
+      "lifecycle_evidence": {
+        "install": {
+          "ok": false,
+          "error": "LeapFlow engine is a single hardened OODA execution loop with PCD; replacing it breaks session safety, recovery, and context invariants",
+          "verdict": "incompatible"
+        }
+      },
+      "approval_requests": 0,
+      "approval_evidence": [],
+      "elapsed_ms": 4.953,
+      "ok": true,
+      "failures": []
+    },
+    {
+      "case_id": "native-tool-fs",
+      "title": "Tool domain is relevant, but the real package needs npm and Cordis services.",
+      "source": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/sources/native-tool-fs",
+      "source_reference": "packages/fs/tool-fs",
+      "expected_verdict": "incompatible",
+      "expected_error": "npm install/build",
+      "lifecycle": "reject",
+      "expected_tool": "",
+      "expected_value": null,
+      "source_sha256": "a29a724f630f50d218fc216e12e3e43ed1bc17866feb33ac83f23e2976a2f2da",
+      "static": {
+        "source_kind": "dsh_package",
+        "verdict": "incompatible",
+        "installable": false,
+        "installable_candidate": false,
+        "category": "fs",
+        "dependencies": [
+          "@deepseek-ai/cordis",
+          "@deepseek-ai/dsh-attachment",
+          "@deepseek-ai/dsh-fs",
+          "@deepseek-ai/dsh-invariants",
+          "@deepseek-ai/dsh-llm",
+          "@deepseek-ai/dsh-sandbox",
+          "@deepseek-ai/dsh-sandbox-policy",
+          "@deepseek-ai/dsh-session",
+          "@deepseek-ai/dsh-system-prompt",
+          "@deepseek-ai/dsh-tools",
+          "@deepseek-ai/dsh-user-approval",
+          "@deepseek-ai/schemastery",
+          "diff"
+        ],
+        "permissions": [
+          "unknown.service.approval",
+          "unknown.service.attachments",
+          "unknown.service.fs",
+          "unknown.service.llm",
+          "unknown.service.sandboxPolicy",
+          "unknown.service.systemPrompt"
+        ],
+        "blockers": [
+          "P0 does not install npm dependencies; provide a self-contained pre-built bundle",
+          "P0 does not expose required DSH host service: approval",
+          "P0 does not expose required DSH host service: attachments",
+          "P0 does not expose required DSH host service: fs",
+          "P0 does not expose required DSH host service: llm",
+          "P0 does not expose required DSH host service: sandboxPolicy",
+          "P0 does not expose required DSH host service: systemPrompt"
+        ],
+        "limitations": [],
+        "components": [
+          {
+            "kind": "host",
+            "status": "candidate",
+            "reason": "Pre-built JavaScript entry requires restricted Node runtime discovery"
+          }
+        ],
+        "rejection_reason": "Blocking or unavailable dependencies cannot be satisfied in P0: ['@deepseek-ai/cordis', '@deepseek-ai/dsh-attachment', '@deepseek-ai/dsh-fs', '@deepseek-ai/dsh-invariants', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-sandbox', '@deepseek-ai/dsh-sandbox-policy', '@deepseek-ai/dsh-session', '@deepseek-ai/dsh-system-prompt', '@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-user-approval', '@deepseek-ai/schemastery', 'diff']. DSH packages must be self-contained pre-built bundles; npm install/build and architecture-bound DSH services are not available."
+      },
+      "lifecycle_evidence": {
+        "install": {
+          "ok": false,
+          "error": "Blocking or unavailable dependencies cannot be satisfied in P0: ['@deepseek-ai/cordis', '@deepseek-ai/dsh-attachment', '@deepseek-ai/dsh-fs', '@deepseek-ai/dsh-invariants', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-sandbox', '@deepseek-ai/dsh-sandbox-policy', '@deepseek-ai/dsh-session', '@deepseek-ai/dsh-system-prompt', '@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-user-approval', '@deepseek-ai/schemastery', 'diff']. DSH packages must be self-contained pre-built bundles; npm install/build and architecture-bound DSH services are not available.",
+          "verdict": "incompatible"
+        }
+      },
+      "approval_requests": 0,
+      "approval_evidence": [],
+      "elapsed_ms": 4.806,
+      "ok": true,
+      "failures": []
+    },
+    {
+      "case_id": "native_cross_plugin_service_consumer",
+      "title": "Real DSH composition fixture requiring a greeter service absent in LeapFlow P0.",
+      "source": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/sources/native_cross_plugin_service_consumer",
+      "source_reference": "packages/extensions/cordis-host-runner/tests/helpers.ts#CONSUMER_CODE",
+      "expected_verdict": "incompatible",
+      "expected_error": "required DSH host service: greeter",
+      "lifecycle": "reject",
+      "expected_tool": "",
+      "expected_value": null,
+      "source_sha256": "482b224060958a198ee8b9775c5342e24ff3c4e7a0d842393613d8ce28e98591",
+      "static": {
+        "source_kind": "cordis_dynamic_export",
+        "verdict": "incompatible",
+        "installable": false,
+        "installable_candidate": false,
+        "category": "tools",
+        "dependencies": [],
+        "permissions": [
+          "unknown.service.greeter"
+        ],
+        "blockers": [
+          "P0 does not expose required DSH host service: greeter"
+        ],
+        "limitations": [],
+        "components": [
+          {
+            "kind": "host",
+            "status": "candidate",
+            "reason": "Dynamic Cordis host requires restricted runtime discovery"
+          }
+        ],
+        "rejection_reason": "P0 does not expose required DSH host service: greeter"
+      },
+      "lifecycle_evidence": {
+        "install": {
+          "ok": false,
+          "error": "P0 does not expose required DSH host service: greeter",
+          "verdict": "incompatible"
+        }
+      },
+      "approval_requests": 0,
+      "approval_evidence": [],
+      "elapsed_ms": 2.702,
+      "ok": true,
+      "failures": []
+    },
+    {
+      "case_id": "native_ui_only",
+      "title": "Real DSH browser-half fixture with no model-visible host tool.",
+      "source": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/sources/native_ui_only",
+      "source_reference": "packages/extensions/cordis-host-runner/tests/helpers.ts#CLIENT_CODE",
+      "expected_verdict": "incompatible",
+      "expected_error": "no statically visible registerTool",
+      "lifecycle": "reject",
+      "expected_tool": "",
+      "expected_value": null,
+      "source_sha256": "45a744f8c13072060d11040eaab2b2c5d3c10e6cfd6ec322e7e17e676e4bb03a",
+      "static": {
+        "source_kind": "cordis_dynamic_export",
+        "verdict": "incompatible",
+        "installable": false,
+        "installable_candidate": false,
+        "category": "tools",
+        "dependencies": [],
+        "permissions": [],
+        "blockers": [
+          "Dynamic export contains no statically visible registerTool call; P0 does not publish private handler channels as LeapFlow tools"
+        ],
+        "limitations": [
+          "client.js UI was detected and will be skipped; only safe host tools can be installed"
+        ],
+        "components": [
+          {
+            "kind": "host",
+            "status": "candidate",
+            "reason": "Dynamic Cordis host requires restricted runtime discovery"
+          },
+          {
+            "kind": "client",
+            "status": "unsupported",
+            "reason": "Cordis React/slots client UI is not executable in LeapFlow P0"
+          }
+        ],
+        "rejection_reason": "Dynamic export contains no statically visible registerTool call; P0 does not publish private handler channels as LeapFlow tools"
+      },
+      "lifecycle_evidence": {
+        "install": {
+          "ok": false,
+          "error": "Dynamic export contains no statically visible registerTool call; P0 does not publish private handler channels as LeapFlow tools",
+          "verdict": "incompatible"
+        }
+      },
+      "approval_requests": 0,
+      "approval_evidence": [],
+      "elapsed_ms": 2.925,
+      "ok": true,
+      "failures": []
+    },
+    {
+      "case_id": "native_unbuilt_typescript",
+      "title": "Real native TypeScript source without a pre-built JavaScript entry.",
+      "source": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/sources/native_unbuilt_typescript",
+      "source_reference": "packages/context/time-context/src/index.ts",
+      "expected_verdict": null,
+      "expected_error": "pre-built JavaScript entry",
+      "lifecycle": "reject",
+      "expected_tool": "",
+      "expected_value": null,
+      "source_sha256": "f1d124352a2effc97d4ac7e0f7b5ab5dffe1c6c7c147fd632598e822cb59e9cc",
+      "static": {
+        "inspection_error": "P0 requires a pre-built JavaScript entry; TypeScript build/install is not supported",
+        "error_type": "SourceInspectionError"
+      },
+      "lifecycle_evidence": {
+        "install": {
+          "ok": false,
+          "error": "DSH source assessment failed: P0 requires a pre-built JavaScript entry; TypeScript build/install is not supported"
+        }
+      },
+      "approval_requests": 0,
+      "approval_evidence": [],
+      "elapsed_ms": 1.607,
+      "ok": true,
+      "failures": []
+    },
+    {
+      "case_id": "native_missing_entry",
+      "title": "Real native package manifest whose compiled entry is absent from the artifact.",
+      "source": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/sources/native_missing_entry",
+      "source_reference": "packages/bundle/base/package.json",
+      "expected_verdict": null,
+      "expected_error": "entry point does not exist",
+      "lifecycle": "reject",
+      "expected_tool": "",
+      "expected_value": null,
+      "source_sha256": "a3eba5d10e8b816570fb63b263771397d45e4c08042eb9e38adf280c15c755c6",
+      "static": {
+        "inspection_error": "DSH entry point does not exist: lib/index.js",
+        "error_type": "SourceInspectionError"
+      },
+      "lifecycle_evidence": {
+        "install": {
+          "ok": false,
+          "error": "DSH source assessment failed: DSH entry point does not exist: lib/index.js"
+        }
+      },
+      "approval_requests": 0,
+      "approval_evidence": [],
+      "elapsed_ms": 0.837,
+      "ok": true,
+      "failures": []
+    },
+    {
+      "case_id": "dynamic_shell_injection",
+      "title": "Dynamic host tool whose runtime command violates the strict curl grammar.",
+      "source": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/sources/dynamic_shell_injection",
+      "source_reference": "packages/extensions/cordis-host-runner/src/sandbox.ts#HOST_BUILTIN_INSPECTION",
+      "expected_verdict": "adaptable",
+      "expected_error": "",
+      "lifecycle": "security",
+      "expected_tool": "unsafe_shell_probe",
+      "expected_value": null,
+      "source_sha256": "97b3cbccc4de0ef09f754e5617dd33997679f04256d9d278b903618aabd8bef1",
+      "static": {
+        "source_kind": "cordis_dynamic_export",
+        "verdict": "adaptable",
+        "installable": false,
+        "installable_candidate": true,
+        "category": "tools",
+        "dependencies": [],
+        "permissions": [
+          "compat.shell.curl_get",
+          "network.outbound"
+        ],
+        "blockers": [],
+        "limitations": [],
+        "components": [
+          {
+            "kind": "host",
+            "status": "candidate",
+            "reason": "Dynamic Cordis host requires restricted runtime discovery"
+          }
+        ],
+        "rejection_reason": ""
+      },
+      "lifecycle_evidence": {
+        "install": {
+          "ok": true,
+          "action": "install",
+          "plugin_id": "dynamic_shell_injection",
+          "installed_tools": [
+            "unsafe_shell_probe"
+          ],
+          "state": "active",
+          "version": "native-exp-security",
+          "source_kind": "cordis_dynamic_export",
+          "bundle_sha256": "97b3cbccc4de0ef09f754e5617dd33997679f04256d9d278b903618aabd8bef1",
+          "descriptor_path": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/profile/plugins/dsh/dynamic_shell_injection/descriptor.json",
+          "verdict": "adaptable",
+          "limitations": [],
+          "client_components": []
+        },
+        "invoke": {
+          "ok": false,
+          "error": "DSH shell compatibility only permits: curl -sS -m <1..120> '<http(s) URL>' [| iconv -f GB18030 -t UTF-8]",
+          "error_type": "Error",
+          "retryable": false
+        },
+        "fetch_count": 0,
+        "remove": {
+          "ok": true,
+          "action": "remove",
+          "plugin_id": "dynamic_shell_injection",
+          "state": "disposed",
+          "source_path": "/Users/jason/work/github/leapflow/temp/plugin_exp/work/native-dsh/20260827-173327/profile/plugins/dynamic_shell_injection.py",
+          "source_deleted": true
+        }
+      },
+      "approval_requests": 2,
+      "approval_evidence": [
+        {
+          "kind": "platform.action",
+          "effect": "write",
+          "resource": "plugin_management:install",
+          "bundle_sha256": "97b3cbccc4de0ef09f754e5617dd33997679f04256d9d278b903618aabd8bef1",
+          "verdict": "adaptable"
+        },
+        {
+          "kind": "platform.action",
+          "effect": "write",
+          "resource": "plugin_management:remove",
+          "bundle_sha256": "",
+          "verdict": ""
+        }
+      ],
+      "elapsed_ms": 201.881,
+      "ok": true,
+      "failures": []
+    }
+  ]
+}

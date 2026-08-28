@@ -1,13 +1,9 @@
-"""DSH package.json → LeapFlow PluginManifest converter.
+"""DSH package.json → LeapFlow compatibility descriptor conversion.
 
-Translates a DSH-format manifest dict (as parsed by Stage 1) into a
-LeapFlow PluginManifest-compatible dict that could be handed to
-``MarketplaceClient.install()``.
-
-This is a pure, side-effect-free transformation: no file I/O and no
-checksum computation. The checksum is intentionally left as ``None`` because
-integrity is verified against the actual downloaded source at install time,
-not against the manifest at conversion time.
+This is metadata for assessment and audit, not a ``MarketplaceClient`` install
+manifest. A DSH ``main`` such as ``dist/index.js`` is not a Python entry point;
+passing it to the Python-only marketplace would fabricate ``dist/index.js.py``.
+Executable DSH bundles must enter through ``plugin_install(source_path=...)``.
 """
 
 from __future__ import annotations
@@ -17,7 +13,7 @@ from typing import Any
 
 
 def convert_dsh_to_leapflow(dsh_manifest: dict) -> dict:
-    """Convert a DSH manifest dict into a LeapFlow PluginManifest-compatible dict.
+    """Convert a DSH manifest into a non-installable compatibility descriptor.
 
     Field mapping:
         - ``name``        → stripped of ``@org/`` and ``dsh-`` prefixes, hyphens
@@ -57,6 +53,8 @@ def convert_dsh_to_leapflow(dsh_manifest: dict) -> dict:
         "entry_point": entry_point,
         "description": description,
         "plugin_type": "tool",
+        "source_language": "javascript",
+        "artifact_type": "dsh_source_bundle",
         "requires_sandbox": requires_sandbox,
         "dependencies": dependencies,
         "checksum_sha256": None,  # computed at install time, not conversion

@@ -93,6 +93,7 @@ def _load_plugin_from_file(path: Path) -> "ToolPlugin | None":
         return None
     try:
         setattr(plugin, "__leapflow_plugin_path__", str(path))
+        setattr(plugin, "__leapflow_plugin_module__", module_name)
     except Exception:
         logger.debug("Cannot attach plugin source path metadata for %s", path, exc_info=True)
     return plugin

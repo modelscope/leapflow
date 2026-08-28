@@ -19,10 +19,13 @@ from leapflow.learning.compatibility.protocol import (
 )
 
 # ═══════════════════════════════════════════════════════════════════════
-# Known dependency classification patterns.
-# Matching is case-insensitive and supports substring matching.
+# Known dependency classifications. Names are normalized and matched exactly.
 # ═══════════════════════════════════════════════════════════════════════
 
+# Dependencies LeapFlow can actually provide to a foreign runtime in P0.
+# npm libraries are intentionally absent: P0 never runs npm install/build, so a
+# package depending on node-fetch/axios is not satisfiable merely because Python
+# has an HTTP client with a similar purpose.
 SATISFIABLE_DEPS: set[str] = {
     # Core runtime services LeapFlow provides
     "config",
@@ -40,14 +43,6 @@ SATISFIABLE_DEPS: set[str] = {
     "scheduler",
     "file_read_gate",
     "research_ledger",
-    # Common npm/python packages that are runtime-satisfiable
-    "node-fetch",
-    "axios",
-    "requests",
-    "aiohttp",
-    "httpx",
-    "pydantic",
-    "asyncio",
 }
 
 SHIMMABLE_DEPS: set[str] = {
@@ -79,31 +74,25 @@ BLOCKING_DEPS: set[str] = {
 }
 
 
-def _classify_dep(dep: str) -> DependencyFeasibility:
-    """Classify a single dependency string."""
-    dep_lower = dep.lower().strip()
+def _classify_dep(dep: str, *, foreign_runtime: bool = False) -> DependencyFeasibility:
+    """Classify one exact, normalized dependency name.
 
-    # Exact match first
+    Substring matching made unrelated packages inherit privileged classifications
+    (for example a name containing ``config`` became satisfiable). Dependency
+    names are stable protocol identifiers, so exact matching is both simpler and
+    safer. Unknown dependencies from a foreign runtime are blocking in P0 because
+    LeapFlow neither installs packages nor proves that they are bundled. Native
+    manifests may still name runtime dependencies injected by the host.
+    """
+    dep_lower = dep.lower().strip()
     if dep_lower in SATISFIABLE_DEPS:
         return DependencyFeasibility.SATISFIABLE
     if dep_lower in SHIMMABLE_DEPS:
         return DependencyFeasibility.SHIMMABLE
     if dep_lower in BLOCKING_DEPS:
         return DependencyFeasibility.BLOCKING
-
-    # Substring/prefix matching for common patterns
-    for known in SATISFIABLE_DEPS:
-        if known in dep_lower or dep_lower in known:
-            return DependencyFeasibility.SATISFIABLE
-    for known in SHIMMABLE_DEPS:
-        if known in dep_lower or dep_lower in known:
-            return DependencyFeasibility.SHIMMABLE
-    for known in BLOCKING_DEPS:
-        if known in dep_lower or dep_lower in known:
-            return DependencyFeasibility.BLOCKING
-
-    # Unknown deps default to satisfiable (benefit of the doubt for
-    # external libs like npm packages or Python packages)
+    if foreign_runtime:
+        return DependencyFeasibility.BLOCKING
     return DependencyFeasibility.SATISFIABLE
 
 
@@ -136,8 +125,12 @@ class DependencyChecker:
         shimmable: list[str] = []
         satisfiable: list[str] = []
 
+        foreign_runtime = manifest.source_format == "dsh" or manifest.source_language.lower() in {
+            "javascript",
+            "typescript",
+        }
         for dep in deps:
-            feasibility = _classify_dep(dep)
+            feasibility = _classify_dep(dep, foreign_runtime=foreign_runtime)
             classification[dep] = feasibility.value
             if feasibility == DependencyFeasibility.BLOCKING:
                 blocking.append(dep)
@@ -160,8 +153,9 @@ class DependencyChecker:
                 passed=False,
                 verdict=Verdict.INCOMPATIBLE,
                 details=(
-                    f"Blocking dependencies cannot be satisfied: {blocking}. "
-                    "These require DSH-specific runtime services not available in LeapFlow."
+                    f"Blocking or unavailable dependencies cannot be satisfied in P0: {blocking}. "
+                    "DSH packages must be self-contained pre-built bundles; npm install/build "
+                    "and architecture-bound DSH services are not available."
                 ),
                 evidence=evidence,
             )

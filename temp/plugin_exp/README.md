@@ -24,6 +24,56 @@ The script does not call an LLM, network, daemon process, approval modal, or rea
 plugin installation path. It uses synthetic candidates to stress the resolver and
 plan logic without coupling this experiment to framework runtime side effects.
 
+## Native DeepSeek Harness Compatibility Experiment
+
+`temp/plugin_exp/scripts/native_dsh_plugin_exp.py` complements the synthetic
+matrix with real artifacts from a local DeepSeek Harness checkout. It extracts the
+canonical dynamic `REVERSE_TOOL_CODE` and composition fixtures, copies selected
+published package manifests/build outputs, and runs LeapFlow's production path:
+
+```text
+source inspection → compatibility verdict → isolated profile install
+→ restricted Node discovery → tool invocation → wrapper rediscovery/reload → remove
+```
+
+The default matrix covers:
+
+| Class | Real source | Expected result |
+|---|---|---|
+| Directly adaptable | `cordis-host-runner` `REVERSE_TOOL_CODE` | Installs, invokes, reloads, and removes. |
+| Partial | The same Host tool plus the runner's real Client fixture | Host tool runs; Client half is explicitly skipped. |
+| Adapted package | Real dynamic fixture wrapped as a self-contained pre-built package | Standard DSH package path executes end to end. |
+| Architecturally unsuitable | `packages/core/agent-loop` | Rejected before approval by the pluggability taxonomy. |
+| Relevant but not self-contained | `packages/fs/tool-fs` | Rejected for npm/peer dependencies and unsupported services. |
+| Unsupported composition | Real `CONSUMER_CODE` requiring `greeter` | Declared service dependency is rejected statically. |
+| UI-only | Real Client fixture with no public Host tool | Rejected as non-executable in P0. |
+| Unbuilt or incomplete | Real TypeScript source / package missing its compiled entry | Source inspection rejects the artifact. |
+| Capability attack | Dynamic tool requesting `curl ...; id` | Installs, but invocation is denied before `web_fetch`. |
+
+Run it from the LeapFlow repository root, using the project experiment environment:
+
+```bash
+conda run -n leap python temp/plugin_exp/scripts/native_dsh_plugin_exp.py
+```
+
+Options:
+
+```bash
+python temp/plugin_exp/scripts/native_dsh_plugin_exp.py \
+  --harness-root /path/to/deepseek-harness \
+  --user-data-root ~/.leapflow \
+  --keep-work
+```
+
+Each run writes JSON and Markdown evidence to
+`temp/plugin_exp/reports/<timestamp>-native-dsh-plugin-exp.*`. Runtime files live
+under `temp/plugin_exp/work/native-dsh/<timestamp>/` and are deleted unless
+`--keep-work` is set. The registry and profile are isolated from the active user
+profile. The default profile's cache and LLM configuration are probed with direct
+read-only YAML/existence checks; secret references are not resolved, secret values
+are never emitted or copied, and this deterministic experiment sends zero LLM or
+network requests.
+
 ## P0 Scenario Matrix
 
 | Scenario | Purpose |

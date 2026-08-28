@@ -65,8 +65,15 @@ class ScopedToolRegistry:
         tools when the fiber is disposed.
         """
         plugin_id = plugin.plugin_id
-        # Track reload metadata so reload() can re-import the plugin later.
-        self._plugin_modules[plugin_id] = plugin.__class__.__module__
+        # Track reload metadata so reload() can re-import the plugin later. A
+        # generated wrapper may instantiate a class defined in a core module
+        # (e.g. DshBridgePlugin), so prefer the wrapper module explicitly attached
+        # by the file loader over plugin.__class__.__module__. Reloading the core
+        # module from the wrapper path would overwrite sys.modules and make the
+        # wrapper import itself recursively.
+        self._plugin_modules[plugin_id] = str(
+            getattr(plugin, "__leapflow_plugin_module__", plugin.__class__.__module__)
+        )
         plugin_path = getattr(plugin, "__leapflow_plugin_path__", None)
         if plugin_path:
             self._plugin_files[plugin_id] = Path(str(plugin_path))
@@ -135,7 +142,9 @@ class ScopedToolRegistry:
             if plugin_id in self._fibers:
                 continue  # already adopted
             fiber = self.create_fiber(plugin_id)
-            self._plugin_modules[plugin_id] = plugin.__class__.__module__
+            self._plugin_modules[plugin_id] = str(
+                getattr(plugin, "__leapflow_plugin_module__", plugin.__class__.__module__)
+            )
             plugin_path = getattr(plugin, "__leapflow_plugin_path__", None)
             if plugin_path:
                 self._plugin_files[plugin_id] = Path(str(plugin_path))
@@ -322,6 +331,7 @@ class ScopedToolRegistry:
         if file_path is not None:
             try:
                 setattr(plugin, "__leapflow_plugin_path__", str(file_path))
+                setattr(plugin, "__leapflow_plugin_module__", module_path)
             except Exception:
                 logger.debug("Cannot attach plugin file path metadata for %s", plugin_id, exc_info=True)
         return plugin

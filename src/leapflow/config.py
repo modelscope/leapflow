@@ -127,6 +127,14 @@ class Settings:
     # When non-empty, marketplace installs MUST carry a valid signature from
     # one of these keys; empty tuple -> checksum-only integrity verification.
     plugin_marketplace_trusted_pubkeys: tuple[str, ...] = ()
+    # Restricted DeepSeek Harness / Cordis bridge runtime. These are cold-path
+    # process limits; changing them requires rebuilding daemon-owned plugin
+    # wrappers and therefore takes effect after daemon restart.
+    plugins_dsh_invoke_timeout_s: float = 30.0
+    plugins_dsh_discovery_timeout_s: float = 10.0
+    plugins_dsh_max_message_bytes: int = 1_000_000
+    plugins_dsh_max_stderr_bytes: int = 64_000
+    plugins_dsh_max_memory_mb: int = 128
     runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
@@ -921,6 +929,11 @@ def _build_settings_from_env(
     tools_lint_command = os.getenv("LEAPFLOW_TOOLS_LINT_COMMAND", "").strip()
     tools_terminal_session_enabled = os.getenv("LEAPFLOW_TOOLS_TERMINAL_SESSION_ENABLED", "1").strip().lower() in ("1", "true", "yes")
     tools_verify_edits = os.getenv("LEAPFLOW_TOOLS_VERIFY_EDITS", "1").strip().lower() in ("1", "true", "yes")
+    plugins_dsh_invoke_timeout_s = float(os.getenv("LEAPFLOW_PLUGINS_DSH_INVOKE_TIMEOUT_S", "30"))
+    plugins_dsh_discovery_timeout_s = float(os.getenv("LEAPFLOW_PLUGINS_DSH_DISCOVERY_TIMEOUT_S", "10"))
+    plugins_dsh_max_message_bytes = int(os.getenv("LEAPFLOW_PLUGINS_DSH_MAX_MESSAGE_BYTES", "1000000"))
+    plugins_dsh_max_stderr_bytes = int(os.getenv("LEAPFLOW_PLUGINS_DSH_MAX_STDERR_BYTES", "64000"))
+    plugins_dsh_max_memory_mb = int(os.getenv("LEAPFLOW_PLUGINS_DSH_MAX_MEMORY_MB", "128"))
     web_transport = os.getenv("LEAPFLOW_WEB_TRANSPORT", "auto").strip().lower() or "auto"
     web_timeout_s = float(os.getenv("LEAPFLOW_WEB_TIMEOUT_S", "20"))
     web_max_bytes = int(os.getenv("LEAPFLOW_WEB_MAX_BYTES", "2000000"))
@@ -1277,6 +1290,11 @@ def _build_settings_from_env(
         tools_lint_command=tools_lint_command,
         tools_terminal_session_enabled=tools_terminal_session_enabled,
         tools_verify_edits=tools_verify_edits,
+        plugins_dsh_invoke_timeout_s=plugins_dsh_invoke_timeout_s,
+        plugins_dsh_discovery_timeout_s=plugins_dsh_discovery_timeout_s,
+        plugins_dsh_max_message_bytes=plugins_dsh_max_message_bytes,
+        plugins_dsh_max_stderr_bytes=plugins_dsh_max_stderr_bytes,
+        plugins_dsh_max_memory_mb=plugins_dsh_max_memory_mb,
         web_transport=web_transport,
         web_timeout_s=web_timeout_s,
         web_max_bytes=web_max_bytes,
