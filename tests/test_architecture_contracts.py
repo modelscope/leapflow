@@ -29,6 +29,7 @@ import pytest
 
 GATEWAY_DIR = pathlib.Path(__file__).resolve().parents[1] / "src" / "leapflow" / "gateway"
 PLUGINS_DIR = pathlib.Path(__file__).resolve().parents[1] / "src" / "leapflow" / "plugins"
+HARDWARE_DIR = pathlib.Path(__file__).resolve().parents[1] / "src" / "leapflow" / "hardware"
 
 # Sub-packages that own platform/vendor specifics. Gateway core may define the
 # contracts these implement, but must never depend on them.
@@ -113,6 +114,91 @@ def test_gateway_core_has_no_vendor_endpoints_or_error_shapes() -> None:
                 violations.append(f"{path.name}:{lineno}")
 
     assert violations == [], "vendor endpoint hardcoded in gateway core: " + ", ".join(violations)
+
+
+# ── Hardware Context Protocol boundaries ─────────────────────────────────
+
+
+def _hardware_modules() -> list[pathlib.Path]:
+    """Return every module in the hardware package, including its seams."""
+    return sorted(HARDWARE_DIR.rglob("*.py"))
+
+
+def test_hardware_domain_model_is_free_of_upstream_standard_names() -> None:
+    """The Hardware Context Protocol's one architectural red line.
+
+    ``context.py`` describes what an agent must know to operate a device safely --
+    facts fixed by physics and by governance, not by whichever southbound standard
+    eventually carries the command. The moment a guessed upstream concept leaks into
+    the domain model, the model expires when that standard is published, and the
+    two-file integration promise is gone with it.
+
+    Upstream names belong in ``providers/`` and ``transports/``, which is where a
+    mapping is allowed to be wrong.
+    """
+    upstream_names = re.compile(r"\bmhs\b|model_hardware_standard", re.IGNORECASE)
+    domain_modules = (HARDWARE_DIR / "context.py", HARDWARE_DIR / "transport.py")
+    violations: list[str] = []
+    for path in domain_modules:
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if upstream_names.search(line):
+                violations.append(f"{path.name}:{lineno}: {line.strip()}")
+
+    assert violations == [], (
+        "an upstream standard's name leaked into the hardware domain model; keep it "
+        "in providers/ or transports/:\n  " + "\n  ".join(violations)
+    )
+
+
+def test_hardware_does_not_import_the_engine() -> None:
+    """Dependency runs engine -> hardware, never back.
+
+    ``WriteOutcome.side_effect_state`` mirrors ``SideEffectState`` as plain strings
+    for exactly this reason: importing the enum would create a cycle and make the
+    domain model unimportable on its own.
+    """
+    violations: list[str] = []
+    for path in _hardware_modules():
+        for module, lineno in _imported_modules(path):
+            if module.startswith("leapflow.engine"):
+                violations.append(f"{path.relative_to(HARDWARE_DIR)}:{lineno} imports {module}")
+
+    assert violations == [], (
+        "leapflow.hardware must not depend on leapflow.engine:\n  " + "\n  ".join(violations)
+    )
+
+
+def test_hardware_domain_model_does_not_import_its_own_seams() -> None:
+    """The domain model must not know which providers or transports exist.
+
+    If ``context.py`` reached for the transport table, adding a transport would
+    become a change to the stable half of the protocol -- the exact coupling the
+    split exists to prevent.
+    """
+    violations: list[str] = []
+    for module, lineno in _imported_modules(HARDWARE_DIR / "context.py"):
+        if "hardware.providers" in module or "hardware.transports" in module:
+            violations.append(f"context.py:{lineno} imports {module}")
+
+    assert violations == [], (
+        "the hardware domain model must not import its seams:\n  " + "\n  ".join(violations)
+    )
+
+
+def test_hardware_transports_are_not_named_after_one_device() -> None:
+    """Transports are generic mechanisms; device specifics live in declarations.
+
+    A transport named after a particular instrument or board is a sign that device
+    knowledge has moved into code, where it can no longer be reviewed or overridden
+    per bench.
+    """
+    allowed = {"__init__.py", "mock.py", "python_callable.py"}
+    present = {p.name for p in (HARDWARE_DIR / "transports").glob("*.py")}
+    unexpected = present - allowed
+    assert not unexpected, (
+        f"unexpected transport modules {sorted(unexpected)}; a transport must be a generic "
+        "mechanism, and a new one also needs a case in tests/test_hardware_transport_contract.py"
+    )
 
 
 # ── Plugin core vs tool implementations ──────────────────────────────────

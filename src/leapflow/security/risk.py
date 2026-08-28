@@ -5,7 +5,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from leapflow.security.actions import ActionDescriptor, ActionEffect, ActionKind
 from leapflow.security.path_sensitivity import configured_path_sensitivity_roots
@@ -64,6 +65,41 @@ class RiskClassifier(Protocol):
     def assess(self, action: ActionDescriptor) -> RiskAssessment: ...
 
 
+class CompositeRiskClassifier:
+    """Dispatches by action-kind prefix, delegating everything else.
+
+    ``ApprovalOrchestrator`` holds a single classifier slot, so a new action
+    domain cannot simply register itself alongside the default classifier.
+    Composing rather than replacing keeps the fallback the authority for every
+    kind it already owns: adding a domain must never change how a shell command
+    is assessed.
+
+    This class carries no domain knowledge of its own, which is the point -- a
+    second domain registers a prefix instead of forking it. Longest prefix wins,
+    so ``device.actuate.`` can refine ``device.`` without ordering surprises.
+    """
+
+    def __init__(
+        self,
+        *,
+        fallback: RiskClassifier,
+        by_prefix: Mapping[str, RiskClassifier] = MappingProxyType({}),
+    ) -> None:
+        self._fallback = fallback
+        # Sorted longest-first so a more specific prefix is never shadowed by a
+        # shorter one that happens to be inserted earlier.
+        self._by_prefix: tuple[tuple[str, RiskClassifier], ...] = tuple(
+            sorted(dict(by_prefix).items(), key=lambda item: len(item[0]), reverse=True)
+        )
+
+    def assess(self, action: ActionDescriptor) -> RiskAssessment:
+        kind = str(getattr(action, "kind", "") or "")
+        for prefix, classifier in self._by_prefix:
+            if kind.startswith(prefix):
+                return classifier.assess(action)
+        return self._fallback.assess(action)
+
+
 class DefaultRiskClassifier:
     """Small, explainable risk classifier for core LeapFlow actions."""
 
@@ -106,6 +142,8 @@ class DefaultRiskClassifier:
             return self._assess_network_fetch(action)
         if action.kind == ActionKind.WORKSPACE_ESCAPE.value:
             return self._assess_workspace_escape(action)
+        if action.kind == ActionKind.MCP_TOOL.value:
+            return self._assess_mcp_tool(action)
         if action.kind == ActionKind.GATEWAY_SEND.value:
             return RiskAssessment(
                 level=RiskLevel.HIGH,
@@ -426,6 +464,47 @@ class DefaultRiskClassifier:
                 explanation="This writes a non-trivial amount of content.",
             )
         return RiskAssessment(level=RiskLevel.LOW, score=0.2, reasons=("ordinary_file_write",))
+
+    def _assess_mcp_tool(self, action: ActionDescriptor) -> RiskAssessment:
+        """Assess a tool supplied by an external MCP server.
+
+        The MCP protocol does not tell us what a tool does, so the only honest basis is
+        provenance: this is third-party code reached over a local transport, running with
+        the agent's own privileges. That places it at the same tier as any other external
+        action, and *not* at the tier its own description claims -- the description was
+        written by the server being assessed.
+
+        A server may declare ``readOnlyHint``, and that declaration is honoured the same
+        way a plugin's declared metadata is: it is the server's own contract, and treating
+        a self-declared read as a write would gate documentation lookups into uselessness.
+        Absence of the hint is not a claim of read-only, so it stays at the higher tier.
+
+        ``allow_permanent`` remains available. A person who trusts a server enough to
+        configure it should be able to say so once; refusing that would mean prompting on
+        every call, which is how a gate gets switched off by the person it protects.
+        """
+        metadata = action.metadata or {}
+        server = str(metadata.get("server") or "unknown")
+        if bool(metadata.get("read_only", False)):
+            return RiskAssessment(
+                level=RiskLevel.LOW,
+                score=0.25,
+                reasons=("mcp_tool_read_only",),
+                explanation=(
+                    f"This calls a tool the {server!r} MCP server declares as read-only. "
+                    "It still runs third-party code on this machine."
+                ),
+            )
+        return RiskAssessment(
+            level=RiskLevel.HIGH,
+            score=0.7,
+            reasons=("mcp_tool_undeclared_effect",),
+            explanation=(
+                f"This calls a tool on the {server!r} MCP server that does not declare "
+                "itself read-only, so its effect is unknown. It runs third-party code "
+                "with this agent's privileges."
+            ),
+        )
 
     @staticmethod
     def _matched_reasons(command: str, rules: tuple[tuple[re.Pattern[str], str], ...]) -> list[str]:

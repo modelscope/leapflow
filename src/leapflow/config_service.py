@@ -106,6 +106,61 @@ _BOOTSTRAP_ONLY_SETTINGS = frozenset({
 _SECRET_SETTINGS = frozenset({"llm_api_key", "vlm_api_key", "llm_aux_api_key"})
 
 _FIELD_DESCRIPTIONS = {
+    "mcp.approval_mode": (
+        "Approval policy for tools from external MCP servers, which run third-party code "
+        "with this agent's privileges. mutating_only assesses every tool that does not "
+        "declare itself read-only; always assesses and audits all of them, including "
+        "declared reads; off disables the gate entirely. Read when MCP servers are "
+        "configured, so a change needs a daemon restart."
+    ),
+    "hardware.enabled": (
+        "Expose declared physical devices as tools. Off by default; takes effect after "
+        "`leap daemon restart` because the approval risk classifier is composed when "
+        "the orchestrator is built."
+    ),
+    "hardware.devices_dir": (
+        "Directory of device declaration files for the active profile. Read once at "
+        "startup, so a change needs a daemon restart."
+    ),
+    "hardware.max_devices": (
+        "Maximum number of devices admitted from all providers. Applied during "
+        "admission at startup; changing it needs a daemon restart."
+    ),
+    "hardware.unverified_policy": (
+        "How to treat a device context no human has confirmed. deny_write keeps it "
+        "readable but not commandable. Applied during admission, so a change needs a "
+        "daemon restart."
+    ),
+    "hardware.require_describe": (
+        "Require hw_describe before the first command to a device, so the model has "
+        "read the channel's operating envelope before commanding it. Read at startup; "
+        "a change needs a daemon restart."
+    ),
+    "hardware.envelope_grant": (
+        "Let one consent cover a channel's whole declared envelope band. Off asks for "
+        "every command separately. Read at startup, so a change needs a daemon restart."
+    ),
+    "hardware.stream_enabled": (
+        "Sample channels that declare a sample rate. Sampling loops start during "
+        "initialization, so a change needs a daemon restart."
+    ),
+    "hardware.stream_ring_capacity": (
+        "Per-channel raw sample ring buffer depth. Buffers are sized when sampling "
+        "starts, so a change needs a daemon restart."
+    ),
+    "hardware.persist_readings": (
+        "Persist sampled readings so physical history survives the process. Off means "
+        "samples exist only in memory and nothing can be learned from them afterwards. "
+        "Read when sampling starts, so a change needs a daemon restart."
+    ),
+    "hardware.downsample_interval_s": (
+        "Seconds of samples collapsed into one stored history window. Read when sampling "
+        "starts, so a change needs a daemon restart."
+    ),
+    "hardware.raw_retention_days": (
+        "How long raw sample files are kept. They are session-scoped, sensitive, and "
+        "never synced. Read when sampling starts, so a change needs a daemon restart."
+    ),
     "llm.api_key": "Primary LLM API key stored in the local secret vault.",
     "llm.aux_api_key": "Auxiliary LLM provider API key stored in the local secret vault.",
     "llm.base_url": "OpenAI-compatible endpoint for the primary LLM provider.",
@@ -236,6 +291,9 @@ _SECTION_CATEGORIES = {
 _VALUE_HINTS = {
     "runtime.log_level": "DEBUG|INFO|WARNING|ERROR",
     "daemon.log_level": "DEBUG|INFO|WARNING|ERROR",
+    "mcp.approval_mode": "mutating_only|always|off",
+    "hardware.unverified_policy": "deny_write|prompt|allow",
+    "hardware.devices_dir": "absolute path, or empty for the profile default",
     "recording.mode": "video|default|vision_only",
     "signal.channels": "all or comma-separated channel names",
     "signal.noise_path_fragments": "comma-separated path fragments",
@@ -247,7 +305,7 @@ _VALUE_HINTS = {
 }
 
 _PARTIAL_RELOAD_SECTIONS = frozenset({"runtime", "mock", "gateway", "hub", "scheduler", "observer", "cua", "use", "dashboard"})
-_RESTART_REQUIRED_SECTIONS = frozenset({"daemon", "plugins"})
+_RESTART_REQUIRED_SECTIONS = frozenset({"daemon", "plugins", "hardware", "mcp"})
 
 _PROFILE_FILE_BY_SECTION = {
     "llm": "llm.yaml",

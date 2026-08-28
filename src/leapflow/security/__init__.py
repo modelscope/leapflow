@@ -11,7 +11,13 @@ from leapflow.security.approval import (
 from leapflow.security.grants import ApprovalAuditLog, ApprovalGrant, ApprovalScope
 from leapflow.security.orchestrator import ApprovalOrchestrator, ApprovalResult
 from leapflow.security.policy import ApprovalPolicyEngine, PolicyDecision, PolicyVerdict
-from leapflow.security.risk import DefaultRiskClassifier, RiskAssessment, RiskLevel
+from leapflow.security.risk import (
+    CompositeRiskClassifier,
+    DefaultRiskClassifier,
+    RiskAssessment,
+    RiskClassifier,
+    RiskLevel,
+)
 
 __all__ = [
     "ActionDescriptor",
@@ -27,11 +33,13 @@ __all__ = [
     "ApprovalRequest",
     "ApprovalResult",
     "ApprovalScope",
+    "CompositeRiskClassifier",
     "DefaultRiskClassifier",
     "DenyAllGate",
     "PolicyDecision",
     "PolicyVerdict",
     "RiskAssessment",
+    "RiskClassifier",
     "RiskLevel",
     "SessionAwareGate",
 ]

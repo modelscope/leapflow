@@ -187,6 +187,32 @@ class GatewayLayout:
 
 
 @dataclass(frozen=True)
+class HardwareLayout:
+    """Hardware context declaration, verification, and time-series paths.
+
+    Device declarations are durable user assets: they encode physical operating
+    limits a person is accountable for, so they live under the profile and are
+    never regenerated. Raw samples do not live here -- they are session-scoped
+    sensitive artifacts and route through CacheLayout instead.
+    """
+
+    root: Path
+
+    @property
+    def devices_dir(self) -> Path:
+        return self.root / "devices"
+
+    @property
+    def verified_path(self) -> Path:
+        """Human confirmations of device contexts (ContextProvenance records)."""
+        return self.root / "verified.json"
+
+    def ensure(self) -> None:
+        for path in (self.root, self.devices_dir):
+            path.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass(frozen=True)
 class ApprovalLayout:
     """Approval grant and audit paths."""
 
@@ -417,6 +443,19 @@ class ProfileLayout:
     @property
     def approval(self) -> ApprovalLayout:
         return ApprovalLayout(self.root / "approval")
+
+    @property
+    def hardware(self) -> HardwareLayout:
+        return HardwareLayout(self.root / "hardware")
+
+    @property
+    def instrument_db_path(self) -> Path:
+        """Downsampled hardware time series and parameter experience.
+
+        Separate from leap.duckdb because sample volume grows on a different
+        curve from conversation state and is pruned on its own schedule.
+        """
+        return self.db_dir / "instrument.duckdb"
 
     @property
     def dashboard(self) -> DashboardLayout:

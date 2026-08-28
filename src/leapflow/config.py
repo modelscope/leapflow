@@ -135,6 +135,58 @@ class Settings:
     plugins_dsh_max_message_bytes: int = 1_000_000
     plugins_dsh_max_stderr_bytes: int = 64_000
     plugins_dsh_max_memory_mb: int = 128
+
+    # Approval policy for tools supplied by external MCP servers. An MCP tool is
+    # third-party code reached over a local transport, running with this agent's
+    # privileges, and the protocol does not say what it does.
+    #   mutating_only -- assess every tool that does not declare readOnlyHint (default)
+    #   always        -- assess and audit every MCP call, including declared reads
+    #   off           -- no gate; logged once per process
+    # Absence of a read-only declaration is not a claim of safety, which is why the
+    # default gates unannotated servers in full rather than trusting them. A declared
+    # read is assessed LOW and auto-allowed on risk, so the practical difference between
+    # the first two modes is audit coverage rather than prompt frequency.
+    mcp_approval_mode: str = "mutating_only"
+
+    # Hardware Context Protocol. Off by default: with hardware disabled the plugin
+    # exposes no tools and the risk classifier is the unmodified default, so the
+    # rest of the system behaves exactly as it did before the subsystem existed.
+    # Enabling it is restart-required because the approval classifier is composed
+    # when the orchestrator is constructed.
+    hardware_enabled: bool = False
+    # Directory holding device declarations. Empty -> the active profile's
+    # hardware/devices/ directory.
+    hardware_devices_dir: str = ""
+    # Admission cap. A declaration directory that suddenly lists hundreds of
+    # devices is far more likely to be a mistake than an intent.
+    hardware_max_devices: int = 16
+    # How to treat a device context no human has confirmed: deny_write (writable
+    # channels are demoted to read-only), prompt, or allow. The default keeps an
+    # unverified declaration observable but not commandable.
+    hardware_unverified_policy: str = "deny_write"
+    # Require hw_describe before the first command to a device in a session. The
+    # generic tool schemas cannot express per-channel limits, so this is what puts
+    # the envelope in front of the model before it commands anything.
+    hardware_require_describe: bool = True
+    # Allow one consent to cover a channel's whole declared envelope band. Turning it
+    # off asks separately for every command, which suits a bench where each operation
+    # deserves its own decision -- at the cost of prompting often enough that people
+    # start clicking through.
+    hardware_envelope_grant: bool = True
+    # Continuous sampling for channels that declare a sample rate.
+    hardware_stream_enabled: bool = True
+    # Per-channel ring buffer depth for raw samples. Raw readings never enter the
+    # interaction signal buffer; only derived events cross that boundary.
+    hardware_stream_ring_capacity: int = 4096
+    # Persist sampled readings. Without this, samples live only in a bounded in-memory
+    # ring and vanish with the process, so nothing can be learned from physical
+    # experience afterwards -- there is no series to learn from.
+    hardware_persist_readings: bool = True
+    # Interval collapsed into one stored history window. Raw samples are kept separately
+    # as session-scoped sensitive artifacts; this governs the long-term tier.
+    hardware_downsample_interval_s: float = 60.0
+    # TTL for raw sample files, which are sensitive and non-syncable.
+    hardware_raw_retention_days: float = 7.0
     runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
@@ -934,6 +986,29 @@ def _build_settings_from_env(
     plugins_dsh_max_message_bytes = int(os.getenv("LEAPFLOW_PLUGINS_DSH_MAX_MESSAGE_BYTES", "1000000"))
     plugins_dsh_max_stderr_bytes = int(os.getenv("LEAPFLOW_PLUGINS_DSH_MAX_STDERR_BYTES", "64000"))
     plugins_dsh_max_memory_mb = int(os.getenv("LEAPFLOW_PLUGINS_DSH_MAX_MEMORY_MB", "128"))
+    mcp_approval_mode = (
+        os.getenv("LEAPFLOW_MCP_APPROVAL_MODE", "mutating_only").strip().lower()
+        or "mutating_only"
+    )
+    if mcp_approval_mode not in ("mutating_only", "always", "off"):
+        logger.warning(
+            "Unknown mcp.approval_mode %r; falling back to mutating_only", mcp_approval_mode
+        )
+        mcp_approval_mode = "mutating_only"
+    hardware_enabled = os.getenv("LEAPFLOW_HARDWARE_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+    hardware_devices_dir = os.getenv("LEAPFLOW_HARDWARE_DEVICES_DIR", "").strip()
+    hardware_max_devices = int(os.getenv("LEAPFLOW_HARDWARE_MAX_DEVICES", "16"))
+    hardware_unverified_policy = (
+        os.getenv("LEAPFLOW_HARDWARE_UNVERIFIED_POLICY", "deny_write").strip().lower()
+        or "deny_write"
+    )
+    hardware_require_describe = os.getenv("LEAPFLOW_HARDWARE_REQUIRE_DESCRIBE", "1").strip().lower() in ("1", "true", "yes")
+    hardware_envelope_grant = os.getenv("LEAPFLOW_HARDWARE_ENVELOPE_GRANT", "1").strip().lower() in ("1", "true", "yes")
+    hardware_stream_enabled = os.getenv("LEAPFLOW_HARDWARE_STREAM_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+    hardware_stream_ring_capacity = int(os.getenv("LEAPFLOW_HARDWARE_STREAM_RING_CAPACITY", "4096"))
+    hardware_persist_readings = os.getenv("LEAPFLOW_HARDWARE_PERSIST_READINGS", "1").strip().lower() in ("1", "true", "yes")
+    hardware_downsample_interval_s = float(os.getenv("LEAPFLOW_HARDWARE_DOWNSAMPLE_INTERVAL_S", "60"))
+    hardware_raw_retention_days = float(os.getenv("LEAPFLOW_HARDWARE_RAW_RETENTION_DAYS", "7"))
     web_transport = os.getenv("LEAPFLOW_WEB_TRANSPORT", "auto").strip().lower() or "auto"
     web_timeout_s = float(os.getenv("LEAPFLOW_WEB_TIMEOUT_S", "20"))
     web_max_bytes = int(os.getenv("LEAPFLOW_WEB_MAX_BYTES", "2000000"))
@@ -1295,6 +1370,18 @@ def _build_settings_from_env(
         plugins_dsh_max_message_bytes=plugins_dsh_max_message_bytes,
         plugins_dsh_max_stderr_bytes=plugins_dsh_max_stderr_bytes,
         plugins_dsh_max_memory_mb=plugins_dsh_max_memory_mb,
+        mcp_approval_mode=mcp_approval_mode,
+        hardware_enabled=hardware_enabled,
+        hardware_devices_dir=hardware_devices_dir,
+        hardware_max_devices=hardware_max_devices,
+        hardware_unverified_policy=hardware_unverified_policy,
+        hardware_require_describe=hardware_require_describe,
+        hardware_envelope_grant=hardware_envelope_grant,
+        hardware_stream_enabled=hardware_stream_enabled,
+        hardware_stream_ring_capacity=hardware_stream_ring_capacity,
+        hardware_persist_readings=hardware_persist_readings,
+        hardware_downsample_interval_s=hardware_downsample_interval_s,
+        hardware_raw_retention_days=hardware_raw_retention_days,
         web_transport=web_transport,
         web_timeout_s=web_timeout_s,
         web_max_bytes=web_max_bytes,

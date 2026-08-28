@@ -27,6 +27,28 @@ class ActionKind(str, Enum):
     NETWORK_FETCH = "network.fetch"
     WORKSPACE_ESCAPE = "workspace.escape"
     EXTERNAL_ACTION = "external.action"
+    # A tool provided by an external MCP server. First-class rather than folded into
+    # external.action for the same reason the device kinds are: classifiers dispatch on
+    # ``kind``, and an unrecognized one only ever reaches the generic fallback, which
+    # makes the tier an accident of that fallback's value instead of a decision.
+    #
+    # It is its own kind rather than a per-capability one because the MCP protocol does
+    # not tell us what a tool does. What we know is where it came from, and that is the
+    # honest basis for assessing it.
+    MCP_TOOL = "mcp.tool"
+    # Physical device operations. Each effect class is its own first-class kind
+    # rather than a metadata field on one "device.write" kind, because
+    # DefaultRiskClassifier and its peers dispatch on ``kind``: an unrecognized
+    # one only ever reaches the generic fallback, which would make the tier an
+    # accident of the fallback's value instead of a decision. The classes differ
+    # by risk profile, not by device type -- actuating carries kinetic energy,
+    # dispensing consumes an irreversible resource, configuring has thermal or
+    # mechanical inertia, and reading has no effect at all.
+    DEVICE_READ = "device.read"
+    DEVICE_CONFIGURE = "device.configure"
+    DEVICE_ACTUATE = "device.actuate"
+    DEVICE_DISPENSE = "device.dispense"
+    DEVICE_ESTOP = "device.estop"
 
 
 class ActionEffect(str, Enum):
@@ -120,6 +142,111 @@ class ActionDescriptor:
             detail=detail or f"{operation} wants to access {path}, which is outside the active workspace.",
             effect=effect,
             resource=path,
+            origin=origin,
+            metadata=merged,
+        )
+
+    @classmethod
+    def device(
+        cls,
+        *,
+        kind: str,
+        device_id: str,
+        channel_id: str,
+        quantity: str = "",
+        value: Any = None,
+        unit: str = "",
+        envelope_band: str = "",
+        location: str = "",
+        reversible: bool = False,
+        origin: str = ActionOrigin.AGENT_TOOL.value,
+        metadata: dict[str, Any] | None = None,
+    ) -> "ActionDescriptor":
+        """Describe one physical device operation.
+
+        ``resource`` is ``<device_id>:<channel_id>@<envelope_band>``, and that
+        composition is the whole grant contract. Scoping reuse to the channel
+        *and its declared band* is what makes "allow writes to this channel" a
+        usable consent instead of a prompt per microlitre -- while ensuring that
+        widening the declared envelope invalidates the narrower grant it was
+        given under, rather than silently inheriting it. The commanded value is
+        deliberately excluded (see ``_normalize_detail``); values outside the
+        band never reach approval at all, because the risk classifier
+        hardline-denies them first.
+
+        ``location`` is included in the summary on purpose: in the physical
+        world, *which* machine is safety information, and the summary is what a
+        human reads before consenting.
+        """
+        merged = dict(metadata or {})
+        merged.update(
+            {
+                "device_id": device_id,
+                "channel_id": channel_id,
+                "envelope_band": envelope_band,
+                "reversible": reversible,
+            }
+        )
+        if quantity:
+            merged["quantity"] = quantity
+        where = f" at {location}" if location else ""
+        rendered = _render_device_value(value, unit)
+        action_word = kind.rsplit(".", 1)[-1]
+        resource = f"{device_id}:{channel_id}"
+        if envelope_band:
+            resource = f"{resource}@{envelope_band}"
+        return cls(
+            kind=kind,
+            summary=f"{action_word.capitalize()} {device_id}.{channel_id}{where}",
+            detail=(
+                f"{action_word} {device_id}.{channel_id}"
+                f"{f' to {rendered}' if rendered else ''}"
+                f"{where}."
+            ),
+            effect=_DEVICE_EFFECTS.get(kind, ActionEffect.EXECUTE.value),
+            resource=resource,
+            origin=origin,
+            metadata=merged,
+        )
+
+    @classmethod
+    def mcp_tool(
+        cls,
+        *,
+        server: str,
+        tool: str,
+        arguments: Any = None,
+        description: str = "",
+        read_only: bool = False,
+        origin: str = ActionOrigin.AGENT_TOOL.value,
+        metadata: dict[str, Any] | None = None,
+    ) -> "ActionDescriptor":
+        """Describe a call to a tool supplied by an external MCP server.
+
+        ``resource`` is ``<server>:<tool>`` and the arguments are deliberately kept out
+        of the grant identity (see ``_normalize_detail``): scoping consent to the tool
+        rather than the payload is what makes "allow this tool for the session" a usable
+        decision instead of a prompt per distinct argument -- the same reasoning already
+        applied to ``network.fetch``.
+
+        The server name leads the summary because it is the trust boundary. Which server
+        a tool came from is the only thing a person can actually judge; the tool's own
+        description was written by that server and cannot vouch for itself.
+        """
+        merged = dict(metadata or {})
+        merged.update({"server": server, "tool": tool, "read_only": read_only})
+        summary = f"Run MCP tool {tool} from server {server}"
+        detail = f"MCP server {server!r} tool {tool!r}"
+        if description.strip():
+            # Truncated because this text is persisted to the approval audit log, and an
+            # MCP description is attacker-controlled input of unbounded length.
+            detail = f"{detail}: {' '.join(description.split())[:400]}"
+        return cls(
+            kind=ActionKind.MCP_TOOL.value,
+            summary=summary,
+            detail=detail,
+            effect=ActionEffect.READ.value if read_only else ActionEffect.EXECUTE.value,
+            resource=f"{server}:{tool}",
             origin=origin,
             metadata=merged,
         )
@@ -295,6 +422,30 @@ def _normalize_resource(resource: str) -> str:
     return resource.replace("\\", "/").strip().lower()
 
 
+_DEVICE_KIND_PREFIX = "device."
+
+_DEVICE_EFFECTS: dict[str, str] = {
+    ActionKind.DEVICE_READ.value: ActionEffect.READ.value,
+    ActionKind.DEVICE_CONFIGURE.value: ActionEffect.CONFIGURE.value,
+    ActionKind.DEVICE_ACTUATE.value: ActionEffect.EXECUTE.value,
+    ActionKind.DEVICE_DISPENSE.value: ActionEffect.EXECUTE.value,
+    ActionKind.DEVICE_ESTOP.value: ActionEffect.EXECUTE.value,
+}
+
+
+def _render_device_value(value: Any, unit: str) -> str:
+    """Render a commanded value for a human reading an approval prompt.
+
+    Kept deliberately dumb: no rounding, no unit conversion. The prompt must
+    show what will actually be sent, and this text is also persisted to the
+    approval audit log.
+    """
+    if value is None:
+        return ""
+    rendered = str(value)
+    return f"{rendered} {unit}".strip() if unit else rendered
+
+
 def _normalize_detail(kind: str, detail: str) -> str:
     text = re.sub(r"\s+", " ", detail.strip())
     if kind in {ActionKind.GATEWAY_SEND.value, ActionKind.PLATFORM_ACTION.value}:
@@ -304,4 +455,19 @@ def _normalize_detail(kind: str, detail: str) -> str:
         # keeping the full URL here would mint a separate grant per path and
         # query string and re-prompt for every request to an approved host.
         return "<network-target>"
+    if kind == ActionKind.MCP_TOOL.value:
+        # Same reasoning: the grant is scoped by server:tool, so the arguments must not
+        # enter the key or every distinct payload would re-prompt for a tool the user
+        # already approved. The description is excluded too -- it is attacker-controlled
+        # text from the server, and letting it shape grant identity would let a server
+        # invalidate its own grants by rewording itself.
+        return "<mcp-invocation>"
+    if kind.startswith(_DEVICE_KIND_PREFIX):
+        # Same reasoning as network.fetch, one step further: the grant is scoped
+        # by device:channel (the resource) plus the declared envelope band, so
+        # the commanded value must not enter the key or every distinct setpoint
+        # would mint its own grant and re-prompt. Values outside the band never
+        # reach approval -- the risk classifier hardline-denies them first, which
+        # is what makes a band-wide consent safe rather than open-ended.
+        return "<device-command>"
     return text[:4000]

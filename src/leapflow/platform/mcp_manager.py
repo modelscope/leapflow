@@ -41,6 +41,23 @@ class McpServerConfig:
     stderr_log_path: Optional[str] = None
 
 
+def _read_only_hint(tool: Any) -> bool:
+    """Return the server's ``readOnlyHint`` annotation, defaulting to False.
+
+    Read through ``getattr`` rather than attribute access because annotations are optional
+    and were added to the MCP tool schema after its first revisions: a server that
+    predates them, or omits them, must not break discovery. Absence yields the guarded
+    answer, never the permissive one.
+    """
+    annotations = getattr(tool, "annotations", None)
+    if annotations is None:
+        return False
+    hint = getattr(annotations, "readOnlyHint", None)
+    if hint is None and isinstance(annotations, dict):
+        hint = annotations.get("readOnlyHint")
+    return hint is True
+
+
 @dataclass(frozen=True)
 class McpToolSchema:
     """Schema for a discovered MCP tool (OpenAI function-calling format)."""
@@ -49,15 +66,57 @@ class McpToolSchema:
     server_name: str
     description: str = ""
     parameters: Dict[str, Any] = field(default_factory=dict)
+    read_only: bool = False
+    """The server's own ``readOnlyHint`` annotation, absent means False.
+
+    Absence is not a claim of read-only, so it defaults to the guarded reading. The
+    hint is honoured where present for the same reason a plugin's declared metadata is:
+    it is the provider's own contract.
+    """
 
     def to_openai_function(self) -> Dict[str, Any]:
-        """Convert to OpenAI function-calling tool definition."""
+        """Convert to OpenAI function-calling tool definition.
+
+        The ``x_leapflow`` block is not decoration. Two separate consumers read it and
+        neither can be skipped:
+
+        * ``CapabilityManifest.from_tool_definition`` honours ``risk_level`` and
+          ``requires_approval``, which is what puts the tool in the right PCD tier.
+        * ``ToolRegistry.from_definitions`` honours ``effect_scope`` and
+          ``idempotency_scope`` -- and re-infers ``risk_level`` from the tool *name*,
+          ignoring the declared value. ``effect_scope="external"`` is therefore the only
+          thing that makes ``execution_policy_for`` return ``external_side_effect``.
+
+        Without it an MCP tool falls through to ``mutating_idempotent`` -- "safe to
+        repeat" -- so a failed call to a third-party server would be silently replayed.
+        A read-only tool is exempt: replaying a read converges, and marking it otherwise
+        would stall safe retries.
+        """
+        metadata: Dict[str, Any] = {
+            "category": "mcp",
+            "schema_cost": "medium",
+            "mcp_server": self.server_name,
+            "mcp_read_only": self.read_only,
+        }
+        if self.read_only:
+            metadata.update({"risk_level": "read_only", "requires_approval": False})
+        else:
+            metadata.update(
+                {
+                    "risk_level": "external",
+                    "requires_approval": True,
+                    "effect_scope": "external",
+                    "idempotency_scope": "session",
+                    "mutates_state": True,
+                }
+            )
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
                 "parameters": self.parameters or {"type": "object", "properties": {}},
+                "x_leapflow": metadata,
             },
         }
 
@@ -193,6 +252,7 @@ class StdioMcpServer:
                     server_name=self._config.name,
                     description=tool.description or "",
                     parameters=mcp_schema_to_openai(tool.inputSchema) if tool.inputSchema else {},
+                    read_only=_read_only_hint(tool),
                 ))
             return schemas
         except Exception as e:

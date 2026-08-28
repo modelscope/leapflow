@@ -43,6 +43,11 @@ _BUILTIN_PLUGIN_MODULES = (
     "leapflow.plugins.tool_plugins.self_management",
     # Desktop semantics — tools activate only once perception is bound.
     "leapflow.plugins.tool_plugins.desktop_semantic",
+    # Hardware Context Protocol — appended last, and contributes no tools until a
+    # hardware registry is bound. With hardware disabled the tool index is
+    # byte-identical to a build without it, which is what keeps the journey
+    # cassette fingerprints valid.
+    "leapflow.hardware.plugin",
 )
 
 
