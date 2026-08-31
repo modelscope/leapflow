@@ -671,3 +671,175 @@ async def test_an_optimisation_performed_once_is_reusable() -> None:
     # The attempt that failed to track is still on record, not discarded.
     assert max(row["delta"] for row in protein_rows) > 0.05
     assert "water" in rows[-1]["command"]
+
+
+# ════════════════════════════════════════════════════════════════
+# Model fidelity: the residual a learning loop can actually reduce
+# ════════════════════════════════════════════════════════════════
+
+
+def _observe_once(recorder: Any, *, commanded: float, factor: float, at: float) -> Any:
+    """Command a channel and observe the device landing ``factor`` of the way there."""
+    channel = _channel()
+    recorder.record_command(device_id="rig", channel=channel, value=commanded, now=at)
+    return recorder.observe(
+        device_id="rig", channel_id=channel.channel_id, value=commanded * factor, now=at + 60.0
+    )
+
+
+def test_the_first_command_is_predicted_to_land_exactly() -> None:
+    """A device is expected to do what it is told until evidence says otherwise."""
+    recorder = HardwareOutcomeRecorder(experience_store=FakeExperienceStore())
+    outcome = _observe_once(recorder, commanded=10.0, factor=0.92, at=0.0)
+
+    assert outcome is not None
+    assert outcome.predicted == outcome.commanded
+    assert outcome.model_delta == outcome.delta, (
+        "with no prior observation the two residuals are the same measurement"
+    )
+
+
+def test_a_consistent_bias_is_learned_so_model_error_falls_while_device_error_does_not() -> None:
+    """The distinction that makes this worth having.
+
+    Before this, the expected value was always the commanded value, so the residual
+    measured the *device* and could never improve: a valve that always ran eight
+    percent low reported the same error on its thousandth command as on its first, and
+    nothing in the loop was capable of getting better at anything.
+
+    The device error must stay put -- the hardware did not change -- while the model
+    error falls, because that second number is the only one a learning loop can drive.
+    """
+    recorder = HardwareOutcomeRecorder(experience_store=FakeExperienceStore())
+    device_errors: list[float] = []
+    model_errors: list[float] = []
+    for index in range(5):
+        outcome = _observe_once(recorder, commanded=10.0, factor=0.92, at=index * 200.0)
+        assert outcome is not None
+        device_errors.append(outcome.delta)
+        model_errors.append(outcome.model_delta)
+
+    assert len(set(round(value, 6) for value in device_errors)) == 1, (
+        f"the device did not change, so its error must not either: {device_errors}"
+    )
+    assert model_errors[-1] < model_errors[0], (
+        f"the model never improved: {model_errors}"
+    )
+    assert model_errors[-1] < 1e-6, f"a fixed bias must be learned exactly: {model_errors}"
+
+
+def test_an_accurate_device_can_be_unpredictable_and_says_so() -> None:
+    """Accuracy and predictability are different claims, and both matter.
+
+    A device with a known bias is compensable. A device that lands somewhere different
+    every time is not, however close to the command it happens to get, and collapsing
+    the two into one number would hide exactly that.
+
+    The swing is sized against the *declared span*, not against the command, because
+    that is what both thresholds normalise by: on a channel declared 0-200, being three
+    units off is two percent and genuinely is within tolerance. The first version of
+    this test alternated by thirty percent of a command of ten and asserted the device
+    looked unpredictable -- it did not, and the implementation was right.
+    """
+    recorder = HardwareOutcomeRecorder(experience_store=FakeExperienceStore())
+    channel = _channel()
+    span = channel.envelope.max_value - channel.envelope.min_value
+    commanded = 100.0
+    swing = span * 0.2  # far outside the 5% of span that counts as tracking
+
+    outcome = None
+    for index, direction in enumerate((1, -1, 1, -1)):
+        recorder.record_command(
+            device_id="rig", channel=channel, value=commanded, now=index * 200.0
+        )
+        outcome = recorder.observe(
+            device_id="rig",
+            channel_id=channel.channel_id,
+            value=commanded + direction * swing,
+            now=index * 200.0 + 60.0,
+        )
+        assert outcome is not None
+    assert outcome is not None
+    assert outcome.predictable is False, (
+        f"an alternating device must not look understood (model delta "
+        f"{outcome.model_delta:.4f} on a span of {span:g})"
+    )
+
+
+def test_the_learned_correction_cannot_leave_the_declared_envelope() -> None:
+    """A prediction may be wrong; it may not be absurd.
+
+    One transient caught just after settling would otherwise push the expected value
+    past the limits a human wrote down, and every later model residual would be
+    measured against a value the device is not permitted to reach.
+    """
+    recorder = HardwareOutcomeRecorder(experience_store=FakeExperienceStore())
+    channel = _channel()
+    span = channel.envelope.max_value - channel.envelope.min_value
+
+    for index in range(6):  # a wildly wrong reading, repeatedly
+        recorder.record_command(device_id="rig", channel=channel, value=10.0, now=index * 200.0)
+        recorder.observe(
+            device_id="rig", channel_id=channel.channel_id, value=10_000.0,
+            now=index * 200.0 + 60.0,
+        )
+
+    calibration = recorder.calibration_for("rig", channel.channel_id)
+    assert calibration is not None
+    recorder.record_command(device_id="rig", channel=channel, value=10.0, now=5000.0)
+    outcome = recorder.observe(
+        device_id="rig", channel_id=channel.channel_id, value=10.0, now=5060.0
+    )
+    assert outcome is not None
+    assert abs(outcome.predicted - outcome.commanded) <= span * 0.25 + 1e-9, (
+        f"the correction escaped its cap: predicted {outcome.predicted} for a span of {span}"
+    )
+
+
+def test_the_stored_experience_names_the_correction_it_applied() -> None:
+    """A later reader must be able to tell an accurate device from an understood one."""
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(experience_store=store)
+    _observe_once(recorder, commanded=10.0, factor=0.92, at=0.0)
+    _observe_once(recorder, commanded=10.0, factor=0.92, at=200.0)
+
+    assert store.records[0]["predicted_effect"].startswith("reach 10")
+    assert "prior bias" in store.records[1]["predicted_effect"], (
+        f"the second prediction was corrected but does not say so: "
+        f"{store.records[1]['predicted_effect']!r}"
+    )
+
+
+def test_the_calibration_is_reported_per_channel_for_a_person_to_read() -> None:
+    """A correction the operator cannot inspect is one they cannot disagree with."""
+    recorder = HardwareOutcomeRecorder(experience_store=FakeExperienceStore())
+    channel = _channel()
+    assert recorder.calibration_for("rig", channel.channel_id) is None, "untested until observed"
+
+    _observe_once(recorder, commanded=10.0, factor=0.92, at=0.0)
+    calibration = recorder.calibration_for("rig", channel.channel_id)
+    assert calibration is not None
+    bias, samples = calibration
+    assert bias < 0, "the device undershot, so the correction must be negative"
+    assert samples == 1
+
+
+def test_an_outcome_built_without_a_prediction_reports_the_command() -> None:
+    """A numeric default for the prediction produced nonsense about a perfect device.
+
+    ``predicted: float = 0.0`` was indistinguishable from a genuine prediction of zero,
+    so an outcome constructed without it described a device that landed exactly on 50 as
+    "reach 0 (commanded 50, prior bias -50)". The sentinel makes the honest starting
+    point -- the command itself -- automatic rather than the caller's responsibility.
+    """
+    outcome = PhysicalOutcome(
+        device_id="d", channel_id="c", quantity="q", unit="u",
+        commanded=50.0, observed=50.0, delta=0.0, residual=0.0,
+    )
+    assert outcome.predicted == 50.0
+    assert outcome.to_predicted_effect() == "reach 50 u"
+    assert outcome.model_delta == outcome.delta, (
+        "with no prediction the two residuals are the same measurement, not a stand-in"
+    )
+    assert outcome.model_residual == outcome.residual
+    assert outcome.predictable is True

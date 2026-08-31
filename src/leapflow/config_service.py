@@ -161,6 +161,18 @@ _FIELD_DESCRIPTIONS = {
         "How long raw sample files are kept. They are session-scoped, sensitive, and "
         "never synced. Read when sampling starts, so a change needs a daemon restart."
     ),
+    "hardware.history_retention_days": (
+        "How long downsampled history windows are kept in instrument.duckdb. Longer than "
+        "the raw tier because this is the data later analysis reads, but bounded: nothing "
+        "else deletes from that table. Read when sampling starts, so a change needs a "
+        "daemon restart."
+    ),
+    "hardware.raw_segment_mb": (
+        "Size at which a raw sample file is closed and a new segment started. A finished "
+        "segment is written once, so its indexed size and TTL are accurate and old data "
+        "can expire without touching the file being appended to. Read when sampling "
+        "starts, so a change needs a daemon restart."
+    ),
     "llm.api_key": "Primary LLM API key stored in the local secret vault.",
     "llm.aux_api_key": "Auxiliary LLM provider API key stored in the local secret vault.",
     "llm.base_url": "OpenAI-compatible endpoint for the primary LLM provider.",

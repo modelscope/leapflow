@@ -35,6 +35,22 @@ _last_hint: Optional["PredictionCandidate"] = None
 _WATCH_EXIT_ACTIVE_STATES = frozenset({"armed", "watching", "due", "confirming", "executing"})
 
 
+def _board_lens_names() -> tuple[str, ...]:
+    """Return the installed board lenses, for ``/board `` completion.
+
+    Read from the template library rather than enumerated, because a lens is a YAML
+    file an operator can add: a hardcoded list would silently stop offering theirs.
+    Failure is empty, not fatal -- losing a completion must never stop the TUI starting.
+    """
+    try:
+        from leapflow.dashboard.templates import TemplateLibrary
+
+        return tuple(sorted(TemplateLibrary().names()))
+    except Exception:
+        logger.debug("slash completion: board lenses unavailable", exc_info=True)
+        return ()
+
+
 def _is_app_command(canonical: str) -> bool:
     """Return true only for `/app` or `/app ...`, not `/apple`."""
     return canonical == "app" or canonical.startswith("app ")
@@ -913,6 +929,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         status=status,
         commands=completion_entries(),
         config_fields=tuple(ConfigService(ctx.settings).list_fields()),
+        board_templates=_board_lens_names(),
         history_path=ctx.settings.profile_layout.tui_history_path,
         on_input=handle_input,
         on_control=_handle_task_control,
@@ -1517,6 +1534,7 @@ async def cmd_interactive_daemon(
         status=status,
         commands=completion_entries(),
         config_fields=tuple(ConfigService(settings).list_fields()),
+        board_templates=_board_lens_names(),
         history_path=settings.profile_layout.tui_history_path,
         on_input=handle_input,
         on_control=_handle_task_control,

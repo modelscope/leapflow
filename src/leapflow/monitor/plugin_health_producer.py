@@ -4,8 +4,11 @@ Emits Monitor Findings when plugin trust degrades or error rate spikes,
 enabling proactive notification to the Agent without waiting for
 explicit plugin_status queries.
 
-Domain: ``plugin_health``. Registered with ProducerRegistry so MonitorManager
-can invoke it on a watch schedule (default 5 min polling).
+Domain: ``plugin_health``. Both halves of that are required and neither implies the
+other: ``MonitorCoordinator`` registers this producer *and* arms a ``plugin-health``
+watch on a 5-minute interval. Registration alone leaves it resolvable but never
+called, because a producer only runs when a watch names its domain -- which is the
+state this module was actually in while this docstring claimed otherwise.
 """
 
 from __future__ import annotations

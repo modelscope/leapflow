@@ -14,6 +14,16 @@ PRIORITY_NORMAL: int = 3     # Default: clipboard, scroll, etc.
 PRIORITY_LOW: int = 2        # Background: filesystem changes
 PRIORITY_DEFERRED: int = 1   # System: unmapped / internal
 
+PRE_NORMALIZED_EVENT_PREFIXES: tuple[str, ...] = ("gateway.", "daemon.", "hw.")
+"""Event-type prefixes whose producers already emit normalized types.
+
+Every normalizer passes these through unchanged, because downstream consumers --
+watch triggers, the board's family grouping -- match on the original type. Anything
+not listed here collapses to ``internal.unmapped``, which silently discards the
+family a producer chose; kept in one place so adding a source is one edit rather
+than a matching pair that can drift apart.
+"""
+
 
 @dataclass(frozen=True)
 class SystemEvent:

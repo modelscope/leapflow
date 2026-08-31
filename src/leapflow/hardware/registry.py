@@ -66,6 +66,8 @@ class HardwareSettings:
     persist_readings: bool = True
     downsample_interval_s: float = 60.0
     raw_retention_days: float = 7.0
+    history_retention_days: float = 90.0
+    raw_segment_mb: float = 32.0
     readings_dir: str = ""
     instrument_db_path: str = ""
     workspace_id: str = ""
@@ -120,6 +122,10 @@ class HardwareSettings:
             raw_retention_days=float(
                 getattr(settings, "hardware_raw_retention_days", 7.0) or 7.0
             ),
+            history_retention_days=float(
+                getattr(settings, "hardware_history_retention_days", 90.0) or 90.0
+            ),
+            raw_segment_mb=float(getattr(settings, "hardware_raw_segment_mb", 32.0) or 32.0),
             instrument_db_path=(
                 str(profile_layout.instrument_db_path) if profile_layout is not None else ""
             ),
@@ -205,6 +211,7 @@ class HardwareRegistry:
         self._contexts: dict[str, HardwareContext] = {}
         self._transports: dict[str, HardwareTransport] = {}
         self._open_locks: dict[str, asyncio.Lock] = {}
+        self._io_locks: dict[str, asyncio.Lock] = {}
         self._report = LoadReport()
         self._described: set[tuple[str, str]] = set()
         self._last_command: dict[tuple[str, str], tuple[float, float]] = {}
@@ -216,6 +223,7 @@ class HardwareRegistry:
         # Bounded on purpose: an unbounded event log on a long-running bench is a leak
         # with a schedule, and hw_status only ever shows a recent tail.
         self._recent_events: Deque[Any] = deque(maxlen=200)
+        self._event_emitter: Any = None
 
     # ── Loading ──
 
@@ -595,6 +603,8 @@ class HardwareRegistry:
                 session_id=self._session_id,
                 raw_ttl_s=self._settings.raw_retention_days * 24 * 3600.0,
                 downsample_interval_s=self._settings.downsample_interval_s,
+                history_ttl_s=self._settings.history_retention_days * 24 * 3600.0,
+                raw_segment_bytes=int(self._settings.raw_segment_mb * 1024 * 1024),
             )
         return self._reading_store
 
@@ -674,15 +684,19 @@ class HardwareRegistry:
                 return source.ring.summary()
         return None
 
-    async def start_streams(self, emit: Any = None) -> int:
+    async def start_streams(self) -> int:
         """Start sampling every streaming channel, returning how many started.
 
         The registry owns this lifecycle rather than delegating it to
-        ``ActiveSourceManager``, because that manager currently has no production
+        ``ActiveSourceManager``, because that manager still has no production
         caller: relying on it would mean shipping a sampling loop that never runs.
-        Sources still satisfy ``ActiveSignalSource``, so they can be handed to the
-        manager unchanged once it is wired, and *emit* is the same callback it would
-        pass -- absent it, events are still recorded for hw_status.
+
+        Events go to whatever ``set_event_emitter`` installed. Without it they are
+        still recorded for ``hw_status``, but nothing reacts to them -- a bench can
+        leave its declared envelope overnight with no watch, board or turn ever
+        hearing about it. The sink is read from the registry rather than taken as an
+        argument so that omitting it is one fact about the process instead of a
+        mistake each caller can make separately.
         """
         sources = self.stream_sources()
         if not sources:
@@ -690,7 +704,7 @@ class HardwareRegistry:
         started = 0
         for source in sources:
             try:
-                await source.start(emit)
+                await source.start(self._event_emitter)
                 started += 1
             except Exception as exc:  # noqa: BLE001 - one source must not stop the rest
                 logger.warning(
@@ -716,6 +730,39 @@ class HardwareRegistry:
         """Keep a bounded tail of derived events for hw_status."""
         self._recent_events.append(event)
 
+    def set_event_emitter(self, emit: Any) -> None:
+        """Install the sink that carries hardware events onto the signal path.
+
+        One installation point rather than an argument threaded to each producer.
+        The sampling loop used to take its emitter as a parameter, which made
+        "forgot to pass it" a per-callsite mistake that no test could see from the
+        inside -- and it shipped exactly that way once: six detection rules produced
+        events that reached nothing. With the sink held here, whether anything is
+        listening is a single testable fact, and the command path can report through
+        the same channel as the sampling loop.
+        """
+        self._event_emitter = emit
+
+    def publish_event(self, event: Any) -> None:
+        """Record an event and put it on the signal path.
+
+        Used by the command path. The sampling loop keeps its own dispatch because it
+        must pace per channel first, and that state belongs to the source.
+
+        Not paced here: a command is a human-scale act and each refusal is one the
+        operator asked for, so suppressing repeats would hide the very thing that
+        makes a stalled bench visible. Downstream deduplication remains free to
+        collapse them.
+        """
+        self.record_event(event)
+        emit = self._event_emitter
+        if emit is None:
+            return
+        try:
+            emit(event)
+        except Exception as exc:  # noqa: BLE001 - a sink must not fail the command
+            logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
+
     def recent_events(self, device_id: str = "", limit: int = 10) -> tuple[Any, ...]:
         """Return the most recent derived events, newest last."""
         items = [
@@ -732,6 +779,29 @@ class HardwareRegistry:
 
     def was_described(self, session_id: str, device_id: str) -> bool:
         return (str(session_id), str(device_id)) in self._described
+
+    def device_io(self, device_id: str) -> Any:
+        """Return an async context manager serialising data-plane access to one device.
+
+        Per device, not per channel: a serial line, an I2C bus or a GPIB address is a
+        single conversation, and two coroutines reading different channels of the same
+        instrument interleave request and response frames. The result is not a failed
+        read -- it is a *plausible* reading carrying the wrong channel's value, which
+        no downstream check can detect. Streaming makes this the common case rather
+        than an edge one, because one task per channel starts automatically.
+
+        ``halt`` deliberately does not take this lock. Emergency stop must preempt a
+        queued read, not wait behind it.
+
+        A shared bus hosting several addresses still needs a coarser lock; that needs
+        a real device to size (see the transport conformance suite).
+        """
+        key = str(device_id)
+        lock = self._io_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._io_locks[key] = lock
+        return lock
 
     # ── Rate-limit baseline ──
 
@@ -754,6 +824,31 @@ class HardwareRegistry:
         return self._last_command.get((str(device_id), str(channel_id)))
 
     # ── Teardown ──
+
+    async def drop_transport(self, device_id: str) -> None:
+        """Forget the cached transport for *device_id* so the next call reconnects.
+
+        ``transport()`` caches, and the cache is what makes a dead connection
+        permanent: a server that restarted leaves a session object that answers every
+        probe with "not connected", and since the instance is cached ``open()`` is
+        never called again. Without this, one transient outage would make a device
+        unusable for the life of the process.
+
+        Never raises. It is called from failure paths, where an exception would
+        replace the original diagnosis with a teardown error.
+        """
+        transport = self._transports.pop(device_id, None)
+        if transport is None:
+            return
+        try:
+            await transport.close()
+        except Exception as exc:  # noqa: BLE001 - as above
+            logger.warning(
+                "Hardware transport %r close failed while dropping it: %s",
+                device_id,
+                exc,
+                exc_info=True,
+            )
 
     async def close_all(self) -> None:
         """Stop sampling, then close every open transport, isolating failures.

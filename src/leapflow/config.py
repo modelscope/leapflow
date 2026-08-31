@@ -187,6 +187,14 @@ class Settings:
     hardware_downsample_interval_s: float = 60.0
     # TTL for raw sample files, which are sensitive and non-syncable.
     hardware_raw_retention_days: float = 7.0
+    # How long downsampled history is kept. Longer than the raw tier because this is
+    # what later analysis reads, but bounded: the table grows at a fixed rate per
+    # streaming channel and nothing else was ever going to delete from it.
+    hardware_history_retention_days: float = 90.0
+    # Byte cap per raw sample file before a new segment starts. Segments exist so a
+    # finished one is a write-once artifact -- its recorded size and TTL are correct,
+    # and old data can be dropped without discarding the file being written to.
+    hardware_raw_segment_mb: float = 32.0
     runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
@@ -1009,6 +1017,10 @@ def _build_settings_from_env(
     hardware_persist_readings = os.getenv("LEAPFLOW_HARDWARE_PERSIST_READINGS", "1").strip().lower() in ("1", "true", "yes")
     hardware_downsample_interval_s = float(os.getenv("LEAPFLOW_HARDWARE_DOWNSAMPLE_INTERVAL_S", "60"))
     hardware_raw_retention_days = float(os.getenv("LEAPFLOW_HARDWARE_RAW_RETENTION_DAYS", "7"))
+    hardware_history_retention_days = float(
+        os.getenv("LEAPFLOW_HARDWARE_HISTORY_RETENTION_DAYS", "90")
+    )
+    hardware_raw_segment_mb = float(os.getenv("LEAPFLOW_HARDWARE_RAW_SEGMENT_MB", "32"))
     web_transport = os.getenv("LEAPFLOW_WEB_TRANSPORT", "auto").strip().lower() or "auto"
     web_timeout_s = float(os.getenv("LEAPFLOW_WEB_TIMEOUT_S", "20"))
     web_max_bytes = int(os.getenv("LEAPFLOW_WEB_MAX_BYTES", "2000000"))
@@ -1382,6 +1394,8 @@ def _build_settings_from_env(
         hardware_persist_readings=hardware_persist_readings,
         hardware_downsample_interval_s=hardware_downsample_interval_s,
         hardware_raw_retention_days=hardware_raw_retention_days,
+        hardware_history_retention_days=hardware_history_retention_days,
+        hardware_raw_segment_mb=hardware_raw_segment_mb,
         web_transport=web_transport,
         web_timeout_s=web_timeout_s,
         web_max_bytes=web_max_bytes,

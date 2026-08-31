@@ -10,7 +10,7 @@ import logging
 import time
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from leapflow.domain.events import SystemEvent
+from leapflow.domain.events import PRE_NORMALIZED_EVENT_PREFIXES, SystemEvent
 from leapflow.memory.providers.episodic import EpisodicMemoryProvider
 from leapflow.memory.providers.working import WorkingMemoryProvider
 from leapflow.platform.normalizer import EventNormalizer
@@ -275,9 +275,9 @@ class EventBus:
                 payload={"sub_type": action, "app_bundle_id": app_bundle_id, **payload},
                 timestamp=payload.get("timestamp", time.time()),
             )
-        # Gateway/daemon events are pre-normalized upstream; pass through so
+        # Producers on these prefixes emit normalized types already; pass through so
         # downstream subscribers see the original event_type for matching.
-        if event_type.startswith("gateway.") or event_type.startswith("daemon."):
+        if event_type.startswith(PRE_NORMALIZED_EVENT_PREFIXES):
             return SystemEvent(
                 event_type=event_type,
                 source=str(payload.get("_platform", payload.get("source", event_type))),

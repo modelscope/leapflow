@@ -14,6 +14,7 @@ production code, because the protocol must not know what a liquid handler is.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -30,6 +31,8 @@ from leapflow.hardware.context import (
     Interlock,
     TransportRef,
 )
+from leapflow.hardware.transport import SIDE_EFFECT_NONE
+from leapflow.hardware.transports.mcp import set_mcp_client_provider
 from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
 from leapflow.hardware.risk import build_risk_classifier
 from leapflow.hardware.tools import HardwareTools, build_hardware_tools
@@ -383,14 +386,17 @@ def test_t1_write_tools_are_classified_as_non_replayable() -> None:
         assert effect_is_uncertain_on_failure(policy) is True
 
 
-def test_t1_declared_risk_level_alone_would_not_be_enough() -> None:
-    """Pins why the write metadata declares four keys instead of one.
+def test_t1_a_declared_external_risk_now_reaches_the_execution_policy() -> None:
+    """``risk_level="external"`` is honoured, so it no longer needs a second key.
 
-    ``ToolRegistry.from_definitions`` re-infers ``risk_level`` from the tool *name*
-    and ignores the declared value, while honouring ``effect_scope``. A future edit
-    that trims the metadata down to ``risk_level`` would silently drop physical
-    writes back to a replayable policy, so the asymmetry is asserted rather than
-    left as a comment.
+    This test previously asserted the opposite -- that the declared value was
+    re-inferred away -- and passed for exactly that reason. It pinned the defect
+    instead of the requirement, which is why nothing ever pushed the fix: a test
+    that agrees with the bug stays green forever.
+
+    The write metadata still declares ``effect_scope`` as well, because the two
+    keys answer different questions and either one alone should be sufficient to
+    keep a physical command out of a replayable policy.
     """
     definitions = [
         {
@@ -405,8 +411,93 @@ def test_t1_declared_risk_level_alone_would_not_be_enough() -> None:
     ]
     resolver = ToolRegistry.from_definitions(definitions, {"hw_dispense": lambda **_: None})
     spec = resolver.specs["hw_dispense"]
-    assert spec.risk_level != "external", "declared risk_level is expected to be re-inferred"
-    assert execution_policy_for("hw_dispense", spec) != "external_side_effect"
+    assert spec.risk_level == "external"
+    assert execution_policy_for("hw_dispense", spec) == "external_side_effect"
+    assert effect_is_uncertain_on_failure("external_side_effect") is True
+
+
+def test_t1_a_graded_risk_level_never_buys_the_read_only_policy() -> None:
+    """A disclosure grade is not an effect classification.
+
+    ``x_leapflow.risk_level`` carries two vocabularies: graded for disclosure
+    (``none`` .. ``high``) and three-valued for execution. Copying ``"medium"``
+    across would land a value outside ``RiskLevel`` in a typed field and match none
+    of the comparisons that read it -- which is why the declaration is consulted
+    rather than honoured wholesale. What must never happen is the reverse: a tool
+    that declares any graded risk being resolved to ``read_only``, a policy that
+    skips the execution ledger, parallelises freely and is exempt from side-effect
+    gating.
+    """
+    for graded in ("low", "medium", "high"):
+        definitions = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bench_probe",
+                    "description": f"declares {graded} risk and nothing else",
+                    "parameters": {"type": "object", "properties": {}},
+                    "x_leapflow": {"risk_level": graded},
+                },
+            }
+        ]
+        resolver = ToolRegistry.from_definitions(definitions, {})
+        spec = resolver.specs["bench_probe"]
+        assert spec.risk_level == "mutating", graded
+        assert execution_policy_for("bench_probe", spec) != "read_only", graded
+
+
+def test_t1_an_undeclared_tool_is_not_assumed_effect_free() -> None:
+    """Absence of a declaration is not a claim of safety.
+
+    A third-party tool with an innocuous name used to resolve to ``read_only``,
+    because the name matched no fragment in a hardcoded list of mutating words.
+    Whether a call was gated therefore depended on the vocabulary its author
+    happened to pick.
+    """
+    definitions = [
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_report",
+                "description": "declares no x_leapflow metadata at all",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    resolver = ToolRegistry.from_definitions(definitions, {})
+    spec = resolver.specs["fetch_report"]
+    assert spec.risk_level == "mutating"
+    assert execution_policy_for("fetch_report", spec) != "read_only"
+
+
+def test_t1_an_explicit_no_effect_claim_outranks_the_name() -> None:
+    """``test_run`` contains "run" but is an inspection.
+
+    The declaration is explicit and a substring is a guess, so the declaration
+    wins. A mutating bridge still overrides both, since a declaration contradicted
+    by the handler's own answer is the stale one.
+    """
+    def _define(name: str, **metadata: object) -> ToolRegistry:
+        return ToolRegistry.from_definitions(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": "d",
+                        "parameters": {"type": "object", "properties": {}},
+                        "x_leapflow": metadata,
+                    },
+                }
+            ],
+            {},
+        )
+
+    claimed = _define("suite_run", risk_level="read_only")
+    assert claimed.specs["suite_run"].risk_level == "read_only"
+
+    contradicted = _define("suite_run", risk_level="read_only", mutates_state=True)
+    assert contradicted.specs["suite_run"].risk_level == "mutating"
 
 
 def test_t1_read_tools_stay_cheap_and_ungated() -> None:
@@ -1227,6 +1318,8 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.persist_readings",
         "hardware.downsample_interval_s",
         "hardware.raw_retention_days",
+        "hardware.history_retention_days",
+        "hardware.raw_segment_mb",
     }
     for key in keys:
         view = service.describe(key)
@@ -1334,3 +1427,240 @@ async def test_enabled_profile_drives_the_whole_chain_from_declarations(tmp_path
     assert len(human.prompts) == 1
 
     await registry.close_all()
+
+
+# ════════════════════════════════════════════════════════════════
+# Reachability precedes consent
+# ════════════════════════════════════════════════════════════════
+
+
+def _unreachable_context(**config: Any) -> HardwareContext:
+    """A bench node behind a transport that cannot be reached.
+
+    ``kind: mcp`` with no client installed is the shortest honest way to build one:
+    the transport refuses to open, exactly as a dead serial port or a stopped server
+    would, and the refusal comes from production code rather than a test double.
+    """
+    base = bench_node_context()
+    return replace(base, transport=TransportRef(kind="mcp", config=config or {
+        "read_tool": "r", "write_tool": "w", "halt_tool": "h",
+        "channel_arg": "c", "value_arg": "v",
+    }))
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_device_never_reaches_the_human() -> None:
+    """An action that cannot succeed must not be put in front of a person.
+
+    Before this, the order was resolve -> validate -> approve -> *open the transport*,
+    so a device that was never reachable produced a prompt, a consent, and only then
+    the failure. Asking somebody to authorise a command that cannot be delivered is
+    how people learn to click through prompts, and the prompt they learn to dismiss is
+    the same one that guards a command which *can* be delivered.
+    """
+    bench = Bench(_unreachable_context())
+    result = await bench.tools.hw_actuate(
+        device_id="bench_node", channel_id="fan_duty", value=30.0
+    )
+    assert result["ok"] is False
+    assert bench.human.prompts == [], "nobody may be asked about an undeliverable command"
+    assert result["failure_code"] == "mcp_client_unavailable"
+    assert result["side_effect_state"] == SIDE_EFFECT_NONE
+    assert "hw_status" in result["error"], "a refusal must name the next step"
+
+
+@pytest.mark.asyncio
+async def test_a_reachable_device_is_still_put_to_the_human() -> None:
+    """The check must gate on reachability alone, not quietly swallow the prompt."""
+    bench = Bench(bench_node_context())
+    result = await bench.tools.hw_actuate(
+        device_id="bench_node", channel_id="fan_duty", value=30.0
+    )
+    assert result["ok"] is True
+    assert len(bench.human.prompts) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_device_that_dies_after_opening_is_caught_before_consent() -> None:
+    """A cached transport is why an open alone is not enough.
+
+    ``transport()`` caches, so a connection that was live and then died is handed back
+    without ``open()`` ever running again -- the common failure for a server-backed
+    device whose server restarted. Only a probe sees it.
+    """
+
+    class _Dying:
+        """Answers the first probe (during open) and fails every one after it."""
+
+        def __init__(self) -> None:
+            self.probes = 0
+
+        async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+            if tool_name != "status":
+                return {"ok": True, "value": 0.0}
+            self.probes += 1
+            if self.probes == 1:
+                return {"ok": True}
+            return {"ok": False, "error": "session closed"}
+
+    dying = _Dying()
+    undo = set_mcp_client_provider(lambda: dying)
+    try:
+        bench = Bench(
+            _unreachable_context(
+                read_tool="r", write_tool="w", probe_tool="status", halt_tool="h",
+                channel_arg="c", value_arg="v",
+            )
+        )
+        result = await bench.tools.hw_actuate(
+            device_id="bench_node", channel_id="fan_duty", value=30.0
+        )
+    finally:
+        undo()
+    assert result["ok"] is False
+    assert bench.human.prompts == []
+    assert result["failure_code"] == "device_unreachable"
+    assert result["side_effect_state"] == SIDE_EFFECT_NONE
+
+
+@pytest.mark.asyncio
+async def test_a_dead_transport_is_dropped_so_the_next_attempt_reconnects() -> None:
+    """Otherwise one transient outage disables the device for the process's life.
+
+    The refusal must not outlive the condition that caused it: a cached dead session
+    answers every probe with "not connected", and nothing else would ever call
+    ``open()`` again.
+    """
+
+    class _Recovering:
+        """Fails the probe once after opening, then behaves."""
+
+        def __init__(self) -> None:
+            self.probes = 0
+            self.opens = 0
+
+        async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
+            if tool_name != "status":
+                return {"ok": True, "value": 0.0}
+            self.probes += 1
+            # Probe 1 runs inside the first open, probe 2 is the pre-consent check
+            # that must fail, probe 3 runs inside the reopen after the drop.
+            if self.probes == 2:
+                return {"ok": False, "error": "session closed"}
+            return {"ok": True}
+
+    client = _Recovering()
+    undo = set_mcp_client_provider(lambda: client)
+    try:
+        bench = Bench(
+            _unreachable_context(
+                read_tool="r", write_tool="w", probe_tool="status", halt_tool="h",
+                channel_arg="c", value_arg="v",
+            )
+        )
+        first = await bench.tools.hw_actuate(
+            device_id="bench_node", channel_id="fan_duty", value=30.0
+        )
+        assert first["failure_code"] == "device_unreachable"
+        assert bench.registry.opened_devices() == (), "the dead transport must be forgotten"
+
+        second = await bench.tools.hw_actuate(
+            device_id="bench_node", channel_id="fan_duty", value=30.0
+        )
+    finally:
+        undo()
+    assert second["ok"] is True, "the device must be usable again once the outage clears"
+    assert len(bench.human.prompts) == 1, "only the deliverable command reached the human"
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_is_not_blocked_by_an_unreachable_probe() -> None:
+    """Halt must still be attempted, because refusing to try to stop is worse.
+
+    The pre-consent check exists to keep undeliverable commands away from a human;
+    ``hw_estop`` asks no human, so gating it on reachability would only mean declining
+    to attempt a stop on a device that might still be moving.
+    """
+    bench = Bench(_unreachable_context())
+    result = await bench.tools.hw_estop(device_id="bench_node")
+    assert result["ok"] is False
+    assert result["failure_code"] == "mcp_client_unavailable", (
+        "the failure must come from attempting the halt, not from a pre-check refusing to"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_refusal_reaches_the_signal_path() -> None:
+    """A tool result is read once; the board and every watch need the event.
+
+    Without this the condition that most needs to be visible is the one nothing can
+    see: a bench refusing every command is indistinguishable from a bench nobody is
+    using. The refusal lands in the same ring and on the same sink as a threshold
+    breach, so no consumer needs to learn a second shape.
+    """
+    from leapflow.hardware.stream import EventKind
+
+    published: list[Any] = []
+    bench = Bench(_unreachable_context())
+    bench.registry.set_event_emitter(published.append)
+
+    result = await bench.tools.hw_actuate(
+        device_id="bench_node", channel_id="fan_duty", value=30.0
+    )
+    assert result["ok"] is False
+
+    recorded = bench.registry.recent_events(device_id="bench_node")
+    assert [event.kind for event in recorded] == [EventKind.UNREACHABLE]
+    assert recorded[0].channel_id == "fan_duty"
+    assert recorded[0].quantity == "ratio.fan_duty", "the channel's declared quantity"
+    assert recorded[0].observed_at > 1.7e9, "wall clock, since this crosses modules"
+
+    assert [event.kind for event in published] == [EventKind.UNREACHABLE], (
+        "recording it without emitting leaves the board blind, which is the whole point"
+    )
+    assert published[0].event_type == "hw.unreachable", "the family every consumer groups on"
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_still_happens_when_nothing_is_listening() -> None:
+    """Reporting is telemetry; it must never be what decides a command's fate."""
+    bench = Bench(_unreachable_context())  # no emitter installed
+
+    result = await bench.tools.hw_actuate(
+        device_id="bench_node", channel_id="fan_duty", value=30.0
+    )
+    assert result["failure_code"] == "mcp_client_unavailable"
+    assert len(bench.registry.recent_events(device_id="bench_node")) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_raising_event_sink_does_not_fail_the_command() -> None:
+    """The refusal is the answer; a broken sink must not replace it with a crash."""
+
+    def _explode(event: Any) -> None:
+        raise RuntimeError("bus is down")
+
+    bench = Bench(_unreachable_context())
+    bench.registry.set_event_emitter(_explode)
+
+    result = await bench.tools.hw_actuate(
+        device_id="bench_node", channel_id="fan_duty", value=30.0
+    )
+    assert result["failure_code"] == "mcp_client_unavailable"
+    assert result["side_effect_state"] == SIDE_EFFECT_NONE
+
+
+@pytest.mark.asyncio
+async def test_the_board_shows_an_unreachable_device_as_an_alert() -> None:
+    """End to end: the refusal must survive into the panel an operator reads."""
+    from leapflow.hardware.observability.digest import build_digest
+
+    bench = Bench(_unreachable_context())
+    await bench.tools.hw_actuate(device_id="bench_node", channel_id="fan_duty", value=30.0)
+
+    digest = build_digest(bench.registry)
+    kinds = [str(event["kind"]) for event in digest.events]
+    assert "unreachable" in kinds, f"the board timeline must carry it, got {kinds}"
+    row = next(event for event in digest.events if event["kind"] == "unreachable")
+    assert row["severity"] == "alert", "a bench that cannot be commanded is not routine"
+    assert row["title"].startswith("unreachable · bench_node.fan_duty")

@@ -91,14 +91,32 @@ def _registry(context: HardwareContext, **overrides: Any) -> HardwareRegistry:
     return registry
 
 
-def _reading(value: Any, *, sequence: int, timestamp: float = 0.0, quality: str = Quality.OK.value):
+_WALL_EPOCH = 1_780_000_000.0
+"""An arbitrary but realistic wall-clock base, three orders of magnitude above the
+monotonic values these tests use, so a clock mix-up is visible rather than plausible."""
+
+
+def _reading(
+    value: Any,
+    *,
+    sequence: int,
+    at: float = 0.0,
+    quality: str = Quality.OK.value,
+):
+    """Build a reading whose two clocks are distinguishable.
+
+    ``observed_at`` is offset onto a plausible wall-clock epoch so any code that
+    confuses the two produces an obviously wrong number instead of a subtly wrong
+    one -- the failure mode this pair exists to prevent is silence.
+    """
     return Reading(
         device_id="sampled_device",
         channel_id="level",
         value=value,
         quantity="generic.level",
         unit="unit",
-        timestamp=timestamp,
+        monotonic_at=at,
+        observed_at=_WALL_EPOCH + at,
         sequence=sequence,
         quality=quality,
     )
@@ -191,39 +209,39 @@ def test_threshold_event_fires_once_per_excursion() -> None:
     this layer exists to prevent.
     """
     detector = _detector()
-    assert detector.observe(_reading(50.0, sequence=1, timestamp=1.0)) == ()
-    first = detector.observe(_reading(150.0, sequence=2, timestamp=2.0))
+    assert detector.observe(_reading(50.0, sequence=1, at=1.0)) == ()
+    first = detector.observe(_reading(150.0, sequence=2, at=2.0))
     assert [e.kind for e in first] == [EventKind.THRESHOLD_EXCEEDED]
-    assert detector.observe(_reading(160.0, sequence=3, timestamp=3.0)) == ()
+    assert detector.observe(_reading(160.0, sequence=3, at=3.0)) == ()
 
 
 def test_returning_to_range_is_reported_as_recovery() -> None:
     """Recovery must be observable, not inferred from silence."""
     detector = _detector()
-    detector.observe(_reading(150.0, sequence=1, timestamp=1.0))
-    events = detector.observe(_reading(50.0, sequence=2, timestamp=2.0))
+    detector.observe(_reading(150.0, sequence=1, at=1.0))
+    events = detector.observe(_reading(50.0, sequence=2, at=2.0))
     assert [e.kind for e in events] == [EventKind.SETTLED]
 
 
 def test_rate_event_uses_the_declared_max_rate() -> None:
     detector = _detector(max_rate=5.0)
-    detector.observe(_reading(10.0, sequence=1, timestamp=1.0))
+    detector.observe(_reading(10.0, sequence=1, at=1.0))
     # 40 units in one second, against a declared 5/s.
-    events = detector.observe(_reading(50.0, sequence=2, timestamp=2.0))
+    events = detector.observe(_reading(50.0, sequence=2, at=2.0))
     assert EventKind.RATE_EXCEEDED in [e.kind for e in events]
 
 
 def test_no_rate_event_without_a_declared_limit() -> None:
     """No rule may exist that a human did not write down."""
     detector = _detector(max_rate=None)
-    detector.observe(_reading(10.0, sequence=1, timestamp=1.0))
-    events = detector.observe(_reading(90.0, sequence=2, timestamp=2.0))
+    detector.observe(_reading(10.0, sequence=1, at=1.0))
+    events = detector.observe(_reading(90.0, sequence=2, at=2.0))
     assert EventKind.RATE_EXCEEDED not in [e.kind for e in events]
 
 
 def test_sample_loss_is_reported() -> None:
     detector = _detector()
-    events = detector.observe(_reading(20.0, sequence=5, timestamp=1.0), lost=3)
+    events = detector.observe(_reading(20.0, sequence=5, at=1.0), lost=3)
     assert [e.kind for e in events] == [EventKind.SAMPLE_LOSS]
     assert "3 sample" in events[0].detail
 
@@ -234,7 +252,7 @@ def test_quality_degradation_needs_a_streak() -> None:
     kinds: list[str] = []
     for index in range(3):
         events = detector.observe(
-            _reading(20.0, sequence=index, timestamp=float(index), quality=Quality.SUSPECT.value)
+            _reading(20.0, sequence=index, at=float(index), quality=Quality.SUSPECT.value)
         )
         kinds.extend(e.kind for e in events)
     assert kinds.count(EventKind.QUALITY_DEGRADED) == 1
@@ -242,11 +260,11 @@ def test_quality_degradation_needs_a_streak() -> None:
 
 def test_quality_streak_resets_on_a_good_sample() -> None:
     detector = _detector()
-    detector.observe(_reading(20.0, sequence=1, timestamp=1.0, quality=Quality.SUSPECT.value))
-    detector.observe(_reading(20.0, sequence=2, timestamp=2.0, quality=Quality.SUSPECT.value))
-    detector.observe(_reading(20.0, sequence=3, timestamp=3.0))
+    detector.observe(_reading(20.0, sequence=1, at=1.0, quality=Quality.SUSPECT.value))
+    detector.observe(_reading(20.0, sequence=2, at=2.0, quality=Quality.SUSPECT.value))
+    detector.observe(_reading(20.0, sequence=3, at=3.0))
     events = detector.observe(
-        _reading(20.0, sequence=4, timestamp=4.0, quality=Quality.SUSPECT.value)
+        _reading(20.0, sequence=4, at=4.0, quality=Quality.SUSPECT.value)
     )
     assert EventKind.QUALITY_DEGRADED not in [e.kind for e in events]
 
@@ -254,7 +272,7 @@ def test_quality_streak_resets_on_a_good_sample() -> None:
 def test_silence_on_a_declared_rate_is_itself_an_observation() -> None:
     """A 10 Hz channel that says nothing for a second has failed."""
     detector = _detector(sample_rate_hz=10.0)
-    detector.observe(_reading(20.0, sequence=1, timestamp=100.0))
+    detector.observe(_reading(20.0, sequence=1, at=100.0))
     assert detector.check_stale(now=100.05) == ()
     events = detector.check_stale(now=101.0)
     assert [e.kind for e in events] == [EventKind.STALE]
@@ -264,7 +282,7 @@ def test_silence_on_a_declared_rate_is_itself_an_observation() -> None:
 
 def test_staleness_does_not_apply_to_an_unsampled_channel() -> None:
     detector = _detector(sample_rate_hz=0.0)
-    detector.observe(_reading(20.0, sequence=1, timestamp=100.0))
+    detector.observe(_reading(20.0, sequence=1, at=100.0))
     assert detector.check_stale(now=1000.0) == ()
 
 
@@ -357,10 +375,14 @@ async def test_stop_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_events_cross_the_boundary_as_interaction_signals() -> None:
-    """Only derived events reach the signal pipeline, and in its own type."""
-    from leapflow.perception.types import InteractionSignal
+async def test_events_cross_the_boundary_as_hardware_events() -> None:
+    """Only derived events reach the emit sink, and they keep their structure.
 
+    The sink receives the event rather than a flattened signal because the family,
+    the value and the unit are all needed downstream: an event type of
+    ``hw.<kind>`` is what makes the board group these without any enumeration, and
+    a detail string would force every consumer to parse it back apart.
+    """
     context = _context(sample_rate_hz=50.0)
     registry = _registry(context)
     source = registry.stream_sources()[0]
@@ -373,12 +395,68 @@ async def test_events_cross_the_boundary_as_interaction_signals() -> None:
     await asyncio.sleep(0.1)
     await source.stop()
 
-    assert emitted, "a threshold excursion should have produced a signal"
-    signal = emitted[0]
-    assert isinstance(signal, InteractionSignal)
-    assert signal.signal_type == "hw_event"
-    assert signal.app == "sampled_device"
-    assert "threshold_exceeded" in signal.detail
+    assert emitted, "a threshold excursion should have produced an event"
+    event = emitted[0]
+    assert isinstance(event, HardwareEvent)
+    assert event.kind == EventKind.THRESHOLD_EXCEEDED
+    assert event.event_type == "hw.threshold_exceeded"
+    assert event.source == "sampled_device.level"
+    # Wall-clock: this instant is sorted against findings and other signal families,
+    # all of which are wall-clock. A monotonic value here lands decades away.
+    assert event.observed_at > 1_500_000_000.0
+    payload = event.to_payload()
+    assert payload["ts"] == event.observed_at
+    # The reorder buffer keys on this; omitting it leaves hardware events unorderable
+    # against every other source.
+    assert "_mono_ts" in payload
+
+
+@pytest.mark.asyncio
+async def test_repeated_events_of_one_kind_are_paced() -> None:
+    """A level-triggered kind must not emit once per sample.
+
+    Without this floor a slew that stays above ``max_rate`` for a whole ramp
+    reproduces, on the consumer side, exactly the sampling-rate flood that keeping
+    raw readings inside this module prevents on the producer side.
+    """
+    context = _context(sample_rate_hz=50.0)
+    registry = _registry(context)
+    source = registry.stream_sources()[0]
+    emitted: list[Any] = []
+    await source.start(emitted.append)
+    transport = await registry.transport("sampled_device")
+    transport.set_value("level", 500.0)
+    # Long enough for many samples at 50 Hz, but shorter than the pacing floor.
+    await asyncio.sleep(0.2)
+    await source.stop()
+
+    breaches = [e for e in emitted if e.kind == EventKind.THRESHOLD_EXCEEDED]
+    assert len(breaches) == 1, "one excursion is one event, however many samples it spans"
+
+
+def test_a_value_resting_on_the_boundary_does_not_flap() -> None:
+    """Recovery must clear an inward margin, or a hovering value alternates forever.
+
+    This is the difference between a crossing and a hover. Judged by a plain in/out
+    test they are identical, and the hover buries the crossing that mattered.
+    """
+    channel = Channel(
+        channel_id="level",
+        direction=Direction.READ.value,
+        quantity="generic.level",
+        unit="unit",
+        envelope=Envelope(declared=True, min_value=0.0, max_value=100.0),
+    )
+    detector = HardwareEventDetector(_context(), channel)
+    detector.observe(_reading(50.0, sequence=1, at=1.0))
+    # Leave the range, then sit just barely back inside it.
+    breach = detector.observe(_reading(100.5, sequence=2, at=2.0))
+    assert [e.kind for e in breach] == [EventKind.THRESHOLD_EXCEEDED]
+    assert detector.observe(_reading(99.99, sequence=3, at=3.0)) == ()
+    assert detector.observe(_reading(100.5, sequence=4, at=4.0)) == ()
+    # Well inside now: recovery is reported exactly once.
+    settled = detector.observe(_reading(50.0, sequence=5, at=5.0))
+    assert [e.kind for e in settled] == [EventKind.SETTLED]
 
 
 @pytest.mark.asyncio
@@ -507,3 +585,68 @@ async def test_sources_must_be_registered_before_the_manager_starts() -> None:
             )
     finally:
         await manager.dispose()
+
+
+# ════════════════════════════════════════════════════════════════
+# Device I/O serialisation and sampling health
+# ════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reads_on_one_device_are_serialised() -> None:
+    """Two channels of one instrument are one conversation.
+
+    A serial line, an I2C bus or a GPIB address handles one request at a time. Two
+    coroutines reading concurrently interleave request and response frames, and the
+    result is not an error -- it is a plausible reading carrying the wrong channel's
+    value, which nothing downstream can detect. Streaming makes this the common case
+    because one task per channel starts automatically.
+    """
+    context = _context(sample_rate_hz=10.0)
+    registry = _registry(context)
+    overlaps = 0
+    active = 0
+
+    async def _contend() -> None:
+        nonlocal overlaps, active
+        async with registry.device_io("sampled_device"):
+            active += 1
+            if active > 1:
+                overlaps += 1
+            await asyncio.sleep(0.01)
+            active -= 1
+
+    await asyncio.gather(*(_contend() for _ in range(5)))
+    assert overlaps == 0, "data-plane access to one device must not overlap"
+
+
+@pytest.mark.asyncio
+async def test_each_device_gets_its_own_lock() -> None:
+    """Serialisation is per device; one slow instrument must not stall another."""
+    context = _context()
+    registry = _registry(context)
+    assert registry.device_io("a") is registry.device_io("a")
+    assert registry.device_io("a") is not registry.device_io("b")
+
+
+@pytest.mark.asyncio
+async def test_health_compares_observed_rate_against_the_declaration() -> None:
+    """A cadence shortfall is invisible in the data itself.
+
+    The stored series looks entirely normal when a channel runs at two thirds of its
+    declared rate -- the window records the samples it actually got, and nothing else
+    compares that against what was declared.
+    """
+    context = _context(sample_rate_hz=50.0)
+    registry = _registry(context)
+    source = registry.stream_sources()[0]
+    await source.start(None)
+    await asyncio.sleep(0.15)
+    await source.stop()
+
+    health = source.health
+    assert health["declared_hz"] == 50.0
+    assert health["samples"] > 0
+    assert health["observed_hz"] > 0.0
+    assert 0.0 < health["rate_ratio"] <= 1.5
+    assert health["channel_id"] == "level"

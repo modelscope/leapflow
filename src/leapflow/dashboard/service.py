@@ -125,6 +125,25 @@ def _short_id(value: Any) -> str:
     return text[:8] if len(text) > 8 else text
 
 
+_PAYLOAD_DOMAINS: dict[str, tuple[str, str]] = {
+    # template -> (finding domain, data key the template binds to)
+    "capability": ("capability_adaptation", "capability_plan"),
+    "hardware": ("hardware", "hardware"),
+}
+"""Templates whose data is a producer's finding payload, not a session lens.
+
+The distinction is real and was previously unrepresented. ``generic``/``finance``/
+``sentiment``/``research`` are four renderings of *one* subject, the current
+session, so they all read ``analysis``. These read the newest finding of their own
+domain instead.
+
+Held as a table because the alternative -- a name check per template in ``build``
+-- had already gone wrong once: ``capability.yaml`` binds ``capability_plan.*``,
+nothing supplied that key, and every value on the board rendered blank. The
+producer ran, the template was valid, and nothing connected them.
+"""
+
+
 class DashboardViewBuilder:
     """Assemble ViewSpecs for dashboard intents."""
 
@@ -132,15 +151,51 @@ class DashboardViewBuilder:
         self._templates = templates or TemplateLibrary()
 
     async def build(self, intent: DashboardIntent, provider: DashboardDataProvider) -> dict[str, Any]:
-        """Return a normalized ViewSpec: the current session rendered via a template.
+        """Return a normalized ViewSpec for the requested template.
 
-        LeapBoard has one analysis target (the current session); the intent only
-        carries which template lens to render it with.
+        Three data shapes, not one: the signal pipeline's own metrics, a producer's
+        finding payload, or the session analysis every other lens renders.
         """
         template_name = intent.template
         if template_name == "signals":
             return await self._build_signals(template_name, provider)
+        payload_domain = _PAYLOAD_DOMAINS.get(template_name)
+        if payload_domain is not None:
+            return await self._build_from_finding_payload(template_name, provider, *payload_domain)
         return await self._build_session(intent.template, provider)
+
+    async def _build_from_finding_payload(
+        self,
+        template: str,
+        provider: DashboardDataProvider,
+        finding_domain: str,
+        data_key: str,
+    ) -> dict[str, Any]:
+        """Render a template from the newest finding of one producer domain.
+
+        Newest rather than merged: each of these payloads is a self-consistent
+        snapshot of a subject at one instant, and stitching two together would show
+        a state that never existed.
+        """
+        watches = await provider.watches()
+        watch = next((w for w in watches if str(w.get("domain")) == finding_domain), {})
+        findings = await provider.findings(watch_id="", limit=50)
+        domain_findings = [f for f in findings if str(f.get("domain")) == finding_domain]
+        payload = dict(domain_findings[0].get("payload") or {}) if domain_findings else {}
+        data = {
+            "title": template.replace("_", " ").title(),
+            data_key: payload,
+            "findings": domain_findings or None,
+            "watch": watch,
+            "observation": {
+                "watch_state": watch.get("state", ""),
+                "watch_muted": watch.get("muted", False),
+                "last_run_at": watch.get("last_run_at", 0),
+                "next_due_at": watch.get("next_due_at", 0),
+                "run_count": watch.get("run_count", 0),
+            },
+        }
+        return self._render(template, data)
 
     async def _build_session(self, template: str, provider: DashboardDataProvider) -> dict[str, Any]:
         # The session watch emits an insight finding whose payload carries the
@@ -181,10 +236,16 @@ class DashboardViewBuilder:
             "findings": session_findings,
             "watch": session_watch,
         }
+        return self._render(template, data)
+
+    def _render(self, template: str, data: dict[str, Any]) -> dict[str, Any]:
+        """Compile a template and attach the lens list the client switches on.
+
+        Shared by every build path so a new one cannot forget the metadata and leave
+        the web client with no way to offer the other lenses.
+        """
         name = select_template(template, self._templates.names())
         spec = self._templates.render(name, data)
-        # Expose the available lenses + the active one so the web client can
-        # render a template switcher without hardcoding template names.
         if isinstance(spec, dict):
             meta = spec.setdefault("meta", {})
             if isinstance(meta, dict):
@@ -239,15 +300,7 @@ class DashboardViewBuilder:
             "watch_state_distribution": _distribution(watches, "state") if watches else None,
             "finding_severity_distribution": _distribution(findings, "severity") if findings else None,
         }
-        name = select_template(template, self._templates.names())
-        spec = self._templates.render(name, data)
-        if isinstance(spec, dict):
-            meta = spec.setdefault("meta", {})
-            if isinstance(meta, dict):
-                meta["templates"] = self._templates.visible_names()
-                meta["hidden_templates"] = self._templates.hidden_names()
-                meta["active_template"] = name
-        return spec
+        return self._render(template, data)
 
 
 __all__ = [

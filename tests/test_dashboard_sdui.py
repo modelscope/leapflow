@@ -182,3 +182,73 @@ def test_intent_from_args_first_token_is_template() -> None:
 def test_intent_from_params_reads_template() -> None:
     assert DashboardIntent.from_params({"template": "research"}).template == "research"
     assert DashboardIntent.from_params({}).to_dict() == {"template": ""}
+
+
+# ════════════════════════════════════════════════════════════════
+# Template bindings the engine will silently ignore
+# ════════════════════════════════════════════════════════════════
+
+
+def test_no_template_binds_in_a_shape_the_engine_drops() -> None:
+    """The two mistakes here produce a panel with headings and no rows.
+
+    ``render_node`` expands ``repeat`` only when it is a *string*, and it reads
+    ``bind`` only from inside ``props``. Neither mistake raises: the template loads,
+    the panel renders, the columns appear, and every row is missing. Four tables on
+    the capability board shipped that way -- ``repeat`` as a mapping and ``bind`` at
+    node level -- and nothing failed anywhere.
+    """
+    from leapflow.dashboard.templates import TemplateLibrary
+
+    library = TemplateLibrary()
+    problems: list[str] = []
+
+    def walk(node: object, where: str) -> None:
+        if isinstance(node, dict):
+            repeat = node.get("repeat")
+            if repeat is not None and not isinstance(repeat, str):
+                problems.append(f"{where}: repeat must be a path string, got {type(repeat).__name__}")
+            # Only a component node is checked for a stray ``bind``. Inside ``props``
+            # it is the correct spelling, and ``type`` is what tells the two apart.
+            if "type" in node and "bind" in node:
+                problems.append(f"{where}: bind must live inside props, not on the node")
+            for key, value in node.items():
+                walk(value, f"{where}.{key}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{where}[{index}]")
+
+    for name in library.names():
+        walk(library.load(name), name)
+    assert not problems, "bindings the engine ignores:\n  " + "\n  ".join(problems)
+
+
+def test_every_table_column_declares_the_key_it_reads() -> None:
+    """A bare column label renders a header over an empty cell.
+
+    The Table renderer reads ``props.columns[].key`` against each row mapping, so a
+    column given as a plain string has no key to read and shows nothing under it.
+    """
+    from leapflow.dashboard.templates import TemplateLibrary
+
+    library = TemplateLibrary()
+    problems: list[str] = []
+
+    def walk(node: object, where: str) -> None:
+        if isinstance(node, dict):
+            props = node.get("props")
+            if node.get("type") == "Table" and isinstance(props, dict):
+                columns = props.get("columns")
+                if isinstance(columns, list):
+                    for index, column in enumerate(columns):
+                        if not isinstance(column, dict) or not column.get("key"):
+                            problems.append(f"{where} column[{index}] declares no key: {column!r}")
+            for key, value in node.items():
+                walk(value, f"{where}.{key}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{where}[{index}]")
+
+    for name in library.names():
+        walk(library.load(name), name)
+    assert not problems, "table columns with no key:\n  " + "\n  ".join(problems)

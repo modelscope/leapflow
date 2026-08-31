@@ -687,3 +687,54 @@ def test_hermetic_env_forces_mock_host(tmp_path: Path) -> None:
     """OS-host mocking is the one legitimate mock: CI has no macOS perception."""
     env = hermetic_env(data_dir=tmp_path, profile="default", llm_base_url="http://x/v1")
     assert env["LEAPFLOW_MOCK_HOST"] == "1"
+
+
+# ════════════════════════════════════════════════════════════════
+# The derived fixture is a contract, not an inventory
+# ════════════════════════════════════════════════════════════════
+
+
+def test_the_shape_fixture_holds_no_volatile_inventory() -> None:
+    """``--check`` may only fail on provider drift, never on corpus growth.
+
+    The file used to record how many exchanges it was distilled from, and ``--check``
+    compared the whole rendered text. Adding a journey therefore turned CI red with a
+    diff whose shapes were byte-identical -- ``37`` versus ``200`` -- so the gate
+    stopped meaning "a provider changed" and started meaning "somebody added a test".
+    A gate that fires on unrelated growth as loudly as on real drift gets ignored,
+    and then the drift it exists for goes unnoticed too.
+    """
+    import json
+    from pathlib import Path
+
+    fixture = (
+        Path(__file__).resolve().parents[1]
+        / "tests" / "_fixtures" / "llm_responses" / "response_shapes.json"
+    )
+    stored = json.loads(fixture.read_text(encoding="utf-8"))
+    volatile = [key for key in stored if "seen" in key or "count" in key or "total" in key]
+    assert not volatile, (
+        f"{volatile} vary with the size of the corpus, so --check would fail on "
+        "changes that are not provider drift"
+    )
+    assert "completion_shapes" in stored, "the contract itself must still be there"
+
+
+def test_the_shape_fixture_is_in_sync_with_the_stored_exchanges() -> None:
+    """The gate's own promise: run it, and it must be green on a clean tree.
+
+    Asserted here rather than left to CI, because a check nobody can run locally is a
+    check that gets fixed by deleting it.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "tools/sync_fixtures.py", "--check"],
+        cwd=repo, capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, (
+        f"sync_fixtures --check failed:\n{result.stdout}\n{result.stderr}"
+    )

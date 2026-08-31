@@ -24,7 +24,6 @@ Behaviour is configured through ``TransportRef.config``:
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -123,7 +122,6 @@ class MockTransport:
             value=self._values.get(channel_id),
             quantity=channel.quantity if channel is not None else "",
             unit=channel.unit if channel is not None else "",
-            timestamp=time.monotonic(),
             sequence=sequence,
             quality=Quality.OK.value,
         )

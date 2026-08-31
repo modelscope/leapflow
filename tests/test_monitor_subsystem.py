@@ -336,3 +336,102 @@ async def test_arm_watch_with_event_trigger_glob_pattern(tmp_path: Path) -> None
     # Stop removes from bridge
     manager.stop_watch(view.watch_id)
     assert manager.event_bridge.active_count == 0
+
+
+# ════════════════════════════════════════════════════════════════
+# Default producers and watches are asserted by their effect, not their existence
+# ════════════════════════════════════════════════════════════════
+
+
+def _coordinator_with_manager(tmp_path: Path) -> tuple[object, MonitorManager]:
+    """Build a real MonitorCoordinator around a temporary in-process manager."""
+    from leapflow.daemon.monitor_coordinator import MonitorCoordinator
+
+    holder = LocalConnectionHolder(tmp_path / "monitor.duckdb")
+    manager = MonitorManager(holder=holder, emit=lambda *_a, **_k: None, tick_seconds=3600)
+    coordinator = MonitorCoordinator()
+    coordinator._monitors = manager
+    return coordinator, manager
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "domain",
+    ["session", "signal", "capability_adaptation", "plugin_health"],
+)
+async def test_every_default_producer_is_actually_registered(
+    tmp_path: Path, domain: str
+) -> None:
+    """Drives the production ``start()`` and reads the registry it built.
+
+    ``PluginHealthProducer`` was fully implemented, exported nowhere and registered
+    nowhere, while its own docstring said it was registered. Instantiating the class
+    in a test proves only that the class exists, and registering it in a test proves
+    only that the test can -- so this asserts the registry that the coordinator
+    itself populates. Deleting a ``producers.register(...)`` line turns this red.
+    """
+    from types import SimpleNamespace
+
+    from leapflow.daemon.monitor_coordinator import MonitorCoordinator
+
+    holder = LocalConnectionHolder(tmp_path / "monitor.duckdb")
+    ctx = SimpleNamespace(_db_holder=holder, event_bus=None)
+    bus = SimpleNamespace(emit_event=lambda *_a, **_k: None, emit=lambda *_a, **_k: None)
+    settings = SimpleNamespace(
+        scheduler_enabled=True,
+        scheduler_tick_seconds=3600,
+        scheduler_grace_seconds=120.0,
+        workspace_root=str(tmp_path),
+    )
+
+    coordinator = MonitorCoordinator()
+    await coordinator.start(ctx, bus, settings)
+    manager = getattr(ctx, "monitors", None)
+    assert manager is not None, "start() must build a manager for this test to mean anything"
+    try:
+        assert domain in manager.producers.domains(), f"no producer serves domain={domain!r}"
+        assert manager.producers.resolve(domain) is not None
+    finally:
+        await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_default_watches_cover_every_polled_default_domain(tmp_path: Path) -> None:
+    """A registered producer with no watch naming its domain never runs.
+
+    Registration and arming are two separate connections, and satisfying one reads
+    as satisfying both. This asserts the pair.
+    """
+    coordinator, manager = _coordinator_with_manager(tmp_path)
+    try:
+        await coordinator._arm_default_watches()
+        armed = {view.name: view for view in manager.list_watches()}
+        assert "plugin-health" in armed, "the plugin_health producer has no watch to invoke it"
+        assert armed["plugin-health"].domain == "plugin_health"
+        # Polled, not event-driven: trust degradation is a trend between observations.
+        assert armed["plugin-health"].trigger == "every 5m"
+    finally:
+        await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_arming_defaults_twice_does_not_duplicate_an_interval_watch(
+    tmp_path: Path,
+) -> None:
+    """Idempotency must hold for interval triggers, not just event ones.
+
+    The previous dedup key rebuilt the label as ``f"event:{expr}"``, so an interval
+    watch could never match its own entry and was re-armed on every daemon start.
+    Each restart would have added another copy, each polling the same producer.
+    """
+    coordinator, manager = _coordinator_with_manager(tmp_path)
+    try:
+        await coordinator._arm_default_watches()
+        first = [v.name for v in manager.list_watches()]
+        await coordinator._arm_default_watches()
+        second = [v.name for v in manager.list_watches()]
+        assert sorted(first) == sorted(second)
+        assert second.count("plugin-health") == 1
+        assert second.count("fs-observer") == 1
+    finally:
+        await manager.stop()

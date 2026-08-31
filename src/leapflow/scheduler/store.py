@@ -11,7 +11,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 from leapflow.scheduler.types import ArmedTask
 from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
@@ -36,8 +36,18 @@ class TaskStore:
         if self._owns_holder:
             source = LocalConnectionHolder(Path(source))
         self._holder = source
-        self._con = self._holder.connection
         self._ensure_table()
+
+    @property
+    def _con(self) -> Any:
+        """Resolve per call, so each thread gets its own cursor.
+
+        See ``LocalConnectionHolder.connection``: caching this puts two threads on
+        one connection. ``load_all`` is reached from the ``daemon.status`` RPC on the
+        event loop while deferred init reads other tables in a worker, so a shared
+        connection here stalls the whole control plane.
+        """
+        return self._holder.connection
 
     def close(self) -> None:
         """Close the DuckDB connection if owned by this store."""

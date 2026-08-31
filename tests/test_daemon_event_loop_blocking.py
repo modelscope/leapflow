@@ -23,6 +23,8 @@ Validates:
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import asyncio
 import time
 from pathlib import Path
@@ -354,3 +356,83 @@ class TestDaemonControlPlaneResponsiveness:
             executor = getattr(ctx, "_deferred_db_executor", None)
             if executor is not None:
                 executor.shutdown(wait=True)
+
+
+# ════════════════════════════════════════════════════════════════
+# status() must not read the watch store on the loop
+# ════════════════════════════════════════════════════════════════
+
+
+async def test_the_watch_summary_does_not_block_the_loop() -> None:
+    """status() is the most-polled RPC there is; it cannot hold the loop.
+
+    The watch store is DuckDB, so reading it takes as long as the query takes and
+    grows with the number of armed watches. Read inline, one status poll stalled every
+    other RPC for that whole time -- the shape that makes a busy daemon look hung.
+
+    Measured by driving the summary against a store whose read sleeps, and checking
+    that an unrelated coroutine still gets scheduled while it is in flight.
+    """
+    from leapflow.daemon.monitor_coordinator import MonitorCoordinator
+
+    read_started = asyncio.Event()
+    ticks = 0
+
+    class _SlowStore:
+        def list_watches(self) -> list[Any]:
+            # Blocking on purpose: this is what DuckDB does, and it is the reason the
+            # read must not happen on the loop thread.
+            read_started.set()
+            time.sleep(0.25)
+            return []
+
+    coordinator = MonitorCoordinator()
+    coordinator._monitors = _SlowStore()
+    coordinator._off_loop = _serialized_off_loop()
+
+    async def _tick() -> None:
+        nonlocal ticks
+        await read_started.wait()
+        for _ in range(5):
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    ticker = asyncio.create_task(_tick())
+    summary = await coordinator.get_summary()
+    # Sampled the instant the read returns. Counting after awaiting the ticker
+    # measures nothing: the task runs to completion either way, so the first
+    # version of this assertion passed against the blocking implementation too.
+    ticks_during_read = ticks
+    await ticker
+
+    assert summary["total"] == 0
+    assert ticks_during_read > 0, (
+        "no other coroutine ran while the watch store was being read, so the read "
+        "happened on the loop thread; status() would stall every other RPC"
+    )
+
+
+async def test_the_summary_still_answers_without_an_off_loop_channel() -> None:
+    """A missing channel must degrade to a slow answer, never to no answer."""
+    from leapflow.daemon.monitor_coordinator import MonitorCoordinator
+
+    class _Store:
+        def list_watches(self) -> list[Any]:
+            return []
+
+    coordinator = MonitorCoordinator()
+    coordinator._monitors = _Store()
+    coordinator._off_loop = None
+
+    summary = await coordinator.get_summary()
+    assert summary["total"] == 0
+
+
+def _serialized_off_loop() -> Any:
+    """The runtime's channel shape: a single worker, awaited by the caller."""
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-deferred-db")
+
+    async def _run(fn: Any) -> Any:
+        return await asyncio.get_running_loop().run_in_executor(executor, fn)
+
+    return _run

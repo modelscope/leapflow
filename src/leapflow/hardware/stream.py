@@ -13,6 +13,12 @@ actually happens.
 Every detection rule is derived from the channel's own ``Envelope``. Nothing new is
 declared: the limits a human already wrote down for approval are the same limits
 that make an observation interesting.
+
+Two clocks are in play and they are not interchangeable. Intervals, slew rates and
+staleness read ``Reading.monotonic_at``, because wall-clock jumps would fabricate
+rates no device produced. Anything that leaves this module -- an event's timestamp,
+a persisted window -- carries ``Reading.observed_at``, because every consumer
+outside it (findings, audit, the board's time axis) is wall-clock.
 """
 
 from __future__ import annotations
@@ -31,12 +37,29 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_RING_CAPACITY = 4096
 
+MIN_EVENT_INTERVAL_S = 1.0
+"""Floor on how often one channel may re-report the same event kind.
+
+Edge-triggered kinds rarely reach it. Level-triggered ones -- a slew that stays
+above ``max_rate`` for a whole ramp -- would otherwise emit once per sample and
+reproduce, on the consumer side, the exact flood the raw/event split prevents on
+the producer side. The first occurrence of a kind is never suppressed, and
+suppressions are counted rather than discarded silently.
+"""
+
 EventSink = Callable[["HardwareEvent"], None]
 """Receives derived events. Must be thread-safe and non-blocking."""
 
 
 class EventKind:
-    """Derived observations, each traceable to a declared envelope field."""
+    """Observed conditions worth telling somebody about.
+
+    Some are traceable to a declared envelope field -- a threshold, a rate limit, a
+    settling time. Others are not: sample loss is read from gaps in the transport's
+    own sequence, degraded quality from what the device reports about its reading,
+    and unreachability from the connection itself. What they share is that each names
+    one specific observable condition rather than a judgement about it.
+    """
 
     THRESHOLD_EXCEEDED = "threshold_exceeded"
     RATE_EXCEEDED = "rate_exceeded"
@@ -44,6 +67,13 @@ class EventKind:
     SAMPLE_LOSS = "sample_loss"
     QUALITY_DEGRADED = "quality_degraded"
     SETTLED = "settled"
+    UNREACHABLE = "unreachable"
+    """A command was refused because the device could not be reached.
+
+    Raised from the command path rather than the sampling loop, and it is the one
+    condition a board cannot infer from anything else: a bench whose commands are all
+    being refused looks exactly like a bench nobody is using.
+    """
 
 
 @dataclass(frozen=True)
@@ -57,18 +87,57 @@ class HardwareEvent:
     detail: str
     value: Any = None
     unit: str = ""
-    timestamp: float = 0.0
+    observed_at: float = 0.0
+    """Wall-clock. This crosses module boundaries, so it must be the clock every
+    consumer outside ``leapflow.hardware`` already uses."""
 
     @property
-    def signal_type(self) -> str:
-        """Return the interaction-signal type used when this crosses the boundary."""
-        return "hw_event"
+    def event_type(self) -> str:
+        """Return the EventBus type. ``hw`` is the family every consumer groups on.
+
+        Dotted so ``dashboard.service._event_family`` -- which splits on the first
+        separator -- yields ``hw`` without any enumeration being added anywhere.
+        """
+        return f"hw.{self.kind}"
+
+    @property
+    def source(self) -> str:
+        """Return the EventBus source: the channel that produced the observation."""
+        return f"{self.device_id}.{self.channel_id}"
 
     def to_detail(self) -> str:
         """Return a compact one-line description for the signal pipeline."""
         where = f"{self.device_id}.{self.channel_id}"
         rendered = "" if self.value is None else f" value={self.value}{f' {self.unit}' if self.unit else ''}"
         return f"[{self.kind}] {where}{rendered}: {self.detail}"
+
+    def to_payload(self) -> dict[str, Any]:
+        """Return the EventBus payload, using that layer's key names.
+
+        ``ts`` and ``_mono_ts`` are the platform's contract, not this module's
+        preference: the pre-normalized pass-through reads ``ts`` for the event's
+        instant and ``EventReorderBuffer`` reads ``_mono_ts`` for arrival-order
+        correction. Supplying ``observed_at`` under its domain name instead would
+        leave both unset -- the event would be stamped with the moment it was
+        *normalized* rather than observed, and would sort against other sources by
+        nothing at all.
+
+        ``source`` is explicit for the same reason: without it the pass-through
+        substitutes the event type, and every view then shows that as the origin
+        instead of the channel that produced the observation.
+        """
+        return {
+            "kind": self.kind,
+            "source": self.source,
+            "device_id": self.device_id,
+            "channel_id": self.channel_id,
+            "quantity": self.quantity,
+            "detail": self.detail,
+            "value": self.value,
+            "unit": self.unit,
+            "ts": self.observed_at,
+            "_mono_ts": time.monotonic(),
+        }
 
 
 class ReadingRing:
@@ -160,7 +229,7 @@ class HardwareEventDetector:
         self._context = context
         self._channel = channel
         self._last_numeric: float | None = None
-        self._last_timestamp: float | None = None
+        self._last_monotonic: float | None = None
         self._degraded_streak = 0
         self._breached = False
         self._stale = False
@@ -201,7 +270,7 @@ class HardwareEventDetector:
             events.extend(self._numeric_events(reading, numeric))
 
         self._last_numeric = numeric if numeric is not None else self._last_numeric
-        self._last_timestamp = reading.timestamp
+        self._last_monotonic = reading.monotonic_at
         self._stale = False
         return tuple(events)
 
@@ -211,12 +280,17 @@ class HardwareEventDetector:
         Silence is itself an observation: a channel declared at 10 Hz that has said
         nothing for a second has failed, and the absence of readings is the only way
         that failure shows up.
+
+        ``now`` is monotonic, matching ``_last_monotonic``. Comparing a wall-clock
+        instant against a monotonic one yields a difference of the two epochs --
+        a number so large or so negative that the deadline is either always or
+        never met, and in both cases the check reports nothing useful.
         """
         channel = self._channel
-        if channel.sample_rate_hz <= 0 or self._last_timestamp is None or self._stale:
+        if channel.sample_rate_hz <= 0 or self._last_monotonic is None or self._stale:
             return ()
         deadline = 2.0 / channel.sample_rate_hz
-        elapsed = (now if now is not None else time.monotonic()) - self._last_timestamp
+        elapsed = (now if now is not None else time.monotonic()) - self._last_monotonic
         if elapsed <= deadline:
             return ()
         self._stale = True
@@ -230,7 +304,7 @@ class HardwareEventDetector:
                     f"no sample for {elapsed:.2f}s on a {channel.sample_rate_hz:g} Hz channel"
                 ),
                 unit=channel.unit,
-                timestamp=time.monotonic(),
+                observed_at=time.time(),
             ),
         )
 
@@ -238,17 +312,22 @@ class HardwareEventDetector:
         events: list[HardwareEvent] = []
         envelope = self._channel.envelope
 
-        inside = envelope.contains(numeric)
-        if not inside and not self._breached:
-            self._breached = True
-            events.append(
-                self._event(
-                    EventKind.THRESHOLD_EXCEEDED,
-                    reading,
-                    f"left the declared range ({_bounds(envelope)})",
+        # Asymmetric on purpose. Leaving the range is judged against the declared
+        # limit, because that is the limit a human wrote down. Returning must clear
+        # an inward margin, so a value resting on the boundary does not alternate
+        # breach and recovery at the sampling rate -- which would bury the one
+        # crossing that mattered under thousands of identical events.
+        if not self._breached:
+            if not envelope.contains(numeric):
+                self._breached = True
+                events.append(
+                    self._event(
+                        EventKind.THRESHOLD_EXCEEDED,
+                        reading,
+                        f"left the declared range ({_bounds(envelope)})",
+                    )
                 )
-            )
-        elif inside and self._breached:
+        elif envelope.contains(numeric, margin=envelope.settle_margin):
             # Re-entering is worth one event too, so a watcher can see recovery
             # instead of inferring it from silence.
             self._breached = False
@@ -261,9 +340,9 @@ class HardwareEventDetector:
         if (
             envelope.max_rate is not None
             and self._last_numeric is not None
-            and self._last_timestamp is not None
+            and self._last_monotonic is not None
         ):
-            elapsed = reading.timestamp - self._last_timestamp
+            elapsed = reading.monotonic_at - self._last_monotonic
             if elapsed > 0 and envelope.rate_exceeded(
                 delta=numeric - self._last_numeric, elapsed_s=elapsed
             ):
@@ -287,18 +366,20 @@ class HardwareEventDetector:
             detail=detail,
             value=reading.value,
             unit=reading.unit or self._channel.unit,
-            timestamp=reading.timestamp,
+            observed_at=reading.observed_at,
         )
 
 
 class HardwareStreamSource:
     """Samples one channel on a schedule, emitting derived events.
 
-    Implements ``ActiveSignalSource`` structurally: ``source_id`` / ``channel_id`` /
-    ``start(emit)`` / ``stop()``. It is registered with the session's
-    ``ActiveSourceManager`` like any other lifecycle-bearing source, which is what puts
-    device observations on the same path as every other environment signal instead of
-    inventing a parallel one.
+    Satisfies ``ActiveSignalSource`` structurally -- ``source_id`` / ``channel_id`` /
+    ``start(emit)`` / ``stop()`` -- but the sink receives a ``HardwareEvent``, not an
+    ``InteractionSignal``. Moving this under ``ActiveSourceManager`` therefore needs an
+    adapter for that one type, not just a registration: the manager's queue is typed for
+    interaction signals. Stated here because "can be handed over unchanged" was true of
+    the protocol and false of the payload, and that gap is the kind a reader would only
+    discover after wiring it.
     """
 
     def __init__(
@@ -320,6 +401,11 @@ class HardwareStreamSource:
         self._store = reading_store
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
+        self._last_emitted: dict[str, float] = {}
+        self._paced_out = 0
+        self._samples = 0
+        self._skipped_slots = 0
+        self._started_monotonic: float | None = None
 
     @property
     def source_id(self) -> str:
@@ -360,10 +446,17 @@ class HardwareStreamSource:
     async def _run(self, emit: Any) -> None:
         interval = 1.0 / self._channel.sample_rate_hz if self._channel.sample_rate_hz > 0 else 1.0
         consecutive_failures = 0
+        self._started_monotonic = time.monotonic()
+        # Deadline-based rather than sleep-based. A fixed sleep after each read adds
+        # the read's own duration to every period, so a channel declared at 10 Hz
+        # runs slower than 10 Hz -- silently, because the window record counts the
+        # samples it actually got and nothing compares that against the declaration.
+        next_at = self._started_monotonic
         while not self._stopping.is_set():
             try:
-                transport = await self._registry.transport(self._context.device_id)
-                reading = await transport.read(self._channel.channel_id)
+                async with self._registry.device_io(self._context.device_id):
+                    transport = await self._registry.transport(self._context.device_id)
+                    reading = await transport.read(self._channel.channel_id)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - one device must not stop the rest
@@ -377,26 +470,56 @@ class HardwareStreamSource:
                     )
                 self._dispatch(self._detector.check_stale(), emit)
                 await self._sleep(min(interval * (2**consecutive_failures), 30.0))
+                # Backoff deliberately abandons the old cadence; resuming the prior
+                # deadline would burst to "catch up" on a device that just recovered.
+                next_at = time.monotonic()
                 continue
 
             consecutive_failures = 0
+            self._samples += 1
             lost = self.ring.record(reading)
-            if self._store is not None:
-                # Buffered here rather than in the ring, because the ring is a bounded
-                # window for the current decision while the store is the durable record
-                # that later analysis reads. Contained so a full disk cannot stop sampling.
-                try:
-                    self._store.record(reading, dropped=lost)
-                    self._store.flush()
-                except Exception as exc:  # noqa: BLE001 - persistence must not stop sampling
-                    logger.warning(
-                        "Hardware reading persistence failed for %s: %s",
-                        self.source_id,
-                        exc,
-                        exc_info=True,
-                    )
+            await self._persist(reading, lost=lost)
             self._dispatch(self._detector.observe(reading, lost=lost), emit)
-            await self._sleep(interval)
+
+            next_at += interval
+            delay = next_at - time.monotonic()
+            if delay < 0:
+                # Behind schedule. Skip the missed slots instead of firing them back
+                # to back: a burst would exceed the declared rate the envelope was
+                # written against, and the count makes the shortfall observable
+                # rather than leaving it to be inferred from a thin series.
+                missed = int(-delay // interval) + 1
+                self._skipped_slots += missed
+                next_at += missed * interval
+                delay = max(0.0, next_at - time.monotonic())
+            await self._sleep(delay)
+
+    async def _persist(self, reading: Reading, *, lost: int) -> None:
+        """Buffer one sample and, when a window closes, write it off the sampling path.
+
+        Buffering stays on the loop because it only mutates dictionaries. The write
+        does not: appending a file and opening DuckDB inside the sampling loop stalls
+        it for the duration of that I/O, which on a 10 Hz channel is a whole period
+        or more. Draining first and writing in a worker keeps buffer mutation
+        single-threaded while the blocking part happens elsewhere.
+        """
+        store = self._store
+        if store is None:
+            return
+        try:
+            store.record(reading, dropped=lost)
+            if not store.due_for_flush():
+                return
+            batches = store.drain()
+            if batches:
+                await asyncio.to_thread(store.write_batches, batches)
+        except Exception as exc:  # noqa: BLE001 - persistence must not stop sampling
+            logger.warning(
+                "Hardware reading persistence failed for %s: %s",
+                self.source_id,
+                exc,
+                exc_info=True,
+            )
 
     async def _sleep(self, seconds: float) -> None:
         try:
@@ -405,8 +528,16 @@ class HardwareStreamSource:
             return
 
     def _dispatch(self, events: Iterable[HardwareEvent], emit: Any) -> None:
-        """Hand events to the sink and to the interaction signal pipeline."""
+        """Hand events to the sink and to the signal pipeline, paced per kind.
+
+        ``emit`` receives the ``HardwareEvent`` itself rather than a pre-flattened
+        signal, because the consumer decides the representation: the event family,
+        the value and the unit are all needed downstream, and collapsing them to a
+        detail string here would force every consumer to parse it back out.
+        """
         for event in events:
+            if not self._admit(event):
+                continue
             if self._event_sink is not None:
                 try:
                     self._event_sink(event)
@@ -415,25 +546,49 @@ class HardwareStreamSource:
             if emit is None:
                 continue
             try:
-                emit(_as_interaction_signal(event))
+                emit(event)
             except Exception as exc:  # noqa: BLE001 - as above
                 logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
 
+    def _admit(self, event: HardwareEvent) -> bool:
+        """Return whether this event clears the per-kind rate floor.
 
-def _as_interaction_signal(event: HardwareEvent) -> Any:
-    """Convert an event into the perception layer's signal type.
+        Keyed by kind so a paced ``rate_exceeded`` can never hide a first-time
+        ``threshold_exceeded`` behind it -- suppressing a different observation
+        would trade one flood for one blind spot.
+        """
+        now = time.monotonic()
+        previous = self._last_emitted.get(event.kind)
+        if previous is not None and now - previous < MIN_EVENT_INTERVAL_S:
+            self._paced_out += 1
+            return False
+        self._last_emitted[event.kind] = now
+        return True
 
-    Imported lazily so ``leapflow.hardware`` stays importable without the perception
-    subsystem, and so the domain model keeps no compile-time dependency on it.
-    """
-    from leapflow.perception.types import InteractionSignal
+    @property
+    def health(self) -> dict[str, Any]:
+        """Return sampling health for disclosure and for the board.
 
-    return InteractionSignal(
-        timestamp=event.timestamp or time.monotonic(),
-        signal_type=event.signal_type,
-        app=event.device_id,
-        detail=event.to_detail(),
-    )
+        ``observed_hz`` against ``declared_hz`` is the only way a cadence shortfall
+        becomes visible: the stored series looks entirely normal when a channel runs
+        at two thirds of its declared rate.
+        """
+        declared = float(self._channel.sample_rate_hz or 0.0)
+        started = self._started_monotonic
+        elapsed = (time.monotonic() - started) if started is not None else 0.0
+        observed = (self._samples / elapsed) if elapsed > 0 else 0.0
+        return {
+            "source_id": self.source_id,
+            "device_id": self._context.device_id,
+            "channel_id": self._channel.channel_id,
+            "declared_hz": declared,
+            "observed_hz": observed,
+            "rate_ratio": (observed / declared) if declared > 0 else 0.0,
+            "samples": self._samples,
+            "skipped_slots": self._skipped_slots,
+            "dropped": self.ring.dropped,
+            "events_paced_out": self._paced_out,
+        }
 
 
 def build_stream_sources(
@@ -492,6 +647,7 @@ def _bounds(envelope: Any) -> str:
 
 __all__ = [
     "DEFAULT_RING_CAPACITY",
+    "MIN_EVENT_INTERVAL_S",
     "EventKind",
     "HardwareEvent",
     "HardwareEventDetector",

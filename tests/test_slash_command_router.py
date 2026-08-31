@@ -183,3 +183,73 @@ def test_tools_payload_groups_desktop_tools_when_perception_online() -> None:
         assert "file_read" in online["groups"]["file"]
     finally:
         _tool_reg.set_capability_catalog_provider(None)
+
+
+# ════════════════════════════════════════════════════════════════
+# /board completes its own second token
+# ════════════════════════════════════════════════════════════════
+
+
+def _board_completer(templates: tuple[str, ...] = ("capability", "hardware", "signals")):
+    from leapflow.cli.tui_app.input import SlashCommandCompleter
+
+    return SlashCommandCompleter(
+        [("board", "Board"), ("config", "Config")], board_templates=templates
+    )
+
+
+def _offered(completer, text: str) -> list[str]:
+    from prompt_toolkit.document import Document
+
+    return [item.text for item in completer.get_completions(Document(text, len(text)), None)]
+
+
+def test_board_offers_both_verbs_and_lenses() -> None:
+    """The dispatcher accepts either in the same position, so both must be offered.
+
+    ``/board`` took a reserved verb *or* a template name as its second token and the
+    completer offered neither: every lens and every control verb was undiscoverable,
+    reachable only by reading the source or the args hint.
+    """
+    offered = _offered(_board_completer(), "/board ")
+    assert {"templates", "status", "refresh", "pause", "resume", "stop"} <= set(offered)
+    assert {"capability", "hardware", "signals"} <= set(offered)
+
+
+def test_board_narrows_on_the_typed_prefix() -> None:
+    """One prefix can match a verb and a lens at once; both must survive."""
+    completer = _board_completer(("sentiment", "signals"))
+    assert _offered(completer, "/board h") == []
+    assert set(_offered(completer, "/board s")) == {
+        "status", "stop", "sentiment", "signals",
+    }, "a prefix shared by verbs and lenses must not drop either kind"
+    assert _offered(completer, "/board cap") == []
+
+
+def test_board_offers_nothing_for_a_watch_id() -> None:
+    """Only the running daemon knows watch ids, so inventing one would mislead."""
+    completer = _board_completer()
+    assert _offered(completer, "/board stop ") == []
+    assert _offered(completer, "/board stop abc") == []
+
+
+def test_board_lenses_come_from_the_installed_templates() -> None:
+    """A lens is a YAML file an operator can add; a hardcoded list would omit theirs."""
+    completer = _board_completer(("my_bench",))
+    assert "my_bench" in _offered(completer, "/board ")
+    assert "capability" not in _offered(completer, "/board "), (
+        "the lens list must be the one supplied, not a built-in default"
+    )
+
+
+def test_the_completer_and_the_dispatcher_agree_on_the_reserved_verbs() -> None:
+    """Two literal lists drift, so the agreement is asserted rather than assumed.
+
+    A verb the dispatcher accepts but never offers is undiscoverable; one offered but
+    rejected is worse than no completion at all, because it teaches the user a command
+    that does not exist.
+    """
+    from leapflow.cli.commands.slash_handlers import _BOARD_VERBS as dispatcher_verbs
+    from leapflow.cli.tui_app.input import _BOARD_VERBS as completer_verbs
+
+    assert {verb for verb, _ in completer_verbs} == set(dispatcher_verbs)

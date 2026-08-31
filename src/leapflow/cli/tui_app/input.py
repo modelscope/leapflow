@@ -62,6 +62,22 @@ _CONFIG_SECRET_ACTIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+_BOARD_VERBS: tuple[tuple[str, str], ...] = (
+    ("templates", "List the available board lenses"),
+    ("status", "Show board observations and their ids"),
+    ("refresh", "Re-run the session observation now"),
+    ("pause", "Pause the session observation"),
+    ("resume", "Resume a paused observation"),
+    ("stop", "Stop an observation"),
+)
+"""Reserved ``/board`` verbs, mirroring the dispatcher's own set.
+
+A second literal list is a drift risk, so a test asserts the two agree rather than
+trusting them to: a verb the dispatcher accepts but never offers is undiscoverable, and
+one offered but rejected is worse than no completion at all.
+"""
+
+
 @dataclass(frozen=True)
 class ConfigCompletionField:
     """Compact config field metadata used by slash completion."""
@@ -86,9 +102,11 @@ class SlashCommandCompleter(Completer):
         self,
         commands: Sequence[tuple[str, str]],
         config_fields: Sequence[object] = (),
+        board_templates: Sequence[str] = (),
     ) -> None:
         self._commands = tuple(commands)
         self._config_fields = tuple(_normalize_config_field(item) for item in config_fields)
+        self._board_templates = tuple(sorted({str(name) for name in board_templates if name}))
 
     @property
     def commands(self) -> tuple[tuple[str, str], ...]:
@@ -109,6 +127,9 @@ class SlashCommandCompleter(Completer):
         if text.startswith("/config "):
             yield from self._config_completions(text)
             return
+        if text.startswith("/board "):
+            yield from self._board_completions(text)
+            return
 
         query = text.lstrip("/").lower()
         for command, description in self._commands:
@@ -121,6 +142,37 @@ class SlashCommandCompleter(Completer):
                 start_position=-len(text),
                 display=f"/{command}",
                 display_meta=_truncate_meta(description),
+            )
+
+    def _board_completions(self, text: str) -> "Iterable[Completion]":
+        """Offer the reserved verbs and the installed lenses after ``/board ``.
+
+        Both, not one: the dispatcher accepts a verb *or* a template name in the same
+        position and rejects anything else, so offering only half of that vocabulary
+        leaves the other half undiscoverable. The lens list is read from the template
+        library rather than enumerated, because templates are files an operator can add.
+        """
+        tail = text[len("/board "):]
+        parts = tail.split()
+        # A second token is a watch id -- values only the running daemon knows, so
+        # there is nothing truthful to offer.
+        if len(parts) > 1 or (parts and tail.endswith(" ")):
+            return
+        prefix = parts[0].lower() if parts else ""
+        start = -len(prefix)
+        for verb, description in _BOARD_VERBS:
+            if prefix and not verb.startswith(prefix):
+                continue
+            yield Completion(
+                verb, start_position=start, display=verb,
+                display_meta=_truncate_meta(description),
+            )
+        for name in self._board_templates:
+            if prefix and not name.startswith(prefix):
+                continue
+            yield Completion(
+                name, start_position=start, display=name,
+                display_meta=_truncate_meta("Open this lens"),
             )
 
     def _config_completions(self, text: str) -> "Iterable[Completion]":
@@ -278,6 +330,11 @@ def _value_choices(field: ConfigCompletionField) -> tuple[str, ...]:
 def build_completer(
     commands: Sequence[tuple[str, str]],
     config_fields: Sequence[object] = (),
+    board_templates: Sequence[str] = (),
 ) -> ThreadedCompleter:
     """Create a threaded slash-command completer for the TextArea."""
-    return ThreadedCompleter(SlashCommandCompleter(commands or [], config_fields=config_fields))
+    return ThreadedCompleter(
+        SlashCommandCompleter(
+            commands or [], config_fields=config_fields, board_templates=board_templates
+        )
+    )

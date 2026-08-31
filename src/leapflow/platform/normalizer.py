@@ -8,6 +8,7 @@ from fnmatch import fnmatch
 from typing import Any, Callable, Dict, List, Tuple
 
 from leapflow.domain.events import (
+    PRE_NORMALIZED_EVENT_PREFIXES,
     PRIORITY_CRITICAL,
     PRIORITY_DEFERRED,
     PRIORITY_HIGH,
@@ -141,10 +142,10 @@ class EventNormalizer:
             event = self._normalize_context(payload)
         elif event_type == "event.intent_signal":
             event = self._normalize_intent(payload)
-        elif event_type.startswith("gateway.") or event_type.startswith("daemon."):
-            # Gateway/daemon events are pre-normalized; pass through as-is so
-            # downstream subscribers (e.g. MonitorManager EventBridge) see the
-            # original event_type for pattern-matching.
+        elif event_type.startswith(PRE_NORMALIZED_EVENT_PREFIXES):
+            # Already normalized by their producer; pass through as-is so downstream
+            # subscribers (e.g. MonitorManager EventBridge) see the original
+            # event_type for pattern-matching.
             event = SystemEvent(
                 event_type=event_type,
                 source=str(payload.get("_platform", payload.get("source", event_type))),

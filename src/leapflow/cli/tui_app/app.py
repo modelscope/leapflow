@@ -231,6 +231,7 @@ class LeapApp:
         status: StatusBar,
         commands: Sequence[tuple[str, str]] = (),
         config_fields: Sequence[object] = (),
+        board_templates: Sequence[str] = (),
         history_path: Optional[Path] = None,
         on_input: Optional[InputHandler] = None,
         on_control: Optional[ControlHandler] = None,
@@ -268,7 +269,7 @@ class LeapApp:
         history_path.parent.mkdir(parents=True, exist_ok=True)
         self._history_path = history_path
 
-        self._input_area = self._build_input_area(commands, config_fields)
+        self._input_area = self._build_input_area(commands, config_fields, board_templates)
         self._app = self._build_application()
 
     # ── Public state properties ──────────────────────────────────────
@@ -861,9 +862,14 @@ class LeapApp:
         return Dimension(min=1, max=cap, preferred=preferred)
 
     def _build_input_area(
-        self, commands: Sequence[tuple[str, str]], config_fields: Sequence[object]
+        self,
+        commands: Sequence[tuple[str, str]],
+        config_fields: Sequence[object],
+        board_templates: Sequence[str] = (),
     ) -> TextArea:
-        completer = build_completer(commands, config_fields=config_fields)
+        completer = build_completer(
+            commands, config_fields=config_fields, board_templates=board_templates
+        )
         ref = self
 
         area = TextArea(

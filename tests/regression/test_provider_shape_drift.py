@@ -82,16 +82,31 @@ def _has(shapes: list[Any], path: tuple[Any, ...]) -> bool:
 
 
 def test_derived_fixtures_are_present_and_non_trivial() -> None:
-    """The distilled shapes must actually describe recorded traffic."""
+    """The distilled shapes must actually describe recorded traffic.
+
+    Checked against the shapes themselves rather than a count of exchanges scanned.
+    That count used to live in the fixture and was asserted here, but it also made
+    ``sync_fixtures --check`` fail every time a journey was added -- identical shapes,
+    red build -- so it was removed from the contract. Asserting the structure is the
+    stronger test anyway: a corpus of two hundred stubs would satisfy a count and fail
+    this.
+    """
     shapes = _shapes()
-    assert shapes.get("stored_responses_seen", 0) > 0, (
-        "the derived fixture reports no recorded responses; re-run "
-        "`make seed-cassettes && make sync-fixtures`"
-    )
-    assert shapes.get("completion_shapes"), "no successful completion shape recorded"
-    assert shapes.get("error_shapes"), (
+    completions = shapes.get("completion_shapes") or []
+    assert completions, "no successful completion shape recorded"
+    for shape in completions:
+        missing = {"choices", "usage"} - set(shape)
+        assert not missing, (
+            f"a completion body without {sorted(missing)} is not provider traffic; "
+            "re-run `make seed-cassettes && make sync-fixtures`"
+        )
+    errors = shapes.get("error_shapes") or []
+    assert errors, (
         "no error shape recorded — the recovery classifier's inputs are unverified"
     )
+    for shape in errors:
+        assert "error" in shape, f"an error body must carry an error object: {sorted(shape)}"
+    assert shapes.get("usage_fields"), "no usage fields seen, so token accounting is unverified"
 
 
 def test_recorded_traffic_carries_the_optional_fields_production_reads() -> None:

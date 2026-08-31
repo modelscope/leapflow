@@ -684,3 +684,71 @@ def test_context_round_trips_through_a_mapping() -> None:
     )
     restored = HardwareContext.from_mapping(original.to_dict())
     assert restored == original
+
+
+# ════════════════════════════════════════════════════════════════
+# Hysteresis is derived, and never weakens the safety check
+# ════════════════════════════════════════════════════════════════
+
+
+def test_settle_margin_prefers_the_declared_quantization() -> None:
+    """A change below the device's own resolution is not a change.
+
+    Deriving the band from ``quantization`` keeps the declaration the single source of
+    truth: nothing new has to be written down, and nothing can drift out of sync.
+    """
+    envelope = Envelope(declared=True, min_value=0.0, max_value=100.0, quantization=0.5)
+    assert envelope.settle_margin == pytest.approx(0.5)
+
+
+def test_settle_margin_falls_back_to_a_fraction_of_the_span() -> None:
+    """Most channels declare no quantization but still must not flap."""
+    envelope = Envelope(declared=True, min_value=0.0, max_value=200.0)
+    assert envelope.settle_margin == pytest.approx(2.0)
+
+
+def test_settle_margin_is_capped_so_a_breach_can_always_clear() -> None:
+    """A coarse quantization must not produce a band wider than the range.
+
+    Uncapped, this channel would demand the value land inside 0..100 by 80 on each
+    side -- an empty band. The breach would then be permanent, trading a flood of
+    events for a stuck one, which is worse: a flood is visible.
+    """
+    envelope = Envelope(declared=True, min_value=0.0, max_value=100.0, quantization=80.0)
+    assert envelope.settle_margin == pytest.approx(25.0)
+    assert envelope.contains(50.0, margin=envelope.settle_margin) is True
+
+
+def test_settle_margin_is_zero_without_a_two_sided_range() -> None:
+    """A one-sided envelope has no scale, so no fraction of it can be taken."""
+    assert Envelope(declared=True, min_value=0.0).settle_margin == 0.0
+    assert Envelope(declared=True).settle_margin == 0.0
+
+
+def test_margin_narrows_inward_and_never_widens_the_band() -> None:
+    """The margin may only make the test stricter.
+
+    A margin that widened the range would turn a recovery aid into a hole in the one
+    check standing between a command and the device.
+    """
+    envelope = Envelope(declared=True, min_value=0.0, max_value=100.0)
+    assert envelope.contains(0.0) is True
+    assert envelope.contains(0.0, margin=1.0) is False
+    assert envelope.contains(100.0, margin=1.0) is False
+    assert envelope.contains(50.0, margin=1.0) is True
+    # A negative margin must not reopen the band.
+    assert envelope.contains(101.0, margin=-5.0) is False
+
+
+def test_margin_defaults_to_zero_so_the_hardline_is_unchanged() -> None:
+    """Safety callers evaluate the limit a human declared, not a softened one."""
+    envelope = Envelope(declared=True, min_value=0.0, max_value=100.0, quantization=10.0)
+    assert envelope.contains(100.0) is True, "the declared bound is inclusive"
+    assert envelope.contains(100.0, margin=envelope.settle_margin) is False
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True, "fast", None])
+def test_margin_does_not_reopen_the_non_numeric_path(value: Any) -> None:
+    """Still fail-closed: "cannot evaluate" carries the same weight as "out of range"."""
+    envelope = Envelope(declared=True, min_value=0.0, max_value=100.0)
+    assert envelope.contains(value, margin=1.0) is False

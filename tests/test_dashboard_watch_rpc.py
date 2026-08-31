@@ -70,7 +70,7 @@ async def test_service_watch_summary_separates_keepalive_watches(tmp_path: Path)
 
     await service.watch_arm({"name": "Session", "domain": "demo", "client_coupled": True})
     await service.watch_arm({"name": "Market", "domain": "demo"})
-    summary = service._watch_runtime_summary()
+    summary = await service._watch_runtime_summary()
 
     assert summary["active"] == 2
     assert summary["client_coupled_active"] == 1

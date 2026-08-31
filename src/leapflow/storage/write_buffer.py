@@ -17,7 +17,7 @@ import logging
 import os
 import random
 import time
-from typing import Any, List, Tuple
+from typing import Any, Callable, List, Tuple
 
 import duckdb
 
@@ -69,8 +69,10 @@ class WriteBuffer:
 
     Parameters
     ----------
-    conn : duckdb.DuckDBPyConnection
-        The database connection to flush to.
+    connection : callable returning duckdb.DuckDBPyConnection
+        Resolved on every flush rather than held, because the holder hands out a
+        different connection per thread and a buffer flushed from a worker must not
+        reuse the event loop's. See ``LocalConnectionHolder.connection``.
     max_count : int
         Flush when the buffer reaches this many operations.
     max_interval_s : float
@@ -81,13 +83,13 @@ class WriteBuffer:
 
     def __init__(
         self,
-        conn: duckdb.DuckDBPyConnection,
+        connection: Callable[[], duckdb.DuckDBPyConnection],
         *,
         max_count: int = 100,
         max_interval_s: float = 0.5,
         max_capacity: int = 2000,
     ) -> None:
-        self._conn = conn
+        self._connection = connection
         self._max_count = max_count
         self._max_interval_s = max_interval_s
         self._max_capacity = max_capacity
@@ -120,9 +122,10 @@ class WriteBuffer:
 
         flushed = 0
         remaining: List[_Op] = []
+        connection = self._connection()
         for tag, sql, params in self._buffer:
             try:
-                execute_with_retry(self._conn, sql, params)
+                execute_with_retry(connection, sql, params)
                 flushed += 1
             except Exception as exc:
                 if is_lock_error(exc):
@@ -140,7 +143,3 @@ class WriteBuffer:
         if flushed:
             logger.debug("write_buffer: flushed %d ops, %d remaining", flushed, len(remaining))
         return flushed
-
-    def update_connection(self, conn: duckdb.DuckDBPyConnection) -> None:
-        """Update the underlying connection (used during connection sharing)."""
-        self._conn = conn

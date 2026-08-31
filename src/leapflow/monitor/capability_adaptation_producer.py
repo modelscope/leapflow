@@ -110,6 +110,15 @@ class CapabilityAdaptationProducer:
                     ),
                 ),
                 dedup_key=f"capability_plan:{latest.get('record_id') or plan.get('plan_id') or 'latest'}",
+                # The board renders from ``payload`` -- the domain-private escape hatch --
+                # while ``evidence`` is the label/value summary a person skims. Only
+                # evidence was ever set, so every panel on the capability board bound to
+                # ``capability_plan.*`` resolved against an empty mapping: correct
+                # headings, correct columns, no rows, and nothing anywhere reported a
+                # fault. Requirements, plan steps, deltas and lifecycle results are lists
+                # of records that cannot be expressed as label/value pairs at all, which
+                # is exactly what this field exists for.
+                payload={**latest, "observation_count": len(observation_ids)},
             ),
         )
 

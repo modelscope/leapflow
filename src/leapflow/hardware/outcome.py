@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from leapflow.hardware.context import Channel, Envelope, as_numeric
+from leapflow.hardware.context import Channel, Envelope, _declared_span, as_numeric
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +53,62 @@ class PhysicalOutcome:
     conditions: str = ""
     settled: bool = True
     timestamp: float = 0.0
+    expected: float | None = None
+    """What this channel was expected to reach, given what it has done before.
+
+    ``None``, not zero, when nothing has been learned yet. A numeric default would be
+    indistinguishable from a genuine prediction of that value, and zero in particular
+    produced nonsense: an outcome built without it reported "reach 0 (commanded 50,
+    prior bias -50)" about a device that behaved perfectly. Read through ``predicted``,
+    which supplies the honest starting point instead.
+    """
+    model_error: float | None = None
+    model_offset: float | None = None
+    """The same error measured against the prediction rather than the command.
+
+    ``None`` while there is no prediction to measure against, in which case
+    ``model_delta`` reports the device-relative figure -- not as a stand-in, but
+    because with no prediction the two genuinely are the same measurement.
+
+    The distinction between them is the whole point of keeping both. ``delta`` answers
+    "how far off was the device?" and never improves -- a valve that always undershoots
+    by eight percent reports the same error forever. ``model_delta`` answers "how far
+    off were *we*?", which is the only one of the two a learning loop can drive down.
+    """
+
+    @property
+    def predicted(self) -> float:
+        """The value expected of this channel: the command until evidence says otherwise.
+
+        A device is expected to do what it is told, so the first command to a channel
+        is predicted exactly. That is a real prior, not a missing value.
+        """
+        return self.commanded if self.expected is None else self.expected
+
+    @property
+    def model_delta(self) -> float:
+        """Normalised error against the prediction."""
+        return self.delta if self.model_error is None else self.model_error
+
+    @property
+    def model_residual(self) -> float:
+        """Raw error against the prediction."""
+        return self.residual if self.model_offset is None else self.model_offset
 
     @property
     def accurate(self) -> bool:
         """Return whether the device landed close to what was asked of it."""
         return self.delta <= 0.05
+
+    @property
+    def predictable(self) -> bool:
+        """Return whether the outcome matched what prior observations implied.
+
+        A device can be inaccurate and perfectly predictable at the same time -- that
+        is the useful case, because a known bias can be compensated. The reverse, an
+        accurate device behaving unpredictably, is the one that needs attention.
+        """
+        return self.model_delta <= 0.05
 
     def to_action_description(self) -> str:
         """Return the retrieval key: what was done, under what conditions.
@@ -79,6 +130,20 @@ class PhysicalOutcome:
             f"(residual {self.residual:g}, normalised delta {self.delta:.3f})"
         )
 
+    def to_predicted_effect(self) -> str:
+        """Return what was expected, naming the learned correction when there was one.
+
+        Stated separately from the command so a later reader can tell an accurate
+        device from a well-understood one.
+        """
+        unit = f" {self.unit}" if self.unit else ""
+        if self.predicted == self.commanded:
+            return f"reach {self.commanded:g}{unit}"
+        return (
+            f"reach {self.predicted:g}{unit} "
+            f"(commanded {self.commanded:g}, prior bias {self.predicted - self.commanded:+g})"
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "device_id": self.device_id,
@@ -89,6 +154,9 @@ class PhysicalOutcome:
             "observed": self.observed,
             "residual": self.residual,
             "delta": self.delta,
+            "predicted": self.predicted,
+            "model_residual": self.model_residual,
+            "model_delta": self.model_delta,
             "conditions": self.conditions,
             "settled": self.settled,
         }
@@ -103,6 +171,7 @@ class _PendingCommand:
     quantity: str
     unit: str
     commanded: float
+    predicted: float
     envelope: Envelope
     conditions: str
     settle_after: float
@@ -134,6 +203,24 @@ def normalized_delta(
     return min(1.0, magnitude), residual
 
 
+_BIAS_ALPHA = 0.3
+"""Weight given to the newest residual when updating a channel's bias.
+
+Low enough that one outlier cannot capture the estimate, high enough that a device
+whose behaviour genuinely changed is tracked within a few commands. A plain mean would
+never forget the state the bench was in last week.
+"""
+
+_MAX_BIAS_SPAN_FRACTION = 0.25
+"""Ceiling on the learned correction, as a fraction of the declared envelope span.
+
+A prediction is allowed to be wrong; it is not allowed to be absurd. Without a cap one
+badly-timed reading -- a transient caught just after settling -- could push the expected
+value outside the limits a human wrote down, and every subsequent model residual would
+be measured against a value the device is not permitted to reach.
+"""
+
+
 class HardwareOutcomeRecorder:
     """Turns physical commands and observations into retrievable experience.
 
@@ -151,6 +238,7 @@ class HardwareOutcomeRecorder:
         self._store = experience_store
         self._pending_ttl_s = pending_ttl_s
         self._pending: dict[tuple[str, str], _PendingCommand] = {}
+        self._bias: dict[tuple[str, str], tuple[float, int]] = {}
         self._recorded = 0
 
     @property
@@ -195,6 +283,7 @@ class HardwareOutcomeRecorder:
             quantity=channel.quantity,
             unit=channel.unit,
             commanded=commanded,
+            predicted=commanded + self._bias_for(key, channel.envelope),
             envelope=channel.envelope,
             conditions=conditions,
             # Settling is respected because a reading taken before the value stabilises
@@ -239,6 +328,13 @@ class HardwareOutcomeRecorder:
         delta, residual = normalized_delta(
             commanded=pending.commanded, observed=observed, envelope=pending.envelope
         )
+        # Measured against the prediction as well as the command. Only the second of
+        # these can be driven down by learning: a device with a fixed bias reports the
+        # same command-relative error forever, however well it is understood.
+        model_delta, model_residual = normalized_delta(
+            commanded=pending.predicted, observed=observed, envelope=pending.envelope
+        )
+        self._update_bias(key, residual)
         outcome = PhysicalOutcome(
             device_id=device_id,
             channel_id=channel_id,
@@ -250,18 +346,63 @@ class HardwareOutcomeRecorder:
             residual=residual,
             conditions=pending.conditions,
             timestamp=time.time(),
+            expected=pending.predicted,
+            model_error=model_delta,
+            model_offset=model_residual,
         )
         self._store_outcome(outcome)
         return outcome
+
+    # ── Prediction ──
+
+    def _bias_for(self, key: tuple[str, str], envelope: Envelope) -> float:
+        """Return the learned correction for a channel, clamped to its envelope.
+
+        Zero until the channel has been observed once, because a device is expected to
+        do what it is told until evidence says otherwise.
+
+        Held in memory for the life of the process and deliberately not persisted. The
+        durable record is the experience store, but that store is shared across domains
+        and keeps only the *magnitude* of the error -- the sign, which is what makes a
+        correction a correction, is not recoverable from it. Extending a cross-domain
+        schema for one domain's estimator would be the wrong trade, so the honest
+        statement is that this calibration restarts with the process.
+        """
+        entry = self._bias.get(key)
+        if entry is None:
+            return 0.0
+        bias = entry[0]
+        span = _declared_span(envelope)
+        if span <= 0:
+            return bias
+        cap = span * _MAX_BIAS_SPAN_FRACTION
+        return max(-cap, min(cap, bias))
+
+    def _update_bias(self, key: tuple[str, str], residual: float) -> None:
+        """Fold one observation into the channel's running correction."""
+        entry = self._bias.get(key)
+        if entry is None:
+            self._bias[key] = (residual, 1)
+            return
+        previous, samples = entry
+        self._bias[key] = (previous + _BIAS_ALPHA * (residual - previous), samples + 1)
+
+    def calibration_for(self, device_id: str, channel_id: str) -> tuple[float, int] | None:
+        """Return ``(bias, samples)`` learned for a channel, or None if untested.
+
+        Exposed so a person can see what the agent concluded about their own bench in
+        the units they declared. A correction the operator cannot inspect is one they
+        cannot disagree with, and this one is derived from observation rather than
+        stated by anyone.
+        """
+        return self._bias.get((device_id, channel_id))
 
     def _store_outcome(self, outcome: PhysicalOutcome) -> None:
         try:
             self._store.store(
                 action_description=outcome.to_action_description(),
                 app_context=outcome.device_id,
-                predicted_effect=(
-                    f"reach {outcome.commanded:g}{f' {outcome.unit}' if outcome.unit else ''}"
-                ),
+                predicted_effect=outcome.to_predicted_effect(),
                 actual_effect=outcome.to_actual_effect(),
                 delta=outcome.delta,
                 pre_state_summary=f"{outcome.device_id}.{outcome.channel_id}",
@@ -368,13 +509,6 @@ def _summarize_experience(experience: Any) -> dict[str, Any] | None:
         "outcome": str(getattr(experience, "actual_effect", "") or ""),
         "delta": float(getattr(experience, "delta", 1.0) or 0.0),
     }
-
-
-def _declared_span(envelope: Envelope) -> float:
-    if envelope.min_value is None or envelope.max_value is None:
-        return 0.0
-    span = envelope.max_value - envelope.min_value
-    return span if span > 0 else 0.0
 
 
 __all__ = [

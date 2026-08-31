@@ -28,6 +28,17 @@ worse than rejecting it with a reason.
 
 SUPPORTED_HC_VERSIONS: frozenset[str] = frozenset({HC_VERSION})
 
+_DEFAULT_HYSTERESIS_SPAN_FRACTION = 0.01
+"""Settle band used when a channel declares no quantization, as a share of span."""
+
+_MAX_HYSTERESIS_SPAN_FRACTION = 0.25
+"""Upper bound on the settle band, so a coarse quantization cannot close it.
+
+Without the cap, a channel whose quantization approaches its own span would
+produce a settle band wider than the range itself: the value could never clear
+it, and a breach would be reported as permanent.
+"""
+
 
 class ContextSource(str, Enum):
     """Where a hardware context came from -- drives how much it is trusted."""
@@ -171,7 +182,7 @@ class Envelope:
             for bound in (self.min_value, self.max_value, self.max_rate, self.quantization)
         )
 
-    def contains(self, value: Any) -> bool:
+    def contains(self, value: Any, *, margin: float = 0.0) -> bool:
         """Return True when *value* lies inside the declared bounds.
 
         Three cases, and the middle one is the one that matters. An undeclared
@@ -181,17 +192,45 @@ class Envelope:
         "out of range" or an unparseable command would slip past the one check
         standing between it and the device. Only an envelope with no numeric
         bounds -- a state channel -- admits an arbitrary value.
+
+        ``margin`` narrows the band inward. It exists so a breach can end on a
+        stricter test than it began on (see ``settle_margin``); every safety
+        caller leaves it at zero, because a hardline must be evaluated against
+        the limit a human actually declared.
         """
         if not self.declared:
             return False
         numeric = as_numeric(value)
         if numeric is None:
             return not self.is_numeric
-        if self.min_value is not None and numeric < self.min_value:
+        inward = max(0.0, margin)
+        if self.min_value is not None and numeric < self.min_value + inward:
             return False
-        if self.max_value is not None and numeric > self.max_value:
+        if self.max_value is not None and numeric > self.max_value - inward:
             return False
         return True
+
+    @property
+    def settle_margin(self) -> float:
+        """Return the inward margin a value must clear before a breach is over.
+
+        Derived, never declared. A boundary crossing and a boundary *hover* are
+        different observations, but a plain in/out test cannot tell them apart:
+        a sensor resting on its limit alternates threshold_exceeded and settled
+        at the sampling rate, which is the same flood the event layer exists to
+        prevent -- and it buries the one crossing that mattered.
+
+        ``quantization`` is the natural width when declared: a change smaller
+        than the device's own resolution is not a change. Absent it, a small
+        fraction of the declared span is used. The result is capped so the
+        settle band can never collapse to nothing on a narrow envelope, which
+        would replace flapping with a breach that never clears.
+        """
+        span = _declared_span(self)
+        cap = span * _MAX_HYSTERESIS_SPAN_FRACTION
+        if self.quantization is not None and self.quantization > 0:
+            return min(self.quantization, cap) if cap > 0 else self.quantization
+        return span * _DEFAULT_HYSTERESIS_SPAN_FRACTION
 
     def rate_wait_s(self, *, delta: float, elapsed_s: float) -> float:
         """Return how long to wait before a change of *delta* respects ``max_rate``.
@@ -567,6 +606,18 @@ _as_float = as_numeric
 
 def _format_bound(value: float | None) -> str:
     return "-" if value is None else f"{value:g}"
+
+
+def _declared_span(envelope: "Envelope") -> float:
+    """Return the width of a two-sided declared range, or 0.0 when there isn't one.
+
+    A one-sided or unbounded envelope has no span, and every caller must treat
+    that as "no scale available" rather than as zero width.
+    """
+    if envelope.min_value is None or envelope.max_value is None:
+        return 0.0
+    span = envelope.max_value - envelope.min_value
+    return span if span > 0 else 0.0
 
 
 __all__ = [

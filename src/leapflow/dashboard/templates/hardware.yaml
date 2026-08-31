@@ -1,0 +1,183 @@
+# Physical bench observation template for LeapBoard.
+#
+# The narrative runs Observe -> Orient -> Learn: is the bench alive, is it inside
+# the limits somebody declared, and what has been learned from operating it. Every
+# value is derived from the device declaration, the reading store or the event ring
+# -- nothing here is a second source of truth.
+#
+# Read-only by design. No node carries an action: an observation surface that can
+# actuate a device is not an observation surface, and a browser session is a weaker
+# identity than the TUI process that normally holds the approval route.
+#
+# Two renderer contracts are load-bearing and were both verified rather than
+# assumed. ``bind`` belongs inside ``props`` -- at node level it is silently
+# dropped. And there is no ``.length``: the path resolver walks mapping keys and
+# list indices only, so counts are precomputed into the payload.
+template: hardware
+version: 1
+title: "Physical bench"
+domain: hardware
+meta:
+  title: "Physical bench"
+  description: "Sampled channels against their declared envelopes, with device health, cadence and learned command outcomes."
+layout:
+  - type: Page
+    props:
+      title: "Physical bench"
+    children:
+      # ── 1. Bench state: can this data be trusted right now ──
+      - type: Row
+        props:
+          variant: metrics
+        children:
+          - type: Stat
+            props:
+              label: "Devices"
+              value: "{{ hardware.counts.devices }}"
+          - type: Stat
+            props:
+              label: "Charted channels"
+              value: "{{ hardware.counts.series }}"
+          - type: Stat
+            props:
+              label: "Recent events"
+              value: "{{ hardware.counts.events }}"
+          - type: Stat
+            props:
+              label: "Unpersisted windows"
+              value: "{{ hardware.storage.write_failures }}"
+          - type: Stat
+            props:
+              label: "Raw samples written"
+              value: "{{ hardware.storage.raw_writes }}"
+          - type: Stat
+            props:
+              label: "Watch state"
+              value: "{{ observation.watch_state }}"
+
+      # ── 2. Channel traces ──
+      # One chart carrying every channel: the renderer plots the series list
+      # directly, so a per-channel repeat would produce N single-line charts that are
+      # harder to compare than N lines on one axis.
+      - type: Section
+        props:
+          title: "Channel traces"
+          subtitle: "Sampled history per channel, newest on the right"
+        children:
+          - type: LineChart
+            when: hardware.series
+            props:
+              title: "Sampled channels"
+              caption: "Mean of each downsample window. Declared limits are listed per channel below."
+              bind: hardware.series
+
+      # ── 3. Envelope conformance ──
+      # A distribution, not a per-window grid: Heatmap is in the component catalog
+      # but has no frontend renderer, so asking for one yields a fallback card
+      # printing its own type name.
+      - type: Section
+        props:
+          title: "Envelope conformance"
+          subtitle: "How often each window sat inside, near, or outside its declared limits"
+        children:
+          - type: BarChart
+            when: hardware.conformance_mix
+            props:
+              title: "Window conformance"
+              caption: "Counted across every charted channel. 'near' means within 5% of a declared bound."
+              bind: hardware.conformance_mix
+
+      # ── 4. Event timeline ──
+      - type: Section
+        props:
+          title: "Device events"
+          subtitle: "Envelope, rate, staleness and quality observations · newest first"
+        children:
+          - type: Timeline
+            when: hardware.events
+            props:
+              bind: hardware.events
+
+      # ── 5. Sampling health ──
+      # The only place a cadence shortfall is visible: a window counts the samples
+      # it actually received, so a channel running at two thirds of its declared
+      # rate produces a series that looks entirely correct.
+      - type: Section
+        props:
+          title: "Sampling health"
+          subtitle: "Observed rate against declared rate"
+        children:
+          - type: Table
+            when: hardware.sampling
+            props:
+              caption: "A ratio below 1.0 means the sampling loop is not keeping its declared cadence."
+              columns:
+                - key: channel_id
+                  label: "Channel"
+                - key: declared_hz
+                  label: "Declared Hz"
+                - key: observed_hz
+                  label: "Observed Hz"
+                - key: rate_ratio
+                  label: "Ratio"
+                - key: skipped_slots
+                  label: "Skipped slots"
+                - key: dropped
+                  label: "Dropped samples"
+                - key: events_paced_out
+                  label: "Events paced out"
+              bind: hardware.sampling
+
+      # ── 6. Learned command outcomes ──
+      # What the agent has learned about this bench, shown to the person who owns
+      # it. Until this panel that experience only ever reached the model.
+      - type: Section
+        props:
+          title: "Learned command outcomes"
+          subtitle: "Commanded versus observed, best tracking first"
+        children:
+          - type: Table
+            when: hardware.outcomes
+            props:
+              caption: "Normalized error is the residual as a share of the channel's declared span."
+              columns:
+                - key: channel_id
+                  label: "Channel"
+                - key: command
+                  label: "Command"
+                - key: outcome
+                  label: "Outcome"
+                - key: delta
+                  label: "Normalized error"
+              bind: hardware.outcomes
+
+      # ── 7. Devices and declaration provenance ──
+      - type: Section
+        props:
+          title: "Devices"
+          subtitle: "Transport, provenance and channel counts"
+        children:
+          - type: Table
+            when: hardware.devices
+            props:
+              caption: "An unverified declaration has its writable channels demoted to read-only."
+              columns:
+                - key: label
+                  label: "Device"
+                - key: location
+                  label: "Location"
+                - key: transport_kind
+                  label: "Transport"
+                - key: verified
+                  label: "Verified"
+                - key: channels
+                  label: "Channels"
+                - key: writable
+                  label: "Writable"
+                - key: streaming
+                  label: "Streaming"
+                - key: halt_supported
+                  label: "Halt"
+                - key: opened
+                  label: "Open"
+              bind: hardware.devices

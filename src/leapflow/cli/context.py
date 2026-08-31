@@ -941,11 +941,27 @@ class Context:
             if tool_names:
                 self._mcp_manager = mgr
                 self._mcp_tool_names = tuple(tool_names)
+                self._install_mcp_transport_client()
                 logger.info("MCP Manager: %d servers, %d tools registered to agent", len(server_configs), total_tools)
             else:
                 mgr.close()
         except Exception:
             logger.debug("MCP Manager initialization skipped", exc_info=True)
+
+    def _install_mcp_transport_client(self) -> None:
+        """Let a device declared with ``kind: mcp`` reach the configured servers.
+
+        A resolver rather than the manager itself, because ``_configure_mcp_manager``
+        runs again on every runtime config reload: a captured manager would outlive
+        the servers it was built for, and the device would keep calling a closed
+        session. Installed here because this is the one place the manager exists.
+        """
+        try:
+            from leapflow.hardware.transports.mcp import set_mcp_client_provider
+
+            set_mcp_client_provider(lambda: getattr(self, "_mcp_manager", None))
+        except Exception:
+            logger.debug("MCP hardware transport client not installed", exc_info=True)
 
     def reload_runtime_config_if_changed(self, *, force: bool = False) -> bool:
         """Hot-reload LLM/VLM config when user-editable config files changed."""
@@ -1175,8 +1191,8 @@ class Context:
 
         Started here rather than handed to ``ActiveSourceManager`` because that manager
         has no production caller today; delegating to it would ship a sampling loop that
-        never runs. The sources satisfy ``ActiveSignalSource`` unchanged, so they can be
-        moved onto the manager the moment it is wired.
+        never runs. Handing it over later also needs a ``HardwareEvent`` ->
+        ``InteractionSignal`` adapter, since its queue is typed for the latter.
 
         Failures are contained: a bench that cannot be sampled must not prevent the
         process from finishing initialization.
@@ -1186,9 +1202,48 @@ class Context:
             return
         self._bind_hardware_persistence(registry)
         try:
+            # Installed before starting, and used by the command path too: a refusal
+            # to command an unreachable device must reach the same signal path as a
+            # threshold breach, or a stalled bench stays invisible.
+            registry.set_event_emitter(self._hardware_event_emitter())
             await registry.start_streams()
         except Exception:
             logger.warning("Hardware streaming failed to start", exc_info=True)
+
+    def _hardware_event_emitter(self) -> Any:
+        """Return the sink that puts derived device events on the shared signal path.
+
+        This is the step that makes physical observation actionable. Without it the
+        detector still runs and still records events for ``hw_status``, but nothing
+        reacts to them: an overnight run could leave its declared envelope and no
+        watch, board or turn would ever hear about it. Devices go onto ``EventBus``
+        rather than a private channel so they reach the same noise gate, watch
+        activation and board stream as every other environment signal -- ``hw`` is a
+        family there by virtue of the event type, with nothing enumerated anywhere.
+
+        Returns ``None`` when there is no bus, so the registry keeps recording events
+        for status instead of failing to sample.
+        """
+        event_bus = getattr(self, "event_bus", None)
+        if event_bus is None or not hasattr(event_bus, "handle_event"):
+            logger.debug("No event bus for hardware events; sampling records for status only")
+            return None
+
+        def _emit(event: Any) -> None:
+            # Sampling runs on this loop, and ingestion is async, so the handoff is a
+            # task. Safe to spawn per event only because the source paces each kind;
+            # an unpaced 10 Hz channel would otherwise queue tasks at sampling rate.
+            try:
+                asyncio.create_task(
+                    event_bus.handle_event(event.event_type, event.to_payload()),
+                    name=f"hw-event:{event.kind}",
+                )
+            except RuntimeError:
+                # No running loop (teardown). Dropping one event is correct here;
+                # raising would surface inside the sampling loop's dispatch.
+                logger.debug("Dropped hardware event %s: no running loop", event.event_type)
+
+        return _emit
 
     def _bind_hardware_persistence(self, registry: Any) -> None:
         """Point the reading store at session-scoped, layout-owned paths.

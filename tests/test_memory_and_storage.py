@@ -71,7 +71,7 @@ def test_write_buffer_drops_permanent_failures(tmp_path) -> None:
     conn = duckdb.connect(str(db_path))
     try:
         conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY)")
-        buffer = WriteBuffer(conn, max_count=10)
+        buffer = WriteBuffer(lambda: conn, max_count=10)
         buffer.append("bad-sql", "INSERT INTO missing_table VALUES (?)", [1])
 
         assert buffer.flush() == 0

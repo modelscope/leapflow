@@ -83,6 +83,22 @@ class LocalConnectionHolder:
 
     @property
     def connection(self) -> duckdb.DuckDBPyConnection:
+        """Return the connection *for the calling thread*.
+
+        **Never store the result.** The thread-affinity is the whole point: the
+        value returned depends on who is asking, so a reference captured in one
+        thread and used from another defeats it entirely. Resolve it per call --
+        ``self._holder.connection.execute(...)``, or a ``_con`` property that
+        forwards here.
+
+        Caching it silently freezes the process. Two threads then execute on one
+        ``DuckDBPyConnection``, which is not thread-safe, so the second blocks
+        inside DuckDB until the first query finishes. When one of those threads is
+        the event loop, every RPC stops being answered for the duration -- a
+        deferred skill-library scan against a status call was enough to hang the
+        daemon on roughly a third of starts, with nothing in the log after the last
+        successful init line.
+        """
         # Root connection is created and owned by the first thread that
         # opens it (normally the event loop thread). Other threads receive
         # a thread-local cursor, DuckDB's documented multi-threaded pattern.

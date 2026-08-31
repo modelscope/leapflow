@@ -11,6 +11,7 @@ from leapflow.monitor.capability_adaptation_producer import CapabilityAdaptation
 from leapflow.monitor.event_bridge import EventBridge
 from leapflow.monitor.finding_store import FindingStore
 from leapflow.monitor.manager import EmitFn, MonitorManager
+from leapflow.monitor.plugin_health_producer import PluginHealthProducer
 from leapflow.monitor.producers import ProducerRegistry
 from leapflow.monitor.session_producer import (
     SessionAnalysisProducer,
@@ -52,6 +53,7 @@ __all__ = [
     "ProducerContext",
     "MonitorProducer",
     "FindingStore",
+    "PluginHealthProducer",
     "ProducerRegistry",
     "MonitorManager",
     "EmitFn",

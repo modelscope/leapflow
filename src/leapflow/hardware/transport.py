@@ -11,6 +11,7 @@ six methods, and swapping one for another must not reach any other module.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, runtime_checkable
 
@@ -42,6 +43,22 @@ class Reading:
     ``sequence`` exists so that dropped samples become detectable rather than
     silent -- a gap in the sequence is the only evidence that a bounded queue
     discarded something.
+
+    Timebase convention, identical to ``domain.events.SystemEvent``:
+
+    - ``observed_at``: wall-clock (``time.time()`` epoch seconds). The only clock
+      that may be persisted, rendered, or correlated with anything outside this
+      process -- audit entries, approval records, findings and session events are
+      all wall-clock.
+    - ``monotonic_at``: ``time.monotonic()``. The only clock that may be used for
+      intervals, slew rates and staleness, because wall-clock jumps (NTP, suspend,
+      manual adjustment) would fabricate rates that no device produced.
+
+    Both are populated by default so an out-of-tree driver that omits them still
+    gets a usable pair rather than epoch zero. Carrying one field for both roles
+    is what made downsampled history unorderable across a restart: a monotonic
+    origin resets on reboot, so ``ORDER BY ended_at DESC`` silently returned the
+    oldest rows as the newest.
     """
 
     device_id: str
@@ -49,7 +66,8 @@ class Reading:
     value: Any
     quantity: str = ""
     unit: str = ""
-    timestamp: float = 0.0
+    observed_at: float = field(default_factory=time.time)
+    monotonic_at: float = field(default_factory=time.monotonic)
     sequence: int = 0
     quality: str = Quality.OK.value
 
@@ -58,13 +76,19 @@ class Reading:
         return self.quality == Quality.OK.value
 
     def to_dict(self) -> dict[str, Any]:
+        """Return the raw-evidence form. Wall-clock only.
+
+        ``monotonic_at`` is deliberately absent: these records are read by humans
+        and by later analysis, for whom a per-boot counter is noise that invites
+        exactly the confusion this pair exists to prevent.
+        """
         return {
             "device_id": self.device_id,
             "channel_id": self.channel_id,
             "value": self.value,
             "quantity": self.quantity,
             "unit": self.unit,
-            "timestamp": self.timestamp,
+            "observed_at": self.observed_at,
             "sequence": self.sequence,
             "quality": self.quality,
         }

@@ -42,9 +42,21 @@ class TrajectoryStore:
         if self._owns_holder:
             source = LocalConnectionHolder(source)
         self._holder = source
-        self._con = self._holder.connection
-        self._write_buffer = WriteBuffer(self._con)
+        # A callable, not the connection: the buffer flushes from whichever thread
+        # trips its threshold, and that thread must use its own cursor.
+        self._write_buffer = WriteBuffer(lambda: self._holder.connection)
         self._init_schema()
+
+    @property
+    def _con(self) -> Any:
+        """Resolve per call, so each thread gets its own cursor.
+
+        See ``LocalConnectionHolder.connection``: the value is thread-specific, so
+        caching it puts two threads on one connection and the second blocks inside
+        DuckDB until the first query ends -- freezing the event loop when it is one
+        of them.
+        """
+        return self._holder.connection
 
     def close(self) -> None:
         self._write_buffer.flush()

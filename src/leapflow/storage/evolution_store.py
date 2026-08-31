@@ -35,9 +35,19 @@ class DuckDBEvolutionStore:
         if self._owns_holder:
             source = LocalConnectionHolder(Path(source))
         self._holder = source
-        self._conn = self._holder.connection
         self._db_path = str(self._holder.db_path)
         self._initialize_schema()
+
+    @property
+    def _conn(self) -> Any:
+        """Resolve per call, so each thread gets its own cursor.
+
+        See ``LocalConnectionHolder.connection``: the value is thread-specific, so
+        caching it puts two threads on one connection and the second blocks inside
+        DuckDB until the first query ends -- freezing the event loop when it is one
+        of them.
+        """
+        return self._holder.connection
 
     def _initialize_schema(self) -> None:
         self._conn.execute("""

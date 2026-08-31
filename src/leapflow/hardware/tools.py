@@ -220,8 +220,9 @@ class HardwareTools:
                 f"Channel {channel_id!r} is not readable on {device_id!r}.",
             )
         try:
-            transport = await self._registry.transport(device_id)
-            reading = await transport.read(channel_id)
+            async with self._registry.device_io(device_id):
+                transport = await self._registry.transport(device_id)
+                reading = await transport.read(channel_id)
         except TransportError as exc:
             return {
                 "ok": False,
@@ -378,6 +379,16 @@ class HardwareTools:
                 "side_effect_state": SIDE_EFFECT_NONE,
             }
 
+        # Reachability precedes both interlocks and consent. Before interlocks,
+        # because an interlock cannot be evaluated on a device that cannot be reached
+        # and reporting "interlock unevaluable" would name the wrong root cause --
+        # the same reason writability is checked before the effect class. Before
+        # consent, because asking a human to authorise a command against a device
+        # that was never reachable is how people learn to click through prompts.
+        unreachable = await self._unreachable(device_id, channel)
+        if unreachable is not None:
+            return unreachable
+
         interlocks_failed = await self._failed_interlocks(context, channel)
 
         descriptor = ActionDescriptor.device(
@@ -403,8 +414,12 @@ class HardwareTools:
             return self._refusal(device_id, channel_id, "approval_denied", denial)
 
         try:
-            transport = await self._registry.transport(device_id)
-            outcome = await transport.write(channel_id, value)
+            # Serialised against every other data-plane call on this device: an
+            # interleaved write and read on one bus is how a command lands on the
+            # wrong channel, and that outcome is indistinguishable from success.
+            async with self._registry.device_io(device_id):
+                transport = await self._registry.transport(device_id)
+                outcome = await transport.write(channel_id, value)
         except TransportError as exc:
             # A transport raises this only for "could not attempt", so no effect landed.
             return {
@@ -534,6 +549,115 @@ class HardwareTools:
             delta=numeric - previous_value,
             elapsed_s=time.monotonic() - previous_ts,
         )
+
+    async def _unreachable(self, device_id: str, channel: Channel) -> dict[str, Any] | None:
+        """Return a refusal when the device cannot be reached, else None.
+
+        Opening and probing before consent is safe by the transport's own contract:
+        ``open()`` establishes a connection and is idempotent, ``probe()`` is declared
+        side-effect free. It also sets no new precedent -- ``hw_read`` already opens a
+        transport with no approval at all.
+
+        A probe rather than an open alone, because ``transport()`` caches: a connection
+        that was live and then died is returned from the cache without ``open()`` ever
+        being called again, and that is the *common* failure for a server-backed device
+        whose server restarted. Catching only "could not open" would leave exactly the
+        case this exists for. The cost is one round trip per command, which a
+        human-paced write can afford far more easily than it can afford commanding a
+        device nobody can see.
+
+        A dead transport is dropped from the cache so the next attempt reconnects.
+        Without that the refusal would outlive the outage.
+        """
+        channel_id = channel.channel_id
+        try:
+            transport = await self._registry.transport(device_id)
+            status = await transport.probe()
+        except TransportError as exc:
+            await self._registry.drop_transport(device_id)
+            self._report_unreachable(device_id, channel, str(exc))
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "channel_id": channel_id,
+                "error": (
+                    f"{device_id} cannot be reached, so the command was not attempted and "
+                    f"nobody was asked to approve it: {exc}. Fix the connection, then "
+                    f"call hw_status(device_id={device_id!r}) to confirm it is back before "
+                    "commanding it again."
+                ),
+                "failure_code": exc.failure_code,
+                "side_effect_state": SIDE_EFFECT_NONE,
+            }
+        except Exception as exc:  # noqa: BLE001 - a broken driver is an unusable device
+            # probe() is declared side-effect free, so nothing was commanded whatever
+            # the driver did here; NONE is the honest verdict for the write.
+            logger.error(
+                "Hardware transport raised a non-contract exception probing %s: %s",
+                device_id,
+                exc,
+                exc_info=True,
+            )
+            await self._registry.drop_transport(device_id)
+            self._report_unreachable(
+                device_id, channel, f"the driver raised {type(exc).__name__}"
+            )
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "channel_id": channel_id,
+                "error": (
+                    f"The driver for {device_id} failed unexpectedly "
+                    f"({type(exc).__name__}) while checking that the device was "
+                    "reachable, so the command was not attempted. Check the device "
+                    "declaration and the driver."
+                ),
+                "failure_code": "driver_contract_violation",
+                "side_effect_state": SIDE_EFFECT_NONE,
+            }
+        if status.connected:
+            return None
+        await self._registry.drop_transport(device_id)
+        detail = status.detail or "the transport reports it is not connected"
+        self._report_unreachable(device_id, channel, detail)
+        return {
+            "ok": False,
+            "device_id": device_id,
+            "channel_id": channel_id,
+            "error": (
+                f"{device_id} is not connected, so the command was not attempted and "
+                f"nobody was asked to approve it: {detail}. Restore the connection, then "
+                f"call hw_status(device_id={device_id!r}) to confirm it is back."
+            ),
+            "failure_code": "device_unreachable",
+            "side_effect_state": SIDE_EFFECT_NONE,
+        }
+
+    def _report_unreachable(self, device_id: str, channel: Channel, detail: str) -> None:
+        """Put the refusal on the signal path, not only in the tool result.
+
+        A tool result is read once, by whoever made the call. Without this the one
+        condition that most needs to be visible is the one nothing can see: a bench
+        refusing every command looks identical to a bench nobody is using, on the
+        board and in every watch. Routed through the registry so it lands in the same
+        event ring and on the same bus as the sampling loop's observations.
+        """
+        from leapflow.hardware.stream import EventKind, HardwareEvent
+
+        try:
+            self._registry.publish_event(
+                HardwareEvent(
+                    kind=EventKind.UNREACHABLE,
+                    device_id=device_id,
+                    channel_id=channel.channel_id,
+                    quantity=channel.quantity,
+                    detail=f"command refused before approval: {detail}",
+                    unit=channel.unit,
+                    observed_at=time.time(),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must not fail the refusal
+            logger.warning("Could not report %s as unreachable: %s", device_id, exc, exc_info=True)
 
     async def _evaluate(self, descriptor: ActionDescriptor) -> tuple[bool, str]:
         """Run the approval gate, failing closed on absence and on exception.

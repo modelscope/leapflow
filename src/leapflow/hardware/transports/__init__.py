@@ -25,6 +25,7 @@ _TRANSPORTS: dict[str, str] = {
     # one transport cannot break registry loading for the others.
     "mock": "leapflow.hardware.transports.mock:build_transport",
     "python": "leapflow.hardware.transports.python_callable:build_transport",
+    "mcp": "leapflow.hardware.transports.mcp:build_transport",
 }
 
 

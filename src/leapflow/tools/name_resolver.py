@@ -48,20 +48,22 @@ _READ_ONLY_TOOLS = {
     "terminal_read",
     "terminal_list",
 }
-_MUTATING_NAME_SIGNALS = (
-    "write",
-    "replace",
-    "delete",
-    "move",
-    "copy",
-    "create",
-    "add",
-    "send",
-    "post",
-    "run",
-    "shell",
-    "delegate",
-)
+
+_NO_EFFECT_CLAIMS = frozenset({"read_only", "none"})
+"""The only declared ``risk_level`` values that assert a call has no effect.
+
+``x_leapflow.risk_level`` is graded for disclosure (``none`` .. ``high``) while the
+execution policy needs an effect classification. These two values are where the
+vocabularies coincide; a graded one such as ``medium`` says nothing about whether
+the call can be replayed, so it must not buy the read-only policy.
+
+There is deliberately no matching list of mutating name fragments. One used to
+exist, guessing "mutating" from substrings like "write" or "send" and otherwise
+falling through to read-only. It is unnecessary once the default is mutating, and
+it was actively harmful: the guess decided the effect class for every undeclared
+tool, so whether a call was gated depended on whether its author happened to pick
+a word from the list.
+"""
 
 # ─────────────────────────────────────────────────────────────────────
 # Static Alias Table — common LLM naming drift → canonical name
@@ -208,7 +210,11 @@ class ToolRegistry:
             required = parameters_schema.get("required", []) or []
             metadata = function.get("x_leapflow", {}) or definition.get("x_leapflow", {}) or {}
             mutates_state = bool(metadata.get("mutates_state", False))
-            risk_level = _infer_risk_level(name, mutates_state)
+            risk_level = _resolve_risk_level(
+                name,
+                bridge_mutates=mutates_state,
+                declared=str(metadata.get("risk_level") or ""),
+            )
             specs[name] = ToolSpec(
                 name=name,
                 description=str(function.get("description") or definition.get("description") or ""),
@@ -223,7 +229,9 @@ class ToolRegistry:
             canonical = str(name).removeprefix("gp_")
             if canonical and canonical not in specs:
                 mutates_state = False
-                risk_level = _infer_risk_level(canonical, mutates_state)
+                # A handler with no schema declares nothing at all, so it gets the
+                # unclaimed default rather than being read as read-only.
+                risk_level = _resolve_risk_level(canonical, bridge_mutates=mutates_state)
                 specs[canonical] = ToolSpec(
                     name=canonical,
                     risk_level=risk_level,
@@ -351,11 +359,32 @@ class ToolRegistry:
         return tuple(shape_matches[:5])
 
 
-def _infer_risk_level(name: str, bridge_mutates: bool) -> RiskLevel:
-    if name.startswith("gateway_") or name.startswith("hub_") or name.startswith("platform_"):
+def _resolve_risk_level(name: str, *, bridge_mutates: bool, declared: str = "") -> RiskLevel:
+    """Classify a tool's *effect* for the execution policy.
+
+    ``declared`` is ``x_leapflow.risk_level``, and it is consulted rather than
+    honoured wholesale, because that key carries two different vocabularies. The
+    disclosure side (``CapabilityManifest``) grades how much a call needs to be
+    explained and approved -- ``none``/``read_only``/``low``/``medium``/``high`` --
+    while this side answers a narrower question: does the call have an effect, and
+    can it be replayed. "medium" is not an answer to that; copying it into this
+    field would put a value outside ``RiskLevel`` into a typed slot and match none
+    of the comparisons that read it.
+
+    So only the values where the two vocabularies genuinely agree are taken as a
+    claim of no effect. Everything else -- a graded risk, or no declaration at all
+    -- resolves to ``mutating``. Absence of a declaration is not a claim of
+    safety: read as one, a third-party tool with an innocuous name got the
+    ``read_only`` policy, which skips the execution ledger entirely, runs freely
+    in parallel, and is exempt from side-effect gating.
+
+    Order matters. An explicit no-effect claim outranks the name heuristic,
+    because the heuristic is a substring guess: ``test_run`` contains "run" but is
+    an inspection. A mutating *bridge* still wins over both, since a declaration
+    that contradicts the handler's own answer is the stale one.
+    """
+    if name.startswith(("gateway_", "hub_", "platform_")) or declared == "external":
         return "external"
-    if name in _READ_ONLY_TOOLS and not bridge_mutates:
+    if not bridge_mutates and (declared in _NO_EFFECT_CLAIMS or name in _READ_ONLY_TOOLS):
         return "read_only"
-    if bridge_mutates or any(signal in name for signal in _MUTATING_NAME_SIGNALS):
-        return "mutating"
-    return "read_only"
+    return "mutating"

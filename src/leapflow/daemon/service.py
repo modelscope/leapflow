@@ -608,8 +608,8 @@ class RuntimeLeapService:
     def has_active_watches(self) -> bool:
         return self._monitor_coordinator.has_active_watches()
 
-    def _watch_runtime_summary(self) -> dict[str, Any]:  # backward-compat
-        return self._monitor_coordinator.get_summary()
+    async def _watch_runtime_summary(self) -> dict[str, Any]:  # backward-compat
+        return await self._monitor_coordinator.get_summary()
 
     async def watch_arm(self, spec: dict[str, Any]) -> dict[str, Any]:
         return await self._monitor_coordinator.arm(spec)
@@ -871,7 +871,7 @@ class RuntimeLeapService:
             "pending_approvals": self._approval_coordinator.pending_count(),
             "turn_admission": self._turn_admission_status(),
             "deferred_init": self._deferred_init_status(ctx),
-            "watch_summary": self._monitor_coordinator.get_summary(),
+            "watch_summary": await self._monitor_coordinator.get_summary(),
             "host_backend": host,
             # Whether *this* daemon process still matches the source tree on
             # disk (None when outside a git checkout, e.g. a packaged install).
