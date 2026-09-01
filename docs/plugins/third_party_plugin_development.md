@@ -42,6 +42,9 @@ config, gateway dispatch) plus the Tool Capability Contract in
 | `SignalSource` | `perception/signal_source.py` | Stateless event → signal transform |
 | `ActiveSignalSource` | `perception/active_signal_source.py` | Long-running signal emitter (webhook listener, polling bot) |
 | `CVProcessor` | `perception/cv_processor.py` | Frame-pair visual diff processing |
+| `HardwareContextProvider` | `hardware/providers/__init__.py` | Discover physical devices and declare their channels |
+| `HardwareTransport` | `hardware/transport.py` | Execute reads/writes against one device (six methods) |
+| `FrameTransport` | `hardware/transport.py` | Optional side protocol: a device that produces frames |
 
 Additionally, `FrameStore` (`perception/storage/frame_store.py`) is a `@runtime_checkable` Protocol for pluggable frame persistence backends.
 
@@ -53,6 +56,13 @@ Additionally, `FrameStore` (`perception/storage/frame_store.py`) is a `@runtime_
 - **SignalSource** — You need to normalize external events into LeapFlow's signal pipeline (stateless, transform-only).
 - **ActiveSignalSource** — You need a long-running listener that emits signals (websocket, polling loop).
 - **CVProcessor** — You are implementing a visual diff algorithm for the perception subsystem.
+- **HardwareContextProvider / HardwareTransport** — You are adding a peripheral. Both have
+  their own entry-point groups (`leapflow.hardware.providers`,
+  `leapflow.hardware.transports`), so `pip install` is enough. See
+  [`hardware_peripherals_board.md`](hardware_peripherals_board.md) for the full contract,
+  including how a declared channel becomes a LeapBoard preview or control with no board
+  code, and [`hardware_init_calibration.md`](hardware_init_calibration.md) for declaring
+  readiness preconditions.
 
 ---
 

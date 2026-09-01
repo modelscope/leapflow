@@ -4,6 +4,10 @@ A provider answers "where does device knowledge come from". Adding an upstream
 standard's descriptor import is a new module plus one row here; it records
 anything it could not map in ``ContextProvenance.lossy_fields`` so that a drop in
 fidelity is visible in the reference document instead of being absorbed silently.
+
+Out-of-tree providers are discovered through the ``leapflow.hardware.providers``
+entry-point group, mirroring transports: ``pip install my-scanner`` is enough to
+make a discovery source available to every profile without editing this file.
 """
 
 from __future__ import annotations
@@ -47,11 +51,44 @@ class HardwareContextProvider(Protocol):
 
 _PROVIDERS: dict[str, str] = {
     "yaml": "leapflow.hardware.providers.yaml_provider:build_provider",
+    "host": "leapflow.hardware.providers.host_provider:build_provider",
+    "media": "leapflow.hardware.providers.media_provider:build_provider",
 }
+
+_EP_GROUP = "leapflow.hardware.providers"
+_ep_scanned: bool = False
+
+
+def _discover_entry_points() -> None:
+    """Merge entry-point declared providers into ``_PROVIDERS``, once.
+
+    Idempotent, and built-ins win: an installed package must not be able to
+    hijack ``yaml``, ``host`` or ``media`` and change where every profile's device
+    knowledge comes from.
+    """
+    global _ep_scanned  # noqa: PLW0603
+    if _ep_scanned:
+        return
+    _ep_scanned = True
+
+    from importlib.metadata import entry_points
+
+    try:
+        eps = entry_points(group=_EP_GROUP)
+    except TypeError:  # defensive: pre-3.12 selectable API
+        eps = entry_points().select(group=_EP_GROUP)  # type: ignore[union-attr]
+
+    for ep in eps:
+        if ep.name in _PROVIDERS:
+            logger.debug("entry-point provider %r skipped: already registered", ep.name)
+            continue
+        _PROVIDERS[ep.name] = str(ep.value)
+        logger.debug("entry-point provider %r discovered -> %s", ep.name, ep.value)
 
 
 def available_providers() -> tuple[str, ...]:
     """Return the registered provider kinds, sorted for stable reporting."""
+    _discover_entry_points()
     return tuple(sorted(_PROVIDERS))
 
 
@@ -81,6 +118,7 @@ def register_provider(kind: str, target: str) -> Callable[[], None]:
 
 def build_provider(kind: str, config: Mapping[str, Any] | None = None) -> HardwareContextProvider:
     """Instantiate the provider registered for *kind*."""
+    _discover_entry_points()
     target = _PROVIDERS.get(str(kind).strip())
     if target is None:
         raise ProviderError(

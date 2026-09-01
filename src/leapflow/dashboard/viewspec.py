@@ -30,7 +30,7 @@ COMPONENT_CATALOG: dict[str, tuple[str, ...]] = {
     "layout": ("Page", "Section", "Grid", "Row", "Col", "Tabs", "Tab", "Card", "Drawer", "Toolbar"),
     "display": (
         "Stat", "Table", "List", "Timeline", "Board", "Markdown", "EntityGraph",
-        "Gauge", "ProgressBar", "Badge",
+        "Gauge", "ProgressBar", "Badge", "MediaPreview", "LevelMeter",
     ),
     "chart": ("LineChart", "AreaChart", "BarChart", "CandlestickChart", "Sparkline", "Heatmap", "PieChart"),
     "evidence": ("LinkCard", "Quote", "CitationList"),
@@ -38,6 +38,17 @@ COMPONENT_CATALOG: dict[str, tuple[str, ...]] = {
     "agent": ("FindingCard", "InsightCard", "StoryPanel", "ApprovalPrompt", "SuggestionChips", "AskBox"),
     "escape": ("Custom", "Raw"),
 }
+"""Component vocabulary. Every entry must have a frontend renderer.
+
+``MediaPreview`` and ``LevelMeter`` are first-class rather than ``Custom`` renderers
+because previewing a device is a core capability of the board, not a one-off graphic;
+``Custom`` stays the escape hatch for genuinely bespoke figures.
+
+A name added here without a matching renderer in ``static/app.js`` does not fail --
+it degrades to a card printing its own type name, which is how ``Heatmap`` shipped in
+this table for months while every template asking for one got a fallback. A contract
+test now asserts that every type used by a shipped template has a renderer.
+"""
 
 COMPONENT_TYPES: frozenset[str] = frozenset(
     name for group in COMPONENT_CATALOG.values() for name in group

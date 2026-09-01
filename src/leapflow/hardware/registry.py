@@ -50,12 +50,13 @@ class UnverifiedContextPolicy:
 class HardwareSettings:
     """Runtime policy for the hardware subsystem.
 
-    Defaults are the disabled, most conservative configuration: with hardware off
-    the subsystem contributes no tools and no signal sources, so the rest of the
-    system behaves exactly as it did before it existed.
+    Passive local discovery starts by default: host metrics and media enumeration give the
+    board an honest inventory without opening a camera, a microphone, a radio or a network
+    connection. Observation remains gated per declared privacy tier, and explicitly
+    disabling this setting remains a hard disable.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     providers: tuple[tuple[str, Mapping[str, Any]], ...] = ()
     max_devices: int = 16
     unverified_context_policy: str = UnverifiedContextPolicy.DENY_WRITE
@@ -73,6 +74,14 @@ class HardwareSettings:
     readings_dir: str = ""
     instrument_db_path: str = ""
     workspace_id: str = ""
+    rediscover_interval_s: float = 0.0
+    preview_idle_timeout_s: float = 15.0
+    # Hard ceilings. The page's balanced default is lower (960px / 8fps / JPEG 75); it
+    # may select any profile within these bounds but cannot make a durable config edit or
+    # exceed them.
+    preview_max_fps: float = 12.0
+    preview_max_width: int = 1280
+    preview_quality: int = 85
 
     @property
     def denies_unverified_writes(self) -> bool:
@@ -95,14 +104,14 @@ class HardwareSettings:
             devices_dir = profile_layout.hardware.devices_dir
             verified_path = profile_layout.hardware.verified_path
         else:
-            return cls()
+            # Tests and small in-process callers may deliberately provide no profile
+            # layout. They still own the explicit enable/disable decision; returning the
+            # class default here would silently re-enable a subsystem a caller set False.
+            return cls(enabled=bool(getattr(settings, "hardware_enabled", True)))
         return cls(
-            enabled=bool(getattr(settings, "hardware_enabled", False)),
-            providers=(
-                (
-                    "yaml",
-                    {"devices_dir": str(devices_dir), "verified_path": str(verified_path)},
-                ),
+            enabled=bool(getattr(settings, "hardware_enabled", True)),
+            providers=_provider_rows(
+                settings, devices_dir=devices_dir, verified_path=verified_path
             ),
             max_devices=int(getattr(settings, "hardware_max_devices", 16) or 16),
             unverified_context_policy=str(
@@ -137,7 +146,84 @@ class HardwareSettings:
             instrument_db_path=(
                 str(profile_layout.instrument_db_path) if profile_layout is not None else ""
             ),
+            rediscover_interval_s=float(
+                getattr(settings, "hardware_rediscover_interval_s", 0.0) or 0.0
+            ),
+            preview_idle_timeout_s=float(
+                getattr(settings, "hardware_preview_idle_timeout_s", 15.0) or 15.0
+            ),
+            preview_max_fps=float(
+                getattr(settings, "hardware_preview_max_fps", 12.0) or 12.0
+            ),
+            preview_max_width=int(
+                getattr(settings, "hardware_preview_max_width", 1280) or 1280
+            ),
+            preview_quality=int(getattr(settings, "hardware_preview_quality", 85) or 85),
         )
+
+
+DEFAULT_PROVIDER_KINDS = ("yaml", "host", "media")
+"""Discovery sources enabled when hardware is on and nothing else is configured.
+
+``yaml`` supplies declarations a person wrote and is accountable for. ``host`` costs
+nothing to enumerate, needs no permission, and answers the question every operator
+asks first -- what is this machine doing. ``media`` lists cameras and microphones
+without opening any of them, which is why it can be on by default: enumeration needs
+no consent, and the reads that *do* disclose something are refused until a grant
+exists. Discovering a camera and disclosing what it sees are different acts.
+
+Scanners that transmit (Bluetooth) or leave the host (mDNS) are deliberately absent:
+discovery should never be the reason a radio starts up or a packet leaves the machine.
+"""
+
+
+def _provider_rows(
+    settings: Any, *, devices_dir: Path, verified_path: Path
+) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    """Build the ``(kind, config)`` rows for every configured provider.
+
+    Config-driven rather than a fixed row, so adding a discovery source is a
+    configuration change and an out-of-tree provider needs no core edit. Each kind
+    receives only the config it understands; an unknown kind is passed through with
+    an empty mapping and reported by ``build_provider`` as an admission note rather
+    than crashing the load.
+    """
+    raw = getattr(settings, "hardware_providers", "") or ""
+    if isinstance(raw, str):
+        kinds = [item.strip() for item in raw.split(",") if item.strip()]
+    else:
+        kinds = [str(item).strip() for item in raw if str(item).strip()]
+    if not kinds:
+        kinds = list(DEFAULT_PROVIDER_KINDS)
+
+    configs: dict[str, Mapping[str, Any]] = {
+        "yaml": {"devices_dir": str(devices_dir), "verified_path": str(verified_path)},
+        "host": {
+            "sample_interval_s": float(
+                getattr(settings, "hardware_host_interval_s", 0.0) or 0.0
+            ),
+            "include": str(getattr(settings, "hardware_host_include", "") or ""),
+            "exclude": str(getattr(settings, "hardware_host_exclude", "") or ""),
+        },
+        "media": {
+            "include_screens": bool(getattr(settings, "hardware_media_screens", False)),
+            "include_microphones": bool(
+                getattr(settings, "hardware_media_microphones", True)
+            ),
+            "max_fps": float(getattr(settings, "hardware_preview_max_fps", 0.0) or 0.0),
+        },
+    }
+    # Deduplicated while preserving order: two rows of one kind would discover every
+    # device twice and have the second copy rejected as a duplicate device_id, which
+    # reads as a declaration error rather than a configuration one.
+    seen: set[str] = set()
+    rows: list[tuple[str, Mapping[str, Any]]] = []
+    for kind in kinds:
+        if kind in seen:
+            continue
+        seen.add(kind)
+        rows.append((kind, configs.get(kind, {})))
+    return tuple(rows)
 
 
 def build_registry(settings: Any) -> HardwareRegistry | None:
@@ -226,6 +312,7 @@ class HardwareRegistry:
         self._stream_sources: tuple[Any, ...] | None = None
         self._reading_store: Any = None
         self._calibration_store: Any = None
+        self._preview_broker: Any = None
         # One holder for instrument.duckdb, shared by the reading and calibration stores.
         # A single process must not open two independent read-write connections to the
         # same DuckDB file, so the registry owns the holder and injects it into both.
@@ -329,6 +416,79 @@ class HardwareRegistry:
                     )
                 )
         return tuple(resolved)
+
+    async def reconcile(self) -> LoadReport:
+        """Re-run discovery and converge on the new device set without disrupting the old.
+
+        The hot-plug path, and deliberately *not* ``load()``. ``load()`` clears the
+        admitted contexts and discards ``_stream_sources`` while the sampling tasks
+        those objects own are still running: the tasks keep reading, keep writing to
+        the store, and are no longer the objects ``stop_streams()`` can stop. One
+        rediscovery would leak a task per streaming channel, every time.
+
+        So the difference is computed and the old sources are captured before the
+        reload. Devices that vanished have their transports closed; a device whose
+        declaration is byte-identical keeps running untouched; only new or altered
+        devices cause a restart. Comparing whole contexts is what catches an edited
+        envelope -- the event detector holds the old bounds, so it must be rebuilt.
+
+        Never raises: rediscovery runs on a schedule and from an RPC, and a scanner
+        that fails must leave the previous fleet running.
+        """
+        if not self._settings.enabled:
+            return self._report
+
+        previous = dict(self._contexts)
+        # Captured before load() drops the attribute: without this reference the only
+        # thing still holding the running tasks would be the event loop.
+        retired = self._stream_sources or ()
+        was_streaming = self._stream_sources is not None
+
+        report = self.load()
+
+        current = dict(self._contexts)
+        removed = sorted(set(previous) - set(current))
+        added = sorted(set(current) - set(previous))
+        altered = sorted(
+            device_id
+            for device_id in set(previous) & set(current)
+            if previous[device_id] != current[device_id]
+        )
+
+        if not (removed or added or altered):
+            # Nothing changed, so the discarded source tuple has to be put back or the
+            # next call to stream_sources() would build a second set of loops beside
+            # the ones already running.
+            self._stream_sources = retired or self._stream_sources
+            return report
+
+        for device_id in (*removed, *altered):
+            # An altered device's transport was configured from a declaration that no
+            # longer exists, so it is dropped and rebuilt on next use.
+            await self.drop_transport(device_id)
+
+        if was_streaming:
+            await self._stop_sources(retired)
+            await self.start_streams()
+
+        logger.info(
+            "Hardware reconcile: +%d -%d ~%d device(s)", len(added), len(removed), len(altered)
+        )
+        return report
+
+    @staticmethod
+    async def _stop_sources(sources: Sequence[Any]) -> None:
+        """Stop the given sampling loops, isolating failures. Never raises."""
+        for source in sources:
+            try:
+                await source.stop()
+            except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+                logger.warning(
+                    "Hardware stream %s stop failed during reconcile: %s",
+                    getattr(source, "source_id", "?"),
+                    exc,
+                    exc_info=True,
+                )
 
     # ── Admission rules ──
 
@@ -468,6 +628,45 @@ class HardwareRegistry:
                     )
                 )
                 channels[index] = channel.without_write()
+
+        # V9 -- a frame channel is an observation, never a command.
+        #
+        # Its declared rate is deliberately left alone: on a media channel the rate is
+        # a capture ceiling rather than a sampling cadence, and ``Channel.is_streaming``
+        # already excludes media, so no sampling loop is built for it. Zeroing it here
+        # would destroy the ceiling the preview path needs.
+        for index, channel in enumerate(channels):
+            if channel.is_media and channel.is_writable:
+                notes.append(
+                    AdmissionNote(
+                        device_id=device_id,
+                        rule="V9",
+                        outcome="demoted",
+                        detail=(
+                            f"channel {channel.channel_id!r} carries frames and cannot be "
+                            "written; demoted to read-only"
+                        ),
+                    )
+                )
+                channels[index] = channel.without_write()
+
+        # V10 -- a read that discloses the environment must say so before it happens.
+        for channel in channels:
+            if channel.is_privacy_gated:
+                notes.append(
+                    AdmissionNote(
+                        device_id=device_id,
+                        rule="V10",
+                        outcome="warning",
+                        detail=(
+                            f"channel {channel.channel_id!r} declares privacy "
+                            f"{channel.privacy!r}; reads require consent before the first "
+                            "observation. Start its preview on LeapBoard and answer the "
+                            "in-panel prompt, or run `/board preview <device>` in the TUI. "
+                            "A session grant then covers the continuous preview."
+                        ),
+                    )
+                )
 
         # V6 -- an interlock we cannot evaluate must block, not be ignored.
         readable = {c.channel_id for c in channels if c.is_readable}
@@ -663,6 +862,28 @@ class HardwareRegistry:
                 sensitive=self._settings.reading_store_sensitive,
             )
         return self._calibration_store
+
+    @property
+    def preview_broker(self) -> Any:
+        """Return the shared preview broker, building it on first use.
+
+        Lazy because most profiles have no previewable channel, and a broker that
+        exists starts a sweeper task the moment it holds a lease. Built here rather
+        than injected so there is exactly one per registry: two brokers would each
+        open the device and the second would be refused, since most cameras admit a
+        single reader.
+        """
+        if self._preview_broker is None:
+            from leapflow.hardware.preview import PreviewBroker
+
+            self._preview_broker = PreviewBroker(
+                self,
+                idle_timeout_s=self._settings.preview_idle_timeout_s,
+                max_fps=self._settings.preview_max_fps,
+                max_width=self._settings.preview_max_width,
+                quality=self._settings.preview_quality,
+            )
+        return self._preview_broker
 
     def bind_persistence(
         self,
@@ -933,8 +1154,14 @@ class HardwareRegistry:
         reverse order of opening. Sampling stops first: a loop still reading from a
         transport that is being closed would log a failure for every channel on the way
         down, burying whatever actually caused the teardown.
+
+        Previews are released before transports for the same reason and one more: a
+        preview holds a device claimed, and releasing it here is what powers a camera
+        down on shutdown rather than at interpreter exit.
         """
         await self.stop_streams()
+        if self._preview_broker is not None:
+            await self._preview_broker.close()
         store = self._reading_store
         if store is not None:
             # Flushed before transports close: the last interval of a long run is exactly

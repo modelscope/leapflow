@@ -81,6 +81,7 @@ def build_digest(registry: Any, *, now: float | None = None) -> HardwareDigest:
         conformance=tuple(conformance),
         sampling=_sampling(registry),
         outcomes=tuple(outcomes),
+        calibration=_calibration(registry, contexts, now=moment),
         storage=_storage(registry),
     )
 
@@ -101,11 +102,15 @@ def _device_row(registry: Any, context: Any) -> dict[str, Any]:
         "device_id": context.device_id,
         "label": getattr(context, "display_name", "") or context.device_id,
         "location": getattr(context, "location", ""),
+        # Presentation only, so the board can group a fleet instead of listing it.
+        "device_class": str(getattr(context, "device_class", "") or "unclassified"),
         "transport_kind": str(getattr(getattr(context, "transport", None), "kind", "") or ""),
         "verified": bool(getattr(provenance, "verified_by", "")),
         "channels": len(channels),
         "writable": len(writable),
-        "streaming": sum(1 for c in channels if float(getattr(c, "sample_rate_hz", 0) or 0) > 0),
+        "streaming": sum(1 for c in channels if getattr(c, "is_streaming", False)),
+        "media": sum(1 for c in channels if getattr(c, "is_media", False)),
+        "privacy_gated": sum(1 for c in channels if getattr(c, "is_privacy_gated", False)),
         "halt_supported": bool(getattr(context, "halt_supported", False)),
         "opened": context.device_id in _safely(registry.opened_devices, default=()),
     }
@@ -322,6 +327,85 @@ def _outcomes_for(registry: Any, context: Any) -> list[dict[str, Any]]:
                 "unit": str(getattr(channel, "unit", "") or ""),
             })
     return rows
+
+
+def _calibration(
+    registry: Any, contexts: Sequence[Any], *, now: float
+) -> tuple[dict[str, Any], ...]:
+    """Report per-device calibration state, never-calibrated and expired first.
+
+    This section is the one the board template already asked for and never received:
+    ``hardware.yaml`` binds ``hardware.calibration`` behind a ``when:`` gate, the
+    payload never carried the key, and the gate silently removed the whole panel. The
+    producer ran, the template was valid, and nothing connected them -- exactly the
+    failure the ``capability_plan`` binding hit before it.
+
+    Ordered so the rows that need action come first, because the table is read from
+    the top: a device that has never been calibrated cannot be trusted to measure,
+    and one whose calibration has aged out is worse than one with none, since its
+    readings look authoritative.
+    """
+    store = getattr(registry, "calibration_store", None)
+    if store is None:
+        return ()
+    rows: list[dict[str, Any]] = []
+    for context in contexts:
+        record = _safely(lambda: store.latest(context.device_id), default=None)
+        if record is None:
+            rows.append({
+                "device_id": context.device_id,
+                "channel_id": "--",
+                "state": "never",
+                "calibrated_at": "",
+                "days_since": "",
+                "residual": "",
+                "next_recal_due": "unknown",
+                "_rank": 0,
+            })
+            continue
+        age_days = max(0.0, (now - float(record.recorded_at)) / 86400.0)
+        interval_days = _as_float(dict(record.parameters).get("recal_interval_days"))
+        expired = interval_days is not None and age_days > interval_days
+        rows.append({
+            "device_id": context.device_id,
+            "channel_id": str(record.procedure_id or "--"),
+            "state": "expired" if expired else "valid",
+            "calibrated_at": _stamp(record.recorded_at),
+            "days_since": f"{age_days:.1f}",
+            "residual": _residual(record),
+            "next_recal_due": (
+                _stamp(record.recorded_at + interval_days * 86400.0)
+                if interval_days is not None
+                else "not declared"
+            ),
+            "_rank": 1 if expired else 2,
+        })
+    rows.sort(key=lambda row: (row["_rank"], str(row["device_id"])))
+    return tuple({key: value for key, value in row.items() if key != "_rank"} for row in rows)
+
+
+def _residual(record: Any) -> str:
+    """Render the fitted residual a procedure reported, when it reported one.
+
+    Read from the procedure's own parameters rather than computed here: the residual
+    of a hand-eye fit and of a two-point sensor calibration are different quantities,
+    and inventing a common formula would put a number on the board that no procedure
+    produced.
+    """
+    parameters = dict(getattr(record, "parameters", {}) or {})
+    for key in ("residual", "rms_error", "error"):
+        value = _as_float(parameters.get(key))
+        if value is not None:
+            return f"{value:g}"
+    return "not reported"
+
+
+def _stamp(value: Any) -> str:
+    """Format a wall-clock instant for a table cell, tolerating a bad value."""
+    moment = _as_float(value)
+    if moment is None or moment <= 0:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(moment))
 
 
 def _storage(registry: Any) -> dict[str, Any]:

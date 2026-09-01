@@ -1,7 +1,32 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
 from leapflow.cli.commands.router import CommandRouter
 from leapflow.cli.commands.interactive import _is_app_command
+from leapflow.hardware.context import (
+    Channel,
+    ContextProvenance,
+    ContextSource,
+    Direction,
+    Envelope,
+    HardwareContext,
+    HardwareEffect,
+    PrivacyTier,
+    Representation,
+    TransportRef,
+)
+from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
+from leapflow.hardware.transport import (
+    SIDE_EFFECT_NONE,
+    FrameReading,
+    Reading,
+    TransportStatus,
+    WriteOutcome,
+)
 
 
 def test_command_router_parses_command_args_and_runtime_support() -> None:
@@ -253,3 +278,280 @@ def test_the_completer_and_the_dispatcher_agree_on_the_reserved_verbs() -> None:
     from leapflow.cli.tui_app.input import _BOARD_VERBS as completer_verbs
 
     assert {verb for verb, _ in completer_verbs} == set(dispatcher_verbs)
+
+
+# ── /board peripherals ──────────────────────────────────────────────────────
+#
+# The device verbs, and in particular why ``preview`` is not just a deep link. The
+# browser cannot obtain consent for a camera: ``ApprovalCoordinator.request_approval``
+# denies when no approval route is installed, and the daemon installs one for
+# ``command.execute`` but not for an ordinary RPC. So the slash command is the surface
+# where the prompt can appear, and the grant it mints is what the board's stream is
+# covered by. These tests pin that, and pin that a refusal opens nothing.
+
+_JPEG = (
+    b"\xff\xd8"
+    b"\xff\xc0\x00\x11\x08\x00\x02\x00\x04\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+    b"\xff\xd9"
+)
+
+
+class _FrameSource:
+    """A frame-capable transport that counts how often the device was actually read."""
+
+    kind = "fake_media"
+
+    def __init__(self) -> None:
+        self.grabs = 0
+
+    async def open(self, context: HardwareContext) -> TransportStatus:
+        return TransportStatus(connected=True)
+
+    async def close(self) -> TransportStatus:
+        return TransportStatus(connected=False)
+
+    async def probe(self) -> TransportStatus:
+        return TransportStatus(connected=True)
+
+    async def halt(self) -> TransportStatus:
+        return TransportStatus(connected=True, halt_supported=False)
+
+    async def read(self, channel_id: str) -> Reading:
+        return Reading(device_id="cam", channel_id=channel_id, value="frame")
+
+    async def write(self, channel_id: str, value: object) -> WriteOutcome:
+        return WriteOutcome(ok=False, side_effect_state=SIDE_EFFECT_NONE, error="read-only")
+
+    async def read_frame(
+        self, channel_id: str, *, max_width: int = 0, quality: int = 0
+    ) -> FrameReading:
+        self.grabs += 1
+        return FrameReading(
+            device_id="cam", channel_id=channel_id, data=_JPEG,
+            width=320, height=180, sequence=self.grabs,
+        )
+
+
+def _camera(device_id: str = "cam") -> HardwareContext:
+    return HardwareContext(
+        device_id=device_id,
+        display_name="Fake camera",
+        device_class="camera",
+        # A registered kind, because admission rule V4 rejects one it cannot build; the
+        # transport itself is replaced below.
+        transport=TransportRef(kind="mock"),
+        channels=(
+            Channel(
+                channel_id="frame",
+                direction=Direction.READ.value,
+                quantity="image_frame",
+                effect=HardwareEffect.READ.value,
+                sample_rate_hz=2.0,
+                representation=Representation.FRAME.value,
+                media_type="image/jpeg",
+                privacy=PrivacyTier.ENVIRONMENT.value,
+            ),
+        ),
+        provenance=ContextProvenance(source=ContextSource.DISCOVERED.value),
+    )
+
+
+def _thermometer() -> HardwareContext:
+    return HardwareContext(
+        device_id="rig",
+        display_name="Bench rig",
+        device_class="bench",
+        transport=TransportRef(kind="mock"),
+        channels=(
+            Channel(
+                channel_id="temperature",
+                quantity="temperature",
+                unit="degC",
+                envelope=Envelope(declared=True, min_value=0.0, max_value=100.0),
+            ),
+        ),
+        provenance=ContextProvenance(verified_by="tester"),
+    )
+
+
+class _Allow:
+    def __init__(self) -> None:
+        self.seen: list[object] = []
+
+    async def evaluate(self, descriptor: object) -> object:
+        self.seen.append(descriptor)
+
+        class _Result:
+            approved = True
+
+        return _Result()
+
+
+class _Deny:
+    async def evaluate(self, descriptor: object) -> object:
+        class _Result:
+            approved = False
+            denial_message = "You declined to share the camera."
+
+        return _Result()
+
+
+def _board_ctx(*contexts: HardwareContext, gate: object = None, source: object = None):
+    """Return (ctx, source) with a loaded registry whose transport is the fake source."""
+
+    class _Provider:
+        kind = "fake"
+
+        def discover(self) -> tuple[HardwareContext, ...]:
+            return contexts
+
+    registry = HardwareRegistry(HardwareSettings(enabled=True), providers=(_Provider(),))
+    registry.load()
+    transport = source or _FrameSource()
+
+    async def _transport(device_id: str) -> object:
+        return transport
+
+    registry.transport = _transport  # type: ignore[method-assign]
+    ctx = SimpleNamespace(
+        _hardware_registry=registry, _approval_orchestrator=gate, monitors=None, settings=None
+    )
+    return ctx, transport, registry
+
+
+def _board(ctx, command: str) -> dict:
+    from leapflow.cli.commands.slash_handlers import _execute_dashboard
+
+    return asyncio.run(_execute_dashboard(ctx, f"board {command}"))
+
+
+def test_board_devices_groups_peripherals_and_points_at_the_next_command() -> None:
+    ctx, _source, _registry = _board_ctx(_camera(), _thermometer())
+
+    result = _board(ctx, "devices")
+
+    assert result["ok"] is True
+    assert result["mode"] == "devices", "must not be 'open': this prints, it does not launch a browser"
+    assert {group["device_class"] for group in result["groups"]} == {"camera", "bench"}
+    assert result["counts"]["previewable"] == 1
+    assert "/board device" in result["hint"]
+
+
+def test_board_devices_says_how_to_enable_hardware_when_it_is_off() -> None:
+    """Off is the default, so "nothing here" is the expected state, not a failure."""
+    ctx = SimpleNamespace(_hardware_registry=None, monitors=None, settings=None)
+
+    result = _board(ctx, "devices")
+
+    assert result["ok"] is False
+    assert "hardware.enabled" in result["message"]
+    assert "restart" in result["message"].lower()
+
+
+def test_a_device_id_resolves_from_a_unique_prefix() -> None:
+    """Discovered ids are long, so a prefix is what makes them typeable.
+
+    Matches how ``/board stop`` already resolves a watch id.
+    """
+    ctx, _source, _registry = _board_ctx(_camera("camera_0_macbook_pro"))
+
+    result = _board(ctx, "device camera_0")
+
+    assert result["ok"] is True
+    assert result["mode"] == "open"
+    assert result["template"] == "hardware", (
+        "one lens with a target, not a second lens: naming a device is what switches the "
+        "hardware template from the fleet to that device"
+    )
+    assert result["device"] == "camera_0_macbook_pro"
+
+
+def test_an_ambiguous_prefix_names_the_candidates() -> None:
+    """"Not found" for a prefix that matched too much sends someone hunting a typo."""
+    ctx, _source, _registry = _board_ctx(_camera("camera_0_left"), _camera("camera_1_right"))
+
+    result = _board(ctx, "device camera_")
+
+    assert result["ok"] is False
+    assert "camera_0_left" in result["message"]
+    assert "camera_1_right" in result["message"]
+
+
+def test_board_device_without_a_target_asks_for_one() -> None:
+    ctx, _source, _registry = _board_ctx(_camera())
+
+    result = _board(ctx, "device")
+
+    assert result["ok"] is False
+    assert "/board devices" in result["message"]
+
+
+def test_board_preview_establishes_consent_then_opens_the_device() -> None:
+    """The one frame is the mechanism, not a side effect.
+
+    It goes through the ordinary approval chain from a surface that *has* a route, so the
+    prompt appears in the TUI and the grant it produces is what the browser's stream is
+    covered by. Requesting zero frames would open a page whose Start button is refused
+    with no way to answer.
+    """
+    gate = _Allow()
+    ctx, source, registry = _board_ctx(_camera(), gate=gate)
+
+    result = _board(ctx, "preview cam")
+
+    assert result["ok"] is True
+    assert result["template"] == "hardware"
+    assert result["device"] == "cam"
+    assert result["channel"] == "frame", "the only frame channel must be resolved without naming it"
+    assert source.grabs == 1, "consent was not exercised against the device"
+    assert gate.seen, "the approval chain was bypassed"
+    assert any("released automatically" in note for note in result["notes"]), (
+        "the operator is not told the device stops on its own"
+    )
+    asyncio.run(registry.preview_broker.close())
+
+
+@pytest.mark.parametrize("gate,label", [(_Deny(), "denied"), (None, "no gate installed")])
+def test_a_refused_preview_opens_nothing_and_reads_nothing(gate, label) -> None:
+    """Opening a board whose preview cannot work is a dead end, so it is not opened."""
+    ctx, source, _registry = _board_ctx(_camera(), gate=gate)
+
+    result = _board(ctx, "preview cam")
+
+    assert result["ok"] is False, label
+    assert result.get("mode") != "open", f"{label}: the board was opened despite the refusal"
+    assert result["code"] == "consent_required", label
+    assert source.grabs == 0, f"{label}: the device was read despite the refusal"
+
+
+def test_previewing_a_device_with_no_frame_channel_says_so() -> None:
+    """A thermometer has no preview, and the refusal points at what it does have."""
+    ctx, _source, _registry = _board_ctx(_thermometer(), gate=_Allow())
+
+    result = _board(ctx, "preview rig")
+
+    assert result["ok"] is False
+    assert "no previewable channel" in result["message"]
+    assert "/board device rig" in result["message"]
+
+
+def test_board_rescan_reports_what_converged() -> None:
+    ctx, _source, _registry = _board_ctx(_camera(), _thermometer())
+
+    result = _board(ctx, "rescan")
+
+    assert result["ok"] is True
+    assert result["mode"] == "rescan"
+    assert set(result["admitted"]) == {"cam", "rig"}
+    assert "/board devices" in result["message"]
+
+
+def test_the_unknown_verb_message_mentions_the_device_verbs() -> None:
+    """An unknown command must list what does exist, including the new vocabulary."""
+    ctx, _source, _registry = _board_ctx(_camera())
+
+    result = _board(ctx, "bogus")
+
+    assert result["ok"] is False
+    for verb in ("devices", "device", "preview", "rescan"):
+        assert verb in result["message"]

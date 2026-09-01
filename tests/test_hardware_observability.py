@@ -448,6 +448,20 @@ def test_hardware_renders_the_finding_payload_not_the_session() -> None:
         async def signal_metrics(self) -> dict[str, Any]:
             return {"metrics": {}, "signal_stream": []}
 
+        async def hardware_inventory(self) -> dict[str, Any]:
+            # The fleet list is read live rather than taken from the cycle payload, so
+            # the device count on the board comes from here and not from the digest.
+            return {
+                "ok": True,
+                "groups": [{"device_class": "bench", "devices": [{"device_id": "dev"}]}],
+                "devices": [{"device_id": "dev"}],
+                "counts": {"devices": 1, "channels": 3, "previewable": 0},
+                "notes": [],
+            }
+
+        async def hardware_device(self, device_id: str) -> dict[str, Any]:
+            return {"ok": False, "code": "unknown_device"}
+
     spec = asyncio.run(DashboardViewBuilder().build(DashboardIntent(template="hardware"), _Provider()))
     stats = _nodes_of_type(spec, "Stat")
     values = {node["props"].get("label"): node["props"].get("value") for node in stats}
@@ -456,37 +470,101 @@ def test_hardware_renders_the_finding_payload_not_the_session() -> None:
     assert values["Watch state"] == "watching"
 
 
-def test_every_rendered_component_has_a_frontend_renderer() -> None:
-    """Catalog membership is not implementation.
+def _implemented_renderers() -> set[str]:
+    """Return the component types the shipped frontend can actually draw.
 
-    ``Heatmap`` is in ``COMPONENT_CATALOG`` and has no renderer in ``app.js``, so a
-    template asking for one gets a fallback card printing its own type name. This
-    asserts against the renderer table in the shipped JS, not the catalog.
+    Read out of ``app.js`` rather than the catalog because the two are different
+    things: a catalog entry with no renderer degrades to a card printing its own type
+    name, which is how ``Heatmap`` sat in ``COMPONENT_CATALOG`` for months while every
+    template asking for one got a fallback.
     """
     from pathlib import Path
     import re
 
-    app_js = (Path(__file__).parents[1] / "src" / "leapflow" / "dashboard" / "static" / "app.js")
+    app_js = Path(__file__).parents[1] / "src" / "leapflow" / "dashboard" / "static" / "app.js"
     source = app_js.read_text(encoding="utf-8")
     block = source.split("const RENDERERS = {", 1)[1]
-    implemented = set(re.findall(r"^\s{4}([A-Za-z]+):", block, flags=re.MULTILINE))
+    return set(re.findall(r"^\s{4}([A-Za-z]+):", block, flags=re.MULTILINE))
 
+
+def test_every_rendered_component_has_a_frontend_renderer() -> None:
+    """Catalog membership is not implementation.
+
+    ``Heatmap`` is in ``COMPONENT_CATALOG`` and had no renderer in ``app.js``, so a
+    template asking for one got a fallback card printing its own type name. This
+    asserts against the renderer table in the shipped JS, not the catalog.
+    """
+    implemented = _implemented_renderers()
     spec = TemplateLibrary().render("hardware", {"hardware": _rich_payload(), "observation": {}})
     used = {node["type"] for node in _walk(spec.get("root", []))}
     missing = sorted(used - implemented)
     assert not missing, f"hardware.yaml uses components with no frontend renderer: {missing}"
 
 
-def test_the_board_offers_no_action_on_any_node() -> None:
-    """Read-only by design.
+def test_no_shipped_template_references_an_unrenderable_component() -> None:
+    """The general form of the check above, across every template in the package.
 
-    A browser session is a weaker identity than the TUI process that normally holds
-    the approval route, and an observation surface that can actuate a device is not
-    an observation surface.
+    Per-template coverage was the gap: ``hardware.yaml`` was checked and the rest were
+    not, so a new lens could reference a catalog type with no renderer and ship looking
+    valid. Rendered with empty data on purpose -- ``when:`` gates would otherwise hide
+    most nodes, and an unrenderable component is a defect whether or not data happens to
+    reach it today.
+    """
+    library = TemplateLibrary()
+    implemented = _implemented_renderers()
+    problems: list[str] = []
+    for name in library.names():
+        raw = library.load(name)
+        assert raw is not None, f"{name}: template did not load"
+        # Rendered without ``when`` gating so every declared node is inspected, not just
+        # the ones a particular data shape happens to reveal.
+        for node in _walk(_ungated(raw).get("layout") or []):
+            ntype = str(node.get("type") or "")
+            if ntype and ntype not in implemented:
+                problems.append(f"{name}: {ntype}")
+    assert not problems, (
+        "templates reference components with no renderer in app.js: " + ", ".join(sorted(set(problems)))
+    )
+
+
+def _ungated(node: Any) -> Any:
+    """Return *node* with every ``when``/``repeat`` directive stripped.
+
+    So the walk sees the template's full component vocabulary rather than the subset a
+    given payload unlocks.
+    """
+    if isinstance(node, dict):
+        return {
+            key: _ungated(value)
+            for key, value in node.items()
+            if key not in ("when", "repeat", "as")
+        }
+    if isinstance(node, list):
+        return [_ungated(item) for item in node]
+    return node
+
+
+def test_the_board_never_carries_an_action_that_touches_a_device() -> None:
+    """Refined from "no actions at all", which is no longer the invariant.
+
+    The board now navigates: a fleet row opens that device's page. What must stay true
+    is the reason the original rule existed -- a browser session is a weaker identity
+    than the TUI process that holds the approval route, so nothing the board can click
+    may reach a device without the approval chain. Navigation cannot; a write cannot be
+    expressed here at all.
+
+    Asserted over both action forms, because a per-row action lives inside ``props`` and
+    the node-level check alone would not see it.
     """
     spec = TemplateLibrary().render("hardware", {"hardware": _rich_payload(), "observation": {}})
-    with_actions = [node["type"] for node in _walk(spec.get("root", [])) if node.get("action")]
-    assert not with_actions, f"hardware board must stay read-only, found actions on {with_actions}"
+    offending: list[str] = []
+    for node in _walk(spec.get("root", [])):
+        for action in (node.get("action"), (node.get("props") or {}).get("row_action")):
+            if isinstance(action, dict) and str(action.get("kind")) != "nav":
+                offending.append(f"{node.get('type')}:{action.get('kind')}")
+    assert not offending, (
+        "the fleet board may only navigate; found non-nav actions on " + ", ".join(offending)
+    )
 
 
 def test_capability_now_receives_its_own_payload() -> None:
@@ -669,3 +747,57 @@ def test_digest_payload_clock_is_wall() -> None:
         f"payload clock={payload['clock']!r}, expected 'wall'; G16 regression"
     )
     assert payload["schema_version"] == SERIES_SCHEMA_VERSION
+
+
+def test_the_device_table_offers_buttons_rather_than_an_instruction() -> None:
+    """"Select a row to open the device" is a sentence asking the reader to do the UI's job.
+
+    Nothing about a table row says it is clickable, and a row that can do two things --
+    open the device, preview it -- cannot say which one a click means. So the actions are
+    buttons, and the Preview button appears only where there is something to preview,
+    decided per row from the row's own data rather than from device knowledge in the
+    template.
+    """
+    import pathlib
+
+    import yaml
+
+    import leapflow.dashboard.templates as templates_module
+
+    source = pathlib.Path(templates_module.__file__).parent / "templates" / "hardware.yaml"
+    spec = yaml.safe_load(source.read_text(encoding="utf-8"))
+
+    def walk(node):
+        if isinstance(node, dict):
+            yield node
+            for value in node.values():
+                yield from walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                yield from walk(item)
+
+    tables = [
+        n["props"] for n in walk(spec)
+        if n.get("type") == "Table" and "row_buttons" in (n.get("props") or {})
+    ]
+    assert tables, "the fleet device table must carry explicit row buttons"
+    props = tables[0]
+
+    assert "Select a row" not in str(props.get("caption", "")), (
+        "the caption must not instruct the reader to discover a hidden affordance"
+    )
+    labels = [b["label"] for b in props["row_buttons"]]
+    assert labels == ["Open", "Preview"]
+
+    preview = props["row_buttons"][labels.index("Preview")]
+    assert preview["require"] == "media", (
+        "a Preview button on a device with nothing to preview is a button that cannot work"
+    )
+    # Both resolve their target from the row, because rows are expanded client-side and a
+    # template placeholder has no row in scope when it is compiled.
+    for button in props["row_buttons"]:
+        assert button["param_from_row"]["device"] == "device_id"
+        assert button["params"]["template"] == "hardware", "one lens, plus a target"
+    assert preview["param_from_row"]["channel"] == "preview_channel", (
+        "Preview must name the actual previewable channel, so it can start the target panel"
+    )

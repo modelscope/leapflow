@@ -294,6 +294,74 @@ class LeapService(Protocol):
         """
         ...
 
+    async def hardware_inventory(self) -> Dict[str, Any]:
+        """List admitted devices grouped by declared class.
+
+        Daemon-global and read-only: no transport is opened and nothing is probed,
+        which is what makes it safe to expose to a browser session through the board.
+        """
+        ...
+
+    async def hardware_device(self, device: str = "") -> Dict[str, Any]:
+        """Describe one device's channels, sampled values, controls and previews.
+
+        Read-only, and values come from the sampling ring rather than a fresh read:
+        opening a device page must not be the reason a bus is busy.
+        """
+        ...
+
+    async def hardware_rescan(self) -> Dict[str, Any]:
+        """Re-run discovery and converge on the new device set.
+
+        Daemon-global and shared: the new capability set applies to every connected
+        client at its next turn, exactly as a plugin install does.
+        """
+        ...
+
+    async def hardware_frame(
+        self,
+        device: str = "",
+        channel: str = "",
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Return one base64 frame from a previewable channel.
+
+        Gated by the approval chain on the declared privacy tier, and fail-closed: with
+        no gate installed, or a gate that raises, the frame is refused. The reply either
+        carries ``data_b64`` or a ``code`` and an ``error`` naming where consent is given.
+        ``fps``, ``max_width`` and ``quality`` are bounded by the runtime and declaration
+        ceilings, so a board profile can reduce work but cannot ask the device for an
+        unbounded capture stream.
+
+        Routed (see ``_APPROVAL_ROUTED_METHODS``): the prompt is delivered as an
+        interleaved ``stream.chunk`` notification on this request's own socket, so a
+        caller that passes ``on_stream_event`` can present it and answer via
+        ``approval.resolve`` while this call is still waiting.
+        """
+        ...
+
+    async def hardware_read(self, device: str = "", channel: str = "") -> Dict[str, Any]:
+        """Read one channel's current value through the approval chain.
+
+        A fresh transport read, unlike the sampled value on the device page -- which is why
+        it is an explicit call rather than part of a board refresh. Routed for the same
+        reason ``hardware_frame`` is: a privacy-gated channel needs somewhere to ask.
+        """
+        ...
+
+    async def hardware_write_request(
+        self, device: str = "", channel: str = "", value: Any = None, dry_run: bool = True
+    ) -> Dict[str, Any]:
+        """Preview (``dry_run=True``) or submit a channel write.
+
+        Delegates to the ordinary ``hw_configure``/``hw_actuate``/``hw_dispense`` handler,
+        chosen from the channel's *declared* effect class, so there is one write path with
+        one set of feasibility checks and one approval descriptor. Defaults to a dry run.
+        """
+        ...
+
     async def tools_list(self) -> Dict[str, Any]:
         """Return available tool groups for slash-command rendering."""
         ...
@@ -395,6 +463,12 @@ METHOD_REGISTRY: Dict[str, str] = {
     "host.restart": "host_restart",
     "hardware.pause": "hardware_pause",
     "hardware.resume": "hardware_resume",
+    "hardware.inventory": "hardware_inventory",
+    "hardware.device": "hardware_device",
+    "hardware.rescan": "hardware_rescan",
+    "hardware.frame": "hardware_frame",
+    "hardware.read": "hardware_read",
+    "hardware.write_request": "hardware_write_request",
     "tools.list": "tools_list",
     "usage.summary": "usage_summary",
     "app.command": "app_command",

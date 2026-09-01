@@ -146,6 +146,7 @@ class HardwareDigest:
     conformance: tuple[dict[str, Any], ...] = ()
     sampling: tuple[dict[str, Any], ...] = ()
     outcomes: tuple[dict[str, Any], ...] = ()
+    calibration: tuple[dict[str, Any], ...] = ()
     storage: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -169,14 +170,23 @@ class HardwareDigest:
                 "series": len(self.series),
                 "events": len(self.events),
                 "outcomes": len(self.outcomes),
+                "calibration": len(self.calibration),
+                "media_channels": sum(
+                    int(row.get("media", 0) or 0) for row in self.devices
+                ),
+                "privacy_gated": sum(
+                    int(row.get("privacy_gated", 0) or 0) for row in self.devices
+                ),
             },
             "devices": list(self.devices),
+            "device_classes": _distribution(self.devices, "device_class"),
             "series": [item.to_dict() for item in self.series],
             "events": list(self.events),
             "conformance": list(self.conformance),
             "conformance_mix": _distribution(self.conformance, "state"),
             "sampling": list(self.sampling),
             "outcomes": list(self.outcomes),
+            "calibration": list(self.calibration),
             "storage": dict(self.storage),
         }
         return _fit(payload)

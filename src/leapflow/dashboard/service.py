@@ -34,6 +34,14 @@ class DashboardDataProvider(Protocol):
         """Return signal flow health metrics."""
         ...
 
+    async def hardware_inventory(self) -> dict[str, Any]:
+        """Return the admitted device fleet grouped by declared class."""
+        ...
+
+    async def hardware_device(self, device_id: str) -> dict[str, Any]:
+        """Return one device's channels, sampled values, controls and previews."""
+        ...
+
 
 class DaemonDataProvider:
     """Adapt a DaemonClient's ``watch_*`` RPCs to the provider protocol."""
@@ -56,6 +64,36 @@ class DaemonDataProvider:
                 "signal_stream": result.get("signal_stream", []),
             }
         return {"metrics": {}, "signal_stream": []}
+
+    async def hardware_inventory(self) -> dict[str, Any]:
+        """Return the device fleet, tolerating a daemon without the RPC.
+
+        A refusal is returned as data rather than raised: hardware is off by default,
+        and a board whose whole page fails because a subsystem is disabled is worse
+        than one that says so in a panel.
+        """
+        return await self._hardware_call(lambda: self._client.hardware_inventory())
+
+    async def hardware_device(self, device_id: str) -> dict[str, Any]:
+        """Return one device's live view, tolerating a daemon without the RPC."""
+        return await self._hardware_call(lambda: self._client.hardware_device(device_id))
+
+    @staticmethod
+    async def _hardware_call(call: Any) -> dict[str, Any]:
+        try:
+            return dict(await call() or {})
+        except AttributeError:
+            # An older daemon than this view client. Named as its own case because the
+            # generic handler below would report it as a runtime fault, and "your
+            # daemon predates this panel" has a different fix.
+            return {
+                "ok": False,
+                "code": "rpc_unavailable",
+                "error": "This leapd build has no hardware inventory RPC; restart the daemon.",
+            }
+        except Exception as exc:  # noqa: BLE001 - one panel must not lose the board
+            logger.debug("dashboard: hardware read failed", exc_info=True)
+            return {"ok": False, "code": "unavailable", "error": str(exc)}
 
 
 def select_template(template: str, names: list[str]) -> str:
@@ -120,6 +158,135 @@ def _signal_stream_item(evt: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _actionable_notes(inventory: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only the admission decisions that took a capability away.
+
+    The inventory carries every note, which is the truthful record and what the audit
+    wants. The board wants the subset a person can act on: a demotion or a rejection
+    changed what a device can do, while a ``warning`` is advisory and there is one per
+    privacy-gated channel *by design* (rule V10).
+
+    Filtered here rather than at the source because it is a presentation choice, and
+    filtering the source would hide the notes from `/board devices` and the audit. Left
+    unfiltered, a bench with three cameras showed "Admission decisions: 3" on every page
+    under a heading promising to explain why a device is not what it declared -- when
+    nothing had been demoted at all.
+    """
+    return [
+        note
+        for note in (inventory.get("notes") or [])
+        if isinstance(note, dict) and str(note.get("outcome")) in ("demoted", "rejected")
+    ]
+
+
+def _hardware_notice(
+    inventory: dict[str, Any], digest: dict[str, Any]
+) -> dict[str, str] | None:
+    """Explain an empty bench, or return None when there is something to show.
+
+    Every panel on this board is gated on the data it renders, which is what makes a new
+    peripheral appear without a template edit -- and also what made the page render *bare*
+    when there was no data at all. A blank tab under a title is not an answer to "what
+    hardware do you see"; it is the same silently-gated-out failure the calibration panel
+    had, one level up.
+
+    Each branch names the next step, because the situations are genuinely different and
+    only the message can tell them apart: hardware off is a config change, no devices is a
+    scan or a declaration, and a daemon still starting will fix itself.
+    """
+    if inventory.get("ok") and (inventory.get("groups") or digest.get("devices")):
+        return None
+
+    code = str(inventory.get("code") or "")
+    if code == "hardware_disabled":
+        return {
+            "title": "Hardware is disabled for this profile",
+            "text": (
+                "No peripherals are visible because the hardware subsystem is off. Enable "
+                "it with `leap config set hardware.enabled true`, then restart the daemon "
+                "(`leap daemon restart`). It is off by default: with it disabled LeapFlow "
+                "exposes no device tools and behaves exactly as it did before the "
+                "subsystem existed."
+            ),
+        }
+    if code == "runtime_unavailable":
+        return {
+            "title": "leapd is still starting",
+            "text": "This panel fills in on its own once the daemon has finished initializing.",
+        }
+    if code in ("rpc_unavailable", "unavailable"):
+        return {
+            "title": "This board cannot reach the hardware subsystem",
+            "text": (
+                f"{inventory.get('error') or 'The inventory could not be read.'} "
+                "The board runs as its own long-lived process and does not pick up new "
+                "code until it is restarted -- run `leap board` again if you have just "
+                "upgraded."
+            ),
+        }
+    return {
+        "title": "No devices are attached",
+        "text": (
+            "Hardware is enabled but nothing was admitted. Run `/board rescan` after "
+            "attaching a peripheral, or check `hardware.providers` and the profile's "
+            "declaration directory. Admission decisions, including anything rejected, "
+            "appear below when there are any."
+        ),
+    }
+
+
+def _identity_rows(identity: dict[str, Any], device: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten the declaration's provenance into ``{field, value}`` table rows.
+
+    Flattened here rather than bound field-by-field in the template because the path
+    resolver walks mapping keys and list indices only -- it cannot iterate a mapping's
+    pairs, so a template asking for one renders nothing at all. Empty values are
+    dropped so an unverified device shows a shorter table rather than a column of
+    blanks.
+    """
+    candidates = (
+        ("Device id", identity.get("device_id")),
+        ("Vendor", device.get("vendor")),
+        ("Model", device.get("model")),
+        ("Location", device.get("location")),
+        ("Declared by", identity.get("provenance_source")),
+        ("Verified by", identity.get("verified_by") or "not verified"),
+        ("Emergency stop", "supported" if device.get("halt_supported") else "not supported"),
+        ("Notes", identity.get("notes")),
+        ("Provenance notes", identity.get("provenance_notes")),
+        ("Unmapped fields", ", ".join(identity.get("lossy_fields") or ())),
+    )
+    return [
+        {"field": label, "value": str(value)}
+        for label, value in candidates
+        if value not in (None, "", [])
+    ]
+
+
+def _hardware_error(view: dict[str, Any], device_id: str) -> str:
+    """Turn a structured hardware refusal into a sentence with a next step.
+
+    The raw ``code`` is for the audit log. Surfacing it alone gives a person
+    ``unknown_device`` as the entire content of a page, which names the problem
+    without saying what to do about it.
+    """
+    code = str(view.get("code") or "")
+    if code == "unknown_device":
+        return (
+            f"No device {device_id!r} is admitted. It may have been detached, or its "
+            "declaration may have been rejected -- run `leap hw scan`, then check "
+            "`leap hw list`."
+        )
+    if code == "hardware_disabled":
+        return (
+            "Hardware is disabled for this profile. Run "
+            "`leap config set hardware.enabled true` and restart the daemon."
+        )
+    if code == "runtime_unavailable":
+        return "leapd is still starting up. This panel will fill in once it is ready."
+    return str(view.get("error") or "This device could not be read.")
+
+
 def _short_id(value: Any) -> str:
     text = str(value or "")
     return text[:8] if len(text) > 8 else text
@@ -143,6 +310,16 @@ nothing supplied that key, and every value on the board rendered blank. The
 producer ran, the template was valid, and nothing connected them.
 """
 
+HARDWARE_TEMPLATE = "hardware"
+"""The one hardware lens. It renders the fleet, or one device when the intent names one.
+
+They were two templates (``hardware`` and ``hardware_device``) and the split did not pay
+for itself: the names read as near-synonyms in the lens list, and the second was not a
+different *way of looking* at anything -- only a different subject. One lens with an
+optional target is the honest shape, and it is also what makes a drill-down reversible
+without the operator learning a second name.
+"""
+
 
 class DashboardViewBuilder:
     """Assemble ViewSpecs for dashboard intents."""
@@ -153,16 +330,69 @@ class DashboardViewBuilder:
     async def build(self, intent: DashboardIntent, provider: DashboardDataProvider) -> dict[str, Any]:
         """Return a normalized ViewSpec for the requested template.
 
-        Three data shapes, not one: the signal pipeline's own metrics, a producer's
-        finding payload, or the session analysis every other lens renders.
+        Four data shapes, not one: the signal pipeline's own metrics, one device read
+        live, a producer's finding payload, or the session analysis every other lens
+        renders. The hardware lens picks between the second and third by whether the
+        intent named a device.
         """
         template_name = intent.template
         if template_name == "signals":
             return await self._build_signals(template_name, provider)
+        if template_name == HARDWARE_TEMPLATE and intent.device:
+            return await self._build_device(template_name, intent, provider)
         payload_domain = _PAYLOAD_DOMAINS.get(template_name)
         if payload_domain is not None:
             return await self._build_from_finding_payload(template_name, provider, *payload_domain)
         return await self._build_session(intent.template, provider)
+
+    async def _build_device(
+        self, template: str, intent: DashboardIntent, provider: DashboardDataProvider
+    ) -> dict[str, Any]:
+        """Render one device from a live read, with the fleet alongside for navigation.
+
+        The inventory is fetched too so the page can offer the other devices without a
+        round trip back to the fleet view -- a drill-down that dead-ends is a drill-down
+        people stop using.
+
+        Every section gates on the data it renders rather than a synthetic mode flag. That
+        makes a device page contain its identity and channels, while the shared inventory
+        remains usable to navigate to another device; an old builder can never blank a new
+        template by omitting an invented key.
+        """
+        device_id = intent.device
+        inventory = await provider.hardware_inventory()
+        view = await provider.hardware_device(device_id)
+        data = {
+            "title": str(((view.get("device") or {}).get("label")) or device_id),
+            "inventory": inventory,
+            "admission_notes": _actionable_notes(inventory),
+            "device_id": device_id,
+            "channel_id": intent.channel,
+        }
+        if view.get("ok"):
+            identity = view.get("identity") or {}
+            previews = [dict(item) for item in (view.get("previews") or [])]
+            # A Preview button named the target channel in the intent. Mark only that
+            # panel so a fleet row has one unambiguous action: it opens the device *and*
+            # starts that device's preview, instead of navigating somewhere that asks the
+            # person to click another Start button.
+            for preview in previews:
+                preview["autostart"] = bool(
+                    intent.channel and preview.get("channel_id") == intent.channel
+                )
+            data.update({
+                "device": view.get("device") or {},
+                "identity": identity,
+                "identity_rows": _identity_rows(identity, view.get("device") or {}),
+                "channels": view.get("channels") or None,
+                "traces": view.get("traces") or None,
+                "controls": view.get("controls") or None,
+                "previews": previews or None,
+                "events": view.get("events") or None,
+            })
+        else:
+            data["device_error"] = _hardware_error(view, device_id)
+        return self._render(template, data)
 
     async def _build_from_finding_payload(
         self,
@@ -195,6 +425,18 @@ class DashboardViewBuilder:
                 "run_count": watch.get("run_count", 0),
             },
         }
+        if template == "hardware":
+            # The fleet list comes from the live registry rather than the cycle payload.
+            # The digest is capped at eight charted channels and is up to a monitor
+            # interval old, so a device attached since the last cycle would be missing
+            # from the one panel whose whole job is to say what is attached.
+            inventory = await provider.hardware_inventory()
+            data["inventory"] = inventory
+            data["admission_notes"] = _actionable_notes(inventory)
+            data["title"] = "Physical bench"
+            notice = _hardware_notice(inventory, payload)
+            if notice is not None:
+                data["notice"] = notice
         return self._render(template, data)
 
     async def _build_session(self, template: str, provider: DashboardDataProvider) -> dict[str, Any]:
@@ -304,6 +546,7 @@ class DashboardViewBuilder:
 
 
 __all__ = [
+    "HARDWARE_TEMPLATE",
     "DashboardDataProvider",
     "DaemonDataProvider",
     "DashboardViewBuilder",

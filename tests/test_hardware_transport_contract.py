@@ -86,6 +86,15 @@ class _Case:
     config: dict[str, Any]
     failing_write: dict[str, Any]
     without_halt: dict[str, Any]
+    writable: bool = True
+    """Whether this transport can command anything at all.
+
+    A declared shortfall in the same spirit as ``halt_supported=False``: a sensor-only
+    bus has no write path, so the three write cases are replaced by the stricter
+    contract that every write is refused *and* proves no effect landed. Not an
+    exemption -- a read-only transport that accepted a write, or refused it with an
+    uncertain verdict, still fails.
+    """
 
 
 _MOCK_CONFIG: dict[str, Any] = {
@@ -151,6 +160,16 @@ class _StubMcpServer:
         return {"ok": False, "error": f"unknown tool {tool_name!r}"}
 
 
+_HOST_CONFIG: dict[str, Any] = {
+    # Narrowed to the two channels the standard library can always answer, so the case
+    # behaves identically on every runner. The conformance context declares its own
+    # ``sensor``/``setpoint`` channels; the host transport resolves those against the
+    # declaration rather than the probe table, and reports SUSPECT quality for a
+    # channel it cannot read -- which is exactly the contract under test.
+    "include": "cpu",
+}
+
+
 _TRANSPORT_CASES: tuple[_Case, ...] = (
     _Case(
         kind="mock",
@@ -184,6 +203,16 @@ _TRANSPORT_CASES: tuple[_Case, ...] = (
         },
         without_halt={**_SIMULATED_CONFIG, "halt_supported": False},
     ),
+    _Case(
+        kind="host",
+        config=_HOST_CONFIG,
+        # Both variants are the base config: this transport has one write path and one
+        # halt answer, and neither is configurable. A host has no emergency stop and
+        # no commandable channel, so the shortfall is structural rather than a setting.
+        failing_write=_HOST_CONFIG,
+        without_halt=_HOST_CONFIG,
+        writable=False,
+    ),
 )
 
 _EXTERNAL_ONLY_TRANSPORTS = frozenset(
@@ -192,6 +221,14 @@ _EXTERNAL_ONLY_TRANSPORTS = frozenset(
         # be exercised without one. Its failure modes are covered separately in
         # test_hardware_context.py.
         "python",
+        # Needs a physical camera or microphone *and* a capture backend (ffmpeg or
+        # opencv-python) by definition. Running the generic cases against it would
+        # open the machine's camera during `pytest` -- on macOS that raises a system
+        # permission dialog mid-run, which is a worse outcome than the coverage is
+        # worth. Its contracts are exercised against a fake frame source in
+        # tests/test_hardware_media.py: read-only refusal with a provable NONE verdict,
+        # frame metadata without bytes, and the FrameTransport capability check.
+        "media",
     }
 )
 
@@ -288,11 +325,19 @@ async def test_operating_before_open_raises_rather_than_guessing(transport_case)
 
 
 @pytest.mark.asyncio
-async def test_successful_write_reports_a_definite_side_effect(transport_case) -> None:
+async def test_successful_write_reports_a_definite_side_effect(case: _Case, transport_case) -> None:
     transport, context = transport_case
     await transport.open(context)
     outcome = await transport.write("setpoint", 42.0)
     assert isinstance(outcome, WriteOutcome)
+    if not case.writable:
+        # The read-only shortfall, and a stricter contract than the writable one: the
+        # call never reached anything, so "no effect" is provable and must be reported
+        # -- an uncertain verdict here would block replay of every later action.
+        assert outcome.ok is False
+        assert outcome.side_effect_state == SIDE_EFFECT_NONE
+        assert outcome.error
+        return
     assert outcome.ok is True
     # A successful physical write has definitely landed; reporting "none" would
     # tell the recovery layer it is safe to replay.
@@ -300,7 +345,9 @@ async def test_successful_write_reports_a_definite_side_effect(transport_case) -
 
 
 @pytest.mark.asyncio
-async def test_verify_after_write_channel_returns_a_readback(transport_case) -> None:
+async def test_verify_after_write_channel_returns_a_readback(case: _Case, transport_case) -> None:
+    if not case.writable:
+        pytest.skip("a read-only transport never performs the write a readback follows")
     transport, context = transport_case
     await transport.open(context)
     outcome = await transport.write("setpoint", 33.0)
@@ -315,7 +362,13 @@ async def test_failed_write_never_claims_no_side_effect(case: _Case) -> None:
     A transport reporting ``none`` on failure would let the recovery layer replay a
     physical command, which is precisely how a failed dispense becomes a double
     dispense.
+
+    A read-only transport is the one honest exception, and it is covered by
+    ``test_successful_write_reports_a_definite_side_effect`` above: there the refusal
+    *must* report ``none``, because the call provably never reached a device.
     """
+    if not case.writable:
+        pytest.skip("covered by the read-only refusal contract, which requires 'none'")
     failing = build_transport(case.kind, case.failing_write)
     context = _conformance_context(case.kind, case.failing_write)
     await failing.open(context)
@@ -375,6 +428,7 @@ def test_conformance_suite_passes(case: _Case) -> None:
         case.config,
         failing_write_config=case.failing_write,
         no_halt_config=case.without_halt,
+        writable=case.writable,
     )
     failures = [r for r in report.results if not r.passed]
     assert report.failed == 0, (

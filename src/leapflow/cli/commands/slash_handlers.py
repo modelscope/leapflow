@@ -1965,7 +1965,10 @@ async def _ensure_session_watch_refresh(
     return watch_id
 
 
-_BOARD_VERBS = frozenset({"templates", "refresh", "pause", "resume", "stop", "status"})
+_BOARD_VERBS = frozenset({
+    "templates", "refresh", "pause", "resume", "stop", "status",
+    "devices", "device", "preview", "rescan",
+})
 
 # States in which a watch can still be paused/resumed/stopped (i.e. not terminal).
 _BOARD_CONTROLLABLE_STATES = frozenset(
@@ -1999,6 +2002,19 @@ async def _execute_dashboard(
         return _execute_board_templates(ctx, rest_tokens)
     if verb == "status":
         return await _execute_board_status(ctx, monitors)
+    if verb == "devices":
+        return _execute_board_devices(ctx)
+    if verb == "rescan":
+        return await _execute_board_rescan(ctx)
+    if verb in ("device", "preview"):
+        return await _execute_board_device(
+            ctx,
+            monitors,
+            verb,
+            target=rest_tokens[0] if rest_tokens else "",
+            channel=rest_tokens[1] if len(rest_tokens) > 1 else "",
+            session_id=session_id,
+        )
     if verb in ("refresh", "pause", "resume", "stop"):
         return await _execute_board_control(
             ctx, monitors, verb, target=rest_tokens[0] if rest_tokens else "",
@@ -2013,19 +2029,29 @@ async def _execute_dashboard(
         "ok": False,
         "message": (
             f"Unknown board command: '{verb}'. Use /board for the session board, "
-            "/board <template> for a lens (see /board templates), or "
+            "/board <template> for a lens (see /board templates), "
+            "/board devices|device|preview|rescan for peripherals, or "
             "/board templates|refresh|pause|resume|stop|status."
         ),
     }
 
 
 async def _execute_board_open(
-    ctx: "Context", monitors: Any, *, template: str, session_id: str = "",
+    ctx: "Context",
+    monitors: Any,
+    *,
+    template: str,
+    session_id: str = "",
+    device: str = "",
+    channel: str = "",
+    notes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Open the current-session board rendered with the requested template.
 
     ``template`` is guaranteed to be empty (default) or a known lens by the
-    dispatcher, so there is no silent fallback here.
+    dispatcher, so there is no silent fallback here. ``device``/``channel`` name a
+    drill-down target for the lenses that have one; the client turns them into the
+    matching query parameters.
     """
     session_watch_id = ""
     if monitors is not None:
@@ -2038,9 +2064,278 @@ async def _execute_board_open(
     payload: dict[str, Any] = {
         "ok": True, "view": "dashboard", "mode": "open", "template": template or "generic",
     }
+    if device:
+        payload["device"] = device
+    if channel:
+        payload["channel"] = channel
+    if notes:
+        payload["notes"] = list(notes)
     if session_watch_id:
         payload["watch_id"] = session_watch_id
     return payload
+
+
+_HARDWARE_LENS = "hardware"
+"""The single hardware lens; naming a device renders that device instead of the fleet.
+
+There is no separate ``hardware_device`` lens. Two names that differ only in subject read
+as synonyms in the lens list, and the drill-down is reversible without the operator
+learning a second one.
+"""
+
+_HARDWARE_DISABLED = {
+    "ok": False,
+    "message": (
+        "Hardware is disabled for this profile, so no peripherals are visible. "
+        "Enable it with `leap config set hardware.enabled true`, then restart the "
+        "daemon (`leap daemon restart`)."
+    ),
+}
+"""One wording for the one situation, because it is the common case rather than an error.
+
+Hardware is off by default, so "nothing here" is the expected state for most profiles and
+the reply has to say how to change it rather than read like a failure.
+"""
+
+
+def _hardware_registry(ctx: "Context") -> Any:
+    """Return the daemon's hardware registry, or None when hardware is disabled."""
+    return getattr(ctx, "_hardware_registry", None)
+
+
+def _execute_board_devices(ctx: "Context") -> dict[str, Any]:
+    """List admitted peripherals in the TUI, grouped by declared class.
+
+    Answers "what can you see" without opening a browser, which is the question an
+    operator asks first and the one the board previously required a round trip to
+    answer. Read-only and cheap: the inventory comes from the admitted contexts and the
+    sampling ring, and nothing here opens a transport or probes a device.
+
+    Admission notes are included because a demotion is the difference between "this
+    device has no controls" and "this device was refused its controls, and here is the
+    rule that did it" -- and only the second is actionable.
+    """
+    registry = _hardware_registry(ctx)
+    if registry is None:
+        return dict(_HARDWARE_DISABLED)
+    from leapflow.hardware.observability import build_inventory
+
+    inventory = build_inventory(registry)
+    groups = inventory.get("groups") or []
+    counts = inventory.get("counts") or {}
+    if not groups:
+        return {
+            "ok": True, "view": "dashboard", "mode": "devices",
+            "groups": [], "counts": counts, "notes": inventory.get("notes") or [],
+            "message": (
+                "Hardware is enabled but no device was admitted. Run `/board rescan` "
+                "after attaching one, or check `hardware.providers` and the profile's "
+                "declaration directory."
+            ),
+        }
+    return {
+        "ok": True, "view": "dashboard", "mode": "devices",
+        "groups": groups,
+        "counts": counts,
+        "notes": inventory.get("notes") or [],
+        "rejected": inventory.get("rejected") or [],
+        "hint": "Open one with /board device <id>, or preview it with /board preview <id>.",
+    }
+
+
+async def _execute_board_rescan(ctx: "Context") -> dict[str, Any]:
+    """Re-run device discovery so a peripheral attached since startup appears.
+
+    Goes through ``reconcile()`` rather than ``load()``: reloading outright would orphan
+    one asyncio sampling task per streaming channel while leaving them running, so a
+    device that did not change keeps the loop it already has.
+
+    Deliberately ungated. Every provider in the default set enumerates passively --
+    reading a mount table, listing AVFoundation inputs, parsing a declaration file --
+    so a rescan discloses nothing and changes nothing physical. A scanner that transmits
+    or leaves the host would need its own gate, which is precisely why those are not in
+    the default set.
+
+    The result is shared: rescanning changes the capability set for every connected
+    client at its next turn, exactly as a plugin install does.
+    """
+    registry = _hardware_registry(ctx)
+    if registry is None:
+        return dict(_HARDWARE_DISABLED)
+    try:
+        report = await registry.reconcile()
+    except Exception as exc:  # noqa: BLE001 - a failed scan leaves the fleet running
+        logger.warning("board: hardware rescan failed: %s", exc, exc_info=True)
+        return {
+            "ok": False,
+            "message": f"Rediscovery failed; the previous device set is unchanged: {exc}",
+        }
+    admitted = list(report.admitted)
+    rejected = list(report.rejected)
+    summary = f"{len(admitted)} device(s) admitted"
+    if rejected:
+        summary += f", {len(rejected)} rejected"
+    return {
+        "ok": True, "view": "dashboard", "mode": "rescan",
+        "admitted": admitted, "rejected": rejected,
+        "notes": [note.to_dict() for note in report.notes],
+        "message": f"Rescanned peripherals: {summary}. See /board devices.",
+    }
+
+
+async def _execute_board_device(
+    ctx: "Context",
+    monitors: Any,
+    verb: str,
+    *,
+    target: str,
+    channel: str = "",
+    session_id: str = "",
+) -> dict[str, Any]:
+    """Open one device's board page; ``preview`` also establishes consent first.
+
+    ``target`` accepts a full device id or a unique prefix, matching how ``/board stop``
+    already resolves a watch id. Discovered ids are long (``camera_0_macbook_pro``), and
+    a prefix is what makes them typeable without a completion source that would go stale
+    the moment something is unplugged.
+
+    The two verbs differ in one step, and that step is the reason ``preview`` exists.
+    Opening the page is enough for an ordinary channel. For a privacy-gated one the
+    browser cannot obtain consent -- an RPC carries no approval route, so the daemon
+    denies it -- so ``preview`` requests one frame *from here*, where the route does
+    exist, and the prompt appears in this TUI. The grant that answer mints is what the
+    browser's stream is then covered by.
+    """
+    registry = _hardware_registry(ctx)
+    if registry is None:
+        return dict(_HARDWARE_DISABLED)
+    if not target:
+        return {
+            "ok": False,
+            "message": (
+                f"Name a device: /board {verb} <id>. Run /board devices to see what is "
+                "attached; a unique id prefix is enough."
+            ),
+        }
+
+    device_id, ambiguous = _resolve_device_id(registry, target)
+    if not device_id:
+        detail = (
+            f"'{target}' matches {len(ambiguous)} devices ({', '.join(ambiguous[:4])})"
+            if ambiguous
+            else f"No device matches '{target}'"
+        )
+        return {
+            "ok": False,
+            "message": f"{detail}. Run /board devices to see the attached peripherals.",
+        }
+
+    if verb == "device":
+        return await _execute_board_open(
+            ctx, monitors, template=_HARDWARE_LENS, session_id=session_id, device=device_id,
+        )
+    return await _execute_board_preview(
+        ctx, monitors, registry, device_id, channel, session_id=session_id
+    )
+
+
+async def _execute_board_preview(
+    ctx: "Context",
+    monitors: Any,
+    registry: Any,
+    device_id: str,
+    channel: str,
+    *,
+    session_id: str = "",
+) -> dict[str, Any]:
+    """Establish consent for a previewable channel, then open the device page.
+
+    One frame is requested rather than none, and that is the whole mechanism: the request
+    goes through the ordinary approval chain, so the prompt appears here and the grant it
+    produces covers the browser's later stream. Requesting zero frames would open a page
+    whose Start button is refused with no way to answer.
+
+    A refusal is reported and the board is *not* opened. Opening it anyway would show a
+    preview panel that cannot work, which is exactly the "terminal decision with no next
+    step" this codebase treats as a defect.
+    """
+    context = registry.context(device_id)
+    target_channel = _resolve_preview_channel(context, channel)
+    if not target_channel:
+        declared = ", ".join(c.channel_id for c in getattr(context, "media_channels", ()) or ())
+        return {
+            "ok": False,
+            "message": (
+                f"{device_id} has no previewable channel"
+                + (f"; try one of: {declared}" if declared else " (no channel carries frames)")
+                + ". Use /board device " + device_id + " for its other channels."
+            ),
+        }
+
+    from leapflow.daemon.service import request_hardware_frame
+
+    reply = await request_hardware_frame(ctx, registry, device_id, target_channel)
+    if not reply.get("ok"):
+        return {
+            "ok": False,
+            "code": str(reply.get("code") or ""),
+            "message": str(
+                reply.get("error")
+                or f"Could not preview {device_id}.{target_channel}."
+            ),
+        }
+
+    size = f"{reply.get('width', 0)}x{reply.get('height', 0)}"
+    return await _execute_board_open(
+        ctx,
+        monitors,
+        template=_HARDWARE_LENS,
+        session_id=session_id,
+        device=device_id,
+        channel=target_channel,
+        notes=(
+            f"Preview approved for {device_id}.{target_channel} ({size}); "
+            "the board can now stream it until the grant expires.",
+            "The device is released automatically once nobody is watching.",
+        ),
+    )
+
+
+def _resolve_preview_channel(context: Any, requested: str) -> str:
+    """Return the channel to preview: the named one, else the device's only frame channel.
+
+    Defaulting is safe because a media device declares exactly one frame channel; when a
+    future device declares several, an unnamed request stays ambiguous rather than picking
+    one, because guessing which camera output somebody meant is not a safe default.
+    """
+    media = tuple(getattr(context, "media_channels", ()) or ())
+    if requested:
+        return requested if any(c.channel_id == requested for c in media) else ""
+    return media[0].channel_id if len(media) == 1 else ""
+
+
+def _resolve_device_id(registry: Any, target: str) -> tuple[str, list[str]]:
+    """Resolve a device id from an exact match or a unique prefix.
+
+    Returns ``(device_id, ambiguous_matches)``. An ambiguous prefix returns the candidates
+    so the caller can name them: "matches 3 devices" with the list is actionable, whereas
+    "not found" for a prefix that matched too much sends somebody looking for a typo they
+    did not make.
+    """
+    target = target.strip()
+    if not target:
+        return "", []
+    try:
+        ids = [context.device_id for context in registry.contexts()]
+    except Exception:  # noqa: BLE001 - an unreadable registry is "no match", not a crash
+        logger.debug("board: device list unavailable", exc_info=True)
+        return "", []
+    if target in ids:
+        return target, []
+    matches = sorted(device_id for device_id in ids if device_id.startswith(target))
+    if len(matches) == 1:
+        return matches[0], []
+    return "", matches
 
 
 async def _execute_board_control(
@@ -2751,6 +3046,85 @@ def _render_board_server_health(console: "LeapConsole", server: Any) -> None:
         console.system(f"LeapBoard web server (pid={build.get('pid')}) is up to date.")
 
 
+def _render_board_devices(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    """Render the peripheral inventory as one table per declared class.
+
+    Grouped rather than flat because the classes answer different questions -- what is
+    this machine doing, what can it see, what is on the bench -- and a single 20-row
+    table mixes them into something nobody scans.
+
+    The columns are chosen to make the *next* command obvious: an id short enough to
+    prefix, and the two capability counts that decide whether ``/board preview`` or a
+    control is available at all.
+    """
+    from rich.table import Table
+
+    if message := payload.get("message"):
+        console.system(str(message))
+
+    counts = payload.get("counts") or {}
+    for group in payload.get("groups") or []:
+        devices = group.get("devices") or []
+        table = Table(
+            title=f"{group.get('device_class', 'device')} ({len(devices)})",
+            title_style="bold cyan",
+            border_style="bright_black",
+        )
+        # The id is folded, never cropped: it is the argument to the next command, and a
+        # truncated ``camera_0_macb…`` cannot be typed or prefixed. Same reason the watch
+        # table folds its url. Transport and provenance are deliberately absent -- they
+        # are diagnostic detail, available on the device page and in `leap hw list`, and
+        # including them is what squeezed the id into an ellipsis.
+        table.add_column("id", overflow="fold")
+        for col in ("name", "channels", "preview", "writable"):
+            table.add_column(col)
+        for device in devices:
+            preview_count = int(device.get("media", 0) or 0)
+            writable = int(device.get("writable", 0) or 0)
+            table.add_row(
+                str(device.get("device_id", "")),
+                str(device.get("label", "")),
+                str(device.get("channels", 0)),
+                # Consent state, not just a count: "1 (consent)" says why Start preview
+                # will prompt, which is the question the next command raises.
+                f"{preview_count} (consent)"
+                if preview_count and int(device.get("privacy_gated", 0) or 0)
+                else str(preview_count or "-"),
+                str(writable or "-"),
+            )
+        console.print(table)
+
+    if counts:
+        console.system(
+            f"{counts.get('devices', 0)} device(s), {counts.get('channels', 0)} channel(s), "
+            f"{counts.get('previewable', 0)} previewable, {counts.get('writable', 0)} writable."
+        )
+    _render_admission_notes(console, payload.get("notes") or [])
+    if hint := payload.get("hint"):
+        console.system(str(hint))
+
+
+def _render_admission_notes(console: "LeapConsole", notes: list[Any]) -> None:
+    """Surface admission decisions that changed what a device can do.
+
+    Only demotions and rejections. A ``warning`` note is advisory and there is one per
+    privacy-gated channel by design (V10), so printing those would bury the two outcomes
+    that actually took a capability away.
+    """
+    actionable = [
+        note for note in notes
+        if isinstance(note, dict) and str(note.get("outcome")) in ("demoted", "rejected")
+    ]
+    if not actionable:
+        return
+    console.system(f"Admission changed {len(actionable)} declaration(s):")
+    for note in actionable[:10]:
+        device = str(note.get("device_id") or "-")
+        console.system(
+            f"  [{note.get('outcome')}] {device} ({note.get('rule')}): {note.get('detail')}"
+        )
+
+
 def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
     from rich.table import Table
 
@@ -2770,6 +3144,15 @@ def _render_dashboard_view(console: "LeapConsole", payload: dict[str, Any]) -> N
 
     if mode == "control":
         console.success(str(payload.get("message") or payload.get("action") or "done"))
+        return
+
+    if mode == "devices":
+        _render_board_devices(console, payload)
+        return
+
+    if mode == "rescan":
+        console.success(str(payload.get("message") or "Rescanned peripherals."))
+        _render_admission_notes(console, payload.get("notes") or [])
         return
 
     if mode == "status":

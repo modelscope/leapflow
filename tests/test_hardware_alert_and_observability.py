@@ -481,6 +481,11 @@ class TestCalibrationDashboard:
                 "storage": {},
             },
             "observation": {},
+            # No mode flag is needed. Every fleet panel gates on the data it renders --
+            # this one on ``hardware.calibration`` -- so supplying the data is what makes
+            # it appear. An earlier revision gated the section on a synthetic ``fleet``
+            # key instead, which is how a board served by a process that predated the key
+            # rendered a bare title and nothing else.
         }
         spec = lib.render("hardware", payload)
         # Walk the tree to find the calibration Section

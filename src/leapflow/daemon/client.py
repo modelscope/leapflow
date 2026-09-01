@@ -232,6 +232,80 @@ class DaemonClient:
         result = await self.request("hardware.resume", {"device": device})
         return dict(result or {})
 
+    async def hardware_inventory(self) -> dict[str, Any]:
+        """Return the admitted device fleet grouped by declared class."""
+        result = await self.request("hardware.inventory")
+        return dict(result or {})
+
+    async def hardware_device(self, device: str) -> dict[str, Any]:
+        """Return one device's channels, sampled values, controls and previews."""
+        result = await self.request("hardware.device", {"device": device})
+        return dict(result or {})
+
+    async def hardware_rescan(self) -> dict[str, Any]:
+        """Re-run device discovery and converge on the new set."""
+        result = await self.request("hardware.rescan")
+        return dict(result or {})
+
+    async def hardware_frame(
+        self,
+        device: str,
+        channel: str,
+        *,
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        on_stream_event: Callable[[StreamEvent], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return one base64 preview frame, or a structured refusal.
+
+        ``on_stream_event`` receives the approval prompt when the channel is
+        privacy-gated: the daemon installs a route for this method, so the request waits
+        while the caller presents the prompt and answers it through ``approval.resolve``.
+        Omitting the callback is what makes an unattended caller fail closed -- the prompt
+        is raised, nobody sees it, and the request is denied when the connection ends.
+        """
+        result = await self.request(
+            "hardware.frame",
+            {
+                "device": device,
+                "channel": channel,
+                "max_width": max_width,
+                "quality": quality,
+                "fps": fps,
+            },
+            on_stream_event=on_stream_event,
+        )
+        return dict(result or {})
+
+    async def hardware_read(
+        self,
+        device: str,
+        channel: str,
+        *,
+        on_stream_event: Callable[[StreamEvent], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Read one channel's current value, or return a structured refusal.
+
+        Same approval routing as ``hardware_frame``; see its note on ``on_stream_event``.
+        """
+        result = await self.request(
+            "hardware.read",
+            {"device": device, "channel": channel},
+            on_stream_event=on_stream_event,
+        )
+        return dict(result or {})
+
+    async def hardware_write_request(
+        self, device: str, channel: str, value: Any, *, dry_run: bool = True
+    ) -> dict[str, Any]:
+        """Preview or submit a channel write. Defaults to a dry run."""
+        result = await self.request(
+            "hardware.write_request",
+            {"device": device, "channel": channel, "value": value, "dry_run": dry_run},
+        )
+        return dict(result or {})
+
     async def tools_list(self) -> dict[str, Any]:
         """Return daemon-owned tool summary for slash-command rendering."""
         result = await self.request("tools.list")

@@ -1,43 +1,261 @@
-# Physical bench observation template for LeapBoard.
+# Physical bench template for LeapBoard: the fleet, or one device.
 #
-# The narrative runs Observe -> Orient -> Learn: is the bench alive, is it inside
-# the limits somebody declared, and what has been learned from operating it. Every
-# value is derived from the device declaration, the reading store or the event ring
-# -- nothing here is a second source of truth.
+# **One lens, two subjects.** ``/board hardware`` shows every attached peripheral;
+# naming a device (``/board device <id>``, or clicking a row) shows that one. They were
+# two templates and the split was not worth its cost -- ``hardware`` and
+# ``hardware_device`` read as near-synonyms in the lens list, and nothing about the
+# second was a different *way of looking*, only a different subject. Sections gate on
+# ``fleet`` or ``device``, exactly one of which the builder supplies.
 #
-# Read-only by design. No node carries an action: an observation surface that can
-# actuate a device is not an observation surface, and a browser session is a weaker
-# identity than the TUI process that normally holds the approval route.
+# The narrative in fleet mode runs Observe -> Orient -> Learn: is the bench alive, is it
+# inside the limits somebody declared, and what has been learned from operating it. In
+# device mode it runs identity -> live -> control. Every value is derived from the device
+# declaration, the reading store or the event ring -- nothing here is a second source of
+# truth.
+#
+# What makes this general: every panel comes from the *declaration*. A scalar channel
+# gets a value and a trace, a frame channel gets a preview, a writable channel gets a
+# control whose widget comes from its envelope. Nothing names a device, a vendor or a
+# quantity, which is why a new peripheral arrives with working panels and no edit here.
+#
+# Governance, restated where it is enforced:
+#   - Nothing on this page probes a device. Values come from the sampling ring and the
+#     reading store, so opening it cannot make a bus busy.
+#   - A preview of a privacy-gated channel requires consent. The prompt is raised by the
+#     daemon's approval chain and answered on this page; the browser cannot grant itself
+#     one, it can only carry the question and the answer.
+#   - A control *requests*. Every write goes through ApprovalOrchestrator per invocation.
 #
 # Two renderer contracts are load-bearing and were both verified rather than
 # assumed. ``bind`` belongs inside ``props`` -- at node level it is silently
 # dropped. And there is no ``.length``: the path resolver walks mapping keys and
 # list indices only, so counts are precomputed into the payload.
 template: hardware
-version: 1
-title: "Physical bench"
+version: 2
+title: "{{ title }}"
 domain: hardware
 meta:
   title: "Physical bench"
-  description: "Sampled channels against their declared envelopes, with device health, cadence and learned command outcomes."
+  description: "Attached peripherals, their sampled channels against declared envelopes, and per-device preview and controls."
 layout:
   - type: Page
     props:
-      title: "Physical bench"
+      title: "{{ title }}"
     children:
-      # ── 1. Bench state: can this data be trusted right now ──
+      # ── 0. Why this page is empty, when it is ──
+      # First, so a failure is the first thing read rather than inferred from a page of
+      # blank panels. Two situations reach it, and both used to render *nothing at all*:
+      # a device that could not be read, and a profile where there is nothing to show
+      # (hardware off, or on with no device admitted). A board tab that is blank with no
+      # explanation is the same "silently gated out" defect as the calibration panel that
+      # asked for a key nobody supplied.
+      - type: Card
+        when: notice
+        props:
+          title: "{{ notice.title }}"
+        children:
+          - type: Markdown
+            props:
+              text: "{{ notice.text }}"
+
+      - type: Card
+        when: device_error
+        props:
+          title: "Device unavailable"
+        children:
+          - type: Markdown
+            props:
+              text: "{{ device_error }}"
+
+      # ═══ Device mode ═══════════════════════════════════════════════════════
+
+      # ── D1. Identity ──
       - type: Row
+        when: device
+        props:
+          variant: metrics
+        children:
+          - type: Stat
+            props:
+              label: "Class"
+              value: "{{ device.device_class }}"
+          - type: Stat
+            props:
+              label: "Transport"
+              value: "{{ device.transport_kind }}"
+          - type: Stat
+            props:
+              label: "Channels"
+              value: "{{ device.channels }}"
+          - type: Stat
+            props:
+              label: "Sampled"
+              value: "{{ device.streaming }}"
+          - type: Stat
+            props:
+              label: "Writable"
+              value: "{{ device.writable }}"
+          - type: Stat
+            props:
+              label: "Connection"
+              value: "{{ device.opened }}"
+
+      # ── D2. Live preview ──
+      # Before the numbers: on a device that has one, the picture is why the page was
+      # opened. Each entry carries its own consent state, so the panel is visible while
+      # the stream is not, until a grant exists.
+      - type: Section
+        when: previews
+        props:
+          title: "Preview"
+          subtitle: "Pulled on demand at the declared ceiling · never sampled into stored history"
+        children:
+          - type: MediaPreview
+            repeat: previews
+            as: preview
+            props:
+              title: "{{ preview.channel_id }}"
+              device: "{{ preview.device_id }}"
+              channel: "{{ preview.channel_id }}"
+              kind: "{{ preview.kind }}"
+              media_type: "{{ preview.media_type }}"
+              max_fps: "{{ preview.max_fps }}"
+              max_width: "{{ preview.max_width }}"
+              max_quality: "{{ preview.max_quality }}"
+              autostart: "{{ preview.autostart }}"
+              unit: "{{ preview.unit }}"
+              floor: "{{ preview.floor }}"
+              privacy: "{{ preview.privacy }}"
+              consent_required: "{{ preview.consent_required }}"
+              consent_reason: "{{ preview.consent_reason }}"
+
+      # ── D3. Channels ──
+      - type: Section
+        when: channels
+        props:
+          title: "Channels"
+          subtitle: "Latest sampled value against the declared limits"
+        children:
+          - type: Table
+            props:
+              caption: "'not sampled' means no loop reads this channel, so it has no current value anyone measured."
+              columns:
+                - key: channel_id
+                  label: "Channel"
+                - key: value
+                  label: "Value"
+                - key: unit
+                  label: "Unit"
+                - key: limits
+                  label: "Declared limits"
+                - key: quality
+                  label: "Quality"
+                - key: trend
+                  label: "Trend"
+                - key: declared_hz
+                  label: "Hz"
+                - key: representation
+                  label: "Shape"
+                - key: privacy
+                  label: "Privacy"
+              bind: channels
+
+      # ── D4. Per-channel history ──
+      # One chart per channel here, unlike the fleet view: a single device's units differ
+      # (percent, bytes, degrees), and one axis would make every line but the largest
+      # invisible.
+      - type: Section
+        when: traces
+        props:
+          title: "History"
+          subtitle: "Downsampled windows per channel, newest on the right"
+        children:
+          - type: Sparkline
+            repeat: traces
+            as: trace
+            props:
+              title: "{{ trace.label }}"
+              bind: trace.points
+
+      # ── D5. Controls ──
+      # Present only for channels the declaration made writable *and* admission left
+      # writable. Submitting creates a pending approval; it does not write.
+      - type: Section
+        when: controls
+        props:
+          title: "Controls"
+          subtitle: "Every change is previewed first, then requires approval"
+        children:
+          - type: Form
+            repeat: controls
+            as: control
+            props:
+              title: "{{ control.channel_id }}"
+              control: "{{ control.control }}"
+              options: "{{ control.options }}"
+              unit: "{{ control.unit }}"
+              effect: "{{ control.effect }}"
+              min_value: "{{ control.min_value }}"
+              max_value: "{{ control.max_value }}"
+              step: "{{ control.step }}"
+              limits: "{{ control.limits }}"
+              reversible: "{{ control.reversible }}"
+              settling_s: "{{ control.settling_s }}"
+              device: "{{ device_id }}"
+              channel: "{{ control.channel_id }}"
+
+      # ── D6. Declaration provenance ──
+      - type: Section
+        when: identity_rows
+        props:
+          title: "Declaration"
+          subtitle: "Where this device's knowledge came from, and who is accountable for it"
+        children:
+          - type: Table
+            props:
+              caption: "An unverified declaration keeps its readable channels and loses its writable ones."
+              columns:
+                - key: field
+                  label: "Field"
+                - key: value
+                  label: "Value"
+              bind: identity_rows
+
+      # ── D7. This device's events ──
+      - type: Section
+        when: events
+        props:
+          title: "Events"
+          subtitle: "Envelope, rate, staleness and quality observations · newest first"
+        children:
+          - type: Timeline
+            props:
+              bind: events
+
+      # ═══ Fleet mode ════════════════════════════════════════════════════════
+
+      # ── F1. Bench state: can this data be trusted right now ──
+      - type: Row
+        when: hardware.counts
         props:
           variant: metrics
         children:
           - type: Stat
             props:
               label: "Devices"
-              value: "{{ hardware.counts.devices }}"
+              value: "{{ inventory.counts.devices }}"
+          - type: Stat
+            props:
+              label: "Channels"
+              value: "{{ inventory.counts.channels }}"
           - type: Stat
             props:
               label: "Charted channels"
               value: "{{ hardware.counts.series }}"
+          - type: Stat
+            props:
+              label: "Previewable"
+              value: "{{ inventory.counts.previewable }}"
           - type: Stat
             props:
               label: "Recent events"
@@ -55,11 +273,129 @@ layout:
               label: "Watch state"
               value: "{{ observation.watch_state }}"
 
-      # ── 2. Channel traces ──
+      # ── F2. Fleet inventory ──
+      # Read from the live registry, not from the cycle payload: the digest is up to
+      # one monitor interval old, so a device attached a minute ago would be missing
+      # from the one panel whose entire job is to say what is attached.
+      #
+      # One section per declared class, expanded by ``repeat``. Class is a free-form
+      # label from the declaration and nothing branches on it, which is what lets a new
+      # kind of peripheral appear here with no change to this file.
+      #
+      # Shown in *both* modes: on a device page it is the way to the other devices, and a
+      # drill-down that dead-ends is a drill-down people stop using. The heading is a
+      # literal rather than bound, because a bound one renders the string "None" when the
+      # builder predates it -- and a heading is exactly where that is most visible.
+      - type: Section
+        when: inventory.groups
+        props:
+          title: "Attached devices"
+          subtitle: "Grouped by declared class · select a device for live channels, preview and controls"
+        children:
+          - type: Card
+            repeat: inventory.groups
+            as: group
+            props:
+              title: "{{ group.device_class }}"
+            children:
+              - type: Table
+                props:
+                  caption: "An unverified declaration has its writable channels demoted to read-only."
+                  columns:
+                    - key: label
+                      label: "Device"
+                    - key: transport_kind
+                      label: "Transport"
+                    - key: provenance_source
+                      label: "Declared by"
+                    - key: verified
+                      label: "Verified"
+                    - key: channels
+                      label: "Channels"
+                    - key: streaming
+                      label: "Sampled"
+                    - key: writable
+                      label: "Writable"
+                    - key: media
+                      label: "Preview"
+                    - key: opened
+                      label: "Open"
+                  bind: group.devices
+                  # Explicit buttons rather than an instruction. The caption used to read
+                  # "select a row to open the device", which asks the reader to do the
+                  # renderer's job: nothing about a row says it is clickable, and a row that
+                  # can do two things cannot say which one a click means.
+                  #
+                  # Rows are expanded by the *client*, so a button's target cannot be a
+                  # ``{{ }}`` placeholder -- there is no row in scope when this template is
+                  # compiled. ``param_from_row`` names the column to read instead.
+                  row_buttons:
+                    - label: "Open"
+                      kind: nav
+                      name: device
+                      params:
+                        template: hardware
+                      param_from_row:
+                        device: device_id
+                    - label: "Preview"
+                      kind: nav
+                      name: device
+                      variant: primary
+                      # Only on devices that have something to preview, read from the row's
+                      # own count -- so the template needs no knowledge of device kinds.
+                      require: media
+                      params:
+                        template: hardware
+                      param_from_row:
+                        device: device_id
+                        channel: preview_channel
+                  # The whole row stays a shortcut for the primary action, for anyone who
+                  # already learned to click it. Same lens plus a target: naming a device is
+                  # what switches this template from the fleet to that device.
+                  row_action:
+                    kind: nav
+                    name: device
+                    params:
+                      template: hardware
+                    param_from_row:
+                      device: device_id
+
+      # ── F3. Admission notes ──
+      # A demotion is the difference between "this device has no controls" and "this
+      # device was refused its controls, and here is the rule that did it". Only the
+      # second is actionable, and it used to appear in the daemon log alone.
+      #
+      # Bound to ``admission_notes`` -- the demoted/rejected subset -- not to every note.
+      # A ``warning`` is advisory and rule V10 emits one per privacy-gated channel, so the
+      # unfiltered list put "Admission decisions: 3" on a bench where nothing had been
+      # demoted, under a heading promising to explain exactly that.
+      - type: Section
+        when: admission_notes
+        props:
+          title: "Admission decisions"
+          subtitle: "Why a device or channel is not what its declaration asked for"
+        children:
+          - type: Table
+            when: admission_notes
+            props:
+              caption: "Rejected declarations are unusable; demoted ones remain readable."
+              columns:
+                - key: device_id
+                  label: "Device"
+                - key: rule
+                  label: "Rule"
+                - key: outcome
+                  label: "Outcome"
+                - key: detail
+                  label: "Detail"
+              bind: admission_notes
+
+      # ── F4. Channel traces ──
       # One chart carrying every channel: the renderer plots the series list
       # directly, so a per-channel repeat would produce N single-line charts that are
       # harder to compare than N lines on one axis.
       - type: Section
+        when: hardware.series
         props:
           title: "Channel traces"
           subtitle: "Sampled history per channel, newest on the right"
@@ -71,11 +407,12 @@ layout:
               caption: "Mean of each downsample window. Declared limits are listed per channel below."
               bind: hardware.series
 
-      # ── 3. Envelope conformance ──
+      # ── F5. Envelope conformance ──
       # A distribution, not a per-window grid: Heatmap is in the component catalog
       # but has no frontend renderer, so asking for one yields a fallback card
       # printing its own type name.
       - type: Section
+        when: hardware.conformance_mix
         props:
           title: "Envelope conformance"
           subtitle: "How often each window sat inside, near, or outside its declared limits"
@@ -87,8 +424,9 @@ layout:
               caption: "Counted across every charted channel. 'near' means within 5% of a declared bound."
               bind: hardware.conformance_mix
 
-      # ── 4. Event timeline ──
+      # ── F6. Event timeline ──
       - type: Section
+        when: hardware.events
         props:
           title: "Device events"
           subtitle: "Envelope, rate, staleness and quality observations · newest first"
@@ -98,11 +436,12 @@ layout:
             props:
               bind: hardware.events
 
-      # ── 5. Sampling health ──
+      # ── F7. Sampling health ──
       # The only place a cadence shortfall is visible: a window counts the samples
       # it actually received, so a channel running at two thirds of its declared
       # rate produces a series that looks entirely correct.
       - type: Section
+        when: hardware.sampling
         props:
           title: "Sampling health"
           subtitle: "Observed rate against declared rate"
@@ -128,10 +467,11 @@ layout:
                   label: "Events paced out"
               bind: hardware.sampling
 
-      # ── 6. Learned command outcomes ──
+      # ── F8. Learned command outcomes ──
       # What the agent has learned about this bench, shown to the person who owns
       # it. Until this panel that experience only ever reached the model.
       - type: Section
+        when: hardware.outcomes
         props:
           title: "Learned command outcomes"
           subtitle: "Commanded versus observed, best tracking first"
@@ -151,10 +491,15 @@ layout:
                   label: "Normalized error"
               bind: hardware.outcomes
 
-      # ── 7. Calibration health (IC-6) ──
+      # ── F9. Calibration health (IC-6) ──
       # Per-channel calibration state so an operator can see which channels are
       # due for re-calibration without opening a device console.
+      #
+      # This panel silently rendered nothing for its whole existence: the payload never
+      # carried a ``calibration`` key, so the ``when:`` gate removed the section on
+      # every cycle. The digest now derives it from the calibration store.
       - type: Section
+        when: hardware.calibration
         props:
           title: "Calibration health"
           subtitle: "Per-channel calibration state, freshness, and residual correction"
@@ -177,34 +522,3 @@ layout:
                 - key: next_recal_due
                   label: "Next recal due"
               bind: hardware.calibration
-
-      # ── 8. Devices and declaration provenance ──
-      - type: Section
-        props:
-          title: "Devices"
-          subtitle: "Transport, provenance and channel counts"
-        children:
-          - type: Table
-            when: hardware.devices
-            props:
-              caption: "An unverified declaration has its writable channels demoted to read-only."
-              columns:
-                - key: label
-                  label: "Device"
-                - key: location
-                  label: "Location"
-                - key: transport_kind
-                  label: "Transport"
-                - key: verified
-                  label: "Verified"
-                - key: channels
-                  label: "Channels"
-                - key: writable
-                  label: "Writable"
-                - key: streaming
-                  label: "Streaming"
-                - key: halt_supported
-                  label: "Halt"
-                - key: opened
-                  label: "Open"
-              bind: hardware.devices

@@ -76,12 +76,12 @@
   }
 
   const I18N = {
-    en: { "manual_refresh": "manual refresh", "first_observation": "first observation", "artifact_changed": "artifact changed", "batch_turns": "turn threshold", "batch_tokens": "token threshold", "model_salience": "model salience", "text_only": "conversation text", "text_and_artifacts": "conversation + files", "partial_artifacts": "partial files" },
-    zh: {"Abstract": "摘要", "Action failed": "操作失败", "Action items": "行动项", "Active event-driven monitors": "活跃的事件驱动监视器", "Active triggers": "活跃触发器", "Active watches": "活跃观察", "Artifacts": "副产物", "Buffer dropped": "缓冲丢弃", "Calibrated at": "校准时间", "Calibration health": "校准健康度", "Candlestick": "K线", "Channels that have never been calibrated or whose calibration has expired are shown first.": "从未校准或校准已过期的通道排在最前。", "Context map": "上下文图谱", "Coverage": "覆盖率", "Coverage · storyline · severity": "覆盖率 · 叙事 · 严重度", "Custom": "自定义", "Days since": "距今天数", "Debounced": "去抖", "Decisions": "决策", "Decisions and actions": "决策与行动", "Domain": "领域", "Entities": "实体", "Entities and follow-ups": "实体与后续", "Evidence stream": "证据流", "Executive brief": "执行摘要", "Extracted from this session's tool/file output (not model-generated).": "数据来自本次会话的工具/文件产物（非模型生成）。", "Failed to load view": "视图加载失败", "File": "文件", "File artifacts": "文件副产物", "Findings": "发现", "Gauge": "仪表", "Insight count by severity.": "按严重度统计的洞察数。", "Insights": "洞察", "Key observations": "关键观察", "Language": "语言", "Latest observation results": "最新观测结果", "Latest sentiment": "最新情绪", "Live signal stream": "实时信号流", "Loading…": "加载中…", "Market brief": "市场简报", "Mentions": "提及", "Name": "名称", "Narrative pulse": "叙事脉搏", "New papers": "新论文", "Next prompts": "后续追问", "Next recal due": "下次校准期限", "No content yet.": "暂无内容。", "No entries.": "暂无条目。", "Note": "说明", "Observation": "观察", "Observation status": "观察状态", "Observed context": "已观察上下文", "Open questions": "待回答问题", "Operating agenda": "行动议程", "Overview": "概览", "Per-channel calibration state, freshness, and residual correction": "各通道的校准状态、时效性与残差校正", "Price action": "价格行为", "Reason": "原因", "Recent events (last 50)": "最近事件（最新50条）", "Recent findings": "最新发现", "Refresh cadence": "刷新节奏", "Refresh reason": "刷新原因", "Refresh state": "刷新状态", "Research pipeline": "研究管线", "Residual": "残差", "Sentiment structure": "情绪结构", "Series": "序列", "Session": "会话", "Session Analysis": "会话分析", "Session file artifacts.": "会话文件副产物。", "Severity mix": "严重度结构", "Signal flow": "信号流", "Signal mix": "信号结构", "Signals": "信号", "State": "状态", "Status": "状态", "Storyline": "叙事线", "Subscribers": "订阅者", "Suggested next prompts": "建议追问", "Timeline": "时间线", "Tokens": "词元", "Trigger": "触发器", "Trigger and context": "触发与上下文", "Turns": "轮次", "Watch": "观察", "Watch portfolio": "观察组合", "Watches": "观察任务", "alert": "警报", "artifact_changed": "文件副产物变化", "batch_tokens": "上下文阈值", "batch_turns": "轮次阈值", "connecting…": "连接中…", "first_observation": "首次观察", "info": "信息", "live": "实时", "manual_refresh": "手动刷新", "model_salience": "模型显著性", "notable": "重要", "reconnecting…": "重连中…", "unknown": "未知"},
-    fr: {"Abstract": "Résumé", "Action failed": "Action échouée", "Action items": "Actions", "Active event-driven monitors": "Moniteurs événementiels actifs", "Active triggers": "Déclencheurs actifs", "Artifacts": "Artefacts", "Buffer dropped": "Tampon perdu", "Calibrated at": "Calibré le", "Calibration health": "État de calibration", "Channels that have never been calibrated or whose calibration has expired are shown first.": "Les canaux jamais calibrés ou dont la calibration a expiré apparaissent en premier.", "Context map": "Carte de contexte", "Coverage": "Couverture", "Coverage · storyline · severity": "Couverture · récit · sévérité", "Days since": "Jours écoulés", "Debounced": "Antirebond", "Decisions": "Décisions", "Decisions and actions": "Décisions et actions", "Domain": "Domaine", "Entities": "Entités", "Entities and follow-ups": "Entités et suivis", "Executive brief": "Synthèse exécutive", "Failed to load view": "Échec du chargement", "File": "Fichier", "File artifacts": "Fichiers", "Findings": "Constats", "Insight count by severity.": "Nombre d’analyses par sévérité.", "Insights": "Analyses", "Key observations": "Observations clés", "Language": "Langue", "Latest observation results": "Derniers résultats d'observation", "Live signal stream": "Flux de signaux en direct", "Loading…": "chargement…", "Name": "Nom", "Next prompts": "Invites suivantes", "Next recal due": "Prochaine recalibration", "No content yet.": "Aucun contenu.", "No entries.": "Aucune entrée.", "Note": "Note", "Observation": "Observation", "Observation status": "Statut d’observation", "Observed context": "Contexte observé", "Open questions": "Questions ouvertes", "Operating agenda": "Programme d’action", "Overview": "Vue d’ensemble", "Per-channel calibration state, freshness, and residual correction": "État de calibration, fraîcheur et correction résiduelle par canal", "Reason": "Raison", "Recent events (last 50)": "Événements récents (50 derniers)", "Recent findings": "Constats récents", "Refresh reason": "Raison", "Refresh state": "État", "Residual": "Résidu", "Session": "Session", "Session Analysis": "Analyse de session", "Session file artifacts.": "Artefacts de fichiers de session.", "Severity mix": "Mix de sévérité", "Signal flow": "Flux de signaux", "Signals": "Signaux", "State": "État", "Status": "Statut", "Storyline": "Narratif", "Subscribers": "Abonnés", "Suggested next prompts": "Prochaines invites", "Timeline": "Chronologie", "Tokens": "Jetons", "Trigger": "Déclencheur", "Trigger and context": "Déclencheur et contexte", "Turns": "Tours", "Watch": "Veille", "Watches": "Veilles", "alert": "alerte", "artifact_changed": "artefact modifié", "batch_tokens": "seuil de jetons", "batch_turns": "seuil de tours", "connecting…": "connexion…", "first_observation": "première observation", "info": "info", "live": "direct", "manual_refresh": "actualisation manuelle", "model_salience": "saillance modèle", "notable": "notable", "reconnecting…": "reconnexion…"},
-    es: {"Abstract": "Resumen", "Action failed": "Acción fallida", "Action items": "Acciones", "Active event-driven monitors": "Monitores por eventos activos", "Active triggers": "Disparadores activos", "Artifacts": "Artefactos", "Buffer dropped": "Buffer perdido", "Calibrated at": "Calibrado el", "Calibration health": "Estado de calibración", "Channels that have never been calibrated or whose calibration has expired are shown first.": "Los canales nunca calibrados o con calibración vencida se muestran primero.", "Context map": "Mapa de contexto", "Coverage": "Cobertura", "Coverage · storyline · severity": "Cobertura · relato · severidad", "Days since": "Días desde", "Debounced": "Antirrebote", "Decisions": "Decisiones", "Decisions and actions": "Decisiones y acciones", "Domain": "Dominio", "Entities": "Entidades", "Entities and follow-ups": "Entidades y seguimientos", "Executive brief": "Resumen ejecutivo", "Failed to load view": "Error al cargar", "File": "Archivo", "File artifacts": "Archivos", "Findings": "Hallazgos", "Insight count by severity.": "Recuento de hallazgos por severidad.", "Insights": "Ideas", "Key observations": "Observaciones clave", "Language": "Idioma", "Latest observation results": "Últimos resultados de observación", "Live signal stream": "Flujo de señales en vivo", "Loading…": "cargando…", "Name": "Nombre", "Next prompts": "Siguientes prompts", "Next recal due": "Próxima recalibración", "No content yet.": "Sin contenido.", "No entries.": "Sin entradas.", "Note": "Nota", "Observation": "Observación", "Observation status": "Estado de observación", "Observed context": "Contexto observado", "Open questions": "Preguntas abiertas", "Operating agenda": "Agenda operativa", "Overview": "Resumen", "Per-channel calibration state, freshness, and residual correction": "Estado de calibración, vigencia y corrección residual por canal", "Reason": "Motivo", "Recent events (last 50)": "Eventos recientes (últimos 50)", "Recent findings": "Hallazgos recientes", "Refresh reason": "Motivo", "Refresh state": "Estado", "Residual": "Residuo", "Session": "Sesión", "Session Analysis": "Análisis de sesión", "Session file artifacts.": "Artefactos de archivos de sesión.", "Severity mix": "Mezcla de severidad", "Signal flow": "Flujo de señales", "Signals": "Señales", "State": "Estado", "Status": "Estado", "Storyline": "Narrativa", "Subscribers": "Suscriptores", "Suggested next prompts": "Siguientes preguntas", "Timeline": "Cronología", "Tokens": "Tokens", "Trigger": "Disparador", "Trigger and context": "Disparador y contexto", "Turns": "Turnos", "Watch": "Vigilancia", "Watches": "Vigilancias", "alert": "alerta", "artifact_changed": "artefacto cambiado", "batch_tokens": "umbral de tokens", "batch_turns": "umbral de turnos", "connecting…": "conectando…", "first_observation": "primera observación", "info": "info", "live": "en vivo", "manual_refresh": "actualización manual", "model_salience": "relevancia del modelo", "notable": "relevante", "reconnecting…": "reconectando…"},
-    ar: {"Abstract": "ملخص", "Action failed": "فشل الإجراء", "Action items": "إجراءات", "Active event-driven monitors": "مراقبات حدثية نشطة", "Active triggers": "المُشغِّلات النشطة", "Artifacts": "المخرجات", "Buffer dropped": "ذاكرة مؤقتة مُسقَطة", "Calibrated at": "تاريخ المعايرة", "Calibration health": "سلامة المعايرة", "Channels that have never been calibrated or whose calibration has expired are shown first.": "تظهر أولاً القنوات التي لم تُعاير قط أو التي انتهت صلاحية معايرتها.", "Context map": "خريطة السياق", "Coverage": "التغطية", "Coverage · storyline · severity": "التغطية · السرد · الخطورة", "Days since": "الأيام المنقضية", "Debounced": "مُزال الارتداد", "Decisions": "قرارات", "Decisions and actions": "القرارات والإجراءات", "Domain": "المجال", "Entities": "كيانات", "Entities and follow-ups": "الكيانات والمتابعات", "Executive brief": "ملخص تنفيذي", "Failed to load view": "فشل تحميل العرض", "File": "ملف", "File artifacts": "ملفات", "Findings": "النتائج", "Insight count by severity.": "عدد الرؤى حسب الخطورة.", "Insights": "الرؤى", "Key observations": "ملاحظات رئيسية", "Language": "اللغة", "Latest observation results": "أحدث نتائج الرصد", "Live signal stream": "تدفق الإشارات المباشر", "Loading…": "جارٍ التحميل…", "Name": "الاسم", "Next prompts": "المطالبات التالية", "Next recal due": "موعد إعادة المعايرة", "No content yet.": "لا يوجد محتوى بعد.", "No entries.": "لا توجد إدخالات.", "Note": "ملاحظة", "Observation": "الرصد", "Observation status": "حالة المراقبة", "Observed context": "السياق المرصود", "Open questions": "أسئلة مفتوحة", "Operating agenda": "خطة العمل", "Overview": "نظرة عامة", "Per-channel calibration state, freshness, and residual correction": "حالة المعايرة وحداثتها وتصحيح المتبقي لكل قناة", "Reason": "السبب", "Recent events (last 50)": "الأحداث الأخيرة (آخر 50)", "Recent findings": "أحدث النتائج", "Refresh reason": "سبب التحديث", "Refresh state": "حالة التحديث", "Residual": "المتبقي", "Session": "الجلسة", "Session Analysis": "تحليل الجلسة", "Session file artifacts.": "مخرجات ملفات الجلسة.", "Severity mix": "توزيع الشدة", "Signal flow": "تدفق الإشارات", "Signals": "الإشارات", "State": "الحالة", "Status": "الحالة", "Storyline": "السرد", "Subscribers": "المشتركون", "Suggested next prompts": "أسئلة مقترحة", "Timeline": "الخط الزمني", "Tokens": "الرموز", "Trigger": "المُشغِّل", "Trigger and context": "المُشغِّل والسياق", "Turns": "الأدوار", "Watch": "مراقبة", "Watches": "المراقبات", "alert": "تنبيه", "artifact_changed": "تغير ملف", "batch_tokens": "حد الرموز", "batch_turns": "حد الجولات", "connecting…": "جارٍ الاتصال…", "first_observation": "أول مراقبة", "info": "معلومة", "live": "مباشر", "manual_refresh": "تحديث يدوي", "model_salience": "أهمية النموذج", "notable": "مهم", "reconnecting…": "إعادة الاتصال…"},
-    ru: {"Abstract": "Аннотация", "Action failed": "Действие не выполнено", "Action items": "Действия", "Active event-driven monitors": "Активные событийные мониторы", "Active triggers": "Активные триггеры", "Artifacts": "Артефакты", "Buffer dropped": "Потери буфера", "Calibrated at": "Калиброван", "Calibration health": "Состояние калибровки", "Channels that have never been calibrated or whose calibration has expired are shown first.": "Каналы, которые никогда не калибровались или чья калибровка истекла, показаны первыми.", "Context map": "Карта контекста", "Coverage": "Покрытие", "Coverage · storyline · severity": "Покрытие · сюжет · важность", "Days since": "Дней с тех пор", "Debounced": "Дебаунс", "Decisions": "Решения", "Decisions and actions": "Решения и действия", "Domain": "Домен", "Entities": "Сущности", "Entities and follow-ups": "Сущности и продолжения", "Executive brief": "Краткий обзор", "Failed to load view": "Не удалось загрузить", "File": "Файл", "File artifacts": "Файлы", "Findings": "Находки", "Insight count by severity.": "Число инсайтов по важности.", "Insights": "Инсайты", "Key observations": "Ключевые наблюдения", "Language": "Язык", "Latest observation results": "Последние результаты наблюдений", "Live signal stream": "Поток сигналов (live)", "Loading…": "загрузка…", "Name": "Имя", "Next prompts": "Следующие запросы", "Next recal due": "Следующая рекалибровка", "No content yet.": "Пока нет данных.", "No entries.": "Нет записей.", "Note": "Заметка", "Observation": "Наблюдение", "Observation status": "Статус наблюдения", "Observed context": "Наблюдаемый контекст", "Open questions": "Открытые вопросы", "Operating agenda": "Рабочая повестка", "Overview": "Обзор", "Per-channel calibration state, freshness, and residual correction": "Состояние калибровки, актуальность и остаточная поправка по каналам", "Reason": "Причина", "Recent events (last 50)": "Последние события (50)", "Recent findings": "Последние находки", "Refresh reason": "Причина", "Refresh state": "Состояние", "Residual": "Остаток", "Session": "Сессия", "Session Analysis": "Анализ сессии", "Session file artifacts.": "Файловые артефакты сессии.", "Severity mix": "Структура важности", "Signal flow": "Поток сигналов", "Signals": "Сигналы", "State": "Состояние", "Status": "Статус", "Storyline": "Сюжет", "Subscribers": "Подписчики", "Suggested next prompts": "Следующие запросы", "Timeline": "Хронология", "Tokens": "Токены", "Trigger": "Триггер", "Trigger and context": "Триггер и контекст", "Turns": "Ходы", "Watch": "Наблюдение", "Watches": "Наблюдения", "alert": "тревога", "artifact_changed": "файл изменён", "batch_tokens": "порог токенов", "batch_turns": "порог ходов", "connecting…": "подключение…", "first_observation": "первое наблюдение", "info": "инфо", "live": "онлайн", "manual_refresh": "ручное обновление", "model_salience": "значимость модели", "notable": "важно", "reconnecting…": "переподключение…"}
+    en: {"preview.profile": "Preview quality", "preview.economy": "Economy", "preview.balanced": "Balanced", "preview.detail": "Detail", "preview.one_sample": "One level sample captured. Choose session allow for a live waveform.", "preview.one_frame": "One frame captured. Choose session allow for a live preview.", "preview.level_waveform": "Live microphone level waveform",  "Every change is previewed first, then requires approval": "Every change is previewed first, then requires approval", "approval.allow_once": "Allow once", "approval.allow_session": "Allow for this session", "approval.allow_all_session": "Allow all this session", "approval.allow_always": "Always allow", "approval.allow": "Allow", "approval.deny": "Deny", "approval.deny_always": "Always deny", "approval.cancel_workflow": "Cancel the workflow", "Admission decisions": "Admission decisions", "Attached devices": "Attached devices", "Class": "Class", "Connection": "Connection", "Controls": "Controls", "Declaration": "Declaration", "Declared by": "Declared by", "Declared limits": "Declared limits", "Detail": "Detail", "Device unavailable": "Device unavailable", "Events": "Events", "Field": "Field", "History": "History", "Hz": "Hz", "Other devices": "Other devices", "Preview": "Preview", "Previewable": "Previewable", "Privacy": "Privacy", "Quality": "Quality", "Rule": "Rule", "Sampled": "Sampled", "Shape": "Shape", "Trend": "Trend", "Unit": "Unit", "Latest sampled value against the declared limits": "Latest sampled value against the declared limits", "Downsampled windows per channel, newest on the right": "Downsampled windows per channel, newest on the right", "Every change is previewed first, then requires approval where your session is authenticated": "Every change is previewed first, then requires approval where your session is authenticated", "Grouped by declared class · select a device for live channels, preview and controls": "Grouped by declared class · select a device for live channels, preview and controls", "Pulled on demand at the declared ceiling · never sampled into stored history": "Pulled on demand at the declared ceiling · never sampled into stored history", "Rejected declarations are unusable; demoted ones remain readable.": "Rejected declarations are unusable; demoted ones remain readable.", "Select a row to open the device. An unverified declaration has its writable channels demoted to read-only.": "Select a row to open the device. An unverified declaration has its writable channels demoted to read-only.", "Why a device or channel is not what its declaration asked for": "Why a device or channel is not what its declaration asked for", "Where this device's knowledge came from, and who is accountable for it": "Where this device's knowledge came from, and who is accountable for it", "An unverified declaration keeps its readable channels and loses its writable ones.": "An unverified declaration keeps its readable channels and loses its writable ones.", "'not sampled' means no loop reads this channel, so it has no current value anyone measured.": "'not sampled' means no loop reads this channel, so it has no current value anyone measured.", "ceiling": "ceiling", "consent required": "consent required", "Not streaming.": "Not streaming.", "Start preview": "Start preview", "Stop preview": "Stop preview", "Requesting access…": "Requesting access…", "Preview unavailable": "Preview unavailable", "Preview stream ended.": "Preview stream ended.", "Streaming.": "Streaming.", "Control": "Control", "limits": "limits", "reversible": "reversible", "irreversible": "irreversible", "Preview change": "Preview change", "Request approval": "Request approval", "Checking…": "Checking…", "Requesting approval…": "Requesting approval…", "No response.": "No response.", "Approval is given where your session is authenticated (TUI or leap hw).": "Approval is given where your session is authenticated (TUI or leap hw).", "Approval required": "Approval required", "Answer this where your session is authenticated (TUI or leap hw).": "Answer this where your session is authenticated (TUI or leap hw).", "Distribution": "Distribution", "manual_refresh": "manual refresh", "first_observation": "first observation", "artifact_changed": "artifact changed", "batch_turns": "turn threshold", "batch_tokens": "token threshold", "model_salience": "model salience", "text_only": "conversation text", "text_and_artifacts": "conversation + files", "partial_artifacts": "partial files" },
+    zh: {"preview.profile": "预览质量", "preview.economy": "省资源", "preview.balanced": "平衡", "preview.detail": "高画质", "preview.one_sample": "已获取一次电平。选择“本会话内允许”即可显示实时波形。", "preview.one_frame": "已获取一帧。选择“本会话内允许”即可开始实时预览。", "preview.level_waveform": "实时麦克风电平波形", "Every change is previewed first, then requires approval": "每次变更先预览，然后需要审批", "approval.allow_once": "仅本次允许", "approval.allow_session": "本会话内允许", "approval.allow_all_session": "本会话内全部允许", "approval.allow_always": "始终允许", "approval.allow": "允许", "approval.deny": "拒绝", "approval.deny_always": "始终拒绝", "approval.cancel_workflow": "取消整个流程", "Admission decisions": "准入决定", "Attached devices": "已连接设备", "Class": "类别", "Connection": "连接", "Controls": "控制", "Declaration": "声明", "Declared by": "声明来源", "Declared limits": "声明限值", "Detail": "详情", "Device unavailable": "设备不可用", "Events": "事件", "Field": "字段", "History": "历史", "Hz": "赫兹", "Other devices": "其他设备", "Preview": "预览", "Previewable": "可预览", "Privacy": "隐私", "Quality": "质量", "Rule": "规则", "Sampled": "已采样", "Shape": "形态", "Trend": "趋势", "Unit": "单位", "Latest sampled value against the declared limits": "最新采样值与声明限值对比", "Downsampled windows per channel, newest on the right": "每通道的降采样窗口，最新在右", "Every change is previewed first, then requires approval where your session is authenticated": "每次变更先预览，再在已认证的会话中审批", "Grouped by declared class · select a device for live channels, preview and controls": "按声明类别分组 · 选择设备查看实时通道、预览与控制", "Pulled on demand at the declared ceiling · never sampled into stored history": "按需拉取，不超过声明上限 · 从不写入历史存储", "Rejected declarations are unusable; demoted ones remain readable.": "被拒绝的声明不可用；被降级的仍可读取。", "Select a row to open the device. An unverified declaration has its writable channels demoted to read-only.": "选择一行打开设备。未经确认的声明其可写通道被降级为只读。", "Why a device or channel is not what its declaration asked for": "设备或通道为何与其声明不一致", "Where this device's knowledge came from, and who is accountable for it": "该设备知识的来源，以及谁为其负责", "An unverified declaration keeps its readable channels and loses its writable ones.": "未经确认的声明保留可读通道，失去可写通道。", "'not sampled' means no loop reads this channel, so it has no current value anyone measured.": "“未采样”表示没有循环读取该通道，因此没有任何人测得的当前值。", "ceiling": "上限", "consent required": "需要授权", "Not streaming.": "未在传输。", "Start preview": "开始预览", "Stop preview": "停止预览", "Requesting access…": "正在请求访问…", "Preview unavailable": "预览不可用", "Preview stream ended.": "预览流已结束。", "Streaming.": "正在传输。", "Control": "控制", "limits": "限值", "reversible": "可逆", "irreversible": "不可逆", "Preview change": "预览变更", "Request approval": "申请审批", "Checking…": "正在检查…", "Requesting approval…": "正在申请审批…", "No response.": "无响应。", "Approval is given where your session is authenticated (TUI or leap hw).": "审批需在已认证的会话中完成（TUI 或 leap hw）。", "Approval required": "需要审批", "Answer this where your session is authenticated (TUI or leap hw).": "请在已认证的会话中回应（TUI 或 leap hw）。", "Distribution": "分布", "Abstract": "摘要", "Action failed": "操作失败", "Action items": "行动项", "Active event-driven monitors": "活跃的事件驱动监视器", "Active triggers": "活跃触发器", "Active watches": "活跃观察", "Artifacts": "副产物", "Buffer dropped": "缓冲丢弃", "Calibrated at": "校准时间", "Calibration health": "校准健康度", "Candlestick": "K线", "Channels that have never been calibrated or whose calibration has expired are shown first.": "从未校准或校准已过期的通道排在最前。", "Context map": "上下文图谱", "Coverage": "覆盖率", "Coverage · storyline · severity": "覆盖率 · 叙事 · 严重度", "Custom": "自定义", "Days since": "距今天数", "Debounced": "去抖", "Decisions": "决策", "Decisions and actions": "决策与行动", "Domain": "领域", "Entities": "实体", "Entities and follow-ups": "实体与后续", "Evidence stream": "证据流", "Executive brief": "执行摘要", "Extracted from this session's tool/file output (not model-generated).": "数据来自本次会话的工具/文件产物（非模型生成）。", "Failed to load view": "视图加载失败", "File": "文件", "File artifacts": "文件副产物", "Findings": "发现", "Gauge": "仪表", "Insight count by severity.": "按严重度统计的洞察数。", "Insights": "洞察", "Key observations": "关键观察", "Language": "语言", "Latest observation results": "最新观测结果", "Latest sentiment": "最新情绪", "Live signal stream": "实时信号流", "Loading…": "加载中…", "Market brief": "市场简报", "Mentions": "提及", "Name": "名称", "Narrative pulse": "叙事脉搏", "New papers": "新论文", "Next prompts": "后续追问", "Next recal due": "下次校准期限", "No content yet.": "暂无内容。", "No entries.": "暂无条目。", "Note": "说明", "Observation": "观察", "Observation status": "观察状态", "Observed context": "已观察上下文", "Open questions": "待回答问题", "Operating agenda": "行动议程", "Overview": "概览", "Per-channel calibration state, freshness, and residual correction": "各通道的校准状态、时效性与残差校正", "Price action": "价格行为", "Reason": "原因", "Recent events (last 50)": "最近事件（最新50条）", "Recent findings": "最新发现", "Refresh cadence": "刷新节奏", "Refresh reason": "刷新原因", "Refresh state": "刷新状态", "Research pipeline": "研究管线", "Residual": "残差", "Sentiment structure": "情绪结构", "Series": "序列", "Session": "会话", "Session Analysis": "会话分析", "Session file artifacts.": "会话文件副产物。", "Severity mix": "严重度结构", "Signal flow": "信号流", "Signal mix": "信号结构", "Signals": "信号", "State": "状态", "Status": "状态", "Storyline": "叙事线", "Subscribers": "订阅者", "Suggested next prompts": "建议追问", "Timeline": "时间线", "Tokens": "词元", "Trigger": "触发器", "Trigger and context": "触发与上下文", "Turns": "轮次", "Watch": "观察", "Watch portfolio": "观察组合", "Watches": "观察任务", "alert": "警报", "artifact_changed": "文件副产物变化", "batch_tokens": "上下文阈值", "batch_turns": "轮次阈值", "connecting…": "连接中…", "first_observation": "首次观察", "info": "信息", "live": "实时", "manual_refresh": "手动刷新", "model_salience": "模型显著性", "notable": "重要", "reconnecting…": "重连中…", "unknown": "未知"},
+    fr: {"preview.profile": "Qualité de l’aperçu", "preview.economy": "Économie", "preview.balanced": "Équilibré", "preview.detail": "Détail", "preview.one_sample": "Un niveau a été capturé. Autorisez la session pour la forme d’onde en direct.", "preview.one_frame": "Une image a été capturée. Autorisez la session pour l’aperçu en direct.", "preview.level_waveform": "Forme d’onde du niveau de microphone en direct", "Every change is previewed first, then requires approval": "Chaque changement est d'abord prévisualisé, puis approuvé", "approval.allow_once": "Autoriser une fois", "approval.allow_session": "Autoriser pour la session", "approval.allow_all_session": "Tout autoriser pour la session", "approval.allow_always": "Toujours autoriser", "approval.allow": "Autoriser", "approval.deny": "Refuser", "approval.deny_always": "Toujours refuser", "approval.cancel_workflow": "Annuler le flux", "Admission decisions": "Décisions d'admission", "Attached devices": "Appareils connectés", "Class": "Classe", "Connection": "Connexion", "Controls": "Contrôles", "Declaration": "Déclaration", "Declared by": "Déclaré par", "Declared limits": "Limites déclarées", "Detail": "Détail", "Device unavailable": "Appareil indisponible", "Events": "Événements", "Field": "Champ", "History": "Historique", "Hz": "Hz", "Other devices": "Autres appareils", "Preview": "Aperçu", "Previewable": "Prévisualisable", "Privacy": "Confidentialité", "Quality": "Qualité", "Rule": "Règle", "Sampled": "Échantillonné", "Shape": "Forme", "Trend": "Tendance", "Unit": "Unité", "Latest sampled value against the declared limits": "Dernière valeur échantillonnée face aux limites déclarées", "Downsampled windows per channel, newest on the right": "Fenêtres sous-échantillonnées par canal, la plus récente à droite", "Every change is previewed first, then requires approval where your session is authenticated": "Chaque changement est d'abord prévisualisé, puis approuvé là où votre session est authentifiée", "Grouped by declared class · select a device for live channels, preview and controls": "Groupés par classe déclarée · sélectionnez un appareil pour les canaux en direct, l'aperçu et les contrôles", "Pulled on demand at the declared ceiling · never sampled into stored history": "Récupéré à la demande dans la limite déclarée · jamais échantillonné dans l'historique", "Rejected declarations are unusable; demoted ones remain readable.": "Les déclarations rejetées sont inutilisables ; celles rétrogradées restent lisibles.", "Select a row to open the device. An unverified declaration has its writable channels demoted to read-only.": "Sélectionnez une ligne pour ouvrir l'appareil. Une déclaration non vérifiée voit ses canaux inscriptibles rétrogradés en lecture seule.", "Why a device or channel is not what its declaration asked for": "Pourquoi un appareil ou un canal n'est pas ce que sa déclaration demandait", "Where this device's knowledge came from, and who is accountable for it": "D'où vient la connaissance de cet appareil et qui en est responsable", "An unverified declaration keeps its readable channels and loses its writable ones.": "Une déclaration non vérifiée conserve ses canaux lisibles et perd ceux inscriptibles.", "'not sampled' means no loop reads this channel, so it has no current value anyone measured.": "« non échantillonné » signifie qu'aucune boucle ne lit ce canal : il n'a donc aucune valeur actuelle mesurée.", "ceiling": "plafond", "consent required": "consentement requis", "Not streaming.": "Pas de flux.", "Start preview": "Démarrer l'aperçu", "Stop preview": "Arrêter l'aperçu", "Requesting access…": "Demande d'accès…", "Preview unavailable": "Aperçu indisponible", "Preview stream ended.": "Le flux d'aperçu s'est arrêté.", "Streaming.": "Diffusion en cours.", "Control": "Contrôle", "limits": "limites", "reversible": "réversible", "irreversible": "irréversible", "Preview change": "Prévisualiser le changement", "Request approval": "Demander l'approbation", "Checking…": "Vérification…", "Requesting approval…": "Demande d'approbation…", "No response.": "Aucune réponse.", "Approval is given where your session is authenticated (TUI or leap hw).": "L'approbation se donne là où votre session est authentifiée (TUI ou leap hw).", "Approval required": "Approbation requise", "Answer this where your session is authenticated (TUI or leap hw).": "Répondez là où votre session est authentifiée (TUI ou leap hw).", "Distribution": "Distribution", "Abstract": "Résumé", "Action failed": "Action échouée", "Action items": "Actions", "Active event-driven monitors": "Moniteurs événementiels actifs", "Active triggers": "Déclencheurs actifs", "Artifacts": "Artefacts", "Buffer dropped": "Tampon perdu", "Calibrated at": "Calibré le", "Calibration health": "État de calibration", "Channels that have never been calibrated or whose calibration has expired are shown first.": "Les canaux jamais calibrés ou dont la calibration a expiré apparaissent en premier.", "Context map": "Carte de contexte", "Coverage": "Couverture", "Coverage · storyline · severity": "Couverture · récit · sévérité", "Days since": "Jours écoulés", "Debounced": "Antirebond", "Decisions": "Décisions", "Decisions and actions": "Décisions et actions", "Domain": "Domaine", "Entities": "Entités", "Entities and follow-ups": "Entités et suivis", "Executive brief": "Synthèse exécutive", "Failed to load view": "Échec du chargement", "File": "Fichier", "File artifacts": "Fichiers", "Findings": "Constats", "Insight count by severity.": "Nombre d’analyses par sévérité.", "Insights": "Analyses", "Key observations": "Observations clés", "Language": "Langue", "Latest observation results": "Derniers résultats d'observation", "Live signal stream": "Flux de signaux en direct", "Loading…": "chargement…", "Name": "Nom", "Next prompts": "Invites suivantes", "Next recal due": "Prochaine recalibration", "No content yet.": "Aucun contenu.", "No entries.": "Aucune entrée.", "Note": "Note", "Observation": "Observation", "Observation status": "Statut d’observation", "Observed context": "Contexte observé", "Open questions": "Questions ouvertes", "Operating agenda": "Programme d’action", "Overview": "Vue d’ensemble", "Per-channel calibration state, freshness, and residual correction": "État de calibration, fraîcheur et correction résiduelle par canal", "Reason": "Raison", "Recent events (last 50)": "Événements récents (50 derniers)", "Recent findings": "Constats récents", "Refresh reason": "Raison", "Refresh state": "État", "Residual": "Résidu", "Session": "Session", "Session Analysis": "Analyse de session", "Session file artifacts.": "Artefacts de fichiers de session.", "Severity mix": "Mix de sévérité", "Signal flow": "Flux de signaux", "Signals": "Signaux", "State": "État", "Status": "Statut", "Storyline": "Narratif", "Subscribers": "Abonnés", "Suggested next prompts": "Prochaines invites", "Timeline": "Chronologie", "Tokens": "Jetons", "Trigger": "Déclencheur", "Trigger and context": "Déclencheur et contexte", "Turns": "Tours", "Watch": "Veille", "Watches": "Veilles", "alert": "alerte", "artifact_changed": "artefact modifié", "batch_tokens": "seuil de jetons", "batch_turns": "seuil de tours", "connecting…": "connexion…", "first_observation": "première observation", "info": "info", "live": "direct", "manual_refresh": "actualisation manuelle", "model_salience": "saillance modèle", "notable": "notable", "reconnecting…": "reconnexion…"},
+    es: {"preview.profile": "Calidad de vista previa", "preview.economy": "Ahorro", "preview.balanced": "Equilibrado", "preview.detail": "Detalle", "preview.one_sample": "Se capturó una muestra de nivel. Permita la sesión para la forma de onda en vivo.", "preview.one_frame": "Se capturó un fotograma. Permita la sesión para la vista previa en vivo.", "preview.level_waveform": "Forma de onda del nivel de micrófono en vivo", "Every change is previewed first, then requires approval": "Cada cambio se previsualiza primero y luego requiere aprobación", "approval.allow_once": "Permitir una vez", "approval.allow_session": "Permitir en esta sesión", "approval.allow_all_session": "Permitir todo en la sesión", "approval.allow_always": "Permitir siempre", "approval.allow": "Permitir", "approval.deny": "Denegar", "approval.deny_always": "Denegar siempre", "approval.cancel_workflow": "Cancelar el flujo", "Admission decisions": "Decisiones de admisión", "Attached devices": "Dispositivos conectados", "Class": "Clase", "Connection": "Conexión", "Controls": "Controles", "Declaration": "Declaración", "Declared by": "Declarado por", "Declared limits": "Límites declarados", "Detail": "Detalle", "Device unavailable": "Dispositivo no disponible", "Events": "Eventos", "Field": "Campo", "History": "Historial", "Hz": "Hz", "Other devices": "Otros dispositivos", "Preview": "Vista previa", "Previewable": "Previsualizable", "Privacy": "Privacidad", "Quality": "Calidad", "Rule": "Regla", "Sampled": "Muestreado", "Shape": "Forma", "Trend": "Tendencia", "Unit": "Unidad", "Latest sampled value against the declared limits": "Último valor muestreado frente a los límites declarados", "Downsampled windows per channel, newest on the right": "Ventanas submuestreadas por canal, la más reciente a la derecha", "Every change is previewed first, then requires approval where your session is authenticated": "Cada cambio se previsualiza primero y luego requiere aprobación donde su sesión está autenticada", "Grouped by declared class · select a device for live channels, preview and controls": "Agrupados por clase declarada · seleccione un dispositivo para canales en vivo, vista previa y controles", "Pulled on demand at the declared ceiling · never sampled into stored history": "Obtenido a demanda dentro del techo declarado · nunca se muestrea en el historial", "Rejected declarations are unusable; demoted ones remain readable.": "Las declaraciones rechazadas son inutilizables; las degradadas siguen siendo legibles.", "Select a row to open the device. An unverified declaration has its writable channels demoted to read-only.": "Seleccione una fila para abrir el dispositivo. Una declaración no verificada tiene sus canales escribibles degradados a solo lectura.", "Why a device or channel is not what its declaration asked for": "Por qué un dispositivo o canal no es lo que pedía su declaración", "Where this device's knowledge came from, and who is accountable for it": "De dónde proviene el conocimiento de este dispositivo y quién responde por él", "An unverified declaration keeps its readable channels and loses its writable ones.": "Una declaración no verificada conserva sus canales legibles y pierde los escribibles.", "'not sampled' means no loop reads this channel, so it has no current value anyone measured.": "«no muestreado» significa que ningún bucle lee este canal, por lo que no tiene un valor actual medido.", "ceiling": "techo", "consent required": "se requiere consentimiento", "Not streaming.": "Sin transmisión.", "Start preview": "Iniciar vista previa", "Stop preview": "Detener vista previa", "Requesting access…": "Solicitando acceso…", "Preview unavailable": "Vista previa no disponible", "Preview stream ended.": "La transmisión de vista previa terminó.", "Streaming.": "Transmitiendo.", "Control": "Control", "limits": "límites", "reversible": "reversible", "irreversible": "irreversible", "Preview change": "Previsualizar cambio", "Request approval": "Solicitar aprobación", "Checking…": "Comprobando…", "Requesting approval…": "Solicitando aprobación…", "No response.": "Sin respuesta.", "Approval is given where your session is authenticated (TUI or leap hw).": "La aprobación se otorga donde su sesión está autenticada (TUI o leap hw).", "Approval required": "Se requiere aprobación", "Answer this where your session is authenticated (TUI or leap hw).": "Responda donde su sesión está autenticada (TUI o leap hw).", "Distribution": "Distribución", "Abstract": "Resumen", "Action failed": "Acción fallida", "Action items": "Acciones", "Active event-driven monitors": "Monitores por eventos activos", "Active triggers": "Disparadores activos", "Artifacts": "Artefactos", "Buffer dropped": "Buffer perdido", "Calibrated at": "Calibrado el", "Calibration health": "Estado de calibración", "Channels that have never been calibrated or whose calibration has expired are shown first.": "Los canales nunca calibrados o con calibración vencida se muestran primero.", "Context map": "Mapa de contexto", "Coverage": "Cobertura", "Coverage · storyline · severity": "Cobertura · relato · severidad", "Days since": "Días desde", "Debounced": "Antirrebote", "Decisions": "Decisiones", "Decisions and actions": "Decisiones y acciones", "Domain": "Dominio", "Entities": "Entidades", "Entities and follow-ups": "Entidades y seguimientos", "Executive brief": "Resumen ejecutivo", "Failed to load view": "Error al cargar", "File": "Archivo", "File artifacts": "Archivos", "Findings": "Hallazgos", "Insight count by severity.": "Recuento de hallazgos por severidad.", "Insights": "Ideas", "Key observations": "Observaciones clave", "Language": "Idioma", "Latest observation results": "Últimos resultados de observación", "Live signal stream": "Flujo de señales en vivo", "Loading…": "cargando…", "Name": "Nombre", "Next prompts": "Siguientes prompts", "Next recal due": "Próxima recalibración", "No content yet.": "Sin contenido.", "No entries.": "Sin entradas.", "Note": "Nota", "Observation": "Observación", "Observation status": "Estado de observación", "Observed context": "Contexto observado", "Open questions": "Preguntas abiertas", "Operating agenda": "Agenda operativa", "Overview": "Resumen", "Per-channel calibration state, freshness, and residual correction": "Estado de calibración, vigencia y corrección residual por canal", "Reason": "Motivo", "Recent events (last 50)": "Eventos recientes (últimos 50)", "Recent findings": "Hallazgos recientes", "Refresh reason": "Motivo", "Refresh state": "Estado", "Residual": "Residuo", "Session": "Sesión", "Session Analysis": "Análisis de sesión", "Session file artifacts.": "Artefactos de archivos de sesión.", "Severity mix": "Mezcla de severidad", "Signal flow": "Flujo de señales", "Signals": "Señales", "State": "Estado", "Status": "Estado", "Storyline": "Narrativa", "Subscribers": "Suscriptores", "Suggested next prompts": "Siguientes preguntas", "Timeline": "Cronología", "Tokens": "Tokens", "Trigger": "Disparador", "Trigger and context": "Disparador y contexto", "Turns": "Turnos", "Watch": "Vigilancia", "Watches": "Vigilancias", "alert": "alerta", "artifact_changed": "artefacto cambiado", "batch_tokens": "umbral de tokens", "batch_turns": "umbral de turnos", "connecting…": "conectando…", "first_observation": "primera observación", "info": "info", "live": "en vivo", "manual_refresh": "actualización manual", "model_salience": "relevancia del modelo", "notable": "relevante", "reconnecting…": "reconectando…"},
+    ar: {"preview.profile": "جودة المعاينة", "preview.economy": "اقتصادي", "preview.balanced": "متوازن", "preview.detail": "تفاصيل", "preview.one_sample": "تم التقاط عينة مستوى واحدة. اسمح للجلسة لعرض موجة مباشرة.", "preview.one_frame": "تم التقاط إطار واحد. اسمح للجلسة لمعاينة مباشرة.", "preview.level_waveform": "موجة مستوى الميكروفون المباشرة", "Every change is previewed first, then requires approval": "تُعاين كل تغيير أولاً ثم يتطلب موافقة", "approval.allow_once": "السماح مرة واحدة", "approval.allow_session": "السماح خلال الجلسة", "approval.allow_all_session": "السماح بالكل خلال الجلسة", "approval.allow_always": "السماح دائماً", "approval.allow": "السماح", "approval.deny": "رفض", "approval.deny_always": "الرفض دائماً", "approval.cancel_workflow": "إلغاء سير العمل", "Admission decisions": "قرارات القبول", "Attached devices": "الأجهزة المتصلة", "Class": "الفئة", "Connection": "الاتصال", "Controls": "أدوات التحكم", "Declaration": "الإعلان", "Declared by": "أُعلن بواسطة", "Declared limits": "الحدود المعلنة", "Detail": "التفاصيل", "Device unavailable": "الجهاز غير متاح", "Events": "الأحداث", "Field": "الحقل", "History": "السجل", "Hz": "هرتز", "Other devices": "أجهزة أخرى", "Preview": "معاينة", "Previewable": "قابل للمعاينة", "Privacy": "الخصوصية", "Quality": "الجودة", "Rule": "القاعدة", "Sampled": "تم أخذ العينات", "Shape": "الشكل", "Trend": "الاتجاه", "Unit": "الوحدة", "Latest sampled value against the declared limits": "أحدث قيمة مُقاسة مقابل الحدود المعلنة", "Downsampled windows per channel, newest on the right": "نوافذ مُخفّضة العينات لكل قناة، الأحدث على اليمين", "Every change is previewed first, then requires approval where your session is authenticated": "تُعاين كل تغيير أولاً ثم يتطلب موافقة حيث تكون جلستك موثّقة", "Grouped by declared class · select a device for live channels, preview and controls": "مُجمَّعة حسب الفئة المعلنة · اختر جهازاً لعرض القنوات الحيّة والمعاينة والتحكم", "Pulled on demand at the declared ceiling · never sampled into stored history": "يُسحب عند الطلب وفق الحد الأعلى المعلن · لا يُخزَّن في السجل", "Rejected declarations are unusable; demoted ones remain readable.": "الإعلانات المرفوضة غير قابلة للاستخدام؛ والمُخفَّضة تبقى قابلة للقراءة.", "Select a row to open the device. An unverified declaration has its writable channels demoted to read-only.": "اختر صفاً لفتح الجهاز. الإعلان غير المُتحقَّق منه تُخفَّض قنواته القابلة للكتابة إلى القراءة فقط.", "Why a device or channel is not what its declaration asked for": "لماذا لا يطابق الجهاز أو القناة ما طلبه إعلانه", "Where this device's knowledge came from, and who is accountable for it": "من أين جاءت معرفة هذا الجهاز ومن المسؤول عنها", "An unverified declaration keeps its readable channels and loses its writable ones.": "الإعلان غير المُتحقَّق منه يحتفظ بقنواته القابلة للقراءة ويفقد القابلة للكتابة.", "'not sampled' means no loop reads this channel, so it has no current value anyone measured.": "«لم تُقس» تعني أن لا حلقة تقرأ هذه القناة، فليست لها قيمة حالية قاسها أحد.", "ceiling": "الحد الأعلى", "consent required": "يتطلب موافقة", "Not streaming.": "لا يوجد بث.", "Start preview": "بدء المعاينة", "Stop preview": "إيقاف المعاينة", "Requesting access…": "جارٍ طلب الوصول…", "Preview unavailable": "المعاينة غير متاحة", "Preview stream ended.": "انتهى بث المعاينة.", "Streaming.": "جارٍ البث.", "Control": "تحكم", "limits": "الحدود", "reversible": "قابل للعكس", "irreversible": "غير قابل للعكس", "Preview change": "معاينة التغيير", "Request approval": "طلب الموافقة", "Checking…": "جارٍ التحقق…", "Requesting approval…": "جارٍ طلب الموافقة…", "No response.": "لا استجابة.", "Approval is given where your session is authenticated (TUI or leap hw).": "تُمنح الموافقة حيث تكون جلستك موثّقة (TUI أو leap hw).", "Approval required": "مطلوب موافقة", "Answer this where your session is authenticated (TUI or leap hw).": "أجب عن هذا حيث تكون جلستك موثّقة (TUI أو leap hw).", "Distribution": "التوزيع", "Abstract": "ملخص", "Action failed": "فشل الإجراء", "Action items": "إجراءات", "Active event-driven monitors": "مراقبات حدثية نشطة", "Active triggers": "المُشغِّلات النشطة", "Artifacts": "المخرجات", "Buffer dropped": "ذاكرة مؤقتة مُسقَطة", "Calibrated at": "تاريخ المعايرة", "Calibration health": "سلامة المعايرة", "Channels that have never been calibrated or whose calibration has expired are shown first.": "تظهر أولاً القنوات التي لم تُعاير قط أو التي انتهت صلاحية معايرتها.", "Context map": "خريطة السياق", "Coverage": "التغطية", "Coverage · storyline · severity": "التغطية · السرد · الخطورة", "Days since": "الأيام المنقضية", "Debounced": "مُزال الارتداد", "Decisions": "قرارات", "Decisions and actions": "القرارات والإجراءات", "Domain": "المجال", "Entities": "كيانات", "Entities and follow-ups": "الكيانات والمتابعات", "Executive brief": "ملخص تنفيذي", "Failed to load view": "فشل تحميل العرض", "File": "ملف", "File artifacts": "ملفات", "Findings": "النتائج", "Insight count by severity.": "عدد الرؤى حسب الخطورة.", "Insights": "الرؤى", "Key observations": "ملاحظات رئيسية", "Language": "اللغة", "Latest observation results": "أحدث نتائج الرصد", "Live signal stream": "تدفق الإشارات المباشر", "Loading…": "جارٍ التحميل…", "Name": "الاسم", "Next prompts": "المطالبات التالية", "Next recal due": "موعد إعادة المعايرة", "No content yet.": "لا يوجد محتوى بعد.", "No entries.": "لا توجد إدخالات.", "Note": "ملاحظة", "Observation": "الرصد", "Observation status": "حالة المراقبة", "Observed context": "السياق المرصود", "Open questions": "أسئلة مفتوحة", "Operating agenda": "خطة العمل", "Overview": "نظرة عامة", "Per-channel calibration state, freshness, and residual correction": "حالة المعايرة وحداثتها وتصحيح المتبقي لكل قناة", "Reason": "السبب", "Recent events (last 50)": "الأحداث الأخيرة (آخر 50)", "Recent findings": "أحدث النتائج", "Refresh reason": "سبب التحديث", "Refresh state": "حالة التحديث", "Residual": "المتبقي", "Session": "الجلسة", "Session Analysis": "تحليل الجلسة", "Session file artifacts.": "مخرجات ملفات الجلسة.", "Severity mix": "توزيع الشدة", "Signal flow": "تدفق الإشارات", "Signals": "الإشارات", "State": "الحالة", "Status": "الحالة", "Storyline": "السرد", "Subscribers": "المشتركون", "Suggested next prompts": "أسئلة مقترحة", "Timeline": "الخط الزمني", "Tokens": "الرموز", "Trigger": "المُشغِّل", "Trigger and context": "المُشغِّل والسياق", "Turns": "الأدوار", "Watch": "مراقبة", "Watches": "المراقبات", "alert": "تنبيه", "artifact_changed": "تغير ملف", "batch_tokens": "حد الرموز", "batch_turns": "حد الجولات", "connecting…": "جارٍ الاتصال…", "first_observation": "أول مراقبة", "info": "معلومة", "live": "مباشر", "manual_refresh": "تحديث يدوي", "model_salience": "أهمية النموذج", "notable": "مهم", "reconnecting…": "إعادة الاتصال…"},
+    ru: {"preview.profile": "Качество предпросмотра", "preview.economy": "Экономия", "preview.balanced": "Баланс", "preview.detail": "Детально", "preview.one_sample": "Получено одно измерение уровня. Разрешите на сеанс для живой волны.", "preview.one_frame": "Получен один кадр. Разрешите на сеанс для живого предпросмотра.", "preview.level_waveform": "Живая волна уровня микрофона", "Every change is previewed first, then requires approval": "Каждое изменение сначала предпросматривается, затем требует подтверждения", "approval.allow_once": "Разрешить один раз", "approval.allow_session": "Разрешить на сеанс", "approval.allow_all_session": "Разрешить всё на сеанс", "approval.allow_always": "Разрешать всегда", "approval.allow": "Разрешить", "approval.deny": "Отклонить", "approval.deny_always": "Отклонять всегда", "approval.cancel_workflow": "Отменить весь процесс", "Admission decisions": "Решения о допуске", "Attached devices": "Подключённые устройства", "Class": "Класс", "Connection": "Соединение", "Controls": "Управление", "Declaration": "Декларация", "Declared by": "Объявлено через", "Declared limits": "Заявленные пределы", "Detail": "Подробности", "Device unavailable": "Устройство недоступно", "Events": "События", "Field": "Поле", "History": "История", "Hz": "Гц", "Other devices": "Другие устройства", "Preview": "Предпросмотр", "Previewable": "Доступно для просмотра", "Privacy": "Приватность", "Quality": "Качество", "Rule": "Правило", "Sampled": "Опрашивается", "Shape": "Форма", "Trend": "Тренд", "Unit": "Единица", "Latest sampled value against the declared limits": "Последнее измеренное значение относительно заявленных пределов", "Downsampled windows per channel, newest on the right": "Прореженные окна по каналам, новейшее справа", "Every change is previewed first, then requires approval where your session is authenticated": "Каждое изменение сначала предпросматривается, затем требует подтверждения там, где сеанс аутентифицирован", "Grouped by declared class · select a device for live channels, preview and controls": "Сгруппировано по заявленному классу · выберите устройство для живых каналов, предпросмотра и управления", "Pulled on demand at the declared ceiling · never sampled into stored history": "Запрашивается по требованию в пределах заявленного лимита · никогда не пишется в историю", "Rejected declarations are unusable; demoted ones remain readable.": "Отклонённые декларации непригодны; понижённые остаются доступными для чтения.", "Select a row to open the device. An unverified declaration has its writable channels demoted to read-only.": "Выберите строку, чтобы открыть устройство. У непроверенной декларации записываемые каналы понижаются до чтения.", "Why a device or channel is not what its declaration asked for": "Почему устройство или канал не соответствует своей декларации", "Where this device's knowledge came from, and who is accountable for it": "Откуда взяты сведения об устройстве и кто за них отвечает", "An unverified declaration keeps its readable channels and loses its writable ones.": "Непроверенная декларация сохраняет читаемые каналы и теряет записываемые.", "'not sampled' means no loop reads this channel, so it has no current value anyone measured.": "«не опрашивается» означает, что канал не читает ни один цикл, поэтому измеренного текущего значения нет.", "ceiling": "лимит", "consent required": "требуется согласие", "Not streaming.": "Поток не идёт.", "Start preview": "Начать предпросмотр", "Stop preview": "Остановить предпросмотр", "Requesting access…": "Запрос доступа…", "Preview unavailable": "Предпросмотр недоступен", "Preview stream ended.": "Поток предпросмотра завершён.", "Streaming.": "Идёт поток.", "Control": "Управление", "limits": "пределы", "reversible": "обратимо", "irreversible": "необратимо", "Preview change": "Предпросмотр изменения", "Request approval": "Запросить подтверждение", "Checking…": "Проверка…", "Requesting approval…": "Запрос подтверждения…", "No response.": "Нет ответа.", "Approval is given where your session is authenticated (TUI or leap hw).": "Подтверждение даётся там, где сеанс аутентифицирован (TUI или leap hw).", "Approval required": "Требуется подтверждение", "Answer this where your session is authenticated (TUI or leap hw).": "Ответьте там, где сеанс аутентифицирован (TUI или leap hw).", "Distribution": "Распределение", "Abstract": "Аннотация", "Action failed": "Действие не выполнено", "Action items": "Действия", "Active event-driven monitors": "Активные событийные мониторы", "Active triggers": "Активные триггеры", "Artifacts": "Артефакты", "Buffer dropped": "Потери буфера", "Calibrated at": "Калиброван", "Calibration health": "Состояние калибровки", "Channels that have never been calibrated or whose calibration has expired are shown first.": "Каналы, которые никогда не калибровались или чья калибровка истекла, показаны первыми.", "Context map": "Карта контекста", "Coverage": "Покрытие", "Coverage · storyline · severity": "Покрытие · сюжет · важность", "Days since": "Дней с тех пор", "Debounced": "Дебаунс", "Decisions": "Решения", "Decisions and actions": "Решения и действия", "Domain": "Домен", "Entities": "Сущности", "Entities and follow-ups": "Сущности и продолжения", "Executive brief": "Краткий обзор", "Failed to load view": "Не удалось загрузить", "File": "Файл", "File artifacts": "Файлы", "Findings": "Находки", "Insight count by severity.": "Число инсайтов по важности.", "Insights": "Инсайты", "Key observations": "Ключевые наблюдения", "Language": "Язык", "Latest observation results": "Последние результаты наблюдений", "Live signal stream": "Поток сигналов (live)", "Loading…": "загрузка…", "Name": "Имя", "Next prompts": "Следующие запросы", "Next recal due": "Следующая рекалибровка", "No content yet.": "Пока нет данных.", "No entries.": "Нет записей.", "Note": "Заметка", "Observation": "Наблюдение", "Observation status": "Статус наблюдения", "Observed context": "Наблюдаемый контекст", "Open questions": "Открытые вопросы", "Operating agenda": "Рабочая повестка", "Overview": "Обзор", "Per-channel calibration state, freshness, and residual correction": "Состояние калибровки, актуальность и остаточная поправка по каналам", "Reason": "Причина", "Recent events (last 50)": "Последние события (50)", "Recent findings": "Последние находки", "Refresh reason": "Причина", "Refresh state": "Состояние", "Residual": "Остаток", "Session": "Сессия", "Session Analysis": "Анализ сессии", "Session file artifacts.": "Файловые артефакты сессии.", "Severity mix": "Структура важности", "Signal flow": "Поток сигналов", "Signals": "Сигналы", "State": "Состояние", "Status": "Статус", "Storyline": "Сюжет", "Subscribers": "Подписчики", "Suggested next prompts": "Следующие запросы", "Timeline": "Хронология", "Tokens": "Токены", "Trigger": "Триггер", "Trigger and context": "Триггер и контекст", "Turns": "Ходы", "Watch": "Наблюдение", "Watches": "Наблюдения", "alert": "тревога", "artifact_changed": "файл изменён", "batch_tokens": "порог токенов", "batch_turns": "порог ходов", "connecting…": "подключение…", "first_observation": "первое наблюдение", "info": "инфо", "live": "онлайн", "manual_refresh": "ручное обновление", "model_salience": "значимость модели", "notable": "важно", "reconnecting…": "переподключение…"}
   };
 
   const I18N_PATCH = {
@@ -332,7 +332,13 @@
       const a = el("a", name === active ? "active" : "");
       a.href = "#";
       a.textContent = name;
-      a.addEventListener("click", (ev) => { ev.preventDefault(); fetchView({ template: name }); });
+      a.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        // Choosing a lens clears any drilled-in target. ``current`` is merged rather
+        // than replaced by fetchView, so without this a device selected earlier would
+        // stay in the query string for every later view.
+        fetchView({ template: name, device: "", channel: "" });
+      });
       nav.appendChild(a);
     });
   }
@@ -356,7 +362,10 @@
   // nav actions are purely client-side (no server round-trip).
   function handleNav(action) {
     const p = action.params || {};
-    if (action.name === "openLink" && p.url) window.open(p.url, "_blank", "noopener");
+    if (action.name === "openLink" && p.url) { window.open(p.url, "_blank", "noopener"); return; }
+    // Drill-down into a target view. Routed through fetchView rather than a location
+    // change so the token stays out of history and the WebSocket is not torn down.
+    if (p.template) { fetchView({ template: p.template, device: p.device || "", channel: p.channel || "" }); }
   }
 
   function esc(s) {
@@ -663,17 +672,496 @@
   function renderTable(node) {
     const p = node.props || {}; const rows = asArray(p.data); const cols = asArray(p.columns);
     if (!rows.length) return el("div", "empty-inline", esc(t("No entries.")));
+    const buttons = asArray(p.row_buttons);
     const table = el("table", "data-table");
     if (p.caption) table.appendChild(tableCaption(p.caption));
     const head = document.createElement("thead"); const headRow = document.createElement("tr");
-    cols.forEach((c) => headRow.appendChild(el("th", null, esc(tx(c.label || c.key || c))))); head.appendChild(headRow); table.appendChild(head);
-    const body = document.createElement("tbody"); rows.forEach((row) => { const tr = document.createElement("tr"); cols.forEach((c) => { const v = row && row[c.key || c] != null ? row[c.key || c] : ""; tr.appendChild(el("td", null, esc(tx(v)))); }); body.appendChild(tr); }); table.appendChild(body); return table;
+    cols.forEach((c) => headRow.appendChild(el("th", null, esc(tx(c.label || c.key || c)))));
+    if (buttons.length) headRow.appendChild(el("th", "row-actions-head", ""));
+    head.appendChild(headRow); table.appendChild(head);
+    const body = document.createElement("tbody");
+    rows.forEach((row) => {
+      const tr = document.createElement("tr");
+      cols.forEach((c) => { const v = row && row[c.key || c] != null ? row[c.key || c] : ""; tr.appendChild(el("td", null, esc(tx(v)))); });
+      if (buttons.length) tr.appendChild(rowActionCell(buttons, row));
+      bindRowAction(tr, p.row_action, row);
+      body.appendChild(tr);
+    });
+    table.appendChild(body); return table;
+  }
+
+  // Explicit per-row buttons, because "select a row to open the device" is an instruction
+  // rather than an affordance: nothing about the row says it is clickable, and a row that
+  // could do two things (open it, preview it) cannot say which one a click means. The
+  // whole-row action stays as a shortcut for the primary one.
+  function rowActionCell(buttons, row) {
+    const cell = el("td", "row-actions");
+    buttons.forEach((spec) => {
+      // ``require`` names a column that must be truthy for this button to apply, so a
+      // Preview button appears only on devices that have something to preview. Deciding
+      // per row from the row's own data keeps the template free of device knowledge.
+      if (spec.require && !truthy(row[spec.require])) return;
+      const params = resolveRowParams(spec, row);
+      if (params === null) return;
+      const button = el("button", spec.variant === "primary" ? "row-action primary" : "row-action",
+                        esc(tx(spec.label || "")));
+      button.addEventListener("click", (ev) => {
+        ev.stopPropagation();  // a row click means "open"; this button means something else
+        postAction({ kind: spec.kind, name: spec.name || "", params: params });
+      });
+      cell.appendChild(button);
+    });
+    return cell;
+  }
+
+  // Merge a spec's static params with the columns it reads from this row. Returns null
+  // when a required column is missing, so the caller drops the action instead of firing
+  // it with an empty target -- which would navigate to a device page for no device.
+  function resolveRowParams(spec, row) {
+    const params = Object.assign({}, spec.params || {});
+    const fromRow = spec.param_from_row || {};
+    let complete = true;
+    Object.keys(fromRow).forEach((key) => {
+      const value = row[fromRow[key]];
+      if (value == null || value === "") { complete = false; return; }
+      params[key] = value;
+    });
+    return complete ? params : null;
+  }
+
+  // A per-row action, resolved against the row rather than the template. Rows are
+  // expanded here on the client, so a template cannot interpolate a row value into the
+  // action -- it names the column to read instead (`param_from_row`) and this fills it
+  // in. Without the mapping the action is dropped rather than fired with a missing
+  // target, which would navigate to an empty device page.
+  function bindRowAction(tr, spec, row) {
+    if (!spec || !spec.kind || !row) return;
+    const params = resolveRowParams(spec, row);
+    if (params === null) return;
+    tr.classList.add("row-actionable");
+    tr.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      postAction({ kind: spec.kind, name: spec.name || "", params: params });
+    });
   }
 
   function renderTimeline(node) {
     const items = asArray((node.props || {}).data); const d = el("div", "timeline");
     items.forEach((it) => { const row = el("div", "timeline-item sev-" + severityOf(it)); row.appendChild(el("div", "timeline-title", esc(it.title || ""))); if (it.summary) row.appendChild(el("div", "summary", esc(it.summary))); d.appendChild(row); });
     return d;
+  }
+
+  // ── Device panels: preview, level meter, controls ──
+  //
+  // The client holds no policy. Whether a preview may run is decided by the daemon's
+  // approval chain, so these panels ask and report the answer: a refusal arrives as a
+  // JSON body with a message that already names the next step, and is shown verbatim.
+  // Duplicating the rule here would create a second gate that could disagree with the
+  // one that actually enforces it.
+
+  function mediaUrl(path, props, options) {
+    const url = new URL(path, location.origin);
+    url.searchParams.set("token", TOKEN);
+    url.searchParams.set("device", props.device || "");
+    url.searchParams.set("channel", props.channel || "");
+    const request = options || {};
+    ["fps", "max_width", "quality"].forEach((key) => {
+      if (request[key]) url.searchParams.set(key, String(request[key]));
+    });
+    return url.toString();
+  }
+
+  const _CAMERA_PROFILES = [
+    { id: "economy", fps: 4, max_width: 640, quality: 60, label: "preview.economy" },
+    { id: "balanced", fps: 8, max_width: 960, quality: 75, label: "preview.balanced" },
+    { id: "detail", fps: 12, max_width: 1280, quality: 85, label: "preview.detail" },
+  ];
+
+  // The browser picks a profile, never an unbounded capture request. The values are
+  // clipped again by the daemon's PreviewBroker against both these published runtime caps
+  // and the channel's declaration, so editing a URL cannot turn the camera into a compute
+  // or bandwidth sink. A saved choice is per physical channel; selecting Detail for the
+  // desk camera must not silently make the built-in camera expensive too.
+  function cameraProfiles(props) {
+    const fpsCap = Math.max(0, Number(props.max_fps || 0));
+    const widthCap = Math.max(0, Number(props.max_width || 0));
+    const qualityCap = Math.max(0, Number(props.max_quality || 0));
+    return _CAMERA_PROFILES.map((profile) => ({
+      id: profile.id,
+      label: profile.label,
+      fps: fpsCap ? Math.min(profile.fps, fpsCap) : profile.fps,
+      max_width: widthCap ? Math.min(profile.max_width, widthCap) : profile.max_width,
+      quality: qualityCap ? Math.min(profile.quality, qualityCap) : profile.quality,
+    }));
+  }
+
+  function previewPreferenceKey(props) {
+    return "leapboard.preview." + String(props.device || "") + "." + String(props.channel || "");
+  }
+
+  function buildCameraSettings(props) {
+    const profiles = cameraProfiles(props);
+    const key = previewPreferenceKey(props);
+    let selected = "balanced";
+    try { selected = localStorage.getItem(key) || selected; } catch (_) {}
+    if (!profiles.some((profile) => profile.id === selected)) selected = "balanced";
+    const wrap = el("div", "preview-settings");
+    const label = el("label", "preview-profile-label", esc(t("preview.profile")));
+    const select = document.createElement("select");
+    select.className = "preview-profile";
+    profiles.forEach((profile) => {
+      const option = document.createElement("option");
+      option.value = profile.id;
+      option.textContent = tx(t(profile.label));
+      select.appendChild(option);
+    });
+    select.value = selected;
+    const summary = el("span", "preview-profile-summary");
+    function current() {
+      return profiles.find((profile) => profile.id === select.value) || profiles[0];
+    }
+    function refreshSummary() {
+      const profile = current();
+      summary.innerHTML = esc(profile.max_width + " px · " + profile.fps + " fps · JPEG " + profile.quality);
+    }
+    select.addEventListener("change", () => {
+      try { localStorage.setItem(key, select.value); } catch (_) {}
+      refreshSummary();
+      wrap.dispatchEvent(new CustomEvent("leap:preview-profile", { detail: current() }));
+    });
+    refreshSummary();
+    wrap.appendChild(label);
+    wrap.appendChild(select);
+    wrap.appendChild(summary);
+    return { dom: wrap, current: current };
+  }
+
+  function renderMediaPreview(node) {
+    const p = node.props || {};
+    const isLevel = String(p.kind || "") === "microphone";
+    const card = el("div", "card media-preview");
+    card.appendChild(el("div", "card-title", esc(tx(p.title || t("Preview")))));
+
+    const meta = [
+      isLevel ? p.unit || "dBFS" : p.media_type,
+      !isLevel && p.max_fps ? p.max_fps + " fps " + t("ceiling") : "",
+    ].filter(Boolean);
+    if (meta.length) card.appendChild(el("div", "kicker", esc(meta.join(" \u00b7 "))));
+    const settings = isLevel ? null : buildCameraSettings(p);
+    if (settings) card.appendChild(settings.dom);
+    if (truthy(p.consent_required)) {
+      const notice = el("div", "consent-notice");
+      notice.appendChild(el("span", "badge sev-notable", esc(t("consent required"))));
+      notice.appendChild(el("span", null, esc(tx(p.consent_reason || ""))));
+      card.appendChild(notice);
+    }
+
+    const stage = el("div", "media-stage");
+    const consentSlot = el("div", "media-consent");
+    const status = el("div", "media-status", esc(t("Not streaming.")));
+    const button = el("button", "media-toggle", esc(t("Start preview")));
+    let running = false;
+    let timer = null;
+    let stillUrl = "";
+
+    function stop() {
+      running = false;
+      if (timer) { clearInterval(timer); timer = null; }
+      if (stillUrl) { URL.revokeObjectURL(stillUrl); stillUrl = ""; }
+      // Clearing the src is what actually closes the HTTP response, which is what the
+      // server counts to release the preview lease and shut the device down. Removing
+      // the element alone would leave the request open until the browser collected it.
+      stage.innerHTML = "";
+      status.innerHTML = esc(t("Not streaming."));
+      button.innerHTML = esc(t("Start preview"));
+    }
+
+    // Claim the consent slot for the duration of a request, so a prompt this panel caused
+    // is rendered inside this panel. The decision returns with the request: ``allow_once``
+    // means exactly one still frame/sample, while the explicit session choice starts the
+    // continuous preview. That is what prevents the initial probe and the MJPEG stream
+    // from being two surprise approvals for what the person thought was one action.
+    async function withConsentSlot(work) {
+      let decision = "";
+      _consentSink = (approval) => {
+        consentSlot.innerHTML = "";
+        approval.addEventListener("leap:resolved", (event) => { decision = String(event.detail || ""); });
+        consentSlot.appendChild(approval);
+      };
+      try {
+        return { value: await work(), decision: decision };
+      } finally {
+        _consentSink = null;
+        consentSlot.innerHTML = "";
+      }
+    }
+
+    // A level channel is polled, not streamed: the value is a number, so there is no
+    // multipart response to hold open. Four samples a second makes a useful waveform; the
+    // ffmpeg reader emits 250ms RMS windows, and reads between windows are cached values
+    // rather than fresh device opens.
+    async function pollLevel(meter) {
+      let resp;
+      try {
+        resp = await fetch(mediaUrl("/api/media/level", p));
+      } catch (err) {
+        status.innerHTML = esc(t("Preview unavailable") + ": " + String(err));
+        return "stop";
+      }
+      let body = {};
+      try { body = await resp.json(); } catch (_) {}
+      if (!resp.ok) {
+        status.innerHTML = esc(body.error || body.code || "HTTP " + resp.status);
+        return body.code === "level_not_ready" ? "retry" : "stop";
+      }
+      meter.update(body.value, body.unit || p.unit);
+      status.innerHTML = esc(t("Streaming."));
+      return "ok";
+    }
+
+    async function start() {
+      status.innerHTML = esc(t("Requesting access…"));
+      if (isLevel) {
+        const meter = buildLevelMeter(p);
+        stage.innerHTML = "";
+        stage.appendChild(meter.dom);
+        const first = await withConsentSlot(() => pollLevel(meter));
+        if (first.value === "stop") { stage.innerHTML = ""; return; }
+        if (first.decision === "allow_once") {
+          status.innerHTML = esc(t("preview.one_sample"));
+          return;
+        }
+        running = true;
+        button.innerHTML = esc(t("Stop preview"));
+        timer = setInterval(async () => {
+          if (!running) return;
+          if ((await pollLevel(meter)) === "stop") stop();
+        }, 250);
+        return;
+      }
+      const profile = settings.current();
+      let probe;
+      try {
+        probe = await withConsentSlot(() => fetch(mediaUrl("/api/media/frame", p, profile)));
+      } catch (err) {
+        status.innerHTML = esc(t("Preview unavailable") + ": " + String(err));
+        return;
+      }
+      const resp = probe.value;
+      if (!resp.ok) {
+        let detail = "HTTP " + resp.status;
+        try { const body = await resp.json(); detail = body.error || body.code || detail; } catch (_) {}
+        status.innerHTML = esc(detail);
+        return;
+      }
+      const img = el("img", "media-frame");
+      img.alt = String(p.title || "preview");
+      stage.innerHTML = "";
+      stage.appendChild(img);
+      if (probe.decision === "allow_once") {
+        stillUrl = URL.createObjectURL(await resp.blob());
+        img.src = stillUrl;
+        status.innerHTML = esc(t("preview.one_frame"));
+        return;
+      }
+      running = true;
+      img.src = mediaUrl("/api/media/stream", p, profile);
+      img.addEventListener("error", () => {
+        if (running) status.innerHTML = esc(t("Preview stream ended."));
+      });
+      status.innerHTML = esc(t("Streaming."));
+      button.innerHTML = esc(t("Stop preview"));
+    }
+
+    button.addEventListener("click", (ev) => { ev.stopPropagation(); running ? stop() : start(); });
+    if (settings) {
+      settings.dom.addEventListener("leap:preview-profile", () => {
+        if (running || stillUrl) { stop(); start(); }
+      });
+    }
+    card.appendChild(stage);
+    card.appendChild(consentSlot);
+    card.appendChild(status);
+    card.appendChild(button);
+    if (truthy(p.autostart)) setTimeout(() => start(), 0);
+    return card;
+  }
+
+  // A live meter with an update handle, shared by the polled microphone preview and the
+  // declarative LevelMeter component. A narrow browser-local waveform is intentionally
+  // not persisted: it answers "what is the input doing now" without turning room audio
+  // into stored history.
+  function buildLevelMeter(props) {
+    const dom = el("div", "level-meter");
+    const track = el("div", "level-track");
+    const fill = el("span", "level-fill");
+    track.appendChild(fill);
+    const readout = el("div", "value", "\u2014");
+    const canvas = document.createElement("canvas");
+    canvas.className = "level-waveform";
+    canvas.setAttribute("aria-label", String(t("preview.level_waveform")));
+    dom.appendChild(track);
+    dom.appendChild(readout);
+    dom.appendChild(canvas);
+    const floor = Number(props && props.floor != null && props.floor !== "" ? props.floor : -60);
+    const samples = [];
+
+    function draw() {
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const width = Math.max(240, Math.floor(canvas.clientWidth || dom.clientWidth || 520));
+      const height = 72;
+      if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
+        canvas.width = width * dpr; canvas.height = height * dpr;
+        canvas.style.height = height + "px";
+      }
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      ctx.strokeStyle = "rgba(118, 124, 140, .25)";
+      ctx.lineWidth = 1;
+      [0.25, 0.5, 0.75].forEach((ratio) => { ctx.beginPath(); ctx.moveTo(0, height * ratio); ctx.lineTo(width, height * ratio); ctx.stroke(); });
+      if (!samples.length) return;
+      ctx.strokeStyle = "#b7332c";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      samples.forEach((level, index) => {
+        const ratio = Math.max(0, Math.min(1, (level - floor) / (0 - floor)));
+        const x = samples.length === 1 ? width : (index / (samples.length - 1)) * width;
+        const y = height - ratio * height;
+        if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    return {
+      dom: dom,
+      update: function (value, unit) {
+        const level = Number(value);
+        if (!Number.isFinite(level)) {
+          fill.style.width = "0%";
+          readout.innerHTML = esc("\u2014");
+          return;
+        }
+        const ratio = (level - floor) / (0 - floor);
+        fill.style.width = Math.max(0, Math.min(100, ratio * 100)) + "%";
+        readout.innerHTML = esc(level.toFixed(1) + " " + (unit || ""));
+        samples.push(level);
+        if (samples.length > 96) samples.splice(0, samples.length - 96);
+        requestAnimationFrame(draw);
+      },
+    };
+  }
+
+  function renderLevelMeter(node) {
+    const p = node.props || {};
+    const wrap = el("div", "level-meter-block");
+    if (p.label) wrap.appendChild(el("div", "label", esc(tx(p.label))));
+    const meter = buildLevelMeter(p);
+    meter.update(p.data != null ? p.data : p.value, p.unit);
+    wrap.appendChild(meter.dom);
+    return wrap;
+  }
+
+  // A control derived entirely from the channel's declared envelope: an enumerated
+  // domain is a select, a bounded numeric is a slider, anything else is a field. The
+  // submit path is deliberately two-step -- preview what would be sent, then request
+  // approval -- because the dry-run runs every feasibility check without touching the
+  // device, and confirming intent before an irreversible effect is cheap.
+  function renderControlForm(node) {
+    const p = node.props || {};
+    const form = el("div", "card control-form");
+    form.appendChild(el("div", "card-title", esc(tx(p.title || p.channel || t("Control")))));
+    const kicker = [p.effect, p.limits ? t("limits") + ": " + p.limits : "", truthy(p.reversible) ? t("reversible") : t("irreversible")].filter(Boolean);
+    form.appendChild(el("div", "kicker", esc(kicker.join(" \u00b7 "))));
+
+    const input = buildControlInput(p);
+    const row = el("div", "control-row");
+    row.appendChild(input);
+    if (p.unit) row.appendChild(el("span", "unit", esc(String(p.unit))));
+    form.appendChild(row);
+
+    const status = el("div", "control-status");
+    const preview = el("button", null, esc(t("Preview change")));
+    const submit = el("button", "primary", esc(t("Request approval")));
+
+    async function send(name, label) {
+      status.innerHTML = esc(label);
+      const result = await postAction({
+        kind: "rpc",
+        name: name,
+        params: { device: p.device || "", channel: p.channel || "", value: input.value },
+      });
+      if (!result) { status.innerHTML = esc(t("No response.")); return; }
+      const inner = result.result || result;
+      status.innerHTML = esc(inner.error || inner.detail || inner.message || JSON.stringify(inner));
+    }
+
+    preview.addEventListener("click", (ev) => { ev.stopPropagation(); send("hardware.configure_preview", t("Checking…")); });
+    submit.addEventListener("click", (ev) => { ev.stopPropagation(); send("hardware.request_write", t("Requesting approval…")); });
+
+    const actions = el("div", "control-actions");
+    actions.appendChild(preview);
+    actions.appendChild(submit);
+    form.appendChild(actions);
+    form.appendChild(status);
+    form.appendChild(el("div", "kicker", esc(t("Approval is given where your session is authenticated (TUI or leap hw)."))));
+    return form;
+  }
+
+  function buildControlInput(p) {
+    const options = asArray(p.options);
+    if (String(p.control) === "select" && options.length) {
+      const select = document.createElement("select");
+      options.forEach((option) => {
+        const item = document.createElement("option");
+        item.value = String(option); item.textContent = String(option);
+        select.appendChild(item);
+      });
+      return select;
+    }
+    const input = document.createElement("input");
+    if (String(p.control) === "slider") {
+      input.type = "range";
+      input.min = String(p.min_value); input.max = String(p.max_value);
+      if (p.step) input.step = String(p.step);
+      input.value = String(p.min_value);
+    } else {
+      input.type = "text";
+    }
+    return input;
+  }
+
+  function renderTabs(node) {
+    const p = node.props || {};
+    const wrap = el("div", "tabs");
+    const bar = el("div", "tab-bar");
+    const body = el("div", "tab-body");
+    const panes = (node.children || []).map((child) => renderNode(child));
+    panes.forEach((pane, index) => {
+      const label = ((node.children[index] || {}).props || {}).title || "Tab " + (index + 1);
+      const button = el("button", index === 0 ? "active" : "", esc(tx(label)));
+      button.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        Array.from(bar.children).forEach((b) => b.classList.remove("active"));
+        button.classList.add("active");
+        panes.forEach((other, i) => { other.style.display = i === index ? "" : "none"; });
+      });
+      bar.appendChild(button);
+      pane.style.display = index === 0 ? "" : "none";
+      body.appendChild(pane);
+    });
+    if (p.title) wrap.appendChild(el("div", "section-title", esc(tx(p.title))));
+    wrap.appendChild(bar);
+    wrap.appendChild(body);
+    return wrap;
+  }
+
+  function truthy(value) {
+    // Template interpolation renders every prop through a string, so a bound false
+    // arrives as "false" -- which is truthy in JS and would have shown a consent notice
+    // on every channel, including the ones that need none.
+    return value === true || value === "true" || value === 1 || value === "1";
   }
 
   const RENDERERS = {
@@ -727,6 +1215,29 @@
     InsightCard: renderFinding,
     Button: (n) => el("button", null, esc(tx((n.props || {}).label || (n.props || {}).text || "Action"))),
     FilterBar: (n) => el("div", "toolbar", ""),
+    // Device panels. First-class rather than Custom renderers: previewing and setting a
+    // peripheral is a core capability of the board, and every catalog type a shipped
+    // template references must have a renderer here or it degrades to a card printing
+    // its own type name (tests/test_dashboard_sdui.py enforces this).
+    MediaPreview: renderMediaPreview,
+    LevelMeter: renderLevelMeter,
+    Form: renderControlForm,
+    Tabs: renderTabs,
+    Tab: (n) => renderChildren(n, el("div", "tab-pane")),
+    Select: (n) => { const p = n.props || {}; const d = el("div", "control-row"); d.appendChild(buildControlInput({ control: "select", options: p.options || p.data })); return d; },
+    Slider: (n) => { const p = n.props || {}; const d = el("div", "control-row"); d.appendChild(buildControlInput({ control: "slider", min_value: p.min_value, max_value: p.max_value, step: p.step })); return d; },
+    LinkCard: (n) => { const p = n.props || {}; const d = el("div", "card link-card");
+      const a = el("a", null, esc(tx(p.title || p.url || "link"))); a.href = String(p.url || "#");
+      a.target = "_blank"; a.rel = "noopener noreferrer"; d.appendChild(a);
+      if (p.summary) d.appendChild(el("div", "summary", esc(tx(p.summary)))); return d; },
+    ApprovalPrompt: (n) => { const p = n.props || {}; const d = el("div", "card approval-prompt");
+      d.appendChild(el("div", "card-title", esc(tx(p.title || t("Approval required")))));
+      if (p.summary) d.appendChild(el("div", "summary", esc(tx(p.summary))));
+      // Deliberately not a decision button. A browser session is a weaker identity than
+      // the TUI process that holds the approval route, so this reports the pending
+      // request and says where to answer it.
+      d.appendChild(el("div", "kicker", esc(t("Answer this where your session is authenticated (TUI or leap hw).")))); return d; },
+    Heatmap: (n) => { const p = n.props || {}; return chartNode(renderChartBars(p.data, p.title || t("Distribution")), p); },
   };
 
   function renderFinding(node) {
@@ -781,6 +1292,7 @@
     ws.onmessage = (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
       if (msg.type === "monitor.finding") { toast(msg.payload || {}); fetchView(); }
+      else if (msg.type === "approval_request") { showApproval(msg.payload || {}); }
       else if (msg.type === "watch.state") { fetchView(); }
       else if (msg.type === "signal.stream") {
         // Append to local signal stream buffer (max 50)
@@ -794,6 +1306,76 @@
       }
       else if (msg.type === "view.replace" && msg.spec) { render(msg.spec); }
     };
+  }
+
+  // ── Approval prompts raised by this page's own requests ──
+  //
+  // The board answers only what it asked for: the prompt arrives because a Start preview
+  // click is still waiting on the daemon, and answering it completes that request. Every
+  // decision the card offers is one the *policy* allowed -- the choices come from the
+  // approval request, never from a list here -- and the answer goes back through
+  // ``approval.resolve``, so the grant and the audit record are the orchestrator's.
+  //
+  // Delivered **in place**: into the panel that is waiting, right under its button, so the
+  // question sits next to the thing it is about. A page-level modal was worse in both
+  // directions -- it covered the panel whose consent was being asked for, and when its
+  // stylesheet was stale it degraded into an unstyled block at the foot of the document,
+  // which is where the user found it.
+  let _consentSink = null;
+  const _approvalSeen = new Set();
+
+  function showApproval(approval) {
+    const pendingId = String(approval.pending_id || "");
+    if (!pendingId || _approvalSeen.has(pendingId)) return;
+    _approvalSeen.add(pendingId);
+    const card = buildApprovalCard(approval, pendingId);
+    if (_consentSink) { _consentSink(card); return; }
+    // Nothing claimed it -- an approval raised by something other than a panel on this
+    // page. Float it, because an unanchored prompt still has to be answerable.
+    const overlay = el("div", "approval-overlay");
+    card.classList.add("approval-floating");
+    overlay.appendChild(card);
+    card.addEventListener("leap:resolved", () => overlay.remove());
+    document.body.appendChild(overlay);
+  }
+
+  function buildApprovalCard(approval, pendingId) {
+    const display = approval.display || {};
+    const card = el("div", "approval-inline");
+    card.appendChild(el("div", "approval-title", esc(tx(display.title || t("Approval required")))));
+    if (display.summary) card.appendChild(el("div", "approval-summary", esc(String(display.summary))));
+    if (display.reason) card.appendChild(el("div", "approval-reason", esc(String(display.reason))));
+
+    const actions = el("div", "approval-actions");
+    // Offered verbatim, in the order the policy gave them, minus ``show_details``: this
+    // card already shows the title, the summary and the risk explanation, and
+    // ``_normalize_decision`` maps that choice to *deny* -- so rendering it would be a
+    // button labelled "show details" that silently refuses.
+    const policyOrder = ["allow_session", "allow_once", "deny", "deny_always"];
+    const choices = asArray(approval.choices)
+      .filter((choice) => String(choice) !== "show_details")
+      .sort((left, right) => policyOrder.indexOf(String(left)) - policyOrder.indexOf(String(right)));
+    (choices.length ? choices : ["allow_once", "deny"]).forEach((choice) => {
+      const label = t("approval." + choice);
+      const button = el(
+        "button",
+        String(choice) === "allow_session" ? "approval-choice primary" : "approval-choice",
+        esc(label === "approval." + choice ? String(choice) : label),
+      );
+      button.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        Array.from(actions.children).forEach((b) => { b.disabled = true; });
+        await postAction({
+          kind: "approval",
+          params: { pending_id: pendingId, decision: choice },
+        });
+        card.dispatchEvent(new CustomEvent("leap:resolved", { detail: String(choice) }));
+        card.remove();
+      });
+      actions.appendChild(button);
+    });
+    card.appendChild(actions);
+    return card;
   }
 
   function updateSignalTimeline(stream) {

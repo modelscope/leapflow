@@ -66,24 +66,18 @@ class YamlContextProvider:
         Verification is stored separately from the declaration on purpose: the
         person who confirms a context must not have to edit the file they are
         confirming, or the confirmation would be self-attested.
+
+        ``replace`` rather than a field-by-field rebuild: the hand-written copy
+        silently dropped every field added to ``HardwareContext`` after it, which
+        is a defect that only shows up as a missing value on a board.
         """
         verifier = self._verified.get(context.device_id, "")
         if not verifier or context.provenance.is_verified:
             return context
         from dataclasses import replace
 
-        return HardwareContext(
-            device_id=context.device_id,
-            hc_version=context.hc_version,
-            display_name=context.display_name,
-            transport=context.transport,
-            channels=context.channels,
-            interlocks=context.interlocks,
-            vendor=context.vendor,
-            model=context.model,
-            location=context.location,
-            halt_supported=context.halt_supported,
-            notes=context.notes,
+        return replace(
+            context,
             provenance=replace(context.provenance, verified_by=verifier),
         )
 

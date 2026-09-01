@@ -94,6 +94,55 @@ class Quality(str, Enum):
     SATURATED = "saturated"
 
 
+class Representation(str, Enum):
+    """Shape of the value a channel carries.
+
+    Declared, never inferred from the quantity string: guessing that a channel
+    named ``frame`` produces an image is exactly the substring reasoning this
+    protocol exists to avoid, and it would be wrong the first time somebody
+    declared a *frame rate*.
+
+    ``SCALAR`` and ``STATE`` already existed implicitly -- a numeric envelope
+    versus an enumerated one -- so they are named here rather than introduced.
+    ``FRAME`` is the new fact: the value is a reference to bytes held outside the
+    reading path, because a raw frame must never enter a ``Reading`` (they are
+    persisted as NDJSON) or a finding payload (byte-capped).
+    """
+
+    SCALAR = "scalar"
+    STATE = "state"
+    FRAME = "frame"
+
+    @classmethod
+    def media(cls) -> frozenset[str]:
+        """Return the representations whose value is a reference to bytes."""
+        return frozenset({cls.FRAME.value})
+
+
+class PrivacyTier(str, Enum):
+    """How much of the world a *read* of this channel discloses.
+
+    Orthogonal to ``HardwareEffect``, which classifies what a write changes. A
+    camera read has no physical effect and is still the most consequential
+    operation on the device, so effect class cannot express it and a separate
+    declared tier is the only honest place to put it.
+
+    ``ENVIRONMENT`` observes the space around the machine (camera, microphone).
+    ``PERSONAL`` observes the person using it (screen contents, location,
+    biometrics). Both require consent before the first read; ``NONE`` does not,
+    which is what keeps a CPU gauge free.
+    """
+
+    NONE = "none"
+    ENVIRONMENT = "environment"
+    PERSONAL = "personal"
+
+    @classmethod
+    def gated(cls) -> frozenset[str]:
+        """Return the tiers whose reads require consent before proceeding."""
+        return frozenset({cls.ENVIRONMENT.value, cls.PERSONAL.value})
+
+
 @dataclass(frozen=True)
 class ContextProvenance:
     """Provenance and verification state of one hardware context.
@@ -371,6 +420,11 @@ class Channel:
     ``sample_rate_hz > 0`` is the only switch that matters downstream: it decides
     whether this channel becomes a streaming signal source or stays a
     request/response tool call. No device-type enumeration is involved anywhere.
+
+    ``representation`` and ``privacy`` are declared facts about the value, not
+    about the vendor, so they belong here beside the unit and the envelope. Both
+    default to the pre-existing behaviour, which is what lets every declaration
+    written before they existed keep its exact meaning.
     """
 
     channel_id: str
@@ -382,6 +436,10 @@ class Channel:
     sample_rate_hz: float = 0.0
     verify_after_write: bool = False
     description: str = ""
+    representation: str = Representation.SCALAR.value
+    privacy: str = PrivacyTier.NONE.value
+    media_type: str = ""
+    """IANA type of a ``frame`` channel's bytes (e.g. ``image/jpeg``). Empty otherwise."""
 
     @property
     def is_writable(self) -> bool:
@@ -393,7 +451,35 @@ class Channel:
 
     @property
     def is_streaming(self) -> bool:
-        return self.sample_rate_hz > 0.0
+        """Return whether this channel is sampled on a schedule into stored history.
+
+        A declared rate is necessary but not sufficient: on a media channel the rate
+        is a *capture ceiling*, not a sampling cadence. Treating it as one would build
+        a loop that appends every frame to the raw NDJSON segment and asks the
+        downsampler for the mean of a JPEG. Deriving it here rather than at each
+        consumer means the stream builder, the digest counts and the reference
+        document cannot disagree about what streaming means.
+        """
+        return self.sample_rate_hz > 0.0 and not self.is_media
+
+    @property
+    def max_frame_rate_hz(self) -> float:
+        """Return the declared capture ceiling for a media channel, else 0.0.
+
+        Where the rate on a frame channel actually lives: a preview must not ask the
+        device for frames faster than its declaration says it can produce them.
+        """
+        return self.sample_rate_hz if self.is_media else 0.0
+
+    @property
+    def is_media(self) -> bool:
+        """Return whether reading this channel yields bytes rather than a value."""
+        return self.representation in Representation.media()
+
+    @property
+    def is_privacy_gated(self) -> bool:
+        """Return whether a read of this channel needs consent first."""
+        return self.privacy in PrivacyTier.gated()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -406,6 +492,9 @@ class Channel:
             "sample_rate_hz": self.sample_rate_hz,
             "verify_after_write": self.verify_after_write,
             "description": self.description,
+            "representation": self.representation,
+            "privacy": self.privacy,
+            "media_type": self.media_type,
         }
 
     @classmethod
@@ -420,6 +509,9 @@ class Channel:
             sample_rate_hz=_as_float(data.get("sample_rate_hz"), default=0.0) or 0.0,
             verify_after_write=bool(data.get("verify_after_write", False)),
             description=str(data.get("description") or ""),
+            representation=str(data.get("representation") or Representation.SCALAR.value),
+            privacy=str(data.get("privacy") or PrivacyTier.NONE.value),
+            media_type=str(data.get("media_type") or ""),
         )
 
     def without_write(self) -> "Channel":
@@ -433,6 +525,10 @@ class Channel:
         what the channel is *for*, and erasing it would make a demoted channel report
         an effect-class mismatch instead of the demotion that actually blocked it --
         sending whoever reads the error to the wrong place.
+
+        ``representation``/``privacy``/``media_type`` are carried through for the same
+        reason: a demotion revokes one capability, it does not reclassify the value.
+        Dropping the privacy tier here would silently ungate a demoted camera.
         """
         if not self.is_writable:
             return self
@@ -446,6 +542,9 @@ class Channel:
             sample_rate_hz=self.sample_rate_hz,
             verify_after_write=False,
             description=self.description,
+            representation=self.representation,
+            privacy=self.privacy,
+            media_type=self.media_type,
         )
 
 
@@ -540,6 +639,15 @@ class HardwareContext:
     halt_supported: bool = False
     notes: str = ""
     provenance: ContextProvenance = field(default_factory=ContextProvenance)
+    device_class: str = ""
+    """Free-form grouping label for presentation only -- never a behaviour switch.
+
+    Deliberately not an enum and deliberately not consulted by admission, risk
+    classification, or any transport: the moment a device *type* decides what is
+    permitted, every new peripheral needs a core edit and an unrecognised one gets
+    a wrong default. It exists so the board can group a fleet into compute,
+    camera, storage and sensor sections instead of one flat list.
+    """
 
     def channel(self, channel_id: str) -> Channel | None:
         return next((c for c in self.channels if c.channel_id == channel_id), None)
@@ -554,6 +662,16 @@ class HardwareContext:
     @property
     def streaming_channels(self) -> tuple[Channel, ...]:
         return tuple(c for c in self.channels if c.is_streaming)
+
+    @property
+    def media_channels(self) -> tuple[Channel, ...]:
+        """Return the channels whose reads yield bytes (previewable channels)."""
+        return tuple(c for c in self.channels if c.is_media)
+
+    @property
+    def privacy_gated_channels(self) -> tuple[Channel, ...]:
+        """Return the channels whose reads require consent."""
+        return tuple(c for c in self.channels if c.is_privacy_gated)
 
     @property
     def label(self) -> str:
@@ -575,6 +693,7 @@ class HardwareContext:
             halt_supported=self.halt_supported,
             notes=self.notes,
             provenance=self.provenance,
+            device_class=self.device_class,
         )
 
     def read_only(self) -> "HardwareContext":
@@ -589,6 +708,7 @@ class HardwareContext:
             "vendor": self.vendor,
             "model": self.model,
             "location": self.location,
+            "device_class": self.device_class,
             "halt_supported": self.halt_supported,
             "notes": self.notes,
             "transport": self.transport.to_dict(),
@@ -628,6 +748,7 @@ class HardwareContext:
             halt_supported=bool(data.get("halt_supported", False)),
             notes=str(data.get("notes") or ""),
             provenance=ContextProvenance.from_mapping(data.get("provenance")),
+            device_class=str(data.get("device_class") or ""),
         )
 
 
@@ -694,7 +815,9 @@ __all__ = [
     "HardwareContext",
     "HardwareEffect",
     "Interlock",
+    "PrivacyTier",
     "Quality",
+    "Representation",
     "TransportRef",
     "as_numeric",
 ]

@@ -31,6 +31,8 @@ _TRANSPORTS: dict[str, str] = {
     "simulated": "leapflow.hardware.transports.simulated:build_transport",
     "python": "leapflow.hardware.transports.python_callable:build_transport",
     "mcp": "leapflow.hardware.transports.mcp:build_transport",
+    "host": "leapflow.hardware.transports.host:build_transport",
+    "media": "leapflow.hardware.transports.media:build_transport",
 }
 
 _EP_GROUP = "leapflow.hardware.transports"

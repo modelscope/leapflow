@@ -333,6 +333,33 @@ async def _check_successful_write_reports_definite_effect(
     return f"side_effect={outcome.side_effect_state}"
 
 
+async def _check_read_only_refuses_writes(
+    factory: TransportFactory, config: Mapping[str, Any],
+) -> str:
+    """A read-only transport must refuse every write and prove nothing happened.
+
+    Stricter than the write checks it replaces, not weaker. Two failure modes are
+    covered: quietly accepting a command it cannot honour, which would report success
+    for an effect that never occurred; and refusing with an uncertain verdict, which
+    would make recovery treat a call that provably never reached anything as a
+    possible side effect and block replay of every later action.
+    """
+    transport = factory(config)
+    context = _conformance_context(transport.kind, config)
+    await transport.open(context)
+    outcome = await transport.write("setpoint", 42.0)
+    _assert(isinstance(outcome, WriteOutcome), f"expected WriteOutcome, got {type(outcome).__name__}")
+    _assert(outcome.ok is False, "a read-only transport reported a successful write")
+    _assert(
+        outcome.side_effect_state == SIDE_EFFECT_NONE,
+        f"a read-only transport refused a write but reported {outcome.side_effect_state!r}; "
+        "it never reached the device, so no effect is provable",
+    )
+    _assert(bool(outcome.error), "a refusal must say why, so the caller can act on it")
+    await transport.close()
+    return f"refused: {outcome.failure_code or 'unspecified'}"
+
+
 async def _check_verified_channel_returns_readback(
     factory: TransportFactory, config: Mapping[str, Any],
 ) -> str:
@@ -525,6 +552,7 @@ def run_transport_conformance(
     include_init: bool = False,
     failing_write_config: Mapping[str, Any] | None = None,
     no_halt_config: Mapping[str, Any] | None = None,
+    writable: bool = True,
 ) -> ConformanceReport:
     """Execute the transport conformance suite and return a structured report.
 
@@ -558,6 +586,13 @@ def run_transport_conformance(
         derivation is attempted (setting ``halt_supported=False``).  When the
         transport disables halt differently (e.g. MCP with ``halt_tool=""``),
         pass the pre-built config here.
+    writable:
+        Whether this transport can command anything at all.  A sensor-only bus
+        (and the ``host`` transport) can not, so the three write checks are
+        replaced by the stricter contract for that case: every write is refused
+        *and* proves no effect landed.  This is a declared shortfall, not an
+        exemption -- a read-only transport that quietly accepted a write, or that
+        refused with an uncertain verdict, would still fail the suite.
 
     Returns
     -------
@@ -576,14 +611,25 @@ def run_transport_conformance(
         ("read sequence increases monotonically", _check_read_sequence_increases_monotonically(transport_factory, config)),
         ("unknown channel raises TransportError", _check_unknown_channel_raises(transport_factory, config)),
         ("operating before open raises", _check_operating_before_open_raises(transport_factory, config)),
-        ("successful write reports a definite effect", _check_successful_write_reports_definite_effect(transport_factory, config)),
-        ("verified channel returns a readback", _check_verified_channel_returns_readback(transport_factory, config)),
-        ("failed write never claims no effect", _check_failed_write_never_claims_no_effect(transport_factory, config, failing_write_config)),
+    ]
+
+    if writable:
+        core_checks.extend([
+            ("successful write reports a definite effect", _check_successful_write_reports_definite_effect(transport_factory, config)),
+            ("verified channel returns a readback", _check_verified_channel_returns_readback(transport_factory, config)),
+            ("failed write never claims no effect", _check_failed_write_never_claims_no_effect(transport_factory, config, failing_write_config)),
+        ])
+    else:
+        core_checks.append(
+            ("read-only transport refuses writes cleanly", _check_read_only_refuses_writes(transport_factory, config))
+        )
+
+    core_checks.extend([
         ("halt reports capability", _check_halt_reports_capability(transport_factory, config)),
         ("transport without halt declares it", _check_transport_without_halt_declares_it(transport_factory, config, no_halt_config)),
         ("reading stamps both clocks", _check_reading_stamps_both_clocks(transport_factory, config)),
         ("reading evidence form carries only wall clock", _check_reading_evidence_form(transport_factory, config)),
-    ]
+    ])
 
     if include_init:
         core_checks.extend([

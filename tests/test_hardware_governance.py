@@ -1531,6 +1531,17 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.history_retention_days",
         "hardware.raw_segment_mb",
         "hardware.reading_store_sensitive",
+        "hardware.providers",
+        "hardware.host_interval_s",
+        "hardware.host_include",
+        "hardware.host_exclude",
+        "hardware.rediscover_interval_s",
+        "hardware.media_screens",
+        "hardware.media_microphones",
+        "hardware.preview_max_fps",
+        "hardware.preview_max_width",
+        "hardware.preview_quality",
+        "hardware.preview_idle_timeout_s",
     }
     for key in keys:
         view = service.describe(key)
@@ -1540,8 +1551,8 @@ def test_hardware_config_keys_are_discoverable() -> None:
         assert view.hot_reload == "restart-required"
 
 
-def test_disabled_hardware_leaves_the_classifier_untouched() -> None:
-    """Default-off must be inert, not merely quiet."""
+def test_explicitly_disabled_hardware_leaves_the_classifier_untouched() -> None:
+    """An explicit hard disable remains inert, even though passive discovery defaults on."""
     from leapflow.hardware.registry import build_registry
 
     class _Settings:
@@ -1602,6 +1613,10 @@ async def test_enabled_profile_drives_the_whole_chain_from_declarations(tmp_path
 
     class _Settings:
         hardware_enabled = True
+        # Pinned to the declaration provider: this test is about a hand-written
+        # declaration driving the whole chain, and the default set also enumerates
+        # this host, whose channels have nothing to do with what is asserted below.
+        hardware_providers = "yaml"
         hardware_devices_dir = str(devices)
         hardware_max_devices = 16
         hardware_unverified_policy = "deny_write"
@@ -2133,3 +2148,21 @@ async def test_install_gate_rebinds_hardware_approval_gate() -> None:
     )
 
 
+
+
+def test_passive_hardware_discovery_defaults_on_without_opening_devices() -> None:
+    """`/board hardware` must not require a preliminary config task.
+
+    The distinction is security-critical: default-on means passive inventory only (host
+    metrics and media enumeration); camera/microphone reads remain privacy-gated. A future
+    "safe by default" edit must not conflate the two and reintroduce an empty board.
+    """
+    from leapflow.config import Settings
+    from leapflow.hardware.registry import HardwareSettings
+
+    assert Settings.__dataclass_fields__["hardware_enabled"].default is True
+    policy = HardwareSettings()
+    assert policy.enabled is True
+    assert policy.preview_max_fps == 12.0
+    assert policy.preview_max_width == 1280
+    assert policy.preview_quality == 85

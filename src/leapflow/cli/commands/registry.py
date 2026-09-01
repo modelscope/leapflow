@@ -145,7 +145,7 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
 
     # Board & Monitors (LeapBoard) — one analysis target (current session),
     # rendered through a selectable template lens.
-    CommandDef("board", "Analyze the current session; optionally pick a template lens", "Board", args_hint="[<template> | templates|refresh|pause|resume|stop|status]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board", "Analyze the current session, inspect peripherals, or preview a device", "Board", args_hint="[<template> | devices|device <id>|preview <id>|rescan | templates|refresh|pause|resume|stop|status]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
     CommandDef("board signals", "View signal flow health and live event stream", "Board", effect=CommandEffect.READ_ONLY, execution=CommandExecution.SHORT_OPERATION),
     CommandDef("board templates", "List, add, remove, or show board templates", "Board", args_hint="[list|add <path.yaml> [--name id] [--force]|remove <id>|show <id>]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
     CommandDef("board refresh", "Re-analyze the current session (or a watch by id) now", "Board", args_hint="[<id>]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
@@ -153,6 +153,13 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("board resume", "Resume session analysis (or a watch by id)", "Board", args_hint="[<id>]", effect=CommandEffect.SESSION),
     CommandDef("board stop", "Stop the current session (or a watch by id)", "Board", args_hint="[<id>]", effect=CommandEffect.SESSION),
     CommandDef("board status", "Show watch state, recent findings, and templates", "Board"),
+    # Peripherals. ``devices``/``rescan`` are read-only observation; ``device`` opens a
+    # page; ``preview`` is the one that can prompt, because it establishes the consent a
+    # browser cannot obtain for itself.
+    CommandDef("board devices", "List the peripherals LeapFlow can see", "Board", effect=CommandEffect.READ_ONLY, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board device", "Open one device's page (id or unique prefix)", "Board", args_hint="<id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board preview", "Approve and open a live device preview", "Board", args_hint="<id> [channel]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("board rescan", "Re-run device discovery to pick up a hot-plug", "Board", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
 )
 
 # ── Derived structures ───────────────────────────────────────────────

@@ -148,12 +148,21 @@ class Settings:
     # the first two modes is audit coverage rather than prompt frequency.
     mcp_approval_mode: str = "mutating_only"
 
-    # Hardware Context Protocol. Off by default: with hardware disabled the plugin
-    # exposes no tools and the risk classifier is the unmodified default, so the
-    # rest of the system behaves exactly as it did before the subsystem existed.
-    # Enabling it is restart-required because the approval classifier is composed
-    # when the orchestrator is constructed.
-    hardware_enabled: bool = False
+    # Hardware Context Protocol. On by default: host metrics and passive local media
+    # enumeration are core observability, not an opt-in feature hidden behind an unrelated
+    # config task. Enumeration opens no camera, radio or network connection; a read that
+    # discloses the surrounding space still enters the approval chain and stays refused
+    # until a human grants it. Explicitly setting this False remains a hard disable.
+    #
+    # It is restart-required because the approval classifier is composed when the
+    # orchestrator is constructed.
+    hardware_enabled: bool = True
+    # Comma-separated discovery sources. Empty -> "yaml,host,media": declarations a person
+    # wrote plus this machine's own resources. The media provider only enumerates cameras
+    # and microphones; it never opens either. Scanners that transmit (bluetooth) or leave
+    # the host (mdns) are opt-in, because discovery must never be the reason a radio starts
+    # up or a packet leaves the machine.
+    hardware_providers: str = ""
     # Directory holding device declarations. Empty -> the active profile's
     # hardware/devices/ directory.
     hardware_devices_dir: str = ""
@@ -205,6 +214,38 @@ class Settings:
     # trade secret or sample information. On by default; opt out only for a bench known
     # to produce no sensitive data.
     hardware_reading_store_sensitive: bool = True
+    # Sampling period for fast-moving host channels (cpu, memory, network); slower
+    # quantities multiply it. Empty/0 -> the provider default of 5s. One second would
+    # put twelve times as many rows into stored history for detail nobody diagnoses a
+    # machine from.
+    hardware_host_interval_s: float = 0.0
+    # Comma-separated channel-id prefixes to keep / drop from the discovered host set
+    # (e.g. "cpu,memory" or "net.utun"). Prefixes rather than exact ids because mounts
+    # and interfaces are discovered, so their full ids are not knowable in advance.
+    hardware_host_include: str = ""
+    hardware_host_exclude: str = ""
+    # Seconds between automatic rediscovery passes, so a peripheral plugged in after
+    # startup appears without a restart. 0 disables it; rediscovery is otherwise
+    # driven by `leap hw scan`. Runs on the monitor cadence, never on a turn.
+    hardware_rediscover_interval_s: float = 0.0
+    # Enumerate displays as previewable devices. Off by default: a platform that
+    # presents the screen as just another video input would otherwise put "stream this
+    # person's screen" on the board beside the webcam, one click away. Still available,
+    # because it is a legitimate capability -- it is the default that must not decide.
+    hardware_media_screens: bool = False
+    # Enumerate microphones alongside cameras.
+    hardware_media_microphones: bool = True
+    # The broker enforces hard ceilings. The board's default is a balanced profile below
+    # these limits (960px / 8fps / JPEG 75); a viewer can choose an economy or a detail
+    # profile for its own live preview, never exceed these caps, and no profile changes a
+    # durable config file. The ceiling is what the provider declares at discovery.
+    hardware_preview_max_fps: float = 12.0
+    hardware_preview_max_width: int = 1280
+    hardware_preview_quality: int = 85
+    # How long a preview keeps a device claimed after the last viewer disconnects.
+    # Short, because a camera that stays on after everybody stopped looking is exactly
+    # the failure this whole subsystem is built to avoid.
+    hardware_preview_idle_timeout_s: float = 15.0
     runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
@@ -1013,7 +1054,8 @@ def _build_settings_from_env(
             "Unknown mcp.approval_mode %r; falling back to mutating_only", mcp_approval_mode
         )
         mcp_approval_mode = "mutating_only"
-    hardware_enabled = os.getenv("LEAPFLOW_HARDWARE_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+    hardware_enabled = os.getenv("LEAPFLOW_HARDWARE_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+    hardware_providers = os.getenv("LEAPFLOW_HARDWARE_PROVIDERS", "").strip()
     hardware_devices_dir = os.getenv("LEAPFLOW_HARDWARE_DEVICES_DIR", "").strip()
     hardware_max_devices = int(os.getenv("LEAPFLOW_HARDWARE_MAX_DEVICES", "16"))
     hardware_unverified_policy = (
@@ -1035,6 +1077,20 @@ def _build_settings_from_env(
     hardware_reading_store_sensitive = os.getenv(
         "LEAPFLOW_HARDWARE_READING_STORE_SENSITIVE", "1"
     ).strip().lower() in ("1", "true", "yes")
+    hardware_host_interval_s = float(os.getenv("LEAPFLOW_HARDWARE_HOST_INTERVAL_S", "0") or 0.0)
+    hardware_host_include = os.getenv("LEAPFLOW_HARDWARE_HOST_INCLUDE", "").strip()
+    hardware_host_exclude = os.getenv("LEAPFLOW_HARDWARE_HOST_EXCLUDE", "").strip()
+    hardware_rediscover_interval_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_REDISCOVER_INTERVAL_S", "0") or 0.0
+    )
+    hardware_media_screens = os.getenv("LEAPFLOW_HARDWARE_MEDIA_SCREENS", "0").strip().lower() in ("1", "true", "yes")
+    hardware_media_microphones = os.getenv("LEAPFLOW_HARDWARE_MEDIA_MICROPHONES", "1").strip().lower() in ("1", "true", "yes")
+    hardware_preview_max_fps = float(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_FPS", "12") or 12.0)
+    hardware_preview_max_width = int(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_WIDTH", "1280") or 1280)
+    hardware_preview_quality = int(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_QUALITY", "85") or 85)
+    hardware_preview_idle_timeout_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_PREVIEW_IDLE_TIMEOUT_S", "15") or 15.0
+    )
     web_transport = os.getenv("LEAPFLOW_WEB_TRANSPORT", "auto").strip().lower() or "auto"
     web_timeout_s = float(os.getenv("LEAPFLOW_WEB_TIMEOUT_S", "20"))
     web_max_bytes = int(os.getenv("LEAPFLOW_WEB_MAX_BYTES", "2000000"))
@@ -1399,6 +1455,7 @@ def _build_settings_from_env(
         mcp_approval_mode=mcp_approval_mode,
         hardware_enabled=hardware_enabled,
         hardware_devices_dir=hardware_devices_dir,
+        hardware_providers=hardware_providers,
         hardware_max_devices=hardware_max_devices,
         hardware_unverified_policy=hardware_unverified_policy,
         hardware_require_describe=hardware_require_describe,
@@ -1412,6 +1469,16 @@ def _build_settings_from_env(
         hardware_history_retention_days=hardware_history_retention_days,
         hardware_raw_segment_mb=hardware_raw_segment_mb,
         hardware_reading_store_sensitive=hardware_reading_store_sensitive,
+        hardware_host_interval_s=hardware_host_interval_s,
+        hardware_host_include=hardware_host_include,
+        hardware_host_exclude=hardware_host_exclude,
+        hardware_rediscover_interval_s=hardware_rediscover_interval_s,
+        hardware_media_screens=hardware_media_screens,
+        hardware_media_microphones=hardware_media_microphones,
+        hardware_preview_max_fps=hardware_preview_max_fps,
+        hardware_preview_max_width=hardware_preview_max_width,
+        hardware_preview_quality=hardware_preview_quality,
+        hardware_preview_idle_timeout_s=hardware_preview_idle_timeout_s,
         web_transport=web_transport,
         web_timeout_s=web_timeout_s,
         web_max_bytes=web_max_bytes,

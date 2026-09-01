@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from leapflow.hardware.context import Envelope, HardwareEffect
+from leapflow.hardware.context import Envelope, HardwareEffect, PrivacyTier
 from leapflow.security.actions import ActionDescriptor, ActionKind
 from leapflow.security.risk import (
     CompositeRiskClassifier,
@@ -72,12 +72,7 @@ class HardwareRiskClassifier:
             )
 
         if kind == ActionKind.DEVICE_READ.value:
-            return RiskAssessment(
-                level=RiskLevel.SAFE,
-                score=0.0,
-                reasons=("device_read",),
-                explanation="Reading a channel has no physical effect.",
-            )
+            return self._assess_read(action)
 
         metadata = action.metadata or {}
         device_id = str(metadata.get("device_id") or "")
@@ -253,6 +248,53 @@ class HardwareRiskClassifier:
             if lock is None or lock.channel_id not in readable:
                 missing.append(name)
         return tuple(sorted(missing))
+
+    def _assess_read(self, action: ActionDescriptor) -> RiskAssessment:
+        """Assess a read from the channel's declared privacy tier.
+
+        Reading is free of *physical* effect, which is why this returned SAFE
+        unconditionally -- and why a camera would be readable by anything that could
+        name it. Effect class cannot express the difference between a thermometer and a
+        webcam: both are ``effect=read`` with no envelope and nothing to actuate, and
+        one of them discloses the room. ``PrivacyTier`` is the declared fact that can,
+        so it is what decides here.
+
+        An unresolvable channel stays SAFE, unlike a write: a read of a channel that
+        does not exist fails in the transport with a precise error, and refusing it at
+        the gate would replace that with an approval prompt nobody can act on. Only a
+        *declared* disclosure raises the level.
+        """
+        metadata = action.metadata or {}
+        device_id = str(metadata.get("device_id") or "")
+        channel_id = str(metadata.get("channel_id") or "")
+        context = self._registry.context(device_id) if self._registry is not None else None
+        channel = context.channel(channel_id) if context is not None else None
+        if channel is None or not channel.is_privacy_gated:
+            return RiskAssessment(
+                level=RiskLevel.SAFE,
+                score=0.0,
+                reasons=("device_read",),
+                explanation="Reading a channel has no physical effect.",
+            )
+
+        personal = channel.privacy == PrivacyTier.PERSONAL.value
+        where = "the person using this machine" if personal else "the physical space around it"
+        location = getattr(context, "location", "") or ""
+        return RiskAssessment(
+            level=RiskLevel.HIGH if personal else RiskLevel.MEDIUM,
+            score=0.9 if personal else 0.6,
+            reasons=("privacy_disclosure", f"privacy_{channel.privacy}"),
+            explanation=(
+                f"Reading {device_id}.{channel_id} observes {where}"
+                f"{f' at {location}' if location else ''}. It has no physical effect, and "
+                "it discloses the surroundings, so it needs consent before it happens."
+            ),
+            # Never permanent. A standing, unexpirable grant to observe somebody's room
+            # is not consent -- it is the absence of it. A session-scoped grant still
+            # spares them a prompt per frame.
+            allow_permanent=False,
+            metadata={"privacy": channel.privacy, "quantity": channel.quantity},
+        )
 
     @staticmethod
     def _hardline(reason: str, explanation: str) -> RiskAssessment:

@@ -174,11 +174,21 @@ async def _open_dashboard_view(settings: Any, console: Any, payload: dict[str, A
             return
         url = launcher.build_view_url(
             state["bind"], state["port"], state["token"], template=template,
+            # Forwarded so a drill-down (``/board device`` / ``/board preview``) lands on
+            # that device's page rather than the fleet: the daemon resolved which device
+            # was meant, and dropping it here would silently discard that answer.
+            device=str(payload.get("device") or ""),
+            channel=str(payload.get("channel") or ""),
         )
     if launcher.open_in_browser(url):
         console.system(f"Opened dashboard in your browser: {url}")
     else:
         console.system(f"Dashboard ready (open manually): {url}")
+    # Any follow-up the daemon wants the operator to read -- what a preview grant now
+    # covers, or that a consent prompt is about to appear here. Emitted after the URL so
+    # the actionable line is the last thing on screen.
+    for note in payload.get("notes") or ():
+        console.system(str(note))
     if payload.get("watch_id"):
         console.system(
             "Observing the current session; analysis streams to the board as it completes."

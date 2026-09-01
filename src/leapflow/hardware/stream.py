@@ -636,11 +636,17 @@ def build_stream_sources(
 
     ``sample_rate_hz > 0`` is the only thing consulted. No device type is enumerated
     anywhere, which is what lets a declaration add a sensor without touching code.
+
+    Media channels are excluded even when they declare a rate. Admission already
+    clears the rate on them; this is the second half of that guard, kept here
+    because this is the loop that would otherwise push a few hundred kilobytes per
+    sample into the raw NDJSON segment and try to average frames into a downsample
+    window. Previews are pulled on demand by whoever is watching, never sampled.
     """
     sources: list[HardwareStreamSource] = []
     for context in registry.contexts():
         for channel in context.streaming_channels:
-            if not channel.is_readable:
+            if not channel.is_readable or channel.is_media:
                 continue
             sources.append(
                 HardwareStreamSource(

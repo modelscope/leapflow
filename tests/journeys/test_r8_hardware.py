@@ -233,6 +233,11 @@ async def test_r8_hardware_bench(journeys: JourneyFactory) -> None:
             extra_env={
                 "LEAPFLOW_HARDWARE_ENABLED": "1",
                 "LEAPFLOW_HARDWARE_DEVICES_DIR": str(devices_dir),
+                # Declarations only. The default provider set also enumerates the host
+                # running the journey, whose channel count differs per machine -- and
+                # hw_list output is part of the recorded conversation, so an ambient
+                # second device would invalidate the cassette on every new runner.
+                "LEAPFLOW_HARDWARE_PROVIDERS": "yaml",
                 # Memory prefetch injects a "## Recent Context" block into the
                 # system prompt from the profile's signal store, and that store
                 # picks up ambient desktop events (a focus switch to loginwindow)

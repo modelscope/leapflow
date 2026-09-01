@@ -14,6 +14,7 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,234 @@ logger = logging.getLogger(__name__)
 
 # ── Hardware sampling control (module-level so unit tests can exercise the
 # pause/resume core against a lightweight registry without a full service) ──
+
+
+_WRITE_TOOL_BY_EFFECT: dict[str, str] = {
+    "configure": "hw_configure",
+    "actuate": "hw_actuate",
+    "dispense": "hw_dispense",
+}
+"""Declared effect class -> the command tool that owns it.
+
+The caller never chooses. Letting a board name the tool would let it route a motion
+command on an ``actuate`` channel through ``hw_configure`` and get the gentler risk
+classification -- and the tool's own effect-class check would then refuse it with a
+mismatch error that blames the declaration. ``emit`` is deliberately absent: it has no
+command tool, so a channel declaring it is reported as not commandable rather than
+silently mapped onto a neighbouring class.
+"""
+
+
+async def request_hardware_frame(
+    ctx: Any,
+    registry: Any,
+    device: str,
+    channel: str,
+    *,
+    max_width: int = 0,
+    quality: int = 0,
+    fps: float = 0.0,
+) -> dict[str, Any]:
+    """Acquire one frame through the approval chain. The single gated frame path.
+
+    Module-level, and shared by the ``hardware.frame`` RPC and by ``/board preview``,
+    because those two callers differ only in *where the consent prompt can appear* --
+    not in what is being consented to. A second implementation for the slash command
+    would be a second gate free to disagree with the one that protects the device.
+
+    That difference in routing is the whole reason the slash command exists. The daemon
+    installs an approval route for ``command.execute`` but not for an ordinary RPC, so a
+    browser-initiated frame request has nowhere to prompt and is denied
+    (``ApprovalCoordinator.request_approval`` returns ``deny`` when ``route is None``).
+    Running this from a slash command puts the prompt in the TUI, and the grant it mints
+    is what the browser's later requests are covered by.
+
+    Returns the JSON-safe reply -- ``{ok, ...metadata, data_b64}`` or
+    ``{ok: False, code, error}`` -- never raising, because both callers report rather
+    than propagate.
+    """
+    consent = await _consent_for_observation(ctx, registry, device, channel)
+    if consent is not None:
+        return consent
+
+    from leapflow.hardware.transport import TransportError
+
+    try:
+        frame = await registry.preview_broker.frame(
+            device,
+            channel,
+            max_width=int(max_width or 0),
+            quality=int(quality or 0),
+            fps=float(fps or 0.0),
+        )
+    except TransportError as exc:
+        return {
+            "ok": False,
+            "code": exc.failure_code,
+            "device": device,
+            "channel": channel,
+            "error": str(exc),
+        }
+    except Exception as exc:  # noqa: BLE001 - a failed preview must not fail the daemon
+        logger.warning("daemon: preview frame failed: %s", exc, exc_info=True)
+        return {
+            "ok": False, "code": "preview_failed", "device": device,
+            "channel": channel, "error": str(exc),
+        }
+
+    import base64
+
+    return {
+        "ok": True,
+        **frame.to_metadata(),
+        "data_b64": base64.b64encode(frame.data).decode("ascii"),
+    }
+
+
+async def request_hardware_reading(
+    ctx: Any, registry: Any, device: str, channel: str
+) -> dict[str, Any]:
+    """Read one channel through the approval chain. The single gated scalar-read path.
+
+    The counterpart to ``request_hardware_frame`` for channels that carry a value rather
+    than bytes -- a microphone's input level being the case that motivated it, since a
+    live level meter is a poll of a privacy-gated scalar.
+
+    Shares ``_consent_for_observation`` with the frame path, so a camera and a microphone
+    are gated by one rule reading one declared tier. Serialised on the device's own I/O
+    lock: a shared bus is a single conversation, and two coroutines reading different
+    channels of one instrument interleave request and response frames -- which yields a
+    plausible reading carrying the wrong channel's value.
+    """
+    consent = await _consent_for_observation(ctx, registry, device, channel)
+    if consent is not None:
+        return consent
+
+    from leapflow.hardware.transport import TransportError
+
+    try:
+        async with registry.device_io(device):
+            transport = await registry.transport(device)
+            reading = await transport.read(channel)
+    except TransportError as exc:
+        return {
+            "ok": False, "code": exc.failure_code, "device": device,
+            "channel": channel, "error": str(exc),
+        }
+    except Exception as exc:  # noqa: BLE001 - a failed read must not fail the daemon
+        logger.warning("daemon: hardware read failed: %s", exc, exc_info=True)
+        return {
+            "ok": False, "code": "read_failed", "device": device,
+            "channel": channel, "error": str(exc),
+        }
+    return {"ok": True, **reading.to_dict()}
+
+
+async def _consent_for_observation(
+    ctx: Any, registry: Any, device: str, channel: str
+) -> dict[str, Any] | None:
+    """Gate an observation of one channel; None means it may proceed.
+
+    Shared by every read that might disclose the surroundings -- a frame, a level, any
+    future privacy-gated quantity -- because the decision is about the channel's declared
+    tier and nothing else. A second copy per representation would be a second gate free to
+    disagree.
+
+    Fails closed on absence and on exception. The refusal names where consent can be
+    given: with no approval route installed there is nowhere to ask, so the caller is told
+    to use a surface that has one.
+    """
+    context = registry.context(device)
+    target = context.channel(channel) if context is not None else None
+    if target is None:
+        return {
+            "ok": False, "code": "unknown_channel", "device": device, "channel": channel,
+            "error": f"No declared channel {device}.{channel}.",
+        }
+    if not target.is_privacy_gated:
+        return None
+
+    from leapflow.security.actions import ActionDescriptor, ActionKind
+
+    gate = getattr(ctx, "_approval_orchestrator", None)
+    if gate is None:
+        return {
+            "ok": False, "code": "consent_required", "device": device, "channel": channel,
+            "error": (
+                "No approval gate is installed, so this preview was refused. This is a "
+                "configuration fault, not a decision you made."
+            ),
+        }
+    descriptor = ActionDescriptor.device(
+        kind=ActionKind.DEVICE_READ.value,
+        device_id=device,
+        channel_id=channel,
+        quantity=target.quantity,
+        unit=target.unit,
+        location=getattr(context, "location", ""),
+        reversible=True,
+        metadata={"privacy": target.privacy, "representation": target.representation},
+    )
+    consent_scope = _observation_consent_scope(context, target)
+    # A camera preview is a *session* of many frame reads: its probe, every MJPEG part,
+    # and a second local camera looking at the same environment are not independent acts
+    # a person meaningfully understands as separate approvals. The descriptor keeps the
+    # actual device/channel in its summary and metadata (risk, audit and diagnostics stay
+    # precise), while only the reusable-grant resource is grouped by declared disclosure
+    # scope. Camera and microphone stay separate; personal tiers stay separate; anything
+    # non-local or without a known media class remains per-device.
+    if consent_scope:
+        metadata = dict(descriptor.metadata)
+        metadata["consent_scope"] = consent_scope
+        descriptor = replace(
+            descriptor,
+            resource=f"observation:{consent_scope}",
+            metadata=metadata,
+        )
+    try:
+        result = await gate.evaluate(descriptor)
+    except Exception as exc:  # noqa: BLE001 - a broken gate must deny, not open
+        logger.error("daemon: preview approval gate raised: %s", exc, exc_info=True)
+        return {
+            "ok": False, "code": "consent_required", "device": device, "channel": channel,
+            "error": "The approval gate failed while assessing this preview, so it was refused.",
+        }
+    if getattr(result, "approved", False):
+        return None
+    message = getattr(result, "denial_message", "") or getattr(result, "reason", "")
+    return {
+        "ok": False, "code": "consent_required", "device": device, "channel": channel,
+        "error": str(
+            message
+            or (
+                f"Observing {device}.{channel} needs consent, and it was not given."
+            )
+        ),
+    }
+
+
+def _observation_consent_scope(context: Any, channel: Any) -> str:
+    """Return a reusable consent family for a local media observation, or an empty scope.
+
+    The declaration, not a device-name heuristic, says what an observation discloses.
+    Group only the naturally shared case: local environment cameras observe the same
+    physical space, so prompting once per camera and then again for the MJPEG stream is
+    prompt fatigue without a distinct decision. Microphones remain a separate family;
+    personal observations remain per device; a vendor or remote transport never inherits
+    this local grouping.
+
+    This value shapes a *session grant* only. The ActionDescriptor summary, detail and
+    metadata still name the actual camera, so the human prompt, risk classifier and audit
+    never lose the fact that the desk-view camera was the one opened.
+    """
+    if str(getattr(context, "location", "") or "") != "local":
+        return ""
+    if str(getattr(channel, "privacy", "") or "") != "environment":
+        return ""
+    device_class = str(getattr(context, "device_class", "") or "")
+    if device_class not in {"camera", "microphone"}:
+        return ""
+    return f"local-environment:{device_class}"
 
 
 def _hardware_device_sources(registry: Any, device: str) -> list[Any]:
@@ -864,6 +1093,221 @@ class RuntimeLeapService:
             getter = getattr(ctx, "_hardware_event_emitter", None)
             emit = getter() if callable(getter) else None
         return await resume_hardware_sampling(registry, device, emit=emit)
+
+    # ── Delegate: hardware inventory (read-only) ───────────────────────
+    #
+    # Daemon-global for the same reason sampling control is: the admitted device set
+    # is shared daemon state, so these take no ``session_id`` and return none. Both
+    # are pure reads off the registry and the reading store -- no transport is opened
+    # and nothing is probed -- which is what makes them safe to expose to the board.
+
+    def _hardware_registry_or_error(self, action: str) -> tuple[Any, dict[str, Any] | None]:
+        """Resolve the registry, or the structured refusal to return instead.
+
+        Shared by every hardware read so the two "not available yet" cases keep one
+        wording and one code. They are genuinely different situations -- a daemon
+        still starting up will work shortly, a profile with hardware off never will --
+        and a caller that cannot tell them apart cannot advise anyone.
+        """
+        ctx = self._ctx
+        if ctx is None:
+            return None, {
+                "ok": False,
+                "code": "runtime_unavailable",
+                "error": f"leapd runtime is not initialized yet; retry {action} once it is ready.",
+            }
+        registry = getattr(ctx, "_hardware_registry", None)
+        if registry is None:
+            return None, {
+                "ok": False,
+                "code": "hardware_disabled",
+                "error": (
+                    "Hardware is disabled for this profile. Enable it "
+                    "(`leap config set hardware.enabled true`) and restart the daemon."
+                ),
+            }
+        return registry, None
+
+    async def hardware_inventory(self) -> dict[str, Any]:
+        """List every admitted device grouped by declared class. Read-only."""
+        registry, refusal = self._hardware_registry_or_error("the inventory")
+        if refusal is not None:
+            return refusal
+        from leapflow.hardware.observability import build_inventory
+
+        return build_inventory(registry)
+
+    async def hardware_device(self, device: str = "") -> dict[str, Any]:
+        """Describe one device: channels, latest sampled values, controls, previews.
+
+        Values come from the sampling ring and the reading store, never from a fresh
+        transport read: opening a device page must not be the reason a bus is busy.
+        """
+        registry, refusal = self._hardware_registry_or_error("the device view")
+        if refusal is not None:
+            return {**refusal, "device": device}
+        from leapflow.hardware.observability import build_device_view
+
+        return build_device_view(registry, device)
+
+    async def hardware_rescan(self) -> dict[str, Any]:
+        """Re-run discovery and converge on the new device set.
+
+        Goes through ``reconcile()`` rather than ``load()`` so a device that did not
+        change keeps the sampling loop it already has; reloading outright would orphan
+        one asyncio task per streaming channel while leaving them running.
+
+        Daemon-global and shared: a rescan changes the capability set for every
+        connected client at its next turn, exactly as a plugin install does.
+        """
+        registry, refusal = self._hardware_registry_or_error("a rescan")
+        if refusal is not None:
+            return refusal
+        try:
+            report = await registry.reconcile()
+        except Exception as exc:  # noqa: BLE001 - a failed scan must leave the fleet running
+            logger.warning("daemon: hardware rescan failed: %s", exc, exc_info=True)
+            return {
+                "ok": False,
+                "code": "rescan_failed",
+                "error": f"Rediscovery failed and the previous device set is unchanged: {exc}",
+            }
+        return {"ok": True, **report.to_dict()}
+
+    async def hardware_frame(
+        self,
+        device: str = "",
+        channel: str = "",
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+    ) -> dict[str, Any]:
+        """Return one frame from a previewable channel, base64-encoded.
+
+        A thin wrapper over ``request_hardware_frame``, which is the single gated frame
+        path and is shared with ``/board preview``.
+
+        One caveat is structural and worth naming here, where callers look: an ordinary
+        RPC has no approval route installed, so a privacy-gated channel is refused unless
+        a grant already exists. That is fail-closed and correct -- and it is why the
+        refusal message points at the slash command, which does have a route and can
+        therefore mint the grant.
+
+        Base64 over JSON-RPC rather than a binary channel: the transport is line-based,
+        and a preview frame at the default ceiling is tens of kilobytes -- the 33%
+        encoding overhead is worth not introducing a second wire format for one caller.
+        The dashboard re-encodes it as ``image/jpeg`` on its own HTTP hop.
+        """
+        registry, refusal = self._hardware_registry_or_error("a preview")
+        if refusal is not None:
+            return {**refusal, "device": device, "channel": channel}
+        return await request_hardware_frame(
+            self.context,
+            registry,
+            device,
+            channel,
+            max_width=max_width,
+            quality=quality,
+            fps=fps,
+        )
+
+    async def hardware_read(self, device: str = "", channel: str = "") -> dict[str, Any]:
+        """Read one channel's current value, through the approval chain.
+
+        What a live level meter polls. A thin wrapper over
+        ``request_hardware_reading`` so the gated read has one implementation.
+
+        Unlike the sampled value on the device page -- which comes from the ring and costs
+        nothing -- this is a fresh transport read, so it is deliberately a separate,
+        explicitly-requested call rather than something a board refresh performs.
+        """
+        registry, refusal = self._hardware_registry_or_error("a device read")
+        if refusal is not None:
+            return {**refusal, "device": device, "channel": channel}
+        return await request_hardware_reading(self.context, registry, device, channel)
+
+    async def hardware_write_request(
+        self,
+        device: str = "",
+        channel: str = "",
+        value: Any = None,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        """Preview or request a channel write, through the ordinary tool handler.
+
+        Deliberately *not* a second write path. The handler this delegates to owns every
+        feasibility check, the approval descriptor, the audit record and the side-effect
+        verdict; a parallel implementation here would be a second gate free to disagree
+        with the one that actually protects the device -- which is exactly how
+        ``config_set`` shipped with a call nobody could make.
+
+        ``dry_run=True`` (the default, and what the board's "preview change" button
+        sends) runs every check and builds the descriptor without touching the device.
+        ``dry_run=False`` submits the real thing, which means it goes through
+        ``ApprovalOrchestrator`` per invocation: the browser cannot consent to it, so the
+        prompt appears where the caller's session is authenticated. Defaulting to a dry
+        run matters -- a malformed call previews rather than actuates.
+
+        The effect class comes from the declaration, never from the caller: asking the
+        board which tool to use would let it pick ``hw_configure`` for a channel declared
+        ``actuate`` and route a motion command through the gentler classification.
+        """
+        registry, refusal = self._hardware_registry_or_error("a device write")
+        if refusal is not None:
+            return {**refusal, "device": device, "channel": channel}
+
+        context = registry.context(device)
+        target = context.channel(channel) if context is not None else None
+        if target is None:
+            return {
+                "ok": False, "code": "unknown_channel", "device": device, "channel": channel,
+                "error": f"No declared channel {device}.{channel}.",
+            }
+        if not target.is_writable:
+            return {
+                "ok": False, "code": "channel_not_writable", "device": device, "channel": channel,
+                "error": (
+                    f"Channel {device}.{channel} is not writable in the admitted "
+                    "declaration. Check `leap hw list` for the admission rule that "
+                    "demoted it -- an unverified declaration loses its writable channels."
+                ),
+            }
+
+        tool_name = _WRITE_TOOL_BY_EFFECT.get(target.effect, "")
+        if not tool_name:
+            return {
+                "ok": False, "code": "effect_not_commandable", "device": device, "channel": channel,
+                "error": (
+                    f"Channel {device}.{channel} declares effect {target.effect!r}, which "
+                    "has no command tool."
+                ),
+            }
+
+        from leapflow.plugins import get_registry as _get_tool_registry
+
+        handler = dict(_get_tool_registry().tool_handlers).get(tool_name)
+        if handler is None:
+            return {
+                "ok": False, "code": "tool_unavailable", "device": device, "channel": channel,
+                "error": (
+                    f"The {tool_name} handler is not registered, so this change was "
+                    "refused. Hardware may be disabled for this profile."
+                ),
+            }
+        try:
+            result = await handler(
+                device_id=device,
+                channel_id=channel,
+                value=value,
+                dry_run=bool(dry_run),
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed write must not fail the daemon
+            logger.warning("daemon: hardware write request failed: %s", exc, exc_info=True)
+            return {
+                "ok": False, "code": "write_failed", "device": device, "channel": channel,
+                "error": str(exc),
+            }
+        return dict(result or {})
 
     # ── Delegate: signal metrics ──────────────────────────────────────
 

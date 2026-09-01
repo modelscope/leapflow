@@ -69,12 +69,19 @@ _BOARD_VERBS: tuple[tuple[str, str], ...] = (
     ("pause", "Pause the session observation"),
     ("resume", "Resume a paused observation"),
     ("stop", "Stop an observation"),
+    ("devices", "List the peripherals LeapFlow can see"),
+    ("device", "Open one device's page: /board device <id>"),
+    ("preview", "Approve and open a live preview: /board preview <id>"),
+    ("rescan", "Re-run device discovery (picks up a hot-plug)"),
 )
 """Reserved ``/board`` verbs, mirroring the dispatcher's own set.
 
 A second literal list is a drift risk, so a test asserts the two agree rather than
 trusting them to: a verb the dispatcher accepts but never offers is undiscoverable, and
 one offered but rejected is worse than no completion at all.
+
+The two-token verbs (``device``, ``preview``, and the watch-id controls) are offered
+here but their *argument* is not completed -- see ``_board_completions``.
 """
 
 
@@ -154,8 +161,10 @@ class SlashCommandCompleter(Completer):
         """
         tail = text[len("/board "):]
         parts = tail.split()
-        # A second token is a watch id -- values only the running daemon knows, so
-        # there is nothing truthful to offer.
+        # A second token is a watch id or a device id: values that live in the running
+        # daemon and change while the TUI is open, so a list captured at startup would
+        # keep offering something already unplugged. The dispatcher accepts a unique
+        # *prefix* instead, which is what makes a long discovered id typeable.
         if len(parts) > 1 or (parts and tail.endswith(" ")):
             return
         prefix = parts[0].lower() if parts else ""

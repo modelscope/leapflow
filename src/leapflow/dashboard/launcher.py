@@ -20,6 +20,7 @@ import time
 import webbrowser
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 from leapflow.daemon.lifecycle import DaemonSignal
 
@@ -95,17 +96,26 @@ def build_view_url(
     token: str,
     *,
     template: str = "",
+    device: str = "",
+    channel: str = "",
 ) -> str:
-    """Build a token-scoped URL that selects a specific board template.
+    """Build a token-scoped URL that selects a board template and optional target.
 
-    The template is the single view dimension: the server always analyzes the
-    current session and renders it through the named template (default when
-    omitted). Single owner of the query contract so every entry lands on the
-    intended lens.
+    The template is the primary view dimension: the server renders the current session
+    through the named template (default when omitted). ``device``/``channel`` name a
+    drill-down target for the lenses that have one, and are the same parameters
+    ``DashboardIntent.from_params`` reads on the other side.
+
+    Single owner of the query contract so every entry point -- ``leap board``,
+    ``/board``, a deep link printed in the TUI -- lands on the intended view. Values are
+    percent-encoded because a device id is discovered rather than authored: a name with
+    a space or an ampersand would otherwise truncate the query silently and open the
+    wrong page.
     """
     url = build_url(bind, port, token)
-    if template:
-        url += f"&template={template}"
+    for key, value in (("template", template), ("device", device), ("channel", channel)):
+        if value:
+            url += f"&{key}={quote(str(value), safe='')}"
     return url
 
 
@@ -186,6 +196,24 @@ def server_running(settings: Any) -> Optional[dict[str, Any]]:
     return None
 
 
+def server_is_stale(state: dict[str, Any]) -> bool:
+    """Return True only when the running server *definitely* predates the source tree.
+
+    Asks the server for its own build fingerprint, so the answer is about that process
+    rather than this one. Deliberately conservative in both uncertain directions: an
+    unreachable server, an old build with no ``/api/server-info``, or a checkout git
+    cannot fingerprint all report False. Guessing "stale" would restart a working board
+    -- and killing the page somebody is reading is worse than leaving a warning badge on
+    it.
+    """
+    info = fetch_server_info(
+        str(state.get("bind") or "127.0.0.1"),
+        int(state.get("port") or 0),
+        str(state.get("token") or ""),
+    )
+    return bool(info and info.get("stale") is True)
+
+
 def open_in_browser(url: str) -> bool:
     """Open ``url`` in the default browser; return False on headless failure."""
     try:
@@ -252,13 +280,20 @@ def _retire_stale_server(settings: Any) -> None:
 def ensure_server(settings: Any, *, wait_s: float = 8.0) -> dict[str, Any]:
     """Return running dashboard state, spawning a detached server if needed.
 
-    Reuses an existing server only when it accepts the stored token; otherwise
-    it retires the stale one, picks a free port, and spawns a fresh server whose
-    token is verified before its state is published. Raises RuntimeError when the
-    optional web dependency is missing so callers can surface an install hint.
+    Reuses an existing server only when it accepts the stored token **and** is running
+    the current source. Otherwise it retires the stale one, picks a free port, and spawns
+    a fresh server whose token is verified before its state is published. Raises
+    RuntimeError when the optional web dependency is missing so callers can surface an
+    install hint.
+
+    The staleness check is not cosmetic. This process is long-lived and separately
+    launched, and it reads board templates from disk on every render -- so an old server
+    serves *new* templates with *old* builder code. A template that asks for data the old
+    builder never supplies renders nothing at all, which is how the hardware board became
+    a bare title that survived every reopen, because reuse was unconditional.
     """
     existing = server_running(settings)
-    if existing:
+    if existing and not server_is_stale(existing):
         return existing
     if not aiohttp_available():
         raise RuntimeError(
@@ -266,10 +301,21 @@ def ensure_server(settings: Any, *, wait_s: float = 8.0) -> dict[str, Any]:
             "Install it with: pip install 'leapflow[dashboard]'"
         )
 
-    # A prior server may be dead-but-recorded, or alive with a token we can no
-    # longer prove. Retire it so a fresh, trusted server can take over cleanly.
+    # A prior server may be dead-but-recorded, alive with a token we can no longer
+    # prove, or alive but older than the code it is serving. Retire it so a fresh,
+    # trusted server can take over cleanly.
+    if existing:
+        logger.info("dashboard: replacing a server that predates the current source")
     _retire_stale_server(settings)
+    return _spawn_verified_server(settings, wait_s=wait_s)
 
+
+def _spawn_verified_server(settings: Any, *, wait_s: float = 8.0) -> dict[str, Any]:
+    """Spawn a detached board server, prove it answers our token, publish its state.
+
+    Separate from ``ensure_server`` so the *decision* (reuse or replace) can be read and
+    tested apart from the mechanics of getting a process up.
+    """
     token = generate_token()
     bind = str(getattr(settings, "dashboard_bind", "127.0.0.1"))
     preferred = int(getattr(settings, "dashboard_port", 8765))

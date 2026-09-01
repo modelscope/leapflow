@@ -200,8 +200,30 @@ def test_hardware_transports_are_not_named_after_one_device() -> None:
     ``simulated.py`` qualifies too: it synthesises readings from a declared
     waveform and models generic link misbehaviour (latency, drop, reorder,
     disconnect), never anything specific to one instrument.
+
+    ``host.py`` qualifies because "the host" is not an instrument: the module holds
+    no channel id, unit or quantity of its own and resolves every read through the
+    probe table in ``hardware/host_metrics.py``. That table is a *discovery* source
+    (``ContextSource.DISCOVERED``) and belongs outside this directory precisely
+    because the host is the one device whose declaration cannot be hand-written --
+    its mounts, interfaces and sensors differ per machine.
+
+    ``media.py`` qualifies for the same reason, and its name is the evidence: it is
+    local media capture through a pluggable backend, not ``camera.py`` and
+    ``microphone.py``. Which kind of device it is talking to, the platform input
+    format and the input spec all arrive from the declaration; the capture backend
+    comes from availability. A pair of device-named modules here would have been the
+    device knowledge this rule exists to keep out of code.
     """
-    allowed = {"__init__.py", "mock.py", "simulated.py", "python_callable.py", "mcp.py"}
+    allowed = {
+        "__init__.py",
+        "mock.py",
+        "simulated.py",
+        "python_callable.py",
+        "mcp.py",
+        "host.py",
+        "media.py",
+    }
     present = {p.name for p in (HARDWARE_DIR / "transports").glob("*.py")}
     unexpected = present - allowed
     assert not unexpected, (
@@ -637,3 +659,31 @@ def test_each_store_hands_a_worker_thread_its_own_cursor(
     close = getattr(instance, "close", None)
     if callable(close):
         close()
+
+
+def test_only_watched_rpcs_get_an_approval_route() -> None:
+    """A route makes a handler wait for a human, so it must be a call somebody is watching.
+
+    Two failure modes bound this set from either side. Too narrow, and a caller that *can*
+    present a prompt cannot obtain one: an ordinary RPC has no route, so the coordinator
+    denies immediately and a board preview could never be approved. Too wide, and an
+    unattended RPC blocks on a prompt nobody will ever see.
+
+    The lifecycle is what makes membership safe: every routed request registers, denies on
+    exit, and unregisters, so a pending approval cannot outlive the caller that raised it.
+    """
+    from leapflow.daemon.server import _APPROVAL_ROUTED_METHODS
+    from leapflow.daemon.protocol import METHOD_REGISTRY
+
+    assert "command.execute" in _APPROVAL_ROUTED_METHODS, (
+        "slash commands are the original approval surface and must keep their route"
+    )
+    # The device observations, which are the reason the set exists at all.
+    assert {"hardware.frame", "hardware.read"} <= _APPROVAL_ROUTED_METHODS
+
+    unknown = sorted(_APPROVAL_ROUTED_METHODS - set(METHOD_REGISTRY))
+    assert not unknown, f"routed methods that no RPC answers: {unknown}"
+
+    # Writes are deliberately absent: they run through the tool handler, which builds its
+    # own descriptor and is reached from a turn that already owns a route.
+    assert "hardware.write_request" not in _APPROVAL_ROUTED_METHODS

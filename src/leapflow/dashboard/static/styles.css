@@ -265,3 +265,105 @@ button:hover { border-color: var(--accent); color: var(--accent); }
   border: 1px solid var(--line); font-size: 0.7rem; font-variant-numeric: tabular-nums;
   color: var(--muted); vertical-align: middle;
 }
+
+/* ── Device panels: preview, level meter, controls ───────────────────────────
+   Flat surfaces and hairline rules like every other panel: a preview is evidence
+   in a report, not a media player, so it gets no chrome of its own. */
+.row-actionable { cursor: pointer; }
+.row-actionable:hover { background: var(--panel-2); }
+
+.media-preview { display: flex; flex-direction: column; gap: 8px; }
+.media-stage {
+  background: var(--panel-2); border: 1px solid var(--line);
+  min-height: 120px; display: flex; align-items: center; justify-content: center;
+}
+/* Bounded height so a 1080p device cannot push the rest of the page off-screen,
+   and object-fit so the frame is never distorted to fit the box. */
+.media-frame { display: block; max-width: 100%; max-height: 42vh; object-fit: contain; }
+.media-status { color: var(--muted); font-size: .82rem; font-variant-numeric: tabular-nums; }
+.media-toggle, .control-actions button {
+  background: none; border: 1px solid var(--line); border-radius: 0;
+  padding: 4px 10px; cursor: pointer; color: var(--ink); font: inherit; font-size: .82rem;
+  transition: border-color .15s, color .15s;
+}
+.media-toggle:hover, .control-actions button:hover { border-color: var(--accent); color: var(--accent); }
+.control-actions button.primary { border-color: var(--ink); }
+.consent-notice { display: flex; align-items: center; gap: 8px; font-size: .82rem; color: var(--muted); }
+
+.level-meter { display: flex; align-items: center; gap: 10px; }
+.level-track { flex: 1; height: 6px; background: var(--track); border: 1px solid var(--line); }
+.level-fill { display: block; height: 100%; background: var(--accent); }
+.level-meter .value { font-variant-numeric: tabular-nums; color: var(--muted); font-size: .82rem; }
+
+.control-form { display: flex; flex-direction: column; gap: 8px; }
+.control-row { display: flex; align-items: center; gap: 8px; }
+.control-row input[type="text"], .control-row select {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 0;
+  padding: 4px 8px; font: inherit; font-size: .85rem; color: var(--ink); min-width: 12ch;
+}
+.control-row input[type="range"] { flex: 1; accent-color: var(--accent); }
+.control-row .unit { color: var(--muted); font-size: .82rem; }
+.control-actions { display: flex; gap: 8px; }
+.control-status { color: var(--muted); font-size: .82rem; min-height: 1.2em; }
+
+.tab-bar { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-bottom: 10px; }
+.tab-bar button {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  padding: 5px 10px; cursor: pointer; color: var(--muted); font: inherit; font-size: .85rem;
+}
+.tab-bar button.active { color: var(--ink); border-bottom-color: var(--accent); }
+
+.link-card a { color: var(--accent); text-decoration: none; }
+.link-card a:hover { text-decoration: underline; }
+.approval-prompt { border-left: 3px solid var(--notable); }
+
+/* ── Approval prompt ─────────────────────────────────────────────────────────
+   Rendered inside the panel that raised it, so the question sits next to the
+   thing it is about. The accent bar is the only decoration: this appears in the
+   middle of a card and must read as part of it, not as a separate dialog. */
+.approval-inline {
+  margin: 8px 0 4px; padding: 10px 12px;
+  border: 1px solid var(--rule); border-left: 3px solid var(--notable);
+  background: var(--surface-alt, rgba(23, 24, 28, .025));
+  display: flex; flex-direction: column; gap: 6px;
+}
+.approval-title { font-weight: 600; font-size: .92rem; }
+.approval-summary { font-size: .88rem; }
+.approval-reason { font-size: .8rem; color: var(--muted); }
+.approval-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+.approval-choice { font-size: .82rem; padding: 3px 10px; }
+.approval-choice:disabled { opacity: .45; cursor: default; }
+
+/* The fallback for a prompt no panel claimed. Still anchored to the viewport
+   rather than the document, so it cannot end up below the fold. */
+.approval-overlay {
+  position: fixed; top: 16px; right: 16px; z-index: 50; max-width: 30rem;
+}
+.approval-floating {
+  background: var(--surface, #fff);
+  box-shadow: 0 4px 24px rgba(23, 24, 28, .18);
+}
+
+/* ── Per-row actions ──────────────────────────────────────────────────────── */
+.row-actions { white-space: nowrap; text-align: right; }
+.row-actions button.row-action {
+  font-size: .78rem; padding: 2px 8px; margin-left: 4px;
+}
+.media-consent:empty { display: none; }
+.level-meter-block { display: flex; flex-direction: column; gap: 4px; width: 100%; }
+
+/* The profile selector is a transient view preference, not a config editor: it changes
+   this preview's bounded encoder request and is persisted only in this browser for this
+   physical channel. */
+.preview-settings {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 7px;
+  margin: 8px 0; font-size: .82rem;
+}
+.preview-profile-label, .preview-profile-summary { color: var(--muted); }
+.preview-profile { font: inherit; min-width: 7rem; }
+.preview-profile-summary { font-variant-numeric: tabular-nums; }
+.level-waveform {
+  display: block; width: 100%; margin-top: 8px;
+  border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
+  background: rgba(23, 24, 28, .015);
+}

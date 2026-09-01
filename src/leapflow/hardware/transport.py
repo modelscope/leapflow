@@ -155,6 +155,59 @@ class WriteOutcome:
 
 
 @dataclass(frozen=True)
+class FrameReading:
+    """One frame sampled from a ``representation=frame`` channel.
+
+    Deliberately *not* a ``Reading``. Readings are appended to NDJSON segments and
+    downsampled into DuckDB windows, and a frame has neither a mean nor a bound; a
+    few hundred kilobytes per sample would also turn the raw segment writer into a
+    disk filler with a schedule. So frames travel on their own type, are never
+    persisted by the sampling loop, and never enter a finding payload.
+
+    ``data`` is already encoded in ``media_type`` -- encoding happens inside the
+    transport, because only the driver knows the native pixel format and doing it
+    later would mean carrying raw buffers across a process boundary.
+
+    Timebase follows ``Reading``: ``observed_at`` is wall-clock and the only clock
+    that may be rendered or correlated; ``monotonic_at`` is for intervals only.
+    """
+
+    device_id: str
+    channel_id: str
+    data: bytes
+    media_type: str = "image/jpeg"
+    width: int = 0
+    height: int = 0
+    observed_at: float = field(default_factory=time.time)
+    monotonic_at: float = field(default_factory=time.monotonic)
+    sequence: int = 0
+    quality: str = Quality.OK.value
+
+    @property
+    def size_bytes(self) -> int:
+        return len(self.data)
+
+    def to_metadata(self) -> dict[str, Any]:
+        """Return the frame's description *without* its bytes.
+
+        The only form that may reach a tool result, a log line, or a JSON-RPC
+        reply. Inlining the bytes -- even base64 -- is what makes one camera read
+        cost more context than an entire conversation.
+        """
+        return {
+            "device_id": self.device_id,
+            "channel_id": self.channel_id,
+            "media_type": self.media_type,
+            "width": self.width,
+            "height": self.height,
+            "observed_at": self.observed_at,
+            "sequence": self.sequence,
+            "quality": self.quality,
+            "size_bytes": self.size_bytes,
+        }
+
+
+@dataclass(frozen=True)
 class TransportStatus:
     """Transport health and declared capabilities."""
 
@@ -230,11 +283,44 @@ class HardwareTransport(Protocol):
         ...
 
 
+@runtime_checkable
+class FrameTransport(Protocol):
+    """Optional capability: this transport can produce frames from a channel.
+
+    A *side* protocol, not a seventh core method. ``HardwareTransport`` is six
+    methods on purpose, and most devices will never have an image; widening the
+    core contract would force every existing driver -- in-tree and out -- to grow
+    a method it cannot implement.
+
+    Capability is therefore discovered with ``isinstance(transport,
+    FrameTransport)``, exactly as ``halt_supported=False`` makes "cannot stop" a
+    discoverable degradation rather than a silent assumption: a device declaring a
+    frame channel whose transport does not satisfy this Protocol has that channel
+    refused at admission, with a reason, instead of failing on first preview.
+    """
+
+    async def read_frame(
+        self, channel_id: str, *, max_width: int = 0, quality: int = 0, fps: float = 0.0
+    ) -> FrameReading:
+        """Capture one frame. Side-effect free.
+
+        ``max_width``, ``quality`` and ``fps`` are requests, not guarantees: a driver that
+        cannot scale, re-encode or choose a cadence returns its native frame, and the
+        caller reads actual dimensions from the result. The broker clamps every request
+        against the declaration and runtime ceilings before it reaches this method, so a
+        page's economy/balanced/detail setting changes real encoder work without allowing
+        it to demand an arbitrary capture rate.
+        """
+        ...
+
+
 __all__ = [
     "SIDE_EFFECT_COMMITTED",
     "SIDE_EFFECT_NONE",
     "SIDE_EFFECT_PARTIAL",
     "SIDE_EFFECT_UNKNOWN",
+    "FrameReading",
+    "FrameTransport",
     "HardwareTransport",
     "Reading",
     "TransportError",

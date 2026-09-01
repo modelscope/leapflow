@@ -282,6 +282,9 @@ class HardwareTools:
                 "channel_not_readable",
                 f"Channel {channel_id!r} is not readable on {device_id!r}.",
             )
+        consent = await self._consent_for_read(context, channel)
+        if consent is not None:
+            return consent
         try:
             async with self._registry.device_io(device_id):
                 transport = await self._registry.transport(device_id)
@@ -787,6 +790,70 @@ class HardwareTools:
             )
         except Exception as exc:  # noqa: BLE001 - reporting must not fail the refusal
             logger.warning("Could not report %s as unreachable: %s", device_id, exc, exc_info=True)
+
+    async def _consent_for_read(
+        self, context: HardwareContext, channel: Channel
+    ) -> dict[str, Any] | None:
+        """Gate a read that discloses the surroundings; None means it may proceed.
+
+        Only privacy-gated channels reach the orchestrator. Ordinary reads are not
+        merely cheap to approve, they are *worth* not approving: a prompt per
+        thermometer read is how a gate gets dismissed by the person it protects.
+
+        The descriptor is built exactly as a write's is, so the same classifier,
+        policy, grant store and audit log apply -- the risk classifier reads the
+        declared privacy tier and answers SAFE for everything else. Two failure modes
+        matter and both deny:
+
+        - **No gate installed.** The in-process CLI binds none, so a camera read there
+          is refused rather than performed unguarded. Named as a configuration fault
+          because that is what it is.
+        - **A gate that raises.** Handled inside ``_evaluate``, which is why this goes
+          through it rather than calling the gate directly.
+
+        Denial happens *before* the transport is touched, which is the property that
+        matters most here: on macOS, opening the device is what raises the system
+        permission dialog, so a refused read must never get that far.
+        """
+        if not channel.is_privacy_gated:
+            return None
+
+        descriptor = ActionDescriptor.device(
+            kind=ActionKind.DEVICE_READ.value,
+            device_id=context.device_id,
+            channel_id=channel.channel_id,
+            quantity=channel.quantity,
+            unit=channel.unit,
+            location=context.location,
+            # A read changes nothing, so it is reversible in the only sense the word
+            # has here -- but the disclosure it makes is not undone by stopping.
+            reversible=True,
+            metadata={
+                "privacy": channel.privacy,
+                "representation": channel.representation,
+                "session_id": self._session_id,
+            },
+        )
+        allowed, denial = await self._evaluate(descriptor)
+        if allowed:
+            return None
+        self._audit.record(
+            action="read_denied",
+            device=context.device_id,
+            channel=channel.channel_id,
+            outcome=f"privacy={channel.privacy}",
+            identity=self._session_id,
+        )
+        return self._refusal(
+            context.device_id,
+            channel.channel_id,
+            "consent_required",
+            denial
+            or (
+                f"Reading {context.device_id}.{channel.channel_id} observes the physical "
+                "surroundings and was not approved."
+            ),
+        )
 
     async def _evaluate(self, descriptor: ActionDescriptor) -> tuple[bool, str]:
         """Run the approval gate, failing closed on absence and on exception.

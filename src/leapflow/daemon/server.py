@@ -21,6 +21,26 @@ logger = logging.getLogger(__name__)
 _DEFAULT_STREAM_HEARTBEAT_S = 10.0
 _DEFAULT_IDLE_TIMEOUT_S = 600.0
 
+_APPROVAL_ROUTED_METHODS = frozenset({
+    "command.execute",
+    # A device observation that discloses the surroundings needs consent, and consent
+    # needs somewhere to ask. Without a route the coordinator denies immediately
+    # (``request_approval`` returns "deny" when ``route is None``), which is fail-closed
+    # but leaves a caller that *can* present a prompt -- the board -- unable to obtain
+    # one. The prompt travels as an interleaved ``stream.chunk`` notification on this
+    # request's own socket, which ``DaemonClient.request(on_stream_event=...)`` already
+    # forwards to whoever asked.
+    "hardware.frame",
+    "hardware.read",
+})
+"""RPCs that may raise an approval prompt, and therefore get a route installed.
+
+Deliberately a small allow-list rather than "every awaitable method". A route makes the
+handler wait for a human, so a method that acquires one must be a call somebody is
+watching. The lifecycle -- register, deny-on-exit, unregister -- is identical for all of
+them, so a routed request cannot leak a pending approval when its caller disconnects.
+"""
+
 
 def _stream_heartbeat_interval() -> float:
     raw = os.getenv("LEAPFLOW_DAEMON_STREAM_HEARTBEAT", str(_DEFAULT_STREAM_HEARTBEAT_S)).strip()
@@ -183,7 +203,7 @@ class UnixRpcServer:
         if hasattr(result, "__await__"):
             approval_queue: asyncio.Queue[StreamChunk] | None = None
             route_token: contextvars.Token[Any] | None = None
-            if request.method == "command.execute":
+            if request.method in _APPROVAL_ROUTED_METHODS:
                 from leapflow.daemon.approval_route import approval_route as _approval_route
 
                 approval_queue = asyncio.Queue()
