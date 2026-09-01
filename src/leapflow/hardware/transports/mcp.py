@@ -37,6 +37,7 @@ transport terms the operator cannot evaluate.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Callable, Mapping
 
@@ -117,9 +118,14 @@ class McpTransport:
         channel it exposes is a configuration fault, and surfacing it at admission
         time is the difference between an unusable device and a device that fails
         halfway through an experiment.
+
+        After structural validation, the declared tool names are cross-checked
+        against the MCP server's actual capability list.  A mismatch is fail-closed:
+        a tool this transport was not told about is not called, and a tool that does
+        not exist on the server will fail on every invocation.
         """
         self._context = context
-        self._require_client()
+        client = self._require_client()
         if any(channel.is_readable for channel in context.channels) and not self._read_tool:
             raise TransportError(
                 "mcp transport exposes readable channels but declares no read_tool",
@@ -130,8 +136,77 @@ class McpTransport:
                 "mcp transport exposes writable channels but declares no write_tool",
                 failure_code="mcp_write_tool_missing",
             )
+        # Cross-check declared tool names against the server's actual capabilities.
+        await self._validate_server_capabilities(client)
         self._connected = True
         return await self.probe()
+
+    async def _validate_server_capabilities(self, client: Any) -> None:
+        """Verify that every declared tool exists on the MCP server.
+
+        Fail-closed: a declared tool that the server does not advertise will
+        fail on every invocation, so refusing at open() is strictly better than
+        failing halfway through an experiment.  The check is skipped when the
+        server does not expose a capability list (older servers, non-standard
+        implementations).
+
+        ``list_tools`` may be synchronous (returning a list directly) or
+        asynchronous (returning a coroutine).  Both shapes are accepted.
+        """
+        server_tools: set[str] | None = None
+        try:
+            # MCP clients typically expose server capabilities via list_tools()
+            # or a tools property.  We try both common shapes.
+            if hasattr(client, "list_tools"):
+                raw = client.list_tools()
+                tool_list = await raw if asyncio.iscoroutine(raw) else raw
+                if isinstance(tool_list, (list, tuple)):
+                    server_tools = set()
+                    for entry in tool_list:
+                        if isinstance(entry, str):
+                            server_tools.add(entry)
+                        elif hasattr(entry, "name"):
+                            server_tools.add(str(entry.name))
+                        elif isinstance(entry, dict) and "name" in entry:
+                            server_tools.add(str(entry["name"]))
+            elif hasattr(client, "tools"):
+                raw = client.tools
+                if isinstance(raw, (list, tuple)):
+                    server_tools = set()
+                    for entry in raw:
+                        if isinstance(entry, str):
+                            server_tools.add(entry)
+                        elif hasattr(entry, "name"):
+                            server_tools.add(str(entry.name))
+                        elif isinstance(entry, dict) and "name" in entry:
+                            server_tools.add(str(entry["name"]))
+        except Exception as exc:  # noqa: BLE001 - best-effort capability check
+            logger.debug(
+                "Could not enumerate MCP server tools for %s: %s",
+                self._server, exc, exc_info=True,
+            )
+            return  # Cannot check — degrade gracefully, do not fail.
+
+        if server_tools is None:
+            return  # Server does not expose a capability list.
+
+        declared = [
+            ("read_tool", self._read_tool),
+            ("write_tool", self._write_tool),
+            ("probe_tool", self._probe_tool),
+            ("halt_tool", self._halt_tool),
+        ]
+        missing: list[str] = []
+        for role, name in declared:
+            if name and name not in server_tools:
+                missing.append(f"{role}={name!r}")
+        if missing:
+            raise TransportError(
+                f"MCP server {self._server!r} does not advertise the following "
+                f"declared tools: {', '.join(missing)}. Available: "
+                f"{sorted(server_tools)}",
+                failure_code="mcp_capability_mismatch",
+            )
 
     async def close(self) -> TransportStatus:
         # Must never raise: teardown runs on paths where an exception would mask the

@@ -196,8 +196,12 @@ def test_hardware_transports_are_not_named_after_one_device() -> None:
     transport *mechanism* -- one protocol, any device that speaks it -- and it holds
     no tool name, argument name or response key of its own. Every one of those is
     read from the declaration, which is what keeps a bench reviewable.
+
+    ``simulated.py`` qualifies too: it synthesises readings from a declared
+    waveform and models generic link misbehaviour (latency, drop, reorder,
+    disconnect), never anything specific to one instrument.
     """
-    allowed = {"__init__.py", "mock.py", "python_callable.py", "mcp.py"}
+    allowed = {"__init__.py", "mock.py", "simulated.py", "python_callable.py", "mcp.py"}
     present = {p.name for p in (HARDWARE_DIR / "transports").glob("*.py")}
     unexpected = present - allowed
     assert not unexpected, (
@@ -464,6 +468,96 @@ def test_engine_self_attributes_all_exist() -> None:
 
     undefined = sorted(read - assigned - on_class)
     assert not undefined, f"engine reads attributes that are never assigned: {undefined}"
+
+
+# ════════════════════════════════════════════════════════════════
+# CBAG: emit wiring exists + hardware producer registered (G15 / G24)
+# ════════════════════════════════════════════════════════════════
+
+
+def test_hardware_event_emitter_path_exists_in_context() -> None:
+    """The emit wiring path must exist so hardware events reach EventBus.
+
+    CBAG G15: six detection rules produced events that reached nothing because
+    ``set_event_emitter`` was never called, or ``_hardware_event_emitter`` was
+    not defined. This asserts the path *exists* at the source level — a structural
+    guard that catches deletion, rename, or accidental removal.
+    """
+    import ast
+
+    context_source = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "src" / "leapflow" / "cli" / "context.py"
+    )
+    tree = ast.parse(context_source.read_text(encoding="utf-8"))
+    method_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            method_names.add(node.name)
+
+    assert "_hardware_event_emitter" in method_names, (
+        "G15 regression: _hardware_event_emitter() was removed from context.py; "
+        "without it, hardware events never reach EventBus"
+    )
+    assert "_start_hardware_streams" in method_names, (
+        "G15 regression: _start_hardware_streams() was removed from context.py; "
+        "without it, the sampling loop never starts"
+    )
+
+
+def test_set_event_emitter_is_called_in_start_hardware_streams() -> None:
+    """The emit sink must be installed *before* streams start.
+
+    CBAG G15: if ``set_event_emitter`` is not called in the start path, events
+    produced by the sampling loop go nowhere — recorded for hw_status but not
+    actionable via watches, board, or notifications.
+    """
+    context_source = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "src" / "leapflow" / "cli" / "context.py"
+    )
+    source = context_source.read_text(encoding="utf-8")
+    # The call must appear somewhere in the file: either directly or via a
+    # helper, the registry must receive an emitter.
+    assert "set_event_emitter" in source, (
+        "G15 regression: set_event_emitter is not called anywhere in context.py; "
+        "the sampling loop would emit events into the void"
+    )
+
+
+def test_hardware_producer_is_registered_when_hardware_is_enabled() -> None:
+    """The ``hardware`` domain must appear in the monitor producer registry.
+
+    CBAG G24: ``HardwareObservationProducer`` was registered but never invoked
+    because no watch named the ``hardware`` domain. This is the structural
+    check that the producer is registered *and* that a default watch exists.
+    """
+    from leapflow.hardware.observability import DOMAIN, HardwareObservationProducer
+
+    assert DOMAIN == "hardware", (
+        "G24 regression: the hardware producer domain must be 'hardware'"
+    )
+    # The producer must be instantiable with a provider callable.
+    producer = HardwareObservationProducer(lambda: None)
+    assert producer.domain == "hardware", (
+        "G24 regression: HardwareObservationProducer.domain is not 'hardware'"
+    )
+
+
+def test_hardware_default_watch_targets_the_hardware_domain() -> None:
+    """The daemon arms a default watch whose domain matches the producer's.
+
+    CBAG G24: without a watch naming ``hardware``, the producer runs zero
+    times — even though it is registered. The watch list is the contract.
+    """
+    from leapflow.daemon.monitor_coordinator import MonitorCoordinator
+
+    # The class-level _DEFAULT_WATCHES must include a hardware entry.
+    domains = [domain for _name, domain, _trigger in MonitorCoordinator._DEFAULT_WATCHES]
+    assert "hardware" in domains, (
+        "G24 regression: no default watch targets the 'hardware' domain; "
+        "the HardwareObservationProducer would be registered but never invoked"
+    )
 
 
 # ════════════════════════════════════════════════════════════════

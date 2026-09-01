@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 from leapflow.security.actions import ActionDescriptor
-from leapflow.security.risk import RiskAssessment
+from leapflow.security.risk import RiskAssessment, RiskLevel
 
 logger = logging.getLogger(__name__)
 
@@ -132,10 +132,28 @@ class SessionAwareGate:
     async def request_approval(
         self, request: ApprovalRequest,
     ) -> ApprovalDecision:
-        # Session-wide bypass: auto-approve everything without prompting
+        # Session-wide bypass: auto-approve without prompting, EXCEPT
+        # high/critical-risk actions whose risk classifier set
+        # allow_permanent=False.  Those actions require per-invocation
+        # consent; letting a low-risk approval silently extend to them
+        # would let plugin installs, external sends, and credential
+        # reads bypass the gate they are specifically designed to hit.
         if self._bypass_all:
-            self._log_decision(request, ApprovalDecision.ALLOW, auto=True)
-            return ApprovalDecision.ALLOW
+            risk = request.risk
+            if (
+                risk is not None
+                and not risk.allow_permanent
+                and risk.level in {RiskLevel.HIGH, RiskLevel.CRITICAL}
+            ):
+                logger.info(
+                    "bypass_all.fallthrough category=%s level=%s "
+                    "allow_permanent=False",
+                    request.category,
+                    risk.level.value,
+                )
+            else:
+                self._log_decision(request, ApprovalDecision.ALLOW, auto=True)
+                return ApprovalDecision.ALLOW
 
         grant_key = request.grant_key
         if grant_key in self._approved_categories:
@@ -143,6 +161,27 @@ class SessionAwareGate:
             return ApprovalDecision.ALLOW
 
         decision = await self._delegate.request_approval(request)
+
+        # Validate that the delegate's decision is within the declared
+        # choices.  A delegate returning a choice the orchestrator
+        # withheld (e.g. allow_all_session when allow_permanent=False)
+        # is either a UI defect or a spoofed response; fail-closed to
+        # the request's default (deny) rather than honouring it.
+        if request.choices and decision.value not in request.choices:
+            logger.warning(
+                "approval.decision_out_of_choices category=%s "
+                "decision=%s choices=%s",
+                request.category,
+                decision.value,
+                request.choices,
+            )
+            try:
+                fallback = ApprovalDecision(request.default_choice)
+            except ValueError:
+                fallback = ApprovalDecision.DENY
+            self._log_decision(request, fallback)
+            return fallback
+
         if decision == ApprovalDecision.ALLOW_ALL_SESSION:
             self._bypass_all = True
             self._log_decision(request, decision, session=True)

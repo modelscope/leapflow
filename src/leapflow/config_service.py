@@ -140,6 +140,11 @@ _FIELD_DESCRIPTIONS = {
         "Let one consent cover a channel's whole declared envelope band. Off asks for "
         "every command separately. Read at startup, so a change needs a daemon restart."
     ),
+    "hardware.trust_skip_enabled": (
+        "Let reversible channels with VERIFIED+ trust skip per-command approval. "
+        "Off by default; irreversible channels always require approval regardless. "
+        "Read at startup, so a change needs a daemon restart."
+    ),
     "hardware.stream_enabled": (
         "Sample channels that declare a sample rate. Sampling loops start during "
         "initialization, so a change needs a daemon restart."
@@ -172,6 +177,13 @@ _FIELD_DESCRIPTIONS = {
         "segment is written once, so its indexed size and TTL are accurate and old data "
         "can expire without touching the file being appended to. Read when sampling "
         "starts, so a change needs a daemon restart."
+    ),
+    "hardware.reading_store_sensitive": (
+        "Register the durable instrument.duckdb history tier as sensitive and "
+        "non-syncable, so a profile backup excludes physical series that may carry a "
+        "trade secret or sample information. On by default; opt out only for a bench "
+        "known to produce no sensitive data. Applied when the store is built, so a "
+        "change needs a daemon restart."
     ),
     "llm.api_key": "Primary LLM API key stored in the local secret vault.",
     "llm.aux_api_key": "Auxiliary LLM provider API key stored in the local secret vault.",

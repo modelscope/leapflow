@@ -752,3 +752,244 @@ def test_margin_does_not_reopen_the_non_numeric_path(value: Any) -> None:
     """Still fail-closed: "cannot evaluate" carries the same weight as "out of range"."""
     envelope = Envelope(declared=True, min_value=0.0, max_value=100.0)
     assert envelope.contains(value, margin=1.0) is False
+
+
+# ════════════════════════════════════════════════════════════════
+# Enumerated (allowed_values) envelope
+# ════════════════════════════════════════════════════════════════
+
+
+def test_enum_envelope_admits_declared_values() -> None:
+    """An enumerated envelope checks membership, not numeric range."""
+    envelope = Envelope(declared=True, allowed_values=("ac", "battery"))
+    assert envelope.contains("ac") is True
+    assert envelope.contains("battery") is True
+    assert envelope.contains("dc") is False
+    assert envelope.contains(42) is False
+
+
+def test_enum_envelope_boolean_values() -> None:
+    """Boolean enum: True/False are discrete states, not numbers."""
+    envelope = Envelope(declared=True, allowed_values=(True, False))
+    assert envelope.contains(True) is True
+    assert envelope.contains(False) is True
+    assert envelope.contains("on") is False
+
+
+def test_enum_envelope_undeclared_still_admits_nothing() -> None:
+    """An undeclared envelope with allowed_values is still undeclared."""
+    envelope = Envelope(declared=False, allowed_values=("a", "b"))
+    assert envelope.contains("a") is False
+
+
+def test_empty_allowed_values_preserves_numeric_behavior() -> None:
+    """Default empty allowed_values is fully backward-compatible."""
+    envelope = Envelope(declared=True, min_value=0.0, max_value=100.0)
+    assert envelope.allowed_values == ()
+    assert envelope.contains(50.0) is True
+    assert envelope.contains(200.0) is False
+
+
+def test_empty_allowed_values_state_channel_unchanged() -> None:
+    """A state channel with no allowed_values admits any value (existing behavior)."""
+    envelope = Envelope(declared=True)
+    assert envelope.allowed_values == ()
+    assert envelope.contains("standby") is True
+    assert envelope.contains(True) is True
+
+
+def test_enum_envelope_is_not_numeric() -> None:
+    """An enum envelope with no numeric bounds is not numeric."""
+    envelope = Envelope(declared=True, allowed_values=("ac", "battery"))
+    assert envelope.is_numeric is False
+
+
+def test_enum_envelope_band_key_is_stable() -> None:
+    """Band key for enum envelopes must be deterministic."""
+    a = Envelope(declared=True, allowed_values=("battery", "ac"))
+    b = Envelope(declared=True, allowed_values=("ac", "battery"))
+    assert a.band_key() == b.band_key()
+    assert a.band_key().startswith("enum:")
+
+
+def test_enum_envelope_band_key_changes_on_set_change() -> None:
+    """Grant identity must be invalidated when allowed values change."""
+    narrow = Envelope(declared=True, allowed_values=("ac", "battery"))
+    wider = Envelope(declared=True, allowed_values=("ac", "battery", "usb"))
+    assert narrow.band_key() != wider.band_key()
+
+
+def test_enum_envelope_round_trips_through_mapping() -> None:
+    """Serialization and deserialization preserve allowed_values."""
+    original = Envelope(declared=True, allowed_values=("ac", "battery"))
+    restored = Envelope.from_mapping(original.to_dict())
+    assert restored == original
+    assert restored.allowed_values == ("ac", "battery")
+
+
+def test_enum_envelope_from_mapping_ignores_non_list() -> None:
+    """Non-list allowed_values in a mapping is treated as absent."""
+    envelope = Envelope.from_mapping({"declared": True, "allowed_values": "not_a_list"})
+    assert envelope.allowed_values == ()
+
+
+def test_yaml_enum_envelope(tmp_path: Path) -> None:
+    """YAML declarations can specify allowed_values for enum channels."""
+    _write_declaration(
+        tmp_path,
+        "enum_device",
+        {
+            "hc_version": HC_VERSION,
+            "device_id": "enum_device",
+            "display_name": "Enum device",
+            "halt_supported": True,
+            "transport": {"kind": "mock"},
+            "channels": [
+                {
+                    "channel_id": "power_source",
+                    "direction": "read",
+                    "quantity": "power.source",
+                    "effect": "read",
+                    "envelope": {
+                        "declared": True,
+                        "allowed_values": ["ac", "battery"],
+                    },
+                }
+            ],
+        },
+    )
+    provider = YamlContextProvider({"devices_dir": tmp_path})
+    contexts = provider.discover()
+    assert len(contexts) == 1
+    ch = contexts[0].channel("power_source")
+    assert ch is not None
+    assert ch.envelope.allowed_values == ("ac", "battery")
+    assert ch.envelope.contains("ac") is True
+    assert ch.envelope.contains("dc") is False
+
+
+# ════════════════════════════════════════════════════════════════
+# Tolerance (G-1) and settling model (G-2)
+# ════════════════════════════════════════════════════════════════
+
+
+def test_tolerance_defaults_to_zero() -> None:
+    """Zero tolerance preserves existing span-based normalisation."""
+    envelope = Envelope(declared=True, min_value=0.0, max_value=100.0)
+    assert envelope.tolerance == 0.0
+
+
+def test_tolerance_field_is_declared() -> None:
+    """A positive tolerance is carried through construction."""
+    envelope = Envelope(declared=True, min_value=0.0, max_value=100.0, tolerance=0.5)
+    assert envelope.tolerance == 0.5
+
+
+def test_settling_model_defaults_to_step() -> None:
+    """Default settling model is the existing step behaviour."""
+    envelope = Envelope(declared=True)
+    assert envelope.settling_model == "step"
+    assert envelope.settling_tau_s == 0.0
+
+
+def test_effective_settling_step_uses_settling_time_s() -> None:
+    """Step model delegates to the existing settling_time_s."""
+    envelope = Envelope(declared=True, settling_time_s=3.0)
+    assert envelope.effective_settling_s == pytest.approx(3.0)
+
+
+def test_effective_settling_first_order_uses_five_tau() -> None:
+    """First-order model: 5τ gives 99 % convergence."""
+    envelope = Envelope(
+        declared=True, settling_model="first_order", settling_tau_s=2.0
+    )
+    assert envelope.effective_settling_s == pytest.approx(10.0)
+
+
+def test_effective_settling_both_declared_takes_max() -> None:
+    """When both settling_time_s and tau are declared, the larger governs."""
+    # tau*5 = 10.0 > settling_time_s = 3.0 → 10.0
+    envelope = Envelope(
+        declared=True,
+        settling_time_s=3.0,
+        settling_model="first_order",
+        settling_tau_s=2.0,
+    )
+    assert envelope.effective_settling_s == pytest.approx(10.0)
+
+    # settling_time_s = 20.0 > tau*5 = 10.0 → 20.0
+    envelope2 = Envelope(
+        declared=True,
+        settling_time_s=20.0,
+        settling_model="first_order",
+        settling_tau_s=2.0,
+    )
+    assert envelope2.effective_settling_s == pytest.approx(20.0)
+
+
+def test_effective_settling_zero_tau_on_first_order_falls_back_to_step() -> None:
+    """A first_order declaration with tau=0 degrades to step."""
+    envelope = Envelope(
+        declared=True, settling_time_s=5.0,
+        settling_model="first_order", settling_tau_s=0.0,
+    )
+    assert envelope.effective_settling_s == pytest.approx(5.0)
+
+
+def test_tolerance_and_settling_round_trip_through_mapping() -> None:
+    """New fields survive serialise → deserialise without loss."""
+    original = Envelope(
+        declared=True,
+        min_value=0.0,
+        max_value=100.0,
+        tolerance=0.5,
+        settling_model="first_order",
+        settling_tau_s=3.0,
+        settling_time_s=2.0,
+        reversible=True,
+    )
+    restored = Envelope.from_mapping(original.to_dict())
+    assert restored == original
+    assert restored.tolerance == 0.5
+    assert restored.settling_model == "first_order"
+    assert restored.settling_tau_s == 3.0
+
+
+def test_yaml_tolerance_and_settling_model(tmp_path: Path) -> None:
+    """YAML declarations support tolerance and settling_model."""
+    _write_declaration(
+        tmp_path,
+        "sensor",
+        {
+            "hc_version": HC_VERSION,
+            "device_id": "sensor",
+            "display_name": "Sensor",
+            "halt_supported": True,
+            "transport": {"kind": "mock", "config": {"values": {"temp": 25.0}}},
+            "channels": [
+                {
+                    "channel_id": "temp",
+                    "direction": "read",
+                    "quantity": "temperature.ambient",
+                    "unit": "degC",
+                    "envelope": {
+                        "declared": True,
+                        "min_value": -40.0,
+                        "max_value": 85.0,
+                        "tolerance": 0.5,
+                        "settling_model": "first_order",
+                        "settling_tau_s": 2.0,
+                    },
+                }
+            ],
+        },
+    )
+    provider = YamlContextProvider({"devices_dir": tmp_path})
+    contexts = provider.discover()
+    assert len(contexts) == 1
+    ch = contexts[0].channel("temp")
+    assert ch is not None
+    assert ch.envelope.tolerance == 0.5
+    assert ch.envelope.settling_model == "first_order"
+    assert ch.envelope.settling_tau_s == 2.0
+    assert ch.envelope.effective_settling_s == pytest.approx(10.0)

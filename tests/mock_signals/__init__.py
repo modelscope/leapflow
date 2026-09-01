@@ -9,6 +9,8 @@ from tests.mock_signals.generators import (
     InputGenerator,
     GatewaySignalGenerator,
     GatewayMessageGenerator,
+    HardwareChannelSpec,
+    HardwareSignalGenerator,
 )
 from tests.mock_signals.profiles import PROFILES, ScenarioProfile
 from tests.mock_signals.runner import MockSignalRunner, RunResult
@@ -22,6 +24,8 @@ __all__ = [
     "InputGenerator",
     "GatewaySignalGenerator",
     "GatewayMessageGenerator",
+    "HardwareChannelSpec",
+    "HardwareSignalGenerator",
     "PROFILES",
     "ScenarioProfile",
     "MockSignalRunner",

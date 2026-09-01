@@ -231,6 +231,24 @@ class RuleEngine:
     def __init__(self, rules: Optional[List[CausalRule]] = None) -> None:
         self._rules = rules if rules is not None else _load_default_rules()
 
+    @property
+    def rules(self) -> List[CausalRule]:
+        """Return a copy of the current rule list."""
+        return list(self._rules)
+
+    def add_rule(self, rule: CausalRule) -> None:
+        """Append a rule dynamically (e.g. from teach→rule injection).
+
+        Duplicate names are silently replaced so a reload never produces
+        parallel copies of the same declaration.
+        """
+        self._rules = [r for r in self._rules if r.name != rule.name]
+        self._rules.append(rule)
+
+    def set_rules(self, rules: List[CausalRule]) -> None:
+        """Replace the entire rule set (used by ``reload_rules``)."""
+        self._rules = list(rules)
+
     def infer(self, events: List[CausalEvent], graph: CausalGraph) -> int:
         """Apply rules to establish edges. Returns number of edges added."""
         edges_added = 0
@@ -625,3 +643,44 @@ class CausalInferenceEngine:
     @property
     def verifier(self) -> VLMVerifier:
         return self._verifier
+
+    # ── Dynamic rule management ──
+
+    def add_rule(self, rule: CausalRule) -> None:
+        """Add or replace a single rule at runtime.
+
+        Designed for the teach→rule injection path: a rule discovered during a
+        session can be installed immediately without a full reload. Duplicate
+        names are replaced so that teaching the same rule twice does not
+        accumulate copies.
+        """
+        self._rules.add_rule(rule)
+        logger.debug("Dynamic rule added: %s", rule.name)
+
+    def reload_rules(self, path: Optional[Path] = None) -> int:
+        """Hot-reload rules from YAML (default: bundled ``rules.yaml``).
+
+        Returns the number of rules loaded. Existing dynamic rules that are
+        not present in the file are preserved, because they may have been
+        injected by teach→rule during this session.
+        """
+        target = path or _DEFAULT_RULES_PATH
+        try:
+            loaded = load_rules_from_yaml(target)
+        except Exception as exc:
+            logger.warning("reload_rules failed for %s: %s", target, exc, exc_info=True)
+            return len(self._rules.rules)
+
+        # Preserve dynamic (non-file) rules that are not in the reloaded set.
+        loaded_names = {r.name for r in loaded}
+        dynamic = [
+            r for r in self._rules.rules
+            if r.name not in loaded_names
+        ]
+        merged = loaded + dynamic
+        self._rules.set_rules(merged)
+        logger.info(
+            "Rules reloaded: %d from file, %d dynamic, %d total",
+            len(loaded), len(dynamic), len(merged),
+        )
+        return len(merged)

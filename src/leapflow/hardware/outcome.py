@@ -37,6 +37,15 @@ for the life of the process, and an observation arriving fifteen minutes later s
 about the room than about the command.
 """
 
+_MAX_PENDING_PER_CHANNEL = 4
+"""Maximum pending commands tracked per ``(device_id, channel_id)`` pair.
+
+Prevents unbounded memory growth when commands arrive faster than observations.
+When the cap is hit the oldest pending command is evicted -- it was the least
+likely to match an incoming observation, and losing it is strictly better than
+losing the newest command that is still expected to settle.
+"""
+
 
 @dataclass(frozen=True)
 class PhysicalOutcome:
@@ -189,12 +198,20 @@ def normalized_delta(
     entirely different things. Dividing by the declared envelope span makes the error
     dimensionless and comparable -- another use for limits a human already wrote down.
 
+    **G-1 (confirmed by E3-T0)**: when ``tolerance`` (absolute precision) is declared,
+    the delta is normalised against it instead of the span.  Bias is an absolute
+    quantity that does not scale with the declared range; span-normalisation makes a
+    tight-tolerance channel report a misleadingly small error.
+
     Without a declared span the residual is scaled against the magnitude of the command
     instead, which keeps the value bounded and meaningful; a command of zero falls back to
     the bare residual, clamped.
     """
     residual = observed - commanded
     magnitude = abs(residual)
+    # G-1: tolerance takes precedence over span when declared.
+    if envelope.tolerance > 0:
+        return min(1.0, magnitude / envelope.tolerance), residual
     span = _declared_span(envelope)
     if span:
         return min(1.0, magnitude / span), residual
@@ -203,12 +220,16 @@ def normalized_delta(
     return min(1.0, magnitude), residual
 
 
-_BIAS_ALPHA = 0.3
+_BIAS_ALPHA = 0.1
 """Weight given to the newest residual when updating a channel's bias.
 
-Low enough that one outlier cannot capture the estimate, high enough that a device
-whose behaviour genuinely changed is tracked within a few commands. A plain mean would
-never forget the state the bench was in last week.
+An exponential moving average (EMA) forgetting factor. Low enough that one
+outlier cannot capture the estimate, high enough that a device whose behaviour
+genuinely changed is tracked within a moderate number of commands. Under
+continuous drift the estimate converges rather than accumulating without bound,
+because each update discounts the prior by ``(1 - alpha)``.
+
+A plain mean would never forget the state the bench was in last week.
 """
 
 _MAX_BIAS_SPAN_FRACTION = 0.25
@@ -237,9 +258,10 @@ class HardwareOutcomeRecorder:
     ) -> None:
         self._store = experience_store
         self._pending_ttl_s = pending_ttl_s
-        self._pending: dict[tuple[str, str], _PendingCommand] = {}
+        self._pending: dict[tuple[str, str], list[_PendingCommand]] = {}
         self._bias: dict[tuple[str, str], tuple[float, int]] = {}
         self._recorded = 0
+        self._evicted_pending_total = 0
 
     @property
     def enabled(self) -> bool:
@@ -251,7 +273,12 @@ class HardwareOutcomeRecorder:
 
     @property
     def pending(self) -> int:
-        return len(self._pending)
+        return sum(len(entries) for entries in self._pending.values())
+
+    @property
+    def evicted_pending_total(self) -> int:
+        """Total non-expired pending commands evicted because the per-channel cap was full."""
+        return self._evicted_pending_total
 
     # ── Command side ──
 
@@ -277,7 +304,7 @@ class HardwareOutcomeRecorder:
             return
         moment = now if now is not None else time.monotonic()
         key = (device_id, channel.channel_id)
-        self._pending[key] = _PendingCommand(
+        entry = _PendingCommand(
             device_id=device_id,
             channel_id=channel.channel_id,
             quantity=channel.quantity,
@@ -289,9 +316,31 @@ class HardwareOutcomeRecorder:
             # Settling is respected because a reading taken before the value stabilises
             # measures the transition, not the outcome. Recording that as the error would
             # teach the store something false about the device.
-            settle_after=moment + max(0.0, channel.envelope.settling_time_s),
+            settle_after=moment + max(0.0, channel.envelope.effective_settling_s),
             expires_at=moment + self._pending_ttl_s,
         )
+        entries = self._pending.setdefault(key, [])
+        entries.append(entry)
+        # When the list exceeds the cap, reclaim space in two stages:
+        # 1. Purge any entries that have already expired — they would never
+        #    match an observation anyway, so removing them loses nothing.
+        # 2. Only if still over the limit (all entries are live), FIFO-evict
+        #    the oldest non-expired entry and count it so the operator can
+        #    tell whether the cap is too small for the write rate.
+        if len(entries) > _MAX_PENDING_PER_CHANNEL:
+            entries[:] = [e for e in entries if moment <= e.expires_at]
+            if len(entries) > _MAX_PENDING_PER_CHANNEL:
+                entries.pop(0)
+                self._evicted_pending_total += 1
+                logger.debug(
+                    "Evicted a non-expired pending command on %s.%s "
+                    "(pending=%d, cap=%d, evicted_total=%d)",
+                    device_id,
+                    channel.channel_id,
+                    len(entries),
+                    _MAX_PENDING_PER_CHANNEL,
+                    self._evicted_pending_total,
+                )
 
     # ── Observation side ──
 
@@ -311,20 +360,34 @@ class HardwareOutcomeRecorder:
         if self._store is None:
             return None
         key = (device_id, channel_id)
-        pending = self._pending.get(key)
-        if pending is None:
+        entries = self._pending.get(key)
+        if not entries:
             return None
         moment = now if now is not None else time.monotonic()
-        if moment > pending.expires_at:
-            self._pending.pop(key, None)
+
+        # Purge expired entries before searching for a match.
+        entries[:] = [e for e in entries if moment <= e.expires_at]
+        if not entries:
+            del self._pending[key]
             return None
-        if moment < pending.settle_after:
+
+        # Among settled entries, pick the one with the earliest settle_after
+        # (FIFO for equal settling) so the oldest ready command is matched first.
+        best_idx: int | None = None
+        for idx, entry in enumerate(entries):
+            if moment >= entry.settle_after:
+                if best_idx is None or entry.settle_after < entries[best_idx].settle_after:
+                    best_idx = idx
+        if best_idx is None:
             return None
+
         observed = as_numeric(value)
         if observed is None:
             return None
 
-        self._pending.pop(key, None)
+        pending = entries.pop(best_idx)
+        if not entries:
+            del self._pending[key]
         delta, residual = normalized_delta(
             commanded=pending.commanded, observed=observed, envelope=pending.envelope
         )
@@ -379,13 +442,20 @@ class HardwareOutcomeRecorder:
         return max(-cap, min(cap, bias))
 
     def _update_bias(self, key: tuple[str, str], residual: float) -> None:
-        """Fold one observation into the channel's running correction."""
+        """Fold one observation into the channel's running correction via EMA.
+
+        Uses an exponential moving average with forgetting factor ``_BIAS_ALPHA``.
+        Under steady-state drift the estimate converges to the true offset rather
+        than accumulating without bound.  ``samples`` is incremented each call so
+        ``calibration_for()`` can expose the effective observation window.
+        """
         entry = self._bias.get(key)
         if entry is None:
             self._bias[key] = (residual, 1)
             return
         previous, samples = entry
-        self._bias[key] = (previous + _BIAS_ALPHA * (residual - previous), samples + 1)
+        alpha = _BIAS_ALPHA
+        self._bias[key] = (previous + alpha * (residual - previous), samples + 1)
 
     def calibration_for(self, device_id: str, channel_id: str) -> tuple[float, int] | None:
         """Return ``(bias, samples)`` learned for a channel, or None if untested.
@@ -394,6 +464,10 @@ class HardwareOutcomeRecorder:
         the units they declared. A correction the operator cannot inspect is one they
         cannot disagree with, and this one is derived from observation rather than
         stated by anyone.
+
+        ``samples`` counts the total observations folded in. Because the EMA uses a
+        forgetting factor, only the most recent ~1/alpha observations dominate; the
+        "effective window" is approximately ``1 / _BIAS_ALPHA`` samples.
         """
         return self._bias.get((device_id, channel_id))
 
@@ -419,7 +493,13 @@ class HardwareOutcomeRecorder:
             )
 
     def drop_pending(self, device_id: str, channel_id: str) -> None:
-        """Forget a command, so a failed write cannot later be scored as an outcome."""
+        """Forget all pending commands for a channel.
+
+        Called on the write-failure path so that whatever the device settles at
+        is not retroactively scored against a command that never landed.
+        Clears every pending entry for the ``(device_id, channel_id)`` pair,
+        because after a transport failure none of them can be trusted.
+        """
         self._pending.pop((device_id, channel_id), None)
 
     # ── Recall ──

@@ -151,7 +151,34 @@ layout:
                   label: "Normalized error"
               bind: hardware.outcomes
 
-      # ── 7. Devices and declaration provenance ──
+      # ── 7. Calibration health (IC-6) ──
+      # Per-channel calibration state so an operator can see which channels are
+      # due for re-calibration without opening a device console.
+      - type: Section
+        props:
+          title: "Calibration health"
+          subtitle: "Per-channel calibration state, freshness, and residual correction"
+        children:
+          - type: Table
+            when: hardware.calibration
+            props:
+              caption: "Channels that have never been calibrated or whose calibration has expired are shown first."
+              columns:
+                - key: channel_id
+                  label: "Channel"
+                - key: state
+                  label: "State"
+                - key: calibrated_at
+                  label: "Calibrated at"
+                - key: days_since
+                  label: "Days since"
+                - key: residual
+                  label: "Residual"
+                - key: next_recal_due
+                  label: "Next recal due"
+              bind: hardware.calibration
+
+      # ── 8. Devices and declaration provenance ──
       - type: Section
         props:
           title: "Devices"

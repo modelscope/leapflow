@@ -486,6 +486,14 @@ class Context:
         self._observation_daemon: Optional[Any] = None
         self._pipeline_observer: Optional[Any] = None
 
+        # Runtime ownership mode. Defaults to daemon-owned because the daemon is
+        # the one caller that drives ``initialize_critical()`` directly; the
+        # in-process CLI entry point (``initialize()``) flips this off. It gates
+        # hardware sampling so that only leapd writes the session-scoped hardware
+        # reading store (Phase 0.5, paving the way for the Phase 2.1
+        # LocalConnectionHolder migration).
+        self._daemon_mode: bool = True
+
         # Skill evolution & PatternMiner
         self._evolution_policy: Optional[EMAConfidencePolicy] = None
         self._pattern_miner: Optional[Any] = None
@@ -1186,6 +1194,26 @@ class Context:
                 "Could not bind the experience store to hardware outcomes", exc_info=True
             )
 
+    async def _maybe_start_hardware_streams(self) -> None:
+        """Start hardware sampling only when this runtime owns the reading store.
+
+        Sampling flushes downsampled windows into the session-scoped hardware
+        reading store (a DuckDB file), and that store has no cross-process
+        mutual exclusion. To keep a single writer -- and to pave the way for the
+        Phase 2.1 ``LocalConnectionHolder`` migration -- only the daemon-owned
+        runtime samples. In-process CLI mode (reached through ``initialize()``)
+        deliberately skips sampling and reading-store persistence so that a
+        one-shot command never opens the reading store for writing while leapd
+        owns it (Phase 0.5).
+        """
+        if not self._daemon_mode:
+            logger.debug(
+                "In-process CLI mode: skipping hardware sampling; leapd is the "
+                "sole writer of the session hardware reading store (Phase 0.5)."
+            )
+            return
+        await self._start_hardware_streams()
+
     async def _start_hardware_streams(self) -> None:
         """Begin sampling channels that declare a sample rate.
 
@@ -1300,15 +1328,37 @@ class Context:
 
         The gate passed here is the orchestrator, not a bare gate: hardware commands go
         through the same single entry point as every other sensitive capability.
+
+        A ``HardwareTrustGate`` is constructed alongside and stored as
+        ``_hardware_trust_gate`` so that write outcomes can accrue or erode trust.
+        The gate integrates with the plugin-level ``PluginTrustLedger`` when one
+        is available.
         """
         registry = getattr(self, "_hardware_registry", None)
         if registry is None:
             return
         from leapflow.plugins import get_registry as _get_tool_registry
 
+        # Construct the hardware trust gate, optionally linked to the plugin
+        # trust ledger so trust events propagate to the plugin governance layer.
+        try:
+            from leapflow.hardware.trust import HardwareTrustGate
+
+            plugin_trust = getattr(self, "_plugin_trust_ledger", None)
+            self._hardware_trust_gate = HardwareTrustGate(
+                plugin_trust_ledger=plugin_trust,
+            )
+        except Exception:
+            logger.debug(
+                "HardwareTrustGate construction failed; trust-based approval exemption disabled",
+                exc_info=True,
+            )
+            self._hardware_trust_gate = None
+
         _get_tool_registry().bind_runtime(
             hardware_registry=registry,
             hardware_approval_gate=self._approval_orchestrator,
+            hardware_trust_gate=self._hardware_trust_gate,
         )
         report = registry.report
         logger.info(
@@ -1323,17 +1373,28 @@ class Context:
         return bool(getattr(self._db_holder, "is_volatile", False))
 
     async def initialize(self) -> None:
-        """Full initialization - used by CLI direct mode."""
-        await self.initialize_critical()
+        """Full initialization - used by CLI direct mode.
+
+        ``daemon_mode=False`` marks this as an in-process runtime so hardware
+        sampling is skipped: the daemon is the sole writer of the hardware
+        reading store (Phase 0.5).
+        """
+        await self.initialize_critical(daemon_mode=False)
         await self.initialize_deferred()
         self._deferred_initialized = True
 
-    async def initialize_critical(self) -> None:
+    async def initialize_critical(self, *, daemon_mode: bool = True) -> None:
         """Critical-path initialization: platform, memory, engine core.
 
         Must complete before service.start() returns. Provides enough state
         for the engine to handle basic chat requests.
+
+        ``daemon_mode`` defaults to True because the daemon drives this method
+        directly (``service.start()``); the in-process CLI entry point
+        (``initialize()``) passes False. It gates hardware sampling so only the
+        daemon-owned runtime writes the session hardware reading store.
         """
+        self._daemon_mode = daemon_mode
         settings = self.settings
 
         await self.memory.initialize_all()
@@ -1506,7 +1567,7 @@ class Context:
         logger.info("Desktop semantic plugin bound (perception=%s)", perception is not None)
 
         self._bind_hardware_plugin()
-        await self._start_hardware_streams()
+        await self._maybe_start_hardware_streams()
 
         # Initialize skill discovery (SkillIndex + SkillInjector)
         skills_dir = Path(settings.skills_dir).expanduser()

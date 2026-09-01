@@ -285,6 +285,28 @@ def main(argv: list[str] | None = None) -> int:
     dashboard_parser.add_argument("--bind", default="", help="Override the dashboard bind address")
     dashboard_parser.add_argument("--no-open", action="store_true", help="Print the URL instead of opening a browser")
 
+    # leap hw (hardware inspection and direct intervention)
+    hw_parser = subparsers.add_parser("hw", help="Inspect hardware and intervene in it directly")
+    hw_sub = hw_parser.add_subparsers(dest="hw_action")
+    hw_json = argparse.ArgumentParser(add_help=False)
+    hw_json.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    hw_sub.add_parser("list", parents=[hw_json], help="List admitted hardware devices")
+    hw_describe = hw_sub.add_parser("describe", parents=[hw_json], help="Show the full reference for one device")
+    hw_describe.add_argument("device", help="Device id from `leap hw list`")
+    hw_read = hw_sub.add_parser("read", parents=[hw_json], help="Read one channel")
+    hw_read.add_argument("device", help="Device id from `leap hw list`")
+    hw_read.add_argument("channel", help="Channel id from `leap hw describe`")
+    hw_status = hw_sub.add_parser("status", parents=[hw_json], help="Show transport health and recent events")
+    hw_status.add_argument("device", nargs="?", default="", help="Optional device id; omit to roll up every device")
+    hw_estop = hw_sub.add_parser("estop", parents=[hw_json], help="Emergency-stop a device (no approval required)")
+    hw_estop.add_argument("device", help="Device id from `leap hw list`")
+    hw_pause = hw_sub.add_parser("pause", parents=[hw_json], help="Pause daemon sampling for a device")
+    hw_pause.add_argument("device", help="Device id from `leap hw list`")
+    hw_resume = hw_sub.add_parser("resume", parents=[hw_json], help="Resume daemon sampling for a device")
+    hw_resume.add_argument("device", help="Device id from `leap hw list`")
+    hw_replay = hw_sub.add_parser("replay", parents=[hw_json], help="Replay a raw NDJSON segment through the event detector")
+    hw_replay.add_argument("segment_path", help="Path to the NDJSON segment file")
+
     # leap config
     config_parser = subparsers.add_parser("config", help="View and update LeapFlow configuration")
     config_sub = config_parser.add_subparsers(dest="config_action")
@@ -336,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Pre-parse: detect if first non-flag arg is a known subcommand ──
     # If not, treat everything non-flag as a chat prompt.
-    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon", "config", "board"}
+    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon", "config", "board", "hw"}
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
 
     # Find first non-flag argument, skipping values owned by global options.
@@ -435,6 +457,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "board":
         from leapflow.cli.commands.dashboard import cmd_dashboard
         return cmd_dashboard(args)
+
+    # Hardware inspection/intervention: reads run in-process, pause/resume route
+    # to leapd over RPC. No engine Context is needed either way.
+    if args.command == "hw":
+        from leapflow.cli.commands.hardware import cmd_hardware
+        return cmd_hardware(args)
 
     try:
         if args.command in {"interactive", "chat"} and _daemon_enabled(args):

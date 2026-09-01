@@ -207,6 +207,11 @@ class HardwareLayout:
         """Human confirmations of device contexts (ContextProvenance records)."""
         return self.root / "verified.json"
 
+    @property
+    def audit_log_path(self) -> Path:
+        """Append-only NDJSON audit trail for hardware read/write/estop operations."""
+        return self.root / "audit" / "hardware_audit.ndjson"
+
     def ensure(self) -> None:
         for path in (self.root, self.devices_dir):
             path.mkdir(parents=True, exist_ok=True)

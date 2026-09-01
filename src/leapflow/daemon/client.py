@@ -222,6 +222,16 @@ class DaemonClient:
         result = await self.request("host.restart")
         return dict(result or {})
 
+    async def hardware_pause(self, device: str) -> dict[str, Any]:
+        """Pause the daemon-owned hardware sampling loop for one device."""
+        result = await self.request("hardware.pause", {"device": device})
+        return dict(result or {})
+
+    async def hardware_resume(self, device: str) -> dict[str, Any]:
+        """Resume the daemon-owned hardware sampling loop for one device."""
+        result = await self.request("hardware.resume", {"device": device})
+        return dict(result or {})
+
     async def tools_list(self) -> dict[str, Any]:
         """Return daemon-owned tool summary for slash-command rendering."""
         result = await self.request("tools.list")

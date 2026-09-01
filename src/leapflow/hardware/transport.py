@@ -108,6 +108,18 @@ class WriteOutcome:
     can genuinely prove the command never reached the device; ``UNKNOWN`` is the
     correct answer when it cannot, and it blocks replay exactly like
     ``COMMITTED`` does.
+
+    ``preview`` is the dry-run contract flag. ``preview=True`` means the call was
+    a dry run (the tool was invoked with ``parameters.dry_run=true``): the write
+    path ran every feasibility check and built the approval descriptor, but never
+    reached ``transport.write``, so it carries no physical effect and always
+    pairs with ``SIDE_EFFECT_NONE``. The accompanying ``plan`` describes the
+    command that *would* have been issued had this not been a dry run, so intent
+    can be confirmed before committing an irreversible effect. It is a pure
+    additive field defaulting to ``False``: when unset the outcome carries
+    ordinary write semantics -- a committed (or attempted) physical command --
+    so every existing construction site (real transports, the mock, and any
+    out-of-tree driver) keeps its current meaning untouched.
     """
 
     ok: bool
@@ -117,6 +129,7 @@ class WriteOutcome:
     error: str = ""
     failure_code: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict)
+    preview: bool = False
 
     @property
     def effect_may_have_landed(self) -> bool:
@@ -135,6 +148,9 @@ class WriteOutcome:
             payload["error"] = self.error
         if self.failure_code:
             payload["failure_code"] = self.failure_code
+        # Emitted only when set, so an ordinary write's result shape is unchanged.
+        if self.preview:
+            payload["preview"] = True
         return payload
 
 

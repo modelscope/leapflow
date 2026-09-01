@@ -271,6 +271,216 @@ class GatewayMessageGenerator(BaseGenerator):
         }
 
 
+# ─── Hardware channel configuration ──────────────────────────────────────
+
+
+_QUALITY_OK = "ok"
+_QUALITY_SUSPECT = "suspect"
+_QUALITY_STALE = "stale"
+_QUALITY_SATURATED = "saturated"
+_DEGRADED_QUALITIES: List[str] = [_QUALITY_SUSPECT, _QUALITY_STALE, _QUALITY_SATURATED]
+
+
+@dataclass
+class HardwareChannelSpec:
+    """Configuration for one simulated hardware channel.
+
+    Mirrors the physically meaningful fields of
+    ``leapflow.hardware.context.Channel`` without importing it, so the
+    mock framework stays dependency-free from ``src/``.
+    """
+
+    channel_id: str = "ch0"
+    quantity: str = "temperature"
+    unit: str = "°C"
+    center: float = 25.0
+    amplitude: float = 5.0
+    """Half-range of the simulated noise envelope around *center*."""
+    min_threshold: float = 15.0
+    max_threshold: float = 35.0
+    quality_degradation_rate: float = 0.05
+    """Per-reading probability of producing a non-OK quality flag."""
+
+
+_DEFAULT_CHANNELS: List[HardwareChannelSpec] = [
+    HardwareChannelSpec(
+        channel_id="ch_temp",
+        quantity="temperature",
+        unit="°C",
+        center=25.0,
+        amplitude=5.0,
+        min_threshold=15.0,
+        max_threshold=35.0,
+    ),
+    HardwareChannelSpec(
+        channel_id="ch_voltage",
+        quantity="voltage",
+        unit="V",
+        center=3.3,
+        amplitude=0.2,
+        min_threshold=3.0,
+        max_threshold=3.6,
+    ),
+]
+
+
+class HardwareSignalGenerator(BaseGenerator):
+    """Hardware reading and event generator.
+
+    Produces two families of ``(event_type, payload)`` tuples:
+
+    * **hw.reading** — one sampled reading whose payload aligns with
+      ``Reading.to_dict()`` plus ``monotonic_at`` (needed by the test
+      pipeline for monotonic ordering even though ``Reading.to_dict()``
+      omits it for persistence).
+    * **hw.<kind>** — derived hardware events (``threshold_exceeded``,
+      ``quality_degraded``, ``sample_loss``, ``rate_exceeded``, ``stale``,
+      ``settled``) whose payload aligns with ``HardwareEvent.to_payload()``.
+
+    Overrides ``generate()`` because the base implementation always yields a
+    single ``event_type``; this generator interleaves readings with
+    probabilistic event injections.
+    """
+
+    event_type: str = "hw.reading"
+
+    # Supported hardware event kinds mirroring ``stream.EventKind``.
+    _EVENT_KINDS: List[str] = [
+        "threshold_exceeded",
+        "quality_degraded",
+        "sample_loss",
+        "rate_exceeded",
+        "stale",
+        "settled",
+    ]
+
+    def __init__(
+        self,
+        config: SignalConfig,
+        *,
+        device_id: str = "mock_device_0",
+        channels: Optional[List[HardwareChannelSpec]] = None,
+        event_kinds: Optional[List[str]] = None,
+        event_probability: float = 0.08,
+    ) -> None:
+        super().__init__(config)
+        self.device_id = device_id
+        self.channels: List[HardwareChannelSpec] = (
+            channels if channels is not None else list(_DEFAULT_CHANNELS)
+        )
+        self.event_kinds: List[str] = (
+            event_kinds if event_kinds is not None else list(self._EVENT_KINDS[:2])
+        )
+        self.event_probability = max(0.0, min(1.0, event_probability))
+        self._seq: Dict[str, int] = {}
+
+    # ── generate (multi-type override) ──────────────────────────────────
+
+    def generate(self) -> Iterator[tuple[str, Dict[str, Any]]]:
+        """Yield ``(event_type, payload)`` tuples per config timing.
+
+        Inherits the burst / jitter / duration contract from ``BaseGenerator``
+        but yields two event families: readings and hardware events.
+        """
+        cfg = self.config
+        interval = 1.0 / cfg.frequency_hz if cfg.frequency_hz > 0 else cfg.duration_s
+        start = time.monotonic()
+        deadline = start + cfg.duration_s
+
+        while time.monotonic() < deadline:
+            for _ in range(cfg.burst_size):
+                if time.monotonic() >= deadline:
+                    return
+                channel = random.choice(self.channels)
+                yield (self.event_type, self._make_reading(channel))
+                # Probabilistic hardware event injection
+                if self.event_kinds and random.random() < self.event_probability:
+                    kind = random.choice(self.event_kinds)
+                    yield (f"hw.{kind}", self._make_hw_event(channel, kind))
+
+            jitter = random.uniform(0, cfg.jitter_ms / 1000.0)
+            wait = interval + jitter
+            if cfg.burst_interval_s > 0 and cfg.burst_size > 1:
+                wait = cfg.burst_interval_s + jitter
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            wait = min(wait, remaining)
+            yield ("__wait__", {"seconds": wait})
+
+    # ── payload builders ────────────────────────────────────────────────
+
+    def _make_reading(self, ch: HardwareChannelSpec) -> Dict[str, Any]:
+        """Build a reading payload aligned with ``Reading.to_dict()`` + ``monotonic_at``."""
+        seq = self._seq.get(ch.channel_id, 0)
+        self._seq[ch.channel_id] = seq + 1
+
+        noise = random.gauss(0, ch.amplitude * 0.3)
+        value = round(ch.center + noise, 4)
+
+        quality: str = _QUALITY_OK
+        if random.random() < ch.quality_degradation_rate:
+            quality = random.choice(_DEGRADED_QUALITIES)
+
+        return {
+            "device_id": self.device_id,
+            "channel_id": ch.channel_id,
+            "value": value,
+            "quantity": ch.quantity,
+            "unit": ch.unit,
+            "observed_at": time.time(),
+            "sequence": seq,
+            "quality": quality,
+            # Deliberately included for test-pipeline monotonic ordering
+            # even though Reading.to_dict() omits it for persistence.
+            "monotonic_at": time.monotonic(),
+        }
+
+    def _make_hw_event(
+        self, ch: HardwareChannelSpec, kind: str
+    ) -> Dict[str, Any]:
+        """Build a hardware event payload aligned with ``HardwareEvent.to_payload()``."""
+        now_wall = time.time()
+        value = round(ch.center + random.gauss(0, ch.amplitude), 4)
+
+        detail = self._event_detail(ch, kind, value)
+        return {
+            "kind": kind,
+            "source": f"{self.device_id}.{ch.channel_id}",
+            "device_id": self.device_id,
+            "channel_id": ch.channel_id,
+            "quantity": ch.quantity,
+            "detail": detail,
+            "value": value,
+            "unit": ch.unit,
+            "ts": now_wall,
+            "_mono_ts": time.monotonic(),
+        }
+
+    @staticmethod
+    def _event_detail(
+        ch: HardwareChannelSpec, kind: str, value: float
+    ) -> str:
+        """Return a human-readable detail string for a hardware event."""
+        details: Dict[str, str] = {
+            "threshold_exceeded": (
+                f"left the declared range ({ch.min_threshold:g}..{ch.max_threshold:g})"
+            ),
+            "quality_degraded": (
+                "quality has been 'suspect' for 3 consecutive samples"
+            ),
+            "sample_loss": "2 sample(s) missing from the transport sequence",
+            "rate_exceeded": "changing at 15/s, above the declared 10/s",
+            "stale": "no sample for 2.50s on a 10 Hz channel",
+            "settled": "returned to the declared range",
+        }
+        return details.get(kind, f"hardware event: {kind}")
+
+    def _make_payload(self) -> Dict[str, Any]:
+        """Fallback for direct base-class callers; yields a reading."""
+        return self._make_reading(self.channels[0])
+
+
 # Generator class registry for dynamic resolution by name
 GENERATOR_REGISTRY: Dict[str, type] = {
     "FsChangeGenerator": FsChangeGenerator,
@@ -279,6 +489,7 @@ GENERATOR_REGISTRY: Dict[str, type] = {
     "InputGenerator": InputGenerator,
     "GatewaySignalGenerator": GatewaySignalGenerator,
     "GatewayMessageGenerator": GatewayMessageGenerator,
+    "HardwareSignalGenerator": HardwareSignalGenerator,
 }
 
 __all__ = [
@@ -290,5 +501,7 @@ __all__ = [
     "InputGenerator",
     "GatewaySignalGenerator",
     "GatewayMessageGenerator",
+    "HardwareChannelSpec",
+    "HardwareSignalGenerator",
     "GENERATOR_REGISTRY",
 ]

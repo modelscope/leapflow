@@ -252,3 +252,51 @@ def test_every_kind_lands_in_the_hardware_family(kind: str) -> None:
     registration anywhere -- a new kind is visible the day it is added.
     """
     assert _event_family(_event(kind).event_type) == "hw"
+
+
+# ════════════════════════════════════════════════════════════════
+# Phase 0.5: only the daemon-owned runtime samples the reading store
+# ════════════════════════════════════════════════════════════════
+
+
+class _ModeWiring:
+    """Borrow the real mode guard, recording whether sampling was delegated.
+
+    Bound off the production method so the daemon-only constraint is exercised
+    against the code that ships, not a copy of it that can drift.
+    """
+
+    from leapflow.cli.context import Context as _Context
+
+    _maybe_start_hardware_streams = _Context._maybe_start_hardware_streams
+
+    def __init__(self, *, daemon_mode: bool) -> None:
+        self._daemon_mode = daemon_mode
+        self.started = False
+
+    async def _start_hardware_streams(self) -> None:
+        self.started = True
+
+
+@pytest.mark.asyncio
+async def test_in_process_cli_does_not_start_hardware_sampling() -> None:
+    """In-process CLI mode must never open the sampling path.
+
+    Reading-store writes only happen through a sampling flush, so skipping
+    ``_start_hardware_streams`` is what keeps a one-shot command from writing the
+    session hardware reading store while leapd owns it (Phase 0.5).
+    """
+    wiring = _ModeWiring(daemon_mode=False)
+    await wiring._maybe_start_hardware_streams()
+    assert wiring.started is False, (
+        "in-process CLI must not start hardware sampling; leapd is the sole writer "
+        "of the session hardware reading store (Phase 0.5)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_daemon_mode_still_starts_hardware_sampling() -> None:
+    """The daemon-owned runtime must keep sampling unchanged."""
+    wiring = _ModeWiring(daemon_mode=True)
+    await wiring._maybe_start_hardware_streams()
+    assert wiring.started is True, "daemon mode must start hardware sampling"

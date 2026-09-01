@@ -61,18 +61,29 @@ def canonical_json(value: Any) -> str:
 
 
 def execution_policy_for(tool_name: str, spec: Any | None = None) -> ExecutionPolicy:
-    """Classify a tool into an idempotency policy using registry metadata."""
+    """Classify a tool into an idempotency policy using registry metadata.
+
+    MCP tools without ``x_leapflow`` default to ``external_side_effect`` rather
+    than ``mutating_idempotent``, because a tool whose metadata is unknown may
+    have external side effects and replaying it could be harmful.
+    """
     name = str(tool_name or "").removeprefix("gp_")
     risk_level = str(getattr(spec, "risk_level", "") or "")
     mutates_state = bool(getattr(spec, "mutates_state", False))
     idempotency_scope = str(getattr(spec, "idempotency_scope", "") or "")
     effect_scope = str(getattr(spec, "effect_scope", "") or "")
+    category = str(getattr(spec, "category", "") or "")
     if risk_level == "read_only" and not mutates_state:
         return "read_only"
     if name in _EXTERNAL_TOOLS or risk_level == "external" or effect_scope == "external":
         return "external_side_effect"
     if idempotency_scope == "session":
         return "mutating_once"
+    # MCP tools without explicit x_leapflow metadata must not fall through to
+    # mutating_idempotent ("safe to repeat").  A tool whose side-effect profile
+    # is unknown is conservatively treated as having external effects.
+    if category == "mcp" and not risk_level:
+        return "external_side_effect"
     return "mutating_idempotent"
 
 

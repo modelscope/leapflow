@@ -28,6 +28,7 @@ from leapflow.hardware.context import (
     as_numeric,
 )
 from leapflow.hardware.reference import describe, summarize
+from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_UNKNOWN,
@@ -36,6 +37,7 @@ from leapflow.hardware.transport import (
 )
 from leapflow.plugins.protocol import ToolMetadata
 from leapflow.security.actions import ActionDescriptor, ActionKind
+from leapflow.security.permission_failures import build_readiness_failure
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +122,15 @@ def _write_schema(effect: str) -> dict[str, Any]:
                     "Optional, but omitting it makes the result much harder to recall."
                 ),
             },
+            "dry_run": {
+                "type": "boolean",
+                "description": (
+                    "Preview only. Run every feasibility check (envelope, rate, "
+                    "reachability, interlocks) and build the approval detail, then report "
+                    "the command that would be issued without touching the device. No "
+                    "physical effect occurs and no approval is requested. Defaults to false."
+                ),
+            },
         },
         "required": ["device_id", "channel_id", "value"],
     }
@@ -132,10 +143,30 @@ class HardwareTools:
     test drives exactly the same code path as production with its own instances.
     """
 
-    def __init__(self, registry: Any, *, gate: Any = None, session_id: str = "") -> None:
+    def __init__(
+        self,
+        registry: Any,
+        *,
+        gate: Any = None,
+        session_id: str = "",
+        audit_log: HardwareAuditLog | None = None,
+        hardware_trust_gate: Any = None,
+    ) -> None:
         self._registry = registry
         self._gate = gate
         self._session_id = session_id
+        self._audit = audit_log or HardwareAuditLog(None)
+        self._trust_gate = hardware_trust_gate
+
+    def set_gate(self, gate: Any) -> None:
+        """Replace the approval gate used by all write handlers.
+
+        Called by the hardware plugin's ``bind_runtime`` when the daemon's
+        ``install_gate`` re-binds the gate after assembly.  This updates the
+        live instance so already-registered tool handlers resolve to the new
+        orchestrator without re-assembly.
+        """
+        self._gate = gate
 
     # ── Discovery ──
 
@@ -163,6 +194,23 @@ class HardwareTools:
         experience = self._prior_experience(context)
         if experience:
             payload["prior_experience"] = experience
+        # When the device was last calibrated, if a calibration has ever been recorded.
+        # A reference document that states a calibration age lets a reader judge whether
+        # the transform behind every reading is still current, rather than assuming it.
+        last_calibrated = self._last_calibrated_at(device_id)
+        if last_calibrated is not None:
+            payload["last_calibrated_at"] = last_calibrated
+        # Annotate channels whose provenance has not been verified by a human.
+        # A reading from an uncalibrated channel is still a measurement, but a
+        # decision that treats it as absolute -- comparing it against a published
+        # specification, for example -- would be wrong in a way the agent cannot
+        # detect.  Stating it here, once, is cheaper than discovering it after
+        # the fact.
+        if not context.provenance.verified_by:
+            payload["calibration_notice"] = (
+                "Readings from this device have not been independently calibrated. "
+                "Treat numeric values as relative measurements, not absolute references."
+            )
         return payload
 
     def _prior_experience(self, context: HardwareContext) -> dict[str, Any]:
@@ -176,6 +224,21 @@ class HardwareTools:
             if rows:
                 recalled[channel.channel_id] = list(rows)
         return recalled
+
+    def _last_calibrated_at(self, device_id: str) -> float | None:
+        """Return the instant of the device's most recent calibration, if any.
+
+        Contained: the calibration store is optional (no instrument database, or a store
+        that momentarily cannot be read), and a reference document must render with or
+        without it -- so any failure degrades to "no calibration on record", not an error.
+        """
+        store = getattr(self._registry, "calibration_store", None)
+        if store is None:
+            return None
+        try:
+            return store.latest_time(device_id)
+        except Exception:  # noqa: BLE001 - describe must not fail on an optional annotation
+            return None
 
     async def hw_status(self, device_id: str = "", **_: Any) -> dict[str, Any]:
         """Return live transport health and recent observations for one device."""
@@ -232,6 +295,14 @@ class HardwareTools:
                 "failure_code": exc.failure_code,
             }
         payload: dict[str, Any] = {"ok": True, "reading": reading.to_dict()}
+        self._audit.record(
+            action="read",
+            device=device_id,
+            channel=channel_id,
+            value=reading.value,
+            outcome="ok",
+            identity=self._session_id,
+        )
         # A read is a trustworthy observation, so it is also the moment a pending command
         # on this channel can finally be scored -- which is how a channel with settling
         # time gets learned from at all.
@@ -294,6 +365,12 @@ class HardwareTools:
             status.halt_supported,
             status.detail,
         )
+        self._audit.record(
+            action="estop",
+            device=device_id,
+            outcome="ok" if status.halt_supported else "unsupported",
+            identity=self._session_id,
+        )
         return {
             "ok": status.halt_supported,
             "device_id": device_id,
@@ -316,6 +393,7 @@ class HardwareTools:
         channel_id = str(params.get("channel_id") or "")
         value = params.get("value")
         conditions = str(params.get("conditions") or "")
+        dry_run = bool(params.get("dry_run"))
 
         context, channel, error = self._resolve(device_id, channel_id)
         if error is not None:
@@ -409,6 +487,37 @@ class HardwareTools:
             },
         )
 
+        if dry_run:
+            # A dry run stops here on purpose. Every feasibility check above has
+            # already run -- resolution, writability, effect class, describe,
+            # envelope, rate, reachability, interlocks -- and the approval
+            # descriptor is built, but neither consent nor the physical write is
+            # attempted. The verdict is NONE because nothing reached the device,
+            # which is the whole point: a preview must be safe to issue against an
+            # irreversible channel. It works even with no gate installed, since it
+            # returns before ``_evaluate``.
+            return _preview_result(
+                device_id,
+                channel,
+                descriptor,
+                value=value,
+                in_envelope=in_envelope,
+                interlocks_failed=interlocks_failed,
+            )
+
+        # Readiness is a feasibility verdict, so it is settled before consent is
+        # sought. A channel guarded by an interlock -- the declared form of "must
+        # be homed/initialised/calibrated first" -- cannot be commanded until that
+        # precondition holds, and an unmet one is a deterministic hard stop rather
+        # than a prompt: asking a human to approve a command that cannot yet
+        # succeed teaches them to click through prompts. The refusal names the
+        # exact precondition and the init to run, routed through the shared
+        # permission-failure authority so the engine and TUI report it alike. The
+        # risk classifier keeps its own interlock hardline as defence in depth for
+        # any descriptor built outside this path.
+        if interlocks_failed:
+            return self._not_ready(context, channel, interlocks_failed)
+
         allowed, denial = await self._evaluate(descriptor)
         if not allowed:
             return self._refusal(device_id, channel_id, "approval_denied", denial)
@@ -422,6 +531,8 @@ class HardwareTools:
                 outcome = await transport.write(channel_id, value)
         except TransportError as exc:
             # A transport raises this only for "could not attempt", so no effect landed.
+            if self._trust_gate is not None:
+                self._trust_gate.record_failure(device_id, channel_id)
             return {
                 "ok": False,
                 "device_id": device_id,
@@ -444,6 +555,8 @@ class HardwareTools:
                 exc,
                 exc_info=True,
             )
+            if self._trust_gate is not None:
+                self._trust_gate.record_failure(device_id, channel_id, hard=True)
             return {
                 "ok": False,
                 "device_id": device_id,
@@ -457,6 +570,22 @@ class HardwareTools:
                 "side_effect_state": SIDE_EFFECT_UNKNOWN,
                 "effect_uncertain": True,
             }
+
+        self._audit.record(
+            action="write",
+            device=device_id,
+            channel=channel_id,
+            value=value,
+            outcome="ok" if outcome.ok else (outcome.failure_code or "error"),
+            identity=self._session_id,
+        )
+
+        # ── Trust gate: record success / failure ──
+        if self._trust_gate is not None:
+            if outcome.ok:
+                self._trust_gate.record_success(device_id, channel_id)
+            else:
+                self._trust_gate.record_failure(device_id, channel_id)
 
         if outcome.ok:
             numeric = as_numeric(value)
@@ -662,10 +791,43 @@ class HardwareTools:
     async def _evaluate(self, descriptor: ActionDescriptor) -> tuple[bool, str]:
         """Run the approval gate, failing closed on absence and on exception.
 
+        When trust-based approval skip is enabled and the channel qualifies
+        (reversible + trust >= VERIFIED + config on), the gate is bypassed and
+        the write proceeds with an audit record noting ``trust_skip=True``.
+        The invariant is absolute: **irreversible channels always require
+        full approval**, even at PRODUCTION trust, even with the switch on.
+
         No gate installed, or a gate that raises, both mean deny. A broken gate must
         never become an open door, and for a physical device the cost of getting
         that wrong is not measured in data.
         """
+        # ── Trust-based short-circuit (reversible + VERIFIED+ + config) ──
+        if self._trust_gate is not None and self._trust_skip_enabled():
+            meta = descriptor.metadata or {}
+            device_id = str(meta.get("device_id") or "")
+            channel_id = str(meta.get("channel_id") or "")
+            reversible = bool(meta.get("reversible", False))
+            if self._trust_gate.may_skip_approval(
+                device_id, channel_id, reversible=reversible
+            ):
+                level = self._trust_gate.level(device_id, channel_id)
+                logger.info(
+                    "Trust-based approval skip: device=%s channel=%s "
+                    "level=%s reversible=%s",
+                    device_id,
+                    channel_id,
+                    level.name,
+                    reversible,
+                )
+                self._audit.record(
+                    action="trust_skip",
+                    device=device_id,
+                    channel=channel_id,
+                    outcome=f"trust_skip=True level={level.name}",
+                    identity=self._session_id,
+                )
+                return True, ""
+
         if self._gate is None:
             return False, (
                 "No approval gate is installed for hardware commands, so the command was "
@@ -734,6 +896,66 @@ class HardwareTools:
                 failed.append(name)
         return tuple(failed)
 
+    def _not_ready(
+        self,
+        context: HardwareContext,
+        channel: Channel,
+        failed: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Return a deterministic, actionable refusal for an unmet readiness state.
+
+        Built through ``security.permission_failures`` -- the single authority the
+        engine and TUI both consult -- so a device that has not reached its
+        declared ready state is reported the same way everywhere: the precondition
+        to satisfy is named, the repair instruction is executable, and the turn
+        hard-stops instead of asking whether to proceed. Nothing reached the
+        device, so the side-effect verdict is NONE.
+        """
+        payload = build_readiness_failure(
+            device_id=context.device_id,
+            channel_id=channel.channel_id,
+            unmet=self._readiness_requirements(context, failed),
+        )
+        payload["side_effect_state"] = SIDE_EFFECT_NONE
+        return payload
+
+    def _readiness_requirements(
+        self, context: HardwareContext, failed: tuple[str, ...]
+    ) -> list[dict[str, Any]]:
+        """Describe each unmet readiness precondition for an actionable refusal.
+
+        A declared interlock contributes its source channel and the comparison it
+        must satisfy; one named on the channel but absent from the device
+        declaration is reported as undeclared, because "cannot be checked" and
+        "not satisfied" carry the same weight in the write path.
+        """
+        requirements: list[dict[str, Any]] = []
+        for name in failed:
+            lock = context.interlock(name)
+            if lock is None:
+                requirements.append(
+                    {
+                        "interlock_id": name,
+                        "channel_id": "",
+                        "operator": "",
+                        "value": None,
+                        "description": "",
+                        "declared": False,
+                    }
+                )
+                continue
+            requirements.append(
+                {
+                    "interlock_id": lock.interlock_id,
+                    "channel_id": lock.channel_id,
+                    "operator": lock.operator,
+                    "value": lock.value,
+                    "description": lock.description,
+                    "declared": True,
+                }
+            )
+        return requirements
+
     # ── Helpers ──
 
     def _resolve(
@@ -756,6 +978,15 @@ class HardwareTools:
                 ),
             )
         return context, channel, None
+
+    def _trust_skip_enabled(self) -> bool:
+        """Whether the operator has opted in to trust-based approval skip.
+
+        Reads ``trust_skip_enabled`` from the hardware settings, defaulting to
+        False so the feature is off until deliberately activated.
+        """
+        settings = getattr(self._registry, "settings", None)
+        return bool(getattr(settings, "trust_skip_enabled", False))
 
     def _requires_describe(self, device_id: str) -> bool:
         settings = getattr(self._registry, "settings", None)
@@ -812,6 +1043,68 @@ def _write_result(device_id: str, channel: Channel, outcome: WriteOutcome) -> di
         payload["next_step"] = (
             f"The value was accepted but needs {channel.envelope.settling_time_s:g}s to stabilise; "
             "read it back before drawing conclusions."
+        )
+    return payload
+
+
+def _preview_result(
+    device_id: str,
+    channel: Channel,
+    descriptor: ActionDescriptor,
+    *,
+    value: Any,
+    in_envelope: bool,
+    interlocks_failed: tuple[str, ...],
+) -> dict[str, Any]:
+    """Shape a dry run into a tool result without touching the device.
+
+    Reports the command that *would* be issued together with the outcome of every
+    check that precedes consent, so a caller can confirm intent before committing
+    an irreversible physical effect. ``ok`` reflects whether the command would pass
+    validation: it is true only when the value is inside the envelope and every
+    interlock holds -- the same two conditions that would otherwise let it reach
+    approval. Nothing was written, so the side-effect verdict is NONE and the
+    outcome is marked ``preview``.
+    """
+    ok = in_envelope and not interlocks_failed
+    outcome = WriteOutcome(ok=ok, side_effect_state=SIDE_EFFECT_NONE, preview=True)
+    payload: dict[str, Any] = {
+        "device_id": device_id,
+        "channel_id": channel.channel_id,
+        **outcome.to_dict(),
+        "plan": {
+            "summary": descriptor.summary,
+            "detail": descriptor.detail,
+            "resource": descriptor.resource,
+            "quantity": channel.quantity,
+            "value": value,
+            "unit": channel.unit,
+            "effect": channel.effect,
+            "reversible": channel.envelope.reversible,
+            "requires_approval": True,
+            "value_in_envelope": in_envelope,
+            "interlocks_satisfied": not interlocks_failed,
+            "interlocks_failed": list(interlocks_failed),
+        },
+    }
+    if ok:
+        payload["next_step"] = (
+            "Dry run only: nothing was commanded. Re-issue the same call without "
+            "dry_run to execute it, which will require approval."
+        )
+    elif not in_envelope:
+        payload["failure_code"] = "value_out_of_envelope"
+        payload["error"] = (
+            f"{value!r} lies outside the declared envelope for "
+            f"{device_id}.{channel.channel_id}, so the real command would be refused "
+            "before execution. Call hw_describe to read the allowed range."
+        )
+    else:
+        payload["failure_code"] = "interlocks_unsatisfied"
+        payload["error"] = (
+            f"Interlocks {list(interlocks_failed)} are not satisfied for "
+            f"{device_id}.{channel.channel_id}, so the real command would be refused. "
+            "Restore the interlock conditions before commanding it."
         )
     return payload
 

@@ -3,6 +3,12 @@
 Implements on-policy predictive coding: before each action execution,
 the world model predicts the expected effect; after execution, it compares
 the actual outcome against the prediction to compute a prediction error δ.
+
+The physical branch (``_compare_physical``) is special: hardware actions
+(``hw_*``) produce numeric outcomes that can be compared arithmetically
+without a model call, so they bypass the LLM comparison path entirely.
+This makes prediction-error computation for the physical domain *free*
+in model tokens and latency, and the error is exact rather than rated.
 """
 
 from __future__ import annotations
@@ -44,6 +50,23 @@ Output JSON: {{"distance": 0.3, "actual_effect": "one sentence"}}"""
 
 
 @dataclass(frozen=True)
+class PhysicalSnapshot:
+    """A numeric snapshot of one device channel at one moment.
+
+    Used by the physical comparison branch so that ``hw_*`` actions can be
+    scored arithmetically — zero LLM calls, exact error, dimensionless delta
+    normalised against the declared envelope.
+    """
+
+    device_id: str
+    channel_id: str
+    value: float
+    quantity: str = ""
+    unit: str = ""
+    envelope: Any = None  # hardware.context.Envelope or None
+
+
+@dataclass(frozen=True)
 class Prediction:
     """A world-model prediction about an action's expected outcome."""
 
@@ -62,7 +85,7 @@ class PredictionOutcome:
     post_snapshot: Any  # StateSnapshot
     actual_effect: str
     delta: float
-    delta_source: str  # "structural" | "semantic" | "blended"
+    delta_source: str  # "structural" | "semantic" | "blended" | "physical"
     timestamp: float
     experience_id: str = ""
 
@@ -91,6 +114,7 @@ class PredictionLoop:
         rag_advantage_floor: float = -0.3,
         failure_advantage: float = -0.5,
         on_prediction_outcome: Optional[Callable[[PredictionOutcome], None]] = None,
+        hardware_learning_enabled: bool = False,
     ) -> None:
         self._llm = llm
         self._snapshot = snapshot_service
@@ -104,6 +128,7 @@ class PredictionLoop:
         self._rag_advantage_floor = rag_advantage_floor
         self._failure_advantage = failure_advantage
         self._on_outcome = on_prediction_outcome
+        self._hardware_learning_enabled = hardware_learning_enabled
         self._trajectory_buffer: list[dict] = []
         self._last_goal: str = ""
         self._pending_pre_snapshot: Any = None
@@ -279,7 +304,20 @@ class PredictionLoop:
     async def _compare(
         self, prediction: Prediction, pre: "StateSnapshot", post: "StateSnapshot",
     ) -> PredictionOutcome:
-        """Compare prediction against observed state change."""
+        """Compare prediction against observed state change.
+
+        Physical actions (``hw_*``) are detected by prefix and routed to a pure
+        arithmetic branch that costs zero model calls. The branch is gated on
+        ``hardware_learning_enabled`` so it is off by default.
+        """
+        if (
+            self._hardware_learning_enabled
+            and prediction.action_description.startswith("hw_")
+        ):
+            physical = self._compare_physical(prediction)
+            if physical is not None:
+                return physical
+
         structural_delta = pre.semantic_distance(post)
 
         if structural_delta > self._semantic_threshold and self._budget.has_tokens("comparison"):
@@ -302,6 +340,64 @@ class PredictionLoop:
             delta_source=source,
             timestamp=time.time(),
         )
+
+    def _compare_physical(
+        self, prediction: Prediction,
+    ) -> PredictionOutcome | None:
+        """Pure arithmetic comparison for hw_* actions — zero LLM calls.
+
+        Requires a ``PhysicalSnapshot`` on the prediction's reasoning (piggy-backed
+        through the ``reasoning`` field as serialised JSON by the hardware bridge),
+        or an explicit ``physical_snapshot`` attribute.
+
+        Falls back to ``None`` so the caller continues with the UI path.
+        """
+        snapshot = getattr(prediction, "physical_snapshot", None)
+        if not isinstance(snapshot, PhysicalSnapshot):
+            return None
+
+        try:
+            from leapflow.hardware.outcome import normalized_delta as _nd
+            from leapflow.hardware.context import Envelope as _Envelope
+
+            envelope = snapshot.envelope
+            if envelope is None:
+                envelope = _Envelope()
+
+            commanded = snapshot.value
+            # The "expected_effect" encodes the observed value when the bridge
+            # writes it as "settled at <float>".  Fall back to the commanded
+            # value when parsing fails.
+            observed = commanded
+            try:
+                parts = prediction.expected_effect.split()
+                idx = parts.index("at") if "at" in parts else -1
+                if idx >= 0 and idx + 1 < len(parts):
+                    observed = float(parts[idx + 1].rstrip(","))
+            except (ValueError, IndexError):
+                pass
+
+            delta, _residual = _nd(
+                commanded=commanded, observed=observed, envelope=envelope
+            )
+            actual_effect = (
+                f"{snapshot.device_id}.{snapshot.channel_id} "
+                f"settled at {observed:g}"
+                f"{f' {snapshot.unit}' if snapshot.unit else ''}"
+                f" (delta {delta:.3f})"
+            )
+            return PredictionOutcome(
+                prediction=prediction,
+                pre_snapshot=snapshot,
+                post_snapshot=snapshot,
+                actual_effect=actual_effect,
+                delta=delta,
+                delta_source="physical",
+                timestamp=time.time(),
+            )
+        except Exception:
+            logger.debug("_compare_physical failed; falling back to UI path", exc_info=True)
+            return None
 
     async def _semantic_compare(
         self, prediction: Prediction, pre: "StateSnapshot", post: "StateSnapshot",

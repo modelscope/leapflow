@@ -75,3 +75,45 @@ rules:
     child_type: RESPONSE
     time_delta_max: 0.5
     confidence: 0.90
+
+  # ── hardware.* namespace: physical-domain causal priors ──
+
+  - name: hw_actuate_to_reading_change
+    parent_channel: hardware.actuate
+    parent_type: TRIGGER
+    child_channel: hardware.reading
+    child_type: RESPONSE
+    time_delta_max: 5.0
+    confidence: 0.85
+
+  - name: threshold_exceeded_to_estop
+    parent_channel: hardware.threshold_exceeded
+    parent_type: BOUNDARY
+    child_channel: hardware.estop
+    child_type: EFFECT
+    time_delta_max: 1.0
+    confidence: 0.99
+
+  - name: hw_configure_to_settled
+    parent_channel: hardware.configure
+    parent_type: TRIGGER
+    child_channel: hardware.settled
+    child_type: RESPONSE
+    time_delta_max: 30.0
+    confidence: 0.80
+
+  - name: hw_dispense_to_volume_change
+    parent_channel: hardware.dispense
+    parent_type: TRIGGER
+    child_channel: hardware.volume
+    child_type: EFFECT
+    time_delta_max: 10.0
+    confidence: 0.90
+
+  - name: hw_reading_drift_to_recalibrate
+    parent_channel: hardware.reading_drift
+    parent_type: BOUNDARY
+    child_channel: hardware.recalibrate
+    child_type: EFFECT
+    time_delta_max: 60.0
+    confidence: 0.70

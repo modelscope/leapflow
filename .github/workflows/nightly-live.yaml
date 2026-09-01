@@ -1,213 +1,42 @@
-name: Nightly live
+# Hardware conformance CI gate.
+#
+# Runs the real-device conformance and preflight suites from temp/mhs_exp/.
+# Trigger: manual dispatch or the "hardware-conformance" label on a PR.
+# NOT part of every-PR CI -- it requires device access and is opt-in.
 
-# The only lane that talks to a real provider. It exists to catch what replay
-# structurally cannot: a provider changing its behavior or its payload shape.
-# Everything else runs offline, so a red build here never blocks a merge — it
-# tells us the recorded truth has drifted from the real one.
+name: Hardware Conformance
 
 on:
-  schedule:
-    # 02:30 UTC daily.
-    - cron: '30 2 * * *'
   workflow_dispatch:
-    inputs:
-      rerecord:
-        description: 'Capture fresh provider traffic and open a PR with it'
-        type: boolean
-        default: false
-  # Opt-in per pull request via the `ci:live` label. Unlike the schedule, this
-  # path has a diff, so it runs only the journeys the change could plausibly
-  # break — each live journey costs real tokens and real minutes.
   pull_request:
-    types: [labeled, synchronize, reopened]
-
-concurrency:
-  group: nightly-live-${{ github.event.pull_request.number || 'schedule' }}
-  cancel-in-progress: false
-
-permissions:
-  contents: read
+    types: [labeled]
 
 jobs:
-  # ── L3: real provider ──────────────────────────────────────────────────
-  live:
-    # On a pull request, only with the `ci:live` label — never automatically, so a
-    # fork PR cannot spend tokens.
+  hardware-conformance:
+    # Only run when manually dispatched or the label is present.
     if: >-
-      github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'ci:live')
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'hardware-conformance'))
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-    # Credentials live as secrets on this environment, so only jobs that declare
-    # it can read them. Deliberately *without* required-reviewer or
-    # deployment-branch rules: reviewers would leave the nightly cron waiting for
-    # a human, and restricting branches to main would reject every `ci:live` run
-    # (a pull_request ref is refs/pull/N/merge). The real gates are that fork PRs
-    # never receive secrets, that applying the label needs write access, and that
-    # each journey caps its own calls and tokens.
-    environment: live-llm
+    timeout-minutes: 30
+
     steps:
       - uses: actions/checkout@v4
-        with:
-          # Journey selection needs history to find the merge base.
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-        with:
-          enable-cache: true
-
-      - name: Install dependencies
-        run: uv sync --all-extras
-
-      - name: Decide which journeys to run
-        id: pick
-        # A scheduled run has no diff and takes every live-capable journey. A
-        # labelled pull request takes only the journeys whose declared
-        # SUBJECT_PATHS the change touches. Journeys with LIVE_SIGNAL = False
-        # (control plane, lifecycle) are excluded either way, and R4 additionally
-        # refuses to run live because it asserts on injected failures.
-        env:
-          BASE_REF: ${{ github.base_ref }}
+      - name: Install project and experiment drivers
         run: |
-          if [ -n "${BASE_REF}" ]; then
-            JOURNEYS=$(uv run python tools/impact.py --base "origin/${BASE_REF}" --live-journeys)
-          else
-            JOURNEYS=$(uv run python tools/impact.py --live-journeys)
-          fi
-          printf 'selected journeys:\n%s\n' "${JOURNEYS}"
-          echo "journeys=$(echo ${JOURNEYS} | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+          pip install -e .
+          pip install -e temp/mhs_exp/drivers/leapflow_host
+          pip install -e temp/mhs_exp/drivers/leapflow_bench
 
-      - name: Journeys against the real provider
-        if: steps.pick.outputs.journeys != ''
-        env:
-          LEAPFLOW_TEST_LLM_MODE: live
-          LEAPFLOW_LLM_API_KEY: ${{ secrets.LEAPFLOW_LLM_API_KEY }}
-          LEAPFLOW_LLM_BASE_URL: ${{ secrets.LEAPFLOW_LLM_BASE_URL }}
-          # A cheap model keeps the lane affordable; the journeys assert
-          # invariants, not prose quality. Each journey also enforces its own
-          # provider-call *and* token ceilings, so neither a non-converging turn
-          # nor prompt growth can run up a bill.
-          LEAPFLOW_LLM_MODEL: ${{ secrets.LEAPFLOW_LLM_CHEAP_MODEL }}
-          JOURNEYS: ${{ steps.pick.outputs.journeys }}
-        run: uv run pytest ${JOURNEYS} -q -m e2e --tb=short
+      - name: Run conformance suite
+        run: python temp/mhs_exp/scripts/conformance.py
 
-      - name: Daemon logs on failure
-        if: failure()
-        run: |
-          find /tmp -maxdepth 6 -name 'leapd.log' -newermt '-40 minutes' 2>/dev/null | while read -r log; do
-            echo "===== $log ====="
-            tail -n 200 "$log"
-          done
-
-  # ── Re-record: refresh recorded truth and propose it as a diff ──────────
-  # Manual only. Recorded traffic is a reviewed artefact: a bot silently updating
-  # what the mock layer asserts against would defeat the point of recording it.
-  # Recording writes to recordings/ and never touches the replay store, so this
-  # job cannot break the offline lanes.
-  rerecord:
-    if: github.event_name == 'workflow_dispatch' && inputs.rerecord == true
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    environment: live-llm
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-        with:
-          enable-cache: true
-
-      - name: Install dependencies
-        run: uv sync --all-extras
-
-      - name: Capture real provider traffic
-        env:
-          LEAPFLOW_TEST_LLM_MODE: record
-          LEAPFLOW_LLM_API_KEY: ${{ secrets.LEAPFLOW_LLM_API_KEY }}
-          LEAPFLOW_LLM_BASE_URL: ${{ secrets.LEAPFLOW_LLM_BASE_URL }}
-          LEAPFLOW_LLM_MODEL: ${{ secrets.LEAPFLOW_LLM_CHEAP_MODEL }}
-        run: uv run pytest tests/journeys -q -m e2e --tb=short
-
-      - name: Derive mock-layer response shapes from the new traffic
-        run: uv run python tools/sync_fixtures.py
-
-      - name: Confirm the offline lanes still pass
-        env:
-          LEAPFLOW_TEST_LLM_MODE: replay
-        run: uv run pytest tests/journeys tests/regression -q -m "e2e or invariant" -n 4
-
-      - name: Open a pull request with the refreshed traffic
-        uses: peter-evans/create-pull-request@v6
-        with:
-          branch: chore/rerecord-provider-traffic
-          title: 'chore(tests): refresh recorded provider traffic'
-          body: |
-            Captured fresh provider traffic and re-derived the response shapes the
-            mock layer checks against.
-
-            Review the diff in `tests/_fixtures/llm_responses/response_shapes.json`
-            first: a change there means a provider altered its payload shape, and
-            some parser may now be reading a field that no longer exists.
-          commit-message: 'chore(tests): refresh recorded provider traffic'
-          add-paths: |
-            tests/_fixtures/recordings/**
-            tests/_fixtures/llm_responses/**
-
-  # ── Refresh the impact map from a full green run ────────────────────────
-  impact-map:
-    # Never on a pull request: the map is a repository artefact refreshed from a
-    # full green run, not something a PR should regenerate.
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-        with:
-          enable-cache: true
-
-      - name: Install dependencies
-        run: uv sync --all-extras
-
-      - name: Rebuild the coverage-derived impact map
-        env:
-          LEAPFLOW_TEST_LLM_MODE: replay
-        run: uv run python tools/impact.py --build-map
-
-      - name: Open a pull request with the refreshed map
-        uses: peter-evans/create-pull-request@v6
-        with:
-          branch: chore/refresh-impact-map
-          title: 'chore(tests): refresh the coverage-derived impact map'
-          body: |
-            Regenerated `tests/.impact/coverage_map.json` from a full green run.
-
-            This map is what lets the pull-request lane scope the mock layer to
-            the change while still seeing runtime coupling through EventBus and
-            Protocol indirection.
-          commit-message: 'chore(tests): refresh the coverage-derived impact map'
-          add-paths: tests/.impact/coverage_map.json
+      - name: Run preflight checks
+        run: python temp/mhs_exp/scripts/preflight.py

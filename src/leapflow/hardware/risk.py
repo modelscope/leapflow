@@ -159,28 +159,51 @@ class HardwareRiskClassifier:
     ) -> RiskAssessment:
         """Return the in-envelope tier for a permitted command.
 
-        ``allow_permanent`` stays True at HIGH by default, which is a deliberate
-        departure from the software default. Refusing reusable consent would mean
-        prompting for every single motion, and a person asked to confirm hundreds of
-        routine operations stops reading the prompts and disables the gate -- which is
-        strictly worse than a scoped grant. Safety comes from the scope instead: the
-        grant identity is the channel *and its declared band*, and anything outside
-        that band is hardline-denied above, where no grant can reach.
+        ``allow_permanent`` stays True at HIGH for *reversible* commands, which is a
+        deliberate departure from the software default. Refusing reusable consent
+        would mean prompting for every single motion, and a person asked to confirm
+        hundreds of routine operations stops reading the prompts and disables the
+        gate -- which is strictly worse than a scoped grant. Safety comes from the
+        scope instead: the grant identity is the channel *and its declared band*,
+        and anything outside that band is hardline-denied above, where no grant can
+        reach.
 
-        Setting ``hardware.envelope_grant`` to false narrows it further: the grant
-        identity becomes per-value (see ``HardwareTools._grant_band``) and no
-        profile-wide "always" choice is offered, so each command is decided on its own.
-        ``allow_permanent`` alone would not achieve that -- the orchestrator withholds
-        only the "always" choice and still offers a session scope -- which is why the
-        value enters the grant identity rather than relying on this flag.
+        An *irreversible* write, and any DISPENSE (which outputs material into the
+        world), is the exception: it forces ``allow_permanent=False`` regardless of
+        the setting. Reusable consent must never extend to an effect that cannot be
+        undone, because a session-wide bypass earned from a lower-risk approval
+        would otherwise silently authorise it (see
+        ``SessionAwareGate._bypass_all`` fallthrough). Such writes are confirmed
+        every time.
+
+        Setting ``hardware.envelope_grant`` to false narrows reversible writes
+        further: the grant identity becomes per-value (see
+        ``HardwareTools._grant_band``) and no profile-wide "always" choice is
+        offered, so each command is decided on its own. ``allow_permanent`` alone
+        would not achieve that -- the orchestrator withholds only the "always"
+        choice and still offers a session scope -- which is why the value enters the
+        grant identity rather than relying on this flag.
         """
         target = f"{device_id}.{channel_id}"
         reusable = self._reusable_consent_allowed()
         if effect in _HIGH_TIER_EFFECTS:
             irreversible = not envelope.reversible
+            # DISPENSE outputs material into the world; a substance that has left
+            # the device cannot be un-dispensed even if the declaration marks the
+            # channel reversible, so it is treated as irreversible for the purpose
+            # of reusable consent.  Consequently, effect=dispense **never** receives
+            # session-level or profile-level reusable consent (allow_permanent is
+            # always False), regardless of the channel's ``reversible`` flag.
+            external_output = effect == HardwareEffect.DISPENSE.value
             reasons = [f"device_{effect}"]
             if irreversible:
                 reasons.append("irreversible")
+            # A write whose effect cannot be undone is confirmed every time:
+            # reusable session/profile consent is withheld so that a session-wide
+            # bypass earned from a lower-risk approval cannot silently authorise it.
+            # Reversible setpoints keep band-scoped reusable consent, which is what
+            # keeps the gate usable for routine motion.
+            allow_permanent = reusable and not (irreversible or external_output)
             return RiskAssessment(
                 level=RiskLevel.HIGH,
                 score=0.8 if irreversible else 0.7,
@@ -193,7 +216,7 @@ class HardwareRiskClassifier:
                         else "."
                     )
                 ),
-                allow_permanent=reusable,
+                allow_permanent=allow_permanent,
                 metadata={"envelope_band": envelope.band_key()},
             )
         return RiskAssessment(

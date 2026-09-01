@@ -40,8 +40,9 @@ from leapflow.security.actions import ActionDescriptor, ActionKind
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest, SessionAwareGate
 from leapflow.security.grants import ApprovalScope, grant_key
 from leapflow.security.orchestrator import ApprovalOrchestrator
+from leapflow.security.permission_failures import is_permission_hard_stop_payload
 from leapflow.security.policy import ApprovalPolicyEngine
-from leapflow.security.risk import DefaultRiskClassifier
+from leapflow.security.risk import DefaultRiskClassifier, RiskLevel
 from leapflow.tools.name_resolver import ToolRegistry
 
 SESSION = "session-under-test"
@@ -571,6 +572,92 @@ async def test_t2_unsatisfied_interlock_is_a_hardline() -> None:
     assert bench.human.prompts == []
     transport = await bench.transport("fluent_p1")
     assert transport.write_log == ()
+
+
+# ════════════════════════════════════════════════════════════════
+# IC-1 -- device readiness is a fail-closed, executable hard stop
+#
+# Readiness ("must be homed/initialised/calibrated first") is declared by
+# pointing a channel's ``requires_interlocks`` at an ``Interlock`` on a ready
+# channel -- no new field. An unmet precondition must refuse the write before
+# consent is ever sought (feasibility precedes consent) with an executable
+# repair, and must not touch a device that declares no such precondition.
+# ════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_ic1_unready_device_is_hard_stopped_with_executable_repair() -> None:
+    """An unmet readiness precondition is a deterministic, actionable hard stop.
+
+    The command is refused before the gate is consulted, the failure names the
+    exact precondition and the init to run, and the shared permission authority
+    recognises it as a turn-stopping condition -- not a "retry and hope" error.
+    """
+    bench = Bench(with_values(liquid_handler_context(), tip_state=False))
+    await _describe(bench, "fluent_p1")
+    result = await bench.tools.hw_dispense(
+        device_id="fluent_p1", channel_id="aspirate", value=10.0
+    )
+    assert result["ok"] is False
+    # Feasibility precedes consent: refused deterministically, no human asked.
+    assert bench.human.prompts == []
+    assert result["failure_code"] == "not_ready"
+    assert result["failure_class"] == "device_not_ready"
+    assert result["side_effect_state"] == SIDE_EFFECT_NONE
+    # The executable repair names the unmet precondition, its source channel, and
+    # the init routine to run before retrying.
+    error = result["error"]
+    assert "tip_present" in error
+    assert "tip_state" in error
+    assert "A tip must be mounted" in error
+    assert "calibration" in error or "initialization" in error
+    # Machine-readable repair mirrors the prose so a caller can act on it.
+    unmet = result["repair"]["unmet"]
+    assert [item["interlock_id"] for item in unmet] == ["tip_present"]
+    assert unmet[0]["channel_id"] == "tip_state"
+    # Recognised as a hard stop by the single authority engine and TUI consult.
+    assert is_permission_hard_stop_payload(result) is True
+    # Nothing reached the device.
+    transport = await bench.transport("fluent_p1")
+    assert transport.write_log == ()
+
+
+@pytest.mark.asyncio
+async def test_ic1_write_is_released_once_readiness_is_satisfied() -> None:
+    """The identical command proceeds once every readiness precondition holds.
+
+    Readiness gates feasibility, not consent: with the device ready the same
+    write enters the normal approval path and, once approved, reaches the device.
+    """
+    bench = Bench(liquid_handler_context(), decisions=(ApprovalDecision.ALLOW_ONCE,))
+    await _describe(bench, "fluent_p1")
+    result = await bench.tools.hw_dispense(
+        device_id="fluent_p1", channel_id="aspirate", value=10.0
+    )
+    assert result["ok"] is True
+    # A human was asked exactly once: the readiness hard stop did not pre-empt it.
+    assert len(bench.human.prompts) == 1
+    transport = await bench.transport("fluent_p1")
+    assert transport.write_log != ()
+
+
+@pytest.mark.asyncio
+async def test_ic1_channel_without_readiness_precondition_is_unaffected() -> None:
+    """A channel that declares no readiness interlock never sees the hard stop.
+
+    Regression guard: the gate is scoped to declared preconditions, so a device
+    with none goes straight to the normal approval path.
+    """
+    bench = Bench(bench_node_context(), decisions=(ApprovalDecision.ALLOW_ONCE,))
+    await _describe(bench, "bench_node")
+    result = await bench.tools.hw_actuate(
+        device_id="bench_node", channel_id="fan_duty", value=20.0
+    )
+    assert result["ok"] is True
+    assert result.get("failure_code") != "not_ready"
+    assert len(bench.human.prompts) == 1
+    transport = await bench.transport("bench_node")
+    assert transport.write_log != ()
 
 
 @pytest.mark.asyncio
@@ -1195,6 +1282,128 @@ def test_estop_is_never_assessed_as_gated() -> None:
 
 
 # ════════════════════════════════════════════════════════════════
+# Reusable consent posture for irreversible / external-output writes (issue #34)
+# ════════════════════════════════════════════════════════════════
+
+
+def _single_channel_context(
+    *, effect: str, reversible: bool, direction: str = Direction.READWRITE.value
+) -> HardwareContext:
+    """A one-writable-channel device for isolating a risk-tier decision."""
+    return HardwareContext(
+        device_id="rig",
+        hc_version=HC_VERSION,
+        display_name="Rig",
+        location="bench",
+        halt_supported=True,
+        transport=TransportRef(kind="mock", config={"values": {"chan": 0.0}}),
+        channels=(
+            Channel(
+                channel_id="chan",
+                direction=direction,
+                quantity="ratio.chan",
+                unit="percent",
+                effect=effect,
+                envelope=Envelope(
+                    declared=True, min_value=0.0, max_value=100.0, reversible=reversible
+                ),
+            ),
+        ),
+        provenance=ContextProvenance(verified_by="lab-lead"),
+    )
+
+
+def _loaded_registry(context: HardwareContext) -> HardwareRegistry:
+    registry = HardwareRegistry(
+        HardwareSettings(enabled=True, require_describe_before_write=False),
+        providers=[_StaticProvider(context)],
+    )
+    registry.load()
+    return registry
+
+
+def _in_envelope_descriptor(kind: str, value: float) -> ActionDescriptor:
+    """Build a descriptor that clears every feasibility gate so ``_tier_for`` runs."""
+    return ActionDescriptor.device(
+        kind=kind,
+        device_id="rig",
+        channel_id="chan",
+        value=value,
+        metadata={"value_in_envelope": True, "interlocks_satisfied": True},
+    )
+
+
+def test_irreversible_actuate_forbids_reusable_consent() -> None:
+    """An irreversible ACTUATE is HIGH and must never buy a reusable grant.
+
+    Reusable session/profile consent for an effect that cannot be undone would let
+    a session-wide bypass, earned from a lower-risk approval, silently authorise it.
+    """
+    registry = _loaded_registry(
+        _single_channel_context(effect=HardwareEffect.ACTUATE.value, reversible=False)
+    )
+    classifier = build_risk_classifier(registry)
+    assessment = classifier.assess(
+        _in_envelope_descriptor(ActionKind.DEVICE_ACTUATE.value, 40.0)
+    )
+    assert assessment.level == RiskLevel.HIGH
+    assert assessment.allow_permanent is False
+    assert "irreversible" in assessment.reasons
+
+
+def test_dispense_forbids_reusable_consent_even_when_declared_reversible() -> None:
+    """DISPENSE outputs material into the world, so it is treated as irreversible.
+
+    Even a declaration that marks the channel reversible cannot un-dispense a
+    substance, so reusable consent is withheld regardless of ``envelope.reversible``.
+    """
+    registry = _loaded_registry(
+        _single_channel_context(
+            effect=HardwareEffect.DISPENSE.value,
+            reversible=True,
+            direction=Direction.WRITE.value,
+        )
+    )
+    classifier = build_risk_classifier(registry)
+    assessment = classifier.assess(
+        _in_envelope_descriptor(ActionKind.DEVICE_DISPENSE.value, 40.0)
+    )
+    assert assessment.level == RiskLevel.HIGH
+    assert assessment.allow_permanent is False
+
+
+def test_reversible_actuate_keeps_reusable_consent() -> None:
+    """Regression guard: a reversible setpoint write keeps band-scoped reuse.
+
+    Tightening the irreversible case must not make routine reversible motion prompt
+    on every command -- that is what disables the gate in practice.
+    """
+    registry = _loaded_registry(
+        _single_channel_context(effect=HardwareEffect.ACTUATE.value, reversible=True)
+    )
+    classifier = build_risk_classifier(registry)
+    assessment = classifier.assess(
+        _in_envelope_descriptor(ActionKind.DEVICE_ACTUATE.value, 40.0)
+    )
+    assert assessment.level == RiskLevel.HIGH
+    assert assessment.allow_permanent is True
+    assert "irreversible" not in assessment.reasons
+
+
+def test_reversible_configure_setpoint_keeps_reusable_consent() -> None:
+    """A reversible CONFIGURE setpoint is MEDIUM and unaffected by the tightening."""
+    registry = _loaded_registry(
+        _single_channel_context(effect=HardwareEffect.CONFIGURE.value, reversible=True)
+    )
+    classifier = build_risk_classifier(registry)
+    assessment = classifier.assess(
+        _in_envelope_descriptor(ActionKind.DEVICE_CONFIGURE.value, 40.0)
+    )
+    assert assessment.level == RiskLevel.MEDIUM
+    assert assessment.allow_permanent is True
+
+
+# ════════════════════════════════════════════════════════════════
 # Plugin surface
 # ════════════════════════════════════════════════════════════════
 
@@ -1313,6 +1522,7 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.unverified_policy",
         "hardware.require_describe",
         "hardware.envelope_grant",
+        "hardware.trust_skip_enabled",
         "hardware.stream_enabled",
         "hardware.stream_ring_capacity",
         "hardware.persist_readings",
@@ -1320,6 +1530,7 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.raw_retention_days",
         "hardware.history_retention_days",
         "hardware.raw_segment_mb",
+        "hardware.reading_store_sensitive",
     }
     for key in keys:
         view = service.describe(key)
@@ -1664,3 +1875,261 @@ async def test_the_board_shows_an_unreachable_device_as_an_alert() -> None:
     row = next(event for event in digest.events if event["kind"] == "unreachable")
     assert row["severity"] == "alert", "a bench that cannot be commanded is not routine"
     assert row["title"].startswith("unreachable · bench_node.fan_duty")
+
+
+# ════════════════════════════════════════════════════════════════
+# Daemon-side gate re-binding (fix for #24)
+# ════════════════════════════════════════════════════════════════
+
+
+class TestDaemonHardwareGateRebinding:
+    """Prove that ``install_gate`` re-binds the hardware approval gate.
+
+    Before the fix, the hardware plugin captured the pre-daemon orchestrator
+    during ``initialize_critical`` and never updated it when the daemon
+    installed its own stream-routed orchestrator.  Hardware writes therefore
+    had no interactive approver and were refused fail-closed every time.
+
+    These tests drive the *plugin* layer directly: they construct a
+    ``HardwareContextPlugin`` with one orchestrator, call ``bind_runtime``
+    with a replacement (simulating what ``install_gate`` does via
+    ``ToolPluginRegistry.bind_runtime``), and verify that the live tool
+    handlers resolve to the *new* gate.
+    """
+
+    @pytest.mark.asyncio
+    async def test_gate_rebind_routes_through_new_orchestrator(self) -> None:
+        """After re-bind, hw_actuate goes through the replacement gate."""
+        from leapflow.hardware.plugin import HardwareContextPlugin
+
+        ctx = bench_node_context()
+        registry = HardwareRegistry(
+            HardwareSettings(enabled=True, require_describe_before_write=False),
+            providers=[_StaticProvider(ctx)],
+        )
+        registry.load()
+
+        # Phase 1: initial bind with an always-denying gate (pre-daemon path).
+        denying_human = ScriptedHuman(ApprovalDecision.DENY)
+        old_gate = SessionAwareGate(denying_human)
+        old_orchestrator = ApprovalOrchestrator(
+            old_gate,
+            risk_classifier=build_risk_classifier(registry),
+            policy=ApprovalPolicyEngine(),
+        )
+
+        plugin = HardwareContextPlugin()
+        plugin.bind_runtime(
+            hardware_registry=registry,
+            hardware_approval_gate=old_orchestrator,
+        )
+
+        # Access tools once to trigger lazy creation -- simulates assembly.
+        tools_before = plugin.tools
+        assert tools_before, "plugin must expose tools after binding a registry"
+
+        # Capture the handler for hw_actuate from the pre-rebind tools.
+        actuate_meta = next(t for t in tools_before if t.name == "hw_actuate")
+        handler = actuate_meta.handler
+
+        # Confirm old gate denies.
+        result = await handler(device_id="bench_node", channel_id="fan_duty", value=20.0)
+        assert result["ok"] is False
+        assert result["failure_code"] == "approval_denied"
+
+        # Phase 2: re-bind with an allowing gate (daemon install_gate path).
+        allowing_human = ScriptedHuman(ApprovalDecision.ALLOW_ONCE)
+        new_gate = SessionAwareGate(allowing_human)
+        new_orchestrator = ApprovalOrchestrator(
+            new_gate,
+            risk_classifier=build_risk_classifier(registry),
+            policy=ApprovalPolicyEngine(),
+        )
+
+        plugin.bind_runtime(hardware_approval_gate=new_orchestrator)
+
+        # The SAME handler object (already registered in the tool registry)
+        # must now route through the new orchestrator.
+        actuate_meta_after = next(t for t in plugin.tools if t.name == "hw_actuate")
+        assert actuate_meta_after.handler is handler, (
+            "gate-only re-bind must not replace the handler object; "
+            "per-turn snapshots depend on identity stability"
+        )
+        result = await handler(device_id="bench_node", channel_id="fan_duty", value=20.0)
+        assert result["ok"] is True, (
+            f"After re-bind the daemon orchestrator should approve, got: {result}"
+        )
+        assert allowing_human.prompts, "the new gate must have been consulted"
+
+    @pytest.mark.asyncio
+    async def test_gate_rebind_without_registry_is_harmless(self) -> None:
+        """Re-binding only the gate when no registry exists must not crash."""
+        from leapflow.hardware.plugin import HardwareContextPlugin
+
+        plugin = HardwareContextPlugin()
+        # No registry bound -- plugin.tools is empty.
+        plugin.bind_runtime(hardware_approval_gate="some_orchestrator")
+        assert plugin.tools == []
+
+    @pytest.mark.asyncio
+    async def test_absent_gate_after_rebind_still_denies(self) -> None:
+        """Fail-closed: re-binding with None gate must deny."""
+        from leapflow.hardware.plugin import HardwareContextPlugin
+
+        ctx = bench_node_context()
+        registry = HardwareRegistry(
+            HardwareSettings(enabled=True, require_describe_before_write=False),
+            providers=[_StaticProvider(ctx)],
+        )
+        registry.load()
+
+        allowing_human = ScriptedHuman(ApprovalDecision.ALLOW_ONCE)
+        gate = SessionAwareGate(allowing_human)
+        orchestrator = ApprovalOrchestrator(
+            gate,
+            risk_classifier=build_risk_classifier(registry),
+            policy=ApprovalPolicyEngine(),
+        )
+
+        plugin = HardwareContextPlugin()
+        plugin.bind_runtime(
+            hardware_registry=registry,
+            hardware_approval_gate=orchestrator,
+        )
+        _ = plugin.tools  # force creation
+
+        # Re-bind with None gate (simulates a broken installation path).
+        plugin.bind_runtime(hardware_approval_gate=None)
+
+        actuate_meta = next(t for t in plugin.tools if t.name == "hw_actuate")
+        result = await actuate_meta.handler(
+            device_id="bench_node", channel_id="fan_duty", value=20.0
+        )
+        assert result["ok"] is False
+        assert "configuration fault" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_teardown_not_double_registered_on_gate_rebind(self) -> None:
+        """Re-binding only the gate must not re-register the teardown effect."""
+        from leapflow.hardware.plugin import HardwareContextPlugin
+
+        registrations: list[Any] = []
+
+        class _TrackingScope:
+            def async_effect(self, fn: Any) -> None:
+                registrations.append(fn)
+
+        ctx = bench_node_context()
+        registry = HardwareRegistry(
+            HardwareSettings(enabled=True, require_describe_before_write=False),
+            providers=[_StaticProvider(ctx)],
+        )
+        registry.load()
+
+        plugin = HardwareContextPlugin()
+        plugin.bind_runtime(
+            hardware_registry=registry,
+            hardware_approval_gate=None,
+            effect_scope=_TrackingScope(),
+        )
+        assert len(registrations) == 1, "first bind registers teardown"
+
+        # Re-bind only the gate.
+        plugin.bind_runtime(hardware_approval_gate="new_gate")
+        assert len(registrations) == 1, "gate-only re-bind must not double-register teardown"
+
+
+# ════════════════════════════════════════════════════════════════
+# install_gate integration (fix for #24, Minor 2)
+# ════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_install_gate_rebinds_hardware_approval_gate() -> None:
+    """ApprovalCoordinator.install_gate wires the daemon orchestrator into
+    the hardware plugin, not just shell/gateway/config/desktop.
+
+    Constructs a minimal fake context carrying a ``_hardware_registry`` and
+    invokes ``install_gate`` directly.  The assertion is structural: the
+    plugin's live ``HardwareTools`` instance must reference the orchestrator
+    that ``install_gate`` built, not the pre-daemon one.
+    """
+    from leapflow.daemon.approval_coordinator import ApprovalCoordinator
+    from leapflow.hardware.plugin import HardwareContextPlugin
+    from leapflow.plugins.registry import ToolPluginRegistry
+
+    # 1. Build a real hardware registry with one device.
+    hw_registry = HardwareRegistry(
+        HardwareSettings(enabled=True, require_describe_before_write=False),
+        providers=[_StaticProvider(bench_node_context())],
+    )
+    hw_registry.load()
+
+    # 2. Build the hardware plugin and wire it into a fresh tool registry.
+    hw_plugin = HardwareContextPlugin()
+    tool_registry = ToolPluginRegistry()
+    tool_registry.register(hw_plugin)
+
+    # 3. Initial bind with a denying gate (simulates initialize_critical).
+    denying_human = ScriptedHuman(ApprovalDecision.DENY)
+    pre_orchestrator = ApprovalOrchestrator(
+        SessionAwareGate(denying_human),
+        risk_classifier=build_risk_classifier(hw_registry),
+        policy=ApprovalPolicyEngine(),
+    )
+    tool_registry.bind_runtime(
+        hardware_registry=hw_registry,
+        hardware_approval_gate=pre_orchestrator,
+    )
+    tool_registry.assemble()
+
+    # Confirm tools are live and the pre-daemon gate denies.
+    assert hw_plugin.tools, "plugin must expose tools after assembly"
+
+    # 4. Build a fake ctx that carries what install_gate needs.
+    class _FakeCtx:
+        pass
+
+    fake_ctx = _FakeCtx()
+    fake_ctx._approval_orchestrator = pre_orchestrator  # type: ignore[attr-defined]
+    fake_ctx._hardware_registry = hw_registry  # type: ignore[attr-defined]
+    fake_ctx.settings = type("S", (), {  # type: ignore[attr-defined]
+        "approval_bypass": False,
+        "plugin_generation_enabled": False,
+        "plugin_install_dir": None,
+        "profile_layout": None,
+        "plugin_marketplace_root": None,
+        "plugin_marketplace_url": None,
+        "plugin_marketplace_trusted_pubkeys": (),
+    })()
+    fake_ctx.llm = None  # type: ignore[attr-defined]
+
+    class _FakeService:
+        pass
+
+    # Monkey-patch get_registry so install_gate finds our test registry.
+    import leapflow.plugins as _plugins_mod
+    original_get_registry = _plugins_mod.get_registry
+    _plugins_mod.get_registry = lambda: tool_registry
+    try:
+        coordinator = ApprovalCoordinator()
+        coordinator.install_gate(fake_ctx, _FakeService())
+    finally:
+        _plugins_mod.get_registry = original_get_registry
+
+    # 5. The daemon orchestrator is now on fake_ctx._approval_orchestrator.
+    daemon_orchestrator = fake_ctx._approval_orchestrator
+    assert daemon_orchestrator is not pre_orchestrator, (
+        "install_gate must replace the orchestrator"
+    )
+
+    # The hardware plugin's live tools must reference the daemon orchestrator.
+    assert hw_plugin._hw_tools is not None, "tools must have been created"
+    assert hw_plugin._gate is daemon_orchestrator, (
+        "plugin._gate must point to the daemon orchestrator after install_gate"
+    )
+    assert hw_plugin._hw_tools._gate is daemon_orchestrator, (
+        "the live HardwareTools instance must reference the daemon orchestrator"
+    )
+
+

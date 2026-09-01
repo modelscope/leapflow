@@ -177,7 +177,14 @@ def test_payload_declares_its_version_and_clock() -> None:
     payload = build_digest(_Registry()).to_payload()
     assert payload["schema_version"] == SERIES_SCHEMA_VERSION
     assert payload["clock"] == WALL_CLOCK
-    assert all(point["x"] > 1_500_000_000.0 for point in payload["series"][0]["points"])
+    # Every x is a wall-clock epoch, not a value off the monotonic clock the
+    # subsystem also carries. A wall-clock instant is decades larger than any
+    # monotonic reading (seconds since boot), so it must sit above the live
+    # monotonic clock -- a relative floor that never expires, unlike a hardcoded
+    # epoch. A monotonic sample plotted on this axis would fail here while looking
+    # entirely normal: the "wrong by decades" mistake the axis has to catch.
+    monotonic_now = time.monotonic()
+    assert all(point["x"] > monotonic_now for point in payload["series"][0]["points"])
 
 
 def test_counts_are_precomputed_because_there_is_no_length_path() -> None:
@@ -590,3 +597,75 @@ def _rich_payload() -> dict[str, Any]:
         health={"channel_id": "level", "declared_hz": 10.0, "observed_hz": 9.9, "rate_ratio": 0.99},
     )
     return build_digest(registry, now=time.time()).to_payload()
+
+
+# ════════════════════════════════════════════════════════════════
+# CBAG: producer and digest share the same ALERT_KINDS set
+# ════════════════════════════════════════════════════════════════
+
+
+def test_producer_and_digest_share_alert_kinds() -> None:
+    """Producer's push-severity set must be the same object as digest's row-severity set.
+
+    CBAG: the two drifted the first time a kind was added: the board coloured
+    the row as an alert while the producer still declined to push it. Keeping
+    them as one shared constant prevents silent divergence.
+
+    If this assertion fails, a new event kind was added to one copy but not
+    the other, causing the push/colour to disagree.
+    """
+    from leapflow.hardware.observability.digest import ALERT_KINDS as digest_set
+    from leapflow.hardware.observability.producer import _ALERT_EVENTS as producer_set
+
+    assert producer_set is digest_set, (
+        "ALERT_KINDS drift: the producer's push set and the digest's row-severity "
+        "set must be the *same* object, not copies that can diverge. "
+        f"producer={sorted(producer_set)}, digest={sorted(digest_set)}"
+    )
+
+
+def test_alert_kinds_contains_the_known_alert_event_types() -> None:
+    """ALERT_KINDS must contain at least the four canonical alert kinds.
+
+    CBAG: removing a kind from the set would silently suppress push
+    notifications for that event type. This locks the known-good baseline.
+    """
+    from leapflow.hardware.observability.digest import ALERT_KINDS
+
+    expected = {"threshold_exceeded", "rate_exceeded", "stale", "unreachable"}
+    missing = expected - ALERT_KINDS
+    assert not missing, (
+        f"ALERT_KINDS is missing {sorted(missing)}; removing them would suppress "
+        "push notifications for those event types"
+    )
+
+
+def test_producer_severity_matches_digest_event_severity() -> None:
+    """For every alert kind, both the row colour and the push severity agree.
+
+    CBAG: the producer decides push-vs-persist from event kinds. The digest
+    assigns per-event severity for the board timeline. If they use different
+    sets, the board colours a row as "alert" but the producer does not push it
+    (or vice versa).
+    """
+    from leapflow.hardware.observability.digest import ALERT_KINDS, _event_severity
+
+    for kind in ALERT_KINDS:
+        assert _event_severity(kind) == "alert", (
+            f"digest colours {kind!r} as {_event_severity(kind)!r}, not 'alert'; "
+            "but the producer treats it as push-worthy — the two disagree"
+        )
+
+
+def test_digest_payload_clock_is_wall() -> None:
+    """Every digest payload must declare ``clock=='wall'``.
+
+    CBAG G16: a payload with the wrong clock would cause the chart to draw
+    monotonic instants on a wall-clock axis, producing a correct-looking
+    chart that is wrong by decades.
+    """
+    payload = build_digest(_Registry()).to_payload()
+    assert payload["clock"] == WALL_CLOCK, (
+        f"payload clock={payload['clock']!r}, expected 'wall'; G16 regression"
+    )
+    assert payload["schema_version"] == SERIES_SCHEMA_VERSION

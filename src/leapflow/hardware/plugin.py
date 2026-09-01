@@ -34,6 +34,9 @@ class HardwareContextPlugin:
         self._scope: Any = None
         self._session_id: str = ""
         self._tools: Any = None
+        self._hw_tools: Any = None
+        self._teardown_registered: bool = False
+        self._hardware_trust_gate: Any = None
 
     @property
     def plugin_id(self) -> str:
@@ -48,6 +51,7 @@ class HardwareContextPlugin:
         return [
             "hardware_registry",
             "hardware_approval_gate",
+            "hardware_trust_gate",
             "effect_scope",
             "session_id",
         ]
@@ -59,17 +63,35 @@ class HardwareContextPlugin:
         it, ``tools`` stays empty, and the tool index is byte-identical to a build
         without this plugin. That property is what keeps the feature default-off and
         reversible, and it is also what keeps journey cassettes valid.
+
+        The gate may be re-bound after assembly (daemon ``install_gate`` path).
+        When that happens the *live* ``HardwareTools`` instance is patched
+        in-place so that already-registered tool handlers see the new
+        orchestrator without requiring re-assembly.
         """
+        registry_changed = False
         if "hardware_registry" in deps:
             self._registry = deps.get("hardware_registry")
+            registry_changed = True
         if "hardware_approval_gate" in deps:
             self._gate = deps.get("hardware_approval_gate")
+            # Late-bind into the live HardwareTools so already-registered
+            # handlers resolve to the new gate without re-assembly.
+            if self._hw_tools is not None:
+                self._hw_tools.set_gate(self._gate)
+        if "hardware_trust_gate" in deps:
+            self._hardware_trust_gate = deps.get("hardware_trust_gate")
         if "session_id" in deps:
             self._session_id = str(deps.get("session_id") or "")
         if "effect_scope" in deps:
             self._scope = deps.get("effect_scope")
+            self._teardown_registered = False
 
-        self._tools = None
+        if registry_changed:
+            self._tools = None
+            self._hw_tools = None
+            self._teardown_registered = False
+
         if self._registry is None:
             return
 
@@ -81,7 +103,12 @@ class HardwareContextPlugin:
         Registered through ``async_effect`` rather than ``effect``: ``close_all`` is
         a coroutine, and a coroutine handed to the synchronous variant is dropped
         without being awaited -- the connections would simply stay open.
+
+        Guarded against double-registration: a re-bind that only updates the gate
+        must not append a second teardown effect for the same registry.
         """
+        if self._teardown_registered:
+            return
         if self._scope is None:
             return
         register = getattr(self._scope, "async_effect", None)
@@ -93,6 +120,7 @@ class HardwareContextPlugin:
             return
         try:
             register(self._registry.close_all)
+            self._teardown_registered = True
         except (RuntimeError, ValueError) as exc:
             logger.warning("Could not register hardware teardown effect: %s", exc, exc_info=True)
 
@@ -104,9 +132,14 @@ class HardwareContextPlugin:
         if self._tools is None:
             from leapflow.hardware.tools import HardwareTools, build_hardware_tools
 
-            self._tools = build_hardware_tools(
-                HardwareTools(self._registry, gate=self._gate, session_id=self._session_id)
+            hw = HardwareTools(
+                self._registry,
+                gate=self._gate,
+                session_id=self._session_id,
+                hardware_trust_gate=self._hardware_trust_gate,
             )
+            self._hw_tools = hw
+            self._tools = build_hardware_tools(hw)
         return list(self._tools)
 
 

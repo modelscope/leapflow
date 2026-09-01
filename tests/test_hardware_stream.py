@@ -12,6 +12,7 @@ future change cannot quietly introduce a threshold that no human wrote down.
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import pytest
@@ -434,6 +435,125 @@ async def test_repeated_events_of_one_kind_are_paced() -> None:
     assert len(breaches) == 1, "one excursion is one event, however many samples it spans"
 
 
+def test_same_kind_different_channels_are_not_cross_throttled() -> None:
+    """A threshold breach on channel A must not suppress a simultaneous breach on B.
+
+    Before this fix the pacing key was ``event.kind`` alone, so the second
+    channel's first breach was silently dropped whenever it arrived within
+    ``MIN_EVENT_INTERVAL_S`` of the first channel's breach.
+    """
+    context = _context()
+    source = HardwareStreamSource(None, context, context.channels[0])
+
+    event_ch1 = HardwareEvent(
+        kind=EventKind.THRESHOLD_EXCEEDED,
+        device_id="dev",
+        channel_id="ch_a",
+        quantity="q",
+        detail="breach on A",
+        observed_at=time.time(),
+    )
+    event_ch2 = HardwareEvent(
+        kind=EventKind.THRESHOLD_EXCEEDED,
+        device_id="dev",
+        channel_id="ch_b",
+        quantity="q",
+        detail="breach on B",
+        observed_at=time.time(),
+    )
+
+    emitted: list[Any] = []
+    source._dispatch([event_ch1, event_ch2], emitted.append)
+
+    assert len(emitted) == 2, (
+        "same kind on different channels must not suppress each other"
+    )
+    assert {e.channel_id for e in emitted} == {"ch_a", "ch_b"}
+
+
+def test_same_channel_same_kind_is_still_suppressed() -> None:
+    """Level-triggered events on the same channel are still paced.
+
+    The per-channel key must not accidentally defeat the rate floor that
+    prevents a flood of identical observations on the same channel.
+    """
+    context = _context()
+    source = HardwareStreamSource(None, context, context.channels[0])
+
+    event = HardwareEvent(
+        kind=EventKind.THRESHOLD_EXCEEDED,
+        device_id="sampled_device",
+        channel_id="level",
+        quantity="q",
+        detail="breach",
+        observed_at=time.time(),
+    )
+
+    emitted: list[Any] = []
+    # Dispatch twice without waiting for the pacing interval to elapse.
+    source._dispatch([event], emitted.append)
+    source._dispatch([event], emitted.append)
+
+    assert len(emitted) == 1, (
+        "same kind on the same channel should be suppressed by the rate floor"
+    )
+
+
+def test_paced_out_counter_reflects_suppressed_events() -> None:
+    """``_paced_out`` increments exactly once per suppressed event."""
+    context = _context()
+    source = HardwareStreamSource(None, context, context.channels[0])
+    assert source._paced_out == 0
+
+    event_a = HardwareEvent(
+        kind=EventKind.RATE_EXCEEDED,
+        device_id="sampled_device",
+        channel_id="level",
+        quantity="q",
+        detail="fast",
+        observed_at=time.time(),
+    )
+
+    source._dispatch([event_a], None)  # admitted
+    assert source._paced_out == 0
+
+    source._dispatch([event_a], None)  # suppressed
+    assert source._paced_out == 1
+
+    source._dispatch([event_a], None)  # suppressed again
+    assert source._paced_out == 2
+
+
+def test_different_devices_same_channel_id_are_independent() -> None:
+    """Two devices with identical channel names must not suppress each other."""
+    context = _context()
+    source = HardwareStreamSource(None, context, context.channels[0])
+
+    ev1 = HardwareEvent(
+        kind=EventKind.STALE,
+        device_id="device_alpha",
+        channel_id="level",
+        quantity="q",
+        detail="stale alpha",
+        observed_at=time.time(),
+    )
+    ev2 = HardwareEvent(
+        kind=EventKind.STALE,
+        device_id="device_beta",
+        channel_id="level",
+        quantity="q",
+        detail="stale beta",
+        observed_at=time.time(),
+    )
+
+    emitted: list[Any] = []
+    source._dispatch([ev1, ev2], emitted.append)
+
+    assert len(emitted) == 2, (
+        "same channel_id on different devices must not suppress each other"
+    )
+
+
 def test_a_value_resting_on_the_boundary_does_not_flap() -> None:
     """Recovery must clear an inward margin, or a hovering value alternates forever.
 
@@ -650,3 +770,52 @@ async def test_health_compares_observed_rate_against_the_declaration() -> None:
     assert health["observed_hz"] > 0.0
     assert 0.0 < health["rate_ratio"] <= 1.5
     assert health["channel_id"] == "level"
+
+
+# ════════════════════════════════════════════════════════════════
+# G-2: First-order settling model integration
+# ════════════════════════════════════════════════════════════════
+
+
+def test_first_order_settling_flows_through_detector_channel() -> None:
+    """Detector carries the envelope's effective settling through the channel.
+
+    The stream layer does not enforce settling itself (that is outcome.py's
+    concern), but the detector must faithfully expose the model so downstream
+    consumers (alert policy, settling heuristics) can query it.
+    """
+    context = HardwareContext(
+        device_id="heater",
+        hc_version=HC_VERSION,
+        halt_supported=True,
+        transport=TransportRef(kind="mock", config={"values": {"temp": 25.0}}),
+        channels=(
+            Channel(
+                channel_id="temp",
+                direction=Direction.READ.value,
+                quantity="temperature.heater",
+                unit="degC",
+                sample_rate_hz=10.0,
+                envelope=Envelope(
+                    declared=True,
+                    min_value=0.0,
+                    max_value=200.0,
+                    settling_model="first_order",
+                    settling_tau_s=2.0,
+                ),
+            ),
+        ),
+        provenance=ContextProvenance(verified_by="tester"),
+    )
+    detector = HardwareEventDetector(context, context.channel("temp"))
+    # The detector's channel envelope reports 5τ = 10 s.
+    assert detector._channel.envelope.effective_settling_s == pytest.approx(10.0)
+    assert detector._channel.envelope.settling_model == "first_order"
+
+
+def test_step_settling_default_unchanged_through_detector() -> None:
+    """Default step model yields the plain settling_time_s (backward compat)."""
+    context = _context()
+    detector = HardwareEventDetector(context, context.channel("level"))
+    assert detector._channel.envelope.settling_model == "step"
+    assert detector._channel.envelope.effective_settling_s == 0.0

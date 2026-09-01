@@ -75,6 +75,16 @@ class EventKind:
     being refused looks exactly like a bench nobody is using.
     """
 
+    # ── Calibration lifecycle (IC-6) ──
+    CALIBRATION_STARTED = "calibration_started"
+    """A calibration procedure has been initiated on a channel."""
+    CALIBRATION_COMPLETED = "calibration_completed"
+    """A calibration procedure completed successfully."""
+    CALIBRATION_FAILED = "calibration_failed"
+    """A calibration procedure failed before producing a valid correction."""
+    CALIBRATION_EXPIRED = "calibration_expired"
+    """The last successful calibration has exceeded its validity period."""
+
 
 @dataclass(frozen=True)
 class HardwareEvent:
@@ -391,6 +401,7 @@ class HardwareStreamSource:
         ring_capacity: int = DEFAULT_RING_CAPACITY,
         event_sink: EventSink | None = None,
         reading_store: Any = None,
+        alert_policy: Any = None,
     ) -> None:
         self._registry = registry
         self._context = context
@@ -399,6 +410,7 @@ class HardwareStreamSource:
         self._detector = HardwareEventDetector(context, channel)
         self._event_sink = event_sink
         self._store = reading_store
+        self._alert_policy = alert_policy
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._last_emitted: dict[str, float] = {}
@@ -528,12 +540,16 @@ class HardwareStreamSource:
             return
 
     def _dispatch(self, events: Iterable[HardwareEvent], emit: Any) -> None:
-        """Hand events to the sink and to the signal pipeline, paced per kind.
+        """Hand events to the sink, signal pipeline, and alert policy, paced per kind.
 
         ``emit`` receives the ``HardwareEvent`` itself rather than a pre-flattened
         signal, because the consumer decides the representation: the event family,
         the value and the unit are all needed downstream, and collapsing them to a
         detail string here would force every consumer to parse it back out.
+
+        Alert policy evaluation runs after the emit so the event is recorded (and
+        visible on the board) before a response is attempted.  The policy itself
+        dispatches asynchronous tasks so it never blocks the sampling loop.
         """
         for event in events:
             if not self._admit(event):
@@ -543,26 +559,43 @@ class HardwareStreamSource:
                     self._event_sink(event)
                 except Exception as exc:  # noqa: BLE001 - a sink must not stop sampling
                     logger.warning("Hardware event sink raised: %s", exc, exc_info=True)
-            if emit is None:
-                continue
-            try:
-                emit(event)
-            except Exception as exc:  # noqa: BLE001 - as above
-                logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
+            if emit is not None:
+                try:
+                    emit(event)
+                except Exception as exc:  # noqa: BLE001 - as above
+                    logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
+            # Alert policy evaluation: after emit so the event is visible first.
+            if self._alert_policy is not None:
+                try:
+                    self._alert_policy.evaluate(event)
+                    # Reset consecutive counters on recovery so a new breach cycle
+                    # starts fresh rather than carrying stale counts.
+                    if event.kind == EventKind.SETTLED:
+                        self._alert_policy.reset_channel(
+                            event.device_id, event.channel_id
+                        )
+                except Exception as exc:  # noqa: BLE001 - policy must not stop sampling
+                    logger.warning("Hardware alert policy raised: %s", exc, exc_info=True)
 
     def _admit(self, event: HardwareEvent) -> bool:
-        """Return whether this event clears the per-kind rate floor.
+        """Return whether this event clears the per-kind-per-channel rate floor.
 
-        Keyed by kind so a paced ``rate_exceeded`` can never hide a first-time
-        ``threshold_exceeded`` behind it -- suppressing a different observation
-        would trade one flood for one blind spot.
+        Keyed by ``kind:device_id.channel_id`` so that:
+
+        - A paced ``rate_exceeded`` on one channel can never hide a first-time
+          ``threshold_exceeded`` on a *different* channel -- suppressing an
+          observation from another channel would trade one flood for one blind
+          spot.
+        - The same kind on the *same* channel is still suppressed for the
+          ``MIN_EVENT_INTERVAL_S`` floor, preventing level-triggered floods.
         """
         now = time.monotonic()
-        previous = self._last_emitted.get(event.kind)
+        key = f"{event.kind}:{event.device_id}.{event.channel_id}"
+        previous = self._last_emitted.get(key)
         if previous is not None and now - previous < MIN_EVENT_INTERVAL_S:
             self._paced_out += 1
             return False
-        self._last_emitted[event.kind] = now
+        self._last_emitted[key] = now
         return True
 
     @property
@@ -597,6 +630,7 @@ def build_stream_sources(
     ring_capacity: int = DEFAULT_RING_CAPACITY,
     event_sink: EventSink | None = None,
     reading_store: Any = None,
+    alert_policy: Any = None,
 ) -> tuple[HardwareStreamSource, ...]:
     """Return one source per streaming channel across all admitted devices.
 
@@ -616,6 +650,7 @@ def build_stream_sources(
                     ring_capacity=ring_capacity,
                     event_sink=event_sink,
                     reading_store=reading_store,
+                    alert_policy=alert_policy,
                 )
             )
     return tuple(sources)

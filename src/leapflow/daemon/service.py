@@ -47,6 +47,110 @@ logger = logging.getLogger(__name__)
 # circular dependency with approval_coordinator.  See approval_route.py.
 
 
+# ── Hardware sampling control (module-level so unit tests can exercise the
+# pause/resume core against a lightweight registry without a full service) ──
+
+
+def _hardware_device_sources(registry: Any, device: str) -> list[Any]:
+    """Return the streaming sources that belong to one device.
+
+    Sources are named ``hw:{device}:{channel}`` (see ``HardwareStreamSource``),
+    so an exact device prefix isolates a single bench and never touches the
+    sampling loops of its neighbours.
+    """
+    prefix = f"hw:{device}:"
+    return [
+        source
+        for source in registry.stream_sources()
+        if str(getattr(source, "source_id", "")).startswith(prefix)
+    ]
+
+
+def _unknown_device_result(registry: Any, device: str, verb: str) -> dict[str, Any]:
+    """Fail-closed payload naming the admitted devices when *device* is unknown."""
+    admitted = [ctx.device_id for ctx in registry.contexts()]
+    return {
+        "ok": False,
+        "code": "unknown_device",
+        "device": device,
+        "admitted": admitted,
+        "error": (
+            f"Cannot {verb} unknown device '{device}'. "
+            f"Admitted devices: {', '.join(admitted) or 'none'}."
+        ),
+    }
+
+
+async def pause_hardware_sampling(registry: Any, device: str) -> dict[str, Any]:
+    """Stop the sampling loops for one device without closing its transport.
+
+    Fails closed: an empty or unknown device is refused with an actionable
+    message rather than silently pausing nothing.  ``source.stop()`` is
+    idempotent, so re-pausing an already-paused device is safe.
+    """
+    device = str(device or "").strip()
+    if not device:
+        return {
+            "ok": False,
+            "code": "missing_device",
+            "error": "Name a device to pause, e.g. `leap hw pause <device>`.",
+        }
+    if registry.context(device) is None:
+        return _unknown_device_result(registry, device, "pause")
+    paused: list[str] = []
+    for source in _hardware_device_sources(registry, device):
+        await source.stop()
+        paused.append(source.source_id)
+    return {
+        "ok": True,
+        "device": device,
+        "paused": True,
+        "channels": paused,
+        "count": len(paused),
+        "scope": "daemon",
+    }
+
+
+async def resume_hardware_sampling(registry: Any, device: str, *, emit: Any) -> dict[str, Any]:
+    """Restart the sampling loops for one device using the shared event sink.
+
+    Uses the same emitter the daemon installed at startup so resumed channels
+    reach the identical signal path as the original sampling loop.  A single
+    source that fails to restart is isolated and reported, never aborting the
+    rest.
+    """
+    device = str(device or "").strip()
+    if not device:
+        return {
+            "ok": False,
+            "code": "missing_device",
+            "error": "Name a device to resume, e.g. `leap hw resume <device>`.",
+        }
+    if registry.context(device) is None:
+        return _unknown_device_result(registry, device, "resume")
+    resumed: list[str] = []
+    failed: list[str] = []
+    for source in _hardware_device_sources(registry, device):
+        try:
+            await source.start(emit)
+            resumed.append(source.source_id)
+        except Exception as exc:  # noqa: BLE001 - one source must not stop the rest
+            logger.warning(
+                "Hardware stream %s failed to resume: %s",
+                source.source_id, exc, exc_info=True,
+            )
+            failed.append(source.source_id)
+    return {
+        "ok": True,
+        "device": device,
+        "paused": False,
+        "channels": resumed,
+        "failed": failed,
+        "count": len(resumed),
+        "scope": "daemon",
+    }
+
+
 class RuntimeLeapService:
     """LeapService implementation backed by a single initialized Context."""
 
@@ -698,6 +802,68 @@ class RuntimeLeapService:
             if not callable(restart):
                 return {"ok": False, "started": False, "last_error": "host lifecycle is unavailable"}
             return dict(await restart())
+
+    # ── Delegate: hardware sampling control ────────────────────────────
+    #
+    # Daemon-global like ``host_*``: hardware sampling is not session-scoped, so
+    # these take no ``session_id`` and a caller with no session gets no session
+    # identity by construction. Unlike engine turns they do NOT take the turn
+    # admission slot: a direct human intervention (pause a runaway bench, resume
+    # after a fix) must take effect at once rather than queue behind engine work,
+    # matching the immediacy of ``hw estop``.
+
+    async def hardware_pause(self, device: str = "") -> dict[str, Any]:
+        """Pause the daemon-owned sampling loop for one device (fail-closed).
+
+        Daemon-global: hardware sampling is shared daemon state, not session
+        state, so this accepts no ``session_id`` and returns none. It does not
+        occupy a turn-admission slot -- it is a direct control action rather than
+        a turn -- so it is safe to invoke from concurrent TUIs; the effect is
+        shared and visible to every connected client.
+        """
+        ctx = self._ctx
+        if ctx is None:
+            return {
+                "ok": False, "code": "runtime_unavailable", "device": device,
+                "error": "leapd runtime is not initialized yet; retry once it is ready.",
+            }
+        registry = getattr(ctx, "_hardware_registry", None)
+        if registry is None:
+            return {
+                "ok": False, "code": "hardware_disabled", "device": device,
+                "error": "Hardware is disabled for this profile; there is nothing to pause.",
+            }
+        return await pause_hardware_sampling(registry, device)
+
+    async def hardware_resume(self, device: str = "") -> dict[str, Any]:
+        """Resume the daemon-owned sampling loop for one device (fail-closed).
+
+        Daemon-global: hardware sampling is shared daemon state, not session
+        state, so this accepts no ``session_id`` and returns none. It does not
+        occupy a turn-admission slot -- it is a direct control action rather than
+        a turn -- so it is safe to invoke from concurrent TUIs; the resumed
+        sampling is shared and visible to every connected client.
+        """
+        ctx = self._ctx
+        if ctx is None:
+            return {
+                "ok": False, "code": "runtime_unavailable", "device": device,
+                "error": "leapd runtime is not initialized yet; retry once it is ready.",
+            }
+        registry = getattr(ctx, "_hardware_registry", None)
+        if registry is None:
+            return {
+                "ok": False, "code": "hardware_disabled", "device": device,
+                "error": "Hardware is disabled for this profile; there is nothing to resume.",
+            }
+        # Reuse the emitter installed at daemon startup so resumed channels reach
+        # the same signal path as the original loop; fall back to rebuilding it
+        # from the context if it was never set.
+        emit = getattr(registry, "_event_emitter", None)
+        if emit is None:
+            getter = getattr(ctx, "_hardware_event_emitter", None)
+            emit = getter() if callable(getter) else None
+        return await resume_hardware_sampling(registry, device, emit=emit)
 
     # ── Delegate: signal metrics ──────────────────────────────────────
 

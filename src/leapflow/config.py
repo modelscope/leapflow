@@ -173,6 +173,11 @@ class Settings:
     # deserves its own decision -- at the cost of prompting often enough that people
     # start clicking through.
     hardware_envelope_grant: bool = True
+    # Trust-based approval skip for reversible channels that have accumulated
+    # enough successful outcomes.  Off by default: enabling it is a deliberate
+    # operator decision, and the safety invariant (irreversible channels always
+    # require approval) holds regardless.
+    hardware_trust_skip_enabled: bool = False
     # Continuous sampling for channels that declare a sample rate.
     hardware_stream_enabled: bool = True
     # Per-channel ring buffer depth for raw samples. Raw readings never enter the
@@ -195,6 +200,11 @@ class Settings:
     # finished one is a write-once artifact -- its recorded size and TTL are correct,
     # and old data can be dropped without discarding the file being written to.
     hardware_raw_segment_mb: float = 32.0
+    # Whether the durable ``instrument.duckdb`` history tier is registered as sensitive
+    # and non-syncable, so a profile backup excludes physical series that may carry a
+    # trade secret or sample information. On by default; opt out only for a bench known
+    # to produce no sensitive data.
+    hardware_reading_store_sensitive: bool = True
     runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
@@ -1012,6 +1022,7 @@ def _build_settings_from_env(
     )
     hardware_require_describe = os.getenv("LEAPFLOW_HARDWARE_REQUIRE_DESCRIBE", "1").strip().lower() in ("1", "true", "yes")
     hardware_envelope_grant = os.getenv("LEAPFLOW_HARDWARE_ENVELOPE_GRANT", "1").strip().lower() in ("1", "true", "yes")
+    hardware_trust_skip_enabled = os.getenv("LEAPFLOW_HARDWARE_TRUST_SKIP_ENABLED", "0").strip().lower() in ("1", "true", "yes")
     hardware_stream_enabled = os.getenv("LEAPFLOW_HARDWARE_STREAM_ENABLED", "1").strip().lower() in ("1", "true", "yes")
     hardware_stream_ring_capacity = int(os.getenv("LEAPFLOW_HARDWARE_STREAM_RING_CAPACITY", "4096"))
     hardware_persist_readings = os.getenv("LEAPFLOW_HARDWARE_PERSIST_READINGS", "1").strip().lower() in ("1", "true", "yes")
@@ -1021,6 +1032,9 @@ def _build_settings_from_env(
         os.getenv("LEAPFLOW_HARDWARE_HISTORY_RETENTION_DAYS", "90")
     )
     hardware_raw_segment_mb = float(os.getenv("LEAPFLOW_HARDWARE_RAW_SEGMENT_MB", "32"))
+    hardware_reading_store_sensitive = os.getenv(
+        "LEAPFLOW_HARDWARE_READING_STORE_SENSITIVE", "1"
+    ).strip().lower() in ("1", "true", "yes")
     web_transport = os.getenv("LEAPFLOW_WEB_TRANSPORT", "auto").strip().lower() or "auto"
     web_timeout_s = float(os.getenv("LEAPFLOW_WEB_TIMEOUT_S", "20"))
     web_max_bytes = int(os.getenv("LEAPFLOW_WEB_MAX_BYTES", "2000000"))
@@ -1389,6 +1403,7 @@ def _build_settings_from_env(
         hardware_unverified_policy=hardware_unverified_policy,
         hardware_require_describe=hardware_require_describe,
         hardware_envelope_grant=hardware_envelope_grant,
+        hardware_trust_skip_enabled=hardware_trust_skip_enabled,
         hardware_stream_enabled=hardware_stream_enabled,
         hardware_stream_ring_capacity=hardware_stream_ring_capacity,
         hardware_persist_readings=hardware_persist_readings,
@@ -1396,6 +1411,7 @@ def _build_settings_from_env(
         hardware_raw_retention_days=hardware_raw_retention_days,
         hardware_history_retention_days=hardware_history_retention_days,
         hardware_raw_segment_mb=hardware_raw_segment_mb,
+        hardware_reading_store_sensitive=hardware_reading_store_sensitive,
         web_transport=web_transport,
         web_timeout_s=web_timeout_s,
         web_max_bytes=web_max_bytes,

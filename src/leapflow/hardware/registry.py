@@ -61,6 +61,7 @@ class HardwareSettings:
     unverified_context_policy: str = UnverifiedContextPolicy.DENY_WRITE
     require_describe_before_write: bool = True
     envelope_grant: bool = True
+    trust_skip_enabled: bool = False
     stream_enabled: bool = True
     stream_ring_capacity: int = 4096
     persist_readings: bool = True
@@ -68,6 +69,7 @@ class HardwareSettings:
     raw_retention_days: float = 7.0
     history_retention_days: float = 90.0
     raw_segment_mb: float = 32.0
+    reading_store_sensitive: bool = True
     readings_dir: str = ""
     instrument_db_path: str = ""
     workspace_id: str = ""
@@ -111,6 +113,9 @@ class HardwareSettings:
                 getattr(settings, "hardware_require_describe", True)
             ),
             envelope_grant=bool(getattr(settings, "hardware_envelope_grant", True)),
+            trust_skip_enabled=bool(
+                getattr(settings, "hardware_trust_skip_enabled", False)
+            ),
             stream_enabled=bool(getattr(settings, "hardware_stream_enabled", True)),
             stream_ring_capacity=int(
                 getattr(settings, "hardware_stream_ring_capacity", 4096) or 4096
@@ -126,6 +131,9 @@ class HardwareSettings:
                 getattr(settings, "hardware_history_retention_days", 90.0) or 90.0
             ),
             raw_segment_mb=float(getattr(settings, "hardware_raw_segment_mb", 32.0) or 32.0),
+            reading_store_sensitive=bool(
+                getattr(settings, "hardware_reading_store_sensitive", True)
+            ),
             instrument_db_path=(
                 str(profile_layout.instrument_db_path) if profile_layout is not None else ""
             ),
@@ -217,6 +225,11 @@ class HardwareRegistry:
         self._last_command: dict[tuple[str, str], tuple[float, float]] = {}
         self._stream_sources: tuple[Any, ...] | None = None
         self._reading_store: Any = None
+        self._calibration_store: Any = None
+        # One holder for instrument.duckdb, shared by the reading and calibration stores.
+        # A single process must not open two independent read-write connections to the
+        # same DuckDB file, so the registry owns the holder and injects it into both.
+        self._instrument_conn: Any = None
         self._outcome_recorder: Any = None
         self._cache_manager: Any = None
         self._session_id: str = ""
@@ -598,15 +611,58 @@ class HardwareRegistry:
                     if self._settings.instrument_db_path
                     else None
                 ),
+                connection_holder=self._instrument_holder(),
                 cache_manager=self._cache_manager,
                 workspace_id=self._settings.workspace_id,
                 session_id=self._session_id,
+                reading_store_sensitive=self._settings.reading_store_sensitive,
                 raw_ttl_s=self._settings.raw_retention_days * 24 * 3600.0,
                 downsample_interval_s=self._settings.downsample_interval_s,
                 history_ttl_s=self._settings.history_retention_days * 24 * 3600.0,
                 raw_segment_bytes=int(self._settings.raw_segment_mb * 1024 * 1024),
             )
         return self._reading_store
+
+    def _instrument_holder(self) -> Any:
+        """Return the shared holder for ``instrument.duckdb``, building it once.
+
+        Profile-scoped, so it outlives session rebinds: unlike the reading store it is
+        never rebuilt in ``bind_persistence``, which lets the rebuilt store reattach to
+        the same connection rather than opening a second one to the same file. Returns
+        None when no instrument database is configured, so both stores fall back to
+        their bare-path behaviour.
+        """
+        if not self._settings.instrument_db_path:
+            return None
+        if self._instrument_conn is None:
+            from leapflow.storage.connection import LocalConnectionHolder
+
+            self._instrument_conn = LocalConnectionHolder(
+                Path(self._settings.instrument_db_path)
+            )
+        return self._instrument_conn
+
+    @property
+    def calibration_store(self) -> Any:
+        """Return the versioned calibration store, or None without an instrument database.
+
+        Independent of ``persist_readings``: a bench can want its calibration history
+        durable without streaming sample history, so this is gated on the database path
+        alone. Shares the reading store's connection and its sensitivity posture, since
+        both tiers live in the one file.
+        """
+        if not self._settings.instrument_db_path:
+            return None
+        if self._calibration_store is None:
+            from leapflow.hardware.calibration_store import CalibrationStore
+
+            self._calibration_store = CalibrationStore(
+                db_path=Path(self._settings.instrument_db_path),
+                connection_holder=self._instrument_holder(),
+                cache_manager=self._cache_manager,
+                sensitive=self._settings.reading_store_sensitive,
+            )
+        return self._calibration_store
 
     def bind_persistence(
         self,
@@ -648,6 +704,9 @@ class HardwareRegistry:
             # orphaned -- still reading, but no longer the objects stop_streams() stops.
             return
         self._reading_store = None
+        # The calibration store is left in place: its file is profile-scoped and it
+        # shares the instrument holder, which is deliberately not rebuilt here. Only its
+        # cache_manager could go stale, and it re-registers idempotently on next write.
         self._stream_sources = None
 
     @property
@@ -727,8 +786,25 @@ class HardwareRegistry:
                 )
 
     def record_event(self, event: Any) -> None:
-        """Keep a bounded tail of derived events for hw_status."""
+        """Keep a bounded tail of derived events for hw_status.
+
+        An alert-severity event also tightens the reading store's downsample window,
+        so the excursion that raised it is captured at finer resolution than the coarse
+        steady-state interval -- the shape of a breach is exactly what a later analysis
+        needs and what a sixty-second mean would average away. Routed through the same
+        sink the sampling loop already uses, and guarded so an unbuilt store (persistence
+        off) is simply skipped.
+        """
         self._recent_events.append(event)
+        store = self._reading_store
+        if store is None:
+            return
+        # Lazy import, matching how the rest of the registry reaches observability, and
+        # so the alert taxonomy has one home (the digest) rather than a second copy here.
+        from leapflow.hardware.observability.digest import ALERT_KINDS
+
+        if str(getattr(event, "kind", "")) in ALERT_KINDS:
+            store.note_alert()
 
     def set_event_emitter(self, emit: Any) -> None:
         """Install the sink that carries hardware events onto the signal path.
@@ -864,6 +940,16 @@ class HardwareRegistry:
             # Flushed before transports close: the last interval of a long run is exactly
             # the data somebody will want, and it is still only buffered at this point.
             store.close()
+        calibration = self._calibration_store
+        if calibration is not None:
+            calibration.close()
+        # The stores share this holder and neither owns it, so it is closed here, last of
+        # the instrument.duckdb writers. It reopens lazily if history is read afterwards.
+        if self._instrument_conn is not None:
+            try:
+                self._instrument_conn.close()
+            except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+                logger.debug("instrument holder close failed: %s", exc, exc_info=True)
         for device_id, transport in list(self._transports.items()):
             try:
                 await transport.close()

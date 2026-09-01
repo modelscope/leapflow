@@ -12,7 +12,7 @@ itself out of the suite.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Mapping
 
 import pytest
 
@@ -23,8 +23,10 @@ from leapflow.hardware.context import (
     Envelope,
     HardwareContext,
     HardwareEffect,
+    Quality,
     TransportRef,
 )
+from leapflow.hardware.testing import run_transport_conformance
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
     HardwareTransport,
@@ -87,6 +89,14 @@ class _Case:
 
 
 _MOCK_CONFIG: dict[str, Any] = {
+    "values": {"sensor": 21.5, "setpoint": 50.0},
+    "halt_supported": True,
+}
+
+_SIMULATED_CONFIG: dict[str, Any] = {
+    # Static values on both channels: the generic conformance cases assume a read
+    # is repeatable, so the default declaration must not drive a waveform. Fault
+    # injection is exercised by the dedicated cases lower in this file.
     "values": {"sensor": 21.5, "setpoint": 50.0},
     "halt_supported": True,
 }
@@ -162,6 +172,17 @@ _TRANSPORT_CASES: tuple[_Case, ...] = (
         # No halt tool named, so the device cannot be stopped. A declaration may not
         # claim the reverse: a tool that was never named cannot be called.
         without_halt=_mcp_config(halt_tool=""),
+    ),
+    _Case(
+        kind="simulated",
+        config=_SIMULATED_CONFIG,
+        failing_write={
+            **_SIMULATED_CONFIG,
+            "failures": [
+                {"channel_id": "setpoint", "on_call": 1, "side_effect_state": "partial"}
+            ],
+        },
+        without_halt={**_SIMULATED_CONFIG, "halt_supported": False},
     ),
 )
 
@@ -327,6 +348,55 @@ async def test_satisfies_the_protocol(transport_case) -> None:
     transport, _ = transport_case
     assert isinstance(transport, HardwareTransport)
     assert isinstance(transport.kind, str) and transport.kind
+
+
+# ════════════════════════════════════════════════════════════════
+# Conformance suite: reusable runner exercised as a regression guard
+# ════════════════════════════════════════════════════════════════
+
+
+def _factory_for_kind(kind: str) -> Callable[[Mapping[str, Any]], HardwareTransport]:
+    """Return a factory that wraps ``build_transport`` for the given kind."""
+    def _factory(config: Mapping[str, Any]) -> HardwareTransport:
+        return build_transport(kind, config)
+    return _factory
+
+
+@pytest.mark.parametrize("case", _TRANSPORT_CASES, ids=[c.kind for c in _TRANSPORT_CASES])
+def test_conformance_suite_passes(case: _Case) -> None:
+    """The reusable conformance runner must agree with the hand-written cases.
+
+    This is the regression guard: if the extracted suite diverges from the
+    hand-written tests, this test fails and pinpoints the disagreement.
+    """
+    factory = _factory_for_kind(case.kind)
+    report = run_transport_conformance(
+        factory,
+        case.config,
+        failing_write_config=case.failing_write,
+        no_halt_config=case.without_halt,
+    )
+    failures = [r for r in report.results if not r.passed]
+    assert report.failed == 0, (
+        f"{case.kind}: {report.failed} conformance checks failed:\n"
+        + "\n".join(str(f) for f in failures)
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in _TRANSPORT_CASES if c.kind == "simulated"],
+    ids=[c.kind for c in _TRANSPORT_CASES if c.kind == "simulated"],
+)
+def test_conformance_suite_with_init_required(case: _Case) -> None:
+    """The init_required variant must also pass for transports that support it."""
+    factory = _factory_for_kind(case.kind)
+    report = run_transport_conformance(factory, case.config, include_init=True)
+    failures = [r for r in report.results if not r.passed]
+    assert report.failed == 0, (
+        f"{case.kind} (init_required): {report.failed} conformance checks failed:\n"
+        + "\n".join(str(f) for f in failures)
+    )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -587,3 +657,237 @@ def _mcp_config_without_client() -> dict[str, Any]:
     config = _mcp_config()
     config.pop("client")
     return config
+
+
+# ═════════════════════════════════════════════════════════════════
+# SimulatedTransport: parameterised fault injection and a logical clock
+# ═════════════════════════════════════════════════════════════════
+#
+# The generic conformance cases above already prove SimulatedTransport satisfies
+# the six-method contract and stamps both clocks. These cases exercise the
+# behaviour that only exists to be injected, so a downstream L3 journey or a
+# long-run test can assert on it.
+
+
+async def _open_simulated(**config: Any):
+    """Build and open a simulated transport against the conformance declaration."""
+    transport = build_transport("simulated", config)
+    await transport.open(_conformance_context("simulated", config))
+    return transport
+
+
+@pytest.mark.asyncio
+async def test_simulated_waveform_is_a_pure_function_of_the_logical_clock() -> None:
+    """A sine channel returns a stable value until the clock advances.
+
+    Time is driven logically, so two reads at the same instant must agree; that
+    is what lets a long-run test fast-forward without the value drifting on real
+    wall-clock time between samples.
+    """
+    transport = await _open_simulated(
+        values={"setpoint": 50.0},
+        waveforms={
+            "sensor": {"kind": "sine", "offset": 20.0, "amplitude": 5.0, "period_s": 60.0}
+        },
+    )
+    first = await transport.read("sensor")
+    same_instant = await transport.read("sensor")
+    assert first.value == pytest.approx(20.0)
+    assert same_instant.value == pytest.approx(first.value)
+
+    transport.advance_clock(15.0)  # a quarter period -> peak of the sine
+    at_peak = await transport.read("sensor")
+    assert at_peak.value == pytest.approx(25.0)
+
+
+@pytest.mark.asyncio
+async def test_simulated_latency_advances_both_clocks_in_lockstep() -> None:
+    """Latency shows up as elapsed time, and both clocks move together.
+
+    A downstream rate calculation divides by the monotonic interval and persists
+    the wall instant; if the two clocks disagreed on how much time passed, one of
+    those would be wrong without failing.
+    """
+    transport = await _open_simulated(values={"sensor": 1.0}, latency_ms=50.0)
+    first = await transport.read("sensor")
+    second = await transport.read("sensor")
+    wall_delta = second.observed_at - first.observed_at
+    mono_delta = second.monotonic_at - first.monotonic_at
+    assert wall_delta == pytest.approx(0.05)
+    assert mono_delta == pytest.approx(0.05)
+    assert (await transport.probe()).latency_ms == pytest.approx(50.0)
+
+
+@pytest.mark.asyncio
+async def test_simulated_dropped_samples_leave_a_sequence_gap() -> None:
+    """A dropped sample is invisible except as a hole in the numbering."""
+    transport = await _open_simulated(values={"sensor": 1.0}, drop_probability=1.0)
+    sequences = [(await transport.read("sensor")).sequence for _ in range(3)]
+    gaps = [b - a for a, b in zip(sequences, sequences[1:])]
+    assert all(gap > 1 for gap in gaps), (
+        f"a dropped sample must widen the sequence step, got {sequences}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_simulated_reorder_delivers_adjacent_samples_swapped() -> None:
+    """Reordering breaks the sorted order while keeping every sample unique."""
+    transport = await _open_simulated(values={"sensor": 1.0}, reorder=True)
+    sequences = [(await transport.read("sensor")).sequence for _ in range(4)]
+    assert sorted(sequences) != sequences, f"reorder must not stay sorted: {sequences}"
+    assert len(set(sequences)) == len(sequences), "reorder must not duplicate a sample"
+
+
+@pytest.mark.asyncio
+async def test_simulated_quality_degradation_marks_readings_untrustworthy() -> None:
+    """A degraded channel reports a non-OK quality the pipeline can filter on."""
+    transport = await _open_simulated(values={"sensor": 1.0}, quality_degradation=1.0)
+    reading = await transport.read("sensor")
+    assert reading.quality != Quality.OK.value
+    assert reading.is_trustworthy is False
+
+
+@pytest.mark.asyncio
+async def test_simulated_disconnect_sequence_fails_then_recovers() -> None:
+    """A scheduled drop refuses reads until the declared reconnect point.
+
+    A refusal is a "could not attempt", so it surfaces as ``TransportError`` --
+    never as a fabricated reading, which is the failure mode the sequence exists
+    to catch.
+    """
+    transport = await _open_simulated(
+        values={"sensor": 1.0},
+        disconnects=[{"on_read": 2, "reconnect_after": 2}],
+    )
+    assert (await transport.read("sensor")).sequence == 1
+    with pytest.raises(TransportError):
+        await transport.read("sensor")  # attempt 2: link drops here
+    with pytest.raises(TransportError):
+        await transport.read("sensor")  # attempt 3: still down
+    recovered = await transport.read("sensor")  # attempt 4: reconnect_at reached
+    assert isinstance(recovered, Reading)
+
+
+@pytest.mark.asyncio
+async def test_simulated_init_required_gates_the_data_plane_until_initialised() -> None:
+    """With ``init_required`` on, reads and writes are refused until an init write.
+
+    This is the readiness contract an L3 journey asserts: a device that has opened
+    the link but not run its init/calibration step must refuse to read or actuate,
+    and must do so with a verdict recovery can act on -- ``not_initialized`` with
+    no side effect -- rather than by fabricating a reading or a silent success.
+    """
+    transport = await _open_simulated(
+        init_required=True,
+        init_channel="__init__",
+        values={"sensor": 21.5, "setpoint": 50.0},
+    )
+
+    # A read before init is a "could not attempt", so it raises.
+    with pytest.raises(TransportError) as caught:
+        await transport.read("sensor")
+    assert caught.value.failure_code == "not_initialized"
+
+    # An ordinary write before init is refused, and proves nothing reached the
+    # device so recovery may replay it once the device is ready.
+    refused = await transport.write("setpoint", 42.0)
+    assert refused.ok is False
+    assert refused.failure_code == "not_initialized"
+    assert refused.side_effect_state == SIDE_EFFECT_NONE
+    assert refused.effect_may_have_landed is False
+
+    # The declared init channel is the one write allowed before initialisation; it
+    # runs the handshake and opens the data plane.
+    initialised = await transport.write("__init__", "go")
+    assert initialised.ok is True
+    assert initialised.side_effect_state != SIDE_EFFECT_NONE
+    assert transport.initialized is True
+
+    # From here reads and writes behave exactly as an un-gated transport would.
+    reading = await transport.read("sensor")
+    assert isinstance(reading, Reading)
+    assert reading.value == pytest.approx(21.5)
+    assert (await transport.write("setpoint", 42.0)).ok is True
+
+
+@pytest.mark.asyncio
+async def test_simulated_without_init_required_is_ready_the_moment_it_opens() -> None:
+    """Regression guard: the default declares no init step, so nothing is gated.
+
+    ``init_required`` defaults off, so every existing declaration reads and writes
+    immediately after open with no handshake -- the behaviour the rest of the
+    conformance suite already assumes.
+    """
+    transport = await _open_simulated(values={"sensor": 21.5, "setpoint": 50.0})
+    assert transport.initialized is True
+    assert isinstance(await transport.read("sensor"), Reading)
+    assert (await transport.write("setpoint", 42.0)).ok is True
+
+
+# ═════════════════════════════════════════════════════════════════
+# SignalInjector: the deterministic control surface long-run tests drive
+# ═════════════════════════════════════════════════════════════════
+
+
+def test_simulated_transport_implements_the_signal_injector_protocol() -> None:
+    """The injector contract is satisfied by ``isinstance``, not by subclassing."""
+    from leapflow.hardware.testing import SignalInjector
+
+    transport = build_transport("simulated", _SIMULATED_CONFIG)
+    assert isinstance(transport, SignalInjector)
+
+
+@pytest.mark.asyncio
+async def test_injected_reading_takes_priority_then_reverts() -> None:
+    """An injected value is delivered once, then normal behaviour resumes."""
+    transport = await _open_simulated(values={"sensor": 21.5})
+    transport.inject_reading("sensor", 99.9, quality=Quality.SUSPECT.value)
+    forced = await transport.read("sensor")
+    assert forced.value == pytest.approx(99.9)
+    assert forced.quality == Quality.SUSPECT.value
+    reverted = await transport.read("sensor")
+    assert reverted.value == pytest.approx(21.5)
+    assert reverted.quality == Quality.OK.value
+
+
+@pytest.mark.asyncio
+async def test_injected_gap_skips_the_declared_number_of_sequence_numbers() -> None:
+    transport = await _open_simulated(values={"sensor": 1.0})
+    first = await transport.read("sensor")
+    transport.inject_gap("sensor", dropped=5)
+    second = await transport.read("sensor")
+    assert second.sequence - first.sequence == 6, "one live sample plus five dropped"
+
+
+@pytest.mark.asyncio
+async def test_injected_disconnect_refuses_reads_until_reopened() -> None:
+    transport = await _open_simulated(values={"sensor": 1.0})
+    assert isinstance(await transport.read("sensor"), Reading)
+    transport.inject_disconnect()
+    with pytest.raises(TransportError):
+        await transport.read("sensor")
+
+
+@pytest.mark.asyncio
+async def test_advance_clock_fast_forwards_without_sleeping() -> None:
+    """A day of simulated time passes in-process, on both clocks equally.
+
+    This is the mechanism a 7-day longevity test relies on: no real sleep, and
+    wall and monotonic advance by the same amount so ordering stays intact.
+    """
+    transport = await _open_simulated(values={"sensor": 1.0})
+    before = await transport.read("sensor")
+    transport.advance_clock(86_400.0)
+    after = await transport.read("sensor")
+    assert after.observed_at - before.observed_at == pytest.approx(86_400.0)
+    assert after.monotonic_at - before.monotonic_at == pytest.approx(86_400.0)
+
+
+@pytest.mark.asyncio
+async def test_advance_clock_ignores_negative_values() -> None:
+    """The logical clock never runs backwards, even if asked to."""
+    transport = await _open_simulated(values={"sensor": 1.0})
+    before = await transport.read("sensor")
+    transport.advance_clock(-100.0)
+    after = await transport.read("sensor")
+    assert after.observed_at >= before.observed_at

@@ -367,6 +367,344 @@ def test_a_failing_store_does_not_raise() -> None:
     assert recorder.recall(device_id="d", channel=_channel()) == ()
 
 
+# ════════════════════════════════════════════════════════════════
+# Regression baselines: record_command / observe / drop_pending
+# ════════════════════════════════════════════════════════════════
+
+
+def test_record_command_increments_pending_count() -> None:
+    """Baseline: each numeric record_command adds exactly one pending entry."""
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store)
+    assert recorder.pending == 0
+    recorder.record_command(device_id="d", channel=_channel(), value=10.0, now=1.0)
+    assert recorder.pending == 1
+    recorder.record_command(
+        device_id="d2", channel=_channel(), value=20.0, now=2.0,
+    )
+    assert recorder.pending == 2
+
+
+def test_observe_consumes_pending_entry() -> None:
+    """Baseline: a successful observe removes the pending entry and returns an outcome."""
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store)
+    recorder.record_command(device_id="d", channel=_channel(), value=50.0, now=1.0)
+    assert recorder.pending == 1
+    outcome = recorder.observe(device_id="d", channel_id="aspirate", value=50.2, now=2.0)
+    assert outcome is not None
+    assert outcome.commanded == 50.0
+    assert outcome.observed == 50.2
+    assert recorder.pending == 0
+    assert len(store.records) == 1
+
+
+def test_drop_pending_removes_entry_and_does_not_affect_other_channels() -> None:
+    """Baseline: drop_pending removes the channel's pending; others untouched."""
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store)
+    recorder.record_command(device_id="d", channel=_channel(), value=10.0, now=1.0)
+    ch2 = Channel(
+        channel_id="temp",
+        direction=Direction.READWRITE.value,
+        quantity="temperature",
+        unit="C",
+        effect=HardwareEffect.CONFIGURE.value,
+        verify_after_write=True,
+        envelope=Envelope(declared=True, min_value=0.0, max_value=100.0),
+    )
+    recorder.record_command(device_id="d", channel=ch2, value=37.0, now=2.0)
+    assert recorder.pending == 2
+    recorder.drop_pending("d", "aspirate")
+    assert recorder.pending == 1
+    # The other channel is unaffected and can still be observed.
+    outcome = recorder.observe(device_id="d", channel_id="temp", value=37.1, now=3.0)
+    assert outcome is not None
+    assert outcome.commanded == 37.0
+
+
+def test_drop_pending_is_idempotent() -> None:
+    """Baseline: dropping a channel that has no pending entry is a no-op."""
+    recorder = HardwareOutcomeRecorder(FakeExperienceStore())
+    recorder.drop_pending("nonexistent", "no_channel")  # must not raise
+    assert recorder.pending == 0
+
+
+def test_observe_returns_none_for_non_numeric_value() -> None:
+    """Baseline: a non-numeric observation value produces no outcome."""
+    recorder = HardwareOutcomeRecorder(FakeExperienceStore())
+    recorder.record_command(device_id="d", channel=_channel(), value=10.0, now=1.0)
+    assert recorder.observe(device_id="d", channel_id="aspirate", value="high", now=2.0) is None
+    assert recorder.pending == 1  # still pending, not consumed
+
+
+# ════════════════════════════════════════════════════════════════
+# G6 fix: multi-slot pending -- concurrent writes must not overwrite
+# ════════════════════════════════════════════════════════════════
+
+
+def test_two_consecutive_writes_both_produce_outcomes() -> None:
+    """The bug G6 fixed: a second write to the same channel must not erase the first.
+
+    Before the fix, ``_pending[(device, channel)]`` was a single slot.  A second
+    ``record_command`` silently overwrote the first, so the first command's
+    physical result was never matched by ``observe()`` -- learning data lost.
+    """
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store)
+    channel = _channel()
+    recorder.record_command(
+        device_id="d", channel=channel, value=10.0, conditions="first", now=1.0,
+    )
+    recorder.record_command(
+        device_id="d", channel=channel, value=20.0, conditions="second", now=2.0,
+    )
+    assert recorder.pending == 2
+
+    # Observe in order: first command matched first.
+    out1 = recorder.observe(device_id="d", channel_id="aspirate", value=10.2, now=3.0)
+    assert out1 is not None
+    assert out1.commanded == 10.0
+    assert out1.observed == 10.2
+    assert recorder.pending == 1
+
+    out2 = recorder.observe(device_id="d", channel_id="aspirate", value=20.5, now=4.0)
+    assert out2 is not None
+    assert out2.commanded == 20.0
+    assert out2.observed == 20.5
+    assert recorder.pending == 0
+    assert len(store.records) == 2
+
+
+def test_out_of_order_observe_matches_settled_command() -> None:
+    """When two commands have different settling times, a later one may settle first.
+
+    ``observe()`` picks the settled command with the earliest ``settle_after``,
+    so the first to settle is matched regardless of insertion order.
+    """
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store)
+    slow_channel = _channel(settling=5.0)
+    fast_channel = _channel(settling=0.0)
+
+    # First command: slow-settling.
+    recorder.record_command(
+        device_id="d", channel=slow_channel, value=50.0, now=100.0,
+    )
+    # Second command: instant-settling.
+    recorder.record_command(
+        device_id="d", channel=fast_channel, value=80.0, now=101.0,
+    )
+    assert recorder.pending == 2
+
+    # At t=103 only the fast command has settled (settle_after=101).
+    out = recorder.observe(device_id="d", channel_id="aspirate", value=80.1, now=103.0)
+    assert out is not None
+    assert out.commanded == 80.0, "should match the fast (already settled) command"
+    assert recorder.pending == 1
+
+    # At t=106 the slow command is settled (settle_after=105).
+    out2 = recorder.observe(device_id="d", channel_id="aspirate", value=49.8, now=106.0)
+    assert out2 is not None
+    assert out2.commanded == 50.0
+    assert recorder.pending == 0
+    assert len(store.records) == 2
+
+
+def test_drop_pending_clears_all_slots_for_channel() -> None:
+    """Write failure drops every pending command on the channel, not just one."""
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store)
+    channel = _channel()
+    recorder.record_command(device_id="d", channel=channel, value=10.0, now=1.0)
+    recorder.record_command(device_id="d", channel=channel, value=20.0, now=2.0)
+    recorder.record_command(device_id="d", channel=channel, value=30.0, now=3.0)
+    assert recorder.pending == 3
+
+    recorder.drop_pending("d", "aspirate")
+    assert recorder.pending == 0
+    # None of the dropped commands produce outcomes.
+    assert recorder.observe(device_id="d", channel_id="aspirate", value=10.0, now=4.0) is None
+
+
+def test_drop_pending_does_not_affect_other_channels_multi_slot() -> None:
+    """Dropping one channel's slots must leave another channel's slots intact."""
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store)
+    ch1 = _channel()
+    ch2 = Channel(
+        channel_id="temp",
+        direction=Direction.READWRITE.value,
+        quantity="temperature",
+        unit="C",
+        effect=HardwareEffect.CONFIGURE.value,
+        verify_after_write=True,
+        envelope=Envelope(declared=True, min_value=0.0, max_value=100.0),
+    )
+    recorder.record_command(device_id="d", channel=ch1, value=10.0, now=1.0)
+    recorder.record_command(device_id="d", channel=ch1, value=20.0, now=2.0)
+    recorder.record_command(device_id="d", channel=ch2, value=37.0, now=3.0)
+    assert recorder.pending == 3
+
+    recorder.drop_pending("d", "aspirate")
+    assert recorder.pending == 1
+    out = recorder.observe(device_id="d", channel_id="temp", value=37.1, now=4.0)
+    assert out is not None
+    assert out.commanded == 37.0
+
+
+def test_pending_is_bounded_by_max_per_channel() -> None:
+    """Excess pending commands are evicted FIFO so memory stays bounded."""
+    from leapflow.hardware.outcome import _MAX_PENDING_PER_CHANNEL
+
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store)
+    channel = _channel()
+    # Write more than the cap.
+    for i in range(_MAX_PENDING_PER_CHANNEL + 3):
+        recorder.record_command(
+            device_id="d", channel=channel, value=float(i), now=float(i),
+        )
+    assert recorder.pending == _MAX_PENDING_PER_CHANNEL
+
+    # The oldest commands were evicted; only the newest survive.
+    out = recorder.observe(
+        device_id="d", channel_id="aspirate", value=99.0,
+        now=float(_MAX_PENDING_PER_CHANNEL + 10),
+    )
+    assert out is not None
+    # The very first command (value=0.0) should have been evicted.
+    assert out.commanded >= 3.0, (
+        f"oldest commands should have been evicted; got commanded={out.commanded}"
+    )
+
+
+def test_eviction_prefers_expired_entries_over_live_ones() -> None:
+    """When the cap is hit, expired entries are purged first.
+
+    A non-expired command must not be discarded while there are already-expired
+    entries occupying a slot.  This avoids silently losing learning data for
+    commands that are still expected to settle.
+    """
+    from leapflow.hardware.outcome import _MAX_PENDING_PER_CHANNEL
+
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store, pending_ttl_s=10.0)
+    channel = _channel()
+
+    # Fill the channel to the cap with commands that will expire quickly.
+    for i in range(_MAX_PENDING_PER_CHANNEL):
+        recorder.record_command(
+            device_id="d", channel=channel, value=float(i), now=float(i),
+        )
+    assert recorder.pending == _MAX_PENDING_PER_CHANNEL
+
+    # At t=20, all existing entries have expired (ttl=10, latest was at t=3).
+    # Adding a new command should purge the expired ones instead of evicting
+    # a live entry.
+    recorder.record_command(
+        device_id="d", channel=channel, value=99.0, now=20.0,
+    )
+    assert recorder.pending == 1, (
+        "expired entries should have been purged; only the new command remains"
+    )
+    assert recorder.evicted_pending_total == 0, (
+        "no non-expired entry was evicted — only expired ones were purged"
+    )
+
+    # The surviving command is the new one.
+    out = recorder.observe(device_id="d", channel_id="aspirate", value=99.1, now=21.0)
+    assert out is not None
+    assert out.commanded == 99.0
+
+
+def test_eviction_of_non_expired_entry_increments_evicted_counter() -> None:
+    """When all pending entries are live and the cap is exceeded, one is evicted.
+
+    The ``evicted_pending_total`` counter must increment on every such eviction
+    so operators can detect a cap that is too tight for the write rate.
+    """
+    from leapflow.hardware.outcome import _MAX_PENDING_PER_CHANNEL
+
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store, pending_ttl_s=900.0)
+    channel = _channel()
+    assert recorder.evicted_pending_total == 0
+
+    # Fill to cap — no eviction yet.
+    for i in range(_MAX_PENDING_PER_CHANNEL):
+        recorder.record_command(
+            device_id="d", channel=channel, value=float(i), now=float(i),
+        )
+    assert recorder.evicted_pending_total == 0
+
+    # One more — all entries are live (ttl=900), so one must be evicted.
+    recorder.record_command(
+        device_id="d", channel=channel, value=100.0,
+        now=float(_MAX_PENDING_PER_CHANNEL),
+    )
+    assert recorder.evicted_pending_total == 1
+    assert recorder.pending == _MAX_PENDING_PER_CHANNEL
+
+    # A second overflow.
+    recorder.record_command(
+        device_id="d", channel=channel, value=200.0,
+        now=float(_MAX_PENDING_PER_CHANNEL + 1),
+    )
+    assert recorder.evicted_pending_total == 2
+
+
+def test_eviction_with_mixed_expired_and_live_entries() -> None:
+    """A mix of expired and live entries: expired purged first, live kept."""
+    from leapflow.hardware.outcome import _MAX_PENDING_PER_CHANNEL
+
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store, pending_ttl_s=5.0)
+    channel = _channel()
+
+    # t=0..3: four commands (cap=4), all with ttl=5 so expire at t=5..8.
+    for i in range(_MAX_PENDING_PER_CHANNEL):
+        recorder.record_command(
+            device_id="d", channel=channel, value=float(i), now=float(i),
+        )
+    assert recorder.pending == _MAX_PENDING_PER_CHANNEL
+
+    # At t=7: entries at t=0 (exp 5) and t=1 (exp 6) have expired,
+    # entries at t=2 (exp 7 — boundary, expires_at=7 == moment → NOT expired)
+    # and t=3 (exp 8) are still live.
+    # Adding a new command should purge the 2 expired, keep the 2 live + the new one = 3.
+    recorder.record_command(
+        device_id="d", channel=channel, value=50.0, now=7.0,
+    )
+    assert recorder.pending == 3  # t=2, t=3, t=7
+    assert recorder.evicted_pending_total == 0, (
+        "expired entries freed enough room; no live entry should have been evicted"
+    )
+
+    # The earliest surviving command is the one from t=2 (value=2.0).
+    # observe at exactly t=7.0: the entry at t=2 (expires_at=7) is still valid
+    # because the check is moment <= expires_at.
+    out = recorder.observe(device_id="d", channel_id="aspirate", value=2.1, now=7.0)
+    assert out is not None
+    assert out.commanded == 2.0
+
+
+def test_expired_entries_are_purged_on_observe() -> None:
+    """Expired pending commands are cleaned up when observe() runs."""
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store, pending_ttl_s=10.0)
+    channel = _channel()
+    recorder.record_command(device_id="d", channel=channel, value=10.0, now=100.0)
+    recorder.record_command(device_id="d", channel=channel, value=20.0, now=108.0)
+    assert recorder.pending == 2
+
+    # At t=112, the first has expired (100+10=110), but the second has not (108+10=118).
+    out = recorder.observe(device_id="d", channel_id="aspirate", value=20.1, now=112.0)
+    assert out is not None
+    assert out.commanded == 20.0
+    assert recorder.pending == 0
+
+
 def test_recall_orders_by_how_well_the_device_tracked() -> None:
     """Within equally relevant experiences, the one that actually worked leads."""
     store = FakeExperienceStore()
@@ -843,3 +1181,84 @@ def test_an_outcome_built_without_a_prediction_reports_the_command() -> None:
     )
     assert outcome.model_residual == outcome.residual
     assert outcome.predictable is True
+
+
+# ════════════════════════════════════════════════════════════════
+# G-1: Tolerance-based normalisation (E3-T0 confirmed)
+# ════════════════════════════════════════════════════════════════
+
+
+def test_tolerance_normalises_against_tolerance_not_span() -> None:
+    """When tolerance is declared, delta = |residual| / tolerance.
+
+    E3-T0 showed that span-based normalisation underreports error by 100× on a
+    channel with a tight tolerance relative to its range.
+    """
+    envelope = Envelope(declared=True, min_value=0.0, max_value=1000.0, tolerance=0.5)
+    delta, residual = normalized_delta(commanded=500.0, observed=500.3, envelope=envelope)
+    assert residual == pytest.approx(0.3)
+    # 0.3 / 0.5 = 0.6 (tolerance-based), NOT 0.3 / 1000.0 = 0.0003 (span-based)
+    assert delta == pytest.approx(0.6)
+
+
+def test_zero_tolerance_falls_back_to_span() -> None:
+    """Default tolerance=0.0 preserves existing span normalisation."""
+    envelope = Envelope(declared=True, min_value=0.0, max_value=200.0, tolerance=0.0)
+    delta, _ = normalized_delta(commanded=100.0, observed=110.0, envelope=envelope)
+    assert delta == pytest.approx(0.05)
+
+
+def test_tolerance_normalisation_is_capped_at_one() -> None:
+    """Downstream consumers assume 0..1; exceeding it must be prevented."""
+    envelope = Envelope(declared=True, min_value=0.0, max_value=100.0, tolerance=0.1)
+    delta, _ = normalized_delta(commanded=50.0, observed=60.0, envelope=envelope)
+    assert delta == 1.0
+
+
+def test_tolerance_without_span_still_works() -> None:
+    """Tolerance stands on its own -- span is not required."""
+    envelope = Envelope(declared=True, tolerance=1.0)
+    delta, _ = normalized_delta(commanded=50.0, observed=52.0, envelope=envelope)
+    assert delta == pytest.approx(1.0)  # 2.0 / 1.0 = 2.0, capped at 1.0
+
+
+# ════════════════════════════════════════════════════════════════
+# G-2: First-order settling model (E2-T0 confirmed)
+# ════════════════════════════════════════════════════════════════
+
+
+def test_first_order_settling_delays_observation_scoring() -> None:
+    """A channel with first_order settling uses 5τ as its settle time.
+
+    E2-T0 showed that a scalar settling_time_s of 2 s underestimates the 99 %
+    convergence time for a first-order system with τ = 2 s (actual: 10 s).
+    """
+    store = FakeExperienceStore()
+    recorder = HardwareOutcomeRecorder(store)
+    ch = Channel(
+        channel_id="heater",
+        direction=Direction.READWRITE.value,
+        quantity="temperature.setpoint",
+        unit="degC",
+        effect=HardwareEffect.ACTUATE.value,
+        verify_after_write=True,
+        envelope=Envelope(
+            declared=True,
+            min_value=0.0,
+            max_value=200.0,
+            settling_model="first_order",
+            settling_tau_s=2.0,  # effective = 10 s
+        ),
+    )
+    recorder.record_command(device_id="d", channel=ch, value=50.0, now=100.0)
+    # Observation at t=105 s (before 5τ=10 s): not settled.
+    assert recorder.observe(
+        device_id="d", channel_id="heater", value=49.0, now=105.0
+    ) is None
+    # Observation at t=111 s (after 5τ=10 s): scored.
+    outcome = recorder.observe(
+        device_id="d", channel_id="heater", value=49.8, now=111.0
+    )
+    assert outcome is not None
+    assert outcome.commanded == 50.0
+    assert outcome.observed == 49.8

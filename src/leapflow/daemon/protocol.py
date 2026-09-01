@@ -271,6 +271,29 @@ class LeapService(Protocol):
         """Restart the host backend."""
         ...
 
+    async def hardware_pause(self, device: str = "") -> Dict[str, Any]:
+        """Pause the daemon-owned sampling loop for one device.
+
+        Daemon-global like ``host_*``: hardware sampling is shared daemon state,
+        not session state, so this takes no ``session_id`` and returns none. It
+        does not occupy a turn-admission slot -- it is a direct control action,
+        not a turn -- which is what makes it safe to invoke from concurrent TUIs:
+        the effect is shared and visible to every connected client, which is the
+        point of a direct human intervention.
+        """
+        ...
+
+    async def hardware_resume(self, device: str = "") -> Dict[str, Any]:
+        """Resume the daemon-owned sampling loop for one device.
+
+        Daemon-global like ``host_*``: hardware sampling is shared daemon state,
+        not session state, so this takes no ``session_id`` and returns none. It
+        does not occupy a turn-admission slot and is safe to invoke from
+        concurrent TUIs; the resumed sampling is shared and visible to every
+        connected client.
+        """
+        ...
+
     async def tools_list(self) -> Dict[str, Any]:
         """Return available tool groups for slash-command rendering."""
         ...
@@ -370,6 +393,8 @@ METHOD_REGISTRY: Dict[str, str] = {
     "host.start": "host_start",
     "host.stop": "host_stop",
     "host.restart": "host_restart",
+    "hardware.pause": "hardware_pause",
+    "hardware.resume": "hardware_resume",
     "tools.list": "tools_list",
     "usage.summary": "usage_summary",
     "app.command": "app_command",

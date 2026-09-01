@@ -243,7 +243,7 @@ the row correctly and still declined to push it to anyone.
 a lost sample is already visible in the trace, so neither should interrupt anyone.
 """
 
-_NOTABLE_KINDS = frozenset({"quality_degraded", "sample_loss"})
+_NOTABLE_KINDS = frozenset({"quality_degraded", "sample_loss", "calibration_failed", "calibration_expired"})
 
 
 def _event_severity(kind: str) -> str:
@@ -251,7 +251,9 @@ def _event_severity(kind: str) -> str:
 
     ``settled`` stays informational on purpose: a recovery is the one event nobody
     needs to be alarmed by, and colouring it like a breach would train a watcher to
-    ignore the colour.
+    ignore the colour. Calibration events are informational when started or completed,
+    but notable when failed or expired -- an uncalibrated channel may produce
+    misleading readings.
     """
     if kind in ALERT_KINDS:
         return "alert"

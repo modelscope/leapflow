@@ -165,9 +165,51 @@ class Envelope:
     max_rate: float | None = None
     quantization: float | None = None
     settling_time_s: float = 0.0
+    tolerance: float = 0.0
+    """Absolute measurement precision, in the same units as the channel.
+
+    When positive, ``normalized_delta`` divides by this instead of by the
+    envelope span.  Bias is an absolute quantity that does not scale with the
+    declared range, so span-normalisation makes a tight-tolerance channel look
+    better than it is (G-1, confirmed by E3-T0).  Zero (default) preserves the
+    existing span-based normalisation.
+    """
+    settling_model: str = "step"
+    """How the channel reaches its commanded value.
+
+    ``step`` (default): fixed wait of ``settling_time_s``.
+    ``first_order``: first-order exponential approach with time constant
+    ``settling_tau_s``; the effective wait is ``5 * settling_tau_s``
+    (99 % convergence).  G-2, confirmed by E2-T0.
+    """
+    settling_tau_s: float = 0.0
+    """First-order time constant in seconds (used when ``settling_model`` is
+    ``first_order``).  Ignored for the default ``step`` model."""
     reversible: bool = False
     requires_interlocks: tuple[str, ...] = ()
     notes: str = ""
+    allowed_values: tuple[Any, ...] = ()
+
+    @property
+    def effective_settling_s(self) -> float:
+        """Return the effective settling time considering the declared model.
+
+        - ``step`` (default): uses ``settling_time_s`` directly.
+        - ``first_order``: uses ``5 * settling_tau_s`` (99 % convergence of a
+          first-order system).
+
+        When both ``settling_time_s`` and a model-derived wait are positive,
+        the larger value is used so neither declared constraint is violated.
+        """
+        tau_wait = (
+            self.settling_tau_s * 5.0
+            if self.settling_model == "first_order" and self.settling_tau_s > 0.0
+            else 0.0
+        )
+        step_wait = max(0.0, self.settling_time_s)
+        if tau_wait > 0.0 and step_wait > 0.0:
+            return max(tau_wait, step_wait)
+        return tau_wait if tau_wait > 0.0 else step_wait
 
     @property
     def is_numeric(self) -> bool:
@@ -185,13 +227,17 @@ class Envelope:
     def contains(self, value: Any, *, margin: float = 0.0) -> bool:
         """Return True when *value* lies inside the declared bounds.
 
-        Three cases, and the middle one is the one that matters. An undeclared
-        envelope admits nothing. A *numeric* envelope handed a non-numeric value
-        (a string, a boolean, NaN, infinity) admits nothing either: the bounds
-        cannot be evaluated, and "cannot evaluate" must carry the same weight as
-        "out of range" or an unparseable command would slip past the one check
-        standing between it and the device. Only an envelope with no numeric
-        bounds -- a state channel -- admits an arbitrary value.
+        Four cases:
+
+        1. An undeclared envelope admits nothing.
+        2. An *enumerated* envelope (``allowed_values`` is non-empty) checks
+           membership directly -- numeric range logic is bypassed because the
+           value domain is a discrete set, not a continuous interval.
+        3. A *numeric* envelope handed a non-numeric value (a string, a boolean,
+           NaN, infinity) admits nothing: the bounds cannot be evaluated, and
+           "cannot evaluate" must carry the same weight as "out of range".
+        4. An envelope with no numeric bounds and no enumerated set -- a state
+           channel -- admits an arbitrary value.
 
         ``margin`` narrows the band inward. It exists so a breach can end on a
         stricter test than it began on (see ``settle_margin``); every safety
@@ -200,6 +246,9 @@ class Envelope:
         """
         if not self.declared:
             return False
+        # Enumerated domain: discrete membership check replaces range logic.
+        if self.allowed_values:
+            return value in self.allowed_values
         numeric = as_numeric(value)
         if numeric is None:
             return not self.is_numeric
@@ -264,6 +313,8 @@ class Envelope:
         """
         if not self.declared:
             return "undeclared"
+        if self.allowed_values:
+            return "enum:" + ",".join(str(v) for v in sorted(self.allowed_values, key=str))
         parts = (
             _format_bound(self.min_value),
             _format_bound(self.max_value),
@@ -273,21 +324,29 @@ class Envelope:
         return ":".join(parts)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "declared": self.declared,
             "min_value": self.min_value,
             "max_value": self.max_value,
             "max_rate": self.max_rate,
             "quantization": self.quantization,
             "settling_time_s": self.settling_time_s,
+            "tolerance": self.tolerance,
+            "settling_model": self.settling_model,
+            "settling_tau_s": self.settling_tau_s,
             "reversible": self.reversible,
             "requires_interlocks": list(self.requires_interlocks),
             "notes": self.notes,
         }
+        if self.allowed_values:
+            result["allowed_values"] = list(self.allowed_values)
+        return result
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "Envelope":
         data = data or {}
+        raw_allowed = data.get("allowed_values")
+        allowed: tuple[Any, ...] = tuple(raw_allowed) if isinstance(raw_allowed, (list, tuple)) else ()
         return cls(
             declared=bool(data.get("declared", False)),
             min_value=_as_float(data.get("min_value")),
@@ -295,9 +354,13 @@ class Envelope:
             max_rate=_as_float(data.get("max_rate")),
             quantization=_as_float(data.get("quantization")),
             settling_time_s=_as_float(data.get("settling_time_s"), default=0.0) or 0.0,
+            tolerance=_as_float(data.get("tolerance"), default=0.0) or 0.0,
+            settling_model=str(data.get("settling_model") or "step"),
+            settling_tau_s=_as_float(data.get("settling_tau_s"), default=0.0) or 0.0,
             reversible=bool(data.get("reversible", False)),
             requires_interlocks=tuple(str(item) for item in data.get("requires_interlocks") or ()),
             notes=str(data.get("notes") or ""),
+            allowed_values=allowed,
         )
 
 

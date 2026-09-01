@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
-from tests.mock_signals.generators import SignalConfig
+from tests.mock_signals.generators import HardwareChannelSpec, SignalConfig
 
 
 @dataclass
@@ -66,6 +66,64 @@ PROFILES: Dict[str, ScenarioProfile] = {
         generators=[
             ("GatewaySignalGenerator", {"config": SignalConfig(frequency_hz=2.0, duration_s=10)}),
             ("GatewayMessageGenerator", {"config": SignalConfig(frequency_hz=1.0, duration_s=10)}),
+        ],
+    ),
+    "hardware": ScenarioProfile(
+        name="hardware",
+        description="Hardware sensor stream: readings with threshold and quality events",
+        generators=[
+            (
+                "HardwareSignalGenerator",
+                {
+                    "config": SignalConfig(frequency_hz=5.0, duration_s=10),
+                    "device_id": "mock_bench_0",
+                    "channels": [
+                        HardwareChannelSpec(
+                            channel_id="ch_temp",
+                            quantity="temperature",
+                            unit="\u00b0C",
+                            center=25.0,
+                            amplitude=6.0,
+                            min_threshold=15.0,
+                            max_threshold=35.0,
+                            quality_degradation_rate=0.03,
+                        ),
+                        HardwareChannelSpec(
+                            channel_id="ch_voltage",
+                            quantity="voltage",
+                            unit="V",
+                            center=3.3,
+                            amplitude=0.3,
+                            min_threshold=3.0,
+                            max_threshold=3.6,
+                            quality_degradation_rate=0.02,
+                        ),
+                    ],
+                    "event_kinds": ["threshold_exceeded", "quality_degraded"],
+                    "event_probability": 0.10,
+                },
+            ),
+            (
+                "HardwareSignalGenerator",
+                {
+                    "config": SignalConfig(frequency_hz=2.0, duration_s=10),
+                    "device_id": "mock_bench_1",
+                    "channels": [
+                        HardwareChannelSpec(
+                            channel_id="ch_pressure",
+                            quantity="pressure",
+                            unit="kPa",
+                            center=101.3,
+                            amplitude=2.0,
+                            min_threshold=95.0,
+                            max_threshold=110.0,
+                            quality_degradation_rate=0.01,
+                        ),
+                    ],
+                    "event_kinds": ["threshold_exceeded", "sample_loss", "stale"],
+                    "event_probability": 0.05,
+                },
+            ),
         ],
     ),
 }
