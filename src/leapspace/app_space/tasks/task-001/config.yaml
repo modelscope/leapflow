@@ -1,0 +1,16 @@
+# task-001 — LeapChat: reply to the boss's unread message.
+#
+# Pure declaration: the harness consumes this without executing task code.
+# hooks wires functions in action.py to the app's hook points; interface
+# names the bound widgets this task addresses (static precheck against the
+# app's persisted interface).
+id: task-001
+title: Reply to the boss's unread message
+apps: [chat]
+instruction: "Your boss sent you a message; reply to confirm receipt."
+hooks:
+  chat:
+    before_launch: seed
+    after_message_sent: boss_followup
+interface:
+  chat: [contact_list, message_history, message_input, send_button]
