@@ -227,12 +227,20 @@ class JourneyFactory:
         # proxy rewrites the name on the wire instead.
         root = journey_root(journey_id)
         self._roots.append(root)
+        # Journey cassettes fingerprint the complete tool catalogue. Product defaults enable
+        # passive hardware discovery, which correctly adds ``hw_*`` tools for a real
+        # profile -- but that is ambient capability unrelated to seven conversation/
+        # lifecycle journeys whose recordings predate it. Keep the harness deterministic by
+        # explicitly disabling hardware here; a hardware journey opts in deliberately (R8
+        # passes ``LEAPFLOW_HARDWARE_ENABLED=1`` below), exactly like it pins providers to
+        # YAML so host-specific devices cannot enter a recorded prompt.
+        journey_env = {"LEAPFLOW_HARDWARE_ENABLED": "0", **(extra_env or {})}
         daemon = start_leapd(
             root=root,
             llm_base_url=proxy.base_url,
             llm_model=model,
             profile=profile,
-            extra_env=extra_env,
+            extra_env=journey_env,
         )
         self._stack.callback(daemon.stop)
 

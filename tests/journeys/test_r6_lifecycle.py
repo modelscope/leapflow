@@ -208,6 +208,11 @@ async def test_r6_daemon_lifecycle(journeys: JourneyFactory) -> None:
             llm_base_url=journey.proxy.base_url,
             llm_model=journey.daemon.env["LEAPFLOW_LLM_MODEL"],
             profile=journey.daemon.profile,
+            # JourneyFactory disables ambient hardware so cassette fingerprints remain
+            # deterministic. A manual restart must carry that same hermetic capability
+            # set; otherwise it adds hw_* schemas only after restart and the next recorded
+            # DSH turn misses its cassette.
+            extra_env={"LEAPFLOW_HARDWARE_ENABLED": "0"},
         )
         journey.daemon.process = restarted.process
         try:
