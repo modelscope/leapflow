@@ -9,6 +9,7 @@ bound list (e.g. one FindingCard per finding).
 
 from __future__ import annotations
 
+import copy
 import re
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -181,15 +182,22 @@ class TemplateLibrary:
         self,
         builtin_dir: Optional[Path] = None,
         override_dir: Optional[Path] = None,
+        *,
+        _snapshot: Optional[dict[str, dict[str, Any]]] = None,
+        _sources: Optional[dict[str, str]] = None,
     ) -> None:
         self._builtin = builtin_dir or (Path(__file__).parent / "templates")
         self._override = override_dir
+        self._snapshot = _snapshot
+        self._snapshot_sources = _sources or {}
 
     def _dirs(self) -> list[Path]:
         return [d for d in (self._override, self._builtin) if d is not None]
 
     def names(self) -> list[str]:
         """Return available template names (override + builtin)."""
+        if self._snapshot is not None:
+            return sorted(self._snapshot)
         found: set[str] = set()
         for directory in self._dirs():
             if directory.exists():
@@ -216,6 +224,9 @@ class TemplateLibrary:
 
     def load(self, name: str) -> Optional[dict[str, Any]]:
         """Load a raw template dict by name, or None when not found."""
+        if self._snapshot is not None:
+            raw = self._snapshot.get(name)
+            return copy.deepcopy(raw) if raw is not None else None
         import yaml
 
         for directory in self._dirs():
@@ -225,6 +236,22 @@ class TemplateLibrary:
                 return loaded if isinstance(loaded, dict) else None
         return None
 
+    def snapshot(self) -> "TemplateLibrary":
+        """Freeze currently resolvable templates for one Board process generation."""
+        frozen: dict[str, dict[str, Any]] = {}
+        sources: dict[str, str] = {}
+        for name in self.names():
+            raw = self.load(name)
+            if raw is not None:
+                frozen[name] = raw
+                sources[name] = self.source_of(name)
+        return TemplateLibrary(
+            self._builtin,
+            self._override,
+            _snapshot=frozen,
+            _sources=sources,
+        )
+
     def render(self, name: str, data: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         """Render a template by name, falling back to a builtin generic view."""
         template = self.load(name) or self.load("generic") or _DEFAULT_GENERIC
@@ -232,6 +259,8 @@ class TemplateLibrary:
 
     def builtin_names(self) -> list[str]:
         """Return template names shipped with the package."""
+        if self._snapshot is not None:
+            return sorted(name for name, source in self._snapshot_sources.items() if source == "builtin")
         found: set[str] = set()
         if self._builtin.exists():
             for path in self._builtin.glob("*.yaml"):
@@ -240,6 +269,8 @@ class TemplateLibrary:
 
     def user_names(self) -> list[str]:
         """Return template names added by the user (override dir)."""
+        if self._snapshot is not None:
+            return sorted(name for name, source in self._snapshot_sources.items() if source == "user")
         found: set[str] = set()
         if self._override is not None and self._override.exists():
             for path in self._override.glob("*.yaml"):

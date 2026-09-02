@@ -296,6 +296,26 @@ async def test_handle_view_attaches_server_build_meta() -> None:
     assert server_meta["stale"] in (True, False, None)
 
 
+async def test_handle_view_returns_a_structured_error_instead_of_http_500() -> None:
+    pytest.importorskip("aiohttp")
+
+    class _BrokenBuilder:
+        async def build(self, intent, provider):
+            raise RuntimeError("template/data mismatch")
+
+    server = DashboardServer(client=_FakeClient(), token="t")
+    server._builder = _BrokenBuilder()
+    request = SimpleNamespace(query={"token": "t", "template": "hardware"}, headers={})
+
+    response = await server._handle_view(request)
+    payload = json.loads(response.text)
+
+    assert response.status == 503
+    assert payload["error"]["code"] == "view_unavailable"
+    assert payload["error"]["request_id"]
+    assert "template/data mismatch" not in payload["error"]["message"]
+
+
 async def test_handle_server_info_requires_token() -> None:
     pytest.importorskip("aiohttp")
     server = DashboardServer(client=_FakeClient(), token="t")
@@ -328,6 +348,7 @@ async def test_handle_server_info_reports_captured_build_and_stale_verdict(
     assert payload["stale"] is True
     assert payload["build"]["pid"] == server._build_info.pid
     assert payload["build"]["version"] == server._build_info.version
+    assert payload["revision"] == server._revision
 
 
 # ── Device preview endpoints ────────────────────────────────────────────────
@@ -353,11 +374,18 @@ class _FrameClient:
         self.frame_calls = 0
         self.frame_requests: list[dict[str, object]] = []
         self.write_calls: list[tuple] = []
+        self.release_calls: list[tuple[str, str, str]] = []
 
     async def hardware_frame(self, device: str, channel: str, **kwargs: object) -> dict:
         self.frame_calls += 1
         self.frame_requests.append({"device": device, "channel": channel, **kwargs})
         return dict(self.reply)
+
+    async def hardware_preview_release(
+        self, device: str, channel: str, *, viewer_id: str = ""
+    ) -> dict:
+        self.release_calls.append((device, channel, viewer_id))
+        return {"ok": True, "released": True, "active_viewers": 0}
 
     async def hardware_write_request(
         self, device: str, channel: str, value: object, *, dry_run: bool = True
@@ -425,6 +453,20 @@ async def test_a_refused_preview_is_forwarded_as_403_with_the_daemon_message() -
     assert "leap hw preview" in payload["error"]
 
 
+async def test_server_issued_preview_owner_releases_the_exact_channel() -> None:
+    client = _FrameClient({"ok": True})
+    server = DashboardServer(client=client, token="t")
+    server._preview_viewers["viewer-1"] = ("cam", "frame")
+
+    result = await server._release_preview_viewer("viewer-1")
+
+    assert result["released"] is True
+    assert client.release_calls == [("cam", "frame", "viewer-1")]
+    assert await server._release_preview_viewer("viewer-1") == {
+        "ok": True, "released": False, "active_viewers": 0
+    }
+
+
 async def test_a_missing_target_never_reaches_the_daemon() -> None:
     pytest.importorskip("aiohttp")
 
@@ -437,18 +479,14 @@ async def test_a_missing_target_never_reaches_the_daemon() -> None:
     assert client.frame_calls == 0
 
 
-def test_the_stream_rate_is_clamped_at_both_ends() -> None:
-    """A hand-edited ``?fps=`` must not become a spin loop against a device.
-
-    Balanced preview is 8fps; 12fps is the outer page bound, while the daemon applies the
-    stricter declared/runtime cap before it ever opens an encoder.
-    """
-    interval = DashboardServer._stream_interval
-    assert interval("1000") == pytest.approx(1 / 12), "an absurd rate was not clamped"
-    assert interval("") == pytest.approx(1 / 8), "an absent rate did not fall back"
-    assert interval("nonsense") == pytest.approx(1 / 8)
-    assert interval("-4") == pytest.approx(1 / 8), "a negative rate must not invert the interval"
-    assert interval("1") == pytest.approx(1.0)
+def test_preview_rate_is_clamped_before_the_binary_relay() -> None:
+    """A hand-edited ``?fps=`` cannot exceed the Board's 30fps profile ceiling."""
+    options = DashboardServer._preview_options
+    assert options({"fps": "1000"})["fps"] == 30.0
+    assert options({"fps": ""})["fps"] == 0.0
+    assert options({"fps": "nonsense"})["fps"] == 0.0
+    assert options({"fps": "-4"})["fps"] == 0.0
+    assert options({"fps": "1"})["fps"] == 1.0
 
 
 async def test_the_board_can_preview_and_request_a_change_but_not_approve_one() -> None:
@@ -589,7 +627,9 @@ class _GatedFrameClient:
         self.answered.set()
         return {"ok": True, "pending_id": pending_id, "decision": decision}
 
-    async def hardware_read(self, device: str, channel: str, *, on_stream_event: object = None) -> dict:
+    async def hardware_read(
+        self, device: str, channel: str, *, viewer_id: str = "", on_stream_event: object = None
+    ) -> dict:
         return {"ok": True, "value": -32.5, "unit": "dBFS", "channel_id": channel}
 
 
@@ -742,7 +782,9 @@ def test_a_current_board_is_reused(monkeypatch) -> None:
 
     state = {"port": 9911, "bind": "127.0.0.1", "token": "live"}
     monkeypatch.setattr(launcher, "server_running", lambda settings: dict(state))
-    monkeypatch.setattr(launcher, "fetch_server_info", lambda *a, **k: {"stale": False})
+    monkeypatch.setattr(
+        launcher, "fetch_server_info", lambda *a, **k: {"revision": launcher.board_revision(), "stale": False}
+    )
     monkeypatch.setattr(
         launcher, "_retire_stale_server",
         lambda settings: pytest.fail("a current server must not be retired"),
@@ -753,17 +795,15 @@ def test_a_current_board_is_reused(monkeypatch) -> None:
     assert result["token"] == "live"
 
 
-def test_an_unknown_build_is_not_treated_as_stale(monkeypatch) -> None:
-    """Killing the page somebody is reading is worse than leaving a warning badge on it.
-
-    Three uncertain answers reach this: an unreachable server, a build predating
-    ``/api/server-info``, and a checkout git cannot fingerprint. All mean "keep it".
-    """
+def test_only_an_unreachable_board_is_inconclusive(monkeypatch) -> None:
+    """A responding Board without a generation id must be replaced, not mixed with new assets."""
     from leapflow.dashboard import launcher
 
-    for info in (None, {}, {"stale": None}, {"build": {"commit": None}}):
+    monkeypatch.setattr(launcher, "fetch_server_info", lambda *a, **k: None)
+    assert launcher.server_is_stale({"port": 1, "bind": "127.0.0.1", "token": "t"}) is False
+    for info in ({}, {"stale": None}, {"build": {"commit": None}}):
         monkeypatch.setattr(launcher, "fetch_server_info", lambda *a, **k: info)
-        assert launcher.server_is_stale({"port": 1, "bind": "127.0.0.1", "token": "t"}) is False
+        assert launcher.server_is_stale({"port": 1, "bind": "127.0.0.1", "token": "t"}) is True
 
 
 def test_asset_urls_are_versioned_by_content(tmp_path, monkeypatch) -> None:
@@ -805,12 +845,37 @@ def test_asset_urls_are_versioned_by_content(tmp_path, monkeypatch) -> None:
     assert set(re.findall(r"\?v=([\w.-]+)", server_module._index_html(index))) == after_keys
 
 
+async def test_dashboard_server_freezes_static_assets_for_its_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live source edit cannot hand an old Board process new browser code."""
+    pytest.importorskip("aiohttp")
+    from leapflow.dashboard import server as server_module
+
+    static = tmp_path / "static"
+    static.mkdir()
+    (static / "index.html").write_text(
+        '<script src="/static/app.js?v=old"></script>', encoding="utf-8"
+    )
+    (static / "app.js").write_text("const generation = 'old';", encoding="utf-8")
+    monkeypatch.setattr(server_module, "STATIC_DIR", static)
+    server = DashboardServer(client=_FrameClient({"ok": True}), token="t")
+
+    (static / "app.js").write_text("const generation = 'new';", encoding="utf-8")
+    asset = await server._handle_static_asset(SimpleNamespace(match_info={"name": "app.js"}))
+    index = await server._handle_index(SimpleNamespace(query={"token": "t"}, headers={}))
+
+    assert asset.body == b"const generation = 'old';"
+    assert "?v=old" not in index.text
+    assert server._static_version in index.text
+
+
 async def test_preview_profile_values_reach_the_daemon_but_are_bounded_on_the_page_hop() -> None:
     """The page controls request a profile; PreviewBroker remains the final authority.
 
-    This test owns only the dashboard contract: malformed or absurd URL values cannot make
-    its MJPEG loop spin. The broker test asserts the stronger declaration/runtime clamp
-    right before a transport is called.
+    This test owns only the dashboard contract: malformed or absurd URL values cannot exceed
+    the binary relay profile ceiling. The broker test asserts the stronger declaration/runtime
+    clamp right before a transport is called.
     """
     pytest.importorskip("aiohttp")
     import base64
@@ -832,7 +897,7 @@ async def test_preview_profile_values_reach_the_daemon_but_are_bounded_on_the_pa
 
     assert response.status == 200
     forwarded = client.frame_requests[-1]
-    assert forwarded["fps"] == 12.0
+    assert forwarded["fps"] == 30.0
     assert forwarded["max_width"] == 4096
     assert forwarded["quality"] == 100
 

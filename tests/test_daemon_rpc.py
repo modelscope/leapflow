@@ -90,6 +90,31 @@ class _SlowFirstChunkService(_FakeService):
 _TEST_ROUTE: "contextvars.ContextVar[str | None]" = contextvars.ContextVar("test_route", default=None)
 
 
+class _PreviewStreamService(_FakeService):
+    """A frame stream that also proves approval notifications share its socket."""
+
+    async def hardware_preview_stream(
+        self, device: str, channel: str, **kwargs: Any
+    ) -> AsyncIterator[StreamChunk]:
+        yield StreamChunk(
+            request_id="",
+            content="Approval required",
+            event_type="approval_request",
+            metadata={"approval": {"pending_id": "preview-approval"}},
+        )
+        yield StreamChunk(
+            request_id="",
+            content="",
+            event_type="frame",
+            metadata={
+                "device_id": device,
+                "channel_id": channel,
+                "data_b64": "anBlZw==",
+                "sequence": 1,
+            },
+        )
+
+
 class _ContextVarStreamingService(_FakeService):
     """Mimics engine_chat's per-turn ContextVar routing across many yields.
 
@@ -186,6 +211,35 @@ async def test_daemon_client_receives_stream_events() -> None:
         ("final", "done"),
     ]
     assert events[0].metadata == {"session_id": "sess-1"}
+
+
+@pytest.mark.asyncio
+async def test_daemon_client_receives_preview_frames_and_approval_events() -> None:
+    """Preview frames and the initial approval prompt use one persistent RPC connection."""
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        server, task, runtime_dir = await _start_server(
+            Path(root) / "runtime", service=_PreviewStreamService()
+        )
+        client = DaemonClient(get_transport().readiness_path(runtime_dir))
+        approvals: list[str] = []
+
+        try:
+            frames = [
+                frame
+                async for frame in client.hardware_preview_stream(
+                    "cam", "frame", on_stream_event=lambda event: approvals.append(event.type)
+                )
+            ]
+        finally:
+            task.cancel()
+            await server.stop()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    assert approvals == ["approval_request"]
+    assert frames == [{"device_id": "cam", "channel_id": "frame", "data_b64": "anBlZw==", "sequence": 1}]
 
 
 @pytest.mark.asyncio
@@ -2327,3 +2381,24 @@ def test_stream_chunk_notification_preserves_event_shape() -> None:
         "event_type": "thinking",
         "metadata": {"session_id": "s1"},
     }
+
+
+@pytest.mark.asyncio
+async def test_oversized_frame_is_a_typed_actionable_error_not_a_bare_value_error() -> None:
+    """A response larger than the RPC frame limit must classify as unavailability.
+
+    ``asyncio.StreamReader.readline`` reports an over-limit frame as a bare
+    ``ValueError`` ("Separator is not found, and chunk exceed the limit"), which is
+    indistinguishable at the call site from a JSON parse bug. Left unclassified it
+    surfaced as "the Board view could not be assembled" with no hint of which RPC or
+    limit was hit, when the real cause was one oversized watch finding. The client
+    must translate it into a ``DaemonUnavailableError`` that names the frame limit and
+    points at the responding handler.
+    """
+    class _OverLimitReader:
+        async def readline(self) -> bytes:
+            raise ValueError("Separator is not found, and chunk exceed the limit")
+
+    client = DaemonClient(Path(_short_tempdir()) / "leapd.sock")
+    with pytest.raises(DaemonUnavailableError, match="larger than"):
+        await client._read_payload(_OverLimitReader())

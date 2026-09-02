@@ -15,11 +15,21 @@ normal while being wrong by decades.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-SERIES_SCHEMA_VERSION = 1
-"""Payload shape version, read by the renderer before anything else."""
+logger = logging.getLogger(__name__)
+
+SERIES_SCHEMA_VERSION = 2
+"""Payload shape version, read by the renderer before anything else.
+
+Bumped to 2 when the per-window ``conformance`` grid left the wire in favour of the
+``conformance_mix`` distribution that is actually rendered. The grid had no renderer
+and no other consumer, so it was pure weight -- but it was *declared* weight, and a
+consumer that went looking for it deserves a version it can refuse rather than a key
+that silently vanished.
+"""
 
 WALL_CLOCK = "wall"
 """The only clock a point's ``x`` may carry. See ``Reading.observed_at``."""
@@ -47,6 +57,12 @@ The payload is persisted as JSON, pushed over a WebSocket, and held in a bounded
 ring, so it cannot be unbounded. On overflow the series are **decimated, never
 truncated**: dropping the tail hides the present and dropping the head hides the
 baseline, and either makes the chart lie about what happened.
+
+This is a ceiling on what any *one* payload contributes, and it is load-bearing well
+beyond this module: findings are returned in batches over a single newline-delimited
+JSON-RPC frame, so a payload that overruns it does not degrade one panel -- it
+overruns the frame and takes the whole Board down with it. A field that is exempt
+from this ceiling is a defect in the field, not a limit to raise.
 """
 
 
@@ -160,6 +176,11 @@ class HardwareDigest:
         ``counts`` is precomputed because the template path resolver walks mapping
         keys and list indices only -- there is no ``.length``, so a template asking
         for one silently renders an empty value.
+
+        Conformance ships as its distribution only. The per-window grid is an
+        intermediate of the analysis, not part of the wire contract: no renderer draws
+        it (see ``_distribution``) and nothing else reads it, while it cost one row per
+        charted window and grew to four times the entire rest of the payload.
         """
         payload = {
             "schema_version": SERIES_SCHEMA_VERSION,
@@ -171,6 +192,7 @@ class HardwareDigest:
                 "events": len(self.events),
                 "outcomes": len(self.outcomes),
                 "calibration": len(self.calibration),
+                "conformance_windows": len(self.conformance),
                 "media_channels": sum(
                     int(row.get("media", 0) or 0) for row in self.devices
                 ),
@@ -182,7 +204,6 @@ class HardwareDigest:
             "device_classes": _distribution(self.devices, "device_class"),
             "series": [item.to_dict() for item in self.series],
             "events": list(self.events),
-            "conformance": list(self.conformance),
             "conformance_mix": _distribution(self.conformance, "state"),
             "sampling": list(self.sampling),
             "outcomes": list(self.outcomes),
@@ -223,7 +244,15 @@ def decimate(points: Sequence[SeriesPoint], limit: int = MAX_POINTS) -> tuple[Se
 
 
 def _fit(payload: dict[str, Any]) -> dict[str, Any]:
-    """Decimate series until the encoded payload fits ``MAX_PAYLOAD_BYTES``."""
+    """Decimate series until the encoded payload fits ``MAX_PAYLOAD_BYTES``.
+
+    Series are the only field allowed to be large enough to need this, and they are
+    the only field it can reduce -- so an overrun that survives the loop means some
+    *other* field is unbounded, which is a producer defect this function cannot fix.
+    It says so at ``warning`` rather than returning quietly: the previous silent
+    return meant a payload four times the ceiling was persisted, pushed, and batched
+    into an RPC frame with no record anywhere that the ceiling had been passed.
+    """
     limit = MAX_POINTS
     while limit >= 2:
         if _encoded_size(payload) <= MAX_PAYLOAD_BYTES:
@@ -233,6 +262,14 @@ def _fit(payload: dict[str, Any]) -> dict[str, Any]:
             {**series, "points": [p.to_dict() for p in decimate(_as_points(series["points"]), limit)]}
             for series in payload["series"]
         ]
+    size = _encoded_size(payload)
+    if size > MAX_PAYLOAD_BYTES:
+        logger.warning(
+            "hardware digest: payload is %d bytes after decimating series to the floor, "
+            "over the %d-byte ceiling; a non-series field is unbounded",
+            size,
+            MAX_PAYLOAD_BYTES,
+        )
     return payload
 
 

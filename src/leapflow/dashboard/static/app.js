@@ -269,6 +269,25 @@
     return url.toString();
   }
 
+  const _previewCleanup = new Set();
+
+  function disposePreviews() {
+    _previewCleanup.forEach((stop) => { try { stop(); } catch (_) {} });
+    _previewCleanup.clear();
+  }
+
+  function renderViewError(error) {
+    rootEl.innerHTML = "";
+    const card = el("div", "card view-error");
+    card.appendChild(el("div", "card-title", esc(t("Failed to load view"))));
+    card.appendChild(el("div", "summary", esc(String(error.message || error.code || t("Preview unavailable")))));
+    if (error.request_id) card.appendChild(el("div", "kicker", esc("Request ID: " + error.request_id)));
+    const retry = el("button", "primary", esc(t("Retry")));
+    retry.addEventListener("click", () => fetchView());
+    card.appendChild(retry);
+    rootEl.appendChild(card);
+  }
+
   async function fetchView(intent) {
     var prevTemplate = current.template;
     current = Object.assign({}, current, intent || {});
@@ -277,13 +296,20 @@
     Object.entries(current).forEach(([k, v]) => v && url.searchParams.set(k, v));
     try {
       const resp = await fetch(url.toString());
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      const spec = await resp.json();
-      render(spec);
-      renderNav(spec.meta || {});
-      renderServerHealth(spec.meta || {});
+      let payload = {};
+      try { payload = await resp.json(); } catch (_) {}
+      if (!resp.ok) {
+        const remote = payload && payload.error;
+        const detail = remote && typeof remote === "object"
+          ? remote
+          : { code: "http_" + resp.status, message: String(remote || "HTTP " + resp.status) };
+        throw detail;
+      }
+      render(payload);
+      renderNav(payload.meta || {});
+      renderServerHealth(payload.meta || {});
       // Manage signal auto-refresh lifecycle on template switch
-      var newTemplate = (spec.meta && spec.meta.active_template) || current.template || "";
+      var newTemplate = (payload.meta && payload.meta.active_template) || current.template || "";
       if (newTemplate === "signals") {
         startSignalAutoRefresh();
         injectSignalRefreshBtn();
@@ -291,7 +317,10 @@
         stopSignalAutoRefresh();
       }
     } catch (err) {
-      rootEl.innerHTML = '<div class="empty">' + esc(t("Failed to load view") + ": " + String(err)) + "</div>";
+      const detail = err && typeof err === "object"
+        ? err
+        : { code: "view_request_failed", message: String(err) };
+      renderViewError(detail);
     }
   }
 
@@ -765,7 +794,7 @@
     url.searchParams.set("device", props.device || "");
     url.searchParams.set("channel", props.channel || "");
     const request = options || {};
-    ["fps", "max_width", "quality"].forEach((key) => {
+    ["fps", "max_width", "quality", "viewer_id"].forEach((key) => {
       if (request[key]) url.searchParams.set(key, String(request[key]));
     });
     return url.toString();
@@ -774,7 +803,7 @@
   const _CAMERA_PROFILES = [
     { id: "economy", fps: 4, max_width: 640, quality: 60, label: "preview.economy" },
     { id: "balanced", fps: 8, max_width: 960, quality: 75, label: "preview.balanced" },
-    { id: "detail", fps: 12, max_width: 1280, quality: 85, label: "preview.detail" },
+    { id: "detail", fps: 30, max_width: 1280, quality: 85, label: "preview.detail" },
   ];
 
   // The browser picks a profile, never an unbounded capture request. The values are
@@ -836,6 +865,12 @@
     return { dom: wrap, current: current };
   }
 
+  function previewWsUrl(props, profile) {
+    const url = new URL(mediaUrl("/api/media/ws", props, profile));
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return url.toString();
+  }
+
   function renderMediaPreview(node) {
     const p = node.props || {};
     const isLevel = String(p.kind || "") === "microphone";
@@ -861,26 +896,48 @@
     const status = el("div", "media-status", esc(t("Not streaming.")));
     const button = el("button", "media-toggle", esc(t("Start preview")));
     let running = false;
+    let starting = false;
     let timer = null;
-    let stillUrl = "";
+    let socket = null;
+    let viewerId = "";
 
-    function stop() {
+    function releaseViewer() {
+      const owner = viewerId;
+      viewerId = "";
+      if (!owner) return;
+      const payload = JSON.stringify({ viewer_id: owner });
+      const url = api("/api/media/release");
+      try {
+        fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: payload,
+          keepalive: true,
+        }).catch(() => {});
+      } catch (_) {}
+    }
+
+    function stop(preserveStage) {
       running = false;
+      starting = false;
       if (timer) { clearInterval(timer); timer = null; }
-      if (stillUrl) { URL.revokeObjectURL(stillUrl); stillUrl = ""; }
-      // Clearing the src is what actually closes the HTTP response, which is what the
-      // server counts to release the preview lease and shut the device down. Removing
-      // the element alone would leave the request open until the browser collected it.
-      stage.innerHTML = "";
-      status.innerHTML = esc(t("Not streaming."));
+      if (socket) {
+        socket.onopen = null; socket.onmessage = null; socket.onerror = null; socket.onclose = null;
+        try { socket.close(); } catch (_) {}
+        socket = null;
+      }
+      releaseViewer();
+      if (!preserveStage) {
+        stage.innerHTML = "";
+        status.innerHTML = esc(t("Not streaming."));
+      }
+      button.disabled = false;
       button.innerHTML = esc(t("Start preview"));
     }
 
-    // Claim the consent slot for the duration of a request, so a prompt this panel caused
-    // is rendered inside this panel. The decision returns with the request: ``allow_once``
-    // means exactly one still frame/sample, while the explicit session choice starts the
-    // continuous preview. That is what prevents the initial probe and the MJPEG stream
-    // from being two surprise approvals for what the person thought was one action.
+    // A prompt belongs next to the panel whose request raised it. The promise does not
+    // settle until the first media sample, so approval stays in this slot while the daemon
+    // is waiting rather than falling through to a detached page-level notification.
     async function withConsentSlot(work) {
       let decision = "";
       _consentSink = (approval) => {
@@ -896,20 +953,17 @@
       }
     }
 
-    // A level channel is polled, not streamed: the value is a number, so there is no
-    // multipart response to hold open. Four samples a second makes a useful waveform; the
-    // ffmpeg reader emits 250ms RMS windows, and reads between windows are cached values
-    // rather than fresh device opens.
     async function pollLevel(meter) {
       let resp;
       try {
-        resp = await fetch(mediaUrl("/api/media/level", p));
+        resp = await fetch(mediaUrl("/api/media/level", p, { viewer_id: viewerId }));
       } catch (err) {
         status.innerHTML = esc(t("Preview unavailable") + ": " + String(err));
         return "stop";
       }
       let body = {};
       try { body = await resp.json(); } catch (_) {}
+      if (body.viewer_id) viewerId = String(body.viewer_id);
       if (!resp.ok) {
         status.innerHTML = esc(body.error || body.code || "HTTP " + resp.status);
         return body.code === "level_not_ready" ? "retry" : "stop";
@@ -919,71 +973,137 @@
       return "ok";
     }
 
-    async function start() {
-      status.innerHTML = esc(t("Requesting access…"));
-      if (isLevel) {
-        const meter = buildLevelMeter(p);
-        stage.innerHTML = "";
-        stage.appendChild(meter.dom);
-        const first = await withConsentSlot(() => pollLevel(meter));
-        if (first.value === "stop") { stage.innerHTML = ""; return; }
-        if (first.decision === "allow_once") {
-          status.innerHTML = esc(t("preview.one_sample"));
-          return;
-        }
-        running = true;
-        button.innerHTML = esc(t("Stop preview"));
-        timer = setInterval(async () => {
-          if (!running) return;
-          if ((await pollLevel(meter)) === "stop") stop();
-        }, 250);
-        return;
-      }
-      const profile = settings.current();
-      let probe;
-      try {
-        probe = await withConsentSlot(() => fetch(mediaUrl("/api/media/frame", p, profile)));
-      } catch (err) {
-        status.innerHTML = esc(t("Preview unavailable") + ": " + String(err));
-        return;
-      }
-      const resp = probe.value;
-      if (!resp.ok) {
-        let detail = "HTTP " + resp.status;
-        try { const body = await resp.json(); detail = body.error || body.code || detail; } catch (_) {}
-        status.innerHTML = esc(detail);
-        return;
-      }
-      const img = el("img", "media-frame");
-      img.alt = String(p.title || "preview");
+    function openCameraStream(profile) {
       stage.innerHTML = "";
-      stage.appendChild(img);
-      if (probe.decision === "allow_once") {
-        stillUrl = URL.createObjectURL(await resp.blob());
-        img.src = stillUrl;
-        status.innerHTML = esc(t("preview.one_frame"));
-        return;
+      const canvas = document.createElement("canvas");
+      canvas.className = "media-frame";
+      canvas.setAttribute("aria-label", String(p.title || "preview"));
+      stage.appendChild(canvas);
+      const context = canvas.getContext("2d");
+      if (!context || !window.createImageBitmap) {
+        status.innerHTML = esc(t("Preview unavailable") + ": browser image decoding is unavailable.");
+        return Promise.resolve(false);
       }
-      running = true;
-      img.src = mediaUrl("/api/media/stream", p, profile);
-      img.addEventListener("error", () => {
-        if (running) status.innerHTML = esc(t("Preview stream ended."));
+      return new Promise((resolve) => {
+        let settled = false;
+        let decoded = false;
+        let pendingBlob = null;
+        let firstFrame = false;
+        const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
+        const drawLatest = async () => {
+          if (decoded || !pendingBlob) return;
+          decoded = true;
+          const blob = pendingBlob;
+          pendingBlob = null;
+          try {
+            const bitmap = await createImageBitmap(blob);
+            const dpr = Math.max(1, window.devicePixelRatio || 1);
+            const width = bitmap.width;
+            const height = bitmap.height;
+            canvas.width = width * dpr;
+            canvas.height = height * dpr;
+            canvas.style.width = "min(100%, " + width + "px)";
+            canvas.style.height = "auto";
+            context.setTransform(dpr, 0, 0, dpr, 0, 0);
+            context.clearRect(0, 0, width, height);
+            context.drawImage(bitmap, 0, 0, width, height);
+            bitmap.close();
+            if (!firstFrame) {
+              firstFrame = true;
+              running = true;
+              status.innerHTML = esc(t("Streaming."));
+              button.innerHTML = esc(t("Stop preview"));
+              finish(true);
+            }
+          } catch (err) {
+            status.innerHTML = esc(t("Preview unavailable") + ": " + String(err));
+            finish(false);
+          } finally {
+            decoded = false;
+            if (pendingBlob) void drawLatest();
+          }
+        };
+        socket = new WebSocket(previewWsUrl(p, profile));
+        socket.onmessage = (event) => {
+          if (typeof event.data === "string") {
+            let message = {}; try { message = JSON.parse(event.data); } catch (_) {}
+            if (message.type === "opened") viewerId = String(message.viewer_id || "");
+            if (message.type === "error") {
+              status.innerHTML = esc(message.error || message.code || t("Preview unavailable"));
+              finish(false);
+            }
+            return;
+          }
+          pendingBlob = event.data instanceof Blob ? event.data : new Blob([event.data], { type: "image/jpeg" });
+          void drawLatest();
+        };
+        socket.onerror = () => {
+          status.innerHTML = esc(t("Preview unavailable"));
+          finish(false);
+        };
+        socket.onclose = () => {
+          socket = null;
+          if (!firstFrame && !settled) finish(false);
+          if (running) {
+            running = false;
+            status.innerHTML = esc(t("Preview stream ended."));
+            button.innerHTML = esc(t("Start preview"));
+          }
+          releaseViewer();
+        };
       });
-      status.innerHTML = esc(t("Streaming."));
-      button.innerHTML = esc(t("Stop preview"));
     }
 
-    button.addEventListener("click", (ev) => { ev.stopPropagation(); running ? stop() : start(); });
+    async function start() {
+      if (running || starting) return;
+      starting = true;
+      button.disabled = true;
+      status.innerHTML = esc(t("Requesting access…"));
+      try {
+        if (isLevel) {
+          const meter = buildLevelMeter(p);
+          stage.innerHTML = "";
+          stage.appendChild(meter.dom);
+          const first = await withConsentSlot(() => pollLevel(meter));
+          if (first.value === "stop") { stop(); return; }
+          if (first.decision === "allow_once") {
+            releaseViewer();
+            status.innerHTML = esc(t("preview.one_sample"));
+            return;
+          }
+          running = true;
+          button.innerHTML = esc(t("Stop preview"));
+          timer = setInterval(async () => {
+            if (!running) return;
+            if ((await pollLevel(meter)) === "stop") stop();
+          }, 250);
+          return;
+        }
+        const ready = await withConsentSlot(() => openCameraStream(settings.current()));
+        if (!ready.value) { stop(); return; }
+        if (ready.decision === "allow_once") {
+          stop(true);
+          status.innerHTML = esc(t("preview.one_frame"));
+        }
+      } finally {
+        starting = false;
+        button.disabled = false;
+        if (!running) button.innerHTML = esc(t("Start preview"));
+      }
+    }
+
+    button.addEventListener("click", (ev) => { ev.stopPropagation(); running ? stop() : void start(); });
     if (settings) {
       settings.dom.addEventListener("leap:preview-profile", () => {
-        if (running || stillUrl) { stop(); start(); }
+        if (running) { stop(); void start(); }
       });
     }
+    _previewCleanup.add(stop);
     card.appendChild(stage);
     card.appendChild(consentSlot);
     card.appendChild(status);
     card.appendChild(button);
-    if (truthy(p.autostart)) setTimeout(() => start(), 0);
+    if (truthy(p.autostart)) setTimeout(() => { void start(); }, 0);
     return card;
   }
 
@@ -1267,6 +1387,7 @@
   }
 
   function render(spec) {
+    disposePreviews();
     rootEl.innerHTML = "";
     figSeq = 0; tblSeq = 0;
     (spec.root || []).forEach((n) => rootEl.appendChild(renderNode(n)));
@@ -1402,6 +1523,7 @@
     });
   }
 
+  window.addEventListener("pagehide", disposePreviews);
   applyLocale();
   fetchView();
   connectWS();

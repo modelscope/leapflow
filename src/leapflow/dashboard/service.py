@@ -320,6 +320,14 @@ optional target is the honest shape, and it is also what makes a drill-down reve
 without the operator learning a second name.
 """
 
+_DOMAIN_FINDINGS_LIMIT = 10
+"""Rows fetched when a lens wants the newest finding of one domain.
+
+Only the newest is rendered, so this is deliberately small: the fetch is scoped to a
+single domain's watch, and a handful of rows is ample slack for that domain's own
+dedup without pulling a batch of large payloads the page never reads.
+"""
+
 
 class DashboardViewBuilder:
     """Assemble ViewSpecs for dashboard intents."""
@@ -394,6 +402,27 @@ class DashboardViewBuilder:
             data["device_error"] = _hardware_error(view, device_id)
         return self._render(template, data)
 
+    async def _domain_findings(
+        self, provider: DashboardDataProvider, domain: str, watch: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Return the newest findings of one domain, fetched scoped to its watch.
+
+        Scoped by ``watch_id`` rather than fetched across all domains and filtered:
+        findings return newest-first inside a byte-bounded batch, and the hardware
+        payload is far larger than any other, so an unscoped read lets a burst of
+        hardware findings fill the batch and push a still-current session or
+        capability finding off the end -- blanking a board whose data plainly exists.
+        A scoped read asks the store for only the domain the page renders. When no
+        watch has been armed for the domain yet there is no id to scope by, so it
+        falls back to an unscoped read and filters, which is correct because a
+        domain with no watch also has no findings.
+        """
+        watch_id = str(watch.get("watch_id") or "")
+        findings = await provider.findings(watch_id=watch_id, limit=_DOMAIN_FINDINGS_LIMIT)
+        if watch_id:
+            return findings
+        return [f for f in findings if str(f.get("domain")) == domain]
+
     async def _build_from_finding_payload(
         self,
         template: str,
@@ -409,8 +438,7 @@ class DashboardViewBuilder:
         """
         watches = await provider.watches()
         watch = next((w for w in watches if str(w.get("domain")) == finding_domain), {})
-        findings = await provider.findings(watch_id="", limit=50)
-        domain_findings = [f for f in findings if str(f.get("domain")) == finding_domain]
+        domain_findings = await self._domain_findings(provider, finding_domain, watch)
         payload = dict(domain_findings[0].get("payload") or {}) if domain_findings else {}
         data = {
             "title": template.replace("_", " ").title(),
@@ -444,8 +472,7 @@ class DashboardViewBuilder:
         # structured analysis plus observation transparency metadata.
         watches = await provider.watches()
         session_watch = next((w for w in watches if str(w.get("domain")) == "session"), {})
-        findings = await provider.findings(watch_id="", limit=50)
-        session_findings = [f for f in findings if str(f.get("domain")) == "session"]
+        session_findings = await self._domain_findings(provider, "session", session_watch)
         analysis = dict(session_findings[0].get("payload") or {}) if session_findings else {}
         observation = dict(analysis.get("observation_status") or {})
         if session_watch:

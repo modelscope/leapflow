@@ -31,6 +31,7 @@ import inspect
 import logging
 import math
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,8 +39,10 @@ from leapflow.hardware.transport import FrameReading, FrameTransport, TransportE
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_IDLE_TIMEOUT_S = 15.0
-"""Silence after which a previewed device is released."""
+DEFAULT_IDLE_TIMEOUT_S = 5.0
+"""Lost-client fallback before a previewed device is released."""
+
+_LEGACY_VIEWER_ID = "legacy"
 
 _SWEEP_INTERVAL_S = 2.0
 """How often idle leases are checked. Well under the shortest sensible timeout."""
@@ -61,6 +64,8 @@ class _Lease:
     # economy frame for a newly selected 1280px detail profile would make the selector a
     # lie for up to one capture interval, so profile is part of cache identity too.
     last_profile: tuple[float, int, int] | None = None
+    viewers: dict[str, float] = field(default_factory=dict)
+    last_capture_age_ms: float = 0.0
 
 
 def _accepts_keyword(callable_: Any, name: str) -> bool:
@@ -110,6 +115,7 @@ class PreviewBroker:
         max_width: int = 0,
         quality: int = 0,
         fps: float = 0.0,
+        viewer_id: str = "",
     ) -> FrameReading:
         """Return a frame, capturing at most once per declared interval.
 
@@ -138,7 +144,7 @@ class PreviewBroker:
                 lease = _Lease(device_id=device_id, channel_id=channel_id)
                 self._leases[key] = lease
                 logger.info("Preview opened: %s.%s", device_id, channel_id)
-            lease.last_request_at = time.monotonic()
+            self._touch(lease, viewer_id)
             self._ensure_sweeper()
 
             # The declared ceiling and the runtime ceiling cap how often the device is
@@ -186,9 +192,86 @@ class PreviewBroker:
             reading = await transport.read_frame(channel_id, **kwargs)
             lease.last_frame = reading
             lease.last_capture_at = time.monotonic()
+            lease.last_capture_age_ms = max(0.0, (time.time() - reading.observed_at) * 1000.0)
             lease.last_profile = profile
             lease.frames_served += 1
             return reading
+
+    async def stream(
+        self,
+        device_id: str,
+        channel_id: str,
+        *,
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        viewer_id: str = "",
+    ) -> AsyncIterator[FrameReading]:
+        """Yield a latest-only frame stream over one daemon connection.
+
+        The producer is the same broker used by one-shot reads, so multiple streams share
+        the cached upstream and no stream queues old frames. A disconnect closes the async
+        generator and releases just this viewer in ``finally``.
+        """
+        context = self._registry.context(device_id)
+        channel = context.channel(channel_id) if context is not None else None
+        effective_fps = self._effective_fps(channel, fps) if channel is not None else 0.0
+        interval = 1.0 / effective_fps if effective_fps > 0 else 0.1
+        try:
+            while True:
+                yield await self.frame(
+                    device_id,
+                    channel_id,
+                    max_width=max_width,
+                    quality=quality,
+                    fps=fps,
+                    viewer_id=viewer_id,
+                )
+                await asyncio.sleep(interval)
+        finally:
+            await self.release(device_id, channel_id, viewer_id=viewer_id, reason="stream_closed")
+
+    async def observe(self, device_id: str, channel_id: str, *, viewer_id: str = "") -> None:
+        """Register a scalar preview owner without opening/reading its transport."""
+        context = self._registry.context(device_id)
+        if context is None or context.channel(channel_id) is None:
+            raise TransportError(f"unknown channel {device_id}.{channel_id}", failure_code="unknown_channel")
+        key = (device_id, channel_id)
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            lease = self._leases.get(key)
+            if lease is None:
+                lease = _Lease(device_id=device_id, channel_id=channel_id)
+                self._leases[key] = lease
+            self._touch(lease, viewer_id)
+            self._ensure_sweeper()
+
+    async def release(
+        self, device_id: str, channel_id: str, *, viewer_id: str = "", reason: str = "explicit"
+    ) -> dict[str, Any]:
+        """Release one viewer immediately; only the last one closes physical hardware."""
+        key = (device_id, channel_id)
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            lease = self._leases.get(key)
+            if lease is None:
+                return {"released": False, "active_viewers": 0}
+            lease.viewers.pop(self._viewer(viewer_id), None)
+            if lease.viewers:
+                lease.last_request_at = max(lease.viewers.values())
+                return {"released": False, "active_viewers": len(lease.viewers)}
+            await self._release(key, reason=reason)
+            return {"released": True, "active_viewers": 0}
+
+    @staticmethod
+    def _viewer(viewer_id: str) -> str:
+        value = str(viewer_id or "").strip()
+        return value[:128] if value else _LEGACY_VIEWER_ID
+
+    def _touch(self, lease: _Lease, viewer_id: str) -> None:
+        now = time.monotonic()
+        lease.viewers[self._viewer(viewer_id)] = now
+        lease.last_request_at = now
 
     def _effective_fps(self, channel: Any, requested: float) -> float:
         """Return a requested cadence bounded by declaration and runtime policy."""
@@ -226,6 +309,9 @@ class PreviewBroker:
                 "device_id": lease.device_id,
                 "channel_id": lease.channel_id,
                 "frames_served": lease.frames_served,
+                "viewers": len(lease.viewers),
+                "frame_age_ms": round(lease.last_capture_age_ms, 1),
+                "profile": lease.last_profile or (),
                 "idle_s": round(now - lease.last_request_at, 1),
             }
             for lease in sorted(self._leases.values(), key=lambda item: item.device_id)
@@ -242,20 +328,25 @@ class PreviewBroker:
                 await asyncio.sleep(_SWEEP_INTERVAL_S)
                 cutoff = time.monotonic() - self._idle_timeout_s
                 for key, lease in list(self._leases.items()):
-                    if lease.last_request_at <= cutoff:
-                        await self._release(key)
+                    stale = [viewer for viewer, seen_at in lease.viewers.items() if seen_at <= cutoff]
+                    for viewer in stale:
+                        lease.viewers.pop(viewer, None)
+                    if not lease.viewers:
+                        await self._release(key, reason="idle_timeout")
+                    else:
+                        lease.last_request_at = max(lease.viewers.values())
         except asyncio.CancelledError:
             return
         except Exception as exc:  # noqa: BLE001 - the sweeper must never die silently
             logger.warning("Preview sweeper failed: %s", exc, exc_info=True)
 
-    async def _release(self, key: tuple[str, str]) -> None:
+    async def _release(self, key: tuple[str, str], *, reason: str) -> None:
         lease = self._leases.pop(key, None)
         if lease is None:
             return
         logger.info(
-            "Preview released after %.0fs idle: %s.%s (%d frame(s) served)",
-            self._idle_timeout_s,
+            "Preview released (%s): %s.%s (%d frame(s) served)",
+            reason,
             lease.device_id,
             lease.channel_id,
             lease.frames_served,
@@ -264,7 +355,11 @@ class PreviewBroker:
         # caches it, so without this the camera stays claimed for the life of the
         # process even though nothing is watching.
         if not any(existing == lease.device_id for existing, _ in self._leases):
-            await self._registry.drop_transport(lease.device_id)
+            # Scalar previews (microphone level) read through the registry's device-I/O
+            # lock. Taking that same lock before close prevents Stop from tearing down a
+            # level reader in the middle of its analysis-window read.
+            async with self._registry.device_io(lease.device_id):
+                await self._registry.drop_transport(lease.device_id)
 
     async def close(self) -> None:
         """Release every preview. Registered as a teardown effect; never raises."""
@@ -273,7 +368,7 @@ class PreviewBroker:
             sweeper.cancel()
         for key in list(self._leases):
             try:
-                await self._release(key)
+                await self._release(key, reason="broker_close")
             except Exception as exc:  # noqa: BLE001 - teardown must not propagate
                 logger.debug("preview release failed for %s: %s", key, exc)
 

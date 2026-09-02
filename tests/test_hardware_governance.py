@@ -2163,6 +2163,6 @@ def test_passive_hardware_discovery_defaults_on_without_opening_devices() -> Non
     assert Settings.__dataclass_fields__["hardware_enabled"].default is True
     policy = HardwareSettings()
     assert policy.enabled is True
-    assert policy.preview_max_fps == 12.0
+    assert policy.preview_max_fps == 30.0
     assert policy.preview_max_width == 1280
     assert policy.preview_quality == 85

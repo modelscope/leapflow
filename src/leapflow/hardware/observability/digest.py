@@ -58,7 +58,6 @@ def build_digest(registry: Any, *, now: float | None = None) -> HardwareDigest:
 
     contexts = _safely(registry.contexts, default=())
     series: list[ChannelSeries] = []
-    conformance: list[dict[str, Any]] = []
     outcomes: list[dict[str, Any]] = []
 
     for context in contexts:
@@ -68,15 +67,20 @@ def build_digest(registry: Any, *, now: float | None = None) -> HardwareDigest:
             windows = _history(registry, context.device_id, channel.channel_id)
             if not windows:
                 continue
-            built = _series_for(context, channel, windows)
-            series.append(built)
-            conformance.extend(_conformance_for(built))
+            series.append(_series_for(context, channel, windows))
         outcomes.extend(_outcomes_for(registry, context))
+
+    # Clamp first, then classify. Conformance describes the windows of the channels
+    # that are actually charted, so deriving it from the pre-clamp list made it
+    # describe channels the board never draws -- and made it the one section no
+    # ceiling applied to, at one row per window of every readable channel on the bench.
+    charted = clamp_series(series)
+    conformance = [row for item in charted for row in _conformance_for(item)]
 
     return HardwareDigest(
         generated_at=moment,
         devices=tuple(_device_row(registry, context) for context in contexts),
-        series=clamp_series(series),
+        series=charted,
         events=_events(registry),
         conformance=tuple(conformance),
         sampling=_sampling(registry),

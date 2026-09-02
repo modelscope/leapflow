@@ -435,3 +435,73 @@ async def test_arming_defaults_twice_does_not_duplicate_an_interval_watch(
         assert second.count("fs-observer") == 1
     finally:
         await manager.stop()
+
+
+def test_fit_to_frame_keeps_the_newest_prefix_within_the_byte_budget() -> None:
+    """A batch reply is one JSON-RPC frame, so rows must be bounded by bytes.
+
+    ``limit`` counts rows while the transport counts bytes; the two disagree, and an
+    8 MiB batch of large findings overran the 4 MiB frame and took the whole Board
+    down. The batch keeps the newest findings (findings are newest-first) up to the
+    budget and drops the oldest tail rather than losing the present.
+    """
+    from leapflow.daemon.monitor_coordinator import _fit_to_frame
+
+    findings = [{"id": i, "blob": "x" * 1000} for i in range(50)]
+    budget = 5000
+    kept = _fit_to_frame(findings, budget=budget)
+    assert 0 < len(kept) < len(findings)
+    assert [row["id"] for row in kept] == list(range(len(kept)))  # newest prefix
+    import json
+
+    encoded = sum(len(json.dumps(row).encode("utf-8")) for row in kept)
+    assert encoded <= budget
+
+
+def test_fit_to_frame_keeps_a_single_over_budget_finding_rather_than_none() -> None:
+    """The newest state must never be silently empty.
+
+    A lone finding larger than the whole budget is a producer defect the coordinator
+    cannot fix by dropping neighbours it does not have. It is kept so the caller sees
+    the current state; the transport layer still reports the frame overrun as a typed
+    error rather than a crash.
+    """
+    from leapflow.daemon.monitor_coordinator import _fit_to_frame
+
+    kept = _fit_to_frame([{"id": 0, "blob": "x" * 10000}], budget=1000)
+    assert [row["id"] for row in kept] == [0]
+
+
+@pytest.mark.asyncio
+async def test_coordinator_findings_reply_stays_within_one_rpc_frame(tmp_path: Path) -> None:
+    """End to end: many large findings must not produce an unreadable reply.
+
+    Persists more oversized findings than one frame can carry, then asserts the
+    coordinator's ``findings`` reply -- the exact RPC the Board calls -- encodes
+    within the transport frame limit.
+    """
+    import json
+
+    from leapflow.daemon._transport import RPC_STREAM_LIMIT
+
+    coordinator, manager = _coordinator_with_manager(tmp_path)
+    try:
+        for index in range(12):
+            manager.finding_store.save(
+                Finding(
+                    watch_id="hw",
+                    domain="hardware",
+                    title=f"snapshot {index}",
+                    summary="bench",
+                    severity=Severity.INFO,
+                    ts=1_788_000_000.0 + index,
+                    payload={"grid": [{"c": "ch", "x": float(n), "s": "inside"} for n in range(9000)]},
+                    dedup_key=f"hw-{index}",
+                )
+            )
+        reply = await coordinator.findings(watch_id="", limit=50)
+        assert reply, "the newest finding must always be returned"
+        encoded = len(json.dumps(reply, default=str).encode("utf-8"))
+        assert encoded <= RPC_STREAM_LIMIT
+    finally:
+        await manager.stop()

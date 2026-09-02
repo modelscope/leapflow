@@ -236,16 +236,14 @@ class Settings:
     # Enumerate microphones alongside cameras.
     hardware_media_microphones: bool = True
     # The broker enforces hard ceilings. The board's default is a balanced profile below
-    # these limits (960px / 8fps / JPEG 75); a viewer can choose an economy or a detail
-    # profile for its own live preview, never exceed these caps, and no profile changes a
-    # durable config file. The ceiling is what the provider declares at discovery.
-    hardware_preview_max_fps: float = 12.0
+    # these limits (960px / 8fps / JPEG 75); Detail is 1280px / 30fps / JPEG 85. A viewer
+    # can choose a profile for its own live preview but never exceed these caps, and no
+    # profile changes durable configuration. The ceiling is declared at discovery.
+    hardware_preview_max_fps: float = 30.0
     hardware_preview_max_width: int = 1280
     hardware_preview_quality: int = 85
-    # How long a preview keeps a device claimed after the last viewer disconnects.
-    # Short, because a camera that stays on after everybody stopped looking is exactly
-    # the failure this whole subsystem is built to avoid.
-    hardware_preview_idle_timeout_s: float = 15.0
+    # Explicit browser Stop releases immediately. This is only the lost-client fallback.
+    hardware_preview_idle_timeout_s: float = 5.0
     runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
@@ -1085,11 +1083,11 @@ def _build_settings_from_env(
     )
     hardware_media_screens = os.getenv("LEAPFLOW_HARDWARE_MEDIA_SCREENS", "0").strip().lower() in ("1", "true", "yes")
     hardware_media_microphones = os.getenv("LEAPFLOW_HARDWARE_MEDIA_MICROPHONES", "1").strip().lower() in ("1", "true", "yes")
-    hardware_preview_max_fps = float(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_FPS", "12") or 12.0)
+    hardware_preview_max_fps = float(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_FPS", "30") or 30.0)
     hardware_preview_max_width = int(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_WIDTH", "1280") or 1280)
     hardware_preview_quality = int(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_QUALITY", "85") or 85)
     hardware_preview_idle_timeout_s = float(
-        os.getenv("LEAPFLOW_HARDWARE_PREVIEW_IDLE_TIMEOUT_S", "15") or 15.0
+        os.getenv("LEAPFLOW_HARDWARE_PREVIEW_IDLE_TIMEOUT_S", "5") or 5.0
     )
     web_transport = os.getenv("LEAPFLOW_WEB_TRANSPORT", "auto").strip().lower() or "auto"
     web_timeout_s = float(os.getenv("LEAPFLOW_WEB_TIMEOUT_S", "20"))

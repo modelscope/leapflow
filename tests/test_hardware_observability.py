@@ -246,6 +246,54 @@ def test_an_oversized_payload_is_reduced_to_fit() -> None:
     assert len(json.dumps(payload).encode("utf-8")) <= MAX_PAYLOAD_BYTES
 
 
+def test_a_full_bench_with_long_history_stays_within_the_payload_ceiling() -> None:
+    """The regression that killed the whole Board: an unbounded payload field.
+
+    A bench with far more readable channels than are charted, each with a full
+    history, produced a per-window ``conformance`` grid that ``_fit`` never touched
+    -- it decimated only the series -- so one finding grew past 4 MiB, overran the
+    JSON-RPC frame, and every Board view failed to assemble. The digest for that same
+    bench must now stay inside the per-finding ceiling on its own.
+    """
+    import json
+
+    from leapflow.hardware.observability.series import MAX_PAYLOAD_BYTES
+
+    channels = tuple(_channel(channel_id=f"c{index}") for index in range(24))
+    context = _context(channels=channels)
+    registry = _Registry(contexts=(context,), windows=_windows(count=2000, breach_at=None))
+    payload = build_digest(registry, now=_WALL).to_payload()
+    assert len(json.dumps(payload).encode("utf-8")) <= MAX_PAYLOAD_BYTES
+
+
+def test_the_wire_payload_carries_the_conformance_distribution_not_the_grid() -> None:
+    """Only the rendered distribution ships; the per-window grid has no consumer.
+
+    ``conformance_mix`` is what the board's BarChart binds. The raw per-window
+    ``conformance`` list was one row per charted window, had no renderer and no other
+    reader, and was the field that grew unbounded -- so it must not be on the wire,
+    while its distribution and a window count must remain.
+    """
+    payload = build_digest(_Registry(), now=_WALL).to_payload()
+    assert "conformance" not in payload
+    assert "conformance_mix" in payload
+    assert "conformance_windows" in payload["counts"]
+
+
+def test_conformance_describes_only_the_channels_actually_charted() -> None:
+    """Conformance is classified after the series are clamped, not before.
+
+    Deriving it from the pre-clamp list made it describe channels the board never
+    draws and made it the one section no ceiling applied to. Every conformance row
+    must name a channel that survived into the charted series.
+    """
+    channels = tuple(_channel(channel_id=f"c{index}") for index in range(MAX_SERIES + 6))
+    digest = build_digest(_Registry(contexts=(_context(channels=channels),)), now=_WALL)
+    charted_ids = {series.id for series in digest.series}
+    assert len(charted_ids) == MAX_SERIES
+    assert {row["channel_id"] for row in digest.conformance} <= charted_ids
+
+
 # ════════════════════════════════════════════════════════════════
 # Derivation: every value comes from the declaration or the store
 # ════════════════════════════════════════════════════════════════

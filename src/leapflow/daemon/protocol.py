@@ -119,6 +119,7 @@ class StreamChunk:
         "error",
         "approval_request",
         "approval_response",
+        "frame",
     ] = "chunk"
     metadata: Optional[Dict[str, Any]] = None
 
@@ -325,6 +326,7 @@ class LeapService(Protocol):
         max_width: int = 0,
         quality: int = 0,
         fps: float = 0.0,
+        viewer_id: str = "",
     ) -> Dict[str, Any]:
         """Return one base64 frame from a previewable channel.
 
@@ -342,7 +344,29 @@ class LeapService(Protocol):
         """
         ...
 
-    async def hardware_read(self, device: str = "", channel: str = "") -> Dict[str, Any]:
+    async def hardware_preview_stream(
+        self,
+        device: str = "",
+        channel: str = "",
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        viewer_id: str = "",
+    ) -> AsyncIterator[StreamChunk]:
+        """Yield latest-only preview frames over one daemon stream connection."""
+        ...
+
+    async def hardware_preview_release(
+        self, device: str = "", channel: str = "", viewer_id: str = ""
+    ) -> Dict[str, Any]:
+        """Release one preview owner immediately without opening hardware."""
+        ...
+
+    async def hardware_preview_status(self) -> Dict[str, Any]:
+        """Return in-memory active preview metrics without image bytes."""
+        ...
+
+    async def hardware_read(self, device: str = "", channel: str = "", viewer_id: str = "") -> Dict[str, Any]:
         """Read one channel's current value through the approval chain.
 
         A fresh transport read, unlike the sampled value on the device page -- which is why
@@ -467,6 +491,9 @@ METHOD_REGISTRY: Dict[str, str] = {
     "hardware.device": "hardware_device",
     "hardware.rescan": "hardware_rescan",
     "hardware.frame": "hardware_frame",
+    "hardware.preview.stream": "hardware_preview_stream",
+    "hardware.preview.release": "hardware_preview_release",
+    "hardware.preview.status": "hardware_preview_status",
     "hardware.read": "hardware_read",
     "hardware.write_request": "hardware_write_request",
     "tools.list": "tools_list",

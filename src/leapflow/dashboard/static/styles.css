@@ -279,7 +279,7 @@ button:hover { border-color: var(--accent); color: var(--accent); }
 }
 /* Bounded height so a 1080p device cannot push the rest of the page off-screen,
    and object-fit so the frame is never distorted to fit the box. */
-.media-frame { display: block; max-width: 100%; max-height: 42vh; object-fit: contain; }
+.media-frame { display: block; max-width: 100%; max-height: 42vh; height: auto; object-fit: contain; }
 .media-status { color: var(--muted); font-size: .82rem; font-variant-numeric: tabular-nums; }
 .media-toggle, .control-actions button {
   background: none; border: 1px solid var(--line); border-radius: 0;

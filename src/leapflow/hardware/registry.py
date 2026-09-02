@@ -75,11 +75,9 @@ class HardwareSettings:
     instrument_db_path: str = ""
     workspace_id: str = ""
     rediscover_interval_s: float = 0.0
-    preview_idle_timeout_s: float = 15.0
-    # Hard ceilings. The page's balanced default is lower (960px / 8fps / JPEG 75); it
-    # may select any profile within these bounds but cannot make a durable config edit or
-    # exceed them.
-    preview_max_fps: float = 12.0
+    preview_idle_timeout_s: float = 5.0
+    # Detail uses 1280px / 30fps / JPEG 85; Balanced stays 960px / 8fps / JPEG 75.
+    preview_max_fps: float = 30.0
     preview_max_width: int = 1280
     preview_quality: int = 85
 
@@ -150,10 +148,10 @@ class HardwareSettings:
                 getattr(settings, "hardware_rediscover_interval_s", 0.0) or 0.0
             ),
             preview_idle_timeout_s=float(
-                getattr(settings, "hardware_preview_idle_timeout_s", 15.0) or 15.0
+                getattr(settings, "hardware_preview_idle_timeout_s", 5.0) or 5.0
             ),
             preview_max_fps=float(
-                getattr(settings, "hardware_preview_max_fps", 12.0) or 12.0
+                getattr(settings, "hardware_preview_max_fps", 30.0) or 30.0
             ),
             preview_max_width=int(
                 getattr(settings, "hardware_preview_max_width", 1280) or 1280

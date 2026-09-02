@@ -77,6 +77,7 @@ async def request_hardware_frame(
     max_width: int = 0,
     quality: int = 0,
     fps: float = 0.0,
+    viewer_id: str = "",
 ) -> dict[str, Any]:
     """Acquire one frame through the approval chain. The single gated frame path.
 
@@ -109,6 +110,7 @@ async def request_hardware_frame(
             max_width=int(max_width or 0),
             quality=int(quality or 0),
             fps=float(fps or 0.0),
+            viewer_id=viewer_id,
         )
     except TransportError as exc:
         return {
@@ -134,8 +136,23 @@ async def request_hardware_frame(
     }
 
 
+def _preview_stream_error(payload: dict[str, Any]) -> StreamChunk:
+    """Encode a preview refusal as one structured stream event, never a traceback."""
+    return StreamChunk(
+        request_id="",
+        content=str(payload.get("error") or "The preview stream could not start."),
+        event_type="error",
+        metadata={
+            "code": str(payload.get("code") or "preview_stream_failed"),
+            "error": str(payload.get("error") or "The preview stream could not start."),
+            "device": str(payload.get("device") or ""),
+            "channel": str(payload.get("channel") or ""),
+        },
+    )
+
+
 async def request_hardware_reading(
-    ctx: Any, registry: Any, device: str, channel: str
+    ctx: Any, registry: Any, device: str, channel: str, *, viewer_id: str = ""
 ) -> dict[str, Any]:
     """Read one channel through the approval chain. The single gated scalar-read path.
 
@@ -155,16 +172,30 @@ async def request_hardware_reading(
 
     from leapflow.hardware.transport import TransportError
 
+    observed = False
+    if viewer_id:
+        try:
+            await registry.preview_broker.observe(device, channel, viewer_id=viewer_id)
+            observed = True
+        except TransportError as exc:
+            return {
+                "ok": False, "code": exc.failure_code, "device": device,
+                "channel": channel, "error": str(exc),
+            }
     try:
         async with registry.device_io(device):
             transport = await registry.transport(device)
             reading = await transport.read(channel)
     except TransportError as exc:
+        if observed:
+            await registry.preview_broker.release(device, channel, viewer_id=viewer_id, reason="read_failed")
         return {
             "ok": False, "code": exc.failure_code, "device": device,
             "channel": channel, "error": str(exc),
         }
     except Exception as exc:  # noqa: BLE001 - a failed read must not fail the daemon
+        if observed:
+            await registry.preview_broker.release(device, channel, viewer_id=viewer_id, reason="read_failed")
         logger.warning("daemon: hardware read failed: %s", exc, exc_info=True)
         return {
             "ok": False, "code": "read_failed", "device": device,
@@ -1181,6 +1212,7 @@ class RuntimeLeapService:
         max_width: int = 0,
         quality: int = 0,
         fps: float = 0.0,
+        viewer_id: str = "",
     ) -> dict[str, Any]:
         """Return one frame from a previewable channel, base64-encoded.
 
@@ -1209,9 +1241,84 @@ class RuntimeLeapService:
             max_width=max_width,
             quality=quality,
             fps=fps,
+            viewer_id=viewer_id,
         )
 
-    async def hardware_read(self, device: str = "", channel: str = "") -> dict[str, Any]:
+    async def hardware_preview_stream(
+        self,
+        device: str = "",
+        channel: str = "",
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        viewer_id: str = "",
+    ) -> AsyncIterator[StreamChunk]:
+        """Relay a daemon-owned latest-frame stream without reopening the device per frame."""
+        registry, refusal = self._hardware_registry_or_error("a preview stream")
+        if refusal is not None:
+            yield _preview_stream_error({**refusal, "device": device, "channel": channel})
+            return
+        consent = await _consent_for_observation(self.context, registry, device, channel)
+        if consent is not None:
+            yield _preview_stream_error(consent)
+            return
+
+        import base64
+
+        owner = viewer_id or uuid.uuid4().hex
+        try:
+            async for frame in registry.preview_broker.stream(
+                device,
+                channel,
+                max_width=int(max_width or 0),
+                quality=int(quality or 0),
+                fps=float(fps or 0.0),
+                viewer_id=owner,
+            ):
+                yield StreamChunk(
+                    request_id="",
+                    content="",
+                    event_type="frame",
+                    metadata={
+                        **frame.to_metadata(),
+                        "data_b64": base64.b64encode(frame.data).decode("ascii"),
+                        "viewer_id": owner,
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001 - a broken preview must become a structured stream error
+            logger.warning("daemon: preview stream failed: %s", exc, exc_info=True)
+            yield _preview_stream_error({
+                "ok": False,
+                "code": getattr(exc, "failure_code", "preview_stream_failed"),
+                "device": device,
+                "channel": channel,
+                "error": str(exc) or "The preview stream stopped unexpectedly.",
+            })
+
+    async def hardware_preview_release(
+        self, device: str = "", channel: str = "", viewer_id: str = ""
+    ) -> dict[str, Any]:
+        """Release a browser-owned preview immediately, without opening hardware."""
+        registry, refusal = self._hardware_registry_or_error("releasing a preview")
+        if refusal is not None:
+            return {**refusal, "device": device, "channel": channel}
+        return {
+            "ok": True,
+            "device": device,
+            "channel": channel,
+            **await registry.preview_broker.release(device, channel, viewer_id=viewer_id),
+        }
+
+    async def hardware_preview_status(self) -> dict[str, Any]:
+        """Return in-memory preview lease metrics without image data."""
+        registry, refusal = self._hardware_registry_or_error("preview status")
+        if refusal is not None:
+            return refusal
+        return {"ok": True, "active": list(registry.preview_broker.active())}
+
+    async def hardware_read(
+        self, device: str = "", channel: str = "", viewer_id: str = ""
+    ) -> dict[str, Any]:
         """Read one channel's current value, through the approval chain.
 
         What a live level meter polls. A thin wrapper over
@@ -1224,7 +1331,9 @@ class RuntimeLeapService:
         registry, refusal = self._hardware_registry_or_error("a device read")
         if refusal is not None:
             return {**refusal, "device": device, "channel": channel}
-        return await request_hardware_reading(self.context, registry, device, channel)
+        return await request_hardware_reading(
+            self.context, registry, device, channel, viewer_id=viewer_id
+        )
 
     async def hardware_write_request(
         self,

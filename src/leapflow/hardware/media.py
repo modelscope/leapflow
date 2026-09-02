@@ -26,11 +26,13 @@ stream costs that once.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
@@ -343,6 +345,22 @@ class FfmpegFrameGrabber:
         self._buffer = bytearray()
         self._size = (0, 0)
         self._input_rate = _DEFAULT_INPUT_RATE_HZ
+        self._latest: tuple[bytes, int, int] | None = None
+        self._captured_at = 0.0
+        self._captured_monotonic = 0.0
+        self._condition = asyncio.Condition()
+        self._pump_task: asyncio.Task[None] | None = None
+        self._pump_error: MediaCaptureError | None = None
+
+    @property
+    def captured_at(self) -> float:
+        """Wall-clock capture time of the latest frame, for end-to-end age telemetry."""
+        return self._captured_at
+
+    @property
+    def captured_monotonic(self) -> float:
+        """Monotonic capture time of the latest frame, for local interval telemetry."""
+        return self._captured_monotonic
 
     def _command(self) -> list[str]:
         # -q:v is an inverse quality scale (2 best, 31 worst), so a percentage has to be
@@ -351,6 +369,8 @@ class FfmpegFrameGrabber:
         return [
             _ffmpeg_binary() or "ffmpeg",
             "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-fflags", "nobuffer", "-avioflags", "direct", "-flags", "low_delay",
+            "-probesize", "32", "-analyzeduration", "0",
             "-f", self._device.input_format,
             # An *input* option, and it has to be: a capture device negotiates its rate
             # when it is opened, so this must precede -i. avfoundation's default is
@@ -369,9 +389,8 @@ class FfmpegFrameGrabber:
             # discard the extra work at the encoder. The source device stays at a supported
             # 30fps mode; the page profile changes the expensive scale/JPEG path.
             "-vf", f"fps={self._fps:g},scale={self._max_width}:-2",
-            "-r", f"{self._fps:g}",
-            "-q:v", str(qscale),
-            "-f", "mjpeg", "pipe:1",
+            "-fps_mode", "passthrough", "-q:v", str(qscale),
+            "-flush_packets", "1", "-f", "mjpeg", "pipe:1",
         ]
 
     async def start(self) -> None:
@@ -395,42 +414,93 @@ class FfmpegFrameGrabber:
                 f"could not start capture for {self._device.name!r}: {exc}",
                 failure_code="capture_start_failed",
             ) from exc
+        self._latest = None
+        self._captured_at = 0.0
+        self._captured_monotonic = 0.0
+        self._pump_error = None
+        self._pump_task = asyncio.create_task(
+            self._pump_latest(), name=f"frame:{self._device.device_id}"
+        )
 
     async def grab(self) -> tuple[bytes, int, int]:
+        """Return the newest frame, never an accumulated queue of old JPEGs.
+
+        The rate fallback deliberately runs after leaving ``_condition``. ``stop()``
+        notifies the same condition while reaping the child, so awaiting it while holding
+        the condition would deadlock the restart path exactly when a device rejects its
+        initial rate.
+        """
+        restart_at_rate: float | None = None
+        async with self._condition:
+            while self._latest is None and self._pump_error is None:
+                try:
+                    await asyncio.wait_for(self._condition.wait(), timeout=5.0)
+                except asyncio.TimeoutError as exc:
+                    raise MediaCaptureError(
+                        f"capture produced no frame for {self._device.name!r}",
+                        failure_code="capture_timeout",
+                    ) from exc
+            if self._pump_error is not None:
+                learned = _supported_rate(str(self._pump_error), self._input_rate)
+                if learned is not None and learned != self._input_rate:
+                    restart_at_rate = learned
+                else:
+                    raise self._pump_error
+            elif self._latest is not None:
+                return self._latest
+            else:  # pragma: no cover - condition invariants above cover this
+                raise MediaCaptureError("capture is not running", failure_code="capture_not_started")
+
+        if restart_at_rate is None:  # pragma: no cover - guarded by the branch above
+            raise MediaCaptureError("capture restart was not configured", failure_code="capture_not_started")
+        self._input_rate = restart_at_rate
+        await self.stop()
+        await self.start()
+        return await self.grab()
+
+    async def _set_pump_error(self, error: MediaCaptureError) -> None:
+        """Publish a terminal pump error and wake every frame waiter."""
+        async with self._condition:
+            self._pump_error = error
+            self._condition.notify_all()
+
+    async def _pump_latest(self) -> None:
         process = self._process
         if process is None or process.stdout is None:
-            raise MediaCaptureError("capture is not running", failure_code="capture_not_started")
-        while True:
-            frame = self._take_frame()
-            if frame is not None:
-                return frame
-            chunk = await process.stdout.read(65536)
-            if not chunk:
-                detail = await self._stderr_detail()
-                # The device may have refused the rate and said which ones it has. That
-                # is a capability answer, not a failure: adopt it and reopen once. Bounded
-                # to a single retry, because the second refusal is a real problem and
-                # reopening in a loop would strobe the camera light while saying nothing.
-                learned = _supported_rate(detail, self._input_rate)
-                if learned is not None and learned != self._input_rate:
-                    logger.info(
-                        "media: %s refused %.3g fps, reopening at %.3g",
-                        self._device.name, self._input_rate, learned,
-                    )
-                    self._input_rate = learned
-                    await self.stop()
-                    await self.start()
-                    process = self._process
-                    if process is None or process.stdout is None:  # pragma: no cover
-                        raise MediaCaptureError(
-                            "capture is not running", failure_code="capture_not_started"
+            await self._set_pump_error(
+                MediaCaptureError("capture process has no stdout", failure_code="capture_stream_failed")
+            )
+            return
+        try:
+            while True:
+                chunk = await process.stdout.read(65536)
+                if not chunk:
+                    detail = await self._stderr_detail(process)
+                    await self._set_pump_error(
+                        MediaCaptureError(
+                            f"capture ended for {self._device.name!r}{detail}",
+                            failure_code="capture_stream_ended",
                         )
+                    )
+                    return
+                self._buffer.extend(chunk)
+                if len(self._buffer) > 4 * 1024 * 1024:
+                    del self._buffer[:-2 * 1024 * 1024]
+                frame = self._take_frame()
+                if frame is None:
                     continue
-                raise MediaCaptureError(
-                    f"capture ended for {self._device.name!r}{detail}",
-                    failure_code="capture_stream_ended",
-                )
-            self._buffer.extend(chunk)
+                async with self._condition:
+                    self._latest = frame
+                    self._captured_at = time.time()
+                    self._captured_monotonic = time.monotonic()
+                    self._condition.notify_all()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 - every terminal pump failure must wake waiters
+            failure = exc if isinstance(exc, MediaCaptureError) else MediaCaptureError(
+                str(exc), failure_code="capture_stream_failed"
+            )
+            await self._set_pump_error(failure)
 
     def _take_frame(self) -> tuple[bytes, int, int] | None:
         """Cut the newest complete JPEG out of the buffer, discarding older ones.
@@ -450,15 +520,9 @@ class FfmpegFrameGrabber:
         self._size = _jpeg_size(data) or self._size
         return data, self._size[0], self._size[1]
 
-    async def _stderr_detail(self) -> str:
-        """Return ffmpeg's own complaint, which is usually the actionable part.
-
-        A permission denial on macOS appears only here; without it the caller would
-        report "capture ended" for a situation whose real fix is a checkbox in System
-        Settings. The whole tail is kept rather than the last line, because a rate
-        refusal puts the answer -- the list of supported modes -- *above* the summary.
-        """
-        process = self._process
+    async def _stderr_detail(self, process: Any | None = None) -> str:
+        """Return ffmpeg's actionable error tail after stdout ends."""
+        process = process or self._process
         if process is None or process.stderr is None:
             return ""
         try:
@@ -470,26 +534,42 @@ class FfmpegFrameGrabber:
         return f": {' | '.join(useful)}" if useful else ""
 
     async def stop(self) -> None:
+        task, self._pump_task = self._pump_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, OSError):
+                await task
         process, self._process = self._process, None
         self._buffer.clear()
-        if process is None:
-            return
+        async with self._condition:
+            self._latest = None
+            self._condition.notify_all()
+        await _stop_ffmpeg_process(process, label=f"camera {self._device.name!r}")
+
+
+async def _stop_ffmpeg_process(process: Any, *, label: str) -> None:
+    """Terminate and reap an ffmpeg child before a device is considered released."""
+    if process is None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        logger.debug("ffmpeg terminate failed for %s: %s", label, exc)
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=2.0)
+        return
+    except (asyncio.TimeoutError, OSError):
         try:
-            process.terminate()
-        except ProcessLookupError:
+            process.kill()
+        except (OSError, ProcessLookupError):
             return
-        except OSError as exc:
-            logger.debug("media capture terminate failed: %s", exc)
-            return
-        try:
-            await asyncio.wait_for(process.wait(), timeout=2.0)
-        except (asyncio.TimeoutError, OSError):
-            # A camera process that ignores SIGTERM keeps the device claimed, and the
-            # next preview would fail with "device busy" for reasons nothing explains.
-            try:
-                process.kill()
-            except (OSError, ProcessLookupError):
-                pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=2.0)
+    except (asyncio.TimeoutError, OSError) as exc:
+        logger.warning("ffmpeg did not exit after kill for %s: %s", label, exc)
 
 
 class OpenCvFrameGrabber:

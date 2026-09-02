@@ -23,6 +23,7 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 from leapflow.daemon.lifecycle import DaemonSignal
+from leapflow.dashboard.revision import board_revision
 
 logger = logging.getLogger(__name__)
 
@@ -197,22 +198,26 @@ def server_running(settings: Any) -> Optional[dict[str, Any]]:
 
 
 def server_is_stale(state: dict[str, Any]) -> bool:
-    """Return True only when the running server *definitely* predates the source tree.
+    """Return whether a reachable Board belongs to a different content generation.
 
-    Asks the server for its own build fingerprint, so the answer is about that process
-    rather than this one. Deliberately conservative in both uncertain directions: an
-    unreachable server, an old build with no ``/api/server-info``, or a checkout git
-    cannot fingerprint all report False. Guessing "stale" would restart a working board
-    -- and killing the page somebody is reading is worse than leaving a warning badge on
-    it.
+    A missing endpoint remains inconclusive -- it may be a foreign service or a transient
+    start -- but a Board that answers ``/api/server-info`` without a revision is an older
+    Board generation and is replaced. This makes Python, templates and static assets move
+    together instead of letting one long-lived process serve a mixed generation.
     """
     info = fetch_server_info(
         str(state.get("bind") or "127.0.0.1"),
         int(state.get("port") or 0),
         str(state.get("token") or ""),
     )
-    return bool(info and info.get("stale") is True)
-
+    if info is None:
+        return False
+    if info.get("stale") is True:
+        return True
+    running_revision = str(info.get("revision") or "")
+    if not running_revision:
+        return True
+    return running_revision != board_revision()
 
 def open_in_browser(url: str) -> bool:
     """Open ``url`` in the default browser; return False on headless failure."""
@@ -353,6 +358,7 @@ def _spawn_verified_server(settings: Any, *, wait_s: float = 8.0) -> dict[str, A
         "bind": bind,
         "token": token,
         "pid": proc.pid,
+        "revision": board_revision(),
         "url": build_url(bind, port, token),
     }
     write_state(settings, state)

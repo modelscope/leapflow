@@ -31,6 +31,7 @@ _APPROVAL_ROUTED_METHODS = frozenset({
     # request's own socket, which ``DaemonClient.request(on_stream_event=...)`` already
     # forwards to whoever asked.
     "hardware.frame",
+    "hardware.preview.stream",
     "hardware.read",
 })
 """RPCs that may raise an approval prompt, and therefore get a route installed.
@@ -195,7 +196,7 @@ class UnixRpcServer:
         params = dict(request.params or {})
         if request.method == "engine.chat":
             params.setdefault("request_id", request.id)
-        if request.method in ("engine.chat", "events.subscribe"):
+        if request.method in ("engine.chat", "events.subscribe", "hardware.preview.stream"):
             await self._dispatch_stream(request, method, params, writer)
             return
 
@@ -302,32 +303,54 @@ class UnixRpcServer:
         params: dict[str, Any],
         writer: asyncio.StreamWriter,
     ) -> None:
-        stream = None
-        pending: asyncio.Task | None = None
-        # Pin every per-chunk task driving this one stream to a single, shared
-        # Context. asyncio.create_task() defaults to copying the *current*
-        # context on each call, so re-creating ``pending`` per chunk (needed
-        # below to interleave heartbeats via asyncio.wait(..., timeout=...))
-        # would otherwise hand the streamed generator a fresh Context every
-        # time it resumes. A ContextVar.set()/reset() pair inside that
-        # generator (e.g. the daemon's per-turn approval routing) binds its
-        # token to the Context active at set()-time; resetting it from a
-        # different Context object raises "was created in a different
-        # Context". Sharing one Context across all chunks keeps such
-        # set()/reset() pairs valid for the whole life of the stream.
+        """Forward one async generator while preserving its approval route and context."""
+        stream: Any = None
+        pending: asyncio.Task[Any] | None = None
+        approval_get: asyncio.Task[Any] | None = None
+        approval_queue: asyncio.Queue[StreamChunk] | None = None
+        route_token: contextvars.Token[Any] | None = None
+        routed = request.method in _APPROVAL_ROUTED_METHODS
+        if routed:
+            from leapflow.daemon.approval_route import approval_route as _approval_route
+
+            approval_queue = asyncio.Queue()
+            route_token = _approval_route.set((approval_queue, request.id))
+            try:
+                self._service._approval_coordinator.register_route(request.id)
+            except AttributeError:
+                pass
+
+        # Pin every per-chunk task to one shared Context. Recreating ``pending`` with a
+        # copied Context makes ContextVar reset tokens invalid on the next generator step.
         ctx = contextvars.copy_context()
+        completed = False
         try:
             stream = method(**params)
             pending = asyncio.create_task(anext(stream), context=ctx)
             while True:
-                done, _ = await asyncio.wait({pending}, timeout=self._stream_heartbeat_s)
-                if not done:
+                wait_set: set[asyncio.Task[Any]] = {pending}
+                if approval_queue is not None:
+                    if approval_get is None or approval_get.done():
+                        approval_get = asyncio.create_task(approval_queue.get())
+                    wait_set.add(approval_get)
+                done, _ = await asyncio.wait(
+                    wait_set,
+                    timeout=self._stream_heartbeat_s,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if approval_get is not None and approval_get in done:
+                    queued = approval_get.result()
+                    approval_get = None
+                    await _write_json(writer, queued.to_notification().to_json())
+                    continue
+                if pending not in done:
                     await self._write_stream_heartbeat(request.id, writer)
                     continue
                 try:
                     chunk = pending.result()
                 except StopAsyncIteration:
                     pending = None
+                    completed = True
                     break
                 notification = StreamChunk(
                     request_id=request.id,
@@ -339,30 +362,13 @@ class UnixRpcServer:
                 await _write_json(writer, notification.to_json())
                 pending = asyncio.create_task(anext(stream), context=ctx)
         except (ConnectionResetError, BrokenPipeError) as exc:
-            # Client vanished mid-stream (e.g. TUI closed while a heartbeat
-            # or chunk write was in flight). This is routine churn — log a
-            # single debug line, no traceback, and skip the error response
-            # since the pipe is already gone.
-            if pending is not None and not pending.done():
-                pending.cancel()
-            if stream is not None and hasattr(stream, "aclose"):
-                try:
-                    await stream.aclose()
-                except Exception:
-                    logger.debug("daemon: failed to close stream after disconnect", exc_info=True)
+            # Browser/TUI disconnect is routine; closing the generator runs the preview
+            # lease's ``finally`` and releases the physical device immediately.
             logger.debug(
                 "daemon: client disconnected during stream method=%s (%s)",
                 request.method, type(exc).__name__,
             )
-            return
         except Exception as exc:
-            if pending is not None and not pending.done():
-                pending.cancel()
-            if stream is not None and hasattr(stream, "aclose"):
-                try:
-                    await stream.aclose()
-                except Exception:
-                    logger.debug("daemon: failed to close stream after error", exc_info=True)
             logger.exception("daemon: stream failed method=%s", request.method)
             response = RpcResponse.fail(
                 request.id,
@@ -370,13 +376,39 @@ class UnixRpcServer:
                 "Daemon stream failed",
                 data=str(exc),
             )
-            await _write_json(writer, response.to_json())
-            return
+            try:
+                await _write_json(writer, response.to_json())
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+        finally:
+            if approval_get is not None and not approval_get.done():
+                approval_get.cancel()
+            if pending is not None and not pending.done():
+                pending.cancel()
+                try:
+                    await pending
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if stream is not None and hasattr(stream, "aclose"):
+                try:
+                    await stream.aclose()
+                except Exception:
+                    logger.debug("daemon: failed to close stream", exc_info=True)
+            if route_token is not None:
+                from leapflow.daemon.approval_route import approval_route as _approval_route
 
-        done = StreamChunk(request_id=request.id, content="", done=True).to_notification()
-        await _write_json(writer, done.to_json())
-        response = RpcResponse.success(request.id, {"ok": True})
-        await _write_json(writer, response.to_json())
+                _approval_route.reset(route_token)
+                try:
+                    self._service._approval_coordinator.unregister_route(request.id)
+                    self._service._approval_coordinator.deny_for_request(request.id, reason="command_ended")
+                except AttributeError:
+                    pass
+
+        if completed:
+            done = StreamChunk(request_id=request.id, content="", done=True).to_notification()
+            await _write_json(writer, done.to_json())
+            response = RpcResponse.success(request.id, {"ok": True})
+            await _write_json(writer, response.to_json())
 
     async def _write_stream_heartbeat(
         self,

@@ -5,11 +5,13 @@ orchestration while MonitorCoordinator owns all monitor lifecycle and RPC logic.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections import deque
 from typing import Any, Callable, Optional
 
+from leapflow.daemon._transport import RPC_STREAM_LIMIT
 from leapflow.daemon.notifications import Notification
 from leapflow.monitor.signal_noise import SignalNoiseConfig, SignalNoiseGate
 
@@ -17,6 +19,18 @@ logger = logging.getLogger(__name__)
 
 # Rate-limit: max pushes per event_type per second.
 _SIGNAL_STREAM_MAX_PER_SEC = 2
+
+FINDINGS_FRAME_BUDGET = RPC_STREAM_LIMIT // 2
+"""Bytes of finding payload one ``watch.findings`` reply may carry.
+
+A batch reply is one newline-delimited JSON frame, so ``limit`` counts rows while the
+transport counts bytes -- and the two disagree without a bound here. Each producer is
+responsible for bounding its own payload, but this is the boundary that actually
+breaks, and it must not depend on every producer getting that right: an oversized
+frame is not a degraded panel, it is an unreadable reply that fails the caller's whole
+request. Half the frame limit leaves room for the JSON-RPC envelope and for the
+headroom a single unusually large newest finding needs.
+"""
 
 
 class MonitorCoordinator:
@@ -380,13 +394,13 @@ class MonitorCoordinator:
     async def findings(
         self, watch_id: str = "", limit: int = 50, offset: int = 0
     ) -> list[dict[str, Any]]:
-        """Get findings, optionally filtered by watch_id."""
+        """Get findings, optionally filtered by watch_id, bounded to one RPC frame."""
         if self._monitors is None:
             return []
         results = self._monitors.list_findings(
             watch_id=watch_id or None, limit=int(limit), offset=int(offset)
         )
-        return [finding.to_dict() for finding in results]
+        return _fit_to_frame([finding.to_dict() for finding in results])
 
     # ── Status / queries ──────────────────────────────────────────────────
 
@@ -443,3 +457,43 @@ class MonitorCoordinator:
                 for watch in active[:5]
             ],
         }
+
+
+def _fit_to_frame(
+    findings: list[dict[str, Any]], *, budget: int = FINDINGS_FRAME_BUDGET
+) -> list[dict[str, Any]]:
+    """Return the newest findings whose combined JSON stays inside one RPC frame.
+
+    Findings arrive newest-first, so this keeps the prefix a caller can actually read
+    and drops the oldest tail -- the opposite of losing the present. A single finding
+    that is itself over budget is a producer defect the coordinator cannot fix by
+    dropping neighbours; it is kept (so the newest state is never silently empty) and
+    logged, and the transport layer will still report the frame overrun as a typed,
+    actionable error rather than an unclassified crash.
+    """
+    if not findings:
+        return findings
+    kept: list[dict[str, Any]] = []
+    used = 0
+    for index, finding in enumerate(findings):
+        try:
+            size = len(json.dumps(finding, ensure_ascii=False, default=str).encode("utf-8"))
+        except (TypeError, ValueError):
+            logger.warning("daemon: finding %d is not JSON-serialisable; skipping", index)
+            continue
+        if kept and used + size > budget:
+            logger.warning(
+                "daemon: watch.findings truncated to %d of %d findings to fit the "
+                "%d-byte frame budget; the oldest were dropped",
+                len(kept), len(findings), budget,
+            )
+            break
+        if not kept and size > budget:
+            logger.warning(
+                "daemon: newest finding (domain=%s) is %d bytes, over the %d-byte "
+                "frame budget; a producer is not bounding its payload",
+                finding.get("domain"), size, budget,
+            )
+        kept.append(finding)
+        used += size
+    return kept

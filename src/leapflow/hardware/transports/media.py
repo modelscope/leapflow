@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Mapping
 
 from leapflow.hardware.context import HardwareContext, Quality
@@ -215,6 +216,8 @@ class MediaTransport:
             media_type="image/jpeg",
             width=width,
             height=height,
+            observed_at=float(getattr(grabber, "captured_at", 0.0) or time.time()),
+            monotonic_at=float(getattr(grabber, "captured_monotonic", 0.0) or time.monotonic()),
             sequence=self._sequence,
             quality=Quality.OK.value,
         )

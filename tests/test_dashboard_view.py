@@ -87,6 +87,41 @@ async def test_builder_default_template_renders_session_analysis() -> None:
     assert len([n for n in _flatten(spec) if n["type"] == "InsightCard"]) == 1
 
 
+async def test_session_board_is_not_crowded_out_by_other_domain_findings() -> None:
+    """The session build must fetch scoped to the session watch, not all domains.
+
+    Findings are returned newest-first inside a byte-bounded batch. A burst of newer,
+    larger findings from another domain (hardware payloads dwarf every other) would
+    fill an unscoped batch and push a still-current session analysis past the end,
+    blanking a board whose data plainly exists. Here sixty hardware findings sit ahead
+    of the one session finding; scoping to the session watch renders it regardless.
+    """
+    hardware_findings = [
+        {"finding_id": f"h{i}", "watch_id": "hw", "domain": "hardware",
+         "title": "snapshot", "severity": "info"}
+        for i in range(60)
+    ]
+    session_finding = {
+        "finding_id": "s1", "watch_id": "s", "domain": "session", "title": "analysis",
+        "severity": "notable", "payload": {
+            "story": "the arc",
+            "insights": [{"title": "i", "summary": "s", "severity": "notable"}],
+        },
+    }
+    provider = _FakeProvider(
+        watches=[
+            {"watch_id": "hw", "domain": "hardware", "state": "armed"},
+            {"watch_id": "s", "domain": "session", "state": "armed"},
+        ],
+        # Session finding last: an unscoped limit=50 read would never reach it.
+        findings=[*hardware_findings, session_finding],
+    )
+    builder = DashboardViewBuilder(TemplateLibrary())
+    spec = await builder.build(DashboardIntent(template=""), provider)
+    assert spec["title"] == "Session Analysis"
+    assert "StoryPanel" in {n["type"] for n in _flatten(spec)}
+
+
 async def test_builder_named_template_reframes_same_session() -> None:
     builder = DashboardViewBuilder(TemplateLibrary())
     spec = await builder.build(DashboardIntent(template="finance"), _session_provider())

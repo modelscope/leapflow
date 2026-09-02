@@ -497,6 +497,55 @@ def test_a_preview_releases_the_device_when_nobody_is_watching() -> None:
     asyncio.run(_run())
 
 
+def test_explicit_preview_release_only_closes_the_last_viewer() -> None:
+    """Closing one browser panel cannot turn off a camera another panel still owns."""
+    source = _FakeFrameSource()
+    registry = _registry(_camera_context(), source)
+    dropped: list[str] = []
+
+    async def _drop(device_id: str) -> None:
+        dropped.append(device_id)
+        await source.close()
+
+    registry.drop_transport = _drop  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        broker = registry.preview_broker
+        await broker.frame("cam", FRAME_CHANNEL, viewer_id="board-a")
+        await broker.frame("cam", FRAME_CHANNEL, viewer_id="board-b")
+        first = await broker.release("cam", FRAME_CHANNEL, viewer_id="board-a")
+        assert first == {"released": False, "active_viewers": 1}
+        assert dropped == []
+        final = await broker.release("cam", FRAME_CHANNEL, viewer_id="board-b")
+        assert final == {"released": True, "active_viewers": 0}
+
+    asyncio.run(_run())
+    assert dropped == ["cam"]
+    assert source.closes == 1
+
+
+def test_a_preview_stream_releases_its_own_viewer_when_closed() -> None:
+    """Closing a daemon stream is an immediate hardware release, not an idle timeout."""
+    source = _FakeFrameSource()
+    registry = _registry(_camera_context(), source)
+    dropped: list[str] = []
+
+    async def _drop(device_id: str) -> None:
+        dropped.append(device_id)
+        await source.close()
+
+    registry.drop_transport = _drop  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        stream = registry.preview_broker.stream("cam", FRAME_CHANNEL, viewer_id="board")
+        frame = await anext(stream)
+        assert frame.data == _JPEG
+        await stream.aclose()
+
+    asyncio.run(_run())
+    assert dropped == ["cam"]
+
+
 def test_a_transport_without_read_frame_is_refused_with_a_reason() -> None:
     """The capability check admission cannot make, made at the only honest moment.
 
@@ -529,6 +578,44 @@ def test_a_non_media_channel_cannot_be_previewed() -> None:
         with pytest.raises(TransportError) as excinfo:
             await registry.preview_broker.frame("cam", "temperature")
         assert excinfo.value.failure_code == "channel_not_previewable"
+
+    asyncio.run(_run())
+
+
+# ════════════════════════════════════════════════════════════════
+# Daemon preview stream contract
+# ════════════════════════════════════════════════════════════════
+
+
+def test_daemon_preview_stream_reports_latest_metadata_and_release_status() -> None:
+    """The persistent daemon stream carries bytes outside normal reading payloads."""
+    from types import SimpleNamespace
+
+    from leapflow.daemon.service import RuntimeLeapService
+
+    source = _FakeFrameSource()
+    registry = _registry(_camera_context(), source)
+    context = SimpleNamespace(
+        _hardware_registry=registry,
+        _approval_orchestrator=_AllowingGate(),
+    )
+    service = RuntimeLeapService(SimpleNamespace(llm_context_length=100))
+    service._ctx = context  # noqa: SLF001 - inject the daemon runtime boundary
+
+    async def _run() -> None:
+        stream = service.hardware_preview_stream("cam", FRAME_CHANNEL, viewer_id="board")
+        chunk = await anext(stream)
+        assert chunk.event_type == "frame"
+        assert chunk.metadata is not None
+        assert chunk.metadata["viewer_id"] == "board"
+        assert chunk.metadata["data_b64"]
+        assert "data" not in {key for key in chunk.metadata if key != "data_b64"}
+        status = await service.hardware_preview_status()
+        assert status["ok"] is True
+        assert status["active"][0]["viewers"] == 1
+        released = await service.hardware_preview_release("cam", FRAME_CHANNEL, "board")
+        assert released["released"] is True
+        await stream.aclose()
 
     asyncio.run(_run())
 
@@ -605,8 +692,11 @@ def test_the_device_rate_is_an_input_option() -> None:
     # The preview ceiling is not a device mode. 2 fps is what the *broker* enforces; asking
     # a camera to open at 2 fps fails the same way the default did.
     assert command[command.index("-framerate") + 1] != "2"
-    assert "-r" in command and command.index("-r") > command.index("-i"), (
-        "the pull rate stays an output option, which is what decimates the device's frames"
+    assert "-vf" in command and "fps=2" in command[command.index("-vf") + 1], (
+        "preview cadence must be applied after opening the source device"
+    )
+    assert "-fflags" in command and "nobuffer" in command, (
+        "latest-frame capture must ask ffmpeg to avoid an input backlog"
     )
 
 
@@ -622,6 +712,38 @@ def test_a_refused_rate_is_learned_from_the_devices_own_answer() -> None:
     assert _supported_rate(refusal, 30.0) == 30.0, "prefer the requested rate when offered"
     assert _supported_rate(refusal, 24.0) == 15.0, "otherwise the fastest mode at or below it"
     assert _supported_rate(refusal, 10.0) == 15.0, "nothing slow enough: take the slowest offered"
+
+
+def test_rate_fallback_restarts_after_releasing_the_frame_condition() -> None:
+    """The input-rate recovery path must never await stop() while holding its condition."""
+    from leapflow.hardware.media import FfmpegFrameGrabber, MediaCaptureError
+
+    device = MediaDevice(
+        kind="camera", index=0, name="Cam", spec="0:none", input_format="avfoundation"
+    )
+    grabber = FfmpegFrameGrabber(device, max_width=640, quality=70, fps=2.0)
+    grabber._input_rate = 24.0  # noqa: SLF001 - force a deterministic unsupported-rate recovery
+    grabber._pump_error = MediaCaptureError(  # noqa: SLF001 - emulate ffmpeg's terminal message
+        "Selected framerate (24.0) is not supported by the device. Supported modes: 640x480@[15.0 30.0]fps"
+    )
+    calls: list[str] = []
+
+    async def _stop() -> None:
+        calls.append("stop")
+
+    async def _start() -> None:
+        calls.append("start")
+        grabber._pump_error = None  # noqa: SLF001 - the restarted source succeeds
+        grabber._latest = (_JPEG, 4, 2)  # noqa: SLF001 - deterministic latest frame
+
+    grabber.stop = _stop  # type: ignore[method-assign]
+    grabber.start = _start  # type: ignore[method-assign]
+
+    frame = asyncio.run(asyncio.wait_for(grabber.grab(), timeout=0.5))
+
+    assert frame == (_JPEG, 4, 2)
+    assert calls == ["stop", "start"]
+    assert grabber._input_rate == 15.0  # noqa: SLF001 - learned from device modes
 
 
 def test_only_a_rate_refusal_is_retried() -> None:
