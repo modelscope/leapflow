@@ -2,7 +2,7 @@
 
 import pytest
 
-pytest.importorskip("cua_sandbox")  # leapspace dependency group only
+pytest.importorskip("cua_sandbox")  # leapspace extra only
 
 from cua_sandbox.interfaces.shell import CommandResult
 

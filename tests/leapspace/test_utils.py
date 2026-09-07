@@ -5,6 +5,8 @@ import platform
 
 import pytest
 
+pytest.importorskip("cua_sandbox")  # leapspace extra only (utils imports cua_sandbox)
+
 from leapspace.app_space.utils import (
     check,
     get_image_venv_python,

@@ -88,6 +88,14 @@ class ToolMetadata:
     provides_capabilities: tuple[str, ...] = ()
     requires_capabilities: tuple[str, ...] = ()
     requires_platform_capabilities: tuple[str, ...] = ()
+    # ``requires_environment_affordances`` are task-environment (app-level)
+    # preconditions the tool drives -- e.g. ``ui.chat.send.v2`` -- as opposed to
+    # host ``requires_platform_capabilities`` (e.g. ``shell.exec``). Separating the
+    # two lets the resolver score a candidate against the *task environment* an
+    # app presents without conflating it with the host the agent runs on, and lets
+    # the same tool be compared across app adapters. Defaults empty: a tool that
+    # depends on no named app affordance declares nothing.
+    requires_environment_affordances: tuple[str, ...] = ()
 
     def to_openai_schema(self) -> dict[str, Any]:
         """Generate OpenAI function-calling schema dict.
@@ -106,6 +114,11 @@ class ToolMetadata:
         if self.requires_platform_capabilities:
             x_leapflow.setdefault(
                 "requires_platform_capabilities", list(self.requires_platform_capabilities)
+            )
+        if self.requires_environment_affordances:
+            x_leapflow.setdefault(
+                "requires_environment_affordances",
+                list(self.requires_environment_affordances),
             )
         entry: dict[str, Any] = {
             "type": "function",

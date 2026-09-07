@@ -278,7 +278,7 @@ This installs the `leap` command. The first `leap` run creates the local LeapFlo
 ```bash
 git clone https://github.com/modelscope/leapflow.git
 cd leapflow
-uv sync --all-extras
+uv sync --all-extras --no-extra leapspace
 uv run leap --help
 ```
 </details>
@@ -341,6 +341,23 @@ leap --mock-host "hello, are you ready?"
 ```
 
 Expected: LeapFlow responds with a greeting confirming it's operational.
+
+### 5. (Optional) LeapSpace evaluation environment
+
+LeapSpace (`src/leapspace`) is an opt-in, environment-side CUA sandbox: PyQt6
+scenario apps plus a harness that boots a disposable sandbox, drives a task, and
+records signal-mode trajectories as ground truth. Its code ships inside the
+leapflow distribution, but the heavy stack (PyQt6 / cua-sandbox / pydantic) is
+gated behind an extra so the default install — and CI — stays light:
+
+```bash
+pip install 'leapflow[leapspace]'    # from PyPI
+uv sync --extra leapspace            # or from a source checkout (make space-sync)
+```
+
+Without the extra, `import leapspace.app_space` still works; only the submodules
+that pull in PyQt6 / cua-sandbox / pydantic require it, and the LeapSpace tests
+skip cleanly when those dependencies are absent.
 
 ---
 

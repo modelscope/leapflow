@@ -46,6 +46,7 @@ class CapabilityCandidate:
     provides_capabilities: tuple[str, ...] = field(default_factory=tuple)
     requires_capabilities: tuple[str, ...] = field(default_factory=tuple)
     requires_platform_capabilities: tuple[str, ...] = field(default_factory=tuple)
+    requires_environment_affordances: tuple[str, ...] = field(default_factory=tuple)
     risk_level: str = "read_only"
     requires_approval: bool = False
     mutates_state: bool = False
@@ -71,6 +72,10 @@ class CapabilityCandidate:
                 tool.requires_platform_capabilities
                 or tuple(raw.get("requires_platform_capabilities") or ())
             ),
+            requires_environment_affordances=_as_tuple(
+                getattr(tool, "requires_environment_affordances", ())
+                or tuple(raw.get("requires_environment_affordances") or ())
+            ),
             risk_level=str(raw.get("risk_level") or "read_only"),
             requires_approval=bool(raw.get("requires_approval", False)),
             mutates_state=bool(tool.mutates_state or raw.get("mutates_state", False)),
@@ -85,6 +90,7 @@ class CapabilityCandidate:
             "provides_capabilities": list(self.provides_capabilities),
             "requires_capabilities": list(self.requires_capabilities),
             "requires_platform_capabilities": list(self.requires_platform_capabilities),
+            "requires_environment_affordances": list(self.requires_environment_affordances),
             "risk_level": self.risk_level,
             "requires_approval": self.requires_approval,
             "mutates_state": self.mutates_state,
@@ -275,6 +281,49 @@ class EnvironmentFitScorer:
             1.0,
             context.weights.environment_fit,
             "all required platform capabilities are present",
+        )
+
+
+class EnvironmentAffordanceScorer:
+    """Exclude a candidate whose declared app-level affordances the task
+    environment does not offer.
+
+    Mirrors ``EnvironmentFitScorer`` but reads the candidate's
+    ``requires_environment_affordances`` (task/app-level) rather than its host
+    ``requires_platform_capabilities``. The two are separate declarations so a
+    tool that needs ``ui.chat.send.v2`` is excluded when the app presents v1,
+    without conflating that with a host capability. Not in ``_DEFAULT_SCORERS``:
+    it is injected explicitly (``CapabilityResolver(scorers=...)``) by callers
+    that resolve against a task environment, so default resolution is unchanged.
+    """
+
+    name = "environment_affordance"
+
+    def score(
+        self,
+        requirement: CapabilityRequirement,
+        candidate: CapabilityCandidate,
+        context: ResolverContext,
+    ) -> ScoreComponent:
+        required = candidate.requires_environment_affordances
+        missing = tuple(
+            affordance
+            for affordance in required
+            if not context.environment.supports_capability(affordance)
+        )
+        if missing:
+            return ScoreComponent(
+                self.name,
+                0.0,
+                context.weights.environment_fit,
+                "missing environment affordances: " + ", ".join(missing),
+                excluded=True,
+            )
+        return ScoreComponent(
+            self.name,
+            1.0,
+            context.weights.environment_fit,
+            "all required environment affordances are present",
         )
 
 

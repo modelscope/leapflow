@@ -161,10 +161,23 @@ class CapabilityPlan:
         """Return whether the plan has no missing deps and no dependency cycle."""
         return not self.missing_dependencies and not self.cycle_detected
 
+    @property
+    def is_actionable(self) -> bool:
+        """Return whether the plan is executable AND has at least one step.
+
+        ``executable`` is vacuously true for an empty plan (no missing deps, no
+        cycle), which reads as success on the capability board when in fact
+        nothing was selected. ``is_actionable`` is the honest signal: a plan that
+        can actually do something. New surfaces should bind to this; ``executable``
+        is retained unchanged for backward compatibility.
+        """
+        return self.executable and bool(self.steps)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "plan_id": self.plan_id,
             "executable": self.executable,
+            "is_actionable": self.is_actionable,
             "cycle_detected": self.cycle_detected,
             "missing_dependencies": [m.to_dict() for m in self.missing_dependencies],
             "steps": [s.to_dict() for s in self.steps],

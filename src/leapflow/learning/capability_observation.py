@@ -9,11 +9,42 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from leapflow.domain.capability_requirement import CapabilityRequirement
 from leapflow.domain.environment_fingerprint import EnvironmentFingerprint
 from leapflow.learning.capability_gap_detector import CapabilityGapDetector
+
+# The evidence origin the observation layer has always accepted. Kept as the
+# default so behaviour is unchanged unless a classifier is explicitly supplied.
+DEFAULT_ACCEPTED_EVIDENCE = frozenset({"unknown_tool"})
+
+
+@dataclass(frozen=True)
+class CapabilityEvidenceClassifier:
+    """Decide whether a structured tool result is capability-relevant evidence.
+
+    The shipped observation layer hard-codes ``error_type == "unknown_tool"``,
+    which is blind to a structural environment change under a still-present tool.
+    This classifier makes the accepted ``error_type`` set explicit and
+    configurable so an environment-aware source (e.g. interface-drift /
+    affordance-loss signals) can feed the same governed pipeline, while the
+    default set preserves today's behaviour exactly. The accepted set is meant to
+    be driven by ``environment_adaptation.accepted_evidence_kinds`` config; it is
+    never inferred from natural-language text.
+    """
+
+    accepted: frozenset[str] = DEFAULT_ACCEPTED_EVIDENCE
+
+    @classmethod
+    def from_kinds(cls, kinds: Iterable[str] | None = None) -> "CapabilityEvidenceClassifier":
+        """Build from an iterable of accepted error kinds (None -> default)."""
+        if not kinds:
+            return cls()
+        return cls(accepted=frozenset(str(kind) for kind in kinds if str(kind)))
+
+    def accepts(self, result: Mapping[str, Any] | None) -> bool:
+        return isinstance(result, Mapping) and str(result.get("error_type") or "") in self.accepted
 
 
 @dataclass(frozen=True)
@@ -32,16 +63,24 @@ class CapabilityObservationBuffer:
     """Collect structured tool evidence and derive reviewable requirements."""
 
     detector: CapabilityGapDetector = field(default_factory=CapabilityGapDetector)
+    # Optional evidence gate. ``None`` preserves the shipped behaviour (accept
+    # only ``unknown_tool``); an explicit classifier widens the accepted set.
+    classifier: CapabilityEvidenceClassifier | None = None
     _observations: list[CapabilityObservation] = field(default_factory=list)
 
     def add_result(self, result: Mapping[str, Any] | None) -> bool:
         """Record a structured tool result when it represents a capability gap."""
-        if not self._is_supported_signal(result):
+        if not self._accepts(result):
             return False
         self._observations.append(
             CapabilityObservation(observed_at=time.time(), result=dict(result or {}))
         )
         return True
+
+    def _accepts(self, result: Mapping[str, Any] | None) -> bool:
+        if self.classifier is not None:
+            return self.classifier.accepts(result)
+        return self._is_supported_signal(result)
 
     def extend_results(self, results: Sequence[Mapping[str, Any]]) -> int:
         """Record multiple tool results and return how many were accepted."""
@@ -70,9 +109,23 @@ class CapabilityObservationBuffer:
 class CapabilityObservationService:
     """Bridge turn-local observations into durable, cross-turn requirements."""
 
-    def __init__(self, store: Any, *, detector: CapabilityGapDetector | None = None) -> None:
+    def __init__(
+        self,
+        store: Any,
+        *,
+        detector: CapabilityGapDetector | None = None,
+        classifier: CapabilityEvidenceClassifier | None = None,
+    ) -> None:
         self._store = store
         self._detector = detector or CapabilityGapDetector()
+        # ``None`` preserves the shipped ``unknown_tool``-only gate; an explicit
+        # classifier lets environment-derived evidence reach the durable store.
+        self._classifier = classifier
+
+    def _accepts(self, result: Mapping[str, Any] | None) -> bool:
+        if self._classifier is not None:
+            return self._classifier.accepts(result)
+        return CapabilityObservationBuffer._is_supported_signal(result)
 
     def observe_result(
         self,
@@ -86,7 +139,7 @@ class CapabilityObservationService:
         metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Persist one structured observation, returning the stored record."""
-        if not CapabilityObservationBuffer._is_supported_signal(result):
+        if not self._accepts(result):
             return None
         env_payload = (
             environment.to_dict()
@@ -142,7 +195,9 @@ class CapabilityObservationService:
 
 
 __all__ = [
+    "CapabilityEvidenceClassifier",
     "CapabilityObservation",
     "CapabilityObservationBuffer",
     "CapabilityObservationService",
+    "DEFAULT_ACCEPTED_EVIDENCE",
 ]

@@ -10,6 +10,9 @@ import shlex
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("cua_sandbox")  # leapspace extra only
+
 from cua_sandbox.interfaces.shell import CommandResult
 
 import leapspace.app_space.harness as harness_module

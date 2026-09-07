@@ -10,8 +10,8 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> Installing Python dependencies (uv sync --all-extras)..."
-uv sync --all-extras
+echo "==> Installing Python dependencies (uv sync --all-extras --no-extra leapspace)..."
+uv sync --all-extras --no-extra leapspace
 
 echo ""
 echo "Setup complete!"

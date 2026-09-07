@@ -365,6 +365,47 @@ class AdaptivePluginLoop:
             record=record,
         )
 
+    def unmet_requirements(
+        self,
+        requirements: Sequence[CapabilityRequirement],
+        environment: EnvironmentFingerprint,
+        *,
+        candidate_filter: CandidateFilter | None = None,
+        scorers: Any = None,
+    ) -> tuple[CapabilityRequirement, ...]:
+        """Resolution-first gap gate: return only requirements the live registry
+        cannot already satisfy.
+
+        Shipped adaptive evolution has no short-circuit between "a requirement
+        exists" and "propose a plugin", so it can generate and install a
+        capability the live catalog already provides. This method resolves each
+        requirement against the current registry first; a requirement whose best
+        candidate is eligible is *not* a gap and is excluded from the result. Only
+        the returned (unmet) requirements should enter the proposal queue.
+
+        Read with respect to the capability set: it performs no install, remove,
+        or publish. It does call ``assemble()``, which is idempotent and is the
+        same precondition ``candidates_from_registry`` already requires; on a
+        registry that has never been assembled this performs the one-time index
+        and version bump any first read triggers, so a caller that needs a
+        strictly untouched version counter should assemble beforehand. Callers
+        that resolve against a task environment pass the environment-aware
+        ``scorers`` (e.g. including ``EnvironmentAffordanceScorer``); ``None`` uses
+        the resolver's default scorers.
+        """
+        self._registry.assemble()
+        candidates = tuple(candidates_from_registry(self._registry))
+        if candidate_filter is not None:
+            candidates = tuple(c for c in candidates if candidate_filter(c))
+        resolver = CapabilityResolver(scorers) if scorers is not None else self._resolver
+        context = ResolverContext(
+            environment=environment,
+            trust_ledger=self._trust_ledger,
+            usage_tracker=self._usage_tracker,
+        )
+        resolutions = resolver.resolve_all(tuple(requirements), candidates, context)
+        return tuple(r.requirement for r in resolutions if r.unmet)
+
     async def run(self, request: AdaptiveLoopRequest) -> AdaptiveLoopResult:
         """Resolve, optionally mutate the registry, and resolve again."""
         loop_id = request.resolved_loop_id
