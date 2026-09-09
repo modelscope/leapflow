@@ -372,9 +372,19 @@ class AdaptivePluginLoop:
         *,
         candidate_filter: CandidateFilter | None = None,
         scorers: Any = None,
+        authorising_origins: Sequence[str] | None = None,
     ) -> tuple[CapabilityRequirement, ...]:
         """Resolution-first gap gate: return only requirements the live registry
         cannot already satisfy.
+
+        ``authorising_origins`` restricts which requirement *origins* may drive an
+        acquisition. Empty or ``None`` means unrestricted, which is the shipped
+        behaviour. Setting it to ``("world_model",)`` is the enforceable form of
+        "self-evolution is first-driven by the world model": a requirement from any
+        other origin is still resolved and still reported by the caller, but is
+        excluded from the gap set, so it cannot reach the proposal queue. The filter
+        is applied *before* resolution so an unauthorised origin cannot even consume
+        resolver work.
 
         Shipped adaptive evolution has no short-circuit between "a requirement
         exists" and "propose a plugin", so it can generate and install a
@@ -394,6 +404,15 @@ class AdaptivePluginLoop:
         the resolver's default scorers.
         """
         self._registry.assemble()
+        # Authority filter first: an origin that may not drive acquisition should not
+        # consume resolver work, and must not appear in the gap set at all.
+        authorised = tuple(requirements)
+        if authorising_origins:
+            from leapflow.learning.outcome_governance_feed import filter_authorised
+
+            authorised = filter_authorised(authorised, authorising_origins)
+            if not authorised:
+                return ()
         candidates = tuple(candidates_from_registry(self._registry))
         if candidate_filter is not None:
             candidates = tuple(c for c in candidates if candidate_filter(c))
@@ -403,7 +422,7 @@ class AdaptivePluginLoop:
             trust_ledger=self._trust_ledger,
             usage_tracker=self._usage_tracker,
         )
-        resolutions = resolver.resolve_all(tuple(requirements), candidates, context)
+        resolutions = resolver.resolve_all(authorised, candidates, context)
         return tuple(r.requirement for r in resolutions if r.unmet)
 
     async def run(self, request: AdaptiveLoopRequest) -> AdaptiveLoopResult:

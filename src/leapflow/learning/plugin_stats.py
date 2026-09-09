@@ -12,7 +12,11 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+import logging
+
 from leapflow.learning.plugin_trust import PluginTrustLedger
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +60,16 @@ class PluginUsageTracker:
         """Inject the trust ledger for automatic trust forwarding."""
         self._trust_ledger = ledger
 
+    def set_quarantine_tracker(self, tracker: Any) -> None:
+        """Inject the consecutive-failure tracker that feeds cold-path quarantine.
+
+        Trust demotion has always been immediate here; quarantine had no feed at all,
+        so a plugin could fail indefinitely without being disabled. The tracker keeps
+        one integer per plugin and is drained by the cold-path co-evolution sweep --
+        governance work itself must never run on this path.
+        """
+        self._quarantine_tracker = tracker
+
     def record(self, tool_name: str, ok: bool, duration_ms: float) -> None:
         """Called by TurnUsageTracker forward. Must be fast (<1μs hot path)."""
         sample = PluginUsageSample(time.time(), ok, duration_ms)
@@ -68,6 +82,20 @@ class PluginUsageTracker:
                     self._trust_ledger.record_success(plugin_id)
                 else:
                     self._trust_ledger.record_failure(plugin_id)
+                # Streak bookkeeping only: a dict lookup and an integer update. The
+                # governance it may trigger runs later, on the sweep's cold path.
+                #
+                # Effect verification is deliberately *not* recorded here: this path
+                # receives only ``ok``, and a tool's observed effect lives in its result
+                # payload. The engine's result-observation path records outcomes, so
+                # doing it here as well would double-count and would grade every
+                # success as unverifiable.
+                tracker = getattr(self, "_quarantine_tracker", None)
+                if tracker is not None:
+                    try:
+                        tracker.record(plugin_id, tool_name, ok)
+                    except Exception:  # noqa: BLE001 - never fail a tool call on it
+                        logger.debug("quarantine streak not recorded", exc_info=True)
 
     def stats_for_plugin(self, plugin_id: str) -> Optional[PluginStats]:
         """Aggregate stats across all tools owned by a plugin."""

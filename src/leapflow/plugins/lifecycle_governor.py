@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from leapflow.learning.plugin_trust import PluginTrustLedger, PluginTrustLevel
+from leapflow.plugins.evolution_contracts import EvolutionLifecycleStore, OutcomeStore
 
 
 @dataclass(frozen=True)
@@ -38,13 +39,18 @@ class LifecycleGovernanceResult:
 
 
 class LifecycleGovernor:
-    """Update proposal lifecycle state from trust and execution outcomes."""
+    """Update proposal lifecycle state from trust and execution outcomes.
+
+    The stores are Protocol-typed rather than concrete so this machinery can be
+    driven by whichever backing the live acquisition chain uses, not only by the
+    default capability-proposal queue.
+    """
 
     def __init__(
         self,
         *,
-        proposal_queue: Any,
-        outcome_store: Any,
+        proposal_queue: EvolutionLifecycleStore,
+        outcome_store: OutcomeStore,
         lifecycle_actor: Any = None,
         trust_ledger: PluginTrustLedger | None = None,
         quarantine_after: int = 3,

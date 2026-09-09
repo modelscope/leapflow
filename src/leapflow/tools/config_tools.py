@@ -253,7 +253,18 @@ async def config_set_handler(args: Dict[str, Any]) -> Dict[str, Any]:
         key, scope=scope, secret=bool(before.secret), hot_reload=before.hot_reload,
     )
     if denial:
-        return {"ok": False, "error": denial, "retryable": False, "requires_approval": True}
+        return {
+            "ok": False,
+            "error": denial,
+            "failure_code": "approval_denied",
+            "retryable": False,
+            "requires_approval": True,
+            "blocks_approval": True,
+            "llm_instruction": (
+                "STOP: The configuration change was not approved. Do NOT retry it or "
+                "attempt the same change through another tool. Report the denial to the user."
+            ),
+        }
 
     try:
         result = service.set(key, args["value"], scope=scope)  # type: ignore[arg-type]

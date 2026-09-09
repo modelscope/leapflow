@@ -3079,6 +3079,89 @@ class Context:
         except Exception:
             logger.debug("session summary persistence failed", exc_info=True)
 
+    async def _run_coevolution_sweep(self):
+        """Cold-path governance sweep: verify effects, drain quarantine, find residue.
+
+        Runs at the session-end learning boundary, never inside a turn, because
+        every step here writes to a store or awaits the lifecycle actor and plugin
+        governance must add no per-turn cost.
+
+        Called unconditionally: with nothing to verify and no quarantine candidate
+        the sweep emits its no-op traces and returns an empty outcome. That is the
+        point -- a reader (and the evolution dashboard) must be able to tell a quiet
+        sweep from a sweep that never ran.
+
+        Returns the ``SweepOutcome``, or ``None`` if the sweep could not be built.
+        """
+        try:
+            from leapflow.evolution.observations import (
+                current_observations,
+                current_quarantine_tracker,
+            )
+            from leapflow.evolution.sweep import CoevolutionSweep
+
+            # The process tracker, not a private one: the tool-outcome sink increments
+            # that instance, so a sweep with its own would drain something nobody fed.
+            sweep = CoevolutionSweep(
+                governor=getattr(self, "lifecycle_governor", None),
+                tracker=getattr(self, "_quarantine_tracker", None)
+                or current_quarantine_tracker(),
+            )
+            # Facts are collected where they are produced -- the engine's resolution
+            # path, the install tools, and the tool-outcome sink -- so the sweep reads
+            # the process buffer rather than the CLI reaching into other layers.
+            observations = current_observations()
+            return await sweep.run(
+                verifications=observations.drain_verifications(),
+                acquired_plugin_ids=observations.acquired_plugin_ids(),
+                resolutions=observations.resolutions(),
+            )
+        except (ImportError, AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            logger.debug("co-evolution sweep unavailable", exc_info=True)
+            return None
+
+    async def _drive_world_model_evolution(self, trajectory: list, goal: str):
+        """Let the world model propose capability gaps from episode hindsight.
+
+        Returns a ``WorldModelDriveResult`` (whose ``grades`` the caller reuses so
+        no second LLM call is made), or ``None`` when the driver cannot be
+        assembled -- in which case the caller falls back to plain grading.
+
+        Runs only at the session-end learning boundary, so it adds no per-turn
+        cost. Intents are written as ordinary structured evidence and are admitted
+        only if ``accepted_evidence_kinds`` includes ``world_model_intent``; the
+        driver never writes around that gate.
+        """
+        try:
+            from leapflow.learning.capability_observation import (
+                CapabilityEvidenceClassifier,
+                CapabilityObservationService,
+            )
+            from leapflow.learning.world_model_driver import WorldModelEvolutionDriver
+            from leapflow.storage.capability_observation_store import (
+                JsonCapabilityObservationStore,
+            )
+
+            settings = self.settings
+            profile_layout = getattr(settings, "profile_layout", None)
+            if profile_layout is None or self.trajectory_grader is None:
+                return None
+            service = CapabilityObservationService(
+                JsonCapabilityObservationStore(profile_layout.capability_observations_path),
+                classifier=CapabilityEvidenceClassifier.from_settings(settings),
+            )
+            driver = WorldModelEvolutionDriver(
+                teacher=self.trajectory_grader, intake=service
+            )
+            return await driver.drive(
+                trajectory,
+                goal,
+                workspace_root=str(getattr(settings, "workspace_root", "") or ""),
+            )
+        except (ImportError, AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            logger.debug("world-model evolution driver unavailable", exc_info=True)
+            return None
+
     async def _on_session_end_learning(self) -> None:
         """End-of-session OPD learning pipeline (8 phases) with full observability.
 
@@ -3110,14 +3193,31 @@ class Context:
             try:
                 trajectory, goal = self.prediction_loop.flush_trajectory()
                 if trajectory:
-                    grades = await self.trajectory_grader.grade_trajectory(
-                        trajectory, goal=goal,
-                    )
+                    # The world model is the first driver of capability evolution:
+                    # the same hindsight call that grades the episode also proposes
+                    # any capability it found missing, and those proposals enter the
+                    # ordinary governed evidence path. Admission is still gated by
+                    # ``accepted_evidence_kinds``, so this is inert until opted in.
+                    drive = await self._drive_world_model_evolution(trajectory, goal)
+                    grades = list(drive.grades) if drive is not None else None
+                    if grades is None:
+                        grades = await self.trajectory_grader.grade_trajectory(
+                            trajectory, goal=goal,
+                        )
                     if grades and self.replay_engine is not None:
                         self.replay_engine.set_replay_priorities(grades)
+                    phase_detail = {"actions_graded": len(grades) if grades else 0}
+                    if drive is not None:
+                        phase_detail.update(drive.to_dict())
+                    # Cold-path governance sweep: effect verification, quarantine
+                    # drain, reclamation. Runs whether or not the teacher proposed
+                    # anything, so its no-op traces distinguish a quiet session from
+                    # a sweep that never ran.
+                    sweep = await self._run_coevolution_sweep()
+                    if sweep is not None:
+                        phase_detail.update(sweep.to_dict())
                     observer.on_phase_success(
-                        "trajectory_grading", time.perf_counter() - t0,
-                        {"actions_graded": len(grades) if grades else 0},
+                        "trajectory_grading", time.perf_counter() - t0, phase_detail,
                     )
                     phases_ok += 1
                 else:

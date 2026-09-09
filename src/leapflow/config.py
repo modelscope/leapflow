@@ -357,6 +357,21 @@ class Settings:
     replay_budget: int = 3
     grading_budget: int = 5
     distillation_budget: int = 2
+    # Evidence kinds the capability-observation layer accepts. Empty tuple keeps
+    # the shipped behaviour (``unknown_tool`` only). Adding
+    # ``"world_model_intent"`` lets the world-model teacher drive capability
+    # evolution; adding structural kinds (``"interface_drift"``,
+    # ``"affordance_removed"``) lets an environment probe do so. Every admitted
+    # kind still traverses the unchanged deterministic chain -- resolution, risk,
+    # approval, validation, trust -- so widening this set adds a *trigger*, never
+    # a permission.
+    accepted_evidence_kinds: tuple[str, ...] = ()
+    # Requirement origins permitted to drive an *acquisition*. Empty means
+    # unrestricted (shipped behaviour): any origin may. Setting it to
+    # ``("world_model",)`` is the executable form of "all self-evolution's first
+    # driver is the world model" -- other origins keep being recorded and resolved,
+    # but can no longer authorise acquiring new code.
+    evolution_authorising_origins: tuple[str, ...] = ()
     replay_on_session_end: bool = True
     prediction_structural_blend: float = 0.4
     prediction_semantic_blend: float = 0.6
@@ -916,6 +931,16 @@ def _build_settings_from_env(
     replay_budget = int(os.getenv("LEAPFLOW_REPLAY_BUDGET", "3"))
     grading_budget = int(os.getenv("LEAPFLOW_GRADING_BUDGET", "5"))
     distillation_budget = int(os.getenv("LEAPFLOW_DISTILLATION_BUDGET", "2"))
+    accepted_evidence_kinds = tuple(
+        kind.strip()
+        for kind in os.getenv("LEAPFLOW_ACCEPTED_EVIDENCE_KINDS", "").split(",")
+        if kind.strip()
+    )
+    evolution_authorising_origins = tuple(
+        origin.strip()
+        for origin in os.getenv("LEAPFLOW_EVOLUTION_AUTHORISING_ORIGINS", "").split(",")
+        if origin.strip()
+    )
     replay_on_session_end = _bool("LEAPFLOW_REPLAY_ON_SESSION_END", "true")
     prediction_structural_blend = float(os.getenv("LEAPFLOW_PREDICTION_STRUCTURAL_BLEND", "0.4"))
     prediction_semantic_blend = float(os.getenv("LEAPFLOW_PREDICTION_SEMANTIC_BLEND", "0.6"))
@@ -1337,6 +1362,8 @@ def _build_settings_from_env(
         replay_budget=replay_budget,
         grading_budget=grading_budget,
         distillation_budget=distillation_budget,
+        accepted_evidence_kinds=accepted_evidence_kinds,
+        evolution_authorising_origins=evolution_authorising_origins,
         replay_on_session_end=replay_on_session_end,
         prediction_structural_blend=prediction_structural_blend,
         prediction_semantic_blend=prediction_semantic_blend,

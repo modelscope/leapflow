@@ -437,6 +437,14 @@ class ProfileLayout:
         return self.root / "plugins" / "capability_plans.json"
 
     @property
+    def evolution_traces_path(self) -> Path:
+        # Profile-scoped framework self-evolution traces: registry mutations, trust
+        # transitions, world-model proposals, and lifecycle openings. Beside the
+        # capability stores because the causal ledger reads them together; distinct
+        # from them because these are facts no other store retains.
+        return self.root / "plugins" / "evolution_traces.json"
+
+    @property
     def plugin_versions_dir(self) -> Path:
         # Versioned source snapshots and active pointers for profile-installed plugins.
         return self.root / "plugins" / "versions"

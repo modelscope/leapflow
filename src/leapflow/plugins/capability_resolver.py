@@ -378,6 +378,46 @@ class TrustScorer:
         )
 
 
+class FrozenExclusionScorer:
+    """Exclude a candidate whose plugin trust has been permanently frozen.
+
+    Defense in depth at the selection layer. ``TrustScorer`` only *scores* trust,
+    so a plugin frozen by an internal defect stays selectable for as long as it
+    remains registered -- "frozen implies never re-selected" holds today only
+    because ``LifecycleGovernor`` also quarantines (and thus unregisters) on the
+    same event. Any path that freezes trust without unregistering would leave the
+    plugin eligible; this scorer closes that independently of governance.
+
+    Not in ``_DEFAULT_SCORERS``: it is injected explicitly
+    (``CapabilityResolver(scorers=...)``), so default resolution is unchanged.
+    """
+
+    name = "frozen_exclusion"
+
+    def score(
+        self,
+        requirement: CapabilityRequirement,
+        candidate: CapabilityCandidate,
+        context: ResolverContext,
+    ) -> ScoreComponent:
+        ledger = context.trust_ledger
+        is_frozen = getattr(ledger, "is_frozen", None) if ledger is not None else None
+        if callable(is_frozen) and is_frozen(candidate.plugin_id):
+            return ScoreComponent(
+                self.name,
+                0.0,
+                context.weights.trust,
+                f"plugin {candidate.plugin_id!r} is frozen by an internal defect",
+                excluded=True,
+            )
+        return ScoreComponent(
+            self.name,
+            1.0,
+            context.weights.trust,
+            "plugin is not frozen",
+        )
+
+
 class ReliabilityScorer:
     name = "reliability"
 

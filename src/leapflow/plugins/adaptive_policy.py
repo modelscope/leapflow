@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
 from leapflow.learning.plugin_trust import PluginTrustLevel
-from leapflow.storage.capability_proposal_queue import CapabilityProposalItem
+from leapflow.plugins.evolution_contracts import EvolutionProposalView
 
 AutonomyLevel = Literal[
     "observe_only",
@@ -88,7 +88,7 @@ class AdaptiveEvolutionPolicy:
 
     def decide(
         self,
-        proposal: CapabilityProposalItem,
+        proposal: EvolutionProposalView,
         *,
         trust_level: PluginTrustLevel | str | int = PluginTrustLevel.DRAFT,
         usage: Mapping[str, Any] | None = None,
@@ -197,7 +197,7 @@ class AdaptiveEvolutionPolicy:
         )
 
 
-def _risk_level(proposal: CapabilityProposalItem) -> str:
+def _risk_level(proposal: EvolutionProposalView) -> str:
     risk = dict(proposal.risk or {})
     value = str(risk.get("risk_level") or risk.get("max_risk_level") or "read_only")
     for requirement in proposal.requirements:

@@ -179,6 +179,41 @@ def _actionable_notes(inventory: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _empty_state(domain: str, watch: dict[str, Any]) -> dict[str, Any]:
+    """Describe *why* a domain has no payload, so the page can say so.
+
+    A board with no data used to render its metric row as em dashes and, once every
+    other section learned to hide itself when empty, collapsed to a lone heading.
+    That is indistinguishable from a broken page, and it is the first thing a new
+    profile sees.
+
+    Three states, three different next steps, and they are told apart by the watch
+    rather than guessed:
+
+    * **unscheduled** -- no watch armed for the domain, so the producer is never
+      called. Nothing will ever appear; the scheduler is off or arming failed.
+    * **waiting** -- a watch exists but has not completed a cycle yet. Data is
+      coming, and the only useful thing to say is when.
+    * **idle** -- the watch has run and produced nothing, which for this domain is a
+      legitimate quiet answer rather than a fault.
+    """
+    if not watch:
+        state = "unscheduled"
+    elif int(watch.get("run_count") or 0) <= 0:
+        state = "waiting"
+    else:
+        state = "idle"
+    return {
+        "state": state,
+        "domain": domain,
+        "watch_state": str(watch.get("state") or ""),
+        "muted": bool(watch.get("muted")),
+        "run_count": int(watch.get("run_count") or 0),
+        "next_due_at": float(watch.get("next_due_at") or 0.0),
+        "last_run_at": float(watch.get("last_run_at") or 0.0),
+    }
+
+
 def _hardware_notice(
     inventory: dict[str, Any], digest: dict[str, Any]
 ) -> dict[str, str] | None:
@@ -295,6 +330,7 @@ def _short_id(value: Any) -> str:
 _PAYLOAD_DOMAINS: dict[str, tuple[str, str]] = {
     # template -> (finding domain, data key the template binds to)
     "capability": ("capability_adaptation", "capability_plan"),
+    "evolution": ("framework_evolution", "evolution"),
     "hardware": ("hardware", "hardware"),
 }
 """Templates whose data is a producer's finding payload, not a session lens.
@@ -405,7 +441,7 @@ class DashboardViewBuilder:
     async def _domain_findings(
         self, provider: DashboardDataProvider, domain: str, watch: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        """Return the newest findings of one domain, fetched scoped to its watch.
+        """Return the newest findings of one *watch*, or of the domain when unarmed.
 
         Scoped by ``watch_id`` rather than fetched across all domains and filtered:
         findings return newest-first inside a byte-bounded batch, and the hardware
@@ -416,12 +452,56 @@ class DashboardViewBuilder:
         watch has been armed for the domain yet there is no id to scope by, so it
         falls back to an unscoped read and filters, which is correct because a
         domain with no watch also has no findings.
+
+        Note the unit: this is per *watch*, not per domain. A domain armed with more
+        than one watch must be resolved by :meth:`_domain_watch_payload`, which asks
+        each of them; calling this once with an arbitrary watch was how a board went
+        blank while its data existed under a sibling watch.
         """
         watch_id = str(watch.get("watch_id") or "")
         findings = await provider.findings(watch_id=watch_id, limit=_DOMAIN_FINDINGS_LIMIT)
         if watch_id:
             return findings
         return [f for f in findings if str(f.get("domain")) == domain]
+
+    async def _domain_watch_payload(
+        self, provider: DashboardDataProvider, finding_domain: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Resolve the newest finding of a domain across *every* watch armed for it.
+
+        A domain can legitimately carry more than one watch: framework evolution is
+        armed twice, once polled for state that has no event and once event-driven for
+        change that polling would report minutes late. Picking the first match and
+        scoping the finding read to it meant that whenever the arbitrary winner was the
+        event watch -- which has produced nothing until something evolves -- the page
+        received an empty payload and rendered a column of em dashes. The data existed
+        the whole time, under the sibling watch.
+
+        So each watch of the domain is asked, and the newest finding across all of them
+        wins. The returned watch is the one that *produced* that finding, because the
+        observation metadata (last run, next due, run count) describes how the rendered
+        data was obtained; taking it from a different watch would report a cadence that
+        had nothing to do with what is on screen.
+        """
+        watches = [
+            w for w in await provider.watches() if str(w.get("domain")) == finding_domain
+        ]
+        if not watches:
+            # No watch armed: one unscoped read, filtered by domain.
+            findings = await self._domain_findings(provider, finding_domain, {})
+            return ({}, findings)
+
+        best_watch: dict[str, Any] = watches[0]
+        best_findings: list[dict[str, Any]] = []
+        best_ts = float("-inf")
+        for candidate in watches:
+            findings = await self._domain_findings(provider, finding_domain, candidate)
+            if not findings:
+                continue
+            ts = float(findings[0].get("ts") or 0.0)
+            if ts > best_ts:
+                best_ts, best_findings, best_watch = ts, findings, candidate
+        return (best_watch, best_findings)
 
     async def _build_from_finding_payload(
         self,
@@ -436,9 +516,7 @@ class DashboardViewBuilder:
         snapshot of a subject at one instant, and stitching two together would show
         a state that never existed.
         """
-        watches = await provider.watches()
-        watch = next((w for w in watches if str(w.get("domain")) == finding_domain), {})
-        domain_findings = await self._domain_findings(provider, finding_domain, watch)
+        watch, domain_findings = await self._domain_watch_payload(provider, finding_domain)
         payload = dict(domain_findings[0].get("payload") or {}) if domain_findings else {}
         data = {
             "title": template.replace("_", " ").title(),
@@ -453,6 +531,13 @@ class DashboardViewBuilder:
                 "run_count": watch.get("run_count", 0),
             },
         }
+        if not payload:
+            # An empty payload is a state the page must be able to explain, not a
+            # reason to render a column of em dashes. Which state it is matters: a
+            # domain whose watch has never run is waiting, one armed and running is
+            # idle with nothing to report, and no watch at all means the producer is
+            # not being scheduled -- three different next steps.
+            data["empty"] = _empty_state(finding_domain, watch)
         if template == "hardware":
             # The fleet list comes from the live registry rather than the cycle payload.
             # The digest is capped at eight charted channels and is up to a monitor

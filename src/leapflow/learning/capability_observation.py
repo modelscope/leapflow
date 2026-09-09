@@ -27,11 +27,14 @@ class CapabilityEvidenceClassifier:
     The shipped observation layer hard-codes ``error_type == "unknown_tool"``,
     which is blind to a structural environment change under a still-present tool.
     This classifier makes the accepted ``error_type`` set explicit and
-    configurable so an environment-aware source (e.g. interface-drift /
-    affordance-loss signals) can feed the same governed pipeline, while the
-    default set preserves today's behaviour exactly. The accepted set is meant to
-    be driven by ``environment_adaptation.accepted_evidence_kinds`` config; it is
-    never inferred from natural-language text.
+    configurable so an environment-aware source (interface-drift / affordance-loss
+    signals) or the world-model teacher (``world_model_intent``) can feed the same
+    governed pipeline, while the default set preserves today's behaviour exactly.
+
+    The accepted set is driven by the ``accepted_evidence_kinds`` setting (see
+    :meth:`from_settings`); it is never inferred from natural-language text.
+    Widening it adds a *trigger*, never a permission: every admitted kind still
+    traverses resolution, risk classification, approval, validation, and trust.
     """
 
     accepted: frozenset[str] = DEFAULT_ACCEPTED_EVIDENCE
@@ -42,6 +45,15 @@ class CapabilityEvidenceClassifier:
         if not kinds:
             return cls()
         return cls(accepted=frozenset(str(kind) for kind in kinds if str(kind)))
+
+    @classmethod
+    def from_settings(cls, settings: Any) -> "CapabilityEvidenceClassifier":
+        """Build from a Settings-like object's ``accepted_evidence_kinds``.
+
+        Returns the default (``unknown_tool`` only) when the setting is absent or
+        empty, so an operator must opt in before any new trigger becomes live.
+        """
+        return cls.from_kinds(getattr(settings, "accepted_evidence_kinds", None))
 
     def accepts(self, result: Mapping[str, Any] | None) -> bool:
         return isinstance(result, Mapping) and str(result.get("error_type") or "") in self.accepted
@@ -192,6 +204,39 @@ class CapabilityObservationService:
             for record in self._store.unresolved(min_count=min_count, limit=limit)
         ]
         return self._detector.requirements_from_tool_results(results, min_count=1)
+
+    def resolve_capability(
+        self, capability: str, *, reason: str = "", limit: int = 50
+    ) -> tuple[str, ...]:
+        """Retire observations whose capability gap is now satisfied.
+
+        Without this the observation lifecycle is write-only: ``unresolved()``
+        filters on ``status == "open"``, so evidence that motivated a capability
+        which now resolves keeps being reported, and any consumer sizing work from
+        it would re-propose capabilities the system already has.
+
+        Matching is done by running the same detector used to derive requirements,
+        so an observation is retired only when it genuinely maps to the resolved
+        capability -- never by string-matching the raw payload. Returns the ids of
+        the observations retired.
+        """
+        target = str(capability or "").strip()
+        if not target:
+            return ()
+        retired: list[str] = []
+        for record in self._store.unresolved(min_count=1, limit=limit):
+            observation_id = str(record.get("observation_id") or "")
+            if not observation_id:
+                continue
+            derived = self._detector.requirements_from_tool_results(
+                [record.get("result") or {}], min_count=1
+            )
+            if any(requirement.capability == target for requirement in derived):
+                if self._store.mark_status(
+                    observation_id, "resolved", reason=reason or f"{target} resolved"
+                ):
+                    retired.append(observation_id)
+        return tuple(retired)
 
 
 __all__ = [
