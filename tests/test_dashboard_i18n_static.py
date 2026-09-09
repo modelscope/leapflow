@@ -120,10 +120,18 @@ def _translation_tables() -> dict[str, set[str]]:
 
 
 def _template_literals(node: object, found: set[str]) -> None:
-    """Collect every literal a renderer will display, skipping bound expressions."""
+    """Collect every literal a renderer will display, skipping bound expressions.
+
+    ``text`` is included because the Markdown renderer translates it like any other
+    text prop. It was omitted here for as long as the renderer did not translate it,
+    so seven Markdown notices stayed English in every locale while this check passed.
+    An interpolated string is skipped for the same reason as elsewhere: it can never
+    match a dictionary key, which is why a template must keep counts in ``Stat`` and
+    the prose in ``text`` literal.
+    """
     if isinstance(node, dict):
         for key, value in node.items():
-            if key in ("title", "subtitle", "label", "caption"):
+            if key in ("title", "subtitle", "label", "caption", "text"):
                 if isinstance(value, str) and "{{" not in value:
                     found.add(value)
             if key == "columns" and isinstance(value, list):

@@ -86,6 +86,12 @@ class SelfManagementPlugin:
         # Optional persistent store for PluginProposal review queue. When not
         # injected, it is resolved lazily from ProfileLayout.plugin_proposals_path.
         self._plugin_proposal_store: Any = None
+        # Acquisition-lifecycle ledger (PENDING -> GENERATED -> INSTALLED ->
+        # PROBATION -> VERIFIED/QUARANTINED). Distinct from the review store above:
+        # that one answers "should a human accept this proposal", this one tracks
+        # where the capability is in its journey, and is what AdaptiveEvolutionPolicy
+        # and LifecycleGovernor operate on.
+        self._capability_lifecycle_store: Any = None
         # Optional version store; lazily resolved from ProfileLayout.plugin_versions_dir.
         self._plugin_version_store: Any = None
         # Optional adaptive capability decision store; lazily resolved from
@@ -112,6 +118,7 @@ class SelfManagementPlugin:
             "plugin_proposal_store",
             "plugin_version_store",
             "capability_plan_store",
+            "capability_lifecycle_store",
         ]
 
     def bind_runtime(self, **deps: Any) -> None:
@@ -135,6 +142,8 @@ class SelfManagementPlugin:
             self._plugin_version_store = deps["plugin_version_store"]
         if "capability_plan_store" in deps:
             self._capability_plan_store = deps["capability_plan_store"]
+        if "capability_lifecycle_store" in deps:
+            self._capability_lifecycle_store = deps["capability_lifecycle_store"]
 
     # ── Read-only introspection ────────────────────────────
 
@@ -532,10 +541,13 @@ class SelfManagementPlugin:
         except (RuntimeError, OSError, ValueError, AttributeError) as exc:
             return {"ok": False, "error": f"Proposal persistence failed: {exc}"}
 
+        lifecycle_id = self._open_lifecycle_record(stored, requested_capability)
+
         return {
             "ok": True,
             "action": "propose",
             "proposal": stored.to_dict(),
+            "lifecycle_proposal_id": lifecycle_id,
             "next_actions": [
                 "Review proposal fields and risk level.",
                 "If acceptable, call plugin_generate with proposal_id to preserve review metadata.",
@@ -857,6 +869,97 @@ class SelfManagementPlugin:
         self._plugin_proposal_store = JsonPluginProposalStore(profile_layout.plugin_proposals_path)
         return self._plugin_proposal_store
 
+    def _lifecycle_store(self) -> Any:
+        """Resolve the profile-scoped acquisition-lifecycle ledger."""
+        if self._capability_lifecycle_store is not None:
+            return self._capability_lifecycle_store
+        from leapflow.config import get_settings
+        from leapflow.storage.capability_proposal_queue import JsonCapabilityProposalQueue
+
+        settings = get_settings()
+        profile_layout = getattr(settings, "profile_layout", None)
+        if profile_layout is None:
+            raise RuntimeError("profile_layout is required for capability lifecycle storage")
+        self._capability_lifecycle_store = JsonCapabilityProposalQueue(
+            profile_layout.capability_proposal_queue_path
+        )
+        return self._capability_lifecycle_store
+
+    def _open_lifecycle_record(self, proposal: Any, capability: str) -> str:
+        """Open a PENDING lifecycle record correlated with a review proposal.
+
+        This is what makes the trust/probation/quarantine tier reachable: without a
+        lifecycle record there is nothing for ``AdaptiveEvolutionPolicy`` to decide
+        about or for ``LifecycleGovernor`` to transition. Returns the lifecycle
+        proposal id, or ``""`` when no ledger is available.
+
+        Failures are contained: a bookkeeping write must never fail the proposal
+        the caller actually asked for.
+        """
+        try:
+            from leapflow.domain.capability_requirement import CapabilityRequirement
+
+            requirement = CapabilityRequirement.create(
+                capability or proposal.plugin_id,
+                "explicit_request",
+                evidence=proposal.capability_summary,
+                max_risk_level=proposal.risk_level,
+                requirement_id=f"req-review-{proposal.proposal_id}",
+            )
+            item = self._lifecycle_store().enqueue(
+                requirements=[requirement],
+                risk={"risk_level": proposal.risk_level},
+                source="plugin_propose",
+                metadata={
+                    "plugin_id": proposal.plugin_id,
+                    "review_proposal_id": proposal.proposal_id,
+                },
+            )
+            self._trace_lifecycle_opened(item, proposal, requirement)
+            return str(item.proposal_id)
+        except (RuntimeError, OSError, ValueError, TypeError, AttributeError):
+            logger.debug("self_management: lifecycle record not opened", exc_info=True)
+            return ""
+
+    @staticmethod
+    def _trace_lifecycle_opened(item: Any, proposal: Any, requirement: Any) -> None:
+        """Emit the one durable sign that the governance tier was actually driven.
+
+        The queue records the item, but not what it was opened *for*: the link from a
+        review proposal and a requirement to a lifecycle record lives only here. That
+        link is what distinguishes "trust, probation and quarantine exist" from
+        "something reached them" -- a distinction that mattered, because this
+        machinery was for a long time unreachable in production and invisible while
+        it was.
+        """
+        try:
+            from leapflow.domain.evolution_trace import EvolutionStage
+            from leapflow.telemetry.evolution_tap import emit_trace, is_enabled
+
+            if not is_enabled():
+                return
+            emit_trace(
+                EvolutionStage.DECIDE,
+                "lifecycle_opened",
+                correlation={
+                    "lifecycle_proposal_id": str(getattr(item, "proposal_id", "")),
+                    "review_proposal_id": str(getattr(proposal, "proposal_id", "")),
+                    "requirement_id": str(getattr(requirement, "requirement_id", "")),
+                    "plugin_id": str(getattr(proposal, "plugin_id", "")),
+                },
+                summary=(
+                    f"lifecycle record opened for {getattr(proposal, 'plugin_id', '')}"
+                ),
+                detail={
+                    "source": "plugin_propose",
+                    "risk_level": str(getattr(proposal, "risk_level", "")),
+                    "status": str(getattr(item, "status", "")),
+                    "capability": str(getattr(requirement, "capability", "")),
+                },
+            )
+        except Exception:  # noqa: BLE001 - bookkeeping must not fail the proposal
+            logger.debug("self_management: evolution trace failed", exc_info=True)
+
     def _version_store(self) -> Any:
         """Resolve the profile-scoped plugin version store."""
         if self._plugin_version_store is not None:
@@ -943,7 +1046,66 @@ class SelfManagementPlugin:
             logger.debug(
                 "plugin version recording skipped for %s: %s", plugin_id, exc, exc_info=True
             )
+            version_info = {}
+        # An artifact this path installed is one self-evolution acquired, so later
+        # sweeps may verify its effect and reclaim it if nothing can ever select it.
+        # A hand-installed plugin is deliberately never recorded here.
+        self._record_acquisition(plugin_id)
+        self._trace_artifact_installed(plugin_id, proposal, version_info, result)
         return result
+
+    @staticmethod
+    def _record_acquisition(plugin_id: str) -> None:
+        """Note the acquisition for the cold-path co-evolution sweep; never raises."""
+        try:
+            from leapflow.evolution.observations import record_acquisition
+
+            record_acquisition(plugin_id)
+        except Exception:  # noqa: BLE001 - bookkeeping must not fail an install
+            logger.debug("acquisition not recorded for %s", plugin_id, exc_info=True)
+
+    @staticmethod
+    def _trace_artifact_installed(
+        plugin_id: str, proposal: Any, version_info: Any, result: Any
+    ) -> None:
+        """Record the artifact identity behind a completed acquisition.
+
+        A capability transition has to be reconstructable end to end, and the piece no
+        store held was the link from the causal proposal to the *artifact* that ended
+        up registered. The version store knows the digest; the proposal knows why. This
+        joins them so an installed plugin can always be traced back to the requirement
+        that asked for it.
+        """
+        try:
+            from leapflow.domain.evolution_trace import EvolutionStage
+            from leapflow.telemetry.evolution_tap import emit_trace, is_enabled
+
+            if not is_enabled():
+                return
+            info = dict(version_info or {})
+            emit_trace(
+                EvolutionStage.ACT,
+                "artifact_installed",
+                correlation={
+                    "plugin_id": str(plugin_id),
+                    "proposal_id": str(getattr(proposal, "proposal_id", "")),
+                },
+                summary=f"installed {plugin_id} v{info.get('version', '')}",
+                detail={
+                    "plugin_id": str(plugin_id),
+                    "version": str(info.get("version", "")),
+                    "digest": str(
+                        info.get("checksum_sha256")
+                        or info.get("sha256")
+                        or info.get("digest")
+                        or ""
+                    ),
+                    "capability": str(getattr(proposal, "capability", "")),
+                    "installed_tools": list(dict(result or {}).get("installed_tools", ()) or ()),
+                },
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never fail an install
+            logger.debug("artifact install trace failed", exc_info=True)
 
     def _resolve_dsh_install_dir(self) -> "Path":
         """Resolve the profile-owned directory for DSH source bundles."""

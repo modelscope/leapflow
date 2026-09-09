@@ -163,7 +163,7 @@ class ToolPluginRegistry:
         if not isinstance(plugin, ToolPlugin):
             raise TypeError(f"Plugin must satisfy ToolPlugin Protocol: {type(plugin)}")
         self._plugins[plugin.plugin_id] = plugin
-        self._version += 1
+        self._bump_version("plugin_registered", plugin_id=plugin.plugin_id, tools=len(plugin.tools))
         logger.debug("Registered tool plugin: %s (%d tools)", plugin.plugin_id, len(plugin.tools))
 
     # ── Built-in Discovery ──
@@ -242,8 +242,12 @@ class ToolPluginRegistry:
             for tool in plugin.tools:
                 self._index_tool(tool, plugin.plugin_id)
 
+        # Bumped before the flag flips, so this trace is classified as boot
+        # composition rather than a runtime change. Assembly *is* the composition
+        # event; labelling it ``runtime`` made every daemon start publish an
+        # ``evolution.*`` event and put a boot row in the live activity feed.
+        self._bump_version("assembled", plugins=len(self._plugins), tools=len(self._tool_handlers))
         self._assembled = True
-        self._version += 1
 
         logger.info(
             "Tool registry assembled: %d plugins, %d tools",
@@ -268,7 +272,9 @@ class ToolPluginRegistry:
         if self._assembled:
             for tool in plugin.tools:
                 self._index_tool(tool, plugin.plugin_id)
-        self._version += 1
+        self._bump_version(
+            "tools_published", plugin_id=plugin.plugin_id, tool_names=list(tool_names)
+        )
         return tool_names
 
     def register_late_tool(
@@ -288,7 +294,7 @@ class ToolPluginRegistry:
         self._tool_definitions.append(definition)
         self._tool_handlers[name] = handler
         self._tool_owner[name] = owner
-        self._version += 1
+        self._bump_version("late_tool_registered", tool_name=name, owner=owner)
 
     def _index_tool(self, tool: ToolMetadata, owner: str) -> None:
         """Add one tool to the metadata, schema, and handler indexes.
@@ -353,7 +359,7 @@ class ToolPluginRegistry:
         self._conflicts = [
             c for c in self._conflicts if plugin_id not in (c.kept_plugin, c.rejected_plugin)
         ]
-        self._version += 1
+        self._bump_version("plugin_unregistered", plugin_id=plugin_id, tools=sorted(owned))
         return True
 
     def unregister_tools(self, tool_names: Iterable[str]) -> int:
@@ -366,7 +372,7 @@ class ToolPluginRegistry:
         names_set = set(tool_names)
         removed = self._remove_tools_by_name(names_set)
         if removed > 0:
-            self._version += 1
+            self._bump_version("tools_unregistered", tool_names=sorted(names_set), removed=removed)
         return removed
 
     def _remove_tools_by_name(self, names: set[str]) -> int:
@@ -447,7 +453,44 @@ class ToolPluginRegistry:
 
     def notify_mutation(self) -> None:
         """Public API to signal a mutation happened (increments version)."""
+        self._bump_version("scope_disposed")
+
+    def _bump_version(self, kind: str, **detail: Any) -> None:
+        """Single point where the registry's version changes, and is observed.
+
+        Convergence here is not cosmetic. The version was previously incremented at
+        seven separate statements across five methods, so a probe placed at any one
+        of them -- including ``notify_mutation``, which only two scope-disposal
+        callers reach -- would silently miss the rest. Routing every increment
+        through one method makes "the capability set changed" a single fact, which
+        is the only way an observer of it can be trusted.
+
+        ``_assembled`` separates boot-time composition from a later runtime change.
+        Both bump the version, but only the second is an *evolution*: without the
+        distinction, every daemon start would bury the rare real mutation under a
+        replay of the initial plugin load.
+        """
         self._version += 1
+        try:
+            from leapflow.domain.evolution_trace import EvolutionStage
+            from leapflow.telemetry.evolution_tap import emit_trace, is_enabled
+
+            if not is_enabled():
+                return
+            emit_trace(
+                EvolutionStage.ACT,
+                f"registry_{kind}",
+                correlation={"registry_version": str(self._version)},
+                summary=f"registry {kind} -> v{self._version}",
+                detail={
+                    "version": self._version,
+                    "phase": "runtime" if self._assembled else "composition",
+                    "conflicts": [c.to_dict() for c in self._conflicts],
+                    **detail,
+                },
+            )
+        except Exception:  # noqa: BLE001 - the registry must never fail on telemetry
+            logger.debug("registry: evolution trace failed", exc_info=True)
 
     @property
     def last_bound_deps(self) -> dict[str, Any]:

@@ -61,16 +61,67 @@ class _PersistingTrustLedger(PluginTrustLedger):
     def record_success(self, plugin_id: str) -> None:
         before = self.level(plugin_id)
         super().record_success(plugin_id)
-        if self.level(plugin_id) != before:
+        after = self.level(plugin_id)
+        if after != before:
             self._flush()
+            self._trace_transition(plugin_id, before, after, hard=False)
 
     def record_failure(self, plugin_id: str, *, hard: bool = False) -> None:
         before = self.level(plugin_id)
         super().record_failure(plugin_id, hard=hard)
+        after = self.level(plugin_id)
         # ``hard`` freezes the plugin even when the reported level is unchanged
         # (already DRAFT), so persist it explicitly to record the frozen set.
-        if hard or self.level(plugin_id) != before:
+        if hard or after != before:
             self._flush()
+            self._trace_transition(plugin_id, before, after, hard=hard)
+
+    def _trace_transition(
+        self, plugin_id: str, before: Any, after: Any, *, hard: bool
+    ) -> None:
+        """Emit the trust transition, which nothing else records durably.
+
+        Placed here rather than in ``PluginTrustLedger`` for two reasons. The base
+        ledger is a pure domain object with no dependencies, and an observability
+        import does not belong in it; and this subclass has *already* computed the
+        before/after pair for the flush, so the transition is a fact in hand rather
+        than one that has to be detected a second time.
+
+        Only the level a plugin currently holds is persisted. The moment it moved,
+        and the direction, exist nowhere else -- which is exactly why a promotion to
+        PRODUCTION or a freeze on an internal defect cannot be reconstructed after
+        the fact from the trust state alone.
+        """
+        try:
+            from leapflow.domain.evolution_trace import EvolutionStage
+            from leapflow.telemetry.evolution_tap import emit_trace, is_enabled
+
+            if not is_enabled():
+                return
+            from_name = getattr(before, "name", str(before))
+            to_name = getattr(after, "name", str(after))
+            frozen = bool(self.is_frozen(plugin_id))
+            emit_trace(
+                EvolutionStage.LEARN,
+                "trust_frozen" if hard else "trust_transition",
+                correlation={"plugin_id": plugin_id},
+                summary=(
+                    f"{plugin_id}: frozen at {to_name} by an internal defect"
+                    if hard
+                    else f"{plugin_id}: {from_name} -> {to_name}"
+                ),
+                detail={
+                    "plugin_id": plugin_id,
+                    "from": from_name,
+                    "to": to_name,
+                    # A frozen plugin reports DRAFT, so the level alone cannot say
+                    # whether it is new or permanently disqualified.
+                    "frozen": frozen,
+                    "hard_failure": hard,
+                },
+            )
+        except Exception:  # noqa: BLE001 - trust accounting must not fail on telemetry
+            logger.debug("plugin trust: evolution trace failed", exc_info=True)
 
     def _flush(self) -> None:
         """Persist current ledger state; failures degrade to memory-only."""
@@ -230,6 +281,16 @@ def _wire_plugin_stats_sink(
         trust_ledger = _load_or_new_trust_ledger(store)
         usage_tracker = _load_or_new_usage_tracker(store)
         usage_tracker.set_trust_ledger(trust_ledger)
+        # Quarantine had no feed at all: trust demotion was immediate but a failing
+        # plugin was never disabled. The tracker is process-level so the tool-outcome
+        # sink that increments it and the cold-path sweep that drains it share one
+        # instance.
+        try:
+            from leapflow.evolution.observations import current_quarantine_tracker
+
+            usage_tracker.set_quarantine_tracker(current_quarantine_tracker())
+        except Exception:  # noqa: BLE001 - governance wiring must not fail composition
+            logger.debug("quarantine tracker not attached", exc_info=True)
         advisor = PluginAdvisor(trust_ledger, usage_tracker)
         set_default_advisor(advisor)
         tracker.set_plugin_stats_sink(usage_tracker)

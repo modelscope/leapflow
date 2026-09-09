@@ -38,6 +38,7 @@ class MonitorCoordinator:
 
     def __init__(self) -> None:
         self._monitors: Any | None = None
+        self._evolution_sink: Any | None = None
         self._bridge_subscribed: bool = False
         self._bridge_callback: Any | None = None
         self._event_bus: Any | None = None
@@ -59,6 +60,7 @@ class MonitorCoordinator:
         try:
             from leapflow.monitor import (
                 CapabilityAdaptationProducer,
+                EvolutionProducer,
                 MonitorManager,
                 PluginHealthProducer,
                 SessionAnalysisProducer,
@@ -77,7 +79,9 @@ class MonitorCoordinator:
             self._monitors.producers.register(SignalObservationProducer())
             self._monitors.producers.register(CapabilityAdaptationProducer())
             self._monitors.producers.register(PluginHealthProducer())
+            self._monitors.producers.register(EvolutionProducer())
             self._register_hardware_producer(ctx, settings)
+            self._install_evolution_sink(ctx, settings)
             setattr(ctx, "monitors", self._monitors)
             await self._monitors.start()
 
@@ -116,6 +120,100 @@ class MonitorCoordinator:
             logger.debug("daemon: monitor runtime start skipped", exc_info=True)
             self._monitors = None
             setattr(ctx, "monitors", None)
+
+    def _install_evolution_sink(self, ctx: Any, settings: Any) -> None:
+        """Turn the evolution probes from no-ops into a durable trace stream.
+
+        Only the daemon installs a sink. An in-process CLI leaves the probes inert,
+        which is deliberate: traces describe how the framework changed over time, and
+        a short-lived process has no time in which to change.
+
+        Failure here is silent and total -- no sink means every probe stays a no-op,
+        which is exactly the state the system runs in by default. The alternative,
+        failing daemon startup because a transparency panel could not be wired, would
+        trade a working runtime for an observation of it.
+        """
+        try:
+            from leapflow.evolution import LedgerEvolutionSink
+            from leapflow.storage.evolution_trace_store import JsonEvolutionTraceStore
+            from leapflow.telemetry.evolution_tap import install_sink
+
+            layout = getattr(settings, "profile_layout", None)
+            path = getattr(layout, "evolution_traces_path", None)
+            if path is None:
+                return
+            sink = LedgerEvolutionSink(
+                store=JsonEvolutionTraceStore(path),
+                publish=self._make_evolution_publisher(ctx),
+            )
+            sink.register_atexit()
+            install_sink(sink)
+            self._evolution_sink = sink
+            logger.debug("daemon: evolution trace sink installed at %s", path)
+        except Exception:  # noqa: BLE001 - observability is never a startup dependency
+            logger.debug("daemon: evolution trace sink not installed", exc_info=True)
+
+    def _make_evolution_publisher(self, ctx: Any) -> Any:
+        """Build the callback that turns a trace into an ``evolution.*`` event.
+
+        Two constraints shape this. First, probe sites are synchronous and sit deep
+        inside the registry and the trust ledger, while ``EventBus.handle_event`` is a
+        coroutine -- so the loop is captured here and the coroutine is *scheduled*,
+        never awaited. ``call_soon_threadsafe`` is correct from the loop thread and
+        from any other, which matters because a mutation can arrive from either.
+
+        Second, only runtime-phase traces are published. Boot composition emits one
+        trace per plugin on every daemon start; publishing those would fire the watch
+        a dozen times to report that nothing had evolved. The registry marks the phase
+        itself, so this filters on a declared fact rather than guessing from the kind.
+        """
+        import asyncio
+
+        bus = getattr(ctx, "event_bus", None)
+        if bus is None or not hasattr(bus, "handle_event"):
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+
+        def _publish(trace: Any) -> None:
+            detail = dict(getattr(trace, "detail", None) or {})
+            if detail.get("phase") == "composition":
+                return
+            payload = {
+                "stage": getattr(getattr(trace, "stage", None), "value", ""),
+                "kind": str(getattr(trace, "kind", "")),
+                "summary": str(getattr(trace, "summary", "")),
+                "correlation": dict(getattr(trace, "correlation", None) or {}),
+            }
+            event_type = f"evolution.{payload['kind'] or 'trace'}"
+            try:
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(bus.handle_event(event_type, payload))
+                )
+            except RuntimeError:
+                # Loop already closed (shutdown). The trace is still buffered and
+                # will be flushed by the atexit hook; only the live refresh is lost.
+                logger.debug("daemon: evolution event not published, loop closed")
+
+        return _publish
+
+    def flush_evolution_traces(self) -> int:
+        """Persist buffered traces, for shutdown paths that want it explicit.
+
+        Ordinary flushing is done by ``EvolutionProducer`` on the monitor tick --
+        it is the only consumer, so having it flush before reading is what keeps the
+        panel and the file consistent. ``register_atexit`` covers process exit.
+        """
+        sink = self._evolution_sink
+        if sink is None:
+            return 0
+        try:
+            return int(sink.flush())
+        except Exception:  # noqa: BLE001
+            logger.debug("daemon: evolution trace flush failed", exc_info=True)
+            return 0
 
     def _register_hardware_producer(self, ctx: Any, settings: Any) -> None:
         """Register the physical-bench domain, but only when hardware is enabled.
@@ -218,21 +316,41 @@ class MonitorCoordinator:
     # ── Default event-driven watches ──────────────────────────────────────
 
     # Default watches to arm on daemon startup. Each tuple:
-    # (name, domain, trigger_expr)
+    #: name, domain, trigger, and whether the *first* cycle is meaningful at once.
+    #:
+    #: That last flag is not a convenience. A producer reporting live state (the
+    #: plugin registry) says something true the instant it is asked, so waiting a
+    #: full interval leaves the board blank for no reason. A producer reporting an
+    #: accumulation (hardware sample windows, health trends) has nothing to say until
+    #: samples exist, and an immediate first cycle publishes an empty snapshot that
+    #: then sits there as the newest finding until the next interval elapses -- which
+    #: is how bringing every watch forward broke the hardware board.
     _DEFAULT_WATCHES = [
-        ("fs-observer", "signal", "event:fs.*"),
-        ("gateway-observer", "signal", "event:gateway.*"),
+        ("fs-observer", "signal", "event:fs.*", False),
+        ("gateway-observer", "signal", "event:gateway.*", False),
         # Plugin health is polled rather than event-driven: trust degradation and a
         # rising error rate are both trends, visible only by comparing successive
         # observations. Without this watch the producer is registered and never
         # called, which is how it sat unused while its own docstring said otherwise.
-        ("plugin-health", "plugin_health", "5m"),
+        ("plugin-health", "plugin_health", "5m", False),
         # Polled for the same reason: an envelope excursion is caught by the event
         # detector, but cadence drift, quality decay and unpersisted windows are all
         # trends that only a comparison between cycles can show. Armed regardless of
         # ``hardware.enabled`` so the board has a watch to report against; with the
         # producer unregistered the cycle is a no-op.
-        ("hardware-bench", "hardware", "2m"),
+        ("hardware-bench", "hardware", "2m", False),
+        # Framework self-evolution, armed twice on purpose. The domain answers two
+        # different questions with two different cadences: a *state* snapshot (what is
+        # registered, what trust each plugin holds, which pipeline segments show
+        # evidence) has no event to key off, so it must be polled; a *change* has an
+        # event, and polling would report it up to ten minutes late. The content
+        # fingerprint makes the overlap free -- when nothing changed the second
+        # finding dedups and is skipped, so the pair costs one extra cold-path read.
+        #
+        # The polled one runs immediately: it reads the live registry, so its first
+        # answer is already correct and a ten-minute blank board is pure loss.
+        ("framework-evolution", "framework_evolution", "10m", True),
+        ("framework-evolution-live", "framework_evolution", "event:evolution.*", False),
     ]
 
     async def _arm_default_watches(self) -> None:
@@ -261,7 +379,7 @@ class MonitorCoordinator:
             logger.debug("daemon: failed to list watches for default arm", exc_info=True)
             return
 
-        for name, domain, trigger_expr in self._DEFAULT_WATCHES:
+        for name, domain, trigger_expr, run_at_once in self._DEFAULT_WATCHES:
             entry = existing.get(name)
             if entry is not None:
                 view, is_active = entry
@@ -278,16 +396,48 @@ class MonitorCoordinator:
                 except Exception:
                     logger.debug("daemon: failed to delete stale watch %s", name, exc_info=True)
             try:
-                await monitors.arm_watch(
+                view = await monitors.arm_watch(
                     WatchSpec(
                         name=name,
                         domain=domain,
                         trigger_expr=trigger_expr,
                     )
                 )
+                self._make_due_now(monitors, view, trigger_expr, run_at_once)
                 logger.debug("daemon: armed default watch %s (%s)", name, trigger_expr)
             except Exception:
                 logger.debug("daemon: failed to arm default watch %s", name, exc_info=True)
+
+    @staticmethod
+    def _make_due_now(monitors: Any, view: Any, trigger_expr: str, run_at_once: bool) -> None:
+        """Bring a watch's first cycle forward, when its first cycle is meaningful.
+
+        Arming only schedules; the first cycle would otherwise wait a full interval,
+        and for a ten-minute watch that leaves the board with no data for ten minutes
+        after every daemon start -- which reads as a broken page rather than a pending
+        one.
+
+        Opt-in per watch rather than applied to all of them. A producer that reports
+        an accumulation has nothing true to say before it has accumulated anything,
+        and its empty first snapshot would then stand as the newest finding until the
+        next interval elapsed. Applying this to every interval watch made the hardware
+        board render a digest with zero sample windows.
+
+        Event triggers are excluded regardless: their ``next_due_at`` is 0 because
+        there is no predictable next time, and forcing one would make an event-driven
+        watch fire on boot -- reporting as a change something that only happened to be
+        observed at startup.
+
+        Setting the due time to *now* rather than to the past matters: the scheduler
+        fast-forwards any task overdue by more than its grace window, which would skip
+        exactly the cycle this is trying to bring forward.
+        """
+        if not run_at_once or trigger_expr.startswith("event:"):
+            return
+        try:
+            monitors._task_store.advance_next_due(view.watch_id, time.time())
+        except Exception:  # noqa: BLE001 - a late first cycle is not a startup failure
+            logger.debug("daemon: could not bring watch %s forward", trigger_expr, exc_info=True)
 
     async def stop(self) -> None:
         """Stop the monitor runtime."""

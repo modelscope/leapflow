@@ -404,3 +404,151 @@ def test_only_actionable_admission_notes_reach_the_board() -> None:
 
     assert [n["outcome"] for n in notes] == ["demoted", "rejected"]
     assert _actionable_notes({}) == []
+
+
+# ── A domain armed with more than one watch ──────────────────────────────────
+
+
+def _evolution_provider(*, live_has_findings: bool = False) -> _FakeProvider:
+    """Framework evolution as the daemon actually arms it: two watches, one domain.
+
+    The polled watch carries the state snapshot; the event watch carries change and
+    has produced nothing until something evolves. Ordered with the empty one first,
+    which is the case that broke the page.
+    """
+    watches = [
+        {
+            "watch_id": "w-live",
+            "domain": "framework_evolution",
+            "name": "framework-evolution-live",
+            "state": "armed",
+            "run_count": 0,
+        },
+        {
+            "watch_id": "w-poll",
+            "domain": "framework_evolution",
+            "name": "framework-evolution",
+            "state": "armed",
+            "run_count": 4,
+        },
+    ]
+    findings = [
+        {
+            "watch_id": "w-poll",
+            "domain": "framework_evolution",
+            "ts": 100.0,
+            "severity": "info",
+            "payload": {"summary": {"active_plugins": 17, "tool_count": 55}},
+        }
+    ]
+    if live_has_findings:
+        findings.append({
+            "watch_id": "w-live",
+            "domain": "framework_evolution",
+            "ts": 200.0,
+            "severity": "notable",
+            "payload": {"summary": {"active_plugins": 18, "tool_count": 58}},
+        })
+    return _FakeProvider(watches, findings)
+
+
+def _build(provider: _FakeProvider, template: str = "evolution") -> dict:
+    import asyncio
+
+    builder = DashboardViewBuilder(TemplateLibrary())
+    return asyncio.run(builder.build(DashboardIntent(template=template), provider))
+
+
+def test_a_second_watch_on_a_domain_cannot_blank_the_board():
+    """The data existed under a sibling watch, and the page rendered em dashes.
+
+    Selecting the first watch matching the domain and scoping the finding read to it
+    meant an event-driven watch -- which has produced nothing until something
+    evolves -- could shadow the polled watch that holds the snapshot.
+    """
+    spec = _build(_evolution_provider())
+
+    stats = {
+        (node.get("props") or {}).get("label"): (node.get("props") or {}).get("value")
+        for node in _flatten(spec)
+        if node.get("type") == "Stat"
+    }
+    # A whole-match ``{{ }}`` keeps the native type, so this is an int not a string.
+    assert stats.get("Plugins") == 17, f"board rendered without its payload: {stats}"
+    assert "empty" not in str(spec.get("data") or {})
+
+
+def test_the_newest_finding_wins_regardless_of_which_watch_produced_it():
+    """Two watches with data: newest, not first-listed."""
+    spec = _build(_evolution_provider(live_has_findings=True))
+
+    stats = {
+        (node.get("props") or {}).get("label"): (node.get("props") or {}).get("value")
+        for node in _flatten(spec)
+        if node.get("type") == "Stat"
+    }
+    assert stats.get("Plugins") == 18
+
+
+def test_an_unobserved_domain_explains_itself_instead_of_showing_dashes():
+    """A board with no data must say why, and which of the three reasons it is."""
+    provider = _FakeProvider(
+        [{"watch_id": "w-poll", "domain": "framework_evolution", "state": "armed", "run_count": 0}],
+        [],
+    )
+    spec = _build(provider)
+    titles = [
+        (node.get("props") or {}).get("title")
+        for node in _flatten(spec)
+        if node.get("type") == "Section"
+    ]
+    assert "Not yet observed" in titles
+    # A watch exists but has not completed a cycle: waiting, not unscheduled.
+    states = [
+        (node.get("props") or {}).get("value")
+        for node in _flatten(spec)
+        if node.get("type") == "Stat" and (node.get("props") or {}).get("label") == "State"
+    ]
+    assert states == ["waiting"]
+
+
+def test_no_watch_at_all_is_reported_as_unscheduled_not_waiting():
+    """Nothing will ever arrive, which is a different next step from 'wait'."""
+    spec = _build(_FakeProvider([], []))
+    states = [
+        (node.get("props") or {}).get("value")
+        for node in _flatten(spec)
+        if node.get("type") == "Stat" and (node.get("props") or {}).get("label") == "State"
+    ]
+    assert states == ["unscheduled"]
+
+
+def test_a_ran_but_empty_domain_is_idle_rather_than_broken():
+    """The producer ran and had nothing to say, which for this domain is legitimate."""
+    provider = _FakeProvider(
+        [{"watch_id": "w-poll", "domain": "framework_evolution", "state": "armed", "run_count": 9}],
+        [],
+    )
+    spec = _build(provider)
+    states = [
+        (node.get("props") or {}).get("value")
+        for node in _flatten(spec)
+        if node.get("type") == "Stat" and (node.get("props") or {}).get("label") == "State"
+    ]
+    assert states == ["idle"]
+
+
+def test_single_watch_domains_are_unaffected():
+    """The resolver is shared with capability and hardware; one watch must behave as before."""
+    provider = _FakeProvider(
+        [{"watch_id": "w-cap", "domain": "capability_adaptation", "state": "armed", "run_count": 2}],
+        [{
+            "watch_id": "w-cap",
+            "domain": "capability_adaptation",
+            "ts": 10.0,
+            "severity": "info",
+            "payload": {"environment": {"fingerprint_id": "fp-1"}},
+        }],
+    )
+    spec = _build(provider, template="capability")
+    assert spec["root"], "capability board rendered nothing"

@@ -1,0 +1,490 @@
+# Framework self-evolution template for LeapBoard.
+#
+# Organised around the five questions a person actually brings to this page, not
+# around the shape of the payload:
+#
+#   Q1 is the framework growing?      -> Evolution tab, self-acquired count + timeline
+#   Q2 is what it grew trustworthy?   -> Composition tab, trust mix + verification tier
+#   Q3 did it grow wrong?             -> alert band, above the tabs so no tab hides it
+#   Q4 why is it not growing?         -> Pipeline tab, per-segment evidence
+#   Q5 is what it grew actually used? -> Composition tab, reclaim candidates
+#
+# Three tabs rather than one long scroll: the page had ten stacked sections, and the
+# thing a reader needed was rarely the thing at the top. The alert band and the
+# metric strip sit outside the tabs, because a regression must be visible whichever
+# tab is open.
+#
+# Every section carries its own ``when``, at the *section* level rather than on the
+# child. A ``when`` on the child leaves a titled section with nothing under it, and
+# an empty panel under a heading reads as a load failure rather than as "nothing
+# happened".
+#
+# Component choices here are constrained by what the shipped renderers actually do,
+# which is not always what their names suggest. Verified before use:
+#   - Heatmap is an alias of BarChart (no 2D grid), so segment status stays a bar.
+#   - PieChart counts *severity*, not arbitrary labels, so distributions use BarChart.
+#   - FilterBar renders an empty div; there is no filtering to declare yet.
+#   - SuggestionChips takes plain strings and does not translate them, so advisory
+#     rows stay a Table, whose cells do translate.
+#   - FindingCard does not translate its title or summary; Card and Markdown do.
+template: evolution
+version: 1
+title: "Framework evolution"
+domain: framework_evolution
+meta:
+  title: "Framework evolution"
+  description: "Whether the framework is growing, whether what it grew is trustworthy, and where the evolution pipeline stops."
+layout:
+  - type: Page
+    props:
+      title: "Framework evolution"
+    children:
+      # ── Empty state ───────────────────────────────────────────────────────
+      # Rendered instead of a metric row of em dashes. Three states, three next
+      # steps, told apart by the watch rather than guessed.
+      - type: Section
+        when: empty
+        props:
+          title: "Not yet observed"
+          subtitle: "This board reports how the framework changes itself. Nothing has been recorded yet."
+        children:
+          - type: Card
+            when: empty.state
+            props:
+              title: "Why this page is empty"
+              kicker: "The producer reads the live registry and the decision history every cycle."
+            children:
+              - type: Markdown
+                props:
+                  text: >-
+                    > A watch has to complete one cycle before there is anything to show.
+                    If this persists, check that the scheduler is enabled and that the
+                    `framework-evolution` watch is armed and not muted.
+          # Interpolated Stats rather than a Table: ``empty`` is a mapping, and the
+          # Table renderer coerces its data with asArray -- a mapping becomes an empty
+          # list and the panel would render "No entries" while reporting no fault.
+          - type: Row
+            when: empty.state
+            props:
+              variant: meta
+            children:
+              - type: Stat
+                props:
+                  label: "State"
+                  i18nValue: true
+                  value: "{{ empty.state }}"
+              - type: Stat
+                props:
+                  label: "Watch"
+                  i18nValue: true
+                  value: "{{ empty.watch_state }}"
+              - type: Stat
+                props:
+                  label: "Cycles run"
+                  value: "{{ empty.run_count }}"
+
+      # ── Alert band: Q3, outside the tabs on purpose ───────────────────────
+      - type: Section
+        when: evolution.summary.attention
+        props:
+          title: "Needs attention"
+          subtitle: "Signals that something grew wrong, or was withheld. Shown regardless of the open tab."
+        children:
+          - type: Row
+            props:
+              variant: metrics
+            children:
+              - type: Stat
+                props:
+                  label: "Regressions"
+                  value: "{{ evolution.summary.regression_count }}"
+              - type: Stat
+                props:
+                  label: "Frozen plugins"
+                  value: "{{ evolution.summary.frozen_count }}"
+              - type: Stat
+                props:
+                  label: "Tool-name conflicts"
+                  value: "{{ evolution.summary.conflict_count }}"
+              - type: Stat
+                props:
+                  label: "Proposed, not admitted"
+                  value: "{{ evolution.summary.unadmitted_intent_count }}"
+              - type: Stat
+                props:
+                  label: "Reclaimable"
+                  value: "{{ evolution.summary.reclaimable_count }}"
+          # Literal, not interpolated. The renderer translates a Markdown text prop
+          # by dictionary lookup, and an interpolated string can never match a key --
+          # so the counts live in the strip above and the prose here stays fixed.
+          - type: Markdown
+            when: evolution.summary.regression_count
+            props:
+              text: >-
+                > **Regression: a closed gap has recurred.** An evolution that looked
+                successful did not hold. This is the one finding on this board that
+                warrants immediate attention.
+          - type: Markdown
+            when: evolution.summary.frozen_count
+            props:
+              text: >-
+                > **Some plugins are frozen by an internal defect.** A frozen plugin still
+                reports `DRAFT`, and the trust dimension only *scores*, so it stays
+                selectable unless it is also unregistered — check the `Selectable` column.
+
+      # ── Posture strip: always visible, outside the tabs ───────────────────
+      - type: Section
+        when: evolution.summary
+        props:
+          title: "Posture"
+          subtitle: "How much of the framework it grew itself, and how much of the pipeline shows runtime evidence."
+        children:
+          - type: Row
+            props:
+              variant: metrics
+            children:
+              # Deliberately first, and deliberately not "plugins": a framework has
+              # plugins on day one without having evolved at all. This is the number
+              # that answers "is it growing".
+              - type: Stat
+                props:
+                  label: "Self-acquired"
+                  value: "{{ evolution.summary.self_acquired_count }}"
+              - type: Stat
+                props:
+                  label: "Plugins"
+                  value: "{{ evolution.summary.active_plugins }}"
+              - type: Stat
+                props:
+                  label: "Tools"
+                  value: "{{ evolution.summary.tool_count }}"
+              - type: Stat
+                props:
+                  label: "Recent episodes"
+                  value: "{{ evolution.summary.episode_count }}"
+              - type: Gauge
+                props:
+                  label: "Pipeline evidence"
+                  value: "{{ evolution.summary.segments_with_evidence }}/{{ evolution.summary.segments_total }}"
+          - type: Markdown
+            when: evolution.degraded_reason
+            props:
+              text: >-
+                > **Snapshot only.** There is no causal history to rebuild yet, so the
+                timeline is absent rather than empty. Why is stated by the `Policy
+                decisions` row under pipeline reachability; the live snapshot and the
+                reachability table itself are unaffected.
+
+      # ── Tabs ──────────────────────────────────────────────────────────────
+      - type: Tabs
+        when: evolution.summary
+        children:
+          # ═══ Tab 1 · Evolution (default) ═════════════════════════════════
+          - type: Tab
+            props:
+              title: "Evolution"
+            children:
+              # The default tab must never be blank. With no causal history the other
+              # two tabs still have content, so an empty first pane reads as a broken
+              # page -- and it is the pane every visitor lands on. This says what is
+              # missing and which tab answers why.
+              - type: Section
+                when: evolution.degraded
+                props:
+                  title: "No causal history yet"
+                  subtitle: "Nothing has driven a framework change, so there is no episode to narrate."
+                children:
+                  - type: Markdown
+                    props:
+                      text: >-
+                        > An episode is written when an environment observation leads to a
+                        capability decision. None has been recorded, which is either a quiet
+                        system or a pipeline that stops earlier — the **Pipeline** tab names
+                        the segment where it stops, and what would unblock it.
+
+              - type: Section
+                when: evolution.summary.l2_only_closures
+                props:
+                  title: "How closures are verified"
+                children:
+                  - type: Markdown
+                    props:
+                      text: >-
+                        > **Verification tier: L2 (declared fitness).** A retired observation means a
+                        candidate *declared* it provides the capability, not that the capability was
+                        observed to work. Effect verification (L3) is not wired yet, so no closure on
+                        this board should be read as proven.
+
+              - type: Section
+                when: evolution.timeline
+                props:
+                  title: "Evolution timeline"
+                  subtitle: "What changed in the environment, and what the framework did about it."
+                children:
+                  - type: Timeline
+                    props:
+                      bind: evolution.timeline
+
+              - type: Section
+                when: evolution.mutation_matrix
+                props:
+                  title: "Environment to framework"
+                  subtitle: "Per episode: the trigger, the decision, the change, and whether the gap closed."
+                children:
+                  - type: Table
+                    props:
+                      bind: evolution.mutation_matrix
+                      columns:
+                        - key: driver
+                          label: "Trigger"
+                        - key: capability
+                          label: "Capability"
+                        - key: policy_action
+                          label: "Decision"
+                        - key: autonomy_level
+                          label: "Autonomy"
+                        - key: mutation_action
+                          label: "Framework change"
+                        - key: registry_delta
+                          label: "Registry"
+                        - key: lifecycle_status
+                          label: "Acquisition lifecycle"
+                        - key: gap_closure
+                          label: "Gap closure"
+                        - key: verification_tier
+                          label: "Verified by"
+
+              - type: Section
+                when: evolution.unadmitted
+                props:
+                  title: "Proposed, not admitted"
+                  subtitle: "The world model asked for these capabilities and nothing took them up."
+                children:
+                  - type: Markdown
+                    props:
+                      text: >-
+                        > These proposals entered no pipeline, so they appear in no decision
+                        record and no observation. Admitting them is a configuration choice.
+                  - type: Table
+                    props:
+                      bind: evolution.unadmitted
+                      columns:
+                        - key: capability
+                          label: "Capability"
+                        - key: hypothesis
+                          label: "Model's reasoning"
+                        - key: confidence
+                          label: "Confidence"
+                        - key: reason
+                          label: "Why not admitted"
+
+          # ═══ Tab 2 · Pipeline ════════════════════════════════════════════
+          - type: Tab
+            props:
+              title: "Pipeline"
+            children:
+              - type: Section
+                when: evolution.reachability
+                props:
+                  title: "Pipeline reachability"
+                  subtitle: "Per-segment runtime evidence. A module existing is not evidence that anything calls it."
+                children:
+                  # Distribution first, detail second: how much of the pipeline is
+                  # wired is the question, and counting ten table rows to answer it is
+                  # work the reader should not have to do.
+                  - type: BarChart
+                    when: evolution.reachability_mix
+                    props:
+                      title: "Segments by status"
+                      bind: evolution.reachability_mix
+                  - type: Table
+                    props:
+                      bind: evolution.reachability
+                      columns:
+                        - key: stage
+                          label: "Segment"
+                        - key: status
+                          label: "Status"
+                        - key: evidence
+                          label: "Runtime evidence"
+                        - key: next_step
+                          label: "Next step"
+
+              # Traces come from probes at points no store retains: a registry
+              # mutation, a trust transition, a teacher proposal. Kept separate from
+              # the episode timeline on purpose -- these answer "what just happened",
+              # not "why", and merging them would imply causal links never established.
+              - type: Section
+                when: evolution.trace_feed
+                props:
+                  title: "Live activity"
+                  subtitle: "Framework changes as they happened, from runtime probes."
+                children:
+                  - type: Timeline
+                    props:
+                      bind: evolution.trace_feed
+
+              # Recovered by diffing successive snapshots, because a fiber transition
+              # does not bump the registry version and so no probe can see it. The
+              # retry path (LOADING -> FAILED -> LOADING) is invisible anywhere else.
+              - type: Section
+                when: evolution.fiber_transitions
+                props:
+                  title: "Lifecycle transitions"
+                  subtitle: "Fiber state changes since the previous cycle, including load retries."
+                children:
+                  - type: Table
+                    props:
+                      bind: evolution.fiber_transitions
+                      columns:
+                        - key: plugin_id
+                          label: "Plugin"
+                        - key: from
+                          label: "From"
+                        - key: to
+                          label: "To"
+                        - key: kind
+                          label: "Change"
+
+              - type: Section
+                when: evolution.summary.suggestions
+                props:
+                  title: "Suggested next steps"
+                  subtitle: "Each row names one blocked segment and the change that would unblock it."
+                children:
+                  - type: Table
+                    props:
+                      bind: evolution.summary.suggestions
+                      columns:
+                        - key: label
+                          label: "Action"
+                        - key: detail
+                          label: "Why"
+
+          # ═══ Tab 3 · Composition ═════════════════════════════════════════
+          - type: Tab
+            props:
+              title: "Composition"
+            children:
+              - type: Section
+                when: evolution.roster
+                props:
+                  title: "Plugin roster and trust"
+                  subtitle: "Read live from the registry and trust ledger every cycle."
+                children:
+                  - type: BarChart
+                    when: evolution.provenance_mix
+                    props:
+                      title: "Plugins by origin"
+                      bind: evolution.provenance_mix
+                  - type: BarChart
+                    when: evolution.trust_mix
+                    props:
+                      title: "Plugins by trust class"
+                      bind: evolution.trust_mix
+                  # Deliberately no live counters here. This finding dedups on a
+                  # content fingerprint, so a rendered metric that changes every tick
+                  # would either churn a row per cycle or freeze on the page while
+                  # looking current. Per-plugin error rates are plugin_health's subject.
+                  - type: Table
+                    props:
+                      bind: evolution.roster
+                      columns:
+                        - key: plugin_id
+                          label: "Plugin"
+                        - key: provenance
+                          label: "Origin"
+                        - key: fiber_state
+                          label: "Fiber"
+                        - key: trust_level
+                          label: "Trust"
+                        - key: selectable
+                          label: "Selectable"
+                        - key: ever_used
+                          label: "Ever used"
+                        - key: tool_count
+                          label: "Tools"
+
+              # Q5. The recorded LF-10 case, nameable for the first time: a generated
+              # plugin blocked by the risk ceiling keeps its registration forever,
+              # occupying a tool name, because nothing reclaims an unselectable artifact.
+              - type: Section
+                when: evolution.reclaim_candidates
+                props:
+                  title: "Reclaim candidates"
+                  subtitle: "Self-acquired plugins that are registered but unselectable or never once used."
+                children:
+                  - type: Markdown
+                    props:
+                      text: >-
+                        > Nothing reclaims these automatically. Each holds a tool name and
+                        appears in the capability list without being selectable, so the
+                        registry grows in a direction no requirement can use.
+                  - type: Table
+                    props:
+                      bind: evolution.reclaim_candidates
+                      columns:
+                        - key: plugin_id
+                          label: "Plugin"
+                        - key: trust_level
+                          label: "Trust"
+                        - key: selectable
+                          label: "Selectable"
+                        - key: ever_used
+                          label: "Ever used"
+                        - key: tool_count
+                          label: "Tools"
+
+              - type: Section
+                when: evolution.capability_map
+                props:
+                  title: "Capability topology"
+                  subtitle: "Which plugin owns which tool, and which capability that tool provides."
+                children:
+                  # The shipped EntityGraph renderer is a badge cloud: it reads
+                  # props.data as a flat list and shows each item's `name`. Binding it
+                  # a nodes/edges mapping renders an empty panel and reports no fault,
+                  # so the glanceable cloud takes the flat capability list and the
+                  # relation is shown as a table below it.
+                  - type: EntityGraph
+                    when: evolution.capability_badges
+                    props:
+                      bind: evolution.capability_badges
+                  - type: Table
+                    props:
+                      title: "Capability ownership"
+                      bind: evolution.capability_map
+                      # A capability decision has its own lens; a row here is the
+                      # natural place to reach it. ``nav`` switches template, which is
+                      # the only drill-down the client actually implements -- there is
+                      # no filter-in-place action to declare.
+                      row_buttons:
+                        - label: "Decisions"
+                          kind: nav
+                          name: capability
+                          params:
+                            template: capability
+                      columns:
+                        - key: capability
+                          label: "Capability"
+                        - key: tool
+                          label: "Tool"
+                        - key: plugin
+                          label: "Plugin"
+
+              - type: Section
+                when: evolution.conflicts
+                props:
+                  title: "Tool-name conflicts"
+                  subtitle: "One global namespace, arbitrated first-wins. The challenger is recorded, never silently dropped."
+                children:
+                  - type: Table
+                    props:
+                      bind: evolution.conflicts
+                      columns:
+                        - key: tool_name
+                          label: "Tool"
+                        - key: kept_plugin
+                          label: "Kept"
+                        - key: rejected_plugin
+                          label: "Rejected"

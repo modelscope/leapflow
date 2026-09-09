@@ -19,6 +19,7 @@ RequirementOrigin = Literal[
     "explicit_request",
     "environment_probe",
     "task_contract",
+    "world_model",
 ]
 ApprovalMode = Literal["review_required", "autonomous_allowed"]
 

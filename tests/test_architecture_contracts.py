@@ -574,8 +574,10 @@ def test_hardware_default_watch_targets_the_hardware_domain() -> None:
     """
     from leapflow.daemon.monitor_coordinator import MonitorCoordinator
 
-    # The class-level _DEFAULT_WATCHES must include a hardware entry.
-    domains = [domain for _name, domain, _trigger in MonitorCoordinator._DEFAULT_WATCHES]
+    # The class-level _DEFAULT_WATCHES must include a hardware entry. Unpacked by
+    # position with a catch-all so a later column added to the tuple cannot fail this
+    # contract, which is about the domain being present and nothing else.
+    domains = [entry[1] for entry in MonitorCoordinator._DEFAULT_WATCHES]
     assert "hardware" in domains, (
         "G24 regression: no default watch targets the 'hardware' domain; "
         "the HardwareObservationProducer would be registered but never invoked"

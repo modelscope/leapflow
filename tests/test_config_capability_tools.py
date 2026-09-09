@@ -307,10 +307,14 @@ def _guardrail_is_on() -> bool:
 
 
 def test_config_write_is_denied_without_an_approval_gate(cfg_home) -> None:
-    """Fail closed. ``requires_approval`` in the tool schema only drives capability
-    disclosure — it does not gate execution — so an unwired gate must block, not
-    silently allow.
+    """Fail closed and stop the agent turn rather than spending its loop budget.
+
+    ``requires_approval`` only informs capability disclosure. A denied write must
+    also carry the engine's explicit hard-stop signal; otherwise the model retries
+    an action that can never obtain consent until the reasoning budget is exhausted.
     """
+    from leapflow.security.permission_failures import is_permission_hard_stop_payload
+
     config_tools.set_config_approval_gate(None)
 
     result = asyncio.run(
@@ -319,6 +323,10 @@ def test_config_write_is_denied_without_an_approval_gate(cfg_home) -> None:
 
     assert result["ok"] is False
     assert result["requires_approval"] is True
+    assert result["failure_code"] == "approval_denied"
+    assert result["blocks_approval"] is True
+    assert result.get("failure_class") is None
+    assert is_permission_hard_stop_payload(result) is True
     assert _guardrail_is_on(), "a denied write must not reach disk"
 
 

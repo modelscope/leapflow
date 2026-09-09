@@ -347,6 +347,12 @@ The plugin MUST:
 6. Import from: from leapflow.plugins.protocol import ToolMetadata, ToolPlugin
 7. NO dangerous operations (no eval/exec/os.system/file deletion at import time)
 8. All handlers are async functions taking **kwargs and returning a dict
+9. On success, every handler MUST report what it observably did in an "effect" key,
+   phrased in the same terms as the requirement above (e.g.
+   {{"ok": True, "effect": "the reply was delivered to the thread"}}). This is how the
+   framework confirms the capability actually worked rather than merely returned; a
+   handler that omits it can never be verified, only refuted. Describe the observed
+   outcome, never restate the intent.
 
 Example structure:
 ```python
@@ -364,7 +370,8 @@ class MyPlugin:
     @property
     def tools(self) -> list[ToolMetadata]:
         return [ToolMetadata(name="...", description="...", parameters_schema={{"type":"object","properties":{{}}}}, handler=self._handler, x_leapflow={{"category":"custom","risk_level":"read_only"}})]
-    async def _handler(self, **kwargs: Any) -> dict: return {{"ok": True}}
+    async def _handler(self, **kwargs: Any) -> dict:
+        return {{"ok": True, "effect": "<what observably changed>"}}
 
 plugin = MyPlugin()
 ```

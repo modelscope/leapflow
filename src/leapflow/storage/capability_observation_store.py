@@ -27,6 +27,19 @@ _OBSERVATION_FIELDS = frozenset(
         "failure_code",
         "capability",
         "tool_name",
+        # Declarations the detector needs to rebuild a requirement from a
+        # persisted observation. Dropping these silently changed behaviour rather
+        # than failing: without ``max_risk_level`` the requirement inherited the
+        # domain default of ``external`` -- the *most permissive* ceiling -- so a
+        # capability declared ``read_only`` came back from the store able to
+        # select mutating tools. Without ``origin`` a world-model intent was
+        # indistinguishable from an environment probe.
+        "origin",
+        "max_risk_level",
+        "requested_max_risk_level",
+        "intent_id",
+        "target_affordance",
+        "expected_effect",
     }
 )
 
@@ -86,6 +99,14 @@ class JsonCapabilityObservationStore:
             record["occurrence_count"] = int(record.get("occurrence_count") or 0) + 1
             record["result"] = safe_result
             record["environment"] = env
+            # A recurrence reopens a retired record. Without this, marking an
+            # observation resolved would silence that gap permanently: dedup would
+            # keep merging into the closed record and ``unresolved()`` -- which
+            # filters on ``status == "open"`` -- would never surface the
+            # regression again.
+            if str(record.get("status") or "open") != "open":
+                record["status"] = "open"
+                record["status_reason"] = f"reopened after recurrence at {now}"
             record["session_id"] = str(session_id or record.get("session_id") or "")
             record["turn_id"] = str(turn_id or record.get("turn_id") or "")
             record["workspace_root"] = str(workspace_root or record.get("workspace_root") or "")

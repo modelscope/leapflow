@@ -61,6 +61,18 @@ class PluginTrustLedger:
             return PluginTrustLevel.DRAFT
         return self._levels.get(plugin_id, PluginTrustLevel.DRAFT)
 
+    def is_frozen(self, plugin_id: str) -> bool:
+        """Whether the plugin is permanently frozen by an internal defect.
+
+        A frozen plugin reports ``DRAFT``, but ``DRAFT`` alone cannot distinguish
+        "new and unproven" from "permanently disqualified" -- so consumers that
+        must exclude rather than merely down-rank need this predicate. Selection
+        is the case in point: the resolver's trust dimension only *scores*, so
+        without an explicit frozen check a frozen-but-registered plugin stays
+        eligible whenever governance has not also unregistered it.
+        """
+        return plugin_id in self._frozen
+
     def record_success(self, plugin_id: str) -> None:
         """Record a successful execution — accrue trust, may promote."""
         if plugin_id in self._frozen:

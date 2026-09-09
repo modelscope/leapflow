@@ -5378,6 +5378,51 @@ class AgentEngine:
         for item in results:
             result = item.get("result") if isinstance(item, dict) else None
             self._observe_capability_result(result)
+            self._record_coevolution_outcome(
+                item, str(getattr(self._settings, "workspace_root", "") or "")
+            )
+
+    @staticmethod
+    def _record_coevolution_outcome(item: Any, workspace: str = "") -> None:
+        """Pair a tool outcome with the requirement its plugin was selected to serve.
+
+        Recorded here rather than at the usage sink because this is the only place that
+        sees the *full result payload*, and the payload is where a tool reports what it
+        observably did. Without that, a successful call can only be graded
+        ``unverifiable`` -- so verification could refute an acquisition but never
+        confirm one.
+
+        A no-op for every plugin the system did not acquire, which is almost all of
+        them. Bookkeeping only: never raises.
+        """
+        if not isinstance(item, dict):
+            return
+        try:
+            from leapflow.evolution.observations import record_tool_outcome
+            from leapflow.learning.capability_effect_verifier import (
+                observed_effect_from_result,
+            )
+            from leapflow.plugins import get_registry
+
+            tool_name = str(item.get("name") or "")
+            if not tool_name:
+                return
+            plugin_id = str((get_registry().tool_owners or {}).get(tool_name) or "")
+            if not plugin_id:
+                return
+            result = item.get("result")
+            ok = True
+            if isinstance(result, dict):
+                ok = bool(result.get("ok", True)) and not result.get("error")
+            record_tool_outcome(
+                plugin_id,
+                tool_name,
+                ok,
+                observed_effect=observed_effect_from_result(result),
+                workspace=workspace,
+            )
+        except Exception:  # noqa: BLE001 - observation must never affect execution
+            logger.debug("co-evolution outcome not recorded", exc_info=True)
 
     def _observe_capability_result(self, result: Any) -> None:
         """Persist an observe-only adaptive capability plan from structured gaps.
@@ -5392,9 +5437,17 @@ class AgentEngine:
         try:
             buffer = getattr(self, "_capability_observation_buffer", None)
             if buffer is None:
-                from leapflow.learning.capability_observation import CapabilityObservationBuffer
+                from leapflow.learning.capability_observation import (
+                    CapabilityEvidenceClassifier,
+                    CapabilityObservationBuffer,
+                )
 
-                buffer = CapabilityObservationBuffer()
+                # The buffer gate runs first, so it must honour the same accepted
+                # set as the durable service; otherwise a configured evidence kind
+                # would be dropped here and the setting would have no effect.
+                buffer = CapabilityObservationBuffer(
+                    classifier=CapabilityEvidenceClassifier.from_settings(self._settings)
+                )
                 self._capability_observation_buffer = buffer
             if not buffer.add_result(result):
                 return
@@ -5405,7 +5458,10 @@ class AgentEngine:
 
             from leapflow.domain.environment_fingerprint import EnvironmentFingerprint
             from leapflow.domain.platform import PlatformManifest
-            from leapflow.learning.capability_observation import CapabilityObservationService
+            from leapflow.learning.capability_observation import (
+                CapabilityEvidenceClassifier,
+                CapabilityObservationService,
+            )
             from leapflow.plugins import get_registry
             from leapflow.plugins.adaptive_loop import AdaptiveLoopRequest, AdaptivePluginLoop
             from leapflow.storage.capability_observation_store import JsonCapabilityObservationStore
@@ -5419,7 +5475,10 @@ class AgentEngine:
             observation_store = JsonCapabilityObservationStore(
                 profile_layout.capability_observations_path
             )
-            observation_service = CapabilityObservationService(observation_store)
+            observation_service = CapabilityObservationService(
+                observation_store,
+                classifier=CapabilityEvidenceClassifier.from_settings(self._settings),
+            )
             observation_record = observation_service.observe_result(
                 result,
                 environment=environment,
@@ -5458,10 +5517,60 @@ class AgentEngine:
                 },
             )
             self._active_capability_plan = decision.plan.to_dict()
+            # Retire evidence whose gap this resolution closed. Without it the
+            # observation backlog only ever grows and keeps reporting capabilities
+            # the system already has.
+            for resolution in getattr(decision, "resolutions", ()):
+                self._record_coevolution_resolution(resolution)
+                if getattr(resolution, "unmet", True):
+                    continue
+                capability = getattr(getattr(resolution, "requirement", None), "capability", "")
+                if capability:
+                    observation_service.resolve_capability(
+                        capability, reason=f"resolved in {loop_id}"
+                    )
         except (ImportError, AttributeError, RuntimeError, OSError, TypeError, ValueError) as exc:
             logger.debug("capability observation skipped: %s", exc, exc_info=True)
 
     # ── Helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _record_coevolution_resolution(resolution: Any) -> None:
+        """Report one resolution to the co-evolution buffer for the cold-path sweep.
+
+        Exclusions are recorded as the excluded component's **scorer name**
+        (``risk_cost``, ``environment_affordance``, ...) rather than its prose. The
+        reaper needs to tell a durable exclusion from an environment one, and keying
+        that off a human-readable reason would stop working the moment the resolver
+        rewords it.
+
+        Bookkeeping only: never raises, so a buffer problem cannot disturb the turn
+        that produced the resolution.
+        """
+        try:
+            from leapflow.evolution.observations import record_resolution
+
+            selected = getattr(resolution, "selected", None)
+            selected_id = ""
+            if selected is not None:
+                selected_id = str(getattr(getattr(selected, "candidate", None), "plugin_id", ""))
+            exclusions: dict[str, list[str]] = {}
+            for score in getattr(resolution, "candidates", ()) or ():
+                plugin_id = str(getattr(getattr(score, "candidate", None), "plugin_id", ""))
+                if not plugin_id or getattr(score, "eligible", False):
+                    continue
+                exclusions[plugin_id] = [
+                    str(getattr(component, "scorer", ""))
+                    for component in getattr(score, "components", ()) or ()
+                    if getattr(component, "excluded", False)
+                ]
+            record_resolution(
+                requirement=getattr(resolution, "requirement", None),
+                selected_plugin=selected_id,
+                exclusions=exclusions,
+            )
+        except Exception:  # noqa: BLE001 - observation must never affect execution
+            logger.debug("co-evolution resolution not recorded", exc_info=True)
 
     def _budget_exhausted_response(self, messages: List[Dict[str, Any]]) -> str:
         """Response when the iteration hard cap is reached.
