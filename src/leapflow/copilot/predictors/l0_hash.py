@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """L0 Exact-Match Predictor — O(1) context-hash lookup.
 
 Provides the fastest prediction path by matching the current ContextState hash

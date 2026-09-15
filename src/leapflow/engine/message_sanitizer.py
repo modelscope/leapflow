@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Message sanitizer — cleans LLM output of invalid characters and encoding issues.
 
 Handles:

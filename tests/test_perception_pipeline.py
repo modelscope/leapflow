@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scenario-based tests for the perception pipeline (causal, signal fusion).
 
 Covers causal chain construction, graph operations, heuristic priors,

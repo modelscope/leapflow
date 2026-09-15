@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Fitness functions for the test suite itself.
 
 The mock layer is an asset — 1400-plus cases of branch coverage that no

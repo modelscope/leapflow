@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill evolution policy — manages confidence/version progression and degradation.
 
 Implements the trust gradient: DRAFT → CANDIDATE → VERIFIED → PRODUCTION

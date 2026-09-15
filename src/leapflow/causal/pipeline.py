@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Causal Fusion Pipeline — Layer 1 + Layer 2 orchestrator.
 
 Receives raw signals/system events, emits a populated CausalGraph with

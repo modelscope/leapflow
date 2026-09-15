@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Web access plugin — read-only HTTP fetch for the agent loop."""
 
 from __future__ import annotations

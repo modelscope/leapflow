@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Video cache lifecycle management."""
 from __future__ import annotations
 

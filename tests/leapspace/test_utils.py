@@ -1,9 +1,12 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for leapspace.app_space.utils: check() lines and path conventions."""
 
 import asyncio
 import platform
 
 import pytest
+
+pytest.importorskip("cua_sandbox")  # leapspace extra only (utils imports cua_sandbox)
 
 from leapspace.app_space.utils import (
     check,

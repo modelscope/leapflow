@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Pure utility functions extracted from service.py to keep the orchestrator slim."""
 from __future__ import annotations
 

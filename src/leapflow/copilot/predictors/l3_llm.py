@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """L3 LLM Reasoning Predictor — deep inference with RAG context.
 
 Uses a large-language model to generate action predictions for complex

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Telegram event normalizer.
 
 Maps raw Telegram update payloads (from a ``BackendEventSource``)

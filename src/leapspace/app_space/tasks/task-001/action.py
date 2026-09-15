@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """task-001 — Reply to the boss's unread message (LeapChat).
 
 Three parts in one file:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Media devices: discovery, the frame protocol, the privacy gate, and the preview lease.
 
 Hermetic by construction. Nothing here opens a camera, a microphone or a display: the

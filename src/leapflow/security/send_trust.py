@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """S2 outbound SO2: send-scope Progressive Trust ledger.
 
 Autonomous re-entry has no synchronous human approver, so an outbound send is

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Phase 3 learning-layer tests: prediction physical branch, EMA bias,
 causal rules, hardware trust gate, MCP capability validation.
 """

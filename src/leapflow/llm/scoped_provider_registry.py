@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scoped lifecycle wrapper for LLMProviderRegistry.
 
 Leverages the existing unregister() method for cleanup, and mirrors the

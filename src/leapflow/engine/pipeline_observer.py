@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Pipeline observer protocol — provides observability for multi-phase learning pipelines.
 
 Ensures that learning pipeline failures are visible rather than silently swallowed.

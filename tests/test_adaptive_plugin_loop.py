@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for adaptive plugin closed-loop orchestration."""
 
 from __future__ import annotations

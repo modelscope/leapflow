@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """System prompts and templates for routing and ReAct."""
 
 from __future__ import annotations

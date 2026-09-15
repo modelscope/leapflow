@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Suggestion rendering and display gating for the Workflow Copilot.
 
 Implements the "rather not show than show late" principle:

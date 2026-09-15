@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Multi-level action abstraction for trajectory analysis.
 
 Abstraction levels:

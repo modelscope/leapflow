@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the end-to-end harness itself.
 
 The harness is the foundation the whole real layer stands on, so it gets the

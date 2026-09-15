@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Episode intent inference using LLM or rule-based fallback.
 
 Responsible for determining the user's high-level goal from

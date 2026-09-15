@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """CuaDriverClient — MCP stdio bridge to cua-driver for unified OS execution.
 
 Implements the HostRpc Protocol by mapping LeapFlow's Methods constants to

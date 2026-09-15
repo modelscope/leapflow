@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Stage 5: Execution Model Analyzer.
 
 Checks execution_model and source_language compatibility with LeapFlow's

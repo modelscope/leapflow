@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """System information plugin — current time and environment info."""
 
 from __future__ import annotations

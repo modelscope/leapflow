@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scenario-based tests for safety: confirmation levels, action policy, sandbox."""
 
 from __future__ import annotations

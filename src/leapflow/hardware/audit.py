@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Structured NDJSON audit log for hardware operations.
 
 Every read, write, and emergency-stop that passes through ``HardwareTools`` is

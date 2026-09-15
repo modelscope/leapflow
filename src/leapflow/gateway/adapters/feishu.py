@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Feishu/Lark adapter backed by the official lark-cli."""
 from __future__ import annotations
 

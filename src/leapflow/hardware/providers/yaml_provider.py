@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Declaration-file provider: reads hardware contexts from YAML on disk.
 
 The default and, before an upstream standard is available, the only source of

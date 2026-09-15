@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cross-trajectory consensus distillation.
 
 When a user naturally performs the same task multiple times, each recording

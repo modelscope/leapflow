@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Structured session routing for gateway messages.
 
 ``SessionKey`` is an immutable domain type that replaces simple string

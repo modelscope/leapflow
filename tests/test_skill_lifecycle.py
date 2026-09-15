@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scenario-based tests for the skill lifecycle.
 
 Covers registration, invocation, SkillDocument roundtrip, doc store CRUD,

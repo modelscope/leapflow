@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Assessment pipeline orchestrator.
 
 Entry point for the Plugin Compatibility Assessment Engine.

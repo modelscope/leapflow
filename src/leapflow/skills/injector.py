@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill content injection as user message (Hermes pattern).
 
 Protects system prompt cache by injecting SKILL.md content into

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Chat subcommand — single-turn conversational mode with rich output."""
 
 from __future__ import annotations

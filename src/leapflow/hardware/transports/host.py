@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Host transport: reads this machine's resource channels in-process.
 
 The counterpart to ``providers/host_provider.py``, and like it a thin shell over

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Dry-run preview for hardware writes (Phase 1.5).
 
 A preview must run the full feasibility chain -- envelope, rate, reachability,

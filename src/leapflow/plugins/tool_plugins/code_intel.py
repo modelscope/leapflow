@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Code intelligence plugin — document symbols and repository map."""
 
 from __future__ import annotations

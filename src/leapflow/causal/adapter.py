@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Adapters bridging CausalGraph to downstream pipeline interfaces.
 
 Conversions:

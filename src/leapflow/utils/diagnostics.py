@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Lightweight pipeline tracing and structured diagnostics.
 
 Provides non-intrusive instrumentation for multi-stage processing pipelines.

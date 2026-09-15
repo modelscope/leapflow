@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Terminal-based IOProvider for interactive CLI confirmation."""
 
 from __future__ import annotations

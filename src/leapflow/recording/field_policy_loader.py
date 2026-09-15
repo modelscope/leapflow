@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Perceptual Field Policy Loader — builtin rules, YAML persistence, goal inference.
 
 Loads and merges rules from multiple sources:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DuckDB persistence for EvolutionMemoryProvider — skill episodes survive restart.
 
 Design:

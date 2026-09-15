@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill similarity scoring — heuristic fast-filter and optional LLM refinement.
 
 Two-phase architecture:

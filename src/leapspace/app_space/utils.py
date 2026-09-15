@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared leapspace helpers: image presets, the state-dir convention, and
 task action loading."""
 

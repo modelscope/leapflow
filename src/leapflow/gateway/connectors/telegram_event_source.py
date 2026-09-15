@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Telegram polling event source.
 
 Implements ``BackendEventSource`` by long-polling the Telegram Bot API

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for adaptive capability decision history storage."""
 
 from __future__ import annotations

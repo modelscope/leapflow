@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Continuous sampling: the ring, the detector, and the signal source.
 
 The layering under test is a boundary decision, not an optimisation. Raw readings must

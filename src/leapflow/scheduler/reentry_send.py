@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """S2 outbound SO1+SO4: outbound contracts, target resolution, and the pure
 governance decision for autonomous re-entry sends.
 

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill index with three-layer caching and conditional filtering.
 
 Hermes-inspired design: skills are discovered from SKILL.md files,

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Domain types for capability gaps and plugin proposals.
 
 These immutable records are the reviewable bridge between observing that

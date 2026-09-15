@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Bridge between EventBus and MonitorManager event-triggered watches.
 
 Subscribes to EventBus as a callback. When a SystemEvent arrives,

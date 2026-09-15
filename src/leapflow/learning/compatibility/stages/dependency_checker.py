@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Stage 4: Dependency Checker.
 
 Checks declared_dependencies against what LeapFlow can provide.

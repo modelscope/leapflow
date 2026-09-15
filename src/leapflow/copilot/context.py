@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Incremental context encoder and EventBus bridge for Workflow Copilot.
 
 Receives raw SystemEvent streams and maintains an up-to-date ContextState

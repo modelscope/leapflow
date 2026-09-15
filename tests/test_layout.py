@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 from __future__ import annotations
 
 from leapflow.layout import build_layout, workspace_id_for_path

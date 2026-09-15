@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unit tests for the S2 re-entry driver (phase N3).
 
 Hermetic: DuckDB re-entry store on a temp file + a stub async runner; no engine,

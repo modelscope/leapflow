@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """UI element detection — pluggable backend protocol.
 
 Defines the interface for detecting common UI elements (buttons, text fields,

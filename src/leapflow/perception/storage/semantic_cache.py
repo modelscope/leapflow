@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Level 3: Semantic Cache — VLM extraction result reuse across sessions.
 
 Caches VLM action extraction results keyed by visual content similarity,

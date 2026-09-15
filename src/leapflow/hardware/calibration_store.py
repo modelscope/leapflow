@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Versioned storage for device calibration results.
 
 A calibration is not a reading. A reading is a sample of what a channel is doing right

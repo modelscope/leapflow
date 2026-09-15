@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Contracts for budget-estimator self-calibration.
 
 The character heuristic (CJK 1:1, Latin 4:1) cannot match a real tokenizer, and

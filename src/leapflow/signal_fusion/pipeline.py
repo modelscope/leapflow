@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """MHMS-SF Fusion Pipeline — orchestrates multi-scale fusion agents.
 
 Chains ScaleFusionAgent implementations in sequence:

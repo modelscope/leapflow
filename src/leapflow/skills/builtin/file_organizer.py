@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Smart file organization skill (metadata-first + LLM plan + moves)."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Teach subcommand — interactive teaching mode (record → distill)."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Frame storage abstraction and local filesystem implementation.
 
 Migrated from leapflow.recording.frame_store with extended metadata

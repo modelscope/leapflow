@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scoped lifecycle wrapper for ToolPluginRegistry.
 
 Provides reversible plugin registration: registering through this wrapper

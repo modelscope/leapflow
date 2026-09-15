@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for recovery_audit module — structured audit logging for recovery decisions."""
 from __future__ import annotations
 

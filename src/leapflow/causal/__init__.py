@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Causal Propagation Chain — unified causal model for LeapFlow.
 
 Core data model: CausalEvent → CausalChain → CausalGraph.

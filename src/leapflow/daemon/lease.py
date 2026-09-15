@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Client lease files for leapd multi-client lifecycle tracking."""
 from __future__ import annotations
 

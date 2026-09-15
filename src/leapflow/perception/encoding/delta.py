@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Delta frame composition — optimized before/after encoding for VLM input."""
 
 from __future__ import annotations

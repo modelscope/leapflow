@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Platform manifest loading and discovery.
 
 A manifest is a YAML file that declares:

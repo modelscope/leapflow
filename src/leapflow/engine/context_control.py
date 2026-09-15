@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Adaptive context governance primitives for every agent interaction.
 
 The module keeps context accounting, overflow prevention, exploration-ledger

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Iteration budget management for bounded agent loops."""
 from __future__ import annotations
 

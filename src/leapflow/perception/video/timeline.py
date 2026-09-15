@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Event signal timeline for video-mode recording.
 
 Collects lightweight event markers during recording.  The compressed

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the FrameStore Protocol and its consumers (Fix D4).
 
 Covers:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Real-artifact tests for the restricted DSH/Cordis compatibility path."""
 from __future__ import annotations
 

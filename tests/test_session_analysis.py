@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for the session-analysis dashboard (domain=session watch).
 
 Fakes the analysis services facade (no LLM); exercises producer gating,

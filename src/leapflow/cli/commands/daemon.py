@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """CLI commands for leapd daemon management.
 
 ``leap daemon status``  — show whether leapd is running

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Causal chain extraction from semantic action sequences.
 
 Identifies only the actions that contribute to the final observable state,

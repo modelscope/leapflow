@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Core data types for multi-source heterogeneous multi-scale signal fusion.
 
 Defines the fused data model hierarchy:

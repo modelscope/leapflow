@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Comprehensive tests for the Learning Plugin Evolution integration.
 
 Covers:

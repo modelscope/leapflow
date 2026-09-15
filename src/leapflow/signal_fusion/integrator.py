@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cross-scale bidirectional integration.
 
 Bottom-up: enriches Segments with statistical summaries from AtomicActions.

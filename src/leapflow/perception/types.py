@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared data types for the perception subsystem."""
 
 from __future__ import annotations

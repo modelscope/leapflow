@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """CLI execution backend for App Connector actions."""
 from __future__ import annotations
 

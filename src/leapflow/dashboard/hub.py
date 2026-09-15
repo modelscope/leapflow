@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """ViewHub: fan out daemon monitor events to browser WebSocket subscribers.
 
 The dashboard server holds a single subscription to the daemon NotificationBus

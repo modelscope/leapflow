@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Sync engine — bidirectional skill synchronization between local and hub.
 
 Computes diff-based sync plans and executes push/pull actions to keep local

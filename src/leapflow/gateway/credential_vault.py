@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Gateway credential refs backed by the unified LeapFlow secret vault.
 
 Gateway config files store only ``secret://`` references for manifest-declared

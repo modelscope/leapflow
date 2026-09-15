@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared domain model — zero-dependency data types used across all layers."""
 
 from leapflow.domain.capability_requirement import (
@@ -16,6 +17,11 @@ from leapflow.domain.event_types import (
 )
 from leapflow.domain.environment_fingerprint import EnvironmentFingerprint
 from leapflow.domain.events import SystemEvent, UIElement, UISnapshot
+from leapflow.domain.evolution_intent import (
+    WORLD_MODEL_INTENT,
+    WORLD_MODEL_ORIGIN,
+    EvolutionIntent,
+)
 from leapflow.domain.platform import (
     Capability,
     DEFAULT_DARWIN_CAPABILITIES,
@@ -47,6 +53,7 @@ __all__ = [
     "CLIEventType",
     "CapabilityRequirement",
     "EffectScope",
+    "EvolutionIntent",
     "FiberState",
     "GapEvidence",
     "ImplicitFeedbackType",
@@ -80,6 +87,8 @@ __all__ = [
     "TrajectoryStep",
     "UIElement",
     "UISnapshot",
+    "WORLD_MODEL_INTENT",
+    "WORLD_MODEL_ORIGIN",
     "action_type_from_event",
     "capability_from_str",
 ]

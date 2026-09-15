@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for CliNdjsonEventSource — generic CLI NDJSON subprocess manager."""
 from __future__ import annotations
 

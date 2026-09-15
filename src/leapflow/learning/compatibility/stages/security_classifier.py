@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Stage 6: Security Classifier.
 
 Assesses security risk from declared permissions and recommends

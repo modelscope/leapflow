@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Recording Health Monitor — real-time degradation detection during learn recording.
 
 Detects and warns about systemic issues that would silently corrupt the

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Mock signal injection framework for LeapFlow end-to-end testing."""
 
 from tests.mock_signals.generators import (

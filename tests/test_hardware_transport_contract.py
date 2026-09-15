@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Transport conformance suite -- the executable definition of pluggability.
 
 Every registered transport must pass these cases. That is the point: when a driver

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Interactive subcommand — persistent REPL with hybrid Application TUI.
 
 Uses ``LeapApp`` (prompt_toolkit Application + Rich) for a Hermes-style
@@ -246,6 +247,32 @@ def _print_host_status(console: Any, host: dict[str, Any]) -> None:
     console.system(f"backend={backend} started={host.get('started')}{extra}")
     if host.get("last_error"):
         console.warning(f"host error: {host['last_error']}")
+
+
+def _announce_self_evolution(console: Any, settings: Any) -> None:
+    """State the self-evolution mode on the first screen, in both directions.
+
+    Placed beside the approval-bypass notice because it is the same kind of fact: a mode
+    that changes what the agent may decide to do, which a user must know *before* acting
+    rather than discover afterwards. Announced in both states on purpose -- printing only
+    when enabled would make the quiet default indistinguishable from a build without the
+    feature, and a user who cannot tell which they have cannot reason about either.
+
+    The world model itself is not mentioned as a mode because it is not one: it reviews
+    sessions and records what it learned about the environment, which changes what the
+    agent knows and nothing else.
+    """
+    if getattr(settings, "evolution_enabled", False):
+        console.print(
+            "\u26a0 Self-evolution on \u2014 the agent may propose new capabilities "
+            "for itself; each still needs your approval",
+            style="bold yellow",
+        )
+    else:
+        console.system(
+            "Self-evolution off \u2014 the agent adapts by learning, not by writing "
+            "new capabilities. Enable with: leap config set evolution.enabled true"
+        )
 
 
 def _print_auth_setup_hint(console: Any, settings: Any) -> bool:
@@ -966,6 +993,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
     _render_banner()
     if ctx.settings.approval_bypass:
         console.print("\u26a0 Approval bypass active \u2014 all non-hardline actions auto-approved", style="bold yellow")
+    _announce_self_evolution(console, ctx.settings)
     _print_auth_setup_hint(console, ctx.settings)
     _update_status()
     exit_code = 0
@@ -1573,6 +1601,7 @@ async def cmd_interactive_daemon(
     _render_banner()
     if settings.approval_bypass:
         console.print("\u26a0 Approval bypass active \u2014 all non-hardline actions auto-approved", style="bold yellow")
+    _announce_self_evolution(console, settings)
     _print_auth_setup_hint(console, settings)
     _update_status()
 

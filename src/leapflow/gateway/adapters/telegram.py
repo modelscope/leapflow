@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Telegram Bot gateway adapter."""
 from __future__ import annotations
 

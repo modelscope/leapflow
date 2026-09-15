@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Watch lifecycle orchestration for the monitoring subsystem.
 
 ``MonitorManager`` wires the domain-neutral contract to the existing scheduler:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LeapFlow welcome banner.
 
 Two display modes:

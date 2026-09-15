@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for the anti-hallucination chart extractor.
 
 Pure text parsing: no network, no code execution, no invented numbers.

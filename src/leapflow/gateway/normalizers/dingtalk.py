@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DingTalk event normalizer.
 
 Maps DingTalk webhook/stream callback payloads (from a ``BackendEventSource``)

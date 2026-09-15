@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Plugin sandbox for isolating untrusted third-party plugin execution."""
 
 from leapflow.plugins.sandbox.protocol import SandboxRequest, SandboxResponse

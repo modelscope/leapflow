@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Stale stream detection and partial recovery for LLM streaming.
 
 Wraps an async stream iterator with an idle timeout so that hung connections

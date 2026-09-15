@@ -5,12 +5,13 @@
 
 ### News
 
-- **2026-08-12**: v0.0.9 released — TUI thinking display (LLM reasoning surfaced in-place with spinner preview + final panel), approval bypass mode (`approval_bypass` config + session-wide "Allow ALL"), workspace boundary softened to approval-gated, long-task convergence hardening (false-progress fix, repeated-read gate, periodic checkpoint forcing, pre-compression knowledge extraction), cross-session task history (automatic session summaries + proactive history injection), dynamic tool registry rebuild for late-registered tools, terminal sessions enabled by default.
-- **2026-08-06**: v0.0.8 released — Cross-platform Windows support (DaemonTransport protocol with TCP loopback IPC), real journey test layer with cassette-backed CI (6 e2e journeys, cost-bounded), community Windows fixes (@fanqiNO1). 1,540 tests.
+- **2026-09-15**: v0.2.0 released — teacher/student world-model self-evolution: hindsight adaptation verdicts (absorb / rebind / acquire / escalate) distill environment knowledge into the student's context, rebind-based selection preference, and a default-off `evolution.enabled` switch. 3,733 tests.
+- **2026-08-12**: v0.0.9 released — TUI thinking display, approval bypass mode, approval-gated workspace boundary, long-task convergence hardening, cross-session task history, dynamic tool registry rebuild, and terminal sessions on by default.
 
 <details>
 <summary>Previous releases</summary>
 
+- **2026-08-06**: v0.0.8 released — Cross-platform Windows support (DaemonTransport protocol with TCP loopback IPC), real journey test layer with cassette-backed CI (6 e2e journeys, cost-bounded), community Windows fixes (@fanqiNO1). 1,540 tests.
 - **2026-08-06**: v0.0.7 released — 1M-class context windows end-to-end, self-calibrating token estimator, internal-defect failure category, concurrent-TUI session identity isolation. 1,442 tests.
 
 - **2026-07-31**: v0.0.6 released — side-effect-gated recovery (checkpointed halts with structured `InteractionRequest`), uncertain-effect reporting for failed outbound calls, centralized logging with an independent daemon log level, session-bound LeapBoard analysis, platform-neutral gateway validators, and end-to-end architecture contract tests with the CI gate restored.
@@ -278,7 +279,7 @@ This installs the `leap` command. The first `leap` run creates the local LeapFlo
 ```bash
 git clone https://github.com/modelscope/leapflow.git
 cd leapflow
-uv sync --all-extras
+uv sync --all-extras --no-extra leapspace
 uv run leap --help
 ```
 </details>
@@ -341,6 +342,23 @@ leap --mock-host "hello, are you ready?"
 ```
 
 Expected: LeapFlow responds with a greeting confirming it's operational.
+
+### 5. (Optional) LeapSpace evaluation environment
+
+LeapSpace (`src/leapspace`) is an opt-in, environment-side CUA sandbox: PyQt6
+scenario apps plus a harness that boots a disposable sandbox, drives a task, and
+records signal-mode trajectories as ground truth. Its code ships inside the
+leapflow distribution, but the heavy stack (PyQt6 / cua-sandbox / pydantic) is
+gated behind an extra so the default install — and CI — stays light:
+
+```bash
+pip install 'leapflow[leapspace]'    # from PyPI
+uv sync --extra leapspace            # or from a source checkout (make space-sync)
+```
+
+Without the extra, `import leapspace.app_space` still works; only the submodules
+that pull in PyQt6 / cua-sandbox / pydantic require it, and the LeapSpace tests
+skip cleanly when those dependencies are absent.
 
 ---
 

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skills subcommand — list, show, export, import, disable, delete, audit, sessions."""
 
 from __future__ import annotations

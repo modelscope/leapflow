@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Secret redaction for logs, tool outputs, and display-layer text.
 
 Design (inspired by hermes-agent/redact.py):

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Conversation session persistence — chat history storage with full-text search.
 
 Design (inspired by hermes hermes_state.py):

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Semantic memory provider — DuckDB-backed persistent storage with domain support.
 
 Serves as the long-term knowledge store. Accepts all memory kinds as the

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Sandboxed execution namespace for distilled skill code.
 
 Restricts the runtime environment of exec()'d skill code to prevent

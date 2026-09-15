@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """The incident ledger: one entry per outage that shipped with a green suite.
 
 Every entry below is a real regression that reached users. What they had in

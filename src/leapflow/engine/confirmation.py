@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Human-in-the-loop confirmation for skill execution.
 
 Implements the graduation mechanism: skills progress from STEP → CONFIRM →

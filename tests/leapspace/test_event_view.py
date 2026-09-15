@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for event_view — timeline rendering over a temp evidence db."""
 
 import json

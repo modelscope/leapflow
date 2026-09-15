@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Slash-command registry and dispatch.
 
 Single source of truth for all REPL commands.  The registry drives:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Physical-signal observability: the board's view of the bench.
 
 Four files, four reasons to change: ``series`` when the payload shape changes,

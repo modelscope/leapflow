@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tool registry and name-resolution primitives.
 
 This module centralizes the Tool Capability Contract: the set of canonical

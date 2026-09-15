@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cron-expression trigger with graceful fallback.
 
 Uses ``croniter`` when available for full cron expression support.

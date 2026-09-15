@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Preview broker: shared, bounded, self-releasing access to a media channel.
 
 A preview is the one path in this subsystem where a device stays claimed across

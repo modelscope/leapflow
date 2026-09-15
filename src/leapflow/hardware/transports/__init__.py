@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Transport factory table -- the transport half of the pluggability mechanism.
 
 Adding support for a new southbound standard is a new module plus one row here.

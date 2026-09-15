@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Imitation learning pipeline — orchestrates the full observe → distill workflow.
 
 Coordinates:
