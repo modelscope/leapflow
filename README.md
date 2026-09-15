@@ -5,12 +5,13 @@
 
 ### News
 
+- **2026-09-15**: v0.2.0 released — teacher/student world-model evolution: a cold-path teacher grades every session and distills what it learned about the environment into the student's next-turn context via four-value adaptation verdicts (absorb / rebind / acquire / escalate), with supersede/expire/retract knowledge retirement and a rebind-preference selection signal; capability acquisition (self-evolution) is a default-off, prominently surfaced `evolution.enabled` switch. 3,733 tests.
 - **2026-08-12**: v0.0.9 released — TUI thinking display (LLM reasoning surfaced in-place with spinner preview + final panel), approval bypass mode (`approval_bypass` config + session-wide "Allow ALL"), workspace boundary softened to approval-gated, long-task convergence hardening (false-progress fix, repeated-read gate, periodic checkpoint forcing, pre-compression knowledge extraction), cross-session task history (automatic session summaries + proactive history injection), dynamic tool registry rebuild for late-registered tools, terminal sessions enabled by default.
-- **2026-08-06**: v0.0.8 released — Cross-platform Windows support (DaemonTransport protocol with TCP loopback IPC), real journey test layer with cassette-backed CI (6 e2e journeys, cost-bounded), community Windows fixes (@fanqiNO1). 1,540 tests.
 
 <details>
 <summary>Previous releases</summary>
 
+- **2026-08-06**: v0.0.8 released — Cross-platform Windows support (DaemonTransport protocol with TCP loopback IPC), real journey test layer with cassette-backed CI (6 e2e journeys, cost-bounded), community Windows fixes (@fanqiNO1). 1,540 tests.
 - **2026-08-06**: v0.0.7 released — 1M-class context windows end-to-end, self-calibrating token estimator, internal-defect failure category, concurrent-TUI session identity isolation. 1,442 tests.
 
 - **2026-07-31**: v0.0.6 released — side-effect-gated recovery (checkpointed halts with structured `InteractionRequest`), uncertain-effect reporting for failed outbound calls, centralized logging with an independent daemon log level, session-bound LeapBoard analysis, platform-neutral gateway validators, and end-to-end architecture contract tests with the CI gate restored.
