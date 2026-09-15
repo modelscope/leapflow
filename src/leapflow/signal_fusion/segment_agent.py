@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Segment-scale fusion: sub-task identification with wait-period awareness.
 
 Groups AtomicActions into Segments based on app transitions, temporal

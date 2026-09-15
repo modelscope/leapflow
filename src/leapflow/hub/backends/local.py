@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Local filesystem backend — for testing and offline use.
 
 Stores skill bundles as directories on the local filesystem, enabling

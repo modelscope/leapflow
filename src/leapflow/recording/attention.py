@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Context Learning Attention Mechanism — signal/noise filtering for demonstration recording.
 
 Implements layered attention filters that improve the signal-to-noise ratio

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill document generation — transform DistillationCandidates into SKILL.md.
 
 Two strategies (same pattern as codegen.py):

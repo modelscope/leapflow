@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for ToolMetadata handler invocation compatibility."""
 from __future__ import annotations
 

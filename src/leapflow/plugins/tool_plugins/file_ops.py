@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """File operations plugin — list, read, write, search, find, edit."""
 
 from __future__ import annotations

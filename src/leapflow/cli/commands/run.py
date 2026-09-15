@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Run subcommand — execute a skill by trigger match or explicit name."""
 
 from __future__ import annotations

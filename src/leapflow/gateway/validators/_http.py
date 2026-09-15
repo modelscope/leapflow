@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared HTTP helper for credential validators."""
 
 from __future__ import annotations

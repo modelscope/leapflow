@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """System utilities — time, environment info.
 
 All handlers follow the unified tool convention: receive params dict, return result dict.

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Resource provenance tracking for platform actions.
 
 Maintains a session-scoped pool of resource identifiers (chat_id, message_id,

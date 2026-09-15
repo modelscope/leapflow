@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """MHMS-SF: Multi-source Heterogeneous Multi-scale Signal Fusion.
 
 This module is the orchestration layer for fusing visual, event, and

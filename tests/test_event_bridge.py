@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for EventBridge — EventBus to EventTrigger adapter.
 
 No network, no LLM: pure in-memory trigger matching logic.

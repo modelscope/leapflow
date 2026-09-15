@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Dashboard subsystem: declarative Server-Driven UI (SDUI) for monitoring.
 
 This package owns the domain-neutral view layer:

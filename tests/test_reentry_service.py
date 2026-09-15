@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unit tests for the S2 re-entry service (phases N3b–N5): time + event dispatch,
 global-budget backstop, disabled gating, and the N5 no-external-send guarantee.
 

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Lifecycle-bearing signal source category.
 
 Unlike SignalSource (stateless transform), ActiveSignalSource subscribes to

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Action registry utilities for App Connector platform actions.
 
 Supports three sources in priority order:

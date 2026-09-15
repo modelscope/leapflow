@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for Ed25519 signing and verification in the Plugin Marketplace."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Narrative memory provider — pure-text Markdown for LLM-readable knowledge.
 
 Implements the narrative layer of the dual memory architecture:

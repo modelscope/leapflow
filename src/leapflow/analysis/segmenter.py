@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Episode segmentation — split trajectories into semantically coherent chunks.
 
 Uses a chain of heuristic boundary detectors (Strategy pattern) so new

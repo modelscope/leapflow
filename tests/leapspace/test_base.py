@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic unit tests for BaseLeapApp (offscreen Qt, tmp state dirs)."""
 
 import json
@@ -7,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 
-pytest.importorskip("PyQt6")  # leapspace dependency group only
+pytest.importorskip("PyQt6")  # leapspace extra only
 
 from PyQt6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton, QWidget  # noqa: E402
 

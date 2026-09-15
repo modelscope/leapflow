@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for capability gap detection and plugin proposals."""
 from __future__ import annotations
 

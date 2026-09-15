@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Action-scale fusion: converts raw visual actions + system events into AtomicActions.
 
 Replaces the former ActionScaleAligner with a simpler, OCP-friendly design.

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Platform adapter return-shape contracts (cua-driver, verified against 0.6.8).
 
 Locks the response side of the wire contract: get_window_state's flat

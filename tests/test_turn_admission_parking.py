@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Parking a turn's admission slot while it waits on a human decision.
 
 Approval prompts have no deadline, so a turn blocked on one must hand its slot

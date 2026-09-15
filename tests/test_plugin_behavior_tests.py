@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for proposal-defined plugin behavior checks."""
 from __future__ import annotations
 

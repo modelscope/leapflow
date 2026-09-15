@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Structured failure representation for the recovery subsystem.
 
 FailureEnvelope wraps every failure encountered in the agent loop with

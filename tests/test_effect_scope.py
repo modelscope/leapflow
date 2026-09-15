@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unit tests for EffectScope and PluginFiber domain primitives."""
 
 from __future__ import annotations

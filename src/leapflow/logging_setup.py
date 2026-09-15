@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Centralized process logging setup — the single owner of log configuration.
 
 Every LeapFlow process surface initializes logging through this module so that

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Provider response-shape drift guard.
 
 ``tools/sync_fixtures.py`` distils every recorded cassette into the *shapes* the

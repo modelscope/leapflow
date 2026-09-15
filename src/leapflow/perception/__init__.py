@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Visual-First Perception Subsystem.
 
 Supports two modes:

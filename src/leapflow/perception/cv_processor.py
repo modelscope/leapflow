@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """CV Algorithm Plugin Protocol + Registry.
 
 Allows community-contributed computer vision algorithms to replace or augment

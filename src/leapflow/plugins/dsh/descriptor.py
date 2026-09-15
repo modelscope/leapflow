@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Persistent descriptors and wrapper generation for installed DSH plugins."""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Parameterized skill registry with validation, metadata, and trigger matching."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Dispatches due re-entry triggers by seeding an Orient-seeded run (S2, phase N3).
 
 Pure orchestration: reads due TIME triggers from a ``ReentryStore``, atomically

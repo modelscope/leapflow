@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for structured adaptive capability requirements and environments."""
 
 from __future__ import annotations

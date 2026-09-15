@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Local OpenAI-compatible proxy that records, replays, or forwards LLM traffic.
 
 Why a proxy instead of patching the provider: ``OpenAIChat`` builds its

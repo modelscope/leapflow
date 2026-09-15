@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Working memory provider — ring-buffer with token budgeting.
 
 Implements MemoryProvider protocol while preserving chat-message semantics

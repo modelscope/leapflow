@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for GatewayServer consumer loop — BackendEvent routing."""
 from __future__ import annotations
 

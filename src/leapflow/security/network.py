@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Outbound URL classification for the network egress gate.
 
 Splitting this out of ``risk.py`` keeps the risk classifier synchronous and

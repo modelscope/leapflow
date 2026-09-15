@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """`leap hw` — inspect hardware and intervene in it directly (Phase 1.4).
 
 Two planes share one command group:

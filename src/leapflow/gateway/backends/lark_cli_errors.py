@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """lark-cli error normalization for App Connector CLI actions.
 
 This module translates lark-cli's Problem JSON and legacy plain-text failures

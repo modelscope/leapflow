@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hub tools plugin — exposes Hub operations (push, pull, search, sync) as a ToolPlugin."""
 
 from __future__ import annotations

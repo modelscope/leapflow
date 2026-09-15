@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Text utilities plugin — regex search and string replace.
 
 Pilot migration: validates the full ToolPlugin pipeline.

@@ -39,6 +39,7 @@ config, gateway dispatch) plus the Tool Capability Contract in
 | `ToolPlugin` | `plugins/protocol.py` | Register callable tools exposed to the LLM agent |
 | `GatewayAdapterPlugin` | `gateway/adapter_registry.py` | Factory for IM/platform adapters (Feishu, Telegram, etc.) |
 | `LLMProviderPlugin` | `llm/provider_registry.py` | Register alternative LLM backends |
+| `SelectionPolicyPlugin` | `plugins/selection_policy.py` | Decide which admissible tool candidate to use, and learn from the result |
 | `SignalSource` | `perception/signal_source.py` | Stateless event → signal transform |
 | `ActiveSignalSource` | `perception/active_signal_source.py` | Long-running signal emitter (webhook listener, polling bot) |
 | `CVProcessor` | `perception/cv_processor.py` | Frame-pair visual diff processing |
@@ -53,6 +54,10 @@ Additionally, `FrameStore` (`perception/storage/frame_store.py`) is a `@runtime_
 - **ToolPlugin** — You want the LLM agent to invoke your functionality as a tool call (most common).
 - **GatewayAdapterPlugin** — You are integrating a new IM/collaboration platform.
 - **LLMProviderPlugin** — You are adding a new LLM API backend (e.g., a private deployment).
+- **SelectionPolicyPlugin** — You are implementing a strategy for choosing between tools that
+  provide the same capability (greedy, Thompson sampling, UCB). Your policy sees only
+  candidates that already passed every hard constraint, and must be able to explain each
+  choice.
 - **SignalSource** — You need to normalize external events into LeapFlow's signal pipeline (stateless, transform-only).
 - **ActiveSignalSource** — You need a long-running listener that emits signals (websocket, polling loop).
 - **CVProcessor** — You are implementing a visual diff algorithm for the perception subsystem.
@@ -195,9 +200,80 @@ class LLMProviderPlugin(Protocol):
     def create_provider(self, config: Dict[str, Any]) -> LLMProvider: ...
 ```
 
-LLM provider plugins support **entry_point discovery** via setuptools group `"leapflow.llm_providers"`. This is the only Protocol that supports entry_point-based discovery.
+LLM provider plugins support **entry_point discovery** via setuptools group `"leapflow.llm_providers"`.
 
-### 2.5 SignalSource Protocol
+### 2.5 SelectionPolicyPlugin Protocol
+
+When several tools provide the same capability, a selection policy decides which one runs.
+It is a *core extension point*, not a tool plugin: it is invoked by the framework inside a
+turn, reads host-side services, and therefore is **not** sandboxed, **not** approval-gated,
+and earns **no** Progressive Trust — trust is earned by executing tools, and a policy
+executes none.
+
+```python
+@runtime_checkable
+class SelectionPolicyPlugin(Protocol):
+    @property
+    def policy_id(self) -> str: ...        # config value, e.g. "greedy"
+
+    @property
+    def display_name(self) -> str: ...
+
+    def create(self, params: Mapping[str, Any], deps: PolicyDeps) -> SelectionPolicy: ...
+
+
+@runtime_checkable
+class SelectionPolicy(Protocol):
+    policy_id: str
+
+    def select(self, requirement, eligible, context) -> SelectionOutcome: ...
+    def observe(self, requirement, chosen_tool: str, reward: RewardSignal) -> None: ...
+```
+
+Discovery: setuptools group `"leapflow.selection_policies"`. Activation:
+`selection.policy` via `leap config set selection.policy <policy_id>`.
+
+Built in: `greedy` (default, highest score), `thompson` (Beta posterior sampling),
+`ucb1` (deterministic upper confidence bound), `bucketed` (routes capabilities between
+several policies for an A/B experiment; arms come from `selection.buckets`). The
+learners share `selection.prior_strength`; `ucb1` also reads `selection.exploration`.
+
+> **Competition is required for a learning policy to do anything.** With built-in
+> tools alone, every capability name is provided by exactly one tool (55 tools, 55
+> names), so there is one arm per capability and nothing to learn. Multiple candidates
+> appear when self-evolution generates a plugin providing a capability an existing
+> tool already provides. Until then `thompson` and `ucb1` behave as greedy-with-prior.
+
+Three rules the runtime enforces, each of which will otherwise bite you:
+
+- **`eligible` is pre-filtered and never empty.** Any candidate a configured scorer marked
+  `excluded` is removed *before* `select` is called, and your policy cannot reach it. With
+  the default scorer set that covers: a candidate not declaring the capability, a missing
+  host platform capability, and a risk level above the requirement's ceiling. Two further
+  exclusions — app-level affordance and frozen-trust — come from scorers that are opt-in
+  (`CapabilityResolver(scorers=...)`), so they apply only where a caller injects them.
+  Exploration is never permitted to trade off safety, but do not read this list as the
+  complete set of guards in every configuration.
+- **`SelectionOutcome.reason` is rendered to operators**, and `explored=True` is how a
+  deliberate departure from the highest score is distinguished from a scoring bug. "Chose
+  at random" is not an explanation; a posterior and a bonus term are.
+- **`RewardSignal.value is None` means *no information*, not failure.** A successful call
+  whose handler declared no observable effect abstains. Treating that as a zero would drive
+  every arm's posterior down and, through trust, quarantine healthy plugins for a reporting
+  omission. Only `observed_effect` in a tool result carries a confirmable effect.
+
+Registration is **first-wins**: an id already taken is refused and the collision recorded,
+rather than silently replacing how the framework chooses its own tools. Instance lifetime is
+owned by the registry (`activate()` builds once and caches, `current()` never creates), so a
+stateful policy accumulates across turns instead of being rebuilt per call.
+
+A policy that carries a posterior must persist it. `PolicyDeps.stats_store` provides a
+durable per-`(policy, capability, arm)` counter store; keeping the posterior in memory
+instead means restarting cold on every daemon restart and never converging. Reads are
+answered from memory because `select()` is on the turn path; writes happen in `observe()`,
+which runs on the cold-path sweep.
+
+### 2.6 SignalSource Protocol
 
 ```python
 @runtime_checkable
@@ -217,7 +293,7 @@ class SignalSource(Protocol):
 
 Stateless; not fiber-managed. Registered with `SignalSourceRegistry`.
 
-### 2.6 ActiveSignalSource Protocol
+### 2.7 ActiveSignalSource Protocol
 
 ```python
 EmitCallback = Callable[[InteractionSignal], None]
@@ -236,7 +312,7 @@ class ActiveSignalSource(Protocol):
 
 Managed by `ActiveSourceManager` (bounded asyncio queue, per-source task, thread-safe emit callback). **Note:** ActiveSignalSource is not yet integrated with PluginFiber lifecycle; lifecycle is owned by `PerceptionSession` directly.
 
-### 2.7 CVProcessor Protocol
+### 2.8 CVProcessor Protocol
 
 ```python
 @runtime_checkable

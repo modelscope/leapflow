@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Threat pattern scanning for prompt injection and adversarial content.
 
 Layered defense:

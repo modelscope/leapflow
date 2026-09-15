@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Stage 2: Category Resolver.
 
 Looks up the manifest's category in the PLUGGABILITY_TAXONOMY and

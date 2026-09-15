@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Prediction Loop — the core Predict → Execute → Compare → Learn cycle.
 
 Implements on-policy predictive coding: before each action execution,

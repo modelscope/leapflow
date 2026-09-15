@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Application focus change observer (cross-platform).
 
 Detects when the user switches between foreground applications.

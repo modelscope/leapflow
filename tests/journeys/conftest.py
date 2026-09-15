@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Fixtures for the real end-to-end journey layer.
 
 Every journey runs against a real ``leapd`` subprocess with the LLM boundary

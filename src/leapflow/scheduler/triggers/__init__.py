@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Trigger factory: create Trigger instances from type string and config dict."""
 
 from __future__ import annotations

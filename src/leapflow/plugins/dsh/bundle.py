@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Safe copying and runtime preparation for DSH source bundles."""
 from __future__ import annotations
 

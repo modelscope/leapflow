@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """End-to-end guards for the recovery contracts in AGENTS.md.
 
 The existing recovery tests are unit-level: they exercise one budget method or

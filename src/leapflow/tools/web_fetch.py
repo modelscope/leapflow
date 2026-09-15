@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """web_fetch — first-class read-only HTTP access for the agent loop.
 
 Without this tool the only way to read a URL is ``shell_run`` with a hand-written

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Predefined signal injection scenarios (profiles).
 
 Each profile describes a complete scenario with a mix of generators and their

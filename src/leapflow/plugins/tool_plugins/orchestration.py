@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Orchestration & System plugin — capability expansion, subagent delegation, re-entry scheduling.
 
 These tools have late-binding dependencies on engine internals

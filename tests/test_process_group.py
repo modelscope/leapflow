@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for leapflow.utils.process_group — cross-platform tree termination."""
 from __future__ import annotations
 

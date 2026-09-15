@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Standard Skill Document model (Anthropic Agent Skills format).
 
 Provides the data model, renderer, and parser for SKILL.md files that conform

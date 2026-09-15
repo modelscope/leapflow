@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """TUI rendering primitives for the interactive REPL.
 
 Pre-renders an input frame (input line, status bar) then positions the cursor

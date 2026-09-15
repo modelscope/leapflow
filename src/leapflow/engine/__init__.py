@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Engine layer — orchestration, planning, scheduling, and session control."""
 
 from leapflow.engine.engine import AgentEngine, StreamEvent, build_default_registry

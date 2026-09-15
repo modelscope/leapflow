@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Bridge between gateway events and the platform EventBus.
 
 Subscribes to ``GatewayServer.on_event`` and publishes equivalent

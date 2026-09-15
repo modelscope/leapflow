@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Protocols and context containers for the MHMS-SF fusion pipeline.
 
 Defines:

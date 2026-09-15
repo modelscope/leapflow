@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Slash command routing primitives.
 
 The router keeps parsing and result semantics independent from the TUI

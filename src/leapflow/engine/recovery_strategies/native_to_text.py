@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Native-to-text fallback recovery strategy.
 
 Handles format errors by falling back from native tool calling mode to

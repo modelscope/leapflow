@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """File system change observer using watchdog (cross-platform).
 
 Backends:

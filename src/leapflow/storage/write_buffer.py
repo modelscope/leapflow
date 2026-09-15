@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Batched write buffer for DuckDB stores.
 
 High-frequency signal writes to DuckDB benefit from batching:

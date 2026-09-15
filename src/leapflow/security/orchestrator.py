@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Approval orchestration: policy, grants, prompting, and audit."""
 from __future__ import annotations
 

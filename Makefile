@@ -17,11 +17,11 @@ setup:  ## Setup scripts permissions and environment
 	chmod +x scripts/setup.sh scripts/run.sh
 	./scripts/setup.sh
 
-sync:  ## Sync all dependencies
-	uv sync --all-extras
+sync:  ## Sync dependencies (excludes the heavy leapspace extra)
+	uv sync --all-extras --no-extra leapspace
 
-space-sync:  ## Sync dependencies including LeapSpace
-	uv sync --all-extras --group leapspace
+space-sync:  ## Sync all dependencies including the leapspace extra
+	uv sync --all-extras
 
 lint:  ## Lint source code
 	uv run ruff check src/ tests/ tools/

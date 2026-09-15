@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Terminal approval view helpers for LeapFlow CLI/TUI surfaces."""
 from __future__ import annotations
 

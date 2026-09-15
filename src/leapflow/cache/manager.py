@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DuckDB-indexed cache manager for profile/workspace/session scopes."""
 from __future__ import annotations
 

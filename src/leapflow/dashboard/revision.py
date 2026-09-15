@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Content revision for one atomic LeapBoard server generation.
 
 A Board process imports Python once but historically read YAML/JS/CSS from disk on every

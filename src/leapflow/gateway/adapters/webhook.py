@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Generic HTTP webhook gateway adapter."""
 from __future__ import annotations
 

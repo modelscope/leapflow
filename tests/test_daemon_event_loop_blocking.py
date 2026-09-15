@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Regression tests for the daemon event-loop permanent-blocking fix.
 
 Root cause chain (observed as a 43-minute daemon freeze where every RPC

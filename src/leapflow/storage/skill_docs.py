@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Filesystem-based Skill Document store.
 
 Manages skill-name/SKILL.md folder structure on disk and provides

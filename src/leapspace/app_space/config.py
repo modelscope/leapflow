@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """AppTaskConfig — config.yaml loading and validation (harness-side).
 
 config.yaml is pure declaration: wiring and metadata only, no behavior

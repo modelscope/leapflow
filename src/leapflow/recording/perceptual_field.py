@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Perceptual Field Engine — context-aware perception control within apps.
 
 Architecture:

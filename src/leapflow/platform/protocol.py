@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """MsgPack-RPC framing, method constants, and event bus protocol."""
 
 from __future__ import annotations

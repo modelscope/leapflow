@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LeapFlow Memory Subsystem — Provider-based architecture."""
 import math
 

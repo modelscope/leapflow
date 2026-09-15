@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Contract tests for the mock ``HardwareSignalGenerator``.
 
 The mock signal framework lives outside ``src/`` and deliberately does not import

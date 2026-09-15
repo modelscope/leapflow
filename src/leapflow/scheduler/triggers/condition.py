@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Condition-based trigger: fires when a declarative condition is met.
 
 Supports simple comparison expressions like:

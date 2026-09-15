@@ -1,8 +1,13 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic unit tests for LeapSignal's record_* sentinel protocol."""
 
 import asyncio
 import json
 from types import SimpleNamespace
+
+import pytest
+
+pytest.importorskip("cua_sandbox")  # leapspace extra only (signal pulls in app_space.utils)
 
 import leapspace.app_space.signal as signal_module
 from leapspace.app_space.signal import (

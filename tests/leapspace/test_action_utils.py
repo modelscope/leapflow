@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for action_utils — dispatch contract and lazy-import safety."""
 
 import subprocess

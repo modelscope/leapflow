@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """The eight hardware tools, derived from admitted contexts.
 
 The count is fixed regardless of how many devices exist. A rig of seven programs

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Guards for uncertain-effect reporting and InteractionRequest surfacing.
 
 Two contracts that only hold end-to-end:

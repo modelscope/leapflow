@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Waterfall tool execution pipeline — composable interceptor chain.
 
 Interceptors wrap tool execution with pre/post hooks, enabling pluggable

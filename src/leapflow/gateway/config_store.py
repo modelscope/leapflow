@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Gateway configuration persistence (``gateway.yaml``).
 
 Reads and writes platform configurations. Manifest-declared secret fields are

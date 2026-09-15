@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Semantic tool schema support — metadata and conversion for desktop tools.
 
 Semantic desktop tools (observe_ui, click, switch_app, ...) are registered by

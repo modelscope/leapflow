@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Perception Session — lifecycle management for visual perception.
 
 Session-scoped: created at learn-session start, collects interaction signals

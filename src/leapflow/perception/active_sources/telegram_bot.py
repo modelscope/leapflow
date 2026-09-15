@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Telegram Bot ActiveSignalSource.
 
 Subscribes to Telegram Bot messages via long polling and emits

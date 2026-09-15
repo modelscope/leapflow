@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """App connector protocols for platform action execution.
 
 This module defines the platform-neutral contract used by REST, CLI, and

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Privacy policy — configuration-driven data retention, opt-out, and audit.
 
 Design principles (from Active Learning Design doc):

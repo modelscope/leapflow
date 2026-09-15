@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared ContextVar for per-turn approval routing.
 
 Extracted to its own module to avoid circular dependency between

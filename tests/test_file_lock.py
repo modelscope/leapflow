@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the cross-platform lock_fd / unlock_fd pair."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Full fiberization coverage tests.
 
 Verifies that all three plugin subsystems (tools, gateway adapters, LLM

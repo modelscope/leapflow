@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for ReadingReplay and HardwareAuditLog (Phase 2.5).
 
 Covers:

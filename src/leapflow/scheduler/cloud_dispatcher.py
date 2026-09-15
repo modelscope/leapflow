@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cloud dispatcher — orchestrates cloud task deployment lifecycle.
 
 Workflow: package → create worker → inject secrets → deploy → monitor.

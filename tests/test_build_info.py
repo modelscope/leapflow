@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for leapflow.utils.build_info (long-lived-process staleness).
 
 All git subprocess calls are monkeypatched at the module's ``_fingerprint``

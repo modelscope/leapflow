@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Recovery budget — global constraint system for recovery attempts within a turn.
 
 The budget prevents infinite recovery loops by enforcing hard caps on retries,

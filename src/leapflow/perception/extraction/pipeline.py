@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Offline Extraction Pipeline — Stage A → B → C orchestrator."""
 
 from __future__ import annotations

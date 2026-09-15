@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LeapFlow Hub — cloud collaboration for skill sharing and multi-device sync.
 
 Public API:

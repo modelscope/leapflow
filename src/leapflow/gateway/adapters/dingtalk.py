@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DingTalk gateway adapter."""
 from __future__ import annotations
 

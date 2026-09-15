@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tool concurrency policy — metadata-driven parallel/sequential partitioning.
 
 Parallel-safety is derived from the SAME registry metadata that already drives

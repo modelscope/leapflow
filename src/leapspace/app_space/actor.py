@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LeapAppActor: the OS-signal source of leapspace.
 
 Drives the in-sandbox apps through the cua-driver MCP tool surface plus

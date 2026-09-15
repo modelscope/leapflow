@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Deterministic adaptive plugin capability resolution.
 
 The resolver answers: given structured requirements and the current environment,
@@ -15,7 +16,9 @@ from leapflow.domain.capability_requirement import CapabilityRequirement
 from leapflow.domain.environment_fingerprint import EnvironmentFingerprint
 from leapflow.learning.plugin_stats import PluginUsageTracker
 from leapflow.learning.plugin_trust import PluginTrustLedger, PluginTrustLevel
+from leapflow.plugins._builtin_policies import GreedyPolicy
 from leapflow.plugins.protocol import ToolMetadata
+from leapflow.plugins.selection_policy import SelectionPolicy
 
 _RISK_RANK = {
     "read_only": 0,
@@ -46,6 +49,7 @@ class CapabilityCandidate:
     provides_capabilities: tuple[str, ...] = field(default_factory=tuple)
     requires_capabilities: tuple[str, ...] = field(default_factory=tuple)
     requires_platform_capabilities: tuple[str, ...] = field(default_factory=tuple)
+    requires_environment_affordances: tuple[str, ...] = field(default_factory=tuple)
     risk_level: str = "read_only"
     requires_approval: bool = False
     mutates_state: bool = False
@@ -71,6 +75,10 @@ class CapabilityCandidate:
                 tool.requires_platform_capabilities
                 or tuple(raw.get("requires_platform_capabilities") or ())
             ),
+            requires_environment_affordances=_as_tuple(
+                getattr(tool, "requires_environment_affordances", ())
+                or tuple(raw.get("requires_environment_affordances") or ())
+            ),
             risk_level=str(raw.get("risk_level") or "read_only"),
             requires_approval=bool(raw.get("requires_approval", False)),
             mutates_state=bool(tool.mutates_state or raw.get("mutates_state", False)),
@@ -85,6 +93,7 @@ class CapabilityCandidate:
             "provides_capabilities": list(self.provides_capabilities),
             "requires_capabilities": list(self.requires_capabilities),
             "requires_platform_capabilities": list(self.requires_platform_capabilities),
+            "requires_environment_affordances": list(self.requires_environment_affordances),
             "risk_level": self.risk_level,
             "requires_approval": self.requires_approval,
             "mutates_state": self.mutates_state,
@@ -101,6 +110,10 @@ class ResolverWeights:
     risk_cost: float = 1.0
     trust: float = 1.0
     reliability: float = 1.0
+    #: Weight for the teacher's rebind recommendation. Deliberately below the structural
+    #: weights: a hindsight recommendation is evidence, and it must not outvote a
+    #: declaration that a candidate cannot run here.
+    distilled_preference: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -111,6 +124,9 @@ class ResolverContext:
     trust_ledger: PluginTrustLedger | None = None
     usage_tracker: PluginUsageTracker | None = None
     weights: ResolverWeights = field(default_factory=ResolverWeights)
+    #: ``capability -> preferred plugin or tool name``, from the teacher's ``rebind``
+    #: verdicts. Read-only evidence like everything else here: the resolver still decides.
+    distilled_preferences: tuple[tuple[str, str], ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -175,6 +191,11 @@ class CapabilityResolution:
     candidates: tuple[CandidateScore, ...]
     selected: CandidateScore | None = None
     arbitration_used: bool = False
+    #: Which policy chose, and whether it departed from the argmax. Recorded so a
+    #: decision stays auditable once selection is pluggable: an operator seeing a
+    #: lower-scored tool selected must be able to tell exploration from a bug.
+    policy_id: str = ""
+    explored: bool = False
     reason: str = ""
 
     @property
@@ -187,6 +208,8 @@ class CapabilityResolution:
             "selected": self.selected.to_dict() if self.selected else None,
             "unmet": self.unmet,
             "arbitration_used": self.arbitration_used,
+            "policy_id": self.policy_id,
+            "explored": self.explored,
             "reason": self.reason,
             "candidates": [c.to_dict() for c in self.candidates],
         }
@@ -278,6 +301,49 @@ class EnvironmentFitScorer:
         )
 
 
+class EnvironmentAffordanceScorer:
+    """Exclude a candidate whose declared app-level affordances the task
+    environment does not offer.
+
+    Mirrors ``EnvironmentFitScorer`` but reads the candidate's
+    ``requires_environment_affordances`` (task/app-level) rather than its host
+    ``requires_platform_capabilities``. The two are separate declarations so a
+    tool that needs ``ui.chat.send.v2`` is excluded when the app presents v1,
+    without conflating that with a host capability. Not in ``_DEFAULT_SCORERS``:
+    it is injected explicitly (``CapabilityResolver(scorers=...)``) by callers
+    that resolve against a task environment, so default resolution is unchanged.
+    """
+
+    name = "environment_affordance"
+
+    def score(
+        self,
+        requirement: CapabilityRequirement,
+        candidate: CapabilityCandidate,
+        context: ResolverContext,
+    ) -> ScoreComponent:
+        required = candidate.requires_environment_affordances
+        missing = tuple(
+            affordance
+            for affordance in required
+            if not context.environment.supports_capability(affordance)
+        )
+        if missing:
+            return ScoreComponent(
+                self.name,
+                0.0,
+                context.weights.environment_fit,
+                "missing environment affordances: " + ", ".join(missing),
+                excluded=True,
+            )
+        return ScoreComponent(
+            self.name,
+            1.0,
+            context.weights.environment_fit,
+            "all required environment affordances are present",
+        )
+
+
 class RiskCostScorer:
     name = "risk_cost"
 
@@ -329,6 +395,46 @@ class TrustScorer:
         )
 
 
+class FrozenExclusionScorer:
+    """Exclude a candidate whose plugin trust has been permanently frozen.
+
+    Defense in depth at the selection layer. ``TrustScorer`` only *scores* trust,
+    so a plugin frozen by an internal defect stays selectable for as long as it
+    remains registered -- "frozen implies never re-selected" holds today only
+    because ``LifecycleGovernor`` also quarantines (and thus unregisters) on the
+    same event. Any path that freezes trust without unregistering would leave the
+    plugin eligible; this scorer closes that independently of governance.
+
+    Not in ``_DEFAULT_SCORERS``: it is injected explicitly
+    (``CapabilityResolver(scorers=...)``), so default resolution is unchanged.
+    """
+
+    name = "frozen_exclusion"
+
+    def score(
+        self,
+        requirement: CapabilityRequirement,
+        candidate: CapabilityCandidate,
+        context: ResolverContext,
+    ) -> ScoreComponent:
+        ledger = context.trust_ledger
+        is_frozen = getattr(ledger, "is_frozen", None) if ledger is not None else None
+        if callable(is_frozen) and is_frozen(candidate.plugin_id):
+            return ScoreComponent(
+                self.name,
+                0.0,
+                context.weights.trust,
+                f"plugin {candidate.plugin_id!r} is frozen by an internal defect",
+                excluded=True,
+            )
+        return ScoreComponent(
+            self.name,
+            1.0,
+            context.weights.trust,
+            "plugin is not frozen",
+        )
+
+
 class ReliabilityScorer:
     name = "reliability"
 
@@ -361,6 +467,50 @@ class ReliabilityScorer:
         )
 
 
+class DistilledPreferenceScorer:
+    """Prefer the provider the teacher named in a ``rebind`` verdict.
+
+    This is channel C2, and until now the teacher's most frequent recommendation had
+    nowhere to land: a ``rebind`` naming ``chat_reply_v2_native`` reached the student as a
+    line of prose and the selection layer never heard about it. Measured on a real model,
+    ``rebind`` was the answer it reached for most readily -- so leaving it inert wasted the
+    verdict the loop produces most.
+
+    A preference, never a gate, and weighted below the structural scorers on purpose:
+
+    * It **adds** to a candidate's score rather than excluding its rivals, so a
+      recommendation cannot make an inadmissible candidate win -- affordance and frozen
+      exclusions still apply and still exclude.
+    * It cannot outvote a declaration. Hindsight is evidence about the world; a
+      declaration is a fact about the code, and when they disagree the code wins.
+    * It expires with the knowledge that produced it. The entry is retracted when the
+      capability recovers and superseded by the next verdict, so a stale preference stops
+      being read rather than having to be unlearned.
+    """
+
+    name = "distilled_preference"
+
+    def score(
+        self,
+        requirement: CapabilityRequirement,
+        candidate: CapabilityCandidate,
+        context: ResolverContext,
+    ) -> ScoreComponent:
+        preferred = dict(context.distilled_preferences).get(requirement.capability, "")
+        if not preferred:
+            return ScoreComponent(
+                self.name, 0.0, context.weights.distilled_preference, "no recommendation"
+            )
+        matched = preferred in (candidate.plugin_id, candidate.tool_name)
+        return ScoreComponent(
+            self.name,
+            1.0 if matched else 0.0,
+            context.weights.distilled_preference,
+            f"teacher recommended {preferred}"
+            + ("" if matched else f"; this candidate is {candidate.plugin_id}"),
+        )
+
+
 _DEFAULT_SCORERS: tuple[CapabilityScorer, ...] = (
     DeclaredMatchScorer(),
     EnvironmentFitScorer(),
@@ -376,10 +526,13 @@ class CapabilityResolver:
     def __init__(
         self,
         scorers: Sequence[CapabilityScorer] = _DEFAULT_SCORERS,
-        arbiter: CapabilityArbiter | None = None,
+        policy: SelectionPolicy | None = None,
     ) -> None:
         self._scorers = tuple(scorers)
-        self._arbiter = arbiter
+        # Greedy by default, which reproduces the selection this resolver made before
+        # the seam existed. Built directly rather than through the registry so a
+        # resolver constructed in a test needs no process-wide state.
+        self._policy: SelectionPolicy = policy or GreedyPolicy()
 
     def resolve_all(
         self,
@@ -396,7 +549,14 @@ class CapabilityResolver:
         candidates: Sequence[CapabilityCandidate],
         context: ResolverContext,
     ) -> CapabilityResolution:
-        """Score candidates and select the best eligible one."""
+        """Score every candidate, then let the policy choose among the admissible ones.
+
+        The split is the seam: scoring is per-candidate and stateless, selection sees
+        the whole admissible set and may carry state. Only ``eligible`` reaches the
+        policy -- a candidate excluded by a risk ceiling, a missing affordance or a
+        frozen plugin is filtered out first, so exploration can never reach a tool the
+        safety layer refused.
+        """
         scored = tuple(self._score_candidate(requirement, c, context) for c in candidates)
         eligible = tuple(c for c in scored if c.eligible)
         if not eligible:
@@ -406,22 +566,18 @@ class CapabilityResolver:
                 selected=None,
                 reason="no eligible candidate declared the required capability and environment fit",
             )
-        top_score = max(c.total_score for c in eligible)
-        tied = tuple(c for c in eligible if c.total_score == top_score)
-        arbitration_used = False
-        selected = self._stable_first(tied)
-        if len(tied) > 1 and self._arbiter is not None:
-            chosen = self._arbiter.choose(requirement, tied, context)
-            picked = next((c for c in tied if c.candidate.tool_name == chosen), None)
-            if picked is not None:
-                selected = picked
-                arbitration_used = True
+        outcome = self._policy.select(requirement, eligible, context)
         return CapabilityResolution(
             requirement=requirement,
             candidates=tuple(sorted(scored, key=self._sort_key)),
-            selected=selected,
-            arbitration_used=arbitration_used,
-            reason=f"selected {selected.candidate.tool_name!r} with score {selected.total_score:.3f}",
+            selected=outcome.selected,
+            arbitration_used=outcome.arbitration_used,
+            policy_id=outcome.policy_id,
+            explored=outcome.explored,
+            reason=(
+                f"selected {outcome.selected.candidate.tool_name!r} by "
+                f"{outcome.policy_id}: {outcome.reason}"
+            ),
         )
 
     def _score_candidate(
@@ -438,10 +594,6 @@ class CapabilityResolver:
     @staticmethod
     def _sort_key(score: CandidateScore) -> tuple[bool, float, str, str]:
         return (not score.eligible, -score.total_score, score.candidate.plugin_id, score.candidate.tool_name)
-
-    @staticmethod
-    def _stable_first(scores: Sequence[CandidateScore]) -> CandidateScore:
-        return sorted(scores, key=lambda s: (s.candidate.plugin_id, s.candidate.tool_name))[0]
 
 
 def candidates_from_registry(registry: Any) -> tuple[CapabilityCandidate, ...]:

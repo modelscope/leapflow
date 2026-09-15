@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Budget guard for the real end-to-end layer.
 
 The real layer earns the right to run on *every* push — never skipped by impact

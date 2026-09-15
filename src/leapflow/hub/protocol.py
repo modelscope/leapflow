@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hub protocol definitions — backend-agnostic types for cloud skill collaboration.
 
 Defines the HubBackend Protocol and all shared data structures used across

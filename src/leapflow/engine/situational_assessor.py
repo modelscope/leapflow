@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Pre-execution situational assessment for skill execution.
 
 Evaluates whether the current environment satisfies a skill's execution

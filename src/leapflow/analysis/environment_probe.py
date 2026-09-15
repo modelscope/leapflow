@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Structured environment probing for adaptive capability selection.
 
 The probe only observes explicit structural facts supplied by its caller:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for durable plugin trust persistence (Fix D2).
 
 Covers the DuckDB-backed ``PluginStatsStore`` round-trip, the

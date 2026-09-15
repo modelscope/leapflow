@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Versioned contract for the physical-signal payload the board renders.
 
 Separate from the code that fills it, because the two change for different

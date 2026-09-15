@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Idle (pause) detection for the Workflow Copilot.
 
 Identifies natural user pauses between operations and triggers predictive

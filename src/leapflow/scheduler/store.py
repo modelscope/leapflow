@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DuckDB-backed persistence for armed tasks.
 
 Provides atomic CRUD and query operations for the scheduler.

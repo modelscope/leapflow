@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """action_utils — in-sandbox X11/AT-SPI primitives driven via ``python -m``.
 
 One module, three functions, dispatched by function name:

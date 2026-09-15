@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Stateless scoring engine that produces plugin recommendations.
 
 Computed on-demand (when plugin_status is queried), not proactively.

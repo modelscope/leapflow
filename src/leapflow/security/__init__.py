@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Security module — redaction, threat scanning, approval, and trust boundary enforcement."""
 
 from leapflow.security.actions import ActionDescriptor, ActionEffect, ActionKind, ActionOrigin

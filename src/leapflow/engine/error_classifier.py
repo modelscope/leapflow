@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Error classification and recovery strategy for agent loops.
 
 Enhanced taxonomy inspired by hermes-agent/error_classifier.py:

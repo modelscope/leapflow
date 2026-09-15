@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LeapAppHarness — end-to-end orchestration of one LeapSpace task run.
 
 Loads a task config, lints it, boots a disposable sandbox, injects the

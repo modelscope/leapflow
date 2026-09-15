@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Credential rotation recovery strategy.
 
 Handles auth errors and rate limiting by rotating to alternate credentials

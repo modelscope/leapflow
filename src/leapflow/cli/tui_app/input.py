@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Slash-command completion for the TUI input area.
 
 Provides interactive slash-command suggestions for the TextArea widget.

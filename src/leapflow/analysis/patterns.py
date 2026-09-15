@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Extensible action pattern library for trajectory abstraction.
 
 Supports YAML-driven pattern definitions with wildcard matching,

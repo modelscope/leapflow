@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hardware Context Protocol -- safe agent operation of physical devices.
 
 The protocol splits device integration along the axis of what can be known:

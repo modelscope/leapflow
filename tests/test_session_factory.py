@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the Stage 3 per-session engine factory (P3-1).
 
 Proves the shallow-copy factory isolates the concurrency-corrupting substrate

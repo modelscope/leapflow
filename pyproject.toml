@@ -54,12 +54,13 @@ dashboard = ["aiohttp>=3.9"]
 # Better main-content extraction for web_fetch. Optional because the stdlib
 # extractor always ships: this upgrades quality, it does not enable the feature.
 web = ["trafilatura>=2.2"]
-
-# LeapSpace (src/leapspace) heavier dependencies. The package itself ships
-# with the leapflow distribution, but PyQt6/cua-sandbox/pydantic are only
-# installed with this group. Installed with
-# `uv sync --all-extras --group leapspace`.
-[dependency-groups]
+# LeapSpace (src/leapspace) — the optional CUA-sandbox app environment and
+# evaluation harness. Its code ships inside the leapflow distribution, but the
+# heavy PyQt6/cua-sandbox/pydantic stack is opt-in through this extra so the
+# default install stays light. Install it with
+# `pip install 'leapflow[leapspace]'` or `uv sync --extra leapspace`. The
+# default `--all-extras` syncs deliberately exclude it (`--no-extra leapspace`,
+# see Makefile/CI/setup.sh); `make space-sync` opts back in.
 leapspace = ["pyqt6>=6.7", "cua-sandbox", "pydantic>=2"]
 
 [project.scripts]
@@ -81,6 +82,11 @@ include = ["leapflow*", "leapspace*"]
 "leapflow.dashboard.templates" = ["*.yaml"]
 "leapflow.dashboard.static" = ["*"]
 "leapflow.plugins.dsh" = ["*.js"]
+# LeapSpace task directories are data, not importable packages (note the
+# non-identifier `task-001`). Auto-discovery already ships each task's
+# action.py; this keeps its config.yaml beside it so an installed example task
+# stays runnable rather than half-packaged.
+"leapspace.app_space.tasks.task-001" = ["*.yaml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

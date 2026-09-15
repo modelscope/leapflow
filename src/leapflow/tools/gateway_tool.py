@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Gateway tools for the agent — configuration AND messaging.
 
 Two tools:

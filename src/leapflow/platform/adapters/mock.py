@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Mock adapter for testing without a native host process."""
 
 from __future__ import annotations

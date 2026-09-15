@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Observation daemon — manages all observer lifecycles for 24/7 resident observation.
 
 ObservationDaemon is the single entry point for starting/stopping the entire

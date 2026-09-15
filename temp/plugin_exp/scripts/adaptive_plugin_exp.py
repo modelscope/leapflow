@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Deterministic adaptive plugin scenario-matrix experiment.
 
 This harness validates the adaptive decision layer above plugin lifecycle

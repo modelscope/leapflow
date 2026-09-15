@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Host resource probes: the one table both the host provider and transport read.
 
 The machine LeapFlow runs on is a device like any other -- it has quantities,

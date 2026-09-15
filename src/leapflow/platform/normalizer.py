@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Event normalization engine — transforms platform-specific raw events into SystemEvent."""
 
 from __future__ import annotations

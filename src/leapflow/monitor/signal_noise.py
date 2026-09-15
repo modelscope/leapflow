@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Signal noise gate for monitor and LeapBoard live-stream ingestion.
 
 This gate is intentionally *signal-attribute based* rather than natural-language
