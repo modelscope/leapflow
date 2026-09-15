@@ -5,8 +5,8 @@
 
 ### News
 
-- **2026-09-15**: v0.2.0 released — teacher/student world-model evolution: a cold-path teacher grades every session and distills what it learned about the environment into the student's next-turn context via four-value adaptation verdicts (absorb / rebind / acquire / escalate), with supersede/expire/retract knowledge retirement and a rebind-preference selection signal; capability acquisition (self-evolution) is a default-off, prominently surfaced `evolution.enabled` switch. 3,733 tests.
-- **2026-08-12**: v0.0.9 released — TUI thinking display (LLM reasoning surfaced in-place with spinner preview + final panel), approval bypass mode (`approval_bypass` config + session-wide "Allow ALL"), workspace boundary softened to approval-gated, long-task convergence hardening (false-progress fix, repeated-read gate, periodic checkpoint forcing, pre-compression knowledge extraction), cross-session task history (automatic session summaries + proactive history injection), dynamic tool registry rebuild for late-registered tools, terminal sessions enabled by default.
+- **2026-09-15**: v0.2.0 released — teacher/student world-model self-evolution: hindsight adaptation verdicts (absorb / rebind / acquire / escalate) distill environment knowledge into the student's context, rebind-based selection preference, and a default-off `evolution.enabled` switch. 3,733 tests.
+- **2026-08-12**: v0.0.9 released — TUI thinking display, approval bypass mode, approval-gated workspace boundary, long-task convergence hardening, cross-session task history, dynamic tool registry rebuild, and terminal sessions on by default.
 
 <details>
 <summary>Previous releases</summary>
