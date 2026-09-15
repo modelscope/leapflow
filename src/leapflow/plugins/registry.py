@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """ToolPluginRegistry — the single entry point for tool system initialization."""
 
 from __future__ import annotations

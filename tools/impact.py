@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Change-scoped test selection.
 
 Two separate jobs, with different economics:

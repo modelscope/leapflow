@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Static checks for a task's action.py (structure + import safety).
 
 Dual use: CLI (``python -m leapspace.app_space.action_lint <config_path>``) and harness

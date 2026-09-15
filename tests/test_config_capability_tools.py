@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Guards for the config capability and the path boundaries around it.
 
 The scenario these lock down: a user asks to change ``llm.model`` from inside an
@@ -163,6 +164,40 @@ def test_config_set_never_echoes_a_secret(cfg_home) -> None:
     assert result["ok"] is True
     assert "value" not in result
     assert "sk-must-not-echo" not in str(result)
+
+
+def test_config_set_declares_the_value_the_key_now_holds(cfg_home) -> None:
+    """The effect channel: what was observed, not what was asked for.
+
+    A capability that claims to change configuration can only be *verified* if the
+    handler says what the key now holds. Without it the verdict abstains, and the
+    board reports an abstention it cannot attribute.
+    """
+    result = asyncio.run(
+        config_tools.config_set_handler({"key": "llm.model", "value": "qwen3.8-max"})
+    )
+
+    assert result["ok"] is True
+    assert "qwen3.8-max" in result["observed_effect"]
+    assert "llm.model" in result["observed_effect"]
+
+
+def test_the_effect_declaration_redacts_a_secret_like_the_payload(cfg_home) -> None:
+    """An effect declaration is transcript too, so it obeys the same redaction rule.
+
+    The value is withheld while the change is still reported -- otherwise a secret
+    write would be indistinguishable from a tool that said nothing, and would be
+    counted as an abstention rather than a confirmation.
+    """
+    result = asyncio.run(
+        config_tools.config_set_handler({"key": "llm.api_key", "value": "sk-must-not-echo"})
+    )
+
+    assert result["ok"] is True
+    effect = result["observed_effect"]
+    assert "sk-must-not-echo" not in effect
+    assert "llm.api_key" in effect
+    assert "updated" in effect
 
 
 def test_config_set_requires_key_and_value(cfg_home) -> None:

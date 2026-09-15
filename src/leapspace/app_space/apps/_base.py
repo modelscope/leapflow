@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """BaseLeapApp — abstract base for all LeapSpace scenario apps.
 
 Contract:

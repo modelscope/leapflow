@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shell-style argument tokenization that survives Windows paths."""
 
 from __future__ import annotations

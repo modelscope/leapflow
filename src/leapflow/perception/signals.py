@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Signal buffer — accumulates interaction signals between frame stores.
 
 Signals are lightweight temporal anchors (click coords, app switches, clipboard

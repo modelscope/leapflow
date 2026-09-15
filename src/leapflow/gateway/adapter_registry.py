@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Gateway Adapter Plugin Registry.
 
 Provides discovery, registration, and lifecycle management for platform adapters.

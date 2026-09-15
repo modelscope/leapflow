@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Structured YAML configuration loader for LeapFlow.
 
 The loader treats YAML files as the long-lived configuration source and process

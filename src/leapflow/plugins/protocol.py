@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """ToolPlugin Protocol — the unified contract for tool plugin modules."""
 
 from __future__ import annotations

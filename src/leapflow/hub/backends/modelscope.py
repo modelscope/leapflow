@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """ModelScope Hub backend implementation.
 
 Provides push/pull/search operations against ModelScope Hub (modelscope.cn).

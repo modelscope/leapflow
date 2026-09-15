@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """The physical-bench board: contract, derivation, wiring, and what it renders.
 
 Grouped by the claim each assertion defends rather than by module, because the

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Streaming LLM output renderer — Application-compatible.
 
 Accumulates streaming token deltas, tracks tool call state, and

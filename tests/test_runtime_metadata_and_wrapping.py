@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Guards for runtime metadata reporting and long-output rendering.
 
 Two failures that kept coming back, both because a value was read from the wrong

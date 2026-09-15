@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Durable store for framework-evolution traces.
 
 ⚠️ Not to be confused with :mod:`leapflow.storage.evolution_store`, whose

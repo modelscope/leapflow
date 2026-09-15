@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Core protocol and data-type definitions for the Workflow Copilot module.
 
 Defines the shared vocabulary of immutable data objects and structural

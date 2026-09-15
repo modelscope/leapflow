@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Built-in clipboard manager skill."""
 
 from __future__ import annotations

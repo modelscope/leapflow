@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DashboardIntent: the single normalized request behind ``/board`` and the tool.
 
 The **template** is the primary view dimension (a rendering lens). Most templates

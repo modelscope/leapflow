@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """ViewSpec: the declarative, validated UI contract for the dashboard (SDUI).
 
 A ViewSpec is a JSON-serializable tree of components drawn from a fixed,

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Precise code intelligence for the agent loop.
 
 Currently provides ``symbols`` (document outline): for Python files an ``ast``

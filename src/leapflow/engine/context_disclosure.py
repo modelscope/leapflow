@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Progressive context disclosure for unified agent turns.
 
 This module decides how much runtime context a turn should disclose before the

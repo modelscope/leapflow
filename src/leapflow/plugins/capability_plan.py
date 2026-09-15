@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Capability orchestration plan derived from selected plugin candidates.
 
 The plan is intentionally declarative. It describes dependency order and risk

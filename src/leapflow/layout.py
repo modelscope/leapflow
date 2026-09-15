@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Canonical filesystem layout for LeapFlow runtime data.
 
 This module is the single source of truth for paths under the LeapFlow data
@@ -429,6 +430,14 @@ class ProfileLayout:
     def plugin_outcomes_path(self) -> Path:
         # Profile-scoped execution outcome audit for adaptive plugin lifecycle governance.
         return self.root / "plugins" / "outcomes.json"
+
+    @property
+    def distilled_knowledge_path(self) -> Path:
+        # Profile-scoped store for what the teacher distilled about the environment.
+        # Beside the other capability state because it shares their lifecycle: it is
+        # learned per profile, describes that profile's world, and is meaningless to
+        # copy elsewhere.
+        return self.root / "plugins" / "distilled_knowledge.json"
 
     @property
     def capability_plans_path(self) -> Path:

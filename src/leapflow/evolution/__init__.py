@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Evolution ledger: the causal view of how the framework changed itself.
 
 Two halves that meet at :class:`~leapflow.domain.evolution_trace.EvolutionEpisode`:

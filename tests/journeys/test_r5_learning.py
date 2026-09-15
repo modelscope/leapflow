@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """R5 — the learning loop: teach → record → stop → distill → skill visible.
 
 Progressive Trust starts at recording, so the loop only means something if each

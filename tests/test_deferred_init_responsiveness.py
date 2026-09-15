@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Regression tests for the first-command timeout fix.
 
 Root cause: ``Context.initialize_deferred()`` was a ~550-line async function

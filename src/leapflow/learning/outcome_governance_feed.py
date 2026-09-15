@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Feed execution outcomes into lifecycle governance without touching the hot path.
 
 Trust already accrues in production: ``TurnUsageTracker.record_tool_call`` forwards

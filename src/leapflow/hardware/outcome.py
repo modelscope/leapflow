@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Physical outcome learning: commanded value in, numeric prediction error out.
 
 This is where the physical domain earns its keep. In the UI domain "was the prediction

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DuckDB health check and self-repair — corrupt detection + automatic backup.
 
 Provides:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Compute backend protocol for cloud task execution.
 
 Defines the abstract interface that all compute backends must implement.

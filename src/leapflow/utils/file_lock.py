@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cross-platform exclusive advisory locking on open files.
 
 POSIX systems provide ``fcntl.flock`` (advisory, whole-file, released when

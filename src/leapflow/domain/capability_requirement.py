@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Domain records for adaptive capability requirements.
 
 A requirement describes what LeapFlow needs, not which concrete tool should be

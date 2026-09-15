@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """P2 collection layer: the tap, the sink, the trace store, and the four probes.
 
 The probes exist for one reason: to record facts that no store retains. So the

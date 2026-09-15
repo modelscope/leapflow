@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cassette store: request fingerprinting, persistence, and miss diagnostics.
 
 A cassette is one recorded OpenAI-compatible HTTP exchange. Recording real

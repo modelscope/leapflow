@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for ActiveSignalSource protocol, ActiveSourceManager, and FileWatchSignalSource.
 
 Verifies lifecycle management, signal flow, failure isolation, backpressure,

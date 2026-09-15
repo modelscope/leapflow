@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for structured capability observations."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Test-facing protocols and reusable conformance suite for hardware transports.
 
 This module holds no pytest dependency and nothing heavier than the standard

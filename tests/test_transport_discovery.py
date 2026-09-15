@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Entry-point discovery for out-of-tree transport kinds.
 
 Exercises ``_discover_entry_points()`` in isolation and through the public API,

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Stage C: Context-Enriched VLM Extractor — action inference from frame pairs."""
 
 from __future__ import annotations

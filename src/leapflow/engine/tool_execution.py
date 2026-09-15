@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tool execution identity, policy, and idempotency ledger."""
 from __future__ import annotations
 

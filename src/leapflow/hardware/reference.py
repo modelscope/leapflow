@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Deterministic reference-document renderer.
 
 Turns a ``HardwareContext`` into the text an agent reads before operating a

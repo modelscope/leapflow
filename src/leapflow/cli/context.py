@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """CLI runtime context — assembles and manages the LeapFlow component graph."""
 
 from __future__ import annotations
@@ -1344,7 +1345,11 @@ class Context:
         try:
             from leapflow.hardware.trust import HardwareTrustGate
 
-            plugin_trust = getattr(self, "_plugin_trust_ledger", None)
+            # The durable ledger, not an attribute nothing assigns. This read was
+            # always ``None``, so the comment above described a link that never
+            # existed: hardware trust events could not reach plugin governance, and
+            # the trust-based approval exemption had nothing to exempt against.
+            plugin_trust = self._process_trust_ledger()
             self._hardware_trust_gate = HardwareTrustGate(
                 plugin_trust_ledger=plugin_trust,
             )
@@ -3079,6 +3084,155 @@ class Context:
         except Exception:
             logger.debug("session summary persistence failed", exc_info=True)
 
+    def _capability_observation_service(self):
+        """The one durable observation service, shared by every producer.
+
+        Built once and reused, because the degradation sink writes evidence here and the
+        world-model driver reads requirements from here. Two instances over the same file
+        would appear to work -- each writes and each reads -- while the classifier's
+        accepted-kind gate and the in-memory view diverge, so evidence admitted by one
+        would be invisible to the other.
+        """
+        existing = getattr(self, "_observation_service", None)
+        if existing is not None:
+            return existing
+        from leapflow.learning.capability_observation import (
+            CapabilityEvidenceClassifier,
+            CapabilityObservationService,
+        )
+        from leapflow.storage.capability_observation_store import (
+            JsonCapabilityObservationStore,
+        )
+
+        settings = self.settings
+        profile_layout = getattr(settings, "profile_layout", None)
+        if profile_layout is None:
+            return None
+        self._observation_service = CapabilityObservationService(
+            JsonCapabilityObservationStore(profile_layout.capability_observations_path),
+            classifier=CapabilityEvidenceClassifier.from_settings(settings),
+        )
+        return self._observation_service
+
+    def _current_environment_dict(self):
+        """The environment evidence is recorded against.
+
+        Carried with each degradation so one application upgrade that breaks N
+        capabilities is recognisable as one transition rather than N coincidences -- the
+        teacher can then answer once, and usually with a rebind rather than N rebuilds.
+        """
+        try:
+            from leapflow.domain.environment_fingerprint import EnvironmentFingerprint
+            from leapflow.domain.platform import PlatformManifest
+
+            return EnvironmentFingerprint.from_platform_manifest(
+                PlatformManifest.default_darwin(),
+                workspace_root=str(getattr(self.settings, "workspace_root", "") or ""),
+            ).to_dict()
+        except (ImportError, AttributeError, TypeError, ValueError):
+            logger.debug("environment fingerprint unavailable", exc_info=True)
+            return {}
+
+    def _current_affordances(self):
+        """App-level affordances the task environment currently offers.
+
+        Empty when unknown, and an empty set deliberately reads as "cannot judge" rather
+        than "nothing is available": treating an undescribed environment as offering
+        nothing would mark every alternative unusable and push every verdict toward
+        acquire, which is the expensive direction.
+        """
+        environment = self._current_environment_dict()
+        return tuple(environment.get("platform_capabilities") or ())
+
+    def _resolve_lifecycle_governor(self):
+        """Build the lifecycle governor once, lazily, with its degradation sink.
+
+        This was ``getattr(self, "lifecycle_governor", None)`` against an attribute
+        nothing ever assigned, so the sweep ran with ``governor=None`` and
+        ``record_outcome`` was never called in production. Trust never moved, quarantine
+        never drained, and the degradation evidence the teacher prompt and the challenger
+        path were built to consume was never produced -- with the whole suite green,
+        because every unit test constructs the governor itself. The defect was in the
+        wiring, which is the one thing a unit test cannot see.
+
+        Returns ``None`` when the profile layout is absent, the only legitimate reason to
+        run without governance: there is nowhere durable to record it.
+
+        An injected ``lifecycle_governor`` still wins. That attribute was never wrong as a
+        substitution seam -- it was wrong as the *only* source, which is why production,
+        injecting nothing, ran without governance at all.
+        """
+        injected = getattr(self, "lifecycle_governor", None)
+        if injected is not None:
+            return injected
+        existing = getattr(self, "_lifecycle_governor", None)
+        if existing is not None:
+            return existing
+        settings = self.settings
+        profile_layout = getattr(settings, "profile_layout", None)
+        if profile_layout is None:
+            return None
+        try:
+            from leapflow.learning.degradation_sink import build_degradation_sink
+            from leapflow.plugins import get_registry
+            from leapflow.plugins.lifecycle_governor import LifecycleGovernor
+            from leapflow.storage.capability_proposal_queue import (
+                JsonCapabilityProposalQueue,
+            )
+            from leapflow.storage.distilled_knowledge_store import (
+                JsonDistilledKnowledgeStore,
+            )
+            from leapflow.storage.plugin_outcome_store import JsonPluginOutcomeStore
+
+            intake = self._capability_observation_service()
+            if intake is None:
+                return None
+            knowledge_store = JsonDistilledKnowledgeStore(
+                profile_layout.distilled_knowledge_path,
+                ttl_seconds=float(
+                    getattr(settings, "distilled_knowledge_ttl_s", 0.0) or 0.0
+                ),
+            )
+            self._lifecycle_governor = LifecycleGovernor(
+                proposal_queue=JsonCapabilityProposalQueue(
+                    profile_layout.capability_proposal_queue_path
+                ),
+                outcome_store=JsonPluginOutcomeStore(profile_layout.plugin_outcomes_path),
+                # The process ledger, hydrated from DuckDB -- not a fresh one. Letting
+                # the governor default to its own would give one process two divergent
+                # views of trust: the transitions it computed would land in a throwaway
+                # object while the persistent ledger the advisor and disclosure read
+                # stayed at DRAFT forever, so no plugin could ever earn PRODUCTION.
+                trust_ledger=self._process_trust_ledger(),
+                # Plugin health becomes capability evidence here, because the governor
+                # holds no registry and a capability is what a rival can be built for.
+                degradation_sink=build_degradation_sink(
+                    intake=intake,
+                    registry_provider=get_registry,
+                    knowledge_store=knowledge_store,
+                    environment_provider=self._current_environment_dict,
+                ),
+            )
+        except (ImportError, AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            logger.debug("lifecycle governor unavailable", exc_info=True)
+            return None
+        return self._lifecycle_governor
+
+    def _process_trust_ledger(self):
+        """The durable trust ledger, or ``None`` if governance was never composed.
+
+        Reached through the process-global advisor rather than an attribute, because that
+        is where ``session_factory`` puts the ledger it hydrated from DuckDB. Progressive
+        Trust is only progressive if the levels survive the process.
+        """
+        try:
+            from leapflow.learning.plugin_advisor import get_default_advisor
+
+            advisor = get_default_advisor()
+        except ImportError:
+            return None
+        return getattr(advisor, "_trust_ledger", None) if advisor is not None else None
+
     async def _run_coevolution_sweep(self):
         """Cold-path governance sweep: verify effects, drain quarantine, find residue.
 
@@ -3103,7 +3257,7 @@ class Context:
             # The process tracker, not a private one: the tool-outcome sink increments
             # that instance, so a sweep with its own would drain something nobody fed.
             sweep = CoevolutionSweep(
-                governor=getattr(self, "lifecycle_governor", None),
+                governor=self._resolve_lifecycle_governor(),
                 tracker=getattr(self, "_quarantine_tracker", None)
                 or current_quarantine_tracker(),
             )
@@ -3133,25 +3287,69 @@ class Context:
         driver never writes around that gate.
         """
         try:
-            from leapflow.learning.capability_observation import (
-                CapabilityEvidenceClassifier,
-                CapabilityObservationService,
+            from leapflow.learning.degradation_sink import (
+                build_alternatives_provider,
+                build_proposal_sink,
             )
+            from leapflow.plugins import get_registry
             from leapflow.learning.world_model_driver import WorldModelEvolutionDriver
-            from leapflow.storage.capability_observation_store import (
-                JsonCapabilityObservationStore,
+            from leapflow.storage.capability_proposal_queue import (
+                JsonCapabilityProposalQueue,
+            )
+            from leapflow.storage.distilled_knowledge_store import (
+                JsonDistilledKnowledgeStore,
             )
 
             settings = self.settings
             profile_layout = getattr(settings, "profile_layout", None)
             if profile_layout is None or self.trajectory_grader is None:
                 return None
-            service = CapabilityObservationService(
-                JsonCapabilityObservationStore(profile_layout.capability_observations_path),
-                classifier=CapabilityEvidenceClassifier.from_settings(settings),
-            )
+            # The shared service, so the requirements the teacher reads are the ones
+            # the degradation sink wrote.
+            service = self._capability_observation_service()
+            if service is None:
+                return None
             driver = WorldModelEvolutionDriver(
-                teacher=self.trajectory_grader, intake=service
+                teacher=self.trajectory_grader,
+                intake=service,
+                # The C1 channel. Without it the cheap verdicts are graded, traced and
+                # discarded, so the teacher judges correctly and the next session
+                # repeats the same mistake.
+                knowledge_store=JsonDistilledKnowledgeStore(
+                    profile_layout.distilled_knowledge_path,
+                    ttl_seconds=float(
+                        getattr(settings, "distilled_knowledge_ttl_s", 0.0) or 0.0
+                    ),
+                ),
+                # The last hop of the acquisition chain. Without it an ``acquire``
+                # verdict became a requirement and stopped: resolution reported the
+                # capability unmet forever and the only verdict that leads to code had
+                # no effect. Queueing is not acting -- the queue is read by the
+                # dashboard and the self-management tools, which gate on approval.
+                # The fact the rebind/acquire choice is defined by. A teacher that
+                # cannot see whether another provider exists is guessing between them.
+                alternatives_for=build_alternatives_provider(
+                    registry_provider=get_registry,
+                    affordances_provider=self._current_affordances,
+                ),
+                # The last hop of the acquisition chain, and the one the switch governs.
+                # Queueing is still not acting -- the queue is read by the dashboard and the
+                # self-management tools, which gate on approval -- so this is the outermost
+                # of several gates rather than the only one.
+                #
+                # ``None`` when self-evolution is off, which says more than an empty queue
+                # would: the teacher still judges and still records that nothing installed
+                # can serve the capability, and that conclusion reaches the user as
+                # knowledge instead of as a proposal to build something.
+                proposal_sink=(
+                    build_proposal_sink(
+                        queue=JsonCapabilityProposalQueue(
+                            profile_layout.capability_proposal_queue_path
+                        ),
+                    )
+                    if getattr(settings, "evolution_enabled", False)
+                    else None
+                ),
             )
             return await driver.drive(
                 trajectory,

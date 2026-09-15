@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Multi-stage context compression pipeline (Chain of Responsibility).
 
 Four stages applied in order, each only activating when token budget is exceeded:

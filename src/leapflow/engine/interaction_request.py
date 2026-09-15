@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Interaction request types for the agent loop recovery subsystem.
 
 When automated recovery is insufficient (e.g., permissions, credentials,

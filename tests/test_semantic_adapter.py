@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """SemanticAdapter window-target and element_index addressing.
 
 Drives the real SemanticAdapter over the mock perception/execution adapters

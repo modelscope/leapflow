@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """The ``hardware`` monitor domain: one finding per cycle, carrying the digest.
 
 The only file here with a side effect, and the only one the daemon wires. It

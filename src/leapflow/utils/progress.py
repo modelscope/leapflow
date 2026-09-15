@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Verbose progress reporters for multi-stage pipelines (CLI-friendly).
 
 Originally extracted from ``leapflow.cli.helpers``. These reporters print

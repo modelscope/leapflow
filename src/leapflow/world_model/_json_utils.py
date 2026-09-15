@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared JSON extraction for world model modules."""
 
 from __future__ import annotations

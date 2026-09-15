@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Async event reorder buffer for correcting cross-source arrival inversions.
 
 Events produced by different observer threads (CGEvent tap, app focus,

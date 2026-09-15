@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """World Model — train-free curiosity-driven predictive learning.
 
 Provides the Predict → Execute → Compare → Learn loop,

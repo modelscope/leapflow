@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """F7 / F8: concurrent workspaces, and the fiber lifecycle of the changed contracts.
 
 **F7 (MANDATORY).** This work introduced process-global governance state, so AGENTS.md

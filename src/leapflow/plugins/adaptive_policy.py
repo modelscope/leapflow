@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Policy decisions for adaptive plugin evolution.
 
 The policy is intentionally metadata-driven. It never inspects natural-language

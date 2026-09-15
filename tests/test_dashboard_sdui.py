@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for the dashboard SDUI core: ViewSpec, templates, intent."""
 
 from __future__ import annotations

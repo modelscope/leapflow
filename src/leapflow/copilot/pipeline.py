@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """SpeculativePipeline — proactive prediction cache with tiered warming.
 
 Implements the "predict-before-idle" strategy: when an action is observed,

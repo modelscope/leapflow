@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Gateway event checkpoint persistence.
 
 Stores the last-consumed event_id per platform so event sources can

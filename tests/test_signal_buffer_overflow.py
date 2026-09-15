@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for SignalBuffer overflow observability (dropped_count tracking)."""
 from __future__ import annotations
 

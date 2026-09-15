@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Long-run persistence properties of :class:`ReadingStore`, in milliseconds.
 
 A bench that runs for a shift or a week is where storage either stays bounded or

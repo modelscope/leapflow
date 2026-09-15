@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LedgerEvolutionSink: accept traces on the hot side, persist on the cold side.
 
 The probe's contract is "accept and return", so ``record`` only appends to a bounded

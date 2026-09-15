@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """app_space — the LeapSpace core: actor, task config, lint, and the apps.
 
 Kept import-light on purpose: ``leapspace.app_space`` itself must import

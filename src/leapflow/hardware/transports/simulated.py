@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Parameterised simulation transport for end-to-end and long-running tests.
 
 Like :mod:`leapflow.hardware.transports.mock`, this transport is entirely

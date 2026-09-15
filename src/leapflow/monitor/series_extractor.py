@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Extract structured chart data from a session's captured tool outputs.
 
 Signal-driven and anti-hallucination: this reads ONLY what the session already

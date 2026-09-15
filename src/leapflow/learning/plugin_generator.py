@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LLM-driven plugin code generation and validation.
 
 The capstone of LeapFlow's self-evolution: the Agent can propose a new plugin,
@@ -54,6 +55,11 @@ class PluginGenerationRequest:
     plugin_id: str
     description: str  # natural-language description of what the plugin should do
     plugin_type: str = "tool"  # "tool" | "active_signal_source"
+    #: Declared capability names the generated plugin must provide, in the same dotted
+    #: vocabulary existing tools use. Without this a generated plugin declares nothing,
+    #: and ``DeclaredMatchScorer`` excludes it from every resolution -- so the framework
+    #: would build a capability it can then never select.
+    provides_capabilities: tuple[str, ...] = ()
 
 
 class PluginValidator:
@@ -328,6 +334,11 @@ class PluginGenerator:
         The prompt includes the ToolPlugin Protocol contract and an example,
         so the LLM generates conformant code.
         """
+        # Rendered as a Python literal so the model can copy it verbatim. An empty
+        # request yields ``()``, which is honest: the caller declared no capability, so
+        # the prompt must not invent one. Callers that resolve a capability gap always
+        # have the name and are expected to pass it.
+        capabilities_literal = repr(tuple(request.provides_capabilities))
         return f"""Generate a Python ToolPlugin for LeapFlow.
 
 Plugin ID: {request.plugin_id}
@@ -347,12 +358,17 @@ The plugin MUST:
 6. Import from: from leapflow.plugins.protocol import ToolMetadata, ToolPlugin
 7. NO dangerous operations (no eval/exec/os.system/file deletion at import time)
 8. All handlers are async functions taking **kwargs and returning a dict
-9. On success, every handler MUST report what it observably did in an "effect" key,
-   phrased in the same terms as the requirement above (e.g.
-   {{"ok": True, "effect": "the reply was delivered to the thread"}}). This is how the
+9. On success, every handler MUST report what it observably did in an "observed_effect"
+   key, phrased in the same terms as the requirement above (e.g.
+   {{"ok": True, "observed_effect": "the reply was delivered to the thread"}}). This is how the
    framework confirms the capability actually worked rather than merely returned; a
    handler that omits it can never be verified, only refuted. Describe the observed
    outcome, never restate the intent.
+10. Every ToolMetadata MUST set provides_capabilities to exactly this tuple:
+   {capabilities_literal}
+   These are the declared capability names the framework resolves against. A tool that
+   omits them is excluded from every capability resolution, so the plugin would be
+   installed and then never selected. Do not invent additional names.
 
 Example structure:
 ```python
@@ -369,9 +385,9 @@ class MyPlugin:
     def bind_runtime(self, **deps: Any) -> None: pass
     @property
     def tools(self) -> list[ToolMetadata]:
-        return [ToolMetadata(name="...", description="...", parameters_schema={{"type":"object","properties":{{}}}}, handler=self._handler, x_leapflow={{"category":"custom","risk_level":"read_only"}})]
+        return [ToolMetadata(name="...", description="...", parameters_schema={{"type":"object","properties":{{}}}}, handler=self._handler, x_leapflow={{"category":"custom","risk_level":"read_only"}}, provides_capabilities={capabilities_literal})]
     async def _handler(self, **kwargs: Any) -> dict:
-        return {{"ok": True, "effect": "<what observably changed>"}}
+        return {{"ok": True, "observed_effect": "<what observably changed>"}}
 
 plugin = MyPlugin()
 ```

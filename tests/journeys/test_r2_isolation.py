@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """R2 — concurrency and session identity across two workspaces on one daemon.
 
 Several TUIs in different workspaces sharing one leapd is a supported way to use

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """3-tier causal inference engine.
 
 Tier 1: Rule-based (deterministic, zero cost, confidence ≥ 0.9)

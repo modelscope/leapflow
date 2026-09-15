@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """A-r1 / A-r2: the sweep's inputs are produced by the real production paths.
 
 Phase A gave the sweep a call site but nothing fed it, so it correctly emitted three

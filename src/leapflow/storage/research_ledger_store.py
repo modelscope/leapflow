@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DuckDB-backed persistence for the per-session research ledger (S1).
 
 Durable Orient: the structured long-task state (findings, open questions,

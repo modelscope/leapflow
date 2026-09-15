@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """AttentionTuner — bridges world model learning signals to attention filter parameters.
 
 Provides the meta-cognitive feedback loop for the attention mechanism:

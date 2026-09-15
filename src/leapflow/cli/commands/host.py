@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Platform driver lifecycle management commands — cua-driver + ObservationDaemon.
 
 Manages the cua-driver execution layer and ObservationDaemon background

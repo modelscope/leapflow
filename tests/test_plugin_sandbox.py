@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the plugin sandbox (process isolation for untrusted plugins)."""
 
 from __future__ import annotations

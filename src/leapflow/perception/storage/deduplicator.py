@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Frame deduplication — online hash check and offline clustering."""
 
 from __future__ import annotations

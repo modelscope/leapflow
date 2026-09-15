@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Video segment splitter for multi-scale VLM analysis.
 
 Splits recorded video segments into semantically coherent analysis

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LeapSpace — the self-evolving app environment and evaluation harness.
 
 The code lives in the ``leapspace.app_space`` submodule (actor, task config,

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Prometheus-style metrics exporter for hardware observability.
 
 Maps ``ReadingStore`` and ``HardwareStreamSource`` counters to named gauge and

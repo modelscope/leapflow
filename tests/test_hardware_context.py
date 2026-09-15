@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hardware context domain model and registry admission rules.
 
 Admission is where a declaration becomes something the agent may act on, so each

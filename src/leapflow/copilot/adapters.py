@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Memory Bridge Adapters — connect Copilot prediction layers to the Memory system.
 
 Each adapter implements a Copilot Protocol using a Memory provider as its backend,

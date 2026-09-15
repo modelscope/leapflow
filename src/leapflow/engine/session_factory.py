@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Session-scoped engine factory for concurrent, isolated turn execution (Stage 3).
 
 Builds a per-session ``AgentEngine`` that SHARES the base engine's stateless /

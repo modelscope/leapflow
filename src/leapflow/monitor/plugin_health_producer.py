@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Plugin health monitoring producer.
 
 Emits Monitor Findings when plugin trust degrades or error rate spikes,

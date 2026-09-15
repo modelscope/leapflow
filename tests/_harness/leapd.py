@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Spawn and drive a real ``leapd`` subprocess for end-to-end journeys.
 
 Journeys talk to the daemon over its actual Unix-socket RPC, because that is the

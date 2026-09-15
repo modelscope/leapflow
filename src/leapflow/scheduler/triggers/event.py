@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Event-based trigger: fires when an external event matches a pattern."""
 
 from __future__ import annotations

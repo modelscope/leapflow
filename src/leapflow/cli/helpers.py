@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared CLI utilities — recording animation, guards, perceptual-field helpers.
 
 Progress reporters and stage configs have been relocated to

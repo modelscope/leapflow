@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Thinking mode disable recovery strategy.
 
 Handles format errors by disabling the LLM's thinking/reasoning mode

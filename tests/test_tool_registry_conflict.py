@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unit tests for tool-name conflict arbitration in ToolPluginRegistry.
 
 Tool names are a single global namespace consumed by the provider: two plugins

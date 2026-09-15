@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LLM-driven skill code generation from distillation candidates.
 
 Transforms DistillationCandidate (descriptive JSON) into executable Python async functions

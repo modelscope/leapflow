@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Per-turn tool execution context for workspace-scoped safety.
 
 Daemon-backed turns from different TUI clients may share one Python process but

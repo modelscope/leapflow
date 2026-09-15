@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Desktop semantic tools plugin — exposes SemanticAdapter tools to the unified tool system.
 
 Landing C: this plugin is the single registration site for semantic desktop

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Content extraction for fetched web responses.
 
 A fetch tool that hands raw markup to the model is not usable: a single page can

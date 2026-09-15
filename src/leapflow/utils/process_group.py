@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cross-platform process-group termination.
 
 POSIX process groups and Windows job objects play the same role: a

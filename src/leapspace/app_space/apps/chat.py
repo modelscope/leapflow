@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LeapChat — LeapSpace mock chat app (PyQt6, BaseLeapApp contract).
 
 Communication is mocked: outbound messages only append to local state;

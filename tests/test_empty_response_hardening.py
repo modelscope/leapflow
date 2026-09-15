@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Regression tests for empty-LLM-response hardening (P0-A1).
 
 Root cause (observed as "I processed your request but have no additional

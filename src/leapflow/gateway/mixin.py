@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Default implementations for optional ``PlatformAdapter`` capabilities.
 
 Adapters mix this in to get graceful degradation for methods they do not

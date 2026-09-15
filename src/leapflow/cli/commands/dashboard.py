@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """`leap board` — open or serve the LeapBoard monitoring web dashboard.
 
 Two modes:

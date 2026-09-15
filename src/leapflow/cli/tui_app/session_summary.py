@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Exit summary helpers for interactive TUI sessions."""
 
 from __future__ import annotations

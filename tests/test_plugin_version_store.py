@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for profile-scoped plugin version store."""
 from __future__ import annotations
 

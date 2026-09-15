@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Command lifecycle primitives for the interactive TUI.
 
 The module is intentionally UI-framework agnostic: it models submitted user

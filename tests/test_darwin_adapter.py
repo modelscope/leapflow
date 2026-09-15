@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the Darwin platform adapter.
 
 Verifies that each port exposed by DarwinPerceptionAdapter and

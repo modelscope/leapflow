@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Reusable backend event source implementations."""
 from __future__ import annotations
 

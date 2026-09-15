@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cross-app context tracking for workflow hypothesis generation.
 
 Maintains a stateful model of app transitions, clipboard carry payloads,

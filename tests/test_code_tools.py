@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the P0 coding built-in tools: code_search, file_find, edit_file.
 
 Handlers are pure async functions (params dict -> result dict); exercised

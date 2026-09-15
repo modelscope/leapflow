@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for Cordis P1: dependency-driven fiber activation and bind ordering.
 
 Two behaviours are covered:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """The cold-path co-evolution sweep: verify, govern, reclaim.
 
 Three capabilities existed in the tree with no caller, which the evolution
@@ -146,11 +147,54 @@ class CoevolutionSweep:
                 summary=f"{verdict.capability}: {verdict.reason}",
                 detail=verdict.to_dict(),
             )
+            # The feedback edge. Every verdict reaches the selection policy,
+            # including the abstaining ones -- a policy has to see the abstention to
+            # leave its posterior alone, and hiding it here would make "no
+            # information" indistinguishable from "never selected".
+            self._report_to_policy(requirement, verdict)
             # Only a decided verdict may move trust; "unverifiable" must not
             # quarantine a plugin for a missing declaration.
             if verdict.should_record_outcome:
                 await self._record(verdict)
         return tuple(verdicts)
+
+    @staticmethod
+    def _report_to_policy(requirement: CapabilityRequirement, verdict: EffectVerdict) -> None:
+        """Tell the active selection policy what came of its choice.
+
+        The edge that was missing: verdicts fed governance (trust, quarantine) but
+        never the component that made the selection, so no policy could ever learn
+        from its own decisions. Wired for every policy, with the shipped ``greedy``
+        ignoring it, so adding a learning policy is a new file and a config value
+        rather than a change here.
+
+        The reward is three-valued and carries its source: an execution result and a
+        verified effect answer different questions, and a policy may weight them
+        differently. ``value is None`` means abstain, never failure.
+        """
+        try:
+            from leapflow.plugins.selection_policy import RewardSignal
+            from leapflow.plugins.selection_policy_registry import (
+                get_selection_policy_registry,
+            )
+
+            # ``current``, never ``activate``: this is a reporter. Creating the policy
+            # here would cache one with no host dependencies and beat the component
+            # that actually selects to the slot. No active policy means nothing has
+            # selected yet, so there is no decision to report on.
+            policy = get_selection_policy_registry().current()
+            if policy is None:
+                return
+            policy.observe(
+                requirement,
+                verdict.plugin_id,
+                RewardSignal(
+                    value=None if verdict.verified is None else float(bool(verdict.verified)),
+                    source=verdict.reason,
+                ),
+            )
+        except Exception:  # noqa: BLE001 - learning must not break the sweep
+            logger.debug("sweep: selection policy did not accept a verdict", exc_info=True)
 
     async def _record(self, verdict: EffectVerdict) -> None:
         """Feed a decided verdict into trust/lifecycle governance."""

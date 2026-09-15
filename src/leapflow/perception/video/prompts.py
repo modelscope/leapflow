@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Video analysis prompt strategies and VLM message builders.
 
 Follows Open/Closed Principle: extend via new implementations,

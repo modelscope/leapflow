@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Provider factory table -- the context half of the pluggability mechanism.
 
 A provider answers "where does device knowledge come from". Adding an upstream

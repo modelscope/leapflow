@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Monitor producer for framework self-evolution transparency.
 
 Domain: ``framework_evolution``. Answers two questions the existing views cannot:
@@ -30,7 +31,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Mapping, Sequence
 
-from leapflow.domain.evolution_trace import ABORTED, REOPENED, RESOLVED, STILL_OPEN
+from leapflow.domain.evolution_trace import (
+    ABORTED,
+    REOPENED,
+    RESOLVED,
+    STILL_OPEN,
+    EvolutionStage,
+)
 from leapflow.monitor.types import Evidence, Finding, ProducerContext, Severity, SuggestedAction
 
 logger = logging.getLogger(__name__)
@@ -213,13 +220,17 @@ class EvolutionProducer:
 
     def _build_payload(self, ctx: ProducerContext) -> dict[str, Any]:
         snapshot = self._live_registry_snapshot()
-        reachability = self._reachability(snapshot)
         rebuilt = self._episodes(ctx)
         # ``None`` means the history could not be rebuilt; ``()`` means there is
         # genuinely none. Collapsing the two would report a local defect as an
         # absence of data -- the same conflation the reachability rows exist to
         # prevent, and it would be inconsistent for this panel to commit it.
         episodes: tuple[Any, ...] = rebuilt or ()
+        # Traces are read before reachability because three of its rows are decided
+        # by whether the cold-path sweep left a trace. Deriving them from anything
+        # else is how they came to be hardcoded.
+        traces = self._recent_traces()
+        reachability = self._reachability(snapshot, traces)
         payload: dict[str, Any] = {
             "observed_at": float(getattr(ctx, "now", 0.0) or 0.0),
             "roster": snapshot["roster"],
@@ -257,10 +268,10 @@ class EvolutionProducer:
             "mutation_matrix": self._mutation_matrix(episodes),
             "degraded": not episodes,
         }
-        traces = self._recent_traces()
         payload["traces"] = traces
         payload["trace_feed"] = self._trace_feed(traces)
         payload["unadmitted"] = self._unadmitted(traces)
+        payload["reward_bandwidth"] = self._reward_bandwidth(traces, episodes)
         if rebuilt is None:
             payload["degraded_kind"] = UNVERIFIABLE
             payload["degraded_reason"] = (
@@ -824,7 +835,9 @@ class EvolutionProducer:
 
     # ── pipeline reachability ─────────────────────────────────────────────
 
-    def _reachability(self, snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def _reachability(
+        self, snapshot: Mapping[str, Any], traces: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
         """Report the runtime evidence for each pipeline segment.
 
         Ordered as the pipeline runs. Each row carries the measurement that was
@@ -847,7 +860,7 @@ class EvolutionProducer:
             self._segment_plan_records(),
             self._segment_trust(snapshot),
         ]
-        rows.extend(self._segments_awaiting_wiring())
+        rows.extend(self._segments_awaiting_wiring(traces))
         return rows
 
     @staticmethod
@@ -1061,40 +1074,145 @@ class EvolutionProducer:
         status = WIRED if beyond_draft or frozen else NO_EVIDENCE
         return self._row("trust", "Trust accrual", status, detail)
 
-    def _segments_awaiting_wiring(self) -> list[dict[str, Any]]:
-        """Report the segments whose capability exists but produces no evidence.
+    def _segments_awaiting_wiring(
+        self, traces: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Report the three cold-path governance segments from observed traces.
 
-        Each of these has a module in the tree. That is deliberately *not* treated
-        as evidence: the module having no caller is exactly the failure mode this
-        panel exists to expose, so the row reports the absence of observed output
-        and names what would close it.
+        These rows were hardcoded to ``NO_EVIDENCE`` with advice to "wire" each
+        capability, and they stayed that way after ``CoevolutionSweep`` wired all
+        three -- so the board asserted three segments were dead while they were
+        running. A panel whose whole purpose is to distinguish "exists" from
+        "runs" must not itself hardcode the answer.
+
+        The sweep emits one trace per step *including its no-op branches*, which is
+        what makes the three-state distinction possible here:
+
+        * a trace with observations  -> ``wired``
+        * a trace marked ``no_op``   -> ``wired``, and the segment is simply idle
+        * no trace at all            -> ``no_evidence``: the sweep never ran
         """
         awaiting = (
             (
                 "effect_verification",
+                "effect_verification",
                 "Effect verification (L3)",
-                "no EffectVerdict observed",
-                "Closures currently rest on declared fitness (L2). Wire "
-                "CapabilityEffectVerifier to verify by observed effect.",
+                "The cold-path sweep never ran, so no closure has been checked "
+                "against an observed effect.",
             ),
             (
                 "quarantine_feed",
+                "quarantine_drain",
                 "Quarantine feed",
-                "no quarantine candidate observed",
-                "Trust demotion is live but quarantine has no feed. Wire "
-                "QuarantineCandidateTracker and drain on a cold path.",
+                "Trust demotion is live but nothing drains the quarantine queue.",
             ),
             (
                 "reclamation",
+                "reclamation",
                 "Unselectable reclamation",
-                "no reclamation candidate observed",
-                "Wire UnselectableArtifactReaper to find artifacts no requirement can select.",
+                "Nothing scans for artifacts no admissible requirement can select.",
             ),
         )
-        return [
-            self._row(key, label, NO_EVIDENCE, evidence, next_step=next_step)
-            for key, label, evidence, next_step in awaiting
+        rows: list[dict[str, Any]] = []
+        for key, trace_kind, label, absent_step in awaiting:
+            seen = [t for t in traces if str(t.get("kind")) == trace_kind]
+            if not seen:
+                rows.append(self._row(key, label, NO_EVIDENCE, "no sweep trace observed",
+                                      next_step=absent_step))
+                continue
+            active = [t for t in seen if not dict(t.get("detail") or {}).get("no_op")]
+            evidence = (
+                f"{len(active)} observed in {len(seen)} sweep(s)"
+                if active
+                else f"{len(seen)} sweep(s), nothing to act on"
+            )
+            rows.append(self._row(key, label, WIRED, evidence))
+        return rows
+
+    # ── reward signal bandwidth ──────────────────────────────────────
+
+    def _reward_bandwidth(
+        self, traces: Sequence[Mapping[str, Any]], episodes: Sequence[Any]
+    ) -> dict[str, Any]:
+        """How much of the effect signal is actually usable as feedback.
+
+        This is the number that decides whether any learning policy is worth
+        building. ``EffectVerdict`` is three-valued, and its ``None`` class is not a
+        rounding error: it covers a requirement that declared no expected effect, a
+        tool that reported no observable effect, and an absent outcome. A policy that
+        treated abstention as failure would demote and eventually quarantine healthy
+        plugins for a reporting omission -- so abstention has to be *counted*, not
+        folded into either side.
+
+        ``observed`` is reported separately from the rate for the same reason the
+        reachability rows separate "no evidence" from "unverifiable": with no
+        verdicts at all, an abstain rate of 0.0 would read as a healthy signal when
+        it actually means there is no signal.
+        """
+        verdicts = [
+            dict(t.get("detail") or {})
+            for t in traces
+            if str(t.get("kind")) == "effect_verification"
+            and not dict(t.get("detail") or {}).get("no_op")
         ]
+        by_reason: dict[str, int] = {}
+        decided = abstained = 0
+        for verdict in verdicts:
+            by_reason[str(verdict.get("reason") or "unknown")] = (
+                by_reason.get(str(verdict.get("reason") or "unknown"), 0) + 1
+            )
+            if verdict.get("verified") is None:
+                abstained += 1
+            else:
+                decided += 1
+        total = decided + abstained
+
+        declared, requirements = self._declared_effect_rate(episodes)
+        return {
+            "observed": bool(total),
+            # The negation is carried explicitly because the view's ``when`` cannot
+            # invert a value, and "there is no signal" is the single most important
+            # thing this panel has to be able to say.
+            "absent": not total,
+            "total": total,
+            "decided": decided,
+            "abstained": abstained,
+            # Percent strings rather than floats: these are read, not computed
+            # against, and a bare 0.83 in a column headed "abstain rate" invites
+            # being read as a count.
+            "abstain_rate": _percent(abstained / total) if total else "",
+            "usable_rate": _percent(decided / total) if total else "",
+            "by_reason": [
+                {"label": name, "value": count}
+                for name, count in sorted(by_reason.items(), key=lambda kv: -kv[1])
+            ],
+            # The upstream cause. An effect can only be verified when the
+            # requirement declared one, and today only world-model-authored
+            # requirements carry ``expected_effect`` -- so a low rate here explains a
+            # high abstain rate without needing to inspect a single verdict.
+            "declared_effects": declared,
+            "requirements_seen": requirements,
+            "declared_rate": _percent(declared / requirements) if requirements else "",
+        }
+
+    @staticmethod
+    def _declared_effect_rate(episodes: Sequence[Any]) -> tuple[int, int]:
+        """Count requirements carrying an ``expected_effect``, out of those seen.
+
+        Read from the rebuilt episodes rather than the store directly: the ledger
+        already parsed the decision records, and a second reader would be a second
+        chance to disagree with it.
+        """
+        declared = total = 0
+        for episode in episodes:
+            orient = episode.trace_of(EvolutionStage.ORIENT) if hasattr(episode, "trace_of") else None
+            for requirement in (dict(orient.detail) if orient else {}).get("requirements") or []:
+                if not isinstance(requirement, Mapping):
+                    continue
+                total += 1
+                if str(dict(requirement.get("metadata") or {}).get("expected_effect") or ""):
+                    declared += 1
+        return declared, total
 
     @staticmethod
     def _row(

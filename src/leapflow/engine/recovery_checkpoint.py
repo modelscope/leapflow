@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Recovery checkpoint system for cross-turn state persistence and safe resumption.
 
 Enables the agent loop to save execution state when halting with HALT_WITH_CHECKPOINT,

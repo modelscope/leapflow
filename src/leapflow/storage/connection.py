@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """ConnectionHolder protocol and implementation for shared DuckDB access.
 
 All stores receive a ``ConnectionHolder`` instead of a raw ``db_path``.

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Replay raw NDJSON segment files through the event detector.
 
 Reads the segment files produced by ``ReadingStore._append_raw`` and feeds each

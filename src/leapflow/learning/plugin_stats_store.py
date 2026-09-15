@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DuckDB persistence for plugin trust and usage statistics.
 
 Provides save/load for PluginTrustLedger and PluginUsageTracker state across

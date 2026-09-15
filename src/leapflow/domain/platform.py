@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Platform capability discovery and manifest types."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Semantic relevance scoring with platform-aware weight profiles."""
 
 from __future__ import annotations

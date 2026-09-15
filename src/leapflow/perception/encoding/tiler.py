@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Inference tiler — batch composed frame pairs into grid for VLM."""
 
 from __future__ import annotations

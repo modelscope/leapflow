@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Regression tests: LeapBoard must observe the session that opened it.
 
 Root cause of "board opens, status bar shows watch, page stays empty":

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scenario-based tests for platform synthesis (denoise + synthesis + intent inference).
 
 Replaces granular rule-level tests in test_synthesis.py, test_denoise.py,

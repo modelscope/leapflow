@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Marketplace client: discover, download, verify, and install plugins.
 
 Prototype uses a local directory as the marketplace source. The

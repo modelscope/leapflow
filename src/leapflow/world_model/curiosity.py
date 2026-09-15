@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Curiosity signal — composite intrinsic motivation for exploration.
 
 Unifies three intrinsic motivation components from RL literature

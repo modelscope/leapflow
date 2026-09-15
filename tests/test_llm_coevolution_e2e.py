@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """End-to-end demonstration of LLM co-evolution.
 
 Verifies the complete loop:

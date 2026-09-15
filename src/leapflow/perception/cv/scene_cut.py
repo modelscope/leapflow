@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scene cut detection — distinguish hard cuts from soft transitions.
 
 Uses color histogram comparison + edge structure correlation to

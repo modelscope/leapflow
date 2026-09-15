@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Workflow Copilot — context-triggered workflow auto-completion engine."""
 
 from leapflow.copilot.adapters import (

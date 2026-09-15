@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Journey runner: one coarse end-to-end test made diagnosable.
 
 The real layer is deliberately small — a handful of journeys, each covering many

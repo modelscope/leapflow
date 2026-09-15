@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Focus-state-driven reference resolution for session context assembly.
 
 This resolver does not parse user text for keywords, does not choose tools,

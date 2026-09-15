@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """R6 — daemon runtime lifecycle: start, report, restart, stop, recover from stale state.
 
 Lifecycle is only meaningful across processes: a PID file, a Unix socket and a

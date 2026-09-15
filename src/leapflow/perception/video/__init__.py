@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Trajectory-first perception: recording, segmentation, and multi-scale VLM analysis."""
 
 from leapflow.perception.video.analyzer import VideoAnalyzer

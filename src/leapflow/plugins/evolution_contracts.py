@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Contracts for the capability-evolution lifecycle.
 
 ``AdaptiveEvolutionPolicy`` and ``LifecycleGovernor`` are the trust, probation and

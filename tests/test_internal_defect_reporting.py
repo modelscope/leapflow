@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Contracts for how a defect inside LeapFlow is reported, not laundered.
 
 Written after an outage where one mistyped attribute name made the agent unusable

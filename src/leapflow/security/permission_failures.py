@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared permission-failure predicates for agent and TUI recovery flows."""
 from __future__ import annotations
 

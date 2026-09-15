@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unified DuckDB schema definition and migration for leap.duckdb.
 
 Single source of truth for all table schemas. Each store registers its

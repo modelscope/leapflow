@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared UI vocabulary — ActionType ↔ tool name mappings.
 
 This module connects the Recording vocabulary (ActionType enum values)

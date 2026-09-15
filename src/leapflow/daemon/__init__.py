@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LeapFlow daemon (leapd) — centralized process for DuckDB + runtime.
 
 The daemon architecture follows the "single process owns all mutable state"

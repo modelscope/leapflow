@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Recovery audit system — structured logging of all recovery decisions.
 
 Every RecoveryCoordinator.evaluate() call produces an audit entry written

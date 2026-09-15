@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Token-bucket based budget controller for world model learning operations.
 
 Manages compute budgets for prediction, comparison, and replay calls

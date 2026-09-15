@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """GitHub Hub backend — REST API-based skill push/pull/search.
 
 Implements HubBackend Protocol using GitHub REST API (Contents + Repos).

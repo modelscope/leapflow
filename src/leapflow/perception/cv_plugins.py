@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """CV algorithm plugins — wraps existing ``perception/cv/`` algorithms as
 ``CVProcessor`` instances.
 

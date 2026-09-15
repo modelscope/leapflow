@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Integration tests for scoped lifecycle wrappers around registries."""
 
 from __future__ import annotations

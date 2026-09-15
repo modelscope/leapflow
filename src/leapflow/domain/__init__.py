@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared domain model — zero-dependency data types used across all layers."""
 
 from leapflow.domain.capability_requirement import (

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for deterministic adaptive capability resolution."""
 
 from __future__ import annotations
@@ -157,13 +158,23 @@ def test_risk_limit_excludes_candidate() -> None:
 
 
 def test_tie_can_be_resolved_by_optional_arbiter() -> None:
+    """The arbiter now belongs to the greedy policy, which is where ties exist.
+
+    A tie-break is a property of greedy scoring: under a sampling policy two
+    candidates never tie, because each draw is continuous. Leaving the hook on the
+    resolver would have made every future policy inherit something meaningless to it.
+    """
+    from leapflow.plugins._builtin_policies import GreedyPolicy
+
     req = _req("json.pretty")
     candidates = (
         _candidate("a", "tool_a", provides=("json.pretty",)),
         _candidate("b", "tool_b", provides=("json.pretty",)),
     )
 
-    resolution = CapabilityResolver(arbiter=_TieArbiter("tool_b")).resolve_one(
+    resolution = CapabilityResolver(
+        policy=GreedyPolicy(arbiter=_TieArbiter("tool_b"))
+    ).resolve_one(
         req,
         candidates,
         ResolverContext(environment=_env(Capability.FILE_OPS)),
@@ -172,6 +183,9 @@ def test_tie_can_be_resolved_by_optional_arbiter() -> None:
     assert resolution.selected is not None
     assert resolution.selected.candidate.tool_name == "tool_b"
     assert resolution.arbitration_used is True
+    assert resolution.policy_id == "greedy"
+    # An arbitrated tie is still the argmax, so it is not an exploration.
+    assert resolution.explored is False
 
 
 def test_no_arbiter_tie_uses_stable_order() -> None:

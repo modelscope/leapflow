@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Perceptual hashing for frame change detection.
 
 Provides fast, resize-invariant image fingerprinting using DCT-based
