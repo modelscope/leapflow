@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """WM-B: the world model is now the first driver of capability evolution.
 
 `grade_and_propose` could form a capability hypothesis and the observation pipeline
@@ -36,11 +37,36 @@ _TRAJECTORY = [
 ]
 
 
+
+def _acquire_verdict(intent):
+    """Express an intent as the acquire verdict that would have produced it."""
+    from leapflow.domain.adaptation_verdict import AdaptationVerdict
+
+    return AdaptationVerdict.create(
+        "acquire",
+        intent.capability,
+        intent.hypothesis or f"nothing installed provides {intent.capability}",
+        rationale=intent.rationale or intent.hypothesis,
+        confidence=intent.confidence,
+        target_affordance=intent.target_affordance,
+        expected_effect=intent.expected_effect,
+        max_risk_level=intent.max_risk_level,
+    )
+
+
 class _Teacher:
     """Stand-in for TrajectoryGrader with a fixed hindsight verdict."""
 
     def __init__(self, intents=(), grades=("g1", "g2"), raises=False) -> None:
-        self._verdict = TeacherVerdict(tuple(grades), tuple(intents))
+        # Intents are now *derived* from acquire verdicts rather than carried beside
+        # them, so a teacher stub expressing "I want this capability" says it the way
+        # the real teacher does: an acquire verdict, which the verdict object turns
+        # into the intent. Constructing intents directly would test a path production
+        # no longer has.
+        self._verdict = TeacherVerdict(
+            tuple(grades),
+            tuple(_acquire_verdict(intent) for intent in intents),
+        )
         self._raises = raises
         self.calls = 0
 
@@ -207,9 +233,10 @@ def test_real_trajectory_grader_can_drive_evolution(tmp_path):
             {"step": 2, "advantage": -0.9, "is_forking": False, "grade_label": "harmful"},
             {"step": 3, "advantage": -0.5, "is_forking": False, "grade_label": "suboptimal"},
         ],
-        "capability_gaps": [{
+        "adaptation_verdicts": [{
+            "action": "acquire",
             "capability": "chat.reply",
-            "hypothesis": "the send control exists but no longer delivers the message",
+            "knowledge": "the send control exists but no longer delivers the message",
             "confidence": 0.77,
             "target_affordance": "app.chat.v2",
             "expected_effect": "the message appears in the thread",

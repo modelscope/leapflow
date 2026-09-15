@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """OpenAI-compatible API server gateway adapter."""
 from __future__ import annotations
 

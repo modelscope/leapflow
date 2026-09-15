@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LF-11: the observation lifecycle is no longer write-only.
 
 `JsonCapabilityObservationStore.mark_status` existed with **zero callers and zero

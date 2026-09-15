@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared utilities — cross-cutting infrastructure used across multiple modules."""
 
 from leapflow.utils.diagnostics import PipelineTracer, StageRecord

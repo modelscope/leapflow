@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Core type definitions for the long-horizon async task scheduler."""
 
 from __future__ import annotations

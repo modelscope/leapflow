@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Producer registry: resolve per-domain observation logic by ``domain`` key.
 
 The registry keeps the runtime domain-agnostic. A new scenario registers a

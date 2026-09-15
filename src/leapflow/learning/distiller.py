@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill distillation — extract reusable skills from trajectories and transcripts.
 
 Supports two pathways:

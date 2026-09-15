@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Self-Management plugin — lets the Agent introspect and manage its own plugin composition.
 
 This is the Phase 2.4 Self-Modification MVP. It exposes twelve tools:
@@ -55,6 +56,31 @@ from leapflow.plugins.protocol import ToolMetadata
 
 logger = logging.getLogger(__name__)
 
+
+
+def _declared_capabilities(proposal: Any) -> tuple[str, ...]:
+    """The capability names a proposal was raised for, from its own evidence.
+
+    Read off ``GapEvidence.metadata`` rather than re-derived, because the producer
+    already recorded it there: ``capability_gap_detector`` puts ``intent.capability``
+    into the metadata of a world-model proposal. Re-deriving it from the summary would
+    be inferring a capability name from text, which the observation layer forbids.
+
+    Empty for a proposal that carries none -- notably the ``unknown_tool`` path, whose
+    "capability" is the missing tool's invented name and therefore not a name any tool
+    should declare. Generating with no declaration is still better than generating with
+    a wrong one.
+    """
+    if proposal is None:
+        return ()
+    names: list[str] = []
+    for evidence in getattr(proposal, "evidence", ()) or ():
+        for key, value in dict(getattr(evidence, "metadata", ()) or ()).items():
+            if str(key) == "capability" and str(value).strip():
+                candidate = str(value).strip()
+                if candidate not in names:
+                    names.append(candidate)
+    return tuple(names)
 
 class SelfManagementPlugin:
     """ToolPlugin exposing the Agent's own plugin management surface."""
@@ -602,7 +628,11 @@ class SelfManagementPlugin:
 
         try:
             generator = PluginGenerator(llm_provider=self._llm_provider)
-            request = PluginGenerationRequest(plugin_id=plugin_id, description=description)
+            request = PluginGenerationRequest(
+                plugin_id=plugin_id,
+                description=description,
+                provides_capabilities=_declared_capabilities(proposal if proposal_id else None),
+            )
             result = await generator.generate_and_validate(request)
             if proposal_id:
                 result["proposal_id"] = proposal_id

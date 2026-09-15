@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Per-plugin usage statistics accumulator.
 
 Receives forwarded (tool_name, ok, duration_ms) from TurnUsageTracker

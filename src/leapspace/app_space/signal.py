@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LeapSignal — the in-sandbox leapflow entry for signal-mode runs.
 
 One process owns the whole observation stack: EventBus (real normalizer

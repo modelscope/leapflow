@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Gateway server — manages platform adapters and routes messages.
 
 Intentionally thin (< 250 lines): session / transcript persistence,

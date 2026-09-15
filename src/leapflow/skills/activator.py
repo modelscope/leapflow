@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill activation — compile generated code into executable skills.
 
 Bridges the gap between StoredSkill (declarative data) and Skill (executable).

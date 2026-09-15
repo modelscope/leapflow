@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Verify an acquired capability by its effect, and reclaim what never works.
 
 Two gaps this closes, both recorded by the EVO-02 experiments:
@@ -38,13 +39,48 @@ from leapflow.domain.capability_requirement import CapabilityRequirement
 
 logger = logging.getLogger(__name__)
 
-#: Result keys a tool may use to report what it observably did. This is the whole
-#: declaration channel for confirmation: without one of these, a *successful* call is
-#: ``unverifiable`` (we do not know whether the effect landed) while a *failed* call
-#: still refutes. Several spellings are accepted because the convention post-dates
-#: existing tools, and a tool that already says ``observed_effect`` should not have to
-#: be rewritten to be verifiable.
-OBSERVED_EFFECT_KEYS: tuple[str, ...] = ("observed_effect", "effect")
+#: The single result key a tool uses to report what it observably did. This is the
+#: whole declaration channel for confirmation: without it, a *successful* call is
+#: ``unverifiable`` (we do not know whether the effect landed) while a *failed*
+#: call still refutes.
+#:
+#: ``effect`` was accepted here too and had to be removed: it is already in use
+#: across the tree with an entirely different meaning -- a risk *class*
+#: (``"effect": "write"`` in self-management) and a hardware channel *type*
+#: (``channel.effect``). With single-token overlap sufficient for a match, an
+#: expectation reading "write the message to the channel" was confirmed by a tool
+#: reporting ``effect="write"``, producing a decided ``verified=True`` that granted
+#: trust for evidence which never existed.
+#:
+#: One narrow key that nothing yet emits is the honest state: every verdict
+#: abstains until a handler opts in, and the board reports that abstention rate
+#: rather than a sprinkling of fabricated confirmations.
+OBSERVED_EFFECT_KEYS: tuple[str, ...] = ("observed_effect",)
+
+
+def declare_effect(effect: str) -> dict[str, str]:
+    """The writer half of the effect channel, for a handler's success result.
+
+    Used as ``return {"ok": True, ..., **declare_effect(f"wrote {n} bytes to {name}")}``.
+
+    The key is spelled in exactly one place, here, beside the reader that consumes
+    it. Spelling it at each call site is how the two halves drifted before: the
+    channel was narrowed to ``observed_effect`` while the plugin generator still
+    taught handlers to write ``effect``, so every generated plugin reported through
+    a key nothing read and abstained forever.
+
+    An empty description returns no key at all rather than an empty string. Silence
+    is a legitimate answer -- the verifier reads it as *unverifiable* rather than as
+    failure -- and it must stay distinguishable from a handler that tried to describe
+    its effect and had nothing to say.
+
+    What belongs here is what was *observed*, in the same terms a requirement would
+    state it: a measured byte count, the value a key now holds, an id the remote
+    returned. Never a restatement of the request -- an invented description would be
+    compared against the expectation and could confirm work that never happened.
+    """
+    described = str(effect or "").strip()
+    return {OBSERVED_EFFECT_KEYS[0]: described} if described else {}
 
 #: Reasons a verification can fail, kept as constants so callers can branch on
 #: them without matching prose.

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LeapSpace scenario apps: the host-side app registry.
 
 APP_MODULES is the only place an app_id resolves to its module: the

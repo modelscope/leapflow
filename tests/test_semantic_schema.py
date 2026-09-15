@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the semantic desktop tool schema layer and registration plugin."""
 
 from __future__ import annotations

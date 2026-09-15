@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hub CLI commands — push, pull, sync, search, list, login, whoami.
 
 Provides the ``leap hub`` subcommand family for cloud skill collaboration

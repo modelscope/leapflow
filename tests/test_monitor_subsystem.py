@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for the domain-neutral monitor subsystem (Watch -> Finding).
 
 No network, no LLM: uses a temporary DuckDB and a fake in-process producer.

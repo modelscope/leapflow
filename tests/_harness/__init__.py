@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Test harness for the real end-to-end layer.
 
 Modules here are infrastructure, not tests:

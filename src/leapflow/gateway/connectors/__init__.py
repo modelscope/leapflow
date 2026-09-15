@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Connector package exports."""
 from leapflow.gateway.connectors.action_registry import ActionRegistry, summarize_action_result, validate_payload
 from leapflow.gateway.connectors.cli_discovery import CliDiscovery, DiscoveredCommand, HelpParser, HelpParseResult

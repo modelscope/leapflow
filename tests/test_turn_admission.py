@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for TurnAdmission bounded concurrency (Stage 3, P3-4)."""
 from __future__ import annotations
 

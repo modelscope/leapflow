@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Gateway protocol types and adapter interface.
 
 Defines the contract between platform adapters and the gateway server.

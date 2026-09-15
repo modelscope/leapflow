@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Executable guards for the architecture contracts in AGENTS.md.
 
 These contracts are the ones a code review is worst at catching, because a
@@ -395,6 +396,8 @@ _EXTENSION_POINTS = [
     ("leapflow.engine.recovery_coordinator", "RecoveryStrategy"),
     ("leapflow.monitor.types", "MonitorProducer"),
     ("leapflow.dashboard.service", "DashboardDataProvider"),
+    ("leapflow.plugins.selection_policy", "SelectionPolicy"),
+    ("leapflow.plugins.selection_policy", "SelectionPolicyPlugin"),
 ]
 
 
@@ -447,6 +450,12 @@ _STANDALONE_MODULES = [
     "leapflow.plugins.tool_plugins",
     "leapflow.plugins.marketplace",
     "leapflow.plugins.sandbox",
+    "leapflow.plugins.selection_policy",
+    "leapflow.plugins.selection_policy_registry",
+    "leapflow.plugins._builtin_policies",
+    "leapflow.domain.adaptation_verdict",
+    "leapflow.storage.distilled_knowledge_store",
+    "leapflow.learning.degradation_sink",
 ]
 
 
@@ -471,20 +480,33 @@ def test_engine_self_attributes_all_exist() -> None:
 
     Names assigned anywhere in the module count as defined, including on frames
     and per-session clones; this catches the typo case, not lifecycle ordering.
+
+    Public names are checked too. The guard originally matched only ``self._x`` and
+    a read of ``self.settings`` -- where the engine actually stores ``self._settings``
+    -- slipped straight through it, taking out the adaptive capability loop while all
+    3602 mock-layer tests stayed green; only a journey caught it. Dropping the leading
+    underscore is the *more* likely typo, since it is the natural thing to type.
+
+    Scoped to ``AgentEngine``'s own source rather than the whole module, because
+    ``engine.py`` also defines ``TaskContract`` and ``StreamEvent``, whose public
+    ``self.x`` reads would otherwise be attributed to the engine and reported as
+    undefined.
     """
+    import inspect
     import re
     from pathlib import Path
 
     import leapflow.engine.engine as engine_module
 
-    source = Path(engine_module.__file__).read_text(encoding="utf-8")
-    read = set(re.findall(r"self\.(_[a-z][a-z0-9_]*)", source))
-    assigned = set(re.findall(r"self\.(_[a-z][a-z0-9_]*)\s*(?::[^=\n]+)?=", source))
+    attribute = r"self\.(_?[a-z][a-z0-9_]*)"
+    source = inspect.getsource(engine_module.AgentEngine)
+    read = set(re.findall(attribute, source))
+    assigned = set(re.findall(attribute + r"\s*(?::[^=\n]+)?=", source))
     # Attributes may also be set from outside (session_factory clones engines).
     for module in ("leapflow.engine.session_factory", "leapflow.engine.agent_loop"):
         mod = importlib.import_module(module)
         assigned |= set(
-            re.findall(r"engine\.(_[a-z][a-z0-9_]*)\s*=", Path(mod.__file__).read_text(encoding="utf-8"))
+            re.findall(r"engine\.(_?[a-z][a-z0-9_]*)\s*=", Path(mod.__file__).read_text(encoding="utf-8"))
         )
     on_class = {name for name in read if hasattr(engine_module.AgentEngine, name)}
 
@@ -689,3 +711,35 @@ def test_only_watched_rpcs_get_an_approval_route() -> None:
     # Writes are deliberately absent: they run through the tool handler, which builds its
     # own descriptor and is reached from a turn that already owns a route.
     assert "hardware.write_request" not in _APPROVAL_ROUTED_METHODS
+
+
+def test_a_selection_policy_is_a_core_extension_point_not_a_tool_plugin() -> None:
+    """No trust, no sandbox, no approval in the policy layer.
+
+    Progressive Trust is earned by *executing tools*; a selection policy executes
+    none, so a trust level for it would be a meaningless number that the plugin
+    roster would nonetheless render, and a frozen-on-defect rule would have nothing
+    to freeze. It also runs inside the turn and reads host services, so it cannot be
+    sandboxed. The correct template is ``LLMProviderPlugin``, whose registry has the
+    same three absences -- this test is that reasoning made executable.
+    """
+    import inspect
+
+    from leapflow.plugins import _builtin_policies, selection_policy, selection_policy_registry
+
+    forbidden = ("PluginTrustLedger", "TrustLevel", "requires_sandbox",
+                 "ApprovalOrchestrator", "ActionDescriptor", "RiskLevel")
+    for module in (selection_policy, selection_policy_registry, _builtin_policies):
+        source = inspect.getsource(module)
+        for name in forbidden:
+            assert name not in source, (
+                f"{module.__name__} references {name}: a selection policy is a core "
+                "extension point, not a governed tool plugin"
+            )
+
+
+def test_the_policy_entry_point_group_is_a_published_contract() -> None:
+    """Third parties pin this string in their packaging; renaming it unregisters them."""
+    from leapflow.plugins.selection_policy_registry import ENTRY_POINT_GROUP
+
+    assert ENTRY_POINT_GROUP == "leapflow.selection_policies"

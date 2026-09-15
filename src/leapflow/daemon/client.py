@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Thin client for connecting LeapFlow CLI processes to leapd."""
 from __future__ import annotations
 

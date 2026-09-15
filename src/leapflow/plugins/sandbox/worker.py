@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Sandbox worker entrypoint. Runs in an isolated subprocess.
 
 Loads a plugin module, then serves tool invocation requests over stdin/stdout

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shared skill-related data types used across learning and runtime layers."""
 
 from __future__ import annotations

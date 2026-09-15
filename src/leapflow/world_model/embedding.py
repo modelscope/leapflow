@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Embedding providers for semantic similarity in experience retrieval.
 
 Abstracts the embedding source behind a Protocol so callers don't couple

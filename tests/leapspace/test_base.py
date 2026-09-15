@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic unit tests for BaseLeapApp (offscreen Qt, tmp state dirs)."""
 
 import json

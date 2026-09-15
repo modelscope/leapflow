@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Capability gap detection for plugin self-evolution.
 
 The detector is intentionally side-effect free: it only turns structured runtime
@@ -84,6 +85,7 @@ class CapabilityGapDetector:
         intent: EvolutionIntent,
         *,
         risk_ceiling: RiskLevel = MODEL_AUTHORED_RISK_CEILING,
+        incumbent: str = "",
     ) -> PluginProposal:
         """Create a side-effect-free proposal from a world-model intent.
 
@@ -92,6 +94,15 @@ class CapabilityGapDetector:
         ``self_management.plugin_propose`` produces, so it flows on through
         ``plugin_generate`` (validated code, no install) and ``plugin_install``
         (approval-gated). Creating a proposal mutates nothing.
+
+        ``incumbent`` names the plugin that already provides this capability, when one
+        does. Passing it makes the proposal a *rival* rather than a gap fill, and that
+        distinction has to be carried in the identity: the plugin id is otherwise
+        derived from the capability alone, so a rival for ``chat.reply`` would be named
+        exactly what the incumbent's own generated name would be and the two could
+        never coexist -- which is the whole point of proposing a rival. Whether a
+        capability already has a provider is a registry fact supplied by the caller,
+        never inferred from the hypothesis text.
 
         The proposal's risk level is the *clamped* ceiling, never the level the
         authoring model asked for; the original request is preserved in the
@@ -114,6 +125,12 @@ class CapabilityGapDetector:
             metadata["requested_max_risk_level"] = str(intent.max_risk_level)
         if intent.evidence_ids:
             metadata["evidence_ids"] = ",".join(intent.evidence_ids)
+        rival_of = str(incumbent or "").strip()
+        if rival_of:
+            # Recorded in the evidence, not only in the identity: an approver reading
+            # this proposal has to see that it competes with a named incumbent rather
+            # than filling an empty slot.
+            metadata["replaces"] = rival_of
 
         evidence = GapEvidence.create(
             WORLD_MODEL_INTENT,
@@ -124,13 +141,21 @@ class CapabilityGapDetector:
         tool_name = _slug(intent.capability, fallback="generated_tool")
         mutates = effective in {"high", "mutating", "external"}
         proposed_tool = ProposedToolSpec(
-            name=tool_name,
+            name=(f"{tool_name}_alt_{intent.intent_id[:8]}" if rival_of else tool_name),
             description=intent.expected_effect or intent.hypothesis,
             risk_level=effective,  # type: ignore[arg-type]
             mutates_state=mutates,
         )
+        base_plugin_id = (
+            # Discriminated by the intent so successive rivals for the same capability
+            # stay distinct artifacts; a gap fill keeps the stable capability-derived
+            # name, which is the dedup a genuinely missing capability wants.
+            f"{tool_name}_alt_{intent.intent_id[:8]}_plugin"
+            if rival_of
+            else f"{tool_name}_plugin"
+        )
         return PluginProposal.create(
-            plugin_id=_slug(f"{tool_name}_plugin", fallback="generated_tool_plugin"),
+            plugin_id=_slug(base_plugin_id, fallback="generated_tool_plugin"),
             capability_summary=intent.hypothesis,
             gap_type="tool_plugin",
             risk_level=effective,  # type: ignore[arg-type]

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Built-in signal sources reproducing the original _extract_signal() branches.
 
 Each source encapsulates a single branch of the original hardcoded if-chain in

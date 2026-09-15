@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Telegram credential validator.
 
 Referenced declaratively by ``manifests/telegram.yaml`` as

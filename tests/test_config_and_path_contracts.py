@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """End-to-end guards for the config control plane and the path tree contract.
 
 AGENTS.md devotes a whole section to these, but coverage was scattered: each

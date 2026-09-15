@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Pre-distillation episode deduplication via structural fingerprinting.
 
 Prevents redundant LLM calls by grouping structurally identical episodes

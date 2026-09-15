@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Optical flow analysis for motion pattern classification.
 
 Uses Farneback dense optical flow to distinguish:

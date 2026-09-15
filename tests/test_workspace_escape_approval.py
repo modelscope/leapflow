@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Every path-oriented tool asks before crossing the workspace boundary.
 
 The refusal text has always said "Approval is required to access paths outside

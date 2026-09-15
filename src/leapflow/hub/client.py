@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hub client facade — routes operations to the appropriate backend.
 
 Provides a unified interface for all Hub operations, delegating to

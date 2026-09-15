@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """EvolutionTap: emit a framework-evolution fact, or do nothing at all.
 
 One module-level optional sink, and one function that writes to it. When no sink

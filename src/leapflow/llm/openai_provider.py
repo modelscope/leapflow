@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """OpenAI-compatible chat client with provider profiles, retries, and streaming."""
 
 from __future__ import annotations

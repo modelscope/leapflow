@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hardware context: the declarative half of the Hardware Context Protocol.
 
 This module is deliberately free of any transport, vendor, or upstream-standard

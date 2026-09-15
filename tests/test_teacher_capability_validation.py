@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """The teacher's capability names are validated, because a live model abused them.
 
 S9 ran `qwen3.7-plus` as the teacher against an episode that failed for a
@@ -13,19 +14,30 @@ catch the degenerate case, which is the one that produces pure noise.
 
 from __future__ import annotations
 
+from leapflow.domain.evolution_intent import is_capability_name
 from leapflow.world_model.trajectory_grader import (
     TrajectoryGrader,
     _echoes_goal,
-    _is_capability_name,
 )
 
 
 # ── shape ─────────────────────────────────────────────────────────────────────
 
 
+
+def _verdict_intents(payload, goal=""):
+    """The acquisition intents a payload yields, through the real parser.
+
+    Intents are derived from acquire verdicts now, so a test that wants to assert on
+    intents has to go through the same derivation production does.
+    """
+    verdicts = _grader()._parse_verdicts(payload, goal)
+    return tuple(i for i in (v.to_intent() for v in verdicts) if i is not None)
+
+
 def test_real_capability_names_are_accepted():
     for name in ("chat.reply", "ui.view_messages", "app.chat.send", "fs.file.read.bytes"):
-        assert _is_capability_name(name), name
+        assert is_capability_name(name), name
 
 
 def test_prose_and_bare_words_are_rejected():
@@ -42,7 +54,7 @@ def test_prose_and_bare_words_are_rejected():
         "chat." + "x" * 90,                         # too long
         "/usr/bin/chat",                            # a path
     ):
-        assert not _is_capability_name(name), name
+        assert not is_capability_name(name), name
 
 
 # ── goal echo ─────────────────────────────────────────────────────────────────
@@ -82,34 +94,33 @@ def _grader():
 
 def test_goal_restatement_never_becomes_a_requirement():
     payload = {
-        "capability_gaps": [
-            {"capability": "chat.cosmetic.example", "hypothesis": "the send failed"}
+        "adaptation_verdicts": [
+            {"action": "acquire", "capability": "chat.cosmetic.example", "knowledge": "the send failed"}
         ]
     }
-    assert _grader()._parse_intents(payload, "chat.cosmetic.example") == ()
+    assert _grader()._parse_verdicts(payload, "chat.cosmetic.example") == ()
 
 
 def test_a_sentence_never_becomes_a_requirement():
     payload = {
-        "capability_gaps": [
-            {"capability": "the agent lacks a way to reply", "hypothesis": "h"}
+        "adaptation_verdicts": [
+            {"action": "acquire", "capability": "the agent lacks a way to reply", "knowledge": "h"}
         ]
     }
-    assert _grader()._parse_intents(payload, "goal") == ()
+    assert _grader()._parse_verdicts(payload, "goal") == ()
 
 
 def test_a_well_formed_gap_still_passes():
     payload = {
-        "capability_gaps": [
-            {
-                "capability": "chat.reply",
-                "hypothesis": "the send control no-ops",
+        "adaptation_verdicts": [
+            {"action": "acquire", "capability": "chat.reply",
+                "knowledge": "the send control no-ops",
                 "confidence": 0.8,
                 "expected_effect": "the reply appears in the thread",
             }
         ]
     }
-    intents = _grader()._parse_intents(payload, "reply to the latest message")
+    intents = _verdict_intents(payload, "reply to the latest message")
     assert len(intents) == 1
     assert intents[0].capability == "chat.reply"
     assert intents[0].expected_effect == "the reply appears in the thread"
@@ -117,12 +128,12 @@ def test_a_well_formed_gap_still_passes():
 
 def test_one_bad_gap_does_not_discard_a_good_one():
     payload = {
-        "capability_gaps": [
-            {"capability": "my.goal", "hypothesis": "h"},
-            {"capability": "chat.reply", "hypothesis": "the send control no-ops"},
+        "adaptation_verdicts": [
+            {"action": "acquire", "capability": "my.goal", "knowledge": "h"},
+            {"action": "acquire", "capability": "chat.reply", "knowledge": "the send control no-ops"},
         ]
     }
-    intents = _grader()._parse_intents(payload, "my.goal")
+    intents = _verdict_intents(payload, "my.goal")
     assert [i.capability for i in intents] == ["chat.reply"]
 
 
@@ -131,16 +142,21 @@ def test_the_prompt_tells_the_model_both_rules():
     from leapflow.world_model.trajectory_grader import _GAP_PROMPT_SECTION
 
     assert "Do NOT restate the task" in _GAP_PROMPT_SECTION
-    assert "return an empty list" in _GAP_PROMPT_SECTION
+    assert "Report nothing at all" in _GAP_PROMPT_SECTION
     assert "worse than" in _GAP_PROMPT_SECTION
+    # The action space replaced the binary question, so the prompt must also say what
+    # the cheap answers are -- otherwise "report nothing" is the only alternative to
+    # building something, and building wins by default.
+    assert "- absorb:" in _GAP_PROMPT_SECTION
+    assert "- rebind:" in _GAP_PROMPT_SECTION
 
 
 def test_model_authored_risk_is_still_clamped():
     """The guard must not have disturbed the clamp: a model may never widen risk."""
     payload = {
-        "capability_gaps": [
-            {"capability": "chat.reply", "hypothesis": "h", "max_risk_level": "external"}
+        "adaptation_verdicts": [
+            {"action": "acquire", "capability": "chat.reply", "knowledge": "h", "max_risk_level": "external"}
         ]
     }
-    intents = _grader()._parse_intents(payload, "goal")
+    intents = _verdict_intents(payload, "goal")
     assert intents[0].effective_risk_ceiling() == "read_only"

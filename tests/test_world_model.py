@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scenario-based integration tests for the world model subsystem."""
 
 from __future__ import annotations

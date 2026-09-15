@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tool implementations — the callable behaviour behind the agent's tools.
 
 This package holds what tools *do* (file operations, shell, terminal sessions,

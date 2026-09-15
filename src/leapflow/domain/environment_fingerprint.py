@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Immutable environment fingerprint used by adaptive capability resolution.
 
 The fingerprint is a compact, stable view of structured facts: platform

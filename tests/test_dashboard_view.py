@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for the dashboard view builder and WebSocket fan-out hub."""
 
 from __future__ import annotations

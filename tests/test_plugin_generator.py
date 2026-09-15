@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for LLM-driven plugin generation and validation pipeline."""
 
 from __future__ import annotations

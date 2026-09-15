@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Core event types shared across all layers."""
 
 from __future__ import annotations

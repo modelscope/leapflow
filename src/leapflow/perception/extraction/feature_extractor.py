@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Feature extraction — pluggable OCR, UI detection, and embedding backends."""
 
 from __future__ import annotations

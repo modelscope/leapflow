@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """What the co-evolution sweep needs to see, collected where it is produced.
 
 The cold-path sweep verifies effects, drains quarantine candidates and scans for

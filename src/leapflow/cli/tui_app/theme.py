@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Adaptive theming with contrast-aware input colors.
 
 Detects terminal background color via conservative environment heuristics and

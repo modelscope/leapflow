@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """OS-native notification renderer for Copilot suggestions.
 
 Platform-specific implementations:

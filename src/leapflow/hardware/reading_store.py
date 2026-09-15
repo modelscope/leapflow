@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Durable storage for sampled hardware readings.
 
 Two tiers, because raw samples and long-term history have different lifetimes and

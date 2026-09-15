@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Persistent skill library and update suggestion store.
 
 Stores distilled skills durably so the active learning system can compare

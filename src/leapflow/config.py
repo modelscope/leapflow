@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Configuration loading from structured YAML with environment overrides.
 
 Loading priority (highest wins):
@@ -365,6 +366,23 @@ class Settings:
     # kind still traverses the unchanged deterministic chain -- resolution, risk,
     # approval, validation, trust -- so widening this set adds a *trigger*, never
     # a permission.
+    # The self-evolution switch, and the only one a user should need to find.
+    #
+    # The world model runs regardless: it grades every episode, distils what it learned
+    # about the environment into the next session's context, and recommends which installed
+    # provider to prefer. None of that writes code, asks for approval, or changes what the
+    # agent is able to do -- it changes what the agent *knows*, and switching it off would
+    # cost adaptation for no reduction in risk.
+    #
+    # This switch governs the one branch that does write code: an ``acquire`` verdict
+    # becoming a queued proposal for a new plugin. Off by default because acquiring a
+    # capability is the most expensive and least reversible thing the system can decide to
+    # do, and because it should be a deliberate choice rather than something a user
+    # discovers after it has already happened. Queued is still not built -- generation,
+    # validation, approval, sandboxing and trust all remain in front of it -- so this is
+    # the outermost of several gates, not the only one.
+    evolution_enabled: bool = False
+
     accepted_evidence_kinds: tuple[str, ...] = ()
     # Requirement origins permitted to drive an *acquisition*. Empty means
     # unrestricted (shipped behaviour): any origin may. Setting it to
@@ -372,6 +390,26 @@ class Settings:
     # driver is the world model" -- other origins keep being recorded and resolved,
     # but can no longer authorise acquiring new code.
     evolution_authorising_origins: tuple[str, ...] = ()
+    # Which registered policy chooses among admissible tool candidates. ``greedy``
+    # is the shipped default and reproduces the selection made before the policy
+    # seam existed: highest weighted score, stable tie-break.
+    #
+    # A flat typed key rather than a nested params dict because every durable
+    # setting must be discoverable through ``leap config`` -- a dict would become a
+    # YAML-only knob. Built-in policies that need parameters declare them as their
+    # own flat ``selection_*`` keys; a third-party policy registered through the
+    # entry point group configures itself, since it cannot add fields here.
+    selection_policy: str = "greedy"
+    # How long a distilled fact about the environment stays disclosed. An assertion
+    # about a changing world is only true for a while, and stale knowledge misleads
+    # rather than merely going unused -- the acting agent cannot tell a current fact
+    # from one that expired three upgrades ago. Configurable because the right horizon
+    # depends on how fast the environment moves; 0 disables expiry.
+    distilled_knowledge_ttl_s: float = 604800.0
+    #: Cap on how many distilled facts reach the prompt, so the channel meant to
+    #: improve context cannot come to dominate it.
+    distilled_knowledge_limit: int = 12
+
     replay_on_session_end: bool = True
     prediction_structural_blend: float = 0.4
     prediction_semantic_blend: float = 0.6
@@ -931,6 +969,7 @@ def _build_settings_from_env(
     replay_budget = int(os.getenv("LEAPFLOW_REPLAY_BUDGET", "3"))
     grading_budget = int(os.getenv("LEAPFLOW_GRADING_BUDGET", "5"))
     distillation_budget = int(os.getenv("LEAPFLOW_DISTILLATION_BUDGET", "2"))
+    evolution_enabled = _bool("LEAPFLOW_EVOLUTION_ENABLED", "false")
     accepted_evidence_kinds = tuple(
         kind.strip()
         for kind in os.getenv("LEAPFLOW_ACCEPTED_EVIDENCE_KINDS", "").split(",")
@@ -941,7 +980,12 @@ def _build_settings_from_env(
         for origin in os.getenv("LEAPFLOW_EVOLUTION_AUTHORISING_ORIGINS", "").split(",")
         if origin.strip()
     )
+    selection_policy = os.getenv("LEAPFLOW_SELECTION_POLICY", "greedy").strip() or "greedy"
     replay_on_session_end = _bool("LEAPFLOW_REPLAY_ON_SESSION_END", "true")
+    distilled_knowledge_ttl_s = float(
+        os.getenv("LEAPFLOW_DISTILLED_KNOWLEDGE_TTL_S", "604800")
+    )
+    distilled_knowledge_limit = int(os.getenv("LEAPFLOW_DISTILLED_KNOWLEDGE_LIMIT", "12"))
     prediction_structural_blend = float(os.getenv("LEAPFLOW_PREDICTION_STRUCTURAL_BLEND", "0.4"))
     prediction_semantic_blend = float(os.getenv("LEAPFLOW_PREDICTION_SEMANTIC_BLEND", "0.6"))
     prediction_semantic_threshold = float(os.getenv("LEAPFLOW_PREDICTION_SEMANTIC_THRESHOLD", "0.1"))
@@ -1362,9 +1406,13 @@ def _build_settings_from_env(
         replay_budget=replay_budget,
         grading_budget=grading_budget,
         distillation_budget=distillation_budget,
+        evolution_enabled=evolution_enabled,
         accepted_evidence_kinds=accepted_evidence_kinds,
         evolution_authorising_origins=evolution_authorising_origins,
+        selection_policy=selection_policy,
         replay_on_session_end=replay_on_session_end,
+        distilled_knowledge_ttl_s=distilled_knowledge_ttl_s,
+        distilled_knowledge_limit=distilled_knowledge_limit,
         prediction_structural_blend=prediction_structural_blend,
         prediction_semantic_blend=prediction_semantic_blend,
         prediction_semantic_threshold=prediction_semantic_threshold,

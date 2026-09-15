@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Governance for tools supplied by external MCP servers.
 
 An MCP tool is third-party code reached over a local transport, running with this

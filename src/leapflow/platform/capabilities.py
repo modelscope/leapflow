@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Runtime environment capability detection and caching.
 
 Probes the platform connection, platform manifest, and permission state

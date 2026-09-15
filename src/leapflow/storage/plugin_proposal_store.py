@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Profile-scoped JSON store for plugin proposals.
 
 The store intentionally uses the path supplied by ProfileLayout

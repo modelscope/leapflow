@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Structured action descriptors for human approval decisions."""
 from __future__ import annotations
 

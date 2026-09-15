@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """R7 — adaptive plugin closed loop through a real daemon.
 
 Phases: missing capability evidence is observed, a fixture plugin is installed

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """VSI Facade — single entry point exposing platform-agnostic ports to the engine."""
 
 from __future__ import annotations

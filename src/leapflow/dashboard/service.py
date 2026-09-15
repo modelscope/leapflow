@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DashboardViewBuilder: turn a DashboardIntent + live data into a ViewSpec.
 
 The builder is transport-agnostic: it reads data through a small

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Derive mock-layer LLM fixtures from recorded cassettes.
 
 This is the join between the two test layers. The mock layer keeps its speed and

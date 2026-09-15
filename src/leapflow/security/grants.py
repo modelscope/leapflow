@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Approval grant and audit stores."""
 from __future__ import annotations
 

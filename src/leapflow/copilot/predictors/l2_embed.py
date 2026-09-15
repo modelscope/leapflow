@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """L2 Embedding Retrieval Predictor — semantic similarity search.
 
 Retrieves historically similar contexts via vector embedding nearest-neighbour

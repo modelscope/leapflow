@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Feedback collection and evolution loop for the Workflow Copilot.
 
 Captures user reactions (accept / ignore / correct / reject) to displayed

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for plugin adaptive plan introspection surfaces."""
 
 from __future__ import annotations

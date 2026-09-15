@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Adaptive prefix-commitment decision (mechanism 7, W2 slice 2).
 
 Decides whether a task should *commit* to a stable, cacheable prompt prefix.

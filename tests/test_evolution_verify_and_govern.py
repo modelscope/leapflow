@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """WM-6 / LF-10 / A-4 / P5: verify, then govern.
 
 * **WM-6** -- an acquired capability is verified by its *observed effect*, not by

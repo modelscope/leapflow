@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the plugin marketplace (discover, verify, install external plugins)."""
 
 from __future__ import annotations

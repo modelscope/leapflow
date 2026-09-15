@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Implicit feedback signal detection — identifies user struggle signals.
 
 Detects patterns that indicate the user is "stuck" or struggling:

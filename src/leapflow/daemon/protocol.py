@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """JSON-RPC 2.0 protocol types and LeapService interface for leapd.
 
 The protocol layer defines:

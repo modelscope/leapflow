@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """ReAct-style tool-use executor for SKILL.md skills.
 
 Gives the LLM access to real system tools (file ops, shell, UI) via

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the metadata-driven tool concurrency policy (TC-P0).
 
 Parallel-safety is derived from registry ToolSpec metadata via

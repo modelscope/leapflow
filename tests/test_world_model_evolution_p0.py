@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """World-model-first evolution foundation (P0).
 
 Covers the four P0 changes:

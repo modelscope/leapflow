@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DingTalk credential validator.
 
 Referenced declaratively by ``manifests/dingtalk.yaml`` as

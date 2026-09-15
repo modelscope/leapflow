@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """R3 — the control plane: slash commands, layered config, secrets, cancellation.
 
 `leap config` / `/config` is the only sanctioned way to change durable settings,

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Recovery decision types for the agent loop recovery subsystem.
 
 A RecoveryDecision encapsulates what the coordinator decided to do about a

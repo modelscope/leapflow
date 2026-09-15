@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for daemon MonitorCoordinator signal-noise boundary behavior."""
 from __future__ import annotations
 

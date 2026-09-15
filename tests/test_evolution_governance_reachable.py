@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """P2(a): the evolution governance tier becomes reachable.
 
 `AdaptiveEvolutionPolicy` and `LifecycleGovernor` implement trust, probation and

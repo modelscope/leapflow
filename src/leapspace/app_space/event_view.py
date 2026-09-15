@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """event_view — render a signal evidence DuckDB as a human-readable timeline.
 
 Read-only viewer for the eval.duckdb a signal-mode run leaves behind (the

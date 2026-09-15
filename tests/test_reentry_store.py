@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unit tests for the S2 re-entry store (phase N1, pure storage layer).
 
 Hermetic: DuckDB on a temp file, no engine / gateway / network.

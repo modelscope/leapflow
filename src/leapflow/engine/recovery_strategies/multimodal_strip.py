@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Multimodal strip recovery strategy.
 
 Handles image-too-large errors by stripping multimodal content and converting

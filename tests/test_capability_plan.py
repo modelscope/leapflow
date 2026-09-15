@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for declarative capability orchestration plans."""
 
 from __future__ import annotations

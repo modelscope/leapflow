@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Session controller — orchestrates LEARN → DISTILL → EXECUTE lifecycle.
 
 Manages the SessionMode state machine and coordinates between the imitation

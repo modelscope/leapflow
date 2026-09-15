@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skills package — runtime skill registry, activation, and execution."""
 
 from leapflow.skills.index import SkillEntry, SkillIndex

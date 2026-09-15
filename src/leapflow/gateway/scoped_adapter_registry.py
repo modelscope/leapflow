@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scoped lifecycle wrapper for GatewayAdapterRegistry.
 
 Leverages the existing unregister() method for cleanup, and mirrors the

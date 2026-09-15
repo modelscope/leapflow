@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for the dashboard launcher and server action dispatch.
 
 No aiohttp required: the launcher is dependency-free and DashboardServer's

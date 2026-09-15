@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Trajectory Grader — OPD teacher role for train-free agentic learning.
 
 Implements the "teacher-as-reward-model" pattern from On-Policy Distillation:
@@ -13,15 +14,15 @@ Teacher/student asymmetry comes from *information context*, not model capability
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List, Mapping, Sequence
 
 if TYPE_CHECKING:
     from leapflow.world_model.budget import LearningBudgetController
     from leapflow.world_model.experience_store import ExperienceStore
 
-from leapflow.domain.evolution_intent import EvolutionIntent
+from leapflow.domain.adaptation_verdict import AdaptationVerdict
+from leapflow.domain.evolution_intent import EvolutionIntent, is_capability_name
 from leapflow.llm.base import LLMProvider
 from leapflow.llm.message_builder import build_system_message, build_user_message_text
 from leapflow.world_model._json_utils import extract_json_object
@@ -58,49 +59,267 @@ Output JSON:
 # The teacher is deliberately not asked for a risk level. An intent is a
 # hypothesis, not an authorisation; the risk ceiling is imposed by the trusted
 # caller (see ``EvolutionIntent`` / ``MODEL_AUTHORED_RISK_CEILING``).
+
+#: How many declared capability names to show the teacher. Bounded so a large
+#: registry cannot crowd out the trajectory it is supposed to be grading.
+_MAX_DECLARED_SHOWN = 60
+
+
+def _declared_capability_section() -> str:
+    """The capability names tools already declare, for the teacher to reuse.
+
+    Shown, never enforced. A teacher constrained to this list could no longer report a
+    genuinely *missing* capability, which is the main thing it is asked for. Shown so
+    that when the capability does exist under a name the teacher would not have
+    guessed, it names the existing one -- otherwise the same ability accumulates a
+    second name, and a capability with two names has one provider each instead of two
+    competing providers for one name.
+
+    Read live from the registry rather than from a table: a third-party or generated
+    plugin's declarations must appear too, and a hardcoded list would go stale the
+    moment the tool set changed.
+    """
+    try:
+        from leapflow.plugins import get_registry
+
+        registry = get_registry()
+        names = sorted(
+            {
+                capability
+                for plugin in registry.plugins.values()
+                for tool in plugin.tools
+                for capability in (tool.provides_capabilities or ())
+                if capability
+            }
+        )
+    except Exception:  # noqa: BLE001 - no catalog degrades the hint, not the grading
+        logger.debug("teacher: declared capability catalog unavailable", exc_info=True)
+        return ""
+    if not names:
+        return ""
+    shown = names[:_MAX_DECLARED_SHOWN]
+    more = f" (and {len(names) - len(shown)} more)" if len(names) > len(shown) else ""
+    return (
+        "\nCapability names already declared by existing tools"
+        + more
+        + ". If the ability you\nare reporting is one of these, use that exact name; only invent a new name when\nnone of these is the ability in question:\n"
+        + ", ".join(shown)
+        + "\n"
+        # Naming the list is not the same as saying any of it fits. Measured: asked about
+        # a chat app failure while shown this catalogue, a real model answered `rebind`
+        # on 3 of 3 trials -- pointing at a neighbour that shares no environment with the
+        # failure, on a unit whose candidate set had exactly one entry. A `rebind` whose
+        # target cannot serve the environment is worse than no recommendation: it leaves
+        # the failure in place and puts a misleading "Prefer X" in front of every later
+        # turn. So the list is scoped to what it is for.
+        + "This list is for *naming*. It does not mean any of these can serve the failing\n"
+        "capability -- most require an environment that is not present. Only answer\n"
+        "`rebind` when a capability here is genuinely a provider for the same ability in\n"
+        "the same environment, and name it in `target`. If you cannot point to one,\n"
+        "`rebind` is the wrong action.\n"
+    )
+
+
+def _offered_providers(
+    degraded: Sequence[Mapping[str, Any]] = (),
+) -> frozenset[str]:
+    """Every provider named to the teacher as an alternative.
+
+    A target it picked from a list we supplied has to be acceptable, whatever the registry
+    currently holds. The registry check stays as a second route -- it catches a target the
+    teacher invented rather than selected.
+    """
+    names: set[str] = set()
+    for fact in degraded or ():
+        for row in fact.get("alternatives") or ():
+            for key in ("tool_name", "plugin_id"):
+                value = str(row.get(key) or "").strip()
+                if value:
+                    names.add(value)
+    return frozenset(names)
+
+
+def _alternatives_line(rows: Sequence[Mapping[str, Any]]) -> str:
+    """Render the other providers of a capability, and whether each can run here.
+
+    Stated as an absence when there are none, because "no alternative exists" is the
+    positive evidence for ``acquire`` -- and a silent omission would read as "not
+    checked", which is exactly the ambiguity that produced a guess.
+    """
+    if not rows:
+        return "\n  no other installed provider offers this capability"
+    usable = [r for r in rows if r.get("fits_here")]
+    parts = [
+        f"{r.get('tool_name') or r.get('plugin_id')}"
+        + ("" if r.get("fits_here") else f" (needs {', '.join(r.get('requires') or ()) or 'unmet affordances'})")
+        for r in rows
+    ]
+    verdict = (
+        "one of these could take over"
+        if usable
+        else "none of these can run in this environment"
+    )
+    return f"\n  other providers: {'; '.join(parts)} -- {verdict}"
+
+
+def _degraded_capability_section(degraded: Sequence[Mapping[str, Any]]) -> str:
+    """Capabilities whose current provider has been failing, for the teacher to judge.
+
+    Facts only, and deliberately without a verdict attached. A consecutive-failure
+    count cannot distinguish a badly written implementation from an environment that
+    moved underneath a correct one -- both produce the same streak and they want
+    opposite actions, rebuild versus rebind. The teacher has the trajectory and
+    hindsight, so it is the component that can tell them apart; passing it a threshold
+    decision would replace that judgement with a counter.
+
+    Empty when nothing is degraded, so the prompt gains nothing on a healthy session.
+    """
+    rows = [
+        (
+            str(item.get("capability") or "").strip(),
+            str(item.get("plugin_id") or "").strip(),
+            int(item.get("failure_streak") or 0),
+            str(item.get("failure_class") or "").strip(),
+        )
+        for item in degraded or ()
+    ]
+    rows = [row for row in rows if row[0]]
+    if not rows:
+        return ""
+    alternatives = {
+        str(item.get("capability") or ""): tuple(item.get("alternatives") or ())
+        for item in degraded or ()
+    }
+    prior = {
+        str(item.get("capability") or ""): (
+            str(item.get("prior_action") or ""),
+            str(item.get("prior_knowledge") or ""),
+        )
+        for item in degraded or ()
+        if item.get("prior_knowledge")
+    }
+    lines = "\n".join(
+        f"- {capability}: current provider {plugin or '(unknown)'} has "
+        f"{streak} consecutive failure(s) and is still serving"
+        + (f", failing as {failure_class}" if failure_class else "")
+        # What was concluded last time. Stated as history rather than as a verdict on
+        # the verdict: knowledge outliving the failure it describes is evidence the
+        # previous adaptation did not resolve it, not proof the judgement was wrong.
+        + (
+            f"\n  (last time you answered '{prior[capability][0]}' and recorded: "
+            f"{prior[capability][1]})"
+            if capability in prior
+            else ""
+        )
+        # The fact `rebind` and `acquire` are *defined* by. Without it the choice between
+        # them is a guess, which is what a real model was measured doing.
+        + _alternatives_line(alternatives.get(capability, ()))
+        for capability, plugin, streak, failure_class in sorted(rows)
+    )
+    # Named when every degradation shares one environment, because then the right
+    # answer is usually one rebind rather than one rebuild per capability.
+    shared = {
+        str((item.get("environment") or {}).get("fingerprint_id") or "")
+        for item in degraded or ()
+    }
+    # Only meaningful for two or more: telling the teacher that one degradation "may be
+    # one change rather than several" is noise that reads as a hint it must reconcile.
+    common = (
+        "\nAll of these were seen in the same environment, so they may be one change "
+        "rather than several.\n"
+        if len(rows) > 1 and len(shared) == 1 and next(iter(shared))
+        else ""
+    )
+    return (
+        "\nCapabilities whose existing provider has been failing while still in\n"
+        "service. A capability appearing here already exists, so the question is not\n"
+        "whether the ability is absent -- it is which of the four actions the evidence\n"
+        "supports. Prefer the cheapest that fits: absorb costs nothing, rebind reuses\n"
+        "what is installed, and acquire replaces a working-but-wrong implementation at\n"
+        "the price of new code.\n" + common + lines + "\n"
+    )
+
+
 _GAP_PROMPT_SECTION = """
 
-Additionally, identify any capability the agent *lacked* -- cases where no
-available action could have achieved the goal, as distinct from an available
-action being chosen badly. Report only genuine gaps; report none if the agent had
-what it needed and merely used it poorly.
+Additionally, judge what this episode's evidence says the system should *do* about
+the environment it ran in. You are being asked for an action, not for blame: when an
+application upgrades, the existing implementation was not written wrongly -- it was
+right for the old version -- and yet a new adapter may still be the only way forward.
+"Whose fault is it" and "what should be done" are different questions.
 
-Before reporting a gap, apply these two rules:
-- Do NOT restate the task, the goal, or the episode name as a capability. A
-  capability is a reusable ability such as "chat.reply", never a description of
-  this particular attempt.
-- If the episode failed for a reason that is not a missing capability -- a label
-  was renamed, an element moved, a transient error, a wrong choice among
-  available actions -- return an empty list. An invented capability is worse than
-  a missed one, because it will be built.
+Choose one action per capability, from these four only, cheapest first:
+- absorb:   the retry or semantic-addressing layer already handles this. A label moved,
+            an element was renamed, a call timed out. The capability set does not change.
+            This is the correct answer most of the time.
+- rebind:   another installed capability already covers the new environment. Name it in
+            `target`. Prefer this over acquire whenever anything already declared fits.
+- acquire:  nothing installed covers this, so a new implementation is warranted. This is
+            the ONLY action that causes code to be written, so use it last.
+- escalate: this needs a person -- a missing permission or credential, or a decision the
+            agent must not make for itself. Put what the human has to do in `target`.
 
-For each gap provide:
+Every verdict MUST carry `knowledge`: one or two sentences stating what is now true
+about the environment, written for the agent that will act next. It is read as ordinary
+context, so write a statement about the world ("the send control is now labelled
+Dispatch and lives in the toolbar"), never an instruction to the framework ("regenerate
+the plugin"). This field is the point of the exercise: three of the four actions change
+nothing except what the acting agent knows.
+
+Two rules that override everything above:
+- Do NOT restate the task, the goal, or the episode name as a capability. A capability
+  is a reusable ability such as "chat.reply", never a description of this attempt.
+- Report nothing at all if the episode's failure was simply a wrong choice among
+  actions that were available and working. An invented verdict is worse than a missed
+  one, because acquire builds code and rebind redirects traffic.
+
+For each verdict provide:
+- action: one of absorb | rebind | acquire | escalate.
 - capability: a stable dotted capability name (e.g. "chat.reply").
-- hypothesis: what is missing or broken, in one sentence.
+- knowledge: what is now true about the environment. Required.
+- rationale: why this action rather than a cheaper one, in one sentence.
 - confidence: float in [0, 1].
-- target_affordance: the environment affordance a new adapter should target, if visible.
-- rationale: why the existing capabilities cannot serve this.
-- expected_effect: what should observably happen once the capability exists.
-
+- target: for rebind, the capability or tool to use instead; for escalate, what the
+  human must do; omit otherwise.
+- target_affordance: for acquire, the environment affordance a new adapter should
+  target, if visible.
+- expected_effect: for acquire, what should observably happen once it exists.
+{declared_section}{degraded_section}
 Add to the JSON:
-{{"capability_gaps": [{{"capability": "...", "hypothesis": "...", \
-"confidence": 0.7, "target_affordance": "...", "rationale": "...", \
-"expected_effect": "..."}}, ...]}}
-Use an empty list when there is no genuine gap."""
+{{"adaptation_verdicts": [{{"action": "rebind", "capability": "...", \
+"knowledge": "...", "rationale": "...", "confidence": 0.7, "target": "...", \
+"target_affordance": "...", "expected_effect": "..."}}, ...]}}
+Use an empty list when the episode warrants no adaptation."""
 
-#: A capability name is a short dotted path of identifier-like segments. Bounded
-#: deliberately: a model asked for a capability sometimes answers with a sentence, and a
-#: sentence must never become a requirement.
-_CAPABILITY_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}(\.[a-z0-9][a-z0-9_]{0,31}){1,3}$")
+def _is_declared_capability(name: str) -> bool:
+    """Whether some live tool declares this capability or answers to this tool name.
 
+    Reads the registry, not a list, so a generated or third-party plugin counts. Accepts a
+    tool name as well as a capability name because a teacher naming a concrete provider is
+    being *more* specific than asked, and rejecting that would push it toward the vaguer
+    answer.
 
-def _is_capability_name(value: str) -> bool:
-    """Whether a teacher-supplied string is shaped like a capability at all.
-
-    Requires lowercase dotted structure with 2-4 segments. Rejects prose, bare words,
-    paths, and anything long enough to be a description rather than a name.
+    An unavailable registry returns ``True``: the guard exists to catch a target that is
+    demonstrably absent, and failing closed here would silently discard every rebind in
+    any process that composes no registry.
     """
-    return bool(value) and len(value) <= 96 and bool(_CAPABILITY_RE.match(value))
+    candidate = str(name or "").strip()
+    if not candidate:
+        return False
+    try:
+        from leapflow.plugins import get_registry
+
+        registry = get_registry()
+        for plugin in registry.plugins.values():
+            for tool in plugin.tools:
+                if tool.name == candidate:
+                    return True
+                if candidate in (tool.provides_capabilities or ()):
+                    return True
+    except Exception:  # noqa: BLE001 - no registry cannot mean no valid rebind
+        logger.debug("teacher: cannot verify rebind target", exc_info=True)
+        return True
+    return False
 
 
 def _echoes_goal(capability: str, goal: str) -> bool:
@@ -131,13 +350,28 @@ class ActionGrade:
 class TeacherVerdict:
     """Everything one hindsight evaluation produced.
 
-    ``grades`` distil into the experience store as advantage signal; ``intents``
-    are capability hypotheses that may drive self-evolution. Both are derived from
-    a single LLM call, so a verdict costs one ``grading`` budget token.
+    ``grades`` distil into the experience store as advantage signal; ``verdicts`` say
+    what the episode's evidence warrants doing about the environment. Both come from a
+    single LLM call, so a verdict costs one ``grading`` budget token.
+
+    ``intents`` is *derived* from the ``acquire`` verdicts rather than parsed
+    separately. One source of truth: an ``EvolutionIntent`` can only exist because a
+    verdict asked for code to be written, so a recommendation to *rebind* can never
+    silently queue an acquisition.
     """
 
     grades: tuple[ActionGrade, ...] = ()
-    intents: tuple[EvolutionIntent, ...] = ()
+    verdicts: tuple[AdaptationVerdict, ...] = ()
+
+    @property
+    def intents(self) -> tuple[EvolutionIntent, ...]:
+        """The acquisition intents, one per ``acquire`` verdict."""
+        derived = (verdict.to_intent() for verdict in self.verdicts)
+        return tuple(intent for intent in derived if intent is not None)
+
+    def by_action(self, action: str) -> tuple[AdaptationVerdict, ...]:
+        """Verdicts asking for one particular action."""
+        return tuple(v for v in self.verdicts if v.action == action)
 
 
 class TrajectoryGrader:
@@ -190,6 +424,8 @@ class TrajectoryGrader:
         self,
         trajectory: List[dict],
         goal: str = "",
+        *,
+        degraded_capabilities: Sequence[Mapping[str, Any]] = (),
     ) -> "TeacherVerdict":
         """Grade the trajectory *and* propose capability gaps, in one LLM call.
 
@@ -209,11 +445,17 @@ class TrajectoryGrader:
             return TeacherVerdict((), ())
 
         traj_text = self._format_trajectory(trajectory)
-        payload = await self._call_teacher_raw(traj_text, goal, propose_gaps=True)
+        payload = await self._call_teacher_raw(
+            traj_text, goal, propose_gaps=True,
+            degraded_capabilities=degraded_capabilities,
+        )
         self._budget.spend("grading")
 
         grades = self._persist_grades(trajectory, self._parse_grades(payload))
-        return TeacherVerdict(tuple(grades), self._parse_intents(payload, goal))
+        return TeacherVerdict(
+            tuple(grades),
+            self._parse_verdicts(payload, goal, degraded_capabilities),
+        )
 
     async def _call_teacher_raw(
         self,
@@ -221,6 +463,7 @@ class TrajectoryGrader:
         goal: str,
         *,
         propose_gaps: bool = False,
+        degraded_capabilities: Sequence[Mapping[str, Any]] = (),
     ) -> dict:
         """Single LLM call: teacher evaluates with full hindsight.
 
@@ -236,7 +479,10 @@ class TrajectoryGrader:
             example_label=self._grade_labels[1] if len(self._grade_labels) > 1 else self._grade_labels[0],
         )
         if propose_gaps:
-            prompt += _GAP_PROMPT_SECTION.format()
+            prompt += _GAP_PROMPT_SECTION.format(
+                declared_section=_declared_capability_section(),
+                degraded_section=_degraded_capability_section(degraded_capabilities),
+            )
         try:
             resp = await self._llm.achat(
                 [build_system_message(
@@ -281,11 +527,18 @@ class TrajectoryGrader:
             ))
         return results
 
-    def _parse_intents(self, payload: dict, goal: str = "") -> tuple[EvolutionIntent, ...]:
-        """Parse declared capability gaps into intents, skipping malformed entries.
+    def _parse_verdicts(
+        self,
+        payload: dict,
+        goal: str = "",
+        degraded_capabilities: Sequence[Mapping[str, Any]] = (),
+    ) -> tuple[AdaptationVerdict, ...]:
+        """Parse declared adaptation verdicts, skipping the ones that cannot be acted on.
 
-        A gap without both a ``capability`` and a ``hypothesis`` is discarded: the
-        capability name must be declared, never inferred from prose.
+        A verdict without a declared capability, a recognised action, or knowledge is
+        discarded: the capability name must be declared, never inferred from prose, and a
+        verdict that teaches the acting agent nothing leaves the teacher with no effect
+        even when its judgement was right.
 
         Two further rejections exist because a live model was measured doing exactly
         this. Asked to diagnose an episode that failed for a *non-capability* reason,
@@ -295,17 +548,27 @@ class TrajectoryGrader:
         faithfully tried to build ``chat.cosmetic.example``.
 
         So a capability must *look* like a capability, and must not be a restatement of
-        the goal. Neither check can catch a plausible-but-wrong capability; that is what
+        the goal. Neither check can catch a plausible-but-wrong verdict; that is what
         validation, effect verification and quarantine are for. These catch the
         degenerate case, which is the one that produces pure noise.
         """
-        raw_gaps = payload.get("capability_gaps", []) if isinstance(payload, dict) else []
-        intents: List[EvolutionIntent] = []
-        for raw in raw_gaps:
+        raw_verdicts = (
+            payload.get("adaptation_verdicts", []) if isinstance(payload, dict) else []
+        )
+        # Providers we ourselves named as alternatives. Rejecting a target we offered would
+        # be incoherent, and it silently was: the guard consulted only the live registry,
+        # so in any process whose alternatives come from somewhere else -- a replay, a
+        # study, a registry that has not caught up -- every legitimate rebind was
+        # discarded. Measured as 3/3 silence on a rebind unit across two unrelated corpus
+        # designs, which read as "the model will not answer rebind" and was in fact "we
+        # threw the answer away".
+        offered = _offered_providers(degraded_capabilities)
+        verdicts: List[AdaptationVerdict] = []
+        for raw in raw_verdicts:
             if not isinstance(raw, dict):
                 continue
             capability = str(raw.get("capability") or "").strip()
-            if not _is_capability_name(capability):
+            if not is_capability_name(capability):
                 logger.debug(
                     "trajectory_grader: rejected non-capability name %r", capability
                 )
@@ -319,18 +582,37 @@ class TrajectoryGrader:
                 confidence = float(raw.get("confidence", 0.0))
             except (TypeError, ValueError):
                 confidence = 0.0
+            action = str(raw.get("action") or "").strip().lower()
+            target = str(raw.get("target") or "").strip()
+            if action == "rebind" and not (
+                target in offered or _is_declared_capability(target)
+            ):
+                # A rebind that cannot point at something real is not a cheaper answer,
+                # it is a dead end wearing one: the failure stays and the student is told
+                # to "Prefer" a provider that does not exist. Measured on a real model at
+                # 3 of 3 trials, pointing at a neighbour from the naming catalogue.
+                logger.debug(
+                    "trajectory_grader: rejected rebind to unknown target %r", target
+                )
+                continue
             try:
-                intents.append(EvolutionIntent.create(
-                    capability,
-                    str(raw.get("hypothesis") or ""),
-                    confidence=confidence,
-                    target_affordance=str(raw.get("target_affordance") or ""),
-                    rationale=str(raw.get("rationale") or ""),
-                    expected_effect=str(raw.get("expected_effect") or ""),
-                ))
+                verdicts.append(
+                    AdaptationVerdict.create(
+                        str(raw.get("action") or ""),
+                        capability,
+                        str(raw.get("knowledge") or ""),
+                        rationale=str(raw.get("rationale") or ""),
+                        confidence=confidence,
+                        target=str(raw.get("target") or ""),
+                        target_affordance=str(raw.get("target_affordance") or ""),
+                        expected_effect=str(raw.get("expected_effect") or ""),
+                    )
+                )
             except ValueError:
-                logger.debug("trajectory_grader: discarded malformed capability gap %r", raw)
-        return tuple(intents)
+                logger.debug(
+                    "trajectory_grader: discarded unusable adaptation verdict %r", raw
+                )
+        return tuple(verdicts)
 
     def _persist_grades(
         self,

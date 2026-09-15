@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill learnability assessment — decides if a recorded trajectory is worth distilling.
 
 Architecture: Three-tier progressive assessment (L1 Rules → L2 VLM → L3 LLM).

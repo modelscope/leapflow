@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Gateway event types for EventBus integration.
 
 Gateway publishes events; MemoryManager, Copilot, and AgentEngine can

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Core data model for imitation learning trajectories.
 
 Defines the experience hierarchy:

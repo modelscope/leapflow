@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Slash-command handler implementations.
 
 Each handler follows the signature ``(ctx, console, args) -> None``.

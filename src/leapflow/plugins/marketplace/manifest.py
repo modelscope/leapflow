@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Plugin manifest format for marketplace distribution.
 
 Supports Ed25519 signing for authenticity guarantees (in addition to

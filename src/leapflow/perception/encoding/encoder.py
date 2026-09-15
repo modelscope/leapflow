@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Adaptive resolution encoder — context-aware frame compression."""
 
 from __future__ import annotations

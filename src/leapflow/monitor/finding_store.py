@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DuckDB-backed persistence for monitor findings.
 
 Shares the daemon's single ``leap.duckdb`` connection via ``ConnectionHolder``

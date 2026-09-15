@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """The world model's evolution proposal contract.
 
 An ``EvolutionIntent`` is what the LLM-based world model emits when, given
@@ -29,6 +30,7 @@ world-model intent is governed by exactly the same machinery as an
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -56,6 +58,23 @@ MODEL_AUTHORED_RISK_CEILING: RiskLevel = "read_only"
 
 # Ascending permissiveness, matching ``RiskLevel``.
 _RISK_ORDER: tuple[str, ...] = ("read_only", "low", "medium", "high", "mutating", "external")
+
+
+#: What a capability name looks like. One definition, because two nearly-identical
+#: regexes diverged in exactly the way that produces a silent drop: the parser's gate
+#: accepted ``chat.2fa`` and the verdict constructor rejected it, so a legitimately
+#: named capability was discarded with only a debug log. Bounds are deliberate -- a
+#: forty-character segment is prose, and prose must never become a requirement.
+_CAPABILITY_NAME = re.compile(r"^[a-z][a-z0-9_]{1,31}(\.[a-z0-9][a-z0-9_]{0,31}){1,3}$")
+
+
+def is_capability_name(value: str) -> bool:
+    """Whether a model-supplied string is shaped like a capability at all.
+
+    Requires lowercase dotted structure with 2-4 segments. Rejects prose, bare words,
+    paths, and anything long enough to be a description rather than a name.
+    """
+    return bool(value) and len(value) <= 96 and bool(_CAPABILITY_NAME.match(value))
 
 
 def _risk_rank(level: str) -> int:

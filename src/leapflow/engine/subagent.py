@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Subagent isolation — delegated task execution with restricted context.
 
 Design (inspired by hermes delegate_tool):

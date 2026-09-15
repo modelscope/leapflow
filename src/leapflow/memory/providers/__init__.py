@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Memory provider implementations."""
 
 from leapflow.memory.providers.working import WorkingMemoryProvider

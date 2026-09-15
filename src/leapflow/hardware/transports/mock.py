@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Programmable in-memory transport for tests and dry runs.
 
 Deliberately device-agnostic: it holds channel values, applies writes, and

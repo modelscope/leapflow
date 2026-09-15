@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Telemetry taps: optional, opt-in observation points for runtime facts.
 
 A tap is a module-level sink plus a one-line emit function. Absent a sink every

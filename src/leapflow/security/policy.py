@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Approval policy evaluation built on structured risk assessments."""
 from __future__ import annotations
 

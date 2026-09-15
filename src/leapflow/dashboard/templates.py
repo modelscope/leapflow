@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """YAML template rendering into a validated ViewSpec (the SDUI authoring layer).
 
 Templates are authored in YAML per scenario and compiled at runtime into a

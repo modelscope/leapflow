@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Phase A: the co-evolution capabilities are wired, and the wiring is driven.
 
 The prior round shipped `CapabilityEffectVerifier`, `QuarantineCandidateTracker`
@@ -230,6 +231,19 @@ class _Ctx:
         from leapflow.cli.context import Context
 
         return await Context._run_coevolution_sweep(self)
+
+    def _resolve_lifecycle_governor(self):
+        """Bound because the production hook resolves the governor through it.
+
+        The hook used to read ``self.lifecycle_governor`` directly -- an attribute nothing
+        in production ever assigned, so every session swept with ``governor=None``. It now
+        goes through a resolver that honours an injected governor first and builds one from
+        the profile layout otherwise, and a host driving the real hook has to expose the
+        same surface or it would exercise the broad ``except`` instead of the code.
+        """
+        from leapflow.cli.context import Context
+
+        return Context._resolve_lifecycle_governor(self)
 
 
 def test_production_sweep_hook_builds_and_runs_a_real_sweep():

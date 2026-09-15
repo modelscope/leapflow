@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Transport that drives a device through an MCP server.
 
 The second southbound implementation, and therefore the first real test of the

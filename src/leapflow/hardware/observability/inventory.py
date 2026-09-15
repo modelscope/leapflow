@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Fleet inventory and per-device views: the board's on-demand read path.
 
 A third data shape beside the digest. The digest is a *cycle* payload -- built on the

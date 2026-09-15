@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unified error classifier bridging LLM, tool, and system failures into FailureEnvelope.
 
 Provides a single classification entry point that produces FailureEnvelope instances

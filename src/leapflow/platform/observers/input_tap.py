@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Keyboard and mouse input event observer (cross-platform).
 
 Captures low-level input events and publishes UI_ACTION events.

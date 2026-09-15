@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Serialize/deserialize SkillBundle for hub transport.
 
 Converts between SkillLibraryStore records and portable SkillBundle format.

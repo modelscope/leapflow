@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """CuaDriverClient method→tool mapping and timeout resolution.
 
 Locks the cua-driver wire contract (verified against 0.6.8): get_window_state

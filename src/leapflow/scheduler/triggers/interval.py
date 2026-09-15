@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Interval-based trigger: fires every N seconds/minutes/hours/days."""
 
 from __future__ import annotations

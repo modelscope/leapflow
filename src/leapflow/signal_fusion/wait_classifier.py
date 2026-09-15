@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Silent period classification for gaps between user actions.
 
 Classifies temporal gaps as normal pauses, AI generation waits,

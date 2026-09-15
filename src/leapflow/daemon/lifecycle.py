@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Daemon lifecycle management — PID files, lock files, health checks.
 
 Handles the leapd daemon lifecycle:

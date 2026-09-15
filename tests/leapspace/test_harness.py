@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic unit tests for LeapAppHarness (fake actor, no sandbox).
 
 """

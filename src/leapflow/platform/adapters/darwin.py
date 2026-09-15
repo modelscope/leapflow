@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """macOS adapter — maps VSI ports to HostRpc calls targeting CuaDriver."""
 
 from __future__ import annotations

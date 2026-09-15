@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for monitor/display signal noise suppression."""
 from __future__ import annotations
 

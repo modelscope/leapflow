@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Episode-scale fusion: cross-app workflow graph construction.
 
 Assembles Segments into EnrichedEpisodes with WorkflowGraph DAGs,

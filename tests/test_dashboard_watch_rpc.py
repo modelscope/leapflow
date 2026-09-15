@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for the watch RPC surface and the /board command handler.
 
 No network, no LLM, no full Context: the daemon service and slash handler are

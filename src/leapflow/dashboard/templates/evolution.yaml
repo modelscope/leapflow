@@ -310,6 +310,50 @@ layout:
                         - key: next_step
                           label: "Next step"
 
+              - type: Section
+                when: evolution.reward_bandwidth
+                props:
+                  title: "Reward signal bandwidth"
+                  subtitle: "How much of the effect signal is usable as feedback. This decides whether a learning policy is worth building."
+                children:
+                  - type: Row
+                    props:
+                      variant: metrics
+                    children:
+                      - type: Gauge
+                        props:
+                          label: "Usable"
+                          value: "{{ evolution.reward_bandwidth.usable_rate }}"
+                      - type: Gauge
+                        props:
+                          label: "Abstained"
+                          value: "{{ evolution.reward_bandwidth.abstain_rate }}"
+                      - type: Stat
+                        props:
+                          label: "Verdicts"
+                          value: "{{ evolution.reward_bandwidth.total }}"
+                      - type: Gauge
+                        props:
+                          label: "Effects declared"
+                          value: "{{ evolution.reward_bandwidth.declared_rate }}"
+                  # Absence of a signal is not a healthy signal. With no verdicts an
+                  # abstain rate of 0% would read as "almost nothing abstains", which is
+                  # the opposite of the truth.
+                  - type: Markdown
+                    when: evolution.reward_bandwidth.absent
+                    props:
+                      text: >-
+                        > **No effect verdict has been recorded yet**, so there is no reward
+                        signal to measure. The rates above are blank rather than zero on
+                        purpose. An effect can only be verified when the requirement declared
+                        one, and only world-model-authored requirements carry an expected
+                        effect today.
+                  - type: BarChart
+                    when: evolution.reward_bandwidth.by_reason
+                    props:
+                      title: "Verdicts by reason"
+                      bind: evolution.reward_bandwidth.by_reason
+
               # Traces come from probes at points no store retains: a registry
               # mutation, a trust transition, a teacher proposal. Kept separate from
               # the episode timeline on purpose -- these answer "what just happened",

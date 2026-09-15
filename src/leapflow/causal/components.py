@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Layer 2 front-end components — lightweight processors that transform
 raw CausalEvents into structured CausalChains.
 

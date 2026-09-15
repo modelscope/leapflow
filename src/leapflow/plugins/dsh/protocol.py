@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Versioned NDJSON protocol for the restricted DSH Node worker."""
 from __future__ import annotations
 

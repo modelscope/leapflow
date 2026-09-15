@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Static regression guards for LeapBoard frontend i18n coverage.
 
 There is no JS test runner in this repository yet, so these tests protect the

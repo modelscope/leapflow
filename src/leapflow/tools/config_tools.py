@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Config tools: let the model read and change settings without touching paths.
 
 Without these, a request like "switch the model to X" has no legal path: the
@@ -19,6 +20,8 @@ from __future__ import annotations
 import difflib
 import logging
 from typing import Any, Dict
+
+from leapflow.learning.capability_effect_verifier import declare_effect
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +290,18 @@ async def config_set_handler(args: Dict[str, Any]) -> Dict[str, Any]:
     # Never echo a credential back into the transcript.
     if not before.secret:
         payload["value"] = args["value"]
+    if result.ok:
+        # The effect declaration follows the same redaction rule as the payload: a
+        # secret's new value must not travel here either, so its effect names the key
+        # and scope only. Both forms are still observations -- the write returned ok
+        # and the key now holds what was set.
+        payload.update(
+            declare_effect(
+                f"config key {key} in scope {scope} is now {args['value']}"
+                if not before.secret
+                else f"config key {key} in scope {scope} was updated"
+            )
+        )
     if before.hot_reload == "restart-required":
         payload["restart_required"] = True
         payload["next_step"] = "Run `leap daemon restart` for this change to take effect."

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Safe paste handling for the TUI input buffer.
 
 This module keeps high-risk pasted content out of the visible prompt_toolkit

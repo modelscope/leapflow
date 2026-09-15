@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Semantic Adapter — translation layer between LLM tools and platform ports.
 
 This is the execution-side counterpart to the Recording pipeline's

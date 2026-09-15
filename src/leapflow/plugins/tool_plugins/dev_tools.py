@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Dev tools plugin — test runner and linter integration."""
 
 from __future__ import annotations

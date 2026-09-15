@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """EvolutionProducer: the framework-evolution transparency panel.
 
 The tests that matter most here are the negative ones. This producer reports
@@ -526,9 +527,15 @@ def test_capability_ownership_is_emitted_in_renderer_compatible_shapes(monkeypat
 def test_evolution_template_binds_only_shapes_its_renderers_read():
     """Guard the trap above at the template level, for this template.
 
-    ``EntityGraph`` and ``Table`` both read ``props.data``; a template binding a
-    mapping to either renders headings over nothing. Asserted here rather than
-    only in the SDUI suite because the payload contract is this producer's.
+    ``EntityGraph``, ``Table``, ``BarChart`` and ``Timeline`` all read ``props.data``
+    as a flat list; a template binding a mapping to any of them renders headings
+    over nothing and reports no fault. Asserted here rather than only in the SDUI
+    suite because the payload contract is this producer's.
+
+    The chart and timeline types were originally omitted, so three chart binds and
+    two timeline binds went unchecked -- the guard covered the shape hazard it was
+    written for and silently exempted the other half of the components that share
+    it.
     """
     from leapflow.dashboard.templates import TemplateLibrary
 
@@ -550,14 +557,20 @@ def test_evolution_template_binds_only_shapes_its_renderers_read():
         "evolution.reachability_mix",
         "evolution.provenance_mix",
         "evolution.reclaim_candidates",
+        "evolution.reward_bandwidth.by_reason",
         "evolution.summary.suggestions",
     }
+    #: Every shipped renderer that coerces ``props.data`` with ``asArray``.
+    DATA_LIST_COMPONENTS = (
+        "EntityGraph", "Table", "BarChart", "Timeline",
+        "PieChart", "LineChart", "AreaChart", "Sparkline", "Heatmap",
+    )
     binds: list[tuple[str, str]] = []
 
     def walk(node: object) -> None:
         if isinstance(node, dict):
             props = node.get("props")
-            if node.get("type") in ("EntityGraph", "Table") and isinstance(props, dict):
+            if node.get("type") in DATA_LIST_COMPONENTS and isinstance(props, dict):
                 bind = props.get("bind")
                 if isinstance(bind, str):
                     binds.append((str(node.get("type")), bind))
@@ -876,3 +889,178 @@ def test_the_default_tab_is_never_blank():
         assert tab.get("children"), (
             f"the default tab rendered empty for payload keys {sorted(payload)}"
         )
+
+
+# ── P0: reward signal bandwidth ──────────────────────────────────────────────
+
+
+def _verification_trace(reason: str, verified, **detail):
+    return {
+        "trace_id": f"t-{reason}-{verified}",
+        "stage": "learn",
+        "kind": "effect_verification",
+        "summary": reason,
+        "detail": {"reason": reason, "verified": verified, **detail},
+    }
+
+
+def test_no_verdict_is_reported_as_absent_not_as_a_zero_rate():
+    """Absence of a signal is not a healthy signal.
+
+    With no verdicts an abstain rate of 0% reads as "almost nothing abstains",
+    which is the exact opposite of the truth. The rates stay blank and ``absent``
+    carries the fact, mirroring how the reachability rows separate "no evidence"
+    from a measured value.
+    """
+    from leapflow.monitor.evolution_producer import EvolutionProducer
+
+    bandwidth = EvolutionProducer()._reward_bandwidth([], [])
+    assert bandwidth["observed"] is False
+    assert bandwidth["absent"] is True
+    assert bandwidth["total"] == 0
+    assert bandwidth["abstain_rate"] == ""
+    assert bandwidth["usable_rate"] == ""
+
+
+def test_abstention_is_counted_separately_from_refutation():
+    """A three-valued verdict must not be folded into either side.
+
+    Treating abstention as failure would demote and eventually quarantine healthy
+    plugins for a reporting omission -- the failure the three-valued verdict exists
+    to prevent.
+    """
+    from leapflow.monitor.evolution_producer import EvolutionProducer
+
+    traces = [
+        _verification_trace("effect_observed", True),
+        _verification_trace("expected_effect_absent", False),
+        _verification_trace("tool_reported_no_effect", None),
+        _verification_trace("no_expected_effect_declared", None),
+        _verification_trace("no_outcome_observed", None),
+    ]
+    bandwidth = EvolutionProducer()._reward_bandwidth(traces, [])
+
+    assert bandwidth["total"] == 5
+    assert bandwidth["decided"] == 2      # verified True or False
+    assert bandwidth["abstained"] == 3    # verified None
+    assert bandwidth["abstain_rate"] == "60%"
+    assert bandwidth["usable_rate"] == "40%"
+
+
+def test_the_no_op_sweep_branch_is_not_counted_as_a_verdict():
+    """The sweep records "nothing to verify" too; that is not an abstention."""
+    from leapflow.monitor.evolution_producer import EvolutionProducer
+
+    traces = [
+        {"trace_id": "a", "kind": "effect_verification", "detail": {"observed": 0, "no_op": True}},
+        _verification_trace("effect_observed", True),
+    ]
+    bandwidth = EvolutionProducer()._reward_bandwidth(traces, [])
+    assert bandwidth["total"] == 1
+    assert bandwidth["abstained"] == 0
+
+
+def test_reasons_are_ranked_so_the_dominant_cause_leads():
+    from leapflow.monitor.evolution_producer import EvolutionProducer
+
+    traces = [_verification_trace("tool_reported_no_effect", None, i=i) for i in range(3)]
+    traces.append(_verification_trace("effect_observed", True))
+    for row, expected in zip(
+        EvolutionProducer()._reward_bandwidth(traces, [])["by_reason"],
+        ({"label": "tool_reported_no_effect", "value": 3}, {"label": "effect_observed", "value": 1}),
+    ):
+        assert row == expected
+
+
+# ── P0: the three cold-path segments must be read, not asserted ──────────────
+
+
+def test_a_wired_sweep_is_no_longer_reported_as_unwired(monkeypatch):
+    """These rows were hardcoded to NO_EVIDENCE and stayed so after being wired.
+
+    The board asserted three segments were dead while ``CoevolutionSweep`` was
+    running them. A panel whose purpose is to separate "exists" from "runs" must
+    not hardcode the answer.
+    """
+    from leapflow.monitor.evolution_producer import EvolutionProducer
+
+    traces = [
+        {"kind": "effect_verification", "detail": {"reason": "effect_observed", "verified": True}},
+        {"kind": "quarantine_drain", "detail": {"drained": 1}},
+        {"kind": "reclamation", "detail": {"candidates": 2}},
+    ]
+    rows = {r["key"]: r for r in EvolutionProducer()._segments_awaiting_wiring(traces)}
+
+    assert rows["effect_verification"]["status"] == "wired"
+    assert rows["quarantine_feed"]["status"] == "wired"
+    assert rows["reclamation"]["status"] == "wired"
+    # A wired row must not still be advising the reader to wire it.
+    assert not any("Wire" in str(r.get("next_step") or "") for r in rows.values())
+
+
+def test_an_idle_sweep_is_wired_not_absent():
+    """"Ran and had nothing to do" is evidence the segment works.
+
+    The sweep emits its no-op branches precisely so this can be told apart from
+    never having run.
+    """
+    from leapflow.monitor.evolution_producer import EvolutionProducer
+
+    traces = [
+        {"kind": "effect_verification", "detail": {"observed": 0, "no_op": True}},
+        {"kind": "quarantine_drain", "detail": {"no_op": True}},
+        {"kind": "reclamation", "detail": {"no_op": True}},
+    ]
+    rows = {r["key"]: r for r in EvolutionProducer()._segments_awaiting_wiring(traces)}
+    assert {r["status"] for r in rows.values()} == {"wired"}
+    assert "nothing to act on" in rows["reclamation"]["evidence"]
+
+
+def test_a_sweep_that_never_ran_is_still_no_evidence():
+    """The honest negative: no trace at all means the cold path did not run."""
+    from leapflow.monitor.evolution_producer import EvolutionProducer
+
+    rows = {r["key"]: r for r in EvolutionProducer()._segments_awaiting_wiring([])}
+    assert {r["status"] for r in rows.values()} == {"no_evidence"}
+    assert all(r["next_step"] for r in rows.values())
+
+
+def test_a_risk_class_string_can_no_longer_fabricate_a_verified_effect():
+    """``effect`` was a second accepted key and is already taken by another meaning.
+
+    ``"effect": "write"`` is a risk *class* in self-management and a channel *type*
+    in hardware -- not a description of what happened. With single-token overlap
+    sufficient to match, an expectation reading "write the message to the channel"
+    was confirmed by a tool reporting ``effect="write"``, and a decided verdict
+    grants trust. That is worse than no signal: it is a wrong one.
+    """
+    from leapflow.domain.capability_requirement import CapabilityRequirement
+    from leapflow.learning.capability_effect_verifier import (
+        EFFECT_UNREPORTED,
+        OBSERVED_EFFECT_KEYS,
+        CapabilityEffectVerifier,
+    )
+
+    assert OBSERVED_EFFECT_KEYS == ("observed_effect",), (
+        "a key already used for another purpose must not be an effect source"
+    )
+
+    verifier = CapabilityEffectVerifier()
+    requirement = CapabilityRequirement.create(
+        "chat.send",
+        "unknown_tool",
+        metadata={"expected_effect": "write the message to the channel"},
+    )
+
+    # The exact collision that produced a false confirmation.
+    verdict = verifier.verify(requirement, {"ok": True, "effect": "write"}, plugin_id="p")
+    assert verdict.verified is None, "a risk class must not decide an effect verdict"
+    assert verdict.reason == EFFECT_UNREPORTED
+
+    # The declared channel still works.
+    honest = verifier.verify(
+        requirement,
+        {"ok": True, "observed_effect": "wrote the message to the channel"},
+        plugin_id="p",
+    )
+    assert honest.verified is True

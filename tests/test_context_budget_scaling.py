@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Contracts for context budget resolution and truncation-chain scaling.
 
 Two problems these pin down:

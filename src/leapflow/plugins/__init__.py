@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Plugin subsystem — contracts, discovery, lifecycle, and the live registry.
 
 This package owns everything about *extending* LeapFlow: the ``ToolPlugin``

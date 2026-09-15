@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Core data model for the Causal Propagation Chain.
 
 Three levels of abstraction:

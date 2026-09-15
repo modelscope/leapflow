@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for CV algorithm plugins and the CVProcessor Protocol (Fix D4).
 
 Covers the default registry contents, Protocol conformance, and both the

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """S3-L2: offline difficulty calibration analysis (report-only).
 
 Consumes the adaptive-depth learning signals captured per turn (S3-L1) from the

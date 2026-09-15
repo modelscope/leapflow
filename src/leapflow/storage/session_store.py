@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Persistent store for learning session metadata.
 
 Enables `leap teach --resume` by persisting LearningSession records across

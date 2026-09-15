@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DAG-based task scheduler with parallel execution, retry, and fault tolerance.
 
 Executes a TaskGraph by:

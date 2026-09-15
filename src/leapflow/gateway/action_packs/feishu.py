@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Feishu/Lark action pack — loaded from feishu.yaml.
 
 All action definitions live in feishu.yaml next to this file.

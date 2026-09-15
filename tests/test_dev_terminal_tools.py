@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for P2 tools: test_run, lint_check (shell_run wrappers) and the
 terminal_session lifecycle (opt-in persistent shells).
 

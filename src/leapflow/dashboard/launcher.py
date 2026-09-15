@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Dashboard launcher: token/URL/state helpers, browser open, and server spawn.
 
 The dashboard runs as a separate view-client process (like the TUI). This module

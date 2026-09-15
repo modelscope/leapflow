@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Per-frame execution state for the agent OODA loop (W4-M1).
 
 An ``AgentLoopFrame`` bundles everything that must be *fresh and isolated* for a

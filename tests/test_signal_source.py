@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the SignalSource protocol, built-in sources, and registry.
 
 Verifies that the pluginized extraction produces byte-for-byte identical

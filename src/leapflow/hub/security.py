@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Content sanitization and security audit for hub operations.
 
 Scans SkillBundle content for sensitive data (before push) and dangerous

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Progressive trust ledger for plugins.
 
 Trust is earned through consistent successful execution (not human approval).

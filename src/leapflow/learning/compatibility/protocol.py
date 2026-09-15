@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Protocol and data definitions for Plugin Compatibility Assessment Engine.
 
 Defines the core domain types used across all assessment stages.

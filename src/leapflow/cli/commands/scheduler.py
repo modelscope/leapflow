@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scheduler CLI commands — arm tasks and manage scheduled execution.
 
 Provides ``leap arm`` and ``leap tasks`` subcommands for the interactive REPL.

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for CLI help-based command discovery."""
 from __future__ import annotations
 

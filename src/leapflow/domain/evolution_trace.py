@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Causal types for framework self-evolution: one atomic fact, and one episode.
 
 Two concepts sit beside :mod:`leapflow.domain.evolution_intent`, and the pairing is

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Domain-neutral monitoring subsystem: Watch -> Finding contract and runtime.
 
 Public surface:

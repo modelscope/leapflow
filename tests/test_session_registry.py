@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the daemon SessionRegistry (Stage 3, P3-2a).
 
 Pure infrastructure tests with fake engine/working-memory factories: every

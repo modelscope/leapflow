@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for leapspace.app_space.utils: check() lines and path conventions."""
 
 import asyncio

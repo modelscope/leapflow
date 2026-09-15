@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Durable store for structured capability observations.
 
 The store is profile-scoped and intentionally stores only structured metadata
@@ -27,6 +28,20 @@ _OBSERVATION_FIELDS = frozenset(
         "failure_code",
         "capability",
         "tool_name",
+        # Who is failing, and how persistently. Degradation evidence reports that an
+        # *existing* provider is inadequate, so the provider's identity is the payload
+        # -- dropping it leaves "some capability is degraded" with no way to name the
+        # incumbent. Two consumers need it: the teacher, which cannot judge a
+        # replacement without knowing what would be replaced, and proposal identity,
+        # which derives a rival's plugin id from the incumbent so the two can coexist
+        # rather than collide on one capability-derived name.
+        "plugin_id",
+        "failure_streak",
+        "trust_level",
+        # What *kind* of failure it was. Without it a degradation fact reads "failed
+        # twice" and the retry-owned classes cannot be filtered out, so a timeout would
+        # reach the teacher and the only verdict that changes anything is "rebuild".
+        "failure_class",
         # Declarations the detector needs to rebuild a requirement from a
         # persisted observation. Dropping these silently changed behaviour rather
         # than failing: without ``max_risk_level`` the requirement inherited the

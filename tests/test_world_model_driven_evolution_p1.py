@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """P1: the world model becomes a driver of capability evolution.
 
 Two halves:
@@ -83,9 +84,8 @@ _GRADES_AND_GAP = json.dumps({
         {"step": 2, "advantage": -0.9, "is_forking": False, "grade_label": "harmful"},
         {"step": 3, "advantage": 0.2, "is_forking": False, "grade_label": "acceptable"},
     ],
-    "capability_gaps": [{
-        "capability": "chat.reply",
-        "hypothesis": "the send affordance was renamed and no adapter targets it",
+    "adaptation_verdicts": [{"action": "acquire", "capability": "chat.reply",
+        "knowledge": "the send affordance was renamed and no adapter targets it",
         "confidence": 0.82,
         "target_affordance": "app.chat.v2",
         "rationale": "every available tool binds send_button, which no longer exists",
@@ -124,11 +124,11 @@ def test_proposing_costs_no_extra_budget_token():
 def test_gap_section_only_appears_when_proposing():
     grader, llm, _ = _grader(_GRADES)
     asyncio.run(grader.grade_trajectory(_TRAJECTORY))
-    assert "capability_gaps" not in llm.prompts[0]
+    assert "adaptation_verdicts" not in llm.prompts[0]
 
     grader2, llm2, _ = _grader(_GRADES_AND_GAP)
     asyncio.run(grader2.grade_and_propose(_TRAJECTORY))
-    assert "capability_gaps" in llm2.prompts[0]
+    assert "adaptation_verdicts" in llm2.prompts[0]
 
 
 def test_teacher_is_not_asked_to_choose_a_risk_level():
@@ -154,11 +154,11 @@ def test_malformed_gaps_are_discarded_without_losing_grades():
             {"step": 2, "advantage": 0.2, "is_forking": False, "grade_label": "acceptable"},
             {"step": 3, "advantage": 0.3, "is_forking": False, "grade_label": "acceptable"},
         ],
-        "capability_gaps": [
-            {"hypothesis": "no capability field"},        # missing capability
-            {"capability": "chat.reply"},                  # missing hypothesis
+        "adaptation_verdicts": [
+            {"knowledge": "no capability field"},        # missing capability
+            {"action": "acquire", "capability": "chat.reply"},                  # missing hypothesis
             "not even an object",
-            {"capability": "chat.send", "hypothesis": "valid", "confidence": "NaN-ish"},
+            {"action": "acquire", "capability": "chat.send", "knowledge": "valid", "confidence": "NaN-ish"},
         ],
     })
     grader, _, _ = _grader(payload)

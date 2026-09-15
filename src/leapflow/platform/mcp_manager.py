@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """MCP Server Manager — generalized MCP client for arbitrary servers.
 
 Design (inspired by hermes tools/mcp_tool.py, generalized from CuaDriverClient):
