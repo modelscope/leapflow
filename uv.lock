@@ -943,6 +943,7 @@ wheels = [
 name = "leapflow"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "cryptography" },
     { name = "duckdb" },
     { name = "gnureadline", marker = "sys_platform == 'darwin'" },
@@ -961,9 +962,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-dashboard = [
-    { name = "aiohttp" },
-]
 dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -980,7 +978,7 @@ web = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiohttp", marker = "extra == 'dashboard'", specifier = ">=3.9" },
+    { name = "aiohttp", specifier = ">=3.9" },
     { name = "cryptography", specifier = ">=42.0" },
     { name = "duckdb", specifier = ">=1.0.0" },
     { name = "gnureadline", marker = "sys_platform == 'darwin'", specifier = ">=8.0" },
@@ -1004,7 +1002,7 @@ requires-dist = [
     { name = "trafilatura", marker = "extra == 'web'", specifier = ">=2.2" },
     { name = "watchdog", specifier = ">=3.0" },
 ]
-provides-extras = ["dev", "hub", "dashboard", "web"]
+provides-extras = ["dev", "hub", "web"]
 
 [[package]]
 name = "lxml"

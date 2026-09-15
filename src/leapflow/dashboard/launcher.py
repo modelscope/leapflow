@@ -31,7 +31,11 @@ _STATE_FILE = "dashboard.json"
 
 
 def aiohttp_available() -> bool:
-    """Return True when the optional ``aiohttp`` dependency is importable."""
+    """Return True when ``aiohttp`` is importable.
+
+    ``aiohttp`` ships as a core dependency, so this only guards against a
+    broken or partial install rather than an intentionally omitted extra.
+    """
     import importlib.util
 
     return importlib.util.find_spec("aiohttp") is not None
@@ -302,8 +306,8 @@ def ensure_server(settings: Any, *, wait_s: float = 8.0) -> dict[str, Any]:
         return existing
     if not aiohttp_available():
         raise RuntimeError(
-            "The dashboard web server requires the optional 'aiohttp' dependency. "
-            "Install it with: pip install 'leapflow[dashboard]'"
+            "The dashboard web server requires 'aiohttp', which ships with LeapFlow. "
+            "Reinstall it with: pip install aiohttp"
         )
 
     # A prior server may be dead-but-recorded, alive with a token we can no longer

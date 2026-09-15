@@ -30,6 +30,12 @@ class GuardrailViolation:
     reason: str = ""
     severity: str = "warning"  # "warning" | "halt"
     suggestion: str = ""
+    # A halt the engine must honour regardless of the global stall marker.
+    # Set only when the violation is, by construction, zero forward progress
+    # (e.g. the same tool returned the same result N times), so that the coarse
+    # research/governance progress heuristic cannot keep a genuine no-op loop
+    # spinning until the iteration budget is exhausted.
+    progress_independent: bool = False
 
 
 @runtime_checkable
@@ -41,9 +47,16 @@ class ToolLoopGuard(Protocol):
 
 
 class RepetitionGuard:
-    """Detect exact-duplicate tool calls (same name + same arguments hash).
+    """Detect a no-progress loop: the same tool call returning the same result.
 
-    Triggers when the same tool call appears N+ times consecutively.
+    Triggers when a tool call with identical name + arguments *and* an identical
+    result appears N+ times consecutively. The result is part of the signature
+    on purpose: a call that returns a *changing* value each time (legitimate
+    polling of a sensor, a queue, a build status) is genuine progress and must
+    not be flagged, whereas a call that keeps returning the *same* value is zero
+    information gain no matter what the global progress heuristic believes. That
+    is why the resulting halt is ``progress_independent`` — it is safe to honour
+    without consulting the stall marker.
     """
 
     def __init__(self, *, max_repeats: int = 3) -> None:
@@ -58,11 +71,24 @@ class RepetitionGuard:
         if not tool_msgs:
             return GuardrailViolation(violated=False)
 
+        # Correlate each native tool call with the result it produced so the
+        # signature reflects information gain, not just intent. A call whose
+        # result is not yet in history (or unmatched) contributes an empty
+        # result signature, degrading gracefully to call-only comparison.
+        results_by_id: Dict[str, str] = {}
+        for m in history:
+            if m.get("role") == "tool":
+                content = m.get("content", "")
+                results_by_id[str(m.get("tool_call_id", ""))] = (
+                    content if isinstance(content, str) else ""
+                )
+
         hashes: List[str] = []
         for msg in tool_msgs[-self._max_repeats * 2:]:
             for tc in (msg.get("tool_calls") or []):
                 fn = tc.get("function", {})
-                key = f"{fn.get('name', '')}:{fn.get('arguments', '')}"
+                result_sig = results_by_id.get(str(tc.get("id", "")), "")
+                key = f"{fn.get('name', '')}:{fn.get('arguments', '')}:{result_sig}"
                 hashes.append(hashlib.md5(key.encode()).hexdigest()[:12])
 
         if len(hashes) >= self._max_repeats:
@@ -70,9 +96,13 @@ class RepetitionGuard:
             if len(set(tail)) == 1:
                 return GuardrailViolation(
                     violated=True,
-                    reason=f"Identical tool call repeated {self._max_repeats} times",
+                    reason=(
+                        f"Identical tool call returned the same result "
+                        f"{self._max_repeats} times"
+                    ),
                     severity="halt",
                     suggestion="Try a different approach or provide the final answer.",
+                    progress_independent=True,
                 )
 
         return GuardrailViolation(violated=False)

@@ -906,12 +906,12 @@ Watch (leapd-hosted) ── observe → SNR filter → score → Finding ──�
 - **Continuous observation** — a board starts as a `Watch` in `leapd`. Scheduler triggers, manual `/board refresh`, and session-analysis batch thresholds all run the same observe→finding cycle; new findings are persisted, severity-gated, and pushed to browsers over WebSocket.
 - **Refresh model** — the session board re-analyzes as the conversation accumulates turns, when written workspace artifacts change, or on manual `/board refresh`; `/board pause`/`stop` halt re-analysis until resumed. The chosen **template** only changes rendering, never what is analyzed (always the current session).
 - **Server-Driven UI** — each scenario is authored as a **YAML template** compiled into a validated **ViewSpec** over a fixed component catalog (cards, tables, charts, timelines, gauges, story panels…). Interactive components talk back through a bidirectional action protocol; unknown component types degrade gracefully, and bespoke visuals use a `Custom` escape hatch. The board never renders arbitrary HTML/JS.
-- **View client** — the board connects to `leapd` like the TUI does, with no privileged coupling. The web server is optional (`aiohttp`) and degrades with a clear install hint when absent.
+- **View client** — the board connects to `leapd` like the TUI does, with no privileged coupling. The web server (`aiohttp`) ships with the base install, so `leap board` works out of the box.
 
 ### Install & enable
 
 ```bash
-pip install 'leapflow[dashboard]'   # adds the optional aiohttp web server
+pip install leapflow   # the aiohttp web server ships with the base install
 ```
 
 The board binds to `127.0.0.1` with a per-session access token. Tune it through `leap config`:

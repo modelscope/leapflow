@@ -19,8 +19,8 @@ from leapflow.config import load_config
 from leapflow.dashboard import launcher
 
 _DEP_HINT = (
-    "The dashboard web server requires the optional 'aiohttp' dependency.\n"
-    "Install it with: pip install 'leapflow[dashboard]'"
+    "The dashboard web server requires 'aiohttp', which ships with LeapFlow.\n"
+    "Reinstall it with: pip install aiohttp"
 )
 
 

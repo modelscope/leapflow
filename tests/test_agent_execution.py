@@ -720,6 +720,102 @@ def test_guardrail_halt_suppressed_while_progressing() -> None:
             lt.close()
 
 
+def test_repetition_guard_is_result_aware() -> None:
+    """Root-cause guard: a repeated tool call only halts when it also returns the
+    *same* result (zero information gain). A call whose result changes each time
+    (legitimate polling) is progress and must not be flagged. The no-progress
+    halt is ``progress_independent`` so the engine honours it without consulting
+    the coarse global stall marker."""
+    from leapflow.engine.tool_guardrails import RepetitionGuard
+
+    def _call(name: str, args: str, cid: int) -> dict:
+        return {
+            "role": "assistant",
+            "tool_calls": [{"id": cid, "function": {"name": name, "arguments": args}}],
+        }
+
+    def _result(cid: int, content: str) -> dict:
+        return {"role": "tool", "tool_call_id": cid, "content": content}
+
+    guard = RepetitionGuard(max_repeats=3)
+
+    # Same call + identical result three times -> stuck loop -> halt.
+    stuck: list = []
+    for i in range(3):
+        stuck.append(_call("hw_list", "{}", i))
+        stuck.append(_result(i, '{"ok": true, "count": 1}'))
+    v = guard.check(stuck)
+    assert v.violated and v.severity == "halt" and v.progress_independent
+
+    # Same call but a changing result each time (polling) -> not flagged.
+    polling: list = []
+    for i in range(3):
+        polling.append(_call("hw_read", '{"d": "s"}', 100 + i))
+        polling.append(_result(100 + i, '{"ok": true, "value": %d}' % i))
+    assert guard.check(polling).violated is False
+
+
+def test_progress_independent_halt_fires_while_progressing() -> None:
+    """A ``progress_independent`` halt (the same tool returning the same result)
+    must stop the loop even when the global stall marker still reads as advancing
+    -- otherwise a genuine no-op loop spins until the iteration budget is spent
+    and the user gets a canned step-limit notice instead of an answer."""
+    from leapflow.engine.agent_loop import AgentLoopFrame
+    from leapflow.engine.tool_guardrails import GuardrailViolation
+
+    class _NoProgressHaltGuard:
+        def check(self, history):
+            return GuardrailViolation(
+                violated=True,
+                reason="loop",
+                severity="halt",
+                suggestion="stop",
+                progress_independent=True,
+            )
+
+        def reset(self):
+            pass
+
+    with tempfile.TemporaryDirectory() as td:
+        engine, lt, _ = _adaptive_engine(td)
+        try:
+            engine._guardrail = _NoProgressHaltGuard()
+            frame = AgentLoopFrame(user_text="x")
+            engine._active_frame = frame
+            frame.stalled_rounds = 0
+            msgs = [{"role": "user", "content": "x"}]
+            # Not stalled, yet the halt fires because it is progress-independent.
+            assert engine._check_guardrail(msgs) == "halt"
+        finally:
+            lt.close()
+
+
+def test_synthesize_forced_answer_returns_model_answer() -> None:
+    """When the loop stops without a written answer, a single tool-free round lets
+    the model answer from the gathered context instead of emitting the canned
+    'reasoning step limit' notice; a synthesis failure degrades to ''."""
+    answer = "Only the host machine is registered; no external USB devices are connected."
+    with tempfile.TemporaryDirectory() as td:
+        engine, lt, _ = _adaptive_engine(td)
+        try:
+            engine._llm = StubLLM([answer])
+            msgs = [
+                {"role": "user", "content": "any usb devices connected?"},
+                {"role": "tool", "tool_call_id": 0, "content": '{"ok": true, "count": 1}'},
+            ]
+            got = asyncio.run(engine._synthesize_forced_answer(msgs))
+            assert got == answer
+
+            class _BoomLLM:
+                async def achat(self, *a, **k):
+                    raise RuntimeError("provider down")
+
+            engine._llm = _BoomLLM()
+            assert asyncio.run(engine._synthesize_forced_answer(msgs)) == ""
+        finally:
+            lt.close()
+
+
 def _with_coordinator(engine):
     from leapflow.engine.recovery_budget import RecoveryBudget
     from leapflow.engine.recovery_coordinator import RecoveryCoordinator
