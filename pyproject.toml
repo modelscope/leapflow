@@ -36,7 +36,10 @@ dependencies = [
     "rich>=13.0",
     "prompt_toolkit>=3.0.40",
     "pyobjc-framework-Quartz>=12.2; sys_platform == 'darwin'",
-    "pynput>=1.8.0"
+    "pynput>=1.8.0",
+    # LeapBoard web server. Part of the core surface (`leap board`), so it ships
+    # with the base install rather than behind an extra.
+    "aiohttp>=3.9"
 ]
 
 [project.optional-dependencies]
@@ -50,7 +53,6 @@ dev = [
     "pytest-cov>=5.0",
 ]
 hub = ["modelscope-hub>=0.1.0"]
-dashboard = ["aiohttp>=3.9"]
 # Better main-content extraction for web_fetch. Optional because the stdlib
 # extractor always ships: this upgrades quality, it does not enable the feature.
 web = ["trafilatura>=2.2"]

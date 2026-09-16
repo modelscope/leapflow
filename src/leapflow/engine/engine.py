@@ -399,6 +399,20 @@ _EMPTY_RESPONSE_DEGRADED_MESSAGE = (
     "right after startup) \u2014 please resend your message."
 )
 
+# Injected for the single tool-free round that runs when the loop stops before
+# the model has written an answer (a detected repetition loop or an exhausted
+# iteration budget). Breaking cold otherwise leaves the user with a generic
+# "reasoning step limit" notice and none of the information the tools already
+# returned; this asks the model to answer from what it has, with tools withheld
+# so it cannot resume the loop.
+_FORCED_FINALIZE_PROMPT = (
+    "SYSTEM: No further tool calls are available for this turn. Do not attempt "
+    "to call any tool. Answer the user's request directly and concisely using "
+    "the information already gathered above. If part of it cannot be determined "
+    "from what you have, say so plainly and state what would be needed \u2014 do "
+    "not repeat an earlier tool call."
+)
+
 
 def _is_permission_failure_payload(payload: Dict[str, Any]) -> bool:
     """Return whether a tool-result payload represents an unresolved permission failure."""
@@ -1630,9 +1644,17 @@ class AgentEngine:
         # and the finalize/diversify nudge is suppressed so legitimate batch or
         # sequential work on a long task is not cut short. Only when the task is
         # ALSO stalled does the guardrail escalate to a halt (or emit a nudge).
+        #
+        # The one exception is a ``progress_independent`` halt: it is raised only
+        # when the violation is definitionally zero progress (the same tool
+        # returned the same result N times), so it is honoured regardless of the
+        # coarse global stall marker -- which a simple factual query may never
+        # trip, leaving a genuine no-op loop to spin until the budget is spent.
         frame = self._active_frame
         stalled = bool(frame is not None and getattr(frame, "stalled_rounds", 0) >= 1)
-        if violation.severity == "halt" and stalled:
+        if violation.severity == "halt" and (
+            getattr(violation, "progress_independent", False) or stalled
+        ):
             messages.append(
                 build_user_message_text(
                     f"SYSTEM GUARDRAIL: {violation.reason}. {violation.suggestion}"
@@ -3929,9 +3951,13 @@ class AgentEngine:
         if fatal_error:
             self._emit_chat_event("response", {"content": fatal_error[:500]})
             return fatal_error
+        # The loop stopped without a written answer (repetition halt or exhausted
+        # budget). Give the model one tool-free round to answer from what it
+        # gathered before falling back to the canned notice.
         fallback = (
             _app_onboarding_recovery_message(messages)
             or _last_tool_failures_recovery_message(messages)
+            or await self._synthesize_forced_answer(messages)
             or self._budget_exhausted_response(messages)
         )
         self._emit_chat_event("response", {"content": fallback[:500]})
@@ -4282,6 +4308,9 @@ class AgentEngine:
                         yield StreamEvent(type="thinking", content=content)
                     # Preamble exclusion: content alongside tool_calls is ephemeral
                     # reasoning — exclude from context to prevent final-answer repetition.
+                    # Clear the local copy too: on a later halt/break this must not
+                    # leak as the turn's final answer ahead of a synthesized one.
+                    content = ""
                     assistant_msg: Dict[str, Any] = {"role": "assistant", "content": ""}
                     assistant_msg["tool_calls"] = [
                         {
@@ -4786,10 +4815,15 @@ class AgentEngine:
             self._emit_chat_event("response", {"content": final[:500]})
             yield StreamEvent(type="final", content=final)
         else:
+            # The loop stopped without a written answer (repetition halt or
+            # exhausted budget). Give the model one tool-free round to answer
+            # from what it gathered before falling back to the canned notice;
+            # a genuine terminal failure (fatal_error) still surfaces first.
             fallback = (
                 _app_onboarding_recovery_message(messages)
                 or _last_tool_failures_recovery_message(messages)
                 or fatal_error
+                or await self._synthesize_forced_answer(messages)
                 or self._budget_exhausted_response(messages)
             )
             self._emit_chat_event("response", {"content": fallback[:500]})
@@ -5690,6 +5724,37 @@ class AgentEngine:
             logger.debug("capability observation skipped: %s", exc, exc_info=True)
 
     # ── Helpers ──────────────────────────────────────────────────────────
+
+    async def _synthesize_forced_answer(self, messages: List[Dict[str, Any]]) -> str:
+        """One tool-free LLM round to answer with what the turn already gathered.
+
+        A turn can stop before the model has written a final answer: a detected
+        repetition loop is halted, or the iteration budget runs out. Breaking
+        cold then hands the user a canned "reasoning step limit" notice and none
+        of the information the tools already returned. This gives the model
+        exactly one chance to answer from the accumulated context, with tools
+        withheld so it cannot resume the loop.
+
+        Returns the answer text, or "" on any failure so the caller falls back to
+        the canned notice \u2014 a best-effort finalize must never turn a clean
+        stop into a crash.
+        """
+        try:
+            prompt = list(messages)
+            prompt.append(build_user_message_text(_FORCED_FINALIZE_PROMPT))
+            compressed = self._prepare_llm_messages(
+                self._healer.heal(prompt), tools=None, round_number=0
+            )
+            resp = await self._llm.achat(
+                compressed, stream=False, enable_thinking=False
+            )
+            text = (resp.content or "").strip()
+            if self._sanitizer:
+                text = self._sanitizer.sanitize(text)
+            return text
+        except Exception:
+            logger.warning("forced final-answer synthesis failed", exc_info=True)
+            return ""
 
     @staticmethod
     def _record_coevolution_resolution(resolution: Any) -> None:
