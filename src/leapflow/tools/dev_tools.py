@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Structured developer verification tools: test_run and lint_check.
 
 Both are thin, structured wrappers over ``shell_run``: they auto-detect (or take

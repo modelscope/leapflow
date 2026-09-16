@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """S4-D1: multi-layer orientation aggregation (observe-only).
 
 Hermetic unit tests for the pure orientation aggregator and the research-ledger

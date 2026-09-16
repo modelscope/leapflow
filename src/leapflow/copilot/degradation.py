@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Graceful degradation policy for the Workflow Copilot.
 
 Monitors system resource usage and automatically disables higher-cost

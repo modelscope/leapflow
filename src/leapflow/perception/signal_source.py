@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """SignalSource plugin protocol and registry for Perception signal extraction.
 
 A SignalSource transforms a normalized SystemEvent (event_type + payload) into

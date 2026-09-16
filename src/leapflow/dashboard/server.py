@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Local dashboard web server (aiohttp transport, view-client process).
 
 Holds one upstream subscription to the daemon (via DaemonClient) and fans out

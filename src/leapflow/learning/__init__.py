@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill learning layer — distillation, code generation, feedback, and active learning."""
 
 from leapflow.learning.cold_start import ColdStartConfig, ColdStartManager, ColdStartPhase

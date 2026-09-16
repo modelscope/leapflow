@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for P0 tool-calling / result hardening in the agent loop:
 
 - A1: pre-execution required-argument validation (_validate_tool_arguments)

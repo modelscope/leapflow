@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """L1 Markov Sequence Predictor — N-gram transition probability model.
 
 Maintains a transition count matrix over action sequences (N-gram keys).

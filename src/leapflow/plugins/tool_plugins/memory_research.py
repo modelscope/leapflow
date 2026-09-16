@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Memory & Research plugin — memory search/add and research ledger tools.
 
 These tools have late-binding dependencies on engine internals (MemoryManager,

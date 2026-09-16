@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Declarative environment marker catalog for adaptive capability selection."""
 
 from __future__ import annotations

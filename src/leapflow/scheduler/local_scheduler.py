@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Local async scheduler — runs as background task in event loop.
 
 Design principles:

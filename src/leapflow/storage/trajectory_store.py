@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DuckDB-backed trajectory persistence.
 
 Follows the same patterns as memory/long_term.py: single DuckDB connection,

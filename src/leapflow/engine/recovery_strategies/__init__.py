@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Built-in recovery strategies for the agent loop recovery coordinator.
 
 Each strategy implements the RecoveryStrategy Protocol and encapsulates

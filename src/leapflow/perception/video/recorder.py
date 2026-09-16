@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Trajectory recording lifecycle manager.
 
 Wraps CuaDriver's trajectory recording (start_recording/stop_recording)

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill discovery tools — exposed to LLM for progressive disclosure.
 
 Provides two tool handlers registered into the unified tool system:

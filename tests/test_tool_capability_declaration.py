@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unit tests for the declarative capability metadata on ToolMetadata.
 
 The resolver (built in a follow-up P1) needs two facts about a tool that today

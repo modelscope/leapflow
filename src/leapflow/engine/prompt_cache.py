@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Prompt cache optimization — reorganizes messages to maximize prefix cache hits.
 
 Modern LLM APIs cache request prefixes automatically. This module ensures

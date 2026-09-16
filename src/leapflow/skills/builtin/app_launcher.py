@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Built-in app launcher / basic automation skill."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Structured JSONL audit logger for mode transitions, skill executions, and learning events."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for web_fetch: transport contract, egress gating, and extraction.
 
 Hermetic by construction: no test performs a real request. Transports are

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """JSON store for adaptive capability decision history.
 
 The store persists transparent resolver output for user review and dashboard /

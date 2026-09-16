@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Per-(device, channel) trust gate for hardware write approval.
 
 Progressive trust for the physical domain: a channel that consistently produces

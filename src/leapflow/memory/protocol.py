@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Memory subsystem protocol definitions.
 
 Defines the universal interface that all memory providers must implement,

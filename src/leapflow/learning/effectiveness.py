@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Learning effectiveness evaluation — quantifies whether the learning loop is actually learning.
 
 Core question: "Is the system getting better over time, or just accumulating noise?"

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Trigger policy for inbound IM messages.
 
 Controls which inbound messages activate the agent's Decide stage.

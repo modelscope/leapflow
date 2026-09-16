@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Copilot configuration model — all tuneable parameters in one place.
 
 Every threshold, toggle, and budget is exposed here so that runtime behaviour

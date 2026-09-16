@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Session-scoped body cache for ``web_fetch``.
 
 Split out of the tool because storage is a separate responsibility from transport

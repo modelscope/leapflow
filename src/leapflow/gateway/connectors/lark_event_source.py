@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Feishu/Lark event source backed by ``lark-cli event consume``."""
 from __future__ import annotations
 

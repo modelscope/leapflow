@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Event bus: handles platform events and routes them to memory/skills.
 
 Pipeline: CuaDriver/Observer → EventBus → Normalizer → EpisodicMemory → (promotion) → SemanticMemory

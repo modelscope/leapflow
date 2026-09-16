@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Stage B: Semantic Preprocessing — CV features to PairContext."""
 
 from __future__ import annotations

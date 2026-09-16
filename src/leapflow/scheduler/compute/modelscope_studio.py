@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """ModelScope Studio compute backend implementation.
 
 Each task is deployed as a private Docker-based Studio that runs a LeapFlow

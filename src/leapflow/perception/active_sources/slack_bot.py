@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Slack Bot ActiveSignalSource.
 
 Receives Slack events via HTTP webhook (Events API) and converts them into

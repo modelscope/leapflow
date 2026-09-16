@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Plugin lifecycle state machine (PluginFiber).
 
 Manages the runtime lifecycle of a single plugin instance through a

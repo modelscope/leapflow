@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LeapFlow Terminal UI — hybrid Application + Rich architecture.
 
 Built on ``prompt_toolkit`` (Application layout, fixed input, key bindings)

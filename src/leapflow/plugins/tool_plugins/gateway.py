@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Gateway tools plugin — exposes platform connectivity and messaging as a ToolPlugin."""
 
 from __future__ import annotations

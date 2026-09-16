@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Physical outcome learning: numeric prediction error and parameter reuse.
 
 This is the payoff for connecting hardware to the world model, and the reason the physical

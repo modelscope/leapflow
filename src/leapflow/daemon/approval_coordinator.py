@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Approval lifecycle coordinator extracted from RuntimeLeapService."""
 from __future__ import annotations
 

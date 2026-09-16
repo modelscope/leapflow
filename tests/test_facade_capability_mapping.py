@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Regression tests for cua-driver tool → Capability mapping in the VSI facade.
 
 The mapping previously used informal strings ("ax_tree", "input", ...) that

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tool-level action policy — human-in-the-loop gate for the ReAct executor.
 
 Intercepts tool calls between LLM output parsing and platform execution,

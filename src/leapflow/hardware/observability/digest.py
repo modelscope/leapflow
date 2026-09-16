@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Derive the board payload from what the registry already knows.
 
 Pure with respect to the registry: it reads, it never samples, writes, or opens a

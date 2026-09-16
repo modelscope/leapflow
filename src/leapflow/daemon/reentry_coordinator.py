@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Manages the reentry driver lifecycle: background tick loop, gateway observation.
 
 Extracted from service.py (Phase 2.4) to keep RuntimeLeapService focused on

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for P4 domain templates and the custom-component escape hatch."""
 
 from __future__ import annotations

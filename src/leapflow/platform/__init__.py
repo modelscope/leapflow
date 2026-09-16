@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unified platform abstraction layer — RPC, event normalization, and host adapters."""
 
 from leapflow.platform.protocol import (

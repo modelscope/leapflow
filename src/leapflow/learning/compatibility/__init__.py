@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Plugin Compatibility Assessment Engine.
 
 Evaluates foreign plugins (primarily from deepseek-harness ecosystem)

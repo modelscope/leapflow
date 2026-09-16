@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Jittered retry recovery strategy.
 
 The lowest-priority catch-all retry strategy for transient failures.

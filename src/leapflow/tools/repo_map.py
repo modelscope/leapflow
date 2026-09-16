@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Repository orientation map — a compact, read-only project overview.
 
 Grounds the agent when it enters a codebase: languages, detected test/lint

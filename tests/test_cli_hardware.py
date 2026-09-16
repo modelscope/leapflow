@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """`leap hw` — CLI subcommands and pause/resume RPC (Phase 1.4).
 
 Two planes are exercised separately, because they route differently:

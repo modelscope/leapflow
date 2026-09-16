@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Isolation contracts for two TUI clients on one daemon.
 
 Written after two TUIs in different workspaces became unusable in the second one:

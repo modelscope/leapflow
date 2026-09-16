@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cross-platform daemon IPC transport.
 
 Unix (macOS/Linux): Unix Domain Socket via asyncio.start_unix_server / open_unix_connection

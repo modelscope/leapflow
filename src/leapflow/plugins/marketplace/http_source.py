@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """HTTP-based marketplace source for remote plugin discovery and download.
 
 Fetches plugin manifests and code from a remote HTTP(S) registry endpoint.

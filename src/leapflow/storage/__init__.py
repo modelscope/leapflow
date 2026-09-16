@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Persistence layer — trajectory, skill library, session, conversation, and document stores.
 
 Key infrastructure:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Stage 3: Interface Analyzer.
 
 Checks whether the plugin's declared_interfaces list includes methods/attributes

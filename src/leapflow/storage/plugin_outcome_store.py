@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Profile-scoped audit store for adaptive plugin execution outcomes."""
 
 from __future__ import annotations

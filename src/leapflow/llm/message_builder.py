@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Helpers for multimodal OpenAI-compatible chat messages."""
 
 from __future__ import annotations

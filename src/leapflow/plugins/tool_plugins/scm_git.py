@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """SCM/Git plugin — structured git operations (sync, query, write)."""
 
 from __future__ import annotations

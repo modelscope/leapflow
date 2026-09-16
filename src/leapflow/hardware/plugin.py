@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hardware context plugin -- a ToolPlugin, not a sibling subsystem.
 
 Being an ordinary ``ToolPlugin`` is a deliberate structural choice, for two

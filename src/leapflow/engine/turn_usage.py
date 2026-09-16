@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Per-turn usage tracking and cost estimation.
 
 Accumulates token usage, latency, and tool call metrics across a single

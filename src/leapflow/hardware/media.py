@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Local media devices: enumeration and frame capture, behind one backend table.
 
 The counterpart to ``host_metrics`` for media. Cameras and microphones are ordinary

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hardware registry: providers in, admitted contexts and transports out.
 
 Structurally the same shape as ``ToolPluginRegistry`` -- discover, validate,

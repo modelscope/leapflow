@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Signal generators for mock injection testing.
 
 Each generator class produces events conforming to the LeapFlow observer

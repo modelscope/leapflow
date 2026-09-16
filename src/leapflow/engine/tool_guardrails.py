@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tool loop guardrails — detect and halt repeated failures, stagnation, and loops.
 
 Monitors tool execution patterns during the agent loop and emits warnings

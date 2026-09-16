@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Gateway module — platform adapter management and message routing.
 
 Public API:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scenario-based integration tests for the agent execution pipeline."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Worker packager — generates self-contained Docker packages for cloud deployment.
 
 Produces a temporary directory containing all files needed to run a LeapFlow

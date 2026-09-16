@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Text processing utilities — search, replace.
 
 All handlers follow the unified tool convention: receive params dict, return result dict.

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Model capability registry — dynamic context length, feature flags per model.
 
 Provides a single source of truth for model capabilities that the engine,

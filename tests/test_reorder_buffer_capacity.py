@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for EventReorderBuffer capacity hard limit (Task #4)."""
 
 from __future__ import annotations

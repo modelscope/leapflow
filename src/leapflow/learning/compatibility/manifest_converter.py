@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DSH package.json → LeapFlow compatibility descriptor conversion.
 
 This is metadata for assessment and audit, not a ``MarketplaceClient`` install

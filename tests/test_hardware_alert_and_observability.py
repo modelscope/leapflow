@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for Phase 2: alert policy, metrics exporter, and calibration events.
 
 Covers the three sub-items delivered together:

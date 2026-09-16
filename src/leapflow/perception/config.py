@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Perception subsystem configuration."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hermetic tests for cross-platform daemon transport helpers."""
 from __future__ import annotations
 

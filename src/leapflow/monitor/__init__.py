@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Domain-neutral monitoring subsystem: Watch -> Finding contract and runtime.
 
 Public surface:
@@ -9,6 +10,7 @@ Public surface:
 
 from leapflow.monitor.capability_adaptation_producer import CapabilityAdaptationProducer
 from leapflow.monitor.event_bridge import EventBridge
+from leapflow.monitor.evolution_producer import EvolutionProducer
 from leapflow.monitor.finding_store import FindingStore
 from leapflow.monitor.manager import EmitFn, MonitorManager
 from leapflow.monitor.plugin_health_producer import PluginHealthProducer
@@ -39,6 +41,7 @@ from leapflow.monitor.types import (
 __all__ = [
     "CapabilityAdaptationProducer",
     "EventBridge",
+    "EvolutionProducer",
     "EVENT_FINDING",
     "EVENT_WATCH_STATE",
     "EVENT_ERROR",

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Re-entry orchestration service (S2 phases N3b–N5).
 
 Consolidates the two trigger sources (time ticks and gateway events) behind one

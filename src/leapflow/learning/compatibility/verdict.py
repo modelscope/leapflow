@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Verdict Synthesizer.
 
 Takes all stage results and produces the final CompatibilityReport verdict.

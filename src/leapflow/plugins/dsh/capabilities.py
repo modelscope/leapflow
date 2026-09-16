@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Host-side typed capabilities exposed to restricted DSH workers.
 
 Foreign code never receives raw shell, filesystem, process or network access.

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """JSON-RPC protocol between sandbox host and worker subprocess."""
 
 from __future__ import annotations

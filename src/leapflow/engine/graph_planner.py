@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LLM-driven Task DAG planner.
 
 Generates structured task graphs from natural language goals,

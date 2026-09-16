@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unified task orchestrator — routes armed tasks to local or cloud execution.
 
 Tier decision heuristic:

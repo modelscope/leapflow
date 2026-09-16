@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Risk assessment for physical device actions.
 
 Every tier below is derived from declared data -- the channel's effect class and

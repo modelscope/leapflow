@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Daemon notification bus — push events from background tasks to connected TUI clients.
 
 Architecture:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scenario-based integration tests for the learn-distill lifecycle."""
 
 from __future__ import annotations

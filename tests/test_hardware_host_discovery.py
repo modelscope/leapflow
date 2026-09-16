@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Host resource discovery and the hot-plug reconcile path.
 
 Two subjects that share a file because they share a failure mode: both are about the

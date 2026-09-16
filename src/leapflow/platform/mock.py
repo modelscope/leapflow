@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """In-process mock platform backend with event simulation for testing."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """File system event pattern recognition pass.
 
 Identifies high-level file operation patterns from low-level FS events,

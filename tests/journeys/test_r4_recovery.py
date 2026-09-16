@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """R4 — failure and recovery, driven by real provider wire semantics.
 
 Every failure here arrives as an actual HTTP response through the real ``openai``

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Per-turn recovery state — one-shot guards preventing infinite recovery loops.
 
 Each recovery strategy can fire at most once per turn. Prevents:

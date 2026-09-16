@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hardware transport: the executable half of the Hardware Context Protocol.
 
 Six methods, nothing more. Deliberately narrower than ``ExecutionBackend``: a

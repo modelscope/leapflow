@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Real-time recording layer — attention filtering, event capture, and frame storage."""
 
 from leapflow.recording.attention import (

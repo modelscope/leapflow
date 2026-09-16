@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Task DAG (Directed Acyclic Graph) data model for complex task orchestration.
 
 Supports:

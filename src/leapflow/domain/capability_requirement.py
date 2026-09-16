@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Domain records for adaptive capability requirements.
 
 A requirement describes what LeapFlow needs, not which concrete tool should be
@@ -19,6 +20,7 @@ RequirementOrigin = Literal[
     "explicit_request",
     "environment_probe",
     "task_contract",
+    "world_model",
 ]
 ApprovalMode = Literal["review_required", "autonomous_allowed"]
 

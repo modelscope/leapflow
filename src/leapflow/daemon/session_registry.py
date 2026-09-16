@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Session-scoped execution registry for the daemon (Stage 3, P3-2a).
 
 Maps a ``session_id`` to a :class:`SessionExecutionContext` — the per-session

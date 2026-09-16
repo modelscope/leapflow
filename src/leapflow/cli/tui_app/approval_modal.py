@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Prompt-toolkit native approval modal for LeapFlow TUI.
 
 Renders a bordered panel with action summary, detail, risk reason,

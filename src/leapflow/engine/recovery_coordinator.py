@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Recovery coordinator — unified recovery decision entry point for the agent loop.
 
 Replaces the scattered if/elif chains in _handle_api_error() and the inline

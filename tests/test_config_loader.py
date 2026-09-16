@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 from __future__ import annotations
 
 from leapflow.config_loader import load_config_bundle

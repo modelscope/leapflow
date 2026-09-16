@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Configuration tools plugin — list, get, and set LeapFlow settings."""
 
 from __future__ import annotations

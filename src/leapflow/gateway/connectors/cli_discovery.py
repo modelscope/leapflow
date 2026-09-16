@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """CLI help-based command discovery for App Connector backends.
 
 Discovers available commands and arguments by invoking ``<binary> --help``

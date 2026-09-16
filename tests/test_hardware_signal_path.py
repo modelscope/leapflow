@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """The path a derived hardware event actually travels, end to end.
 
 Every assertion here checks a *connection*, not a capability. The defect this file

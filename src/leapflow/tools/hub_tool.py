@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Hub operations as an Agent Tool — enables natural language hub interaction.
 
 Registered as agent-callable tools so the AgentEngine can push, pull, search,

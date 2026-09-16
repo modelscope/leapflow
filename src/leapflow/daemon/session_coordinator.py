@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Manages session lifecycle: create, resume, history, analysis, artifacts.
 
 Extracted from service.py (Phase 2.3) to keep RuntimeLeapService focused on

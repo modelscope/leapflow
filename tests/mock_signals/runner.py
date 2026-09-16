@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Orchestrator: build pipeline, inject signals, collect metrics, report results.
 
 The runner constructs a minimal in-memory LeapFlow pipeline (EventBus + MonitorManager)

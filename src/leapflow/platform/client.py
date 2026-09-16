@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Platform client utilities."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Behavior test execution for generated/profile plugins."""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """HuggingFace Hub backend — placeholder for Phase 2.
 
 Will be activated when huggingface-hub SDK integration is ready.

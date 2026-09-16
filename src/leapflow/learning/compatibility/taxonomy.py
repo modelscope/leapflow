@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Pluggability Boundary Taxonomy — the authoritative decision table.
 
 Maps DSH plugin category strings to LeapFlow compatibility verdicts.

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Durable store for structured capability observations.
 
 The store is profile-scoped and intentionally stores only structured metadata
@@ -27,6 +28,33 @@ _OBSERVATION_FIELDS = frozenset(
         "failure_code",
         "capability",
         "tool_name",
+        # Who is failing, and how persistently. Degradation evidence reports that an
+        # *existing* provider is inadequate, so the provider's identity is the payload
+        # -- dropping it leaves "some capability is degraded" with no way to name the
+        # incumbent. Two consumers need it: the teacher, which cannot judge a
+        # replacement without knowing what would be replaced, and proposal identity,
+        # which derives a rival's plugin id from the incumbent so the two can coexist
+        # rather than collide on one capability-derived name.
+        "plugin_id",
+        "failure_streak",
+        "trust_level",
+        # What *kind* of failure it was. Without it a degradation fact reads "failed
+        # twice" and the retry-owned classes cannot be filtered out, so a timeout would
+        # reach the teacher and the only verdict that changes anything is "rebuild".
+        "failure_class",
+        # Declarations the detector needs to rebuild a requirement from a
+        # persisted observation. Dropping these silently changed behaviour rather
+        # than failing: without ``max_risk_level`` the requirement inherited the
+        # domain default of ``external`` -- the *most permissive* ceiling -- so a
+        # capability declared ``read_only`` came back from the store able to
+        # select mutating tools. Without ``origin`` a world-model intent was
+        # indistinguishable from an environment probe.
+        "origin",
+        "max_risk_level",
+        "requested_max_risk_level",
+        "intent_id",
+        "target_affordance",
+        "expected_effect",
     }
 )
 
@@ -86,6 +114,14 @@ class JsonCapabilityObservationStore:
             record["occurrence_count"] = int(record.get("occurrence_count") or 0) + 1
             record["result"] = safe_result
             record["environment"] = env
+            # A recurrence reopens a retired record. Without this, marking an
+            # observation resolved would silence that gap permanently: dedup would
+            # keep merging into the closed record and ``unresolved()`` -- which
+            # filters on ``status == "open"`` -- would never surface the
+            # regression again.
+            if str(record.get("status") or "open") != "open":
+                record["status"] = "open"
+                record["status_reason"] = f"reopened after recurrence at {now}"
             record["session_id"] = str(session_id or record.get("session_id") or "")
             record["turn_id"] = str(turn_id or record.get("turn_id") or "")
             record["workspace_root"] = str(workspace_root or record.get("workspace_root") or "")
