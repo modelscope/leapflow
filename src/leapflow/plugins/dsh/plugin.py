@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Native ToolPlugin wrapper for an installed restricted DSH bundle."""
 from __future__ import annotations
 

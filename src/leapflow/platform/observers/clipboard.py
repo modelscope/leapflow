@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Clipboard change observer (cross-platform).
 
 Monitors clipboard content via polling and emits CLIPBOARD_CHANGE events

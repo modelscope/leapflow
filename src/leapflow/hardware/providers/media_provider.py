@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Media provider: declares each local camera and microphone as its own device.
 
 One device per physical instrument, unlike the host provider's single namespaced

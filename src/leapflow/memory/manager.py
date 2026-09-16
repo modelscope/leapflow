@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Memory manager — unified orchestrator for all memory providers.
 
 Routes inserts to appropriate providers, aggregates search results,

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """User-facing configuration control plane for LeapFlow."""
 from __future__ import annotations
 
@@ -327,9 +328,31 @@ _FIELD_DESCRIPTIONS = {
     "plugins.dsh_max_message_bytes": "Maximum bytes in one DSH worker NDJSON protocol message; requires daemon restart.",
     "plugins.dsh_max_stderr_bytes": "Bounded diagnostic stderr tail retained from one DSH worker; requires daemon restart.",
     "plugins.dsh_max_memory_mb": "V8 old-space ceiling in megabytes for each DSH worker process; requires daemon restart.",
+    "selection.policy": (
+        "Which registered policy chooses among tools that provide the same capability. "
+        "greedy, the only built-in, takes the highest-scoring candidate. Built-in tools "
+        "provide one capability each, so a policy has something to choose between only "
+        "once self-evolution has generated a competing tool -- which is why the learning "
+        "policies that once shipped here were removed after measurement, and why a "
+        "third-party policy can register through the entry point group when that changes."
+    ),
+    "evolution.enabled": (
+        "Whether the agent may propose acquiring a NEW capability for itself. Off by "
+        "default. The world model runs either way: it reviews every session, records what "
+        "it learned about your environment for the next one, and recommends which "
+        "installed tool to prefer -- none of which writes code. This switch governs the "
+        "one branch that does: turning a 'nothing installed can do this' conclusion into a "
+        "queued proposal for a new plugin. Queued is not built; generation, validation, "
+        "approval, sandboxing and trust all still apply, and every plugin change asks for "
+        "your approval individually."
+    ),
 }
 
 _SECTION_CATEGORIES = {
+    # Its own category rather than folded into Learning or Plugins: this is the switch a
+    # user is most likely to go looking for, and burying it among tuning knobs would make
+    # the most consequential setting the hardest to find.
+    "evolution": "Self-Evolution",
     "llm": "LLM Provider",
     "vlm": "Perception",
     "memory": "Memory",
@@ -388,7 +411,27 @@ _VALUE_HINTS = {
     "web.transport": "auto|httpx|curl",
     "web.extractor": "auto|stdlib",
     "web.private_targets": "approval|deny|allow",
+    # Callable rather than a literal: the valid ids come from the live policy
+    # registry, which a third-party package can add to through an entry point. A
+    # hardcoded enumeration here would silently omit every such policy and would
+    # need editing whenever a built-in is added.
+    "selection.policy": lambda: _registered_selection_policies(),
 }
+
+
+def _registered_selection_policies() -> str:
+    """The policy ids currently registered, as a hint.
+
+    Degrades to a generic note rather than logging: the only consequence of failure is
+    a less specific hint, and this module deliberately carries no logger.
+    """
+    try:
+        from leapflow.plugins.selection_policy_registry import get_selection_policy_registry
+
+        ids = "|".join(d.policy_id for d in get_selection_policy_registry().describe())
+    except Exception:  # noqa: BLE001 - a missing hint must not break the catalog
+        return "a registered selection policy id"
+    return ids or "a registered selection policy id"
 
 _PARTIAL_RELOAD_SECTIONS = frozenset({"runtime", "mock", "gateway", "hub", "scheduler", "observer", "cua", "use", "dashboard"})
 _RESTART_REQUIRED_SECTIONS = frozenset({"daemon", "plugins", "hardware", "mcp"})
@@ -720,11 +763,16 @@ def _with_metadata(spec: ConfigFieldSpec) -> ConfigFieldSpec:
         reload_semantics = "partial"
     else:
         reload_semantics = "yes"
+    hint = _VALUE_HINTS.get(spec.key, None)
+    if hint is None:
+        hint = _default_value_hint(spec)
+    elif callable(hint):
+        hint = hint()
     return replace(
         spec,
         category=_category_for_spec(spec),
         description=_FIELD_DESCRIPTIONS.get(spec.key, _default_description(spec.key)),
-        value_hint=_VALUE_HINTS.get(spec.key, _default_value_hint(spec)),
+        value_hint=str(hint),
         hot_reload=reload_semantics,
         examples=_examples_for_key(spec.key),
     )

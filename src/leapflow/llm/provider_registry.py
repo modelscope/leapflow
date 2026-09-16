@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """LLM Provider Plugin Registry.
 
 Provides discovery, registration, and lifecycle management for LLM providers.

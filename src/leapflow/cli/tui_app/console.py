@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Rich console wrapper — the single output surface for the TUI.
 
 Centralizes all visual output: markdown rendering, code highlighting,
@@ -479,8 +480,15 @@ class LeapConsole:
         cwd: str = "",
         skill_count: int = 0,
         session_id: str = "",
+        self_evolution: bool | None = None,
     ) -> None:
-        """Display compact session information after the banner."""
+        """Display compact session information after the banner.
+
+        ``self_evolution`` is shown on the first screen rather than left to ``/config``
+        because it is the one mode that changes what the agent may decide to do to itself.
+        A user should learn that it is off from the line they already read, not by going
+        looking -- and, when it is on, should have been told so before it acts.
+        """
         info_parts: list[str] = []
         if model:
             info_parts.append(f"model: {model}")
@@ -491,6 +499,12 @@ class LeapConsole:
             info_parts.append(f"cwd: {short_cwd}")
         if skill_count > 0:
             info_parts.append(f"skills: {skill_count}")
+        if self_evolution is not None:
+            # Named in both states. Showing it only when enabled would make the quiet
+            # default indistinguishable from a build that does not have the feature.
+            info_parts.append(
+                f"self-evolution: {'on' if self_evolution else 'off'}"
+            )
 
         if info_parts:
             self._console.print(

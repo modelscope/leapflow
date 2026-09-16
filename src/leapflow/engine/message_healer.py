@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Message sequence healing — fix invalid patterns before LLM call.
 
 Repairs (inspired by hermes message_sanitization.py):

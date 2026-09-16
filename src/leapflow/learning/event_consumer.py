@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Event consumer protocol — defines the interface for consuming events from EventBus.
 
 EventConsumers are registered with EventBus and receive batched events

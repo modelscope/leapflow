@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Bundle file I/O — writes auxiliary Knowledge Bundle artifacts alongside SKILL.md.
 
 Each method creates parent directories as needed. All writes are idempotent.

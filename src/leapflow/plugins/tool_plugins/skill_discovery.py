@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill discovery plugin — list and view learned skills."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Typed source-control tools.
 
 The SCM tool intentionally models git operations as structured actions instead

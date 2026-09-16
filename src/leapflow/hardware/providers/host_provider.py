@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Host provider: declares the machine LeapFlow runs on as one device.
 
 The host is not a special case in the protocol -- it is a device whose channel set

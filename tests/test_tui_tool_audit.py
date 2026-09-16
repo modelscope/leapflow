@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for TUI tool-audit rendering fidelity.
 
 These pin the three defects observed in a real session: a parallel batch printed

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Feishu IM Bot ActiveSignalSource.
 
 Receives Feishu instant messages and converts them into InteractionSignals,

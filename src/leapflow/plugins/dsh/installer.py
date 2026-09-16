@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Prepare and validate DSH plugin installations before registry mutation."""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Session-analysis producer: model the current conversation as a Watch.
 
 ``SessionAnalysisProducer`` reuses the generic Watch -> Finding machinery: on each

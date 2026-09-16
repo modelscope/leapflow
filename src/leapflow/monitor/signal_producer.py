@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Lightweight signal observation producer for event-driven watches.
 
 Produces a Finding summarizing recent signal activity for the watched domain.

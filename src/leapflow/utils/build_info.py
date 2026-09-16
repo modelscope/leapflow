@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Best-effort source-tree fingerprint for long-lived-process staleness checks.
 
 Long-lived local processes (the ``leapd`` daemon, the LeapBoard web server)

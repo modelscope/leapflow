@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the recovery checkpoint system (cross-turn state persistence)."""
 from __future__ import annotations
 

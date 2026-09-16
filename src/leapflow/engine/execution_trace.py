@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Execution state machine and trace recording for the agent loop."""
 from __future__ import annotations
 import time

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Transport that delegates to an externally supplied Python driver.
 
 This is the hardware-neutral escape hatch. A vendor SDK, a serial library, or a

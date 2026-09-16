@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Gateway message router — per-session LLM processing for inbound platform messages.
 
 Sits between ``GatewayServer`` (message ingress) and the LLM/tool layer

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shell and terminal session plugin — one-shot commands and persistent sessions."""
 
 from __future__ import annotations

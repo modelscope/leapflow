@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cherry-picked pure algorithm tests — deterministic, stateless primitives."""
 
 from __future__ import annotations

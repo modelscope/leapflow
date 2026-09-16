@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for durable capability observation storage and service."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Discord Bot ActiveSignalSource.
 
 Receives Discord interaction events via HTTP webhook (Interactions Endpoint)

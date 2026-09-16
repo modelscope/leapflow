@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Mock signal injection for LeapFlow end-to-end testing.
 
 Usage:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """S4-D1: multi-layer orientation aggregation (observe-only).
 
 A unified, read-only "orientation" query that merges the agent's orientation

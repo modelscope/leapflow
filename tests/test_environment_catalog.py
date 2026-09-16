@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for declarative environment marker catalogs."""
 
 from __future__ import annotations

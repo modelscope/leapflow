@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Episodic memory provider — TTL-based buffer with decay-weighted retrieval.
 
 Handles transient observations, events, and actions. Entries decay over time

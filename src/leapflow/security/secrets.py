@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unified secret vault for LeapFlow credentials."""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Path sensitivity classification for local file access governance.
 
 The classifier is intentionally policy-oriented and tool-agnostic: it maps a

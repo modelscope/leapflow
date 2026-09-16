@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for capability adaptation monitor producer."""
 
 from __future__ import annotations

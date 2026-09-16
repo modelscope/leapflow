@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Terminal stream progress writer for LLM chunk callbacks.
 
 Renders LLM streaming output as dim gray text on stdout, giving the user

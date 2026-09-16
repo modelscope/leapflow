@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Status bar for the Application layout.
 
 Hermes-style single-line status rendered via ``FormattedTextControl``::

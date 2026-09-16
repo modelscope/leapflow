@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Pre/postcondition verification for skill execution.
 
 Evaluates declarative condition strings against the runtime environment

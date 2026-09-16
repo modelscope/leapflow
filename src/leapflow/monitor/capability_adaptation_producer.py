@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Monitor producer for adaptive capability decision visibility."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Fusion quality assessment.
 
 Computes quality metrics from fusion results to guide downstream

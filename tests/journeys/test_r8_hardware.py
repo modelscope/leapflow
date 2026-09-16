@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """R8 — physical bench end-to-end through a real daemon.
 
 Phases: a simulated device is discovered and described, the sampling loop lands

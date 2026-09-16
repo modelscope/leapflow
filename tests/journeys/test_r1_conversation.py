@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """R1 — the conversation main line, end to end through a real daemon.
 
 Phases: first turn → streamed chunks → native tool call → tool result fed back →

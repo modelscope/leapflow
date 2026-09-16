@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """File system operations — list, read, write.
 
 All handlers follow the unified tool convention: receive params dict, return result dict.
@@ -24,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
+from leapflow.learning.capability_effect_verifier import declare_effect
 from leapflow.security.path_sensitivity import PathSensitivity, classify_path_sensitivity
 from leapflow.tools.execution_context import require_workspace_access, resolve_workspace_path
 
@@ -483,11 +485,19 @@ async def file_write(params: Dict[str, Any]) -> Dict[str, Any]:
         else:
             target.write_text(content)
         syntax = _verify_syntax(target, content) if mode != "append" else {}
+        written = len(content.encode())
         return {
             "ok": True,
             "path": str(target),
-            "bytes_written": len(content.encode()),
+            "bytes_written": written,
             **syntax,
+            # Measured after the write, in the terms a requirement would state it.
+            # The byte count comes from the content that actually reached the file,
+            # so this is an observation rather than a restatement of the request.
+            **declare_effect(
+                f"{'appended' if mode == 'append' else 'wrote'} {written} bytes "
+                f"to {target.name}"
+            ),
             **_sensitivity_metadata(sensitivity),
         }
     except Exception as e:
@@ -963,4 +973,8 @@ async def edit_file(params: Dict[str, Any]) -> Dict[str, Any]:
         "bytes_written": len(content.encode()),
         **_verify_syntax(target, content),
         **_sensitivity_metadata(sensitivity),
+        **declare_effect(
+            f"applied {len(edits)} edit(s) making {total_replacements} "
+            f"replacement(s) in {target.name}"
+        ),
     }

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Stage 1: Manifest Parser.
 
 Parses raw manifest input (dict) into a PluginManifestInput.

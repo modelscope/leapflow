@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """S2 outbound SO1+SO2+SO4: governance kernel for autonomous re-entry sends.
 
 Hermetic unit tests for the pure decision primitives — contracts + target

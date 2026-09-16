@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Shell command execution with timeout, safety, and output redaction.
 
 All handlers follow the unified tool convention: receive params dict, return result dict.

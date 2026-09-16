@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Risk assessment for structured approval actions."""
 from __future__ import annotations
 

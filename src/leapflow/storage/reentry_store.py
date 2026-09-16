@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DuckDB-backed persistence for event-driven re-entry (S2, phase N1).
 
 Enables "finalize + Orient-seeded re-entry": a task can finalize a turn while

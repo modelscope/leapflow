@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Canonical filesystem layout for LeapFlow runtime data.
 
 This module is the single source of truth for paths under the LeapFlow data
@@ -431,10 +432,26 @@ class ProfileLayout:
         return self.root / "plugins" / "outcomes.json"
 
     @property
+    def distilled_knowledge_path(self) -> Path:
+        # Profile-scoped store for what the teacher distilled about the environment.
+        # Beside the other capability state because it shares their lifecycle: it is
+        # learned per profile, describes that profile's world, and is meaningless to
+        # copy elsewhere.
+        return self.root / "plugins" / "distilled_knowledge.json"
+
+    @property
     def capability_plans_path(self) -> Path:
         # Profile-scoped adaptive capability decision history: requirements,
         # candidate scores, selected tools, and declarative plans.
         return self.root / "plugins" / "capability_plans.json"
+
+    @property
+    def evolution_traces_path(self) -> Path:
+        # Profile-scoped framework self-evolution traces: registry mutations, trust
+        # transitions, world-model proposals, and lifecycle openings. Beside the
+        # capability stores because the causal ledger reads them together; distinct
+        # from them because these are facts no other store retains.
+        return self.root / "plugins" / "evolution_traces.json"
 
     @property
     def plugin_versions_dir(self) -> Path:

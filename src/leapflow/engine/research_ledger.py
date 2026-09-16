@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Structured research ledger for long-horizon task state (mechanism 5, W3).
 
 A compact, bounded record of the active task's accumulated findings, open

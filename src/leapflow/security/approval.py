@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unified approval framework for actions requiring human confirmation.
 
 This module is the compatibility-facing API for LeapFlow approvals.  It keeps

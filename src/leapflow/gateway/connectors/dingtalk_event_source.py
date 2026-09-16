@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """DingTalk webhook event source.
 
 Implements ``BackendEventSource`` by running a lightweight HTTP server

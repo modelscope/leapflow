@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Perceptual Field domain types — fine-grained context-aware perception control.
 
 Defines the vocabulary for expressing per-context perception policies:

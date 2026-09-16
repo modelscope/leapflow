@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Media transport: local capture behind the six-method contract, plus frames.
 
 Deliberately *not* named after a device. It is a generic mechanism -- local media

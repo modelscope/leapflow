@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Provider failover recovery strategy.
 
 Handles permanent provider failures (billing, auth permanent, overloaded,

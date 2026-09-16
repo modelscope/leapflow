@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """One-shot guard — ensures each strategy key fires at most once per lifetime.
 
 Replaces the pattern of 9+ boolean flags (tried_compress, tried_failover, etc.)

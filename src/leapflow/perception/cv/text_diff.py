@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Text change tracking between frames using OCR region matching.
 
 Identifies new, removed, and modified text regions by spatial IoU

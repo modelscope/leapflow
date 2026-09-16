@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Relearn subcommand — re-run learning pipeline on a saved trajectory."""
 
 from __future__ import annotations

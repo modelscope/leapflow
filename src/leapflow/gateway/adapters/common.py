@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Common helpers for built-in gateway adapters.
 
 The helpers here intentionally stay small: they provide shared lifecycle,

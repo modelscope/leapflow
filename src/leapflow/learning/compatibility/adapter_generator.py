@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Deterministic wrapper generation for runtime-discovered DSH plugins.
 
 A manifest cannot prove a foreign tool exists or is executable. Wrapper source

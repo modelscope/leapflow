@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Durable capability proposal queue for adaptive plugin evolution."""
 
 from __future__ import annotations

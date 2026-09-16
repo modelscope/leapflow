@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Platform-aware event synthesis — merges low-level OS events into high-level operations.
 
 Sits between DenoisePass and GroupingPass in the abstraction pipeline.

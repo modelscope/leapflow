@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Invocation adapter for ToolMetadata handlers.
 
 Tool handlers historically used two call shapes:

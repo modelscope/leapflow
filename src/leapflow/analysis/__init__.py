@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Offline analysis layer — synthesis, abstraction, segmentation, and distillation pipeline."""
 
 from leapflow.analysis.abstractor import ActionAbstractor

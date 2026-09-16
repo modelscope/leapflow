@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Multi-fidelity environment state snapshot service.
 
 Captures environment state at varying levels of detail for use by

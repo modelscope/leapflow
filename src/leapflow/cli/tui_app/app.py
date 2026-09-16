@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Application-based TUI controller — the hybrid architecture core.
 
 Combines prompt_toolkit's Application (persistent layout, fixed input,

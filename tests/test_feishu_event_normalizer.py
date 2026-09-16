@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for FeishuEventNormalizer — Feishu event classification and mapping."""
 from __future__ import annotations
 

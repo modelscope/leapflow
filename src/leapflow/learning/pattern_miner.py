@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Pattern miner — discovers recurring operation patterns from event history.
 
 LLM-Native design: uses simple frequency statistics to identify candidate

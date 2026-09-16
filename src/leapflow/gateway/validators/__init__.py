@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Platform credential validation: a neutral registry plus per-vendor modules.
 
 Each validator is a simple async function:

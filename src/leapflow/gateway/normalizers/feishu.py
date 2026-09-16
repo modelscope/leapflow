@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Feishu/Lark event normalizer.
 
 Maps the flat NDJSON output of ``lark-cli event consume`` into the

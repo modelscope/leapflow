@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Session-level semantic focus state for prompt context assembly.
 
 The focus plane is deliberately separate from progressive tool disclosure. PCD

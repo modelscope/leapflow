@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Runtime-backed LeapService implementation for leapd.
 
 This module is the lightweight orchestrator: it assembles coordinators, manages

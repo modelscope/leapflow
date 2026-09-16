@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Built-in ActiveSignalSource implementations.
 
 The FileWatchSignalSource is the community-extension exemplar: it demonstrates

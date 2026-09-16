@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Restricted Node subprocess host for executable DSH plugin bridges."""
 from __future__ import annotations
 

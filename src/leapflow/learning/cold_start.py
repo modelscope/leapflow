@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cold start strategy — handles system behavior when learning data is insufficient.
 
 Design goal (from Active Learning Design doc): "冷启动与适配成本极低 — 首次使用即开始学习"

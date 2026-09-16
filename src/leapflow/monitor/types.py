@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Domain-neutral contract for the monitoring subsystem.
 
 A ``Watch`` is a persistent, proactive monitor that periodically observes a

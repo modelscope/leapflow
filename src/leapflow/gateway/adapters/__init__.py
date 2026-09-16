@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Built-in gateway platform adapters."""
 
 from leapflow.gateway.adapters.api_server import APIServerAdapter

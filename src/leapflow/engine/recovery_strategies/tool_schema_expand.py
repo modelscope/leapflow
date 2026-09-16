@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tool schema expansion recovery strategy.
 
 Handles unknown tool errors by expanding the tool schema to include

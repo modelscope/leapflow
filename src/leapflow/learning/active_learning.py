@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Active learning — detect near-match skills and suggest updates.
 
 Two-phase similarity pipeline:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Declarative alert policies: event kind → automated response.
 
 A policy is a YAML rule that maps an observed ``EventKind`` to an action. The

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Abstract LLM interface."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Channel abstraction: table-driven behavior for all signal channels.
 
 ChannelSpec defines a channel's causal role, aggregation policy, and

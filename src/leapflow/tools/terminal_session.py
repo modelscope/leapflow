@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Persistent terminal sessions — long-lived, opt-in, DISABLED by default.
 
 Long-lived interactive shells (REPLs, dev servers, watch loops) hold process /

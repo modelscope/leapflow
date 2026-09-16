@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Guards for change-scoped test selection.
 
 Selection decides which tests get a chance to fail, so a defect here silently

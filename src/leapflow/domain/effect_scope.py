@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Reversible effect tracking for plugin lifecycle management."""
 
 from __future__ import annotations

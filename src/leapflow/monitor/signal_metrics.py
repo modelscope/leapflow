@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Signal flow metrics collection for real-time observability.
 
 Aggregates health metrics from EventBus, EventBridge, buffers, and monitors

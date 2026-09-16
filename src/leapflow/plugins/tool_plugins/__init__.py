@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Built-in tool plugin discovery.
 
 Each module in this package exposes a module-level ``plugin`` instance

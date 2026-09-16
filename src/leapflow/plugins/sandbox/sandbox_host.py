@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Sandbox host: manages worker subprocesses and proxies tool calls.
 
 The host launches a worker subprocess per sandboxed plugin, then proxies

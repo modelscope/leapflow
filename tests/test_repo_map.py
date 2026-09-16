@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the repo_map project-orientation tool (C1)."""
 from __future__ import annotations
 

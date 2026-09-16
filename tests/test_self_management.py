@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Comprehensive tests for the Phase 2.4 Self-Modification plugin.
 
 Covers:

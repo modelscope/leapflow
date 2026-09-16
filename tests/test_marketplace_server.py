@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Tests for the marketplace HTTP server.
 
 Verifies that the minimal asyncio-based HTTP server correctly serves

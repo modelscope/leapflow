@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Inspect real DSH/Cordis source bundles without executing foreign code.
 
 Static inspection establishes source identity, bounds, integrity and component

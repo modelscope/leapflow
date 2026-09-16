@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Composite event source that merges multiple BackendEventSource streams.
 
 Subscribes to N child sources and yields events from all of them through

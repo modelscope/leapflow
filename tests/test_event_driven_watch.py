@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """End-to-end tests for event-driven Watch full chain.
 
 Verifies the complete pipeline:

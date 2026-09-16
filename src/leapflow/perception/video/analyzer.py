@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Multi-scale video analysis via VLM.
 
 Three-level progressive analysis:

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Demonstration recorder — converts EventBus stream into trajectories.
 
 Plugs into the existing EventBus.subscribe() mechanism as a zero-intrusion

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """End-to-end governance chain for hardware commands.
 
 Every case here drives the *production* ``ApprovalOrchestrator``, ``ApprovalPolicyEngine``,

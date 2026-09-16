@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Noise-robust preprocessing for demonstration trajectories.
 
 Implements DenoisePass as a composable AbstractionPass that runs before

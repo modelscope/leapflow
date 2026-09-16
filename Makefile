@@ -6,7 +6,7 @@ BASE ?= origin/main
 # Parallelism for the mock layer. The real layer runs at -n 4 (few, heavy cases).
 JOBS ?= auto
 
-.PHONY: setup sync test test-unit test-e2e test-live test-impact test-full \
+.PHONY: setup sync space-sync test test-unit test-e2e test-live test-impact test-full \
         record-traffic seed-cassettes sync-fixtures lint brain cua-check help
 
 help:  ## Show available targets
@@ -17,11 +17,14 @@ setup:  ## Setup scripts permissions and environment
 	chmod +x scripts/setup.sh scripts/run.sh
 	./scripts/setup.sh
 
-sync:  ## Sync all dependencies
+sync:  ## Sync dependencies (excludes the heavy leapspace extra)
+	uv sync --all-extras --no-extra leapspace
+
+space-sync:  ## Sync all dependencies including the leapspace extra
 	uv sync --all-extras
 
 lint:  ## Lint source code
-	uv run ruff check src/leapflow/ tests/ tools/
+	uv run ruff check src/ tests/ tools/
 
 # ── Test layers ───────────────────────────────────────────────────────────────
 # The mock layer is broad and fast; the real layer is small, coarse, and never

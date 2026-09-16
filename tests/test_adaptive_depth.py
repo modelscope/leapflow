@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unit tests for the adaptive-depth core (mechanisms 1+2+3, S0 / W1).
 
 Covers:

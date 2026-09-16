@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Run real DeepSeek Harness plugin artifacts through LeapFlow's DSH bridge.
 
 The experiment uses source material from a local deepseek-harness checkout. It

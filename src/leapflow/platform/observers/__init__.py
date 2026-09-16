@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Cross-platform event observers for passive signal collection.
 
 Each observer implements the Observer Protocol and publishes events

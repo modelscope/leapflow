@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Centralized DuckDB connection factory with lock detection and repair.
 
 Replaces bare ``duckdb.connect()`` calls throughout the codebase with a

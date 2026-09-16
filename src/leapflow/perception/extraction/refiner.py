@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Stage A: Keyframe Refinement — dedup, classify, pair, budget allocation."""
 
 from __future__ import annotations

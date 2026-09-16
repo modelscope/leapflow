@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Multi-provider LLM chain — failover, credential rotation, auxiliary client.
 
 Architecture (Protocol-first, inspired by hermes credential_pool + transports):

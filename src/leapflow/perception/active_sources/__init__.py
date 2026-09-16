@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Built-in ActiveSignalSource implementations organized by signal domain."""
 
 from leapflow.perception.active_sources.discord_bot import DiscordBotSignalSource

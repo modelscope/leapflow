@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Assessment pipeline stages."""
 
 from typing import List, Protocol, runtime_checkable

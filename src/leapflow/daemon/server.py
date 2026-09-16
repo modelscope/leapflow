@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Unix socket JSON-RPC server for leapd."""
 from __future__ import annotations
 

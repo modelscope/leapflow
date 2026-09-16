@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Universal async resilience: timeout + retry with exponential backoff.
 
 Provides a composable execution wrapper usable across all execution paths

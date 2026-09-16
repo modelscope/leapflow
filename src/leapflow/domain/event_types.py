@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Canonical event type constants — single source of truth for all event types.
 
 Every module that emits, subscribes, or matches event types MUST import

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """L2 integration: real ReadingStore + real DuckDB + real EventBus + MockTransport.
 
 Cross-boundary assertion gap (CBAG) regression suite for G15, G16, and G24.

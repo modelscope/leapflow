@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Adaptive plugin closed-loop orchestration primitives.
 
 This module is an application service above the plugin registry. It connects
@@ -8,6 +9,7 @@ engine loop.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
@@ -23,6 +25,8 @@ from leapflow.plugins.capability_resolver import (
     ResolverContext,
     candidates_from_registry,
 )
+
+logger = logging.getLogger(__name__)
 
 CandidateFilter = Callable[[CapabilityCandidate], bool]
 
@@ -214,6 +218,65 @@ class CapabilityDecisionRecorder:
         )
 
 
+
+def live_learning_signals() -> tuple[Any, Any]:
+    """The live trust ledger and usage tracker, or ``(None, None)``.
+
+    Both live on the process-global advisor, which is absent in-process and in most
+    tests. Absence is degradation, not failure: ``TrustScorer`` and
+    ``ReliabilityScorer`` then report "unavailable" and score 0, which is what they
+    did for every production selection before this was wired -- meaning both adaptive
+    signals contributed nothing and selection fell to the static scorers with an
+    alphabetical tie-break.
+
+    Shared with the evolution board's ``_trust_and_usage`` rather than duplicated:
+    two accessors would let the board and the resolver disagree about what trust a
+    plugin has.
+    """
+    try:
+        from leapflow.learning.plugin_advisor import get_default_advisor
+
+        advisor = get_default_advisor()
+    except Exception:  # noqa: BLE001 - no advisor is a degraded signal, not a failure
+        return None, None
+    if advisor is None:
+        return None, None
+    return getattr(advisor, "_trust_ledger", None), getattr(advisor, "_usage_tracker", None)
+
+
+def _configured_policy(
+    trust_ledger: Any, usage_tracker: Any, settings: Any = None
+) -> Any:
+    """Activate the configured selection policy, or fall back to the built-in default.
+
+    This loop is the policy's owner: it is the component that selects, and the only
+    one holding the live services a policy is allowed to read. Activation caches the
+    instance process-wide so a learning policy accumulates across turns and the
+    cold-path sweep reports back to the *same* object.
+
+    ``settings`` is pushed in by the caller rather than read here, because
+    ``get_settings()`` is a boot snapshot with no refresh path: reading it would pin
+    the policy to whatever configuration existed at process start and make
+    ``selection.policy`` a setting that reports itself as hot-reloadable and never
+    changes anything.
+
+    Returns ``None`` on any failure, which leaves ``CapabilityResolver`` to construct
+    ``GreedyPolicy`` itself. Selection must keep working when configuration is absent
+    or wrong -- a misconfigured strategy is a reason to log and use the default, never
+    a reason to stop choosing tools.
+    """
+    try:
+        from leapflow.plugins.selection_policy import PolicyDeps
+        from leapflow.plugins.selection_policy_registry import get_selection_policy_registry
+
+        return get_selection_policy_registry().activate(
+            PolicyDeps(trust_ledger=trust_ledger, usage_tracker=usage_tracker),
+            settings=settings,
+        )
+    except Exception:  # noqa: BLE001 - configuration must not break tool selection
+        logger.debug("adaptive_loop: falling back to the default selection policy", exc_info=True)
+        return None
+
 class AdaptivePluginLoop:
     """Resolve capability plans before and after approval-gated registry mutations."""
 
@@ -226,12 +289,20 @@ class AdaptivePluginLoop:
         resolver: CapabilityResolver | None = None,
         trust_ledger: Any = None,
         usage_tracker: Any = None,
+        settings: Any = None,
+        distilled_preferences: Any = None,
     ) -> None:
         self._registry = registry
         self._lifecycle_actor = lifecycle_actor
-        self._resolver = resolver or CapabilityResolver()
         self._trust_ledger = trust_ledger
         self._usage_tracker = usage_tracker
+        # Channel C2. Read per resolution rather than captured, because the teacher's
+        # recommendation is superseded and retracted between sessions and a snapshot would
+        # keep preferring a provider the knowledge behind it no longer endorses.
+        self._distilled_preferences = distilled_preferences
+        self._resolver = resolver or CapabilityResolver(
+            policy=_configured_policy(trust_ledger, usage_tracker, settings)
+        )
         self._recorder = CapabilityDecisionRecorder(plan_store)
 
     def plan_next_action(
@@ -315,6 +386,20 @@ class AdaptivePluginLoop:
             return result
         return {"ok": False, "error": f"Unsupported policy action: {action}"}
 
+    def _read_preferences(self) -> tuple[tuple[str, str], ...]:
+        """The teacher's rebind recommendations, or nothing.
+
+        Contained and empty on failure: a missing preference costs a better choice, while
+        raising here would cost the resolution itself.
+        """
+        if self._distilled_preferences is None:
+            return ()
+        try:
+            return tuple(self._distilled_preferences() or ())
+        except Exception:  # noqa: BLE001 - a preference is evidence, never a gate
+            logger.debug("adaptive_loop: distilled preferences unavailable", exc_info=True)
+            return ()
+
     def resolve_once(
         self,
         request: AdaptiveLoopRequest,
@@ -338,6 +423,10 @@ class AdaptivePluginLoop:
             environment=request.environment,
             trust_ledger=self._trust_ledger,
             usage_tracker=self._usage_tracker,
+            # Channel C2: the provider the teacher named in a ``rebind``. A preference
+            # added to a score, never an exclusion -- an inadmissible candidate still
+            # loses to the affordance scorer no matter what was recommended.
+            distilled_preferences=self._read_preferences(),
         )
         resolutions = self._resolver.resolve_all(request.requirements, candidates, context)
         plan = CapabilityPlan.from_scores(
@@ -364,6 +453,66 @@ class AdaptivePluginLoop:
             plan=plan,
             record=record,
         )
+
+    def unmet_requirements(
+        self,
+        requirements: Sequence[CapabilityRequirement],
+        environment: EnvironmentFingerprint,
+        *,
+        candidate_filter: CandidateFilter | None = None,
+        scorers: Any = None,
+        authorising_origins: Sequence[str] | None = None,
+    ) -> tuple[CapabilityRequirement, ...]:
+        """Resolution-first gap gate: return only requirements the live registry
+        cannot already satisfy.
+
+        ``authorising_origins`` restricts which requirement *origins* may drive an
+        acquisition. Empty or ``None`` means unrestricted, which is the shipped
+        behaviour. Setting it to ``("world_model",)`` is the enforceable form of
+        "self-evolution is first-driven by the world model": a requirement from any
+        other origin is still resolved and still reported by the caller, but is
+        excluded from the gap set, so it cannot reach the proposal queue. The filter
+        is applied *before* resolution so an unauthorised origin cannot even consume
+        resolver work.
+
+        Shipped adaptive evolution has no short-circuit between "a requirement
+        exists" and "propose a plugin", so it can generate and install a
+        capability the live catalog already provides. This method resolves each
+        requirement against the current registry first; a requirement whose best
+        candidate is eligible is *not* a gap and is excluded from the result. Only
+        the returned (unmet) requirements should enter the proposal queue.
+
+        Read with respect to the capability set: it performs no install, remove,
+        or publish. It does call ``assemble()``, which is idempotent and is the
+        same precondition ``candidates_from_registry`` already requires; on a
+        registry that has never been assembled this performs the one-time index
+        and version bump any first read triggers, so a caller that needs a
+        strictly untouched version counter should assemble beforehand. Callers
+        that resolve against a task environment pass the environment-aware
+        ``scorers`` (e.g. including ``EnvironmentAffordanceScorer``); ``None`` uses
+        the resolver's default scorers.
+        """
+        self._registry.assemble()
+        # Authority filter first: an origin that may not drive acquisition should not
+        # consume resolver work, and must not appear in the gap set at all.
+        authorised = tuple(requirements)
+        if authorising_origins:
+            from leapflow.learning.outcome_governance_feed import filter_authorised
+
+            authorised = filter_authorised(authorised, authorising_origins)
+            if not authorised:
+                return ()
+        candidates = tuple(candidates_from_registry(self._registry))
+        if candidate_filter is not None:
+            candidates = tuple(c for c in candidates if candidate_filter(c))
+        resolver = CapabilityResolver(scorers) if scorers is not None else self._resolver
+        context = ResolverContext(
+            environment=environment,
+            trust_ledger=self._trust_ledger,
+            usage_tracker=self._usage_tracker,
+        )
+        resolutions = resolver.resolve_all(authorised, candidates, context)
+        return tuple(r.requirement for r in resolutions if r.unmet)
 
     async def run(self, request: AdaptiveLoopRequest) -> AdaptiveLoopResult:
         """Resolve, optionally mutate the registry, and resolve again."""

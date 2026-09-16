@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Scenario-based tests for the video-first perception pipeline."""
 
 from __future__ import annotations

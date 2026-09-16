@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Profile-scoped version store for dynamically installed plugins."""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Capability health tracking for platform actions.
 
 Maintains a session-scoped ledger that records authorization failures for

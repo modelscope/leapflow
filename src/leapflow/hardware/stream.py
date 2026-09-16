@@ -1,3 +1,4 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
 """Continuous sampling: raw readings in, derived events out.
 
 The layering here is the whole point, and it is a boundary decision rather than an
