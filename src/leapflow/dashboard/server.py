@@ -1,5 +1,5 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Local dashboard web server (optional aiohttp transport, view-client process).
+"""Local dashboard web server (aiohttp transport, view-client process).
 
 Holds one upstream subscription to the daemon (via DaemonClient) and fans out
 monitor events to browser WebSockets through a ``ViewHub``. Serves the SDUI
@@ -141,7 +141,7 @@ class DashboardServer:
     # ── App wiring ─────────────────────────────────────────────────────────
 
     def build_app(self) -> Any:
-        """Build the aiohttp Application (requires the optional aiohttp dep)."""
+        """Build the aiohttp Application."""
         from aiohttp import web
 
         app = web.Application()
