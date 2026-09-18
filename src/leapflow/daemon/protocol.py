@@ -248,6 +248,15 @@ class LeapService(Protocol):
         """Ensure a session-analysis watch and run one analysis cycle now."""
         ...
 
+    async def evolution_run(self, reason: str = "manual") -> Dict[str, Any]:
+        """Run the learning boundary now, the one path that drives evolution.
+
+        Exposed because the boundary was otherwise reachable only from context
+        cleanup -- process shutdown in daemon mode -- which made "when does the
+        framework evolve" unanswerable and untestable without killing the daemon.
+        """
+        ...
+
     async def status(self, session_id: str = "") -> Dict[str, Any]:
         """Return daemon status (uptime, connections, db path, etc.).
 
@@ -480,6 +489,7 @@ METHOD_REGISTRY: Dict[str, str] = {
     "session.history": "session_history",
     "session.detail": "session_detail",
     "session.analyze": "session_analyze",
+    "evolution.run": "evolution_run",
     "daemon.status": "status",
     "daemon.shutdown": "shutdown",
     "host.status": "host_status",

@@ -217,6 +217,73 @@ def test_drive_result_is_reportable(tmp_path):
     assert payload["capabilities"] == ["chat.reply"]
 
 
+# ── authority gate (P5 in the driver) ──────────────────────────────────
+
+
+def test_admitted_hypothesis_is_queued_with_evidence_linkage(tmp_path):
+    """An admitted, authorised hypothesis is queued, carrying its observation ids.
+
+    The linkage is what lets the causal ledger join a queued acquisition back to the
+    evidence that produced it; a proposal minted with no observation ids is an orphan.
+    """
+    _, service = _service(tmp_path, opted_in=True)
+    captured: dict = {}
+
+    def sink(proposal, *, observation_ids=(), environment=None):
+        captured["observation_ids"] = tuple(observation_ids)
+        captured["environment"] = environment
+        return "prop-unmet"
+
+    driver = WorldModelEvolutionDriver(
+        teacher=_Teacher(intents=[_intent()]),
+        intake=service,
+        proposal_sink=sink,
+    )
+    result = asyncio.run(driver.drive(_TRAJECTORY, "reply in chat"))
+
+    assert result.unauthorised == ()
+    assert result.queued_proposal_ids == ("prop-unmet",)
+    assert len(captured["observation_ids"]) == 1
+    assert captured["observation_ids"][0].startswith("obs-")
+
+
+def test_unauthorised_origin_is_a_durable_no_op(tmp_path):
+    """With authority restricted away from world_model, the hypothesis cannot acquire."""
+    store, service = _service(tmp_path, opted_in=True)
+    queued: list = []
+
+    driver = WorldModelEvolutionDriver(
+        teacher=_Teacher(intents=[_intent()]),
+        intake=service,
+        proposal_sink=lambda p, **k: queued.append(p) or "prop-x",
+        # A drive-the-wiring assertion of P5: the world model's own origin is refused
+        # authority, so even an admitted hypothesis is retired rather than queued.
+        authorising_origins=("some_other_origin",),
+    )
+    result = asyncio.run(driver.drive(_TRAJECTORY, "reply in chat"))
+
+    assert result.unauthorised == ("chat.reply",)
+    assert result.queued_proposal_ids == ()
+    assert queued == []
+    # Durable no-op: the observation is retired with a recorded reason.
+    assert store.unresolved() == []
+
+
+def test_world_model_origin_is_authorised_when_named(tmp_path):
+    """Naming world_model in authorising_origins lets its hypothesis through."""
+    _, service = _service(tmp_path, opted_in=True)
+    queued: list = []
+    driver = WorldModelEvolutionDriver(
+        teacher=_Teacher(intents=[_intent()]),
+        intake=service,
+        proposal_sink=lambda p, **k: queued.append(p) or "prop-x",
+        authorising_origins=("world_model",),
+    )
+    result = asyncio.run(driver.drive(_TRAJECTORY, "reply in chat"))
+    assert result.unauthorised == ()
+    assert result.queued_proposal_ids == ("prop-x",)
+
+
 # ── the real grader satisfies the teacher contract ────────────────────────────
 
 

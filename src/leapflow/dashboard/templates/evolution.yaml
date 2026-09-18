@@ -166,6 +166,38 @@ layout:
                 props:
                   label: "Pipeline evidence"
                   value: "{{ evolution.summary.segments_with_evidence }}/{{ evolution.summary.segments_total }}"
+          # ── The evolution axis ──────────────────────────────────────────
+          # Gated on the *series*, not on having two of them: the renderer draws a
+          # lone sample as a marker, and "one observation, here it is" is the most
+          # important reading a board has on the day its subject starts evolving.
+          # Every other panel on this page is a cross-section of one instant; this
+          # is the only one that answers which way the framework is moving. It sits
+          # outside the tabs with the posture strip because that question is not a
+          # detail of any one tab.
+          #
+          # Bound at ``evidence_trend`` rather than ``evolution.evidence_trend``:
+          # the producer owns the ``evolution.*`` namespace, and this series is
+          # derived by the view service from retained findings, which are the only
+          # thing that carries history across daemon restarts.
+          - type: AreaChart
+            when: evidence_trend.series
+            props:
+              title: "Pipeline evidence over time"
+              bind: evidence_trend.series
+              caption: "One point per recorded change in framework state, oldest first."
+          - type: Row
+            when: evidence_trend.series
+            props:
+              variant: meta
+            children:
+              - type: Stat
+                props:
+                  label: "Samples"
+                  value: "{{ evidence_trend.samples }}"
+              - type: Stat
+                props:
+                  label: "Net change"
+                  value: "{{ evidence_trend.delta }}"
           - type: Markdown
             when: evolution.degraded_reason
             props:

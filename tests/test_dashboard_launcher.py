@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from leapflow.dashboard import launcher
-from leapflow.dashboard.server import DashboardServer
+from leapflow.dashboard.server import DashboardServer, _MONITOR_EVENTS
 
 
 def _settings(tmp_path: Path) -> SimpleNamespace:
@@ -215,6 +215,10 @@ def test_check_origin_matches_loopback_host_exactly() -> None:
         assert check(SimpleNamespace(headers={"Origin": origin})) is True
     for origin in ("http://attacker127.0.0.1.com", "http://localhost.attacker.com", "https://evil.com"):
         assert check(SimpleNamespace(headers={"Origin": origin})) is False
+
+
+def test_dashboard_forwards_presentation_only_evolution_events() -> None:
+    assert "evolution.presentation" in _MONITOR_EVENTS
 
 
 # ── DashboardServer.dispatch_action (allow-listed, transport-free) ───────────

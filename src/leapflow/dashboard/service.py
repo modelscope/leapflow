@@ -11,6 +11,7 @@ domain), never a hardcoded domain->file map.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Protocol, runtime_checkable
 
 from leapflow.dashboard.intent import DashboardIntent
@@ -215,6 +216,130 @@ def _empty_state(domain: str, watch: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _provenance(payload: dict[str, Any], watch: dict[str, Any]) -> dict[str, Any]:
+    """State when the rendered data was observed, when it was last confirmed, and
+    whether the watch behind it is keeping its cadence.
+
+    Two instants, deliberately not merged, because merging them is what made the
+    board unreadable:
+
+    * ``observed_at`` -- when the content on screen was produced. Findings dedup on
+      a content fingerprint, so an unchanged subject keeps its previous finding and
+      this can legitimately be hours old.
+    * ``checked_at`` -- when a cycle last completed. It advances on every run,
+      including one that concluded nothing had changed and therefore wrote nothing.
+
+    Reporting only the first made a correct system look broken: pressing refresh ran
+    a real cycle, the fingerprint matched, no finding was written, and every figure
+    on the page -- including its own age -- stayed frozen. Reporting only the second
+    would be worse: it would age a stale page from the clock and call it current.
+
+    So ``stale`` is a verdict about the *watch*, not the content: a cycle has not
+    completed in two cadences, which means the page cannot be trusted to reflect
+    anything. Content that is old but freshly confirmed is not stale, it is stable,
+    and ``unchanged_for_seconds`` says how long it has been so.
+
+    Two cadences rather than a fixed number of seconds: one missed cycle is
+    scheduling jitter, two is a cadence that is not being kept. With no declared
+    cadence (event, cron, condition) the verdict is withheld rather than guessed --
+    judging an event-driven watch against an invented interval would be the same
+    class of error this block exists to remove.
+    """
+    now = time.time()
+    observed_at = float(payload.get("observed_at") or 0.0)
+    checked_at = float(watch.get("last_run_at") or 0.0)
+    # A payload with no instant of its own is dated by the cycle that produced it.
+    if observed_at <= 0.0:
+        observed_at = checked_at
+    cadence = float(watch.get("interval_seconds") or 0.0)
+    next_due_at = float(watch.get("next_due_at") or 0.0)
+    return {
+        "observed_at": observed_at,
+        "age_seconds": max(0.0, now - observed_at) if observed_at > 0.0 else 0.0,
+        "checked_at": checked_at,
+        "checked_age_seconds": max(0.0, now - checked_at) if checked_at > 0.0 else 0.0,
+        # How long the subject has held still. Only meaningful once a check has
+        # happened after the observation; otherwise there is nothing to compare.
+        "unchanged_for_seconds": (
+            max(0.0, checked_at - observed_at)
+            if checked_at > 0.0 and observed_at > 0.0
+            else 0.0
+        ),
+        "cadence_seconds": cadence,
+        "next_due_at": next_due_at,
+        "next_due_in_seconds": max(0.0, next_due_at - now) if next_due_at > 0.0 else 0.0,
+        "run_count": int(watch.get("run_count") or 0),
+        "watch_state": str(watch.get("state") or ""),
+        "muted": bool(watch.get("muted")),
+        # The identity of what produced the page, so the bar can offer a refresh
+        # rather than only report that the page is behind. Being able to re-run the
+        # cycle from here is what turns the freshness reading into a closed loop:
+        # the reader changes something the board told them to change, refreshes, and
+        # sees whether it landed.
+        "watch_id": str(watch.get("watch_id") or ""),
+        # Absent is not the same as fresh. A board whose watch never ran has no
+        # instant to age, and saying "0s ago" there would invent one.
+        "observed": observed_at > 0.0,
+        "checked": checked_at > 0.0,
+        "stale": bool(
+            cadence > 0.0
+            and checked_at > 0.0
+            and (now - checked_at) > cadence * 2
+        ),
+    }
+
+
+def _evidence_trend(findings: list[dict[str, Any]]) -> dict[str, Any]:
+    """Turn the retained framework_evolution findings into one evolution axis.
+
+    The board could say what the framework *is* and never what direction it is
+    moving. Every panel was a cross-section of one instant; the only time-shaped
+    element was the episode timeline, which is gated on episodes and therefore hidden
+    in exactly the state where "has anything started yet" is the question being asked.
+
+    So the axis is built from the findings already retained for the domain. They are
+    persisted newest-first and deduped on content, which makes them a record of
+    *changes* rather than of ticks -- one point per distinct state, which is the right
+    granularity for this question and cheaper than sampling every cycle.
+
+    A single point is emitted and drawn. It reads "one observation, here it is",
+    which is a fact; suppressing it until a second arrives would hide the beginning
+    of every evolution the board exists to show.
+    """
+    points: list[dict[str, Any]] = []
+    for finding in reversed(findings or []):  # oldest first, so the axis reads left to right
+        payload = finding.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        summary = payload.get("summary")
+        if not isinstance(summary, dict):
+            continue
+        with_evidence = summary.get("segments_with_evidence")
+        if with_evidence is None:
+            continue
+        observed_at = float(payload.get("observed_at") or finding.get("ts") or 0.0)
+        points.append({
+            "x": observed_at,
+            "y": int(with_evidence),
+            "at": observed_at,
+        })
+    total = 0
+    for finding in findings or []:
+        payload = finding.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("summary"), dict):
+            total = int(payload["summary"].get("segments_total") or 0)
+            break
+    return {
+        "series": [{"label": "Segments with runtime evidence", "points": points}] if points else [],
+        "samples": len(points),
+        "segments_total": total,
+        "first_at": points[0]["at"] if points else 0.0,
+        "last_at": points[-1]["at"] if points else 0.0,
+        # Direction, stated rather than left to the reader's eye on a two-point line.
+        "delta": (points[-1]["y"] - points[0]["y"]) if len(points) > 1 else 0,
+    }
+
+
 def _hardware_notice(
     inventory: dict[str, Any], digest: dict[str, Any]
 ) -> dict[str, str] | None:
@@ -332,6 +457,12 @@ _PAYLOAD_DOMAINS: dict[str, tuple[str, str]] = {
     # template -> (finding domain, data key the template binds to)
     "capability": ("capability_adaptation", "capability_plan"),
     "evolution": ("framework_evolution", "evolution"),
+    # The hidden demo/audit lens reads the same immutable evolution snapshot.
+    # It adds no data source or mutation path.
+    "causal_trace": ("framework_evolution", "evolution"),
+    # The live lens consumes the same authoritative snapshot and only augments it
+    # with presentation events delivered through the browser WebSocket.
+    "evolution_live": ("framework_evolution", "evolution"),
     "hardware": ("hardware", "hardware"),
 }
 """Templates whose data is a producer's finding payload, not a session lens.
@@ -524,6 +655,7 @@ class DashboardViewBuilder:
             data_key: payload,
             "findings": domain_findings or None,
             "watch": watch,
+            "provenance": _provenance(payload, watch),
             "observation": {
                 "watch_state": watch.get("state", ""),
                 "watch_muted": watch.get("muted", False),
@@ -539,6 +671,13 @@ class DashboardViewBuilder:
             # idle with nothing to report, and no watch at all means the producer is
             # not being scheduled -- three different next steps.
             data["empty"] = _empty_state(finding_domain, watch)
+        if finding_domain == "framework_evolution":
+            # A sibling top-level key, not folded into the bound payload. The producer
+            # owns everything under ``evolution.*`` and a test asserts that contract;
+            # this series is derived here because only the retained finding list
+            # carries history, and hiding a service-derived figure inside the
+            # producer's namespace would make that ownership unreadable.
+            data["evidence_trend"] = _evidence_trend(domain_findings or [])
         if template == "hardware":
             # The fleet list comes from the live registry rather than the cycle payload.
             # The digest is capped at eight charted channels and is up to a monitor
@@ -587,6 +726,7 @@ class DashboardViewBuilder:
             "title": "Session Analysis",
             "analysis": analysis,
             "observation": observation,
+            "provenance": _provenance(analysis, session_watch),
             "artifact_context": analysis.get("artifact_context") or [],
             "findings": session_findings,
             "watch": session_watch,
@@ -607,6 +747,15 @@ class DashboardViewBuilder:
                 meta["templates"] = self._templates.visible_names()
                 meta["hidden_templates"] = self._templates.hidden_names()
                 meta["active_template"] = name
+                # Freshness rides in ``meta`` rather than the component tree so it is
+                # page chrome on every lens at once, and so a template author cannot
+                # forget to bind it. Lifted here for the same reason the lens list is:
+                # this is the one place every build path passes through. A build path
+                # that computes no provenance says nothing rather than claiming the
+                # page is current.
+                provenance = data.get("provenance")
+                if isinstance(provenance, dict):
+                    meta["provenance"] = provenance
         return spec
 
     async def _build_signals(self, template: str, provider: DashboardDataProvider) -> dict[str, Any]:

@@ -266,6 +266,12 @@ class WatchView:
     last_run_at: float
     finding_count: int = 0
     client_coupled: bool = False
+    # Declared cadence in seconds, 0.0 for a watch with no fixed one (event, cron,
+    # condition). Exposed because the board judges its own freshness against it: a
+    # page two cadences past its last observation is stale, and only the watch knows
+    # what one cadence is. Deriving it from ``next_due_at - last_run_at`` was the
+    # alternative and is wrong after a skipped or forced run.
+    interval_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -280,6 +286,7 @@ class WatchView:
             "last_run_at": self.last_run_at,
             "finding_count": self.finding_count,
             "client_coupled": self.client_coupled,
+            "interval_seconds": self.interval_seconds,
         }
 
 

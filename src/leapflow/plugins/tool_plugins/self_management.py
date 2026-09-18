@@ -590,12 +590,16 @@ class SelfManagementPlugin:
         the LLM generates conformant plugin code, and it's rigorously validated.
         Installation is a SEPARATE approval-gated step (plugin_install).
         """
+        provides_capabilities: tuple[str, ...] = ()
+        source = ""
         if proposal_id:
-            proposal = self._proposal_store().get(proposal_id)
-            if proposal is None:
+            source, resolved_plugin_id, resolved_description, provides_capabilities = (
+                self._resolve_generation_source(proposal_id)
+            )
+            if not source:
                 return {"ok": False, "error": f"Plugin proposal '{proposal_id}' not found"}
-            plugin_id = plugin_id or proposal.plugin_id
-            description = description or proposal.capability_summary
+            plugin_id = plugin_id or resolved_plugin_id
+            description = description or resolved_description
         if not plugin_id or not description:
             return {
                 "ok": False,
@@ -631,16 +635,82 @@ class SelfManagementPlugin:
             request = PluginGenerationRequest(
                 plugin_id=plugin_id,
                 description=description,
-                provides_capabilities=_declared_capabilities(proposal if proposal_id else None),
+                provides_capabilities=provides_capabilities,
             )
             result = await generator.generate_and_validate(request)
             if proposal_id:
                 result["proposal_id"] = proposal_id
                 if result.get("ok"):
-                    self._proposal_store().update_status(proposal_id, "review")
+                    self._mark_generation_started(source, proposal_id)
             return result
         except (AttributeError, RuntimeError) as exc:
             return {"ok": False, "error": f"Generation failed: {exc}"}
+
+    def _resolve_generation_source(
+        self, proposal_id: str
+    ) -> tuple[str, str, str, tuple[str, ...]]:
+        """Resolve a generation request from *either* proposal store.
+
+        Two stores can name a proposal, and both must reach generation:
+
+        * the **review store** (``JsonPluginProposalStore``) holds a rich
+          ``PluginProposal`` created by the manual ``plugin_propose`` UX flow;
+        * the **lifecycle queue** (``JsonCapabilityProposalQueue``) holds the
+          acquisition record the world-model driver enqueues -- a
+          ``prop-<hash>`` id keyed on the requirement, carrying the capability,
+          the ``plugin_id`` the sink stamped, and the hypothesis as its summary.
+
+        Before this, ``plugin_generate`` looked only in the review store, so a
+        world-model proposal could never be generated from its own id: Scene C could
+        not proceed from a real teacher verdict to a validated artifact. Returning a
+        normalised ``(source, plugin_id, description, provides_capabilities)`` unifies
+        the two consumption points without collapsing their distinct lifecycle
+        vocabularies. ``source`` is ``""`` when neither store knows the id.
+        """
+        review = self._proposal_store().get(proposal_id)
+        if review is not None:
+            return (
+                "review",
+                str(review.plugin_id),
+                str(review.capability_summary),
+                _declared_capabilities(review),
+            )
+        try:
+            item = self._lifecycle_store().get(proposal_id)
+        except (RuntimeError, OSError, ValueError, AttributeError):
+            item = None
+        if item is not None:
+            requirements = [dict(r) for r in (item.requirements or ())]
+            capability = str((requirements[0].get("capability") if requirements else "") or "")
+            metadata = dict(item.metadata or {})
+            plugin_id = str(metadata.get("plugin_id") or "")
+            description = str(
+                metadata.get("capability_summary")
+                or (requirements[0].get("evidence") if requirements else "")
+                or capability
+            )
+            provides = (capability,) if capability else ()
+            return ("lifecycle", plugin_id, description, provides)
+        return ("", "", "", ())
+
+    def _mark_generation_started(self, source: str, proposal_id: str) -> None:
+        """Advance the proposal's status in whichever store owns it.
+
+        The two stores speak different vocabularies on purpose (see
+        ``evolution_contracts``): the review store moves to ``review`` (a human-accept
+        state), the lifecycle queue to ``GENERATED`` (an acquisition-lifecycle state
+        ``AdaptiveEvolutionPolicy`` reads next). Contained: a status write must not fail
+        a generation that already succeeded.
+        """
+        try:
+            if source == "review":
+                self._proposal_store().update_status(proposal_id, "review")
+            elif source == "lifecycle":
+                self._lifecycle_store().update(proposal_id, status="GENERATED")
+        except (RuntimeError, OSError, ValueError, AttributeError):
+            logger.debug(
+                "plugin_generate: could not advance %s status", proposal_id, exc_info=True
+            )
 
     # ── Compatibility assessment (read-only) ─────────────────
 

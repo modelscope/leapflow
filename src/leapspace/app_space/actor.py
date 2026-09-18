@@ -49,7 +49,7 @@ from cua_sandbox.interfaces.shell import CommandResult
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from leapspace.app_space.utils import (
+from leapspace.app_space.state import (
     CUA_MCP_PORT,
     LINUX_LEAPFLOW_SRC,
     get_actor_stage_dir,

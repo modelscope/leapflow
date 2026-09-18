@@ -17,7 +17,7 @@ test passed, because every unit test constructed the governor itself.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ def build_degradation_sink(
     return sink
 
 
-def build_proposal_sink(*, queue: Any) -> Callable[[Any], str]:
+def build_proposal_sink(*, queue: Any) -> Callable[..., str]:
     """Return the sink that turns an accepted acquisition into a queued proposal.
 
     The last hop of the acquisition chain, and it was missing: the driver derived an
@@ -134,9 +134,19 @@ def build_proposal_sink(*, queue: Any) -> Callable[[Any], str]:
     generated, so this hop makes the proposal *visible and actionable* rather than
     executed. That separation is why the sink can be wired by default while generation
     stays governed.
+
+    ``observation_ids`` and ``environment`` are threaded from the driver so the queue
+    item carries the evidence and the task environment it was born from. The causal
+    ledger joins a proposal back to its motivating observations by exactly these ids;
+    without them a queued acquisition is an orphan the ledger cannot reconstruct.
     """
 
-    def sink(proposal: Any) -> str:
+    def sink(
+        proposal: Any,
+        *,
+        observation_ids: Sequence[str] = (),
+        environment: Any = None,
+    ) -> str:
         requirement = _requirement_from(proposal)
         if requirement is None:
             # Without a capability the queue has nothing to deduplicate on and resolution
@@ -148,14 +158,21 @@ def build_proposal_sink(*, queue: Any) -> Callable[[Any], str]:
             return ""
         evidence = tuple(getattr(proposal, "evidence", ()) or ())
         metadata = dict(getattr(evidence[0], "metadata", {})) if evidence else {}
+        env_payload = _environment_dict(environment)
         try:
             item = queue.enqueue(
                 requirements=(requirement,),
+                environment=env_payload,
                 source="world_model",
+                observation_ids=tuple(str(o) for o in observation_ids if str(o)),
                 risk={"max_risk_level": requirement.max_risk_level},
                 metadata={
                     "plugin_id": str(getattr(proposal, "plugin_id", "")),
                     "capability_summary": str(getattr(proposal, "capability_summary", "")),
+                    # The world model's own words and identity, carried so the ledger can
+                    # render "why this evolved" and so a reviewer sees the hypothesis.
+                    "intent_id": str(metadata.get("intent_id", "")),
+                    "confidence": str(metadata.get("confidence", "")),
                     # Carried so a reviewer can see what a challenger is challenging, and
                     # so a rival stays distinguishable from a gap fill for the same
                     # capability.
@@ -168,6 +185,21 @@ def build_proposal_sink(*, queue: Any) -> Callable[[Any], str]:
         return str(getattr(item, "proposal_id", ""))
 
     return sink
+
+
+def _environment_dict(environment: Any) -> dict[str, Any]:
+    """Coerce a fingerprint or mapping into the queue's plain-dict environment."""
+    if environment is None:
+        return {}
+    to_dict = getattr(environment, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return dict(to_dict())
+        except Exception:  # noqa: BLE001 - a fingerprint is context, not a gate
+            return {}
+    if isinstance(environment, Mapping):
+        return dict(environment)
+    return {}
 
 
 def _requirement_from(proposal: Any) -> Any:

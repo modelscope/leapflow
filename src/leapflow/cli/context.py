@@ -3114,12 +3114,15 @@ class Context:
         )
         return self._observation_service
 
-    def _current_environment_dict(self):
-        """The environment evidence is recorded against.
+    def _current_environment_fingerprint(self):
+        """The environment a capability decision is made against, as a fingerprint.
 
-        Carried with each degradation so one application upgrade that breaks N
-        capabilities is recognisable as one transition rather than N coincidences -- the
-        teacher can then answer once, and usually with a rebind rather than N rebuilds.
+        A single object so the world-model driver's distillation path and its
+        acquisition path agree on the environment: the distilled-knowledge store tags
+        each entry with the fingerprint id, and a queued proposal carries the same
+        fingerprint into the lifecycle queue so the causal ledger can place it. Returns
+        ``None`` when the platform layer is unavailable, which the callers degrade
+        around.
         """
         try:
             from leapflow.domain.environment_fingerprint import EnvironmentFingerprint
@@ -3128,10 +3131,20 @@ class Context:
             return EnvironmentFingerprint.from_platform_manifest(
                 PlatformManifest.default_darwin(),
                 workspace_root=str(getattr(self.settings, "workspace_root", "") or ""),
-            ).to_dict()
+            )
         except (ImportError, AttributeError, TypeError, ValueError):
             logger.debug("environment fingerprint unavailable", exc_info=True)
-            return {}
+            return None
+
+    def _current_environment_dict(self):
+        """The environment evidence is recorded against.
+
+        Carried with each degradation so one application upgrade that breaks N
+        capabilities is recognisable as one transition rather than N coincidences -- the
+        teacher can then answer once, and usually with a rebind rather than N rebuilds.
+        """
+        fingerprint = self._current_environment_fingerprint()
+        return fingerprint.to_dict() if fingerprint is not None else {}
 
     def _current_affordances(self):
         """App-level affordances the task environment currently offers.
@@ -3198,6 +3211,14 @@ class Context:
                     profile_layout.capability_proposal_queue_path
                 ),
                 outcome_store=JsonPluginOutcomeStore(profile_layout.plugin_outcomes_path),
+                # The approval-gated actor that actually disables a plugin. Without it the
+                # governor decided "quarantine" and nothing happened: trust dropped but the
+                # plugin kept serving, and the queue never advanced past PROBATION. Built
+                # from the live registry's self_management plugin, and left ``None`` only
+                # when that plugin is absent (an in-process CLI that composed no lifecycle
+                # surface) -- in which case quarantine records intent without executing it,
+                # which is the honest degradation rather than a silent no-op.
+                lifecycle_actor=self._plugin_lifecycle_actor(),
                 # The process ledger, hydrated from DuckDB -- not a fresh one. Letting
                 # the governor default to its own would give one process two divergent
                 # views of trust: the transitions it computed would land in a throwaway
@@ -3233,6 +3254,69 @@ class Context:
             return None
         return getattr(advisor, "_trust_ledger", None) if advisor is not None else None
 
+    def _plugin_lifecycle_actor(self):
+        """The approval-gated actor that executes governance decisions, or ``None``.
+
+        ``LifecycleGovernor`` decides *quarantine*; something has to carry it out, and
+        that something is the ``self_management`` plugin's approval-gated disable/remove
+        path. Without an actor the governor's decision was inert -- trust fell but the
+        plugin kept serving and the queue never advanced -- which is a wiring gap a unit
+        test cannot see because every unit test injects its own actor.
+
+        Returns ``None`` when the registry has no ``self_management`` plugin (an
+        in-process CLI that composed no lifecycle surface). That is honest degradation:
+        the governor still records the intended transition; it simply cannot execute it
+        until a runtime with the plugin is present.
+        """
+        try:
+            from leapflow.plugins import get_registry
+            from leapflow.plugins.adaptive_loop import SelfManagementLifecycleActor
+
+            return SelfManagementLifecycleActor.from_registry(get_registry())
+        except (ImportError, RuntimeError, AttributeError):
+            logger.debug("plugin lifecycle actor unavailable", exc_info=True)
+            return None
+
+    def _active_proposal_ids(self) -> dict:
+        """Map ``plugin_id -> proposal_id`` from the live lifecycle queue.
+
+        The sweep verifies an acquired plugin's effect and feeds the verdict to
+        ``LifecycleGovernor.record_outcome``, which keys the lifecycle record by
+        proposal id. The plugin only knows its own id, so this bridges the two: the
+        proposal sink stamped ``metadata.plugin_id`` on each queued item, so the map is
+        a read of the queue rather than a second bookkeeping structure that could drift.
+
+        Empty on any failure -- an unresolvable map degrades a governance outcome to an
+        untracked one, which is preferable to failing the cold-path sweep.
+        """
+        settings = getattr(self, "settings", None)
+        profile_layout = getattr(settings, "profile_layout", None)
+        if profile_layout is None:
+            return {}
+        try:
+            from leapflow.storage.capability_proposal_queue import (
+                JsonCapabilityProposalQueue,
+            )
+
+            queue = JsonCapabilityProposalQueue(
+                profile_layout.capability_proposal_queue_path
+            )
+            mapping: dict = {}
+            # ``active()`` returns items newest-first (sorted by updated/created), so the
+            # first mapping seen for a plugin is its most recent lifecycle record. Keep
+            # that one: a plugin can hold several active records (different capability,
+            # environment, or source), and governing the *newest* is what the sweep
+            # means by "this plugin's outcome". Overwriting unconditionally would leave
+            # the map pointing at the oldest record and update the wrong one.
+            for item in queue.active(limit=0):
+                plugin_id = str(dict(item.metadata).get("plugin_id") or "")
+                if plugin_id and plugin_id not in mapping:
+                    mapping[plugin_id] = item.proposal_id
+            return mapping
+        except (ImportError, AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            logger.debug("active proposal id map unavailable", exc_info=True)
+            return {}
+
     async def _run_coevolution_sweep(self):
         """Cold-path governance sweep: verify effects, drain quarantine, find residue.
 
@@ -3260,6 +3344,11 @@ class Context:
                 governor=self._resolve_lifecycle_governor(),
                 tracker=getattr(self, "_quarantine_tracker", None)
                 or current_quarantine_tracker(),
+                # plugin_id -> proposal_id, so a governance outcome updates the *right*
+                # lifecycle record rather than calling ``record_outcome`` with an empty
+                # proposal id (a silent no-op that left the queue frozen). Read from the
+                # queue's live items, whose ``metadata.plugin_id`` the proposal sink set.
+                proposal_ids=self._active_proposal_ids(),
             )
             # Facts are collected where they are produced -- the engine's resolution
             # path, the install tools, and the tool-outcome sink -- so the sweep reads
@@ -3350,15 +3439,51 @@ class Context:
                     if getattr(settings, "evolution_enabled", False)
                     else None
                 ),
+                # P5 authority in the production path: only an authorised requirement
+                # origin may drive an acquisition. Rebind-vs-acquire (whether an
+                # installed provider already covers the capability) is decided upstream
+                # by the teacher from failed-outcome hindsight and the alternatives it
+                # was shown -- a declared-fitness re-check here would re-introduce the
+                # semantic-regression blind spot -- so the driver adds authority only.
+                authorising_origins=tuple(
+                    getattr(settings, "evolution_authorising_origins", ()) or ()
+                ),
             )
             return await driver.drive(
                 trajectory,
                 goal,
+                environment=self._current_environment_fingerprint(),
                 workspace_root=str(getattr(settings, "workspace_root", "") or ""),
             )
         except (ImportError, AttributeError, OSError, RuntimeError, TypeError, ValueError):
             logger.debug("world-model evolution driver unavailable", exc_info=True)
             return None
+
+    async def run_learning_boundary(self, *, reason: str = "shutdown") -> dict[str, Any]:
+        """Run the learning boundary once and report what it did.
+
+        This is the only place capability evolution is driven from, so *when* it is
+        called decides when the framework can evolve at all. It used to be reachable
+        only from :meth:`cleanup`, which in daemon mode means process shutdown: a
+        daemon that ran for a week never evolved, one killed with SIGKILL never
+        evolved at all, and the single flush at the end mixed every session and every
+        workspace of that lifetime into one episode carrying the last user's goal.
+
+        Named and public so a semantic boundary can drive it -- a finished session,
+        or an explicit ``leap evolve`` -- instead of only the process dying.
+        ``reason`` is recorded rather than inspected: the pipeline does the same work
+        either way, and the label is what lets a reader tell a shutdown flush from a
+        session boundary from a hand-run one.
+        """
+        started = time.perf_counter()
+        before = len(self.prediction_loop.trajectory_buffer) if self.prediction_loop else 0
+        await self._on_session_end_learning()
+        return {
+            "ok": True,
+            "reason": reason,
+            "trajectory_steps": before,
+            "duration_s": round(time.perf_counter() - started, 3),
+        }
 
     async def _on_session_end_learning(self) -> None:
         """End-of-session OPD learning pipeline (8 phases) with full observability.
@@ -3390,6 +3515,7 @@ class Context:
             t0 = time.perf_counter()
             try:
                 trajectory, goal = self.prediction_loop.flush_trajectory()
+                phase_detail: dict[str, Any] = {}
                 if trajectory:
                     # The world model is the first driver of capability evolution:
                     # the same hindsight call that grades the episode also proposes
@@ -3404,26 +3530,29 @@ class Context:
                         )
                     if grades and self.replay_engine is not None:
                         self.replay_engine.set_replay_priorities(grades)
-                    phase_detail = {"actions_graded": len(grades) if grades else 0}
+                    phase_detail["actions_graded"] = len(grades) if grades else 0
                     if drive is not None:
                         phase_detail.update(drive.to_dict())
-                    # Cold-path governance sweep: effect verification, quarantine
-                    # drain, reclamation. Runs whether or not the teacher proposed
-                    # anything, so its no-op traces distinguish a quiet session from
-                    # a sweep that never ran.
-                    sweep = await self._run_coevolution_sweep()
-                    if sweep is not None:
-                        phase_detail.update(sweep.to_dict())
-                    observer.on_phase_success(
-                        "trajectory_grading", time.perf_counter() - t0, phase_detail,
-                    )
-                    phases_ok += 1
                 else:
-                    observer.on_phase_success(
-                        "trajectory_grading", time.perf_counter() - t0,
-                        {"actions_graded": 0, "note": "empty_trajectory"},
-                    )
-                    phases_ok += 1
+                    phase_detail.update({"actions_graded": 0, "note": "empty_trajectory"})
+                # Cold-path governance sweep: effect verification, quarantine drain,
+                # reclamation. Outside the trajectory branch, because its whole
+                # purpose is that its no-op traces distinguish a quiet session from a
+                # sweep that never ran -- and nested inside it, an empty trajectory
+                # skipped the sweep entirely and produced exactly the ambiguity it
+                # was written to remove. Three reachability segments read
+                # "no sweep trace observed" on a live board for that reason alone.
+                #
+                # Nothing here depends on the trajectory: the sweep reads the process
+                # observation buffer and the proposal queue, both of which carry work
+                # from turns that predate this boundary.
+                sweep = await self._run_coevolution_sweep()
+                if sweep is not None:
+                    phase_detail.update(sweep.to_dict())
+                observer.on_phase_success(
+                    "trajectory_grading", time.perf_counter() - t0, phase_detail,
+                )
+                phases_ok += 1
             except Exception as exc:
                 observer.on_phase_failure("trajectory_grading", exc, time.perf_counter() - t0)
                 phases_failed += 1
@@ -3776,7 +3905,7 @@ class Context:
             logger.debug("EventBus shutdown failed", exc_info=True)
         # OPD end-of-session learning pipeline
         if self.settings.replay_on_session_end:
-            await self._on_session_end_learning()
+            await self.run_learning_boundary(reason="shutdown")
         # Persist session summary before memory shutdown
         await self._persist_session_summary()
         # Shutdown all memory providers (stops GC, closes DB)

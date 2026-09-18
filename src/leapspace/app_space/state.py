@@ -1,17 +1,23 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Shared leapspace helpers: image presets, the state-dir convention, and
-task action loading."""
+"""In-box-safe leapspace helpers: the state-dir convention, atomic writes,
+the verdict ``check`` line, and task action loading.
+
+Split out from the former ``utils.py`` (EVO-02 LS-1). Everything here is
+stdlib-only and imports no host SDK, so the in-box verdict program
+(``action.py``'s ``expect()``), the pure state helpers, and the PyQt6 apps
+(``apps/_base``) are importable with ``cua_sandbox`` absent -- which is what
+lets a real app run headless (offscreen Qt) or a verdict run on any host.
+Host-only image construction lives in the sibling ``image.py``.
+"""
+
+from __future__ import annotations
 
 import importlib.util
 import os
 import platform
-import subprocess
-import tempfile
 from enum import Enum
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal
-
-from cua_sandbox import Image
 
 if TYPE_CHECKING:
     from leapspace.app_space.actor import LeapAppActor
@@ -41,7 +47,7 @@ def load_action(
     """Import a task's action.py once; return its (reference, expect) pair.
 
     Module-level imports are lint-guaranteed in-sandbox-safe (stdlib /
-    PyQt6 / leapspace) — a set the host import satisfies as well — and
+    PyQt6 / leapspace) -- a set the host import satisfies as well -- and
     exec_module honors the __main__ guard, so loading never triggers the
     verdict.
     """
@@ -81,13 +87,13 @@ def get_sandbox_state_dir(
     in_sandbox: bool,
     system: Literal["linux", "macos", "windows"] | None = None,
 ) -> PurePath:
-    """The apps' state root — the one path harness and apps must agree on.
+    """The apps' state root -- the one path harness and apps must agree on.
 
     Two consumers, two ways to know the sandbox OS: apps run inside and
     detect it with platform.system(); the harness runs on the host, where
     detection would answer the host's OS, so it names the sandbox's OS
     (an image preset's value) instead. Callers append the app_id. No env
-    override — hermetic tests monkeypatch this function.
+    override -- hermetic tests monkeypatch this function.
     """
     if in_sandbox:
         system = platform.system().lower()
@@ -124,63 +130,12 @@ PYQT_SYSTEM_LIBS = [
 # Repo checkout path inside the sandbox image.
 LINUX_LEAPFLOW_PATH = "/opt/leapflow"
 
-# Source tree inside the checkout — PYTHONPATH for interpreters outside the
+# Source tree inside the checkout -- PYTHONPATH for interpreters outside the
 # repo venv (the OS python's apt stack: pyatspi).
 LINUX_LEAPFLOW_SRC = f"{LINUX_LEAPFLOW_PATH}/src"
 
 # Host-side archive landing spot: copied into the image, untarred, removed.
 LEAPFLOW_ARCHIVE_DST = "/tmp/leapflow-checkout.tar.gz"
-
-
-def _archive_checkout() -> Path:
-    """Pack this checkout's committed state for the image to copy in.
-
-    The build VM reaches GitHub only through the host's flaky link, so the
-    repo travels as a host-built archive: no in-box clone, and the box runs
-    exactly the code under test (HEAD, not some remote ref).
-    """
-    repo_root = Path(__file__).resolve().parents[3]
-    fd, name = tempfile.mkstemp(suffix=".tar.gz")
-    os.close(fd)
-    result = subprocess.run(
-        ["git", "archive", "--format=tar.gz", "-o", name, "HEAD"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"git archive failed: {result.stderr.strip()}")
-    return Path(name)
-
-
-def get_image(image: LeapAppImage) -> Image:
-    """Return the preset image spec, rooted in an archive of this checkout.
-
-    Image is frozen and chainable — every mutation returns a new instance —
-    so callers get a fresh spec (and a fresh archive) per run. needrestart
-    is removed before apt: installing python3-dev upgrades service
-    libraries, and needrestart's service restarts SIGTERM the layer's own
-    command transport. Host feasibility: LINUX runs under local QEMU+KVM;
-    WINDOWS is untested; MACOS requires an Apple Silicon host (Lume).
-    """
-    archive = _archive_checkout()
-    if image == LeapAppImage.LINUX:
-        return (
-            Image.linux(distro="ubuntu", version="24.04", kind="vm")
-            .expose(CUA_MCP_PORT)
-            .run("sudo apt-get remove -y needrestart")
-            .apt_install("python3-pyatspi", "python3-dev", *PYQT_SYSTEM_LIBS, "git", "make")
-            .pip_install("PyQt6", "uv")
-            .copy(str(archive), LEAPFLOW_ARCHIVE_DST)
-            .run(
-                f"mkdir -p {LINUX_LEAPFLOW_PATH} && "
-                f"tar xzf {LEAPFLOW_ARCHIVE_DST} -C {LINUX_LEAPFLOW_PATH} && "
-                f"rm {LEAPFLOW_ARCHIVE_DST}"
-            )
-            .run(f"cd {LINUX_LEAPFLOW_PATH} && make space-sync")
-        )
-    else:
-        raise NotImplementedError(f"image preset not defined for {image}")
 
 
 def get_image_venv_python(system: Literal["linux", "macos", "windows"]) -> str:

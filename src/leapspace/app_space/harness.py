@@ -29,9 +29,9 @@ from leapspace.app_space.signal import (
     RECORD_START_FILE,
     RECORD_STOP_FILE,
 )
-from leapspace.app_space.utils import (
+from leapspace.app_space.image import get_image
+from leapspace.app_space.state import (
     LeapAppImage,
-    get_image,
     get_image_venv_python,
     get_sandbox_state_dir,
     load_action,

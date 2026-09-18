@@ -76,7 +76,17 @@ def _index_html(index: Path) -> str:
     return _ASSET_VERSION_RE.sub(rf"\1?v={_asset_version()}", index.read_text(encoding="utf-8"))
 
 
-_MONITOR_EVENTS = frozenset({EVENT_FINDING, EVENT_WATCH_STATE, EVENT_ERROR, EVENT_HEARTBEAT, "signal.stream"})
+_MONITOR_EVENTS = frozenset({
+    EVENT_FINDING,
+    EVENT_WATCH_STATE,
+    EVENT_ERROR,
+    EVENT_HEARTBEAT,
+    "signal.stream",
+    # Presentation-only increment for the hidden evolution_live lens. The daemon
+    # publishes it after buffering the trace and from the event loop, never inline
+    # with a registry/trust mutation.
+    "evolution.presentation",
+})
 # Only these RPCs may be triggered by browser actions (least privilege).
 #
 # The hardware entries are read-or-request only, and that boundary is the whole point.

@@ -1,0 +1,58 @@
+# Presentation-only live evolution lens for demonstrations and audits.
+#
+# The initial view binds the existing framework_evolution snapshot. Browser-side
+# increments may append display events, but every reconnect resynchronizes from this
+# immutable producer payload. No node declares an action.
+#
+# There is deliberately no metric row here. One used to sit above the lanes
+# repeating Episodes, Pipeline evidence, Unadmitted intents and Regressions --
+# four of the six figures the live renderer already draws, forty pixels below and
+# with no way to tell which of the two could move. The renderer owns the strip
+# because only it knows which figures a live event can advance and which wait for
+# the next producer cycle, and it labels them accordingly. Page-level freshness is
+# carried by the provenance bar, above every lens.
+template: evolution_live
+version: 1
+hidden: true
+title: "Evolution live"
+domain: framework_evolution
+meta:
+  title: "Evolution live"
+  description: "Read-only event lanes for environment, decision, and governance evidence."
+layout:
+  - type: Page
+    props:
+      title: "Evolution live"
+    children:
+      - type: Section
+        props:
+          title: "Live event lanes"
+          subtitle: "Presentation-only trace projection. Reconnect resynchronizes from the current evolution snapshot."
+        children:
+          - type: Custom
+            props:
+              render: evolutionLive
+              bind: evolution
+              max_events: 60
+      - type: Section
+        when: evolution.mutation_matrix
+        props:
+          title: "Counterfactual / mutation matrix"
+          subtitle: "Latest durable episode projection; rows do not imply an unrecorded install or approval."
+        children:
+          - type: Table
+            props:
+              bind: evolution.mutation_matrix
+              columns:
+                - key: driver
+                  label: "Trigger"
+                - key: capability
+                  label: "Capability"
+                - key: policy_action
+                  label: "Decision"
+                - key: mutation_action
+                  label: "Mutation"
+                - key: verification_tier
+                  label: "Evidence tier"
+                - key: gap_closure
+                  label: "Gap closure"

@@ -191,11 +191,37 @@ class _Teacher:
 
 
 class _Intake:
+    """Stands in for ``CapabilityObservationService``.
+
+    ``requirements`` derives a need for whatever was just observed, because that is what
+    a real store does: the driver asks at ``min_count=1``, so the observation written a
+    moment earlier already clears the threshold. A stub that returned nothing here would
+    quietly assert the opposite of the shipped contract -- that the driver queues an
+    acquisition the detector never turned into a requirement -- and the driver now
+    records that case as a ``requirement_not_derived`` no-op instead of acting on it.
+    """
+
+    def __init__(self) -> None:
+        self.observed: list[str] = []
+
     def observe_result(self, result, **kwargs):
+        capability = str((result or {}).get("capability") or "")
+        if capability:
+            self.observed.append(capability)
         return {"observation_id": "o1"}
 
     def requirements(self, *, min_count: int = 1, limit: int = 50):
-        return ()
+        from leapflow.domain.capability_requirement import CapabilityRequirement
+
+        return tuple(
+            CapabilityRequirement.create(
+                capability,
+                "world_model",
+                max_risk_level="read_only",
+                requirement_id=f"req-{capability}",
+            )
+            for capability in dict.fromkeys(self.observed)
+        )
 
 
 def _drive(verdicts, sink=None):

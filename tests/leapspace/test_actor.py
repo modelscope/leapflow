@@ -13,7 +13,7 @@ from leapspace.app_space.actor import (
     element_center,
     find_ax_element,
 )
-from leapspace.app_space.utils import get_image_venv_python
+from leapspace.app_space.state import get_image_venv_python
 
 VENV_PYTHON = get_image_venv_python("linux")
 SYSTEM_PYTHON = "/usr/bin/python3"

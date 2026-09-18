@@ -286,6 +286,16 @@ def main(argv: list[str] | None = None) -> int:
     dashboard_parser.add_argument("--bind", default="", help="Override the dashboard bind address")
     dashboard_parser.add_argument("--no-open", action="store_true", help="Print the URL instead of opening a browser")
 
+    # leap evolve (run the learning boundary now)
+    evolve_parser = subparsers.add_parser(
+        "evolve", help="Run the learning boundary now and report what it did"
+    )
+    evolve_parser.add_argument(
+        "--reason", default="manual",
+        help="Label recorded with this run (default: manual)",
+    )
+    evolve_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
     # leap hw (hardware inspection and direct intervention)
     hw_parser = subparsers.add_parser("hw", help="Inspect hardware and intervene in it directly")
     hw_sub = hw_parser.add_subparsers(dest="hw_action")
@@ -359,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Pre-parse: detect if first non-flag arg is a known subcommand ──
     # If not, treat everything non-flag as a chat prompt.
-    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon", "config", "board", "hw"}
+    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon", "config", "board", "hw", "evolve"}
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
 
     # Find first non-flag argument, skipping values owned by global options.
@@ -458,6 +468,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "board":
         from leapflow.cli.commands.dashboard import cmd_dashboard
         return cmd_dashboard(args)
+
+    # Evolve routes to leapd, which owns the context holding the trajectory buffer.
+    # Running it in this process would build a second, empty context and grade
+    # nothing, so no Context is initialized here either.
+    if args.command == "evolve":
+        from leapflow.cli.commands.evolve import cmd_evolve
+        return cmd_evolve(args)
 
     # Hardware inspection/intervention: reads run in-process, pause/resume route
     # to leapd over RPC. No engine Context is needed either way.

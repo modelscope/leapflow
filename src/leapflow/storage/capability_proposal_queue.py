@@ -115,7 +115,7 @@ class JsonCapabilityProposalQueue:
     ) -> CapabilityProposalItem:
         """Create or return an active proposal for the requirement/environment pair."""
         req_payload = tuple(_requirement_dict(item) for item in requirements)
-        proposal_id = self._proposal_id(req_payload, environment or {}, observation_ids)
+        proposal_id = self._proposal_id(req_payload, environment or {})
         existing = self.get(proposal_id)
         if existing is not None and existing.status in _ACTIVE_STATUSES:
             return existing
@@ -203,9 +203,11 @@ class JsonCapabilityProposalQueue:
         return items if limit <= 0 else items[:limit]
 
     def active(self, *, limit: int = 50) -> list[CapabilityProposalItem]:
-        return [item for item in self.list_items(limit=0) if item.status in _ACTIVE_STATUSES][
-            :limit
-        ]
+        # ``limit <= 0`` means "all", matching ``list_items``. Slicing ``[:limit]``
+        # unconditionally made ``active(limit=0)`` return an empty list -- the opposite
+        # of "no cap" -- which silently emptied any caller that asked for the full set.
+        items = [item for item in self.list_items(limit=0) if item.status in _ACTIVE_STATUSES]
+        return items if limit <= 0 else items[:limit]
 
     def _upsert(self, item: CapabilityProposalItem) -> None:
         payload = self._load_payload()
@@ -219,16 +221,40 @@ class JsonCapabilityProposalQueue:
         self,
         requirements: Sequence[Mapping[str, Any]],
         environment: Mapping[str, Any],
-        observation_ids: Sequence[str],
     ) -> str:
+        """A content id over *stable identity only*, so dedup survives rewording.
+
+        Hashing the whole requirement payload made the id a function of the free-text
+        ``evidence`` (the world model's hypothesis) and its metadata, so the same
+        capability re-proposed with different wording every session minted a fresh id
+        and the queue filled with duplicates -- the health of the queue then measured
+        how long the process had run rather than how many real gaps existed. Identity is
+        what a requirement *is* (its id, capability, origin, risk ceiling and platform
+        needs) plus the environment fingerprint it was raised in; the prose that
+        justifies it is not identity. ``observation_ids`` are carried on the item for
+        the causal ledger but deliberately excluded here: two profiles observing the
+        same gap mint different observation ids, and folding those into identity would
+        defeat dedup for the very case it exists to collapse.
+        """
+        identity = [
+            {
+                "requirement_id": str(item.get("requirement_id") or ""),
+                "capability": str(item.get("capability") or ""),
+                "origin": str(item.get("origin") or ""),
+                "max_risk_level": str(item.get("max_risk_level") or ""),
+                "required_platform_capabilities": sorted(
+                    str(cap) for cap in (item.get("required_platform_capabilities") or [])
+                ),
+            }
+            for item in requirements
+        ]
         material = {
-            "requirements": [dict(item) for item in requirements],
+            "identity": identity,
             "environment": {
                 "fingerprint_id": environment.get("fingerprint_id", ""),
                 "platform_capabilities": environment.get("platform_capabilities", []),
                 "workspace_markers": environment.get("workspace_markers", []),
             },
-            "observation_ids": sorted(str(item) for item in observation_ids),
         }
         text = json.dumps(material, sort_keys=True, ensure_ascii=False, default=str)
         import hashlib
