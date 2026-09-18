@@ -559,6 +559,12 @@ def test_evolution_template_binds_only_shapes_its_renderers_read():
         "evolution.reclaim_candidates",
         "evolution.reward_bandwidth.by_reason",
         "evolution.summary.suggestions",
+        # Not this producer's: derived by the view service from the retained finding
+        # list, which is the only thing carrying history across daemon restarts. It
+        # is deliberately outside the ``evolution.*`` namespace so that ownership is
+        # readable from the bind alone, and listed here because this assertion checks
+        # every bind in the template rather than only the producer's own.
+        "evidence_trend.series",
     }
     #: Every shipped renderer that coerces ``props.data`` with ``asArray``.
     DATA_LIST_COMPONENTS = (

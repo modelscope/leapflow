@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Tuple
 
@@ -29,6 +30,12 @@ from leapflow.llm.message_builder import build_system_message, build_user_messag
 from leapflow.world_model._json_utils import extract_json_object
 
 logger = logging.getLogger(__name__)
+
+# Trajectory buffer ceiling. Sized for a long working session rather than a single
+# task: the teacher grades the whole arc, so cutting it too fine would hide the
+# early steps that explain a late failure. It exists to stop a long-lived daemon
+# growing without bound, not to scope one episode -- the learning boundary does that.
+_MAX_TRAJECTORY_STEPS = 2000
 
 _PREDICT_PROMPT = """\
 Given the current state:
@@ -130,7 +137,14 @@ class PredictionLoop:
         self._failure_advantage = failure_advantage
         self._on_outcome = on_prediction_outcome
         self._hardware_learning_enabled = hardware_learning_enabled
-        self._trajectory_buffer: list[dict] = []
+        # Bounded, because the only thing that drains it is the learning boundary and
+        # in daemon mode that used to be process shutdown: an unbounded list then
+        # accumulated every turn of every session for the daemon's whole lifetime.
+        # A deque discards oldest-first, which is the right end to lose -- the
+        # teacher grades with hindsight, so the most recent steps carry the most
+        # signal, and a truncated tail is far better than unbounded growth in a
+        # long-lived process.
+        self._trajectory_buffer: deque[dict] = deque(maxlen=_MAX_TRAJECTORY_STEPS)
         self._last_goal: str = ""
         self._pending_pre_snapshot: Any = None
 

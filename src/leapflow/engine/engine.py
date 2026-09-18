@@ -5703,7 +5703,12 @@ class AgentEngine:
                 registry_version_after=registry.version,
                 mutation={
                     "action": "observe",
-                    "error_type": "unknown_tool",
+                    # The real evidence kind, not a hardcoded literal. Stamping every
+                    # observation as "unknown_tool" made the causal ledger classify a
+                    # world-model or environment-driven episode as an unknown-tool one,
+                    # so the driver attribution on the board was wrong for exactly the
+                    # episodes self-evolution cares about.
+                    "error_type": str(result.get("error_type") or "unknown_tool"),
                     "observation_id": (observation_record or {}).get("observation_id", ""),
                 },
             )

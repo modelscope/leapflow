@@ -522,6 +522,10 @@ class DaemonClient:
         """Ensure a session-analysis watch and run one analysis cycle now."""
         return dict(await self.request("session.analyze") or {})
 
+    async def evolution_run(self, reason: str = "manual") -> dict[str, Any]:
+        """Run the learning boundary in the daemon now."""
+        return dict(await self.request("evolution.run", {"reason": reason}) or {})
+
     async def signal_record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Inject a signal event into the daemon's EventBus."""
         return dict(await self.request(

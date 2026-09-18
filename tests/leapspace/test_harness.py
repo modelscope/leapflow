@@ -24,7 +24,7 @@ from leapspace.app_space.signal import (
     RECORD_START_FILE,
     RECORD_STOP_FILE,
 )
-from leapspace.app_space.utils import LeapAppImage, get_image_venv_python
+from leapspace.app_space.state import LeapAppImage, get_image_venv_python
 
 PYTHON = get_image_venv_python("linux")
 

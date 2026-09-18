@@ -233,9 +233,40 @@ button, .btn {
 }
 button:hover { border-color: var(--accent); color: var(--accent); }
 
-/* ── Prose fallback ──────────────────────────────────────────────────────── */
+/* ── Prose ───────────────────────────────────────────────────────────────── */
 .md { white-space: pre-wrap; }
 .prose { line-height: 1.55; color: var(--ink); }
+/* The Markdown renderer emits blocks, so pre-wrap has to be released here or the
+   folded-scalar indentation the YAML carried would reappear as leading gaps. */
+.md.prose { white-space: normal; }
+.md.prose > p { margin: 0 0 7px; }
+.md.prose > p:last-child, .md.prose > blockquote:last-child { margin-bottom: 0; }
+.md.prose > blockquote + p { margin-top: 7px; }
+.md.prose > .quote { margin: 0 0 7px; }
+.md.prose code, .evolution-live-lane code, .data-table code {
+  padding: 0 3px; background: var(--panel-2); font: 0.92em/1.4 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+/* ── Provenance bar (page-level freshness) ───────────────────────────────── */
+/* Above the rendered tree and on every lens: it describes the whole page, so it
+   must not compete with a section heading or be mistaken for one. Muted and thin
+   while the page is current; only the stale verdict earns colour. */
+.provenance {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px;
+  margin: 0 0 12px; padding: 5px 0 6px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted); font-size: 0.79rem; letter-spacing: .02em;
+  font-variant-numeric: tabular-nums;
+}
+.provenance.is-stale { border-bottom-color: var(--alert); }
+.provenance-stale { color: var(--alert); font-weight: 650; }
+/* Sized down to the bar it lives in: this is a utility, not the page's action. */
+.provenance-refresh {
+  margin-inline-start: auto; padding: 2px 9px;
+  font-size: 0.76rem; color: var(--muted);
+}
+.provenance-refresh:disabled { color: var(--line); cursor: default; border-color: var(--line); }
 
 /* ── Toasts ──────────────────────────────────────────────────────────────── */
 .toasts { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; }
@@ -370,3 +401,50 @@ button:hover { border-color: var(--accent); color: var(--accent); }
   border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
   background: rgba(23, 24, 28, .015);
 }
+
+/* ── Evolution live (presentation-only event lanes) ──────────────────────── */
+.evolution-live { display: flex; flex-direction: column; gap: 10px; }
+/* metric-strip supplies borders only; the custom live renderer owns its layout. */
+.evolution-live-metrics { display: flex; flex-wrap: wrap; margin-bottom: 0; }
+/* Provenance is carried in the label, not the number: a snapshot-derived metric
+   gets a dotted underline so a reader can see at a glance which figures a live
+   event can move and which wait for the next producer cycle. */
+.evolution-live-metrics .prov-snapshot .label {
+  text-decoration: underline dotted var(--line); text-underline-offset: 3px;
+}
+.evolution-live-metrics .prov-live .label { color: var(--accent); }
+.drift-note {
+  padding: 5px 9px; border-inline-start: 2px solid var(--notable);
+  background: var(--panel-2); color: var(--muted); font-size: .82rem;
+}
+/* Equal-height lanes: stretch is the grid default, but the fixed min-height meant
+   an empty lane stayed short and the row read as ragged. align-items keeps the
+   three columns level while the content decides how tall the row is. */
+.evolution-live-lanes {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: stretch; gap: 9px;
+}
+.evolution-live-lane {
+  display: flex; flex-direction: column; min-width: 0; min-height: 132px;
+  padding: 9px; border: 1px solid var(--line); background: var(--panel);
+}
+/* The hint sits at the bottom of an otherwise empty lane, so the three lanes read
+   as one row of equal cards rather than three differently-filled boxes. */
+.evolution-live-lane .lane-hint {
+  margin-top: auto; padding-top: 7px; color: var(--muted); font-size: .78rem;
+  line-height: 1.4; border-top: 1px dashed var(--line);
+}
+.evolution-live-lane.environment { border-top: 3px solid var(--info); }
+.evolution-live-lane.decision { border-top: 3px solid var(--notable); }
+.evolution-live-lane.governance { border-top: 3px solid var(--accent); }
+.evolution-live-event { display: grid; grid-template-columns: max-content 1fr; gap: 2px 7px; width: 100%; margin-top: 6px; padding: 5px 0 5px 8px; border: 0; border-left: 2px solid var(--line); text-align: left; background: transparent; }
+.evolution-live-event:hover { border-left-color: var(--accent); color: inherit; }
+.evolution-live-event.sev-alert { border-left-color: var(--alert); }
+.evolution-live-event.sev-notable { border-left-color: var(--notable); }
+.evolution-live-event.sev-info { border-left-color: var(--info); }
+.evolution-live-time { grid-row: span 2; color: var(--muted); font-size: .76rem; font-variant-numeric: tabular-nums; }
+.evolution-live-kind { font-weight: 650; font-size: .84rem; overflow-wrap: anywhere; }
+.evolution-live-summary { grid-column: 2; color: var(--muted); font-size: .82rem; overflow-wrap: anywhere; }
+.evolution-live-drawer { min-height: 76px; }
+.evolution-live-json { margin: 7px 0 0; padding: 7px; overflow: auto; border-top: 1px solid var(--line); background: var(--panel-2); color: var(--muted); font: .76rem/1.45 var(--mono); }
+@media (max-width: 900px) { .evolution-live-lanes { grid-template-columns: 1fr; } }

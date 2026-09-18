@@ -936,6 +936,23 @@ class RuntimeLeapService:
     async def session_analyze(self) -> dict[str, Any]:
         return await self._session_coordinator.analyze(self._monitors, self._ctx, self._settings)
 
+    async def evolution_run(self, reason: str = "manual") -> dict[str, Any]:
+        """Drive the learning boundary in the daemon's context, now.
+
+        The daemon owns the context that holds the trajectory buffer, the world-model
+        teacher and the proposal queue, so this has to run here rather than in the
+        calling CLI process -- a second context would grade an empty buffer and
+        report success having done nothing.
+        """
+        ctx = self._ctx
+        if ctx is None:
+            return {"ok": False, "error": "daemon context unavailable"}
+        try:
+            return await ctx.run_learning_boundary(reason=str(reason or "manual"))
+        except Exception as exc:  # noqa: BLE001 - reported to the caller, never fatal
+            logger.warning("daemon: learning boundary failed: %s", exc, exc_info=True)
+            return {"ok": False, "error": str(exc), "reason": str(reason or "manual")}
+
     def _ensure_session_registry(self, base_engine: Any) -> Any:
         return self._session_coordinator.ensure_registry(base_engine, self._settings)
 

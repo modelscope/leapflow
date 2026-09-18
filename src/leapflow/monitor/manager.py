@@ -356,6 +356,13 @@ class MonitorManager:
         Bypasses the tick timer while reusing the same producer -> persist ->
         push path, so a user-triggered refresh is identical to a scheduled one.
         ``force=True`` signals producers to re-analyze even without new input.
+
+        Run bookkeeping is applied here because it is the scheduler that normally
+        does it, and this path deliberately skips the scheduler. Without it a manual
+        refresh left no trace at all: findings dedup on content, so a cycle that
+        confirmed "nothing changed" wrote nothing and advanced nothing, and the board
+        could not tell a refresh that ran from one that never happened -- which is
+        precisely what a reader presses refresh to find out.
         """
         task = self._task_store.load(watch_id)
         if task is None or not _is_watch(task):
@@ -364,7 +371,15 @@ class MonitorManager:
         params.setdefault("watch_id", task.task_id)
         if force:
             params["_force"] = True
-        return await self._executor.execute(task.skill_name, params)
+        result = await self._executor.execute(task.skill_name, params)
+        # After the cycle, not before: ``last_run_at`` means "a cycle completed",
+        # and a producer that raised did not complete one.
+        if isinstance(result, dict) and result.get("ok"):
+            try:
+                self._task_store.increment_run_count(task.task_id)
+            except Exception:  # noqa: BLE001 - bookkeeping must not fail the refresh
+                logger.debug("monitor: run bookkeeping failed for %s", watch_id, exc_info=True)
+        return result
 
     def schedule_watch_once(self, watch_id: str, *, force: bool = False) -> None:
         """Fire one observation cycle in the background (non-blocking).
@@ -398,6 +413,7 @@ class MonitorManager:
     def _to_view(self, task: ArmedTask) -> WatchView:
         meta = task.metadata if isinstance(task.metadata, dict) else {}
         params = task.parameters if isinstance(task.parameters, dict) else {}
+        cfg = task.trigger_config if isinstance(task.trigger_config, dict) else {}
         return WatchView(
             watch_id=task.task_id,
             name=str(params.get("name") or task.task_id[:8]),
@@ -410,6 +426,15 @@ class MonitorManager:
             last_run_at=task.last_run_at,
             finding_count=self._finding_store.count(watch_id=task.task_id),
             client_coupled=bool(meta.get(METADATA_CLIENT_COUPLED_KEY, False)),
+            # Only an interval trigger has one. Left at 0.0 for event, cron and
+            # condition watches, which the board reads as "no cadence to judge
+            # against" and so withholds a staleness verdict rather than inventing
+            # an interval for a watch that does not have one.
+            interval_seconds=(
+                float(cfg.get("interval_seconds", 0) or 0)
+                if task.trigger_type == "interval"
+                else 0.0
+            ),
         )
 
     def _emit_state(self, task: ArmedTask) -> None:

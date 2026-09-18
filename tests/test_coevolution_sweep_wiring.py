@@ -245,6 +245,18 @@ class _Ctx:
 
         return Context._resolve_lifecycle_governor(self)
 
+    def _active_proposal_ids(self):
+        """Bound because the production hook maps plugin_id -> proposal_id through it.
+
+        The sweep now feeds ``LifecycleGovernor.record_outcome`` a proposal id keyed off
+        the live queue, so the real hook calls this. With no profile layout on the double
+        it degrades to an empty map -- the honest 'no queued proposals' state -- and the
+        assertions still run the real ``_run_coevolution_sweep`` body.
+        """
+        from leapflow.cli.context import Context
+
+        return Context._active_proposal_ids(self)
+
 
 def test_production_sweep_hook_builds_and_runs_a_real_sweep():
     """Drives `_run_coevolution_sweep` itself, not a hand-made CoevolutionSweep.
@@ -303,6 +315,44 @@ def test_production_hook_uses_the_shared_process_tracker():
     finally:
         install_observations(None)
         _teardown()
+
+
+def test_active_proposal_ids_targets_the_newest_record_for_a_plugin(tmp_path):
+    """One plugin, several active records: governance must target the newest.
+
+    ``active()`` is newest-first, so a naive overwrite would leave the map pointing at
+    the *oldest* record and ``record_outcome`` would update the wrong lifecycle entry.
+    A plugin can legitimately hold several active records (different capability,
+    environment, or source), so this is a reachable case, not a corner one.
+    """
+    from types import SimpleNamespace
+
+    from leapflow.cli.context import Context
+    from leapflow.domain.capability_requirement import CapabilityRequirement
+    from leapflow.layout import ProfileLayout
+    from leapflow.storage.capability_proposal_queue import JsonCapabilityProposalQueue
+
+    layout = ProfileLayout(root=tmp_path / "profile", profile_id="p")
+    layout.root.mkdir(parents=True, exist_ok=True)
+    queue = JsonCapabilityProposalQueue(layout.capability_proposal_queue_path)
+    queue.enqueue(
+        requirements=(
+            CapabilityRequirement.create("chat.reply", "world_model", requirement_id="req-a"),
+        ),
+        metadata={"plugin_id": "shared_plugin"},
+    )
+    newer = queue.enqueue(
+        requirements=(
+            CapabilityRequirement.create("chat.send", "world_model", requirement_id="req-b"),
+        ),
+        metadata={"plugin_id": "shared_plugin"},
+    )
+    # Bump the second record so it is unambiguously the most recently touched.
+    queue.update(newer.proposal_id, status="GENERATED")
+
+    ctx = _Ctx(settings=SimpleNamespace(profile_layout=layout))
+    mapping = Context._active_proposal_ids(ctx)
+    assert mapping["shared_plugin"] == newer.proposal_id
 
 
 def test_production_hook_survives_a_broken_collaborator():

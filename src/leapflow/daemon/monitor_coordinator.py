@@ -69,6 +69,9 @@ class MonitorCoordinator:
             from leapflow.monitor.signal_producer import SignalObservationProducer
 
             bus = notification_bus
+            # The evolution publisher captures this before the trace sink is installed.
+            # It schedules display fan-out on the event loop, never on a probe site.
+            self._notification_bus = bus
             self._monitors = MonitorManager(
                 holder=ctx._db_holder,
                 emit=lambda event_type, payload: bus.emit_event(event_type, **payload),
@@ -178,6 +181,8 @@ class MonitorCoordinator:
         except RuntimeError:
             return None
 
+        notification_bus = self._notification_bus
+
         def _publish(trace: Any) -> None:
             detail = dict(getattr(trace, "detail", None) or {})
             if detail.get("phase") == "composition":
@@ -189,10 +194,22 @@ class MonitorCoordinator:
                 "correlation": dict(getattr(trace, "correlation", None) or {}),
             }
             event_type = f"evolution.{payload['kind'] or 'trace'}"
+
+            def _dispatch() -> None:
+                asyncio.ensure_future(bus.handle_event(event_type, payload))
+                if notification_bus is not None:
+                    try:
+                        from leapflow.telemetry.evolution_presentation import EvolutionPresentationEvent
+
+                        presentation = EvolutionPresentationEvent.from_trace(trace).to_dict()
+                        notification_bus.emit(Notification(
+                            event_type="evolution.presentation", payload=presentation,
+                        ))
+                    except Exception:  # noqa: BLE001 - display fan-out must stay best-effort
+                        logger.debug("daemon: evolution presentation not published", exc_info=True)
+
             try:
-                loop.call_soon_threadsafe(
-                    lambda: asyncio.ensure_future(bus.handle_event(event_type, payload))
-                )
+                loop.call_soon_threadsafe(_dispatch)
             except RuntimeError:
                 # Loop already closed (shutdown). The trace is still buffered and
                 # will be flushed by the atexit hook; only the live refresh is lost.

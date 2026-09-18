@@ -526,6 +526,46 @@ def test_composition_traces_are_not_published_as_events():
     assert seen == ["evolution.registry_plugin_registered"]
 
 
+def test_runtime_trace_publishes_a_presentation_only_notification():
+    import asyncio
+
+    from leapflow.daemon.monitor_coordinator import MonitorCoordinator
+
+    seen_events: list[str] = []
+    presentation: list[object] = []
+
+    class _EventBus:
+        async def handle_event(self, event_type, payload):
+            seen_events.append(event_type)
+
+    class _NotificationBus:
+        def emit(self, notification):
+            presentation.append(notification)
+
+    async def _drive():
+        coordinator = MonitorCoordinator()
+        coordinator._notification_bus = _NotificationBus()
+        publisher = coordinator._make_evolution_publisher(SimpleNamespace(event_bus=_EventBus()))
+        assert publisher is not None
+        publisher(EvolutionTrace(
+            stage=EvolutionStage.DECIDE,
+            kind="policy_decision",
+            trace_id="trace-live",
+            detail={"phase": "runtime", "unbounded": "must not be displayed"},
+            correlation={"record_id": "record-live"},
+        ))
+        await asyncio.sleep(0.05)
+
+    asyncio.run(_drive())
+
+    assert seen_events == ["evolution.policy_decision"]
+    assert len(presentation) == 1
+    notification = presentation[0]
+    assert notification.event_type == "evolution.presentation"
+    assert notification.payload["episode_id"] == "record-live"
+    assert "unbounded" not in notification.payload
+
+
 def test_the_publisher_is_absent_rather_than_broken_without_a_bus():
     """No event bus is a normal state (in-process CLI), not a failure to report."""
     from leapflow.daemon.monitor_coordinator import MonitorCoordinator

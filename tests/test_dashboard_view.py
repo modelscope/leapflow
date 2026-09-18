@@ -149,7 +149,43 @@ async def test_builder_exposes_template_switcher_meta() -> None:
     assert "finance" not in spec["meta"]["templates"]
     assert "research" not in spec["meta"]["templates"]
     assert "sentiment" not in spec["meta"]["templates"]
-    assert {"finance", "research", "sentiment"}.issubset(set(spec["meta"]["hidden_templates"]))
+    assert {"causal_trace", "evolution_live", "finance", "research", "sentiment"}.issubset(
+        set(spec["meta"]["hidden_templates"])
+    )
+
+
+def test_causal_trace_is_hidden_but_renderable_as_a_read_only_lens() -> None:
+    spec = _build(_evolution_provider(), template="causal_trace")
+
+    assert spec["meta"]["active_template"] == "causal_trace"
+    assert "causal_trace" not in spec["meta"]["templates"]
+    assert "causal_trace" in spec["meta"]["hidden_templates"]
+    assert {"Page", "Grid"}.issubset({node["type"] for node in _flatten(spec)})
+    assert not [node for node in _flatten(spec) if "action" in node]
+
+
+def test_evolution_live_is_hidden_and_binds_the_authoritative_snapshot() -> None:
+    provider = _evolution_provider()
+    provider._findings[0]["payload"].update({
+        "traces": [{"trace_id": "t-1", "stage": "observe", "kind": "interface_drift", "ts": 1.0}],
+        "summary": {
+            "episode_count": 1,
+            "segments_with_evidence": 2,
+            "segments_total": 4,
+            "unadmitted_intent_count": 0,
+            "regression_count": 0,
+        },
+    })
+
+    spec = _build(provider, template="evolution_live")
+    custom = [node for node in _flatten(spec) if node["type"] == "Custom"]
+
+    assert spec["meta"]["active_template"] == "evolution_live"
+    assert "evolution_live" not in spec["meta"]["templates"]
+    assert "evolution_live" in spec["meta"]["hidden_templates"]
+    assert custom[0]["props"]["render"] == "evolutionLive"
+    assert custom[0]["props"]["data"]["traces"][0]["kind"] == "interface_drift"
+    assert not [node for node in _flatten(spec) if "action" in node]
 
 
 async def test_builder_signals_template_renders_dense_operational_layout() -> None:
@@ -243,6 +279,22 @@ async def test_view_hub_backpressure_drops_when_full() -> None:
     assert hub.broadcast({"n": 2}) == 0  # queue full -> dropped, not blocked
     await hub.shutdown()
     assert hub.subscriber_count == 0
+
+
+async def test_view_hub_requests_snapshot_resync_after_a_drop() -> None:
+    hub = ViewHub(maxsize=1)
+    queue = hub.subscribe("slow")
+    assert hub.broadcast({"n": 1}) == 1
+    assert hub.broadcast({"n": 2}) == 0
+    assert (await queue.get())["n"] == 1
+
+    # The first delivery after capacity returns is the resync instruction. The
+    # dropped current increment is intentionally not replayed; fetchView() is the
+    # authoritative recovery path.
+    assert hub.broadcast({"n": 3}) == 0
+    assert (await queue.get())["type"] == "view.resync"
+    assert hub.broadcast({"n": 4}) == 1
+    assert (await queue.get())["n"] == 4
 
 
 # ── An empty hardware board must say why ────────────────────────────────────

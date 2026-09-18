@@ -138,8 +138,17 @@ class OpenAIChat(LLMProvider):
             write=30.0,
             pool=30.0,
         )
-        self._sync = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
-        self._async = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        # ``max_retries=0`` is load-bearing: the SDK retries twice by default, and this
+        # class already owns a retry policy with backoff. Leaving the SDK's default in
+        # place multiplies them -- effective attempts become ``max_retries * 3`` and a
+        # hard timeout blocks for three times the configured budget before surfacing,
+        # which breaks the turn-level deadline and recovery-budget accounting that
+        # assume ``timeout_s`` bounds one attempt. Measured: a 45s timeout failed after
+        # 137s. One retry owner, and it is this class.
+        self._sync = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0)
+        self._async = AsyncOpenAI(
+            api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0
+        )
         self._model = model
         self._max_retries = max(1, int(max_retries))
         self._base_url = base_url

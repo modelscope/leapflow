@@ -121,6 +121,13 @@ NO_EVIDENCE = "no_evidence"
 UNVERIFIABLE = "unverifiable"
 NOT_ADMITTED = "not_admitted"
 
+# Acquisition-lifecycle states a record is *created* in. Anything else is proof
+# that something read the queue back and advanced it, which is what distinguishes a
+# governed queue from a write-only one. Kept as a set of entry states rather than a
+# list of advanced ones so a new terminal state cannot silently read as "not yet
+# governed" (see storage.capability_proposal_queue.ProposalStatus).
+_LIFECYCLE_ENTRY_STATES = frozenset({"PENDING", "UNKNOWN", ""})
+
 
 class EvolutionProducer:
     """Emit one framework-evolution snapshot per cycle."""
@@ -993,7 +1000,19 @@ class EvolutionProducer:
         )
 
     def _segment_lifecycle(self) -> dict[str, Any]:
-        """Whether the trust/probation/quarantine tier has anything to govern."""
+        """Whether the trust/probation/quarantine tier is actually governing.
+
+        A non-empty queue used to be reported ``wired``, which read as the healthy
+        class beside a genuinely healthy ``Trust accrual``. On a real profile that
+        was 212 records, every one of them ``PENDING``, none carrying a policy
+        decision or install result, all of them written by ``plugin_propose`` and
+        nothing draining them: a monotonically growing dead end presented as a
+        working segment.
+
+        So the evidence is a *transition*, not a row count. Records existing prove
+        the queue is writable; a record past ``PENDING`` proves something reads it
+        back and advances it, which is the only thing this segment claims to check.
+        """
         store = self._json_store("capability_proposal_queue_path", "capability_proposal_queue", "JsonCapabilityProposalQueue")
         if store is None:
             return self._row("lifecycle", "Lifecycle records", UNVERIFIABLE, "queue unreadable")
@@ -1008,7 +1027,25 @@ class EvolutionProducer:
                 status = str(getattr(item, "status", "") or "unknown")
                 counts[status] = counts.get(status, 0) + 1
             spread = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-            return self._row("lifecycle", "Lifecycle records", WIRED, spread)
+            advanced = sum(
+                count for status, count in counts.items()
+                if status.upper() not in _LIFECYCLE_ENTRY_STATES
+            )
+            if advanced:
+                return self._row("lifecycle", "Lifecycle records", WIRED, spread)
+            # Entry state only. The queue is written but never read back, so the
+            # governor is not running -- and the row says which way the count grows.
+            return self._row(
+                "lifecycle",
+                "Lifecycle records",
+                NO_EVIDENCE,
+                spread,
+                next_step=(
+                    f"{len(items)} record(s) have never left their entry state, so nothing "
+                    "reads the queue back. The governor advances a record only when the "
+                    "co-evolution sweep runs; until then the queue only grows."
+                ),
+            )
         return self._row(
             "lifecycle",
             "Lifecycle records",

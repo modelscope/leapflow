@@ -17,7 +17,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from leapspace.app_space.utils import write_atomic
+from leapspace.app_space.state import write_atomic
 
 if TYPE_CHECKING:
     from leapflow.analysis.intent_inferrer import InferenceResult

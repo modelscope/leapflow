@@ -282,3 +282,47 @@ def test_lifecycle_record_carries_the_declared_risk_ceiling(tmp_path):
     record = queue.get(result["lifecycle_proposal_id"])
     assert dict(record.risk)["risk_level"] == "medium"
     assert dict(record.requirements[0])["max_risk_level"] == "medium"
+
+
+# ── plugin_generate bridges *both* proposal stores (G3) ───────────────────────
+
+
+def test_generate_resolves_a_world_model_lifecycle_proposal(tmp_path):
+    """A world-model queue id must reach generation, not only a review-store id.
+
+    The world-model driver enqueues into the lifecycle queue (``prop-<hash>``); before
+    the bridge, ``plugin_generate`` looked only in the review store, so Scene C could
+    never proceed from a real teacher verdict. This drives the resolver that closes
+    that gap -- no LLM needed, because it is the resolution, not the generation, under
+    test.
+    """
+    from leapflow.domain.capability_requirement import CapabilityRequirement
+
+    plugin, queue = _plugin_with_stores(tmp_path)
+    requirement = CapabilityRequirement.create(
+        "chat.reply", "world_model", evidence="the send path silently no-ops",
+        max_risk_level="read_only", requirement_id="req-wm-chat.reply",
+    )
+    item = queue.enqueue(
+        requirements=(requirement,),
+        source="world_model",
+        observation_ids=("obs-1",),
+        metadata={"plugin_id": "chat_reply_alt_plugin", "capability_summary": "reply via v2"},
+    )
+
+    source, plugin_id, description, provides = plugin._resolve_generation_source(
+        item.proposal_id
+    )
+    assert source == "lifecycle"
+    assert plugin_id == "chat_reply_alt_plugin"
+    assert provides == ("chat.reply",)          # capability preserved for generation
+    assert description                          # non-empty description derived
+
+    # A review-store id still resolves as its own source, unchanged.
+    review = _propose(plugin, requested_capability="chat.send", risk_level="read_only")
+    assert plugin._resolve_generation_source(
+        review["proposal"]["proposal_id"]
+    )[0] == "review"
+
+    # An id neither store knows resolves to nothing, so generate returns not-found.
+    assert plugin._resolve_generation_source("prop-does-not-exist")[0] == ""

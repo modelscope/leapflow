@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "kind": "leapspace_structural_drift_fixture",
+  "evidence_level": "L2-planned",
+  "task_ref": "src/leapspace/app_space/tasks/task-001/config.yaml",
+  "description": "Declarative before/after StateSnapshot projections for the AAAI demo. These fixtures are not recorded evidence and must be paired with a real Leapspace trajectory and expect() output before they are presented as L2 results.",
+  "drifts": [
+    {
+      "drift_id": "chat.message-input.rename.v1",
+      "class": "interface_rename",
+      "reversible": true,
+      "before": {
+        "app_id": "chat",
+        "version": "1",
+        "elements": [
+          {"name": "contact_list", "role": "QListWidget"},
+          {"name": "message_history", "role": "QTextEdit"},
+          {"name": "message_input", "role": "QLineEdit"},
+          {"name": "send_button", "role": "QPushButton"}
+        ]
+      },
+      "after": {
+        "app_id": "chat",
+        "version": "2",
+        "elements": [
+          {"name": "contact_list", "role": "QListWidget"},
+          {"name": "message_history", "role": "QTextEdit"},
+          {"name": "reply_editor", "role": "QLineEdit"},
+          {"name": "send_button", "role": "QPushButton"}
+        ]
+      },
+      "capability_precondition": {
+        "capability": "chat.reply",
+        "bound_names": ["message_input", "send_button"],
+        "affordances": ["app.chat.reply"]
+      },
+      "expected": {
+        "evidence_kind": "interface_drift",
+        "lowest_cost_actions": ["absorb", "rebind"],
+        "must_not_default_to": "acquire"
+      },
+      "oracle": {
+        "kind": "leapspace_expect",
+        "status": "not_recorded",
+        "required_checks": ["reply-sent", "followup-arrived", "event-reply", "event-followup"]
+      }
+    },
+    {
+      "drift_id": "chat.reply-affordance.removed.v1",
+      "class": "affordance_removed",
+      "reversible": true,
+      "before": {
+        "app_id": "chat",
+        "version": "1",
+        "affordances": ["app.chat.reply"],
+        "elements": [
+          {"name": "message_input", "role": "QLineEdit"},
+          {"name": "send_button", "role": "QPushButton"}
+        ]
+      },
+      "after": {
+        "app_id": "chat",
+        "version": "2",
+        "affordances": [],
+        "elements": [
+          {"name": "message_input", "role": "QLineEdit"},
+          {"name": "send_button", "role": "QPushButton"}
+        ]
+      },
+      "capability_precondition": {
+        "capability": "chat.reply",
+        "bound_names": ["message_input", "send_button"],
+        "affordances": ["app.chat.reply"]
+      },
+      "expected": {
+        "evidence_kind": "affordance_removed",
+        "eligible_actions": ["rebind", "acquire", "escalate"],
+        "requires_resolution_first": true
+      },
+      "oracle": {
+        "kind": "leapspace_expect",
+        "status": "not_recorded",
+        "required_checks": ["reply-sent", "followup-arrived"]
+      }
+    },
+    {
+      "drift_id": "chat.benign-status.added.v1",
+      "class": "benign_negative_control",
+      "reversible": true,
+      "before": {
+        "app_id": "chat",
+        "version": "1",
+        "elements": [
+          {"name": "message_input", "role": "QLineEdit"},
+          {"name": "send_button", "role": "QPushButton"}
+        ]
+      },
+      "after": {
+        "app_id": "chat",
+        "version": "2",
+        "elements": [
+          {"name": "message_input", "role": "QLineEdit"},
+          {"name": "send_button", "role": "QPushButton"},
+          {"name": "sync_status", "role": "QLabel"}
+        ]
+      },
+      "capability_precondition": {
+        "capability": "chat.reply",
+        "bound_names": ["message_input", "send_button"],
+        "affordances": ["app.chat.reply"]
+      },
+      "expected": {
+        "evidence_kind": "none",
+        "action": "no_op",
+        "proposal_count": 0
+      },
+      "oracle": {
+        "kind": "leapspace_expect",
+        "status": "not_recorded",
+        "required_checks": ["reply-sent"]
+      }
+    }
+  ]
+}

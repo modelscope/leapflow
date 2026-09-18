@@ -21,6 +21,9 @@ class ViewHub:
 
     def __init__(self, maxsize: int = 128) -> None:
         self._subscribers: dict[str, asyncio.Queue[Optional[dict[str, Any]]]] = {}
+        # A dropped increment must not leave a live lens permanently stale. The next
+        # successful delivery asks that browser to fetch its authoritative snapshot.
+        self._resync_required: set[str] = set()
         self._maxsize = maxsize
 
     def subscribe(self, subscriber_id: str) -> asyncio.Queue[Optional[dict[str, Any]]]:
@@ -32,6 +35,7 @@ class ViewHub:
     def unsubscribe(self, subscriber_id: str) -> None:
         """Remove a browser subscriber."""
         self._subscribers.pop(subscriber_id, None)
+        self._resync_required.discard(subscriber_id)
 
     def broadcast(self, message: dict[str, Any]) -> int:
         """Deliver a message to all subscribers (non-blocking); return count.
@@ -41,10 +45,23 @@ class ViewHub:
         """
         delivered = 0
         for sid, queue in list(self._subscribers.items()):
+            resynced = False
+            if sid in self._resync_required:
+                try:
+                    queue.put_nowait({"type": "view.resync", "payload": {"reason": "dropped_events"}})
+                    self._resync_required.discard(sid)
+                    resynced = True
+                except asyncio.QueueFull:
+                    continue
             try:
                 queue.put_nowait(message)
                 delivered += 1
             except asyncio.QueueFull:
+                # A successful resync marker already occupies the one available
+                # slot. Do not re-arm it because the marker itself tells the client
+                # to fetch the snapshot and discard this increment.
+                if not resynced:
+                    self._resync_required.add(sid)
                 logger.debug("view_hub: dropped message for slow subscriber %s", sid)
         return delivered
 
@@ -60,6 +77,7 @@ class ViewHub:
             except asyncio.QueueFull:
                 pass
         self._subscribers.clear()
+        self._resync_required.clear()
 
 
 __all__ = ["ViewHub"]

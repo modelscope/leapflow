@@ -235,5 +235,24 @@ Package.resolved
 leapflow.sock
 
 temp
+# The AAAI demo tooling is a reproducible artifact, not disposable scratch data.
+# Re-ignore every other temporary artifact after reopening each parent directory.
+!temp/
+temp/*
+!temp/papers/
+temp/papers/*
+!temp/papers/aaai27_demo/
+temp/papers/aaai27_demo/*
+!temp/papers/aaai27_demo/aaai_demo/
+!temp/papers/aaai27_demo/aaai_demo/*.py
+!temp/papers/aaai27_demo/demo_fixtures/
+!temp/papers/aaai27_demo/demo_fixtures/task-001-structural-drifts.json
+!temp/papers/aaai27_demo/demo_fixtures/headless-chat-probe-drifts.json
+!temp/papers/aaai27_demo/plan/
+temp/papers/aaai27_demo/plan/*
+!temp/papers/aaai27_demo/plan/AAAI-27_Demo_论文写作计划.md
+!temp/papers/aaai27_demo/reproduction.md
+!temp/papers/aaai27_demo/tests/
+!temp/papers/aaai27_demo/tests/test_demo_artifacts.py
 .DS_Store
 AGENTS.md
