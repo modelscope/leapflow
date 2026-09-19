@@ -1104,7 +1104,9 @@
     const max = Math.max(1, ...rows.map((r) => r.value));
     rows.forEach((row) => {
       const line = el("div", "bar-row");
-      line.appendChild(el("span", "bar-label", esc(tx(row.label))));
+      const label = el("span", "bar-label", esc(tx(row.label)));
+      label.title = tx(row.label);
+      line.appendChild(label);
       const track = el("span", "bar-track");
       const fill = el("span", "bar-fill" + (severity ? " sev-" + row.key : "")); fill.style.width = Math.round((row.value / max) * 100) + "%";
       track.appendChild(fill); line.appendChild(track); line.appendChild(el("span", "bar-value", esc(row.value))); d.appendChild(line);
