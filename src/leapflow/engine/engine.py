@@ -5589,16 +5589,14 @@ class AgentEngine:
         try:
             handler = handlers.get(name)
             if handler is not None:
-                # The tool execution pipeline wraps only the handler call,
-                # enabling composable interceptors (audit, rate-limit, etc.)
-                # without touching the surrounding approval/semantic gates.
-                # Fast path: no interceptors registered = direct call, zero overhead.
+                # The execution deadline wraps each handler consistently, whether
+                # plugins install pipeline interceptors or the direct path is used.
+                from leapflow.domain.tool_pipeline import ToolCallContext, run_tool_with_timeout
                 from leapflow.plugins import get_registry
                 from leapflow.plugins.handler_invocation import invoke_tool_handler
 
                 pipeline = get_registry().tool_pipeline
                 if pipeline.interceptor_count > 0:
-                    from leapflow.domain.tool_pipeline import ToolCallContext
 
                     spec = _default_tool_registry().specs.get(name)
                     tool_metadata: Dict[str, Any] = {}
@@ -5622,8 +5620,8 @@ class AgentEngine:
 
                     result = await pipeline.execute(call_ctx, _invoke_handler)
                 else:
-                    result = await asyncio.wait_for(
-                        invoke_tool_handler(handler, args), timeout=timeout
+                    result = await run_tool_with_timeout(
+                        invoke_tool_handler(handler, args), timeout
                     )
             else:
                 # No handler — tool is truly unknown

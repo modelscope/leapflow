@@ -294,7 +294,12 @@ class ApprovalCoordinator:
         ))
         try:
             async with parked_for_human_decision():
-                result = await future
+                from leapflow.domain.tool_pipeline import (
+                    pause_tool_execution_timeout_for_human_decision,
+                )
+
+                async with pause_tool_execution_timeout_for_human_decision():
+                    result = await future
             return str(result.get("decision") or "deny")
         finally:
             self._approval_pending.pop(pending_id, None)

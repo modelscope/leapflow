@@ -15,6 +15,8 @@ from leapflow.domain.tool_pipeline import (
     ToolCallContext,
     ToolExecutionPipeline,
     ToolInterceptor,
+    pause_tool_execution_timeout_for_human_decision,
+    run_tool_with_timeout,
 )
 
 
@@ -437,6 +439,49 @@ class TestTimeoutInterceptor:
         ctx = ToolCallContext(tool_name="test", arguments={}, metadata={"timeout": 5.0})
         await pipeline.execute(ctx, echo_handler)
         assert ctx.annotations["_timeout"] == 5.0
+
+    @pytest.mark.asyncio
+    async def test_human_decision_pause_excludes_wait_from_execution_timeout(self) -> None:
+        waiting = asyncio.Event()
+        answered = asyncio.Event()
+        context = ToolCallContext(tool_name="write_file", arguments={})
+
+        async def handler(_: ToolCallContext) -> Dict[str, Any]:
+            async with pause_tool_execution_timeout_for_human_decision():
+                waiting.set()
+                await answered.wait()
+            await asyncio.sleep(0.005)
+            return {"completed": True}
+
+        task = asyncio.create_task(run_tool_with_timeout(handler(context), 0.02))
+        await asyncio.wait_for(waiting.wait(), timeout=1.0)
+        await asyncio.sleep(0.05)
+        assert not task.done(), "human decision time must not consume the tool deadline"
+
+        answered.set()
+        assert await asyncio.wait_for(task, timeout=1.0) == {"completed": True}
+
+    @pytest.mark.asyncio
+    async def test_execution_still_times_out_after_human_decision_pause(self) -> None:
+        waiting = asyncio.Event()
+        answered = asyncio.Event()
+        context = ToolCallContext(tool_name="write_file", arguments={})
+
+        async def handler(_: ToolCallContext) -> Dict[str, Any]:
+            async with pause_tool_execution_timeout_for_human_decision():
+                waiting.set()
+                await answered.wait()
+            await asyncio.sleep(0.05)
+            return {"completed": True}
+
+        task = asyncio.create_task(run_tool_with_timeout(handler(context), 0.02))
+        await asyncio.wait_for(waiting.wait(), timeout=1.0)
+        await asyncio.sleep(0.05)
+        assert not task.done(), "approval wait must remain unbounded"
+
+        answered.set()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(task, timeout=1.0)
 
     @pytest.mark.asyncio
     async def test_timeout_wrapper_times_out(self) -> None:
