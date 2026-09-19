@@ -15,6 +15,8 @@ effects — not the collaborators.
 from __future__ import annotations
 
 import asyncio
+import time
+from pathlib import Path
 
 from leapflow.domain.capability_requirement import CapabilityRequirement
 from leapflow.domain.evolution_trace import EvolutionStage, EvolutionTrace
@@ -75,8 +77,8 @@ def test_empty_sweep_still_records_its_no_op_branches():
     try:
         outcome = asyncio.run(CoevolutionSweep().run())
         assert outcome == SweepOutcome()
-        # All three segments reported, each flagged as a no-op.
-        assert sink.kinds() == {"effect_verification", "quarantine_drain", "reclamation"}
+        # All four segments reported, each flagged as a no-op.
+        assert sink.kinds() == {"effect_verification", "quarantine_drain", "proposal_expiry", "reclamation"}
         assert all(t.detail.get("no_op") for t in sink.traces)
     finally:
         _teardown()
@@ -292,8 +294,8 @@ def test_production_sweep_hook_builds_and_runs_a_real_sweep():
         assert outcome.refuted == 1                                  # WM-6 wired
         assert len(outcome.quarantined) == 1                         # A-4 wired
         assert [c.plugin_id for c in outcome.reclamation] == ["gen_overrisk"]  # LF-10 wired
-        # All three dashboard segments now have observed output.
-        assert sink.kinds() == {"effect_verification", "quarantine_drain", "reclamation"}
+        # All four dashboard segments now have observed output.
+        assert sink.kinds() == {"effect_verification", "quarantine_drain", "proposal_expiry", "reclamation"}
         assert outcome.to_dict()["quarantined"] == 1
         # Verifications were drained, so a second sweep cannot double-govern them.
         assert buf.drain_verifications() == ()
@@ -413,3 +415,155 @@ def test_gap_gate_excludes_unauthorised_origins(tmp_path):
 
     # And with nothing authorised, the gate is empty rather than permissive.
     assert loop.unmet_requirements([shipped], _env(), authorising_origins=("world_model",)) == ()
+
+
+# ── proposal expiry sweep tests ───────────────────────────────────────────────
+
+
+def _proposal_queue(tmp_path: Path, *, ttl_hours: int = 72):
+    from leapflow.storage.capability_proposal_queue import EvolutionCapabilityProposalStore
+    from leapflow.storage.evolution_event_store import DuckDBEvolutionEventStore
+
+    events = DuckDBEvolutionEventStore(tmp_path / "events.duckdb")
+    return EvolutionCapabilityProposalStore(events, profile_id="sweep-p", proposal_ttl_hours=ttl_hours)
+
+
+def _orchestrator(queue):
+    from leapflow.evolution.artifact_store import ContentAddressedArtifactStore
+    from leapflow.plugins.adaptive_policy import AdaptiveEvolutionPolicy
+    from leapflow.plugins.proposal_orchestrator import ProposalOrchestrator
+    import tempfile
+
+    return ProposalOrchestrator(
+        queue=queue,
+        artifact_store=ContentAddressedArtifactStore(Path(tempfile.mkdtemp()) / "artifacts"),
+        approval_gate=None,
+        policy=AdaptiveEvolutionPolicy(autonomy_level="generate_only"),
+    )
+
+
+def test_sweep_expires_stale_proposals(tmp_path: Path):
+    """A proposal with expires_at in the past is swept to EXPIRED."""
+    queue = _proposal_queue(tmp_path / "expire", ttl_hours=0)
+    # Create with an explicit past expires_at via low-level update
+    item = queue.enqueue(
+        requirements=(CapabilityRequirement.create("chat.reply", "world_model", requirement_id="req-exp"),),
+    )
+    # Manually set expires_at in the past by re-creating with occurred_at far back
+    # Since ttl_hours=0 means expires_at=None, we need a different approach.
+    # Use a queue with ttl_hours=1, but create with occurred_at far in the past.
+    queue2 = _proposal_queue(tmp_path / "expire2", ttl_hours=1)
+    item2 = queue2.enqueue(
+        requirements=(CapabilityRequirement.create("chat.stale", "world_model", requirement_id="req-stale"),),
+    )
+    # The item was created "now" with expires_at = now + 3600. Force expiry by
+    # creating a proposal with occurred_at far in the past.
+    queue3 = _proposal_queue(tmp_path / "expire3", ttl_hours=1)
+    past_item, ev = queue3.prepare_enqueue(
+        requirements=(CapabilityRequirement.create("chat.old", "world_model", requirement_id="req-old"),),
+        occurred_at=1.0,  # epoch second 1 = way in the past
+    )
+    assert ev is not None
+    queue3._event_store.append(ev)
+    assert past_item.expires_at is not None
+    assert past_item.expires_at < time.time()  # Definitely expired
+
+    orch = _orchestrator(queue3)
+    sink = _sink()
+    try:
+        outcome = asyncio.run(
+            CoevolutionSweep(
+                orchestrator=orch, proposal_store=queue3,
+            ).run()
+        )
+        assert outcome.expired == 1
+        refreshed = queue3.get(past_item.proposal_id)
+        assert refreshed is not None
+        assert refreshed.status == "EXPIRED"
+        assert refreshed.metadata["terminal_reason"] == "ttl_exceeded"
+    finally:
+        _teardown()
+
+
+def test_sweep_supersedes_outdated_proposal(tmp_path: Path):
+    """Two proposals with same requirements: the older is SUPERSEDED."""
+    queue = _proposal_queue(tmp_path / "supersede", ttl_hours=0)  # no TTL expiry
+    older, ev_old = queue.prepare_enqueue(
+        requirements=(CapabilityRequirement.create("chat.reply", "world_model", requirement_id="req-a"),),
+        occurred_at=100.0,
+    )
+    assert ev_old is not None
+    queue._event_store.append(ev_old)
+
+    newer, ev_new = queue.prepare_enqueue(
+        requirements=(CapabilityRequirement.create("chat.reply", "world_model", requirement_id="req-a"),),
+        environment={"fingerprint_id": "different"},  # different env => different proposal_id
+        occurred_at=200.0,
+    )
+    assert ev_new is not None
+    queue._event_store.append(ev_new)
+    assert older.proposal_id != newer.proposal_id
+
+    orch = _orchestrator(queue)
+    sink = _sink()
+    try:
+        outcome = asyncio.run(
+            CoevolutionSweep(
+                orchestrator=orch, proposal_store=queue,
+            ).run()
+        )
+        assert outcome.superseded == 1
+        old_item = queue.get(older.proposal_id)
+        assert old_item is not None
+        assert old_item.status == "SUPERSEDED"
+        new_item = queue.get(newer.proposal_id)
+        assert new_item is not None
+        assert new_item.status == "PENDING"  # newer remains active
+    finally:
+        _teardown()
+
+
+def test_proposal_without_ttl_not_expired(tmp_path: Path):
+    """A proposal with expires_at=None is not touched by TTL sweep."""
+    queue = _proposal_queue(tmp_path / "no_ttl", ttl_hours=0)  # expires_at=None
+    item = queue.enqueue(
+        requirements=(CapabilityRequirement.create("chat.reply", "world_model", requirement_id="req-no-ttl"),),
+    )
+    assert item.expires_at is None
+
+    orch = _orchestrator(queue)
+    sink = _sink()
+    try:
+        outcome = asyncio.run(
+            CoevolutionSweep(
+                orchestrator=orch, proposal_store=queue,
+            ).run()
+        )
+        assert outcome.expired == 0
+        assert outcome.superseded == 0
+        refreshed = queue.get(item.proposal_id)
+        assert refreshed is not None
+        assert refreshed.status == "PENDING"  # unchanged
+    finally:
+        _teardown()
+
+
+def test_sweep_proposal_expiry_cold_path():
+    """Proposal expiry lives only in CoevolutionSweep.run(), never per-turn."""
+    import ast
+    import inspect
+    import textwrap
+    from leapflow.evolution.sweep import CoevolutionSweep
+
+    source = textwrap.dedent(inspect.getsource(CoevolutionSweep.run))
+    tree = ast.parse(source)
+    calls = [
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and "expir" in getattr(node.func, "attr", "").lower()
+    ]
+    assert "_sweep_proposal_expiry" in calls, (
+        "proposal_expiry must be called inside CoevolutionSweep.run()"
+    )

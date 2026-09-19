@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 from leapflow.evolution.artifact_store import ContentAddressedArtifactStore
@@ -239,28 +240,38 @@ class ProposalOrchestrator:
             metadata={"terminal_reason": reason} if target == "FAILED" else {},
         )
 
-    def supersede(self, proposal_id: str, *, replacement_id: str, reason: str) -> CapabilityProposalItem:
+    def supersede(self, proposal_id: str, *, replacement_id: str, reason: str = "") -> CapabilityProposalItem:
         """Close an uninstalled proposal in favor of a newer durable proposal."""
         return self._queue.transition(
             proposal_id,
             "SUPERSEDED",
-            metadata={"terminal_reason": reason, "replacement_proposal_id": replacement_id},
+            metadata={
+                "terminal_reason": reason,
+                "replacement_proposal_id": replacement_id,
+                "swept_at": datetime.now(timezone.utc).isoformat(),
+            },
         )
 
-    def expire(self, proposal_id: str, *, reason: str) -> CapabilityProposalItem:
+    def expire(self, proposal_id: str, *, reason: str = "") -> CapabilityProposalItem:
         """Close an uninstalled proposal whose review window has elapsed."""
         return self._queue.transition(
             proposal_id,
             "EXPIRED",
-            metadata={"terminal_reason": reason},
+            metadata={
+                "terminal_reason": reason,
+                "swept_at": datetime.now(timezone.utc).isoformat(),
+            },
         )
 
-    def record_noop(self, proposal_id: str, *, reason: str) -> CapabilityProposalItem:
+    def record_noop(self, proposal_id: str, *, reason: str = "") -> CapabilityProposalItem:
         """Close a proposal resolved without acquiring a new capability."""
         return self._queue.transition(
             proposal_id,
             "NO_OP",
-            metadata={"terminal_reason": reason},
+            metadata={
+                "terminal_reason": reason,
+                "swept_at": datetime.now(timezone.utc).isoformat(),
+            },
         )
 
     def _reject(

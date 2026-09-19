@@ -301,3 +301,52 @@ def test_queue_rejects_lifecycle_shortcuts(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="PENDING -> INSTALLED"):
         queue.transition(proposal_id, "INSTALLED")
+
+
+def test_expire_records_reason_in_metadata(tmp_path: Path) -> None:
+    queue, proposal_id = _queue(tmp_path)
+    orchestrator = ProposalOrchestrator(
+        queue=queue,
+        artifact_store=ContentAddressedArtifactStore(tmp_path / "artifacts"),
+        approval_gate=None,
+        policy=AdaptiveEvolutionPolicy(autonomy_level="generate_only"),
+    )
+
+    item = orchestrator.expire(proposal_id, reason="ttl_exceeded")
+
+    assert item.status == "EXPIRED"
+    assert item.metadata["terminal_reason"] == "ttl_exceeded"
+    assert "swept_at" in item.metadata
+
+
+def test_supersede_records_reason_in_metadata(tmp_path: Path) -> None:
+    queue, proposal_id = _queue(tmp_path)
+    orchestrator = ProposalOrchestrator(
+        queue=queue,
+        artifact_store=ContentAddressedArtifactStore(tmp_path / "artifacts"),
+        approval_gate=None,
+        policy=AdaptiveEvolutionPolicy(autonomy_level="generate_only"),
+    )
+
+    item = orchestrator.supersede(proposal_id, replacement_id="prop-new", reason="newer_proposal_exists")
+
+    assert item.status == "SUPERSEDED"
+    assert item.metadata["terminal_reason"] == "newer_proposal_exists"
+    assert item.metadata["replacement_proposal_id"] == "prop-new"
+    assert "swept_at" in item.metadata
+
+
+def test_quarantine_to_probation_transition_allowed(tmp_path: Path) -> None:
+    """QUARANTINED proposals can be transitioned back to PROBATION for re-trial."""
+    queue, proposal_id = _queue(tmp_path)
+    # Walk the proposal through PENDING -> GENERATED -> APPROVED -> INSTALLED -> QUARANTINED
+    queue.transition(proposal_id, "GENERATED")
+    queue.transition(proposal_id, "APPROVED")
+    queue.transition(proposal_id, "INSTALLED")
+    queue.transition(proposal_id, "QUARANTINED")
+    item = queue.get(proposal_id)
+    assert item.status == "QUARANTINED"
+
+    # Now transition QUARANTINED -> PROBATION
+    recovered = queue.transition(proposal_id, "PROBATION")
+    assert recovered.status == "PROBATION"

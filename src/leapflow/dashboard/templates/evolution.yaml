@@ -445,8 +445,8 @@ layout:
               - type: Section
                 when: evolution.roster
                 props:
-                  title: "Plugin roster and trust"
-                  subtitle: "Read live from the registry and trust ledger every cycle."
+                  title: "Plugin roster and maturity"
+                  subtitle: "Read live from the registry and maturity ledger every cycle."
                 children:
                   - type: BarChart
                     when: evolution.provenance_mix
@@ -456,7 +456,7 @@ layout:
                   - type: BarChart
                     when: evolution.trust_mix
                     props:
-                      title: "Plugins by trust class"
+                      title: "Plugins by maturity"
                       bind: evolution.trust_mix
                   # Deliberately no live counters here. This finding dedups on a
                   # content fingerprint, so a rendered metric that changes every tick
@@ -473,7 +473,7 @@ layout:
                         - key: fiber_state
                           label: "Fiber"
                         - key: trust_level
-                          label: "Trust"
+                          label: "Maturity"
                         - key: selectable
                           label: "Selectable"
                         - key: ever_used
@@ -503,7 +503,7 @@ layout:
                         - key: plugin_id
                           label: "Plugin"
                         - key: trust_level
-                          label: "Trust"
+                          label: "Maturity"
                         - key: selectable
                           label: "Selectable"
                         - key: ever_used

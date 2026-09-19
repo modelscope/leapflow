@@ -19,8 +19,14 @@ without changing the decision logic.
 """
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
+from datetime import datetime
 from enum import IntEnum
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 
 class PluginTrustLevel(IntEnum):
@@ -100,6 +106,17 @@ class PluginTrustLedger:
         if self._consecutive_fail[plugin_id] >= self._demote_after:
             self._demote(plugin_id)
 
+    def unfreeze(self, plugin_id: str) -> bool:
+        """Remove plugin from frozen set and reset counters for re-probation."""
+        if plugin_id not in self._frozen:
+            return False
+        self._frozen.discard(plugin_id)
+        self._consecutive_ok.pop(plugin_id, None)
+        self._consecutive_fail.pop(plugin_id, None)
+        # Reset to DRAFT — must re-earn trust
+        self._levels[plugin_id] = PluginTrustLevel.DRAFT
+        return True
+
     # ── Internal promotion / demotion ──
 
     def _maybe_promote(self, plugin_id: str) -> None:
@@ -157,3 +174,83 @@ class PluginTrustLedger:
         }
         ledger._frozen = {str(k) for k in (state.get("frozen") or [])}
         return ledger
+
+
+@dataclass(frozen=True)
+class TrustTransitionRecord:
+    """A single trust level transition persisted in DuckDB."""
+
+    plugin_id: str
+    from_level: int
+    to_level: int
+    trigger: str
+    consecutive_ok: int | None
+    consecutive_fail: int | None
+    transitioned_at: datetime
+
+
+def trust_history(
+    db_path: Path | str,
+    plugin_id: str | None = None,
+    since: datetime | None = None,
+) -> List[TrustTransitionRecord]:
+    """Query trust transition history from DuckDB.
+
+    Returns records ordered by ``transitioned_at ASC``. Handles a missing
+    table gracefully (returns an empty list). ``db_path`` is the path to
+    the ``plugin_stats.duckdb`` file used by ``PluginStatsStore``.
+    """
+    try:
+        from leapflow.storage.duckdb_connect import connect
+    except ImportError:
+        return []
+
+    try:
+        conn = connect(Path(db_path))
+    except (RuntimeError, OSError):
+        return []
+
+    try:
+        # Check table existence — the table may not have been created yet.
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_name = 'plugin_trust_transitions'"
+            ).fetchall()
+        ]
+        if not tables:
+            return []
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if plugin_id is not None:
+            clauses.append("plugin_id = ?")
+            params.append(plugin_id)
+        if since is not None:
+            clauses.append("transitioned_at >= ?")
+            params.append(since)
+
+        sql = "SELECT plugin_id, from_level, to_level, trigger, consecutive_ok, consecutive_fail, transitioned_at FROM plugin_trust_transitions"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY transitioned_at ASC"
+
+        rows = conn.execute(sql, params).fetchall()
+        return [
+            TrustTransitionRecord(
+                plugin_id=r[0],
+                from_level=r[1],
+                to_level=r[2],
+                trigger=r[3],
+                consecutive_ok=r[4],
+                consecutive_fail=r[5],
+                transitioned_at=r[6],
+            )
+            for r in rows
+        ]
+    except Exception:  # noqa: BLE001 - query is best-effort
+        logger.debug("trust_history query failed", exc_info=True)
+        return []
+    finally:
+        conn.close()

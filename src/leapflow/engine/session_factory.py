@@ -77,8 +77,17 @@ class _PersistingTrustLedger(PluginTrustLedger):
             self._flush()
             self._trace_transition(plugin_id, before, after, hard=hard)
 
+    def unfreeze(self, plugin_id: str) -> bool:
+        before = self.level(plugin_id)
+        result = super().unfreeze(plugin_id)
+        if result:
+            after = self.level(plugin_id)
+            self._flush()
+            self._trace_transition(plugin_id, before, after, hard=False, trigger="unfreeze")
+        return result
+
     def _trace_transition(
-        self, plugin_id: str, before: Any, after: Any, *, hard: bool
+        self, plugin_id: str, before: Any, after: Any, *, hard: bool, trigger: str = ""
     ) -> None:
         """Emit the trust transition, which nothing else records durably.
 
@@ -93,6 +102,29 @@ class _PersistingTrustLedger(PluginTrustLedger):
         PRODUCTION or a freeze on an internal defect cannot be reconstructed after
         the fact from the trust state alone.
         """
+        # ── DuckDB trust transition history (cold-path, best-effort) ──
+        try:
+            store = self._store
+            if store is not None:
+                before_int = int(before) if hasattr(before, '__int__') else int(before)
+                after_int = int(after) if hasattr(after, '__int__') else int(after)
+                if trigger:
+                    pass  # Caller-supplied trigger (e.g. "unfreeze")
+                elif hard:
+                    trigger = "hard_failure"
+                elif after_int > before_int:
+                    trigger = "success"
+                else:
+                    trigger = "failure"
+                ok_count = self._consecutive_ok.get(plugin_id, 0)
+                fail_count = self._consecutive_fail.get(plugin_id, 0)
+                store.record_trust_transition(
+                    plugin_id, before_int, after_int, trigger, ok_count, fail_count
+                )
+        except Exception:  # noqa: BLE001 - trust history is best-effort, never fail a turn
+            pass
+
+        # ── EvolutionTap telemetry ──
         try:
             from leapflow.domain.evolution_trace import EvolutionStage
             from leapflow.telemetry.evolution_tap import emit_trace, is_enabled
