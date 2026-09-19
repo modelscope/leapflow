@@ -198,3 +198,32 @@ def test_static_assets_are_cache_busted_together() -> None:
     assert versions[0] != "status-i18n-20260808", (
         "the version predates the markdown and provenance changes"
     )
+
+
+# ════════════════════════════════════════════════════════════════
+# Bar charts: long labels overlapped their tracks in narrow cells
+# ════════════════════════════════════════════════════════════════
+
+
+def test_bar_chart_labels_wrap_without_consuming_the_track() -> None:
+    """Long translated labels must never be allowed to overlap a value or bar.
+
+    ``max-content`` paired with ``white-space: nowrap`` made the maturity label
+    ``new_unproven`` paint over its track. The base grid reserves a bounded label
+    column, and a narrow chart promotes the track to a dedicated second row.
+    """
+    css = _STYLES.read_text(encoding="utf-8")
+    assert ".chart { min-height: 120px; min-width: 0; container-type: inline-size; }" in css
+    assert "grid-template-columns: fit-content(13rem) minmax(4rem, 1fr) max-content;" in css
+    assert "column-gap: 0.65rem;" in css
+    assert ".bar-label { min-width: 0; white-space: normal; overflow-wrap: anywhere; }" in css
+    assert ".bar-track { min-width: 0; width: 100%;" in css
+    assert "@container (max-width: 18rem)" in css
+    assert '"label value"\n      "track track"' in css
+
+
+def test_bar_chart_labels_preserve_full_text_for_accessibility() -> None:
+    """Wrapping is visible; the title retains the complete translated label."""
+    src = _app()
+    assert 'const label = el("span", "bar-label", esc(tx(row.label)));' in src
+    assert "label.title = tx(row.label);" in src

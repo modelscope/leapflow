@@ -155,17 +155,53 @@ body {
 .insight-list, .dl, .citations, .summary, .prose, .md, .chips button { font-size: 0.9rem; }
 
 /* ── Figures + captions (academic numbering set by the renderer) ─────────── */
-.chart { min-height: 120px; }
+.chart { min-height: 120px; min-width: 0; container-type: inline-size; }
 .chart-placeholder { color: var(--muted); border: 1px dashed var(--line); border-radius: 0; padding: 30px 14px; text-align: center; }
 .figcaption { color: var(--muted); font-size: 0.81rem; margin-top: 7px; padding-top: 5px; border-top: 1px solid var(--line); }
 .figcaption .fignum { color: var(--accent); font-weight: 700; margin-inline-end: 5px; }
 
 /* ── Bars / sparkline / pie (flat, single-hue accents) ───────────────────── */
-.bar-row { display: grid; grid-template-columns: max-content 1fr 36px; align-items: center; gap: 8px; margin: 7px 0; }
+.bar-row {
+  display: grid;
+  grid-template-columns: fit-content(13rem) minmax(4rem, 1fr) max-content;
+  align-items: center;
+  column-gap: 0.65rem;
+  row-gap: 4px;
+  margin: 7px 0;
+}
 .bar-label, .bar-value { color: var(--muted); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
-.bar-label { white-space: nowrap; }
-.bar-track { height: 8px; background: var(--track); border-radius: 0; overflow: hidden; }
+.bar-label { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.bar-track { min-width: 0; width: 100%; height: 8px; background: var(--track); border-radius: 0; overflow: hidden; }
+.bar-value { min-width: 2ch; justify-self: end; white-space: nowrap; text-align: end; }
 .bar-fill { display: block; height: 100%; border-radius: 0; background: var(--info); }
+
+/* A chart may be narrow because of its grid cell even on a wide viewport. At
+   that point, preserve every label and value by placing the track on its own
+   row instead of allowing any grid item to overlap another. */
+@container (max-width: 18rem) {
+  .bar-row {
+    grid-template-columns: minmax(0, 1fr) max-content;
+    grid-template-areas:
+      "label value"
+      "track track";
+  }
+  .bar-label { grid-area: label; }
+  .bar-track { grid-area: track; }
+  .bar-value { grid-area: value; }
+}
+
+/* Viewport fallback for browsers without container-query support. */
+@media (max-width: 440px) {
+  .bar-row {
+    grid-template-columns: minmax(0, 1fr) max-content;
+    grid-template-areas:
+      "label value"
+      "track track";
+  }
+  .bar-label { grid-area: label; }
+  .bar-track { grid-area: track; }
+  .bar-value { grid-area: value; }
+}
 .bar-fill.sev-alert { background: var(--alert); }
 .bar-fill.sev-notable { background: var(--notable); }
 .bar-fill.sev-info { background: var(--info); }
