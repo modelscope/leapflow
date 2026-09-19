@@ -27,37 +27,21 @@ The term *Harness self-evolution* is used in this restricted sense: the Harness 
 
 The architecture follows the principle that a capability should be composed rather than built into the core runtime. Tools, platform adapters, signal sources, and other extensions are specified through runtime-checkable protocols and managed by common discovery and lifecycle machinery. The Harness owns the rules of composition; plugins own concrete capability implementations.
 
-```text
-       Environment and execution evidence
-                       │
-                       ▼
-             Observe / filter / persist
-                       │
-                       ├───────────────┐
-                       ▼               │
-              World-model teacher      │
-       grade trajectory + infer verdict│
-                       │               │
-                       ▼               │
-       distilled knowledge / preference│
-                       │               │
-                       ▼               │
-             student execution loop ◄──┘
-                       │
-          unmet requirement only
-                       ▼
-     proposal → validation → approval → sandbox
-                       │
-                       ▼
-             governed plugin lifecycle
-                       │
-                       ▼
-          outcome, trust, quarantine, rollback
-                       │
-              ┌────────┴────────┐
-              ▼                 ▼
-       LeapSpace signals   LeapBoard presentation
-```
+![Figure 1. LeapFlow system architecture and governed capability-evolution pipeline.](../assets/harness_evolution_architecture.png)
+
+*Figure 1. From real-world signals to explainable, reversible capability evolution. The figure depicts LeapSpace as an evidence-producing environment and focuses on the LeapFlow execution and evolution paths. LeapBoard, the read-only presentation surface, is introduced in [Section 8](#8-leapspaceleapflowleapboard-causal-plane).*
+
+### 2.1 Reading the Architecture
+
+Figure 1 is read from left to right and then from the hot path into the cold path:
+
+1. **Signals enter the acting loop.** LeapSpace and live interaction provide observable environmental and execution evidence to the OODA-oriented hot path.
+2. **The teacher interprets completed evidence.** The world model operates on a retrospective trajectory and returns action grades plus a four-valued adaptation verdict; it does not directly install code.
+3. **The default response changes knowledge, not capability.** `absorb` and `rebind` flow through the always-on channel, distilling environmental knowledge and provider preferences into the next-turn context.
+4. **Only an unmet `acquire` verdict reaches the mutation boundary.** This opt-in channel crosses proposal, validation, approval, sandbox, and trust gates before a capability can become active.
+5. **Every consequential outcome becomes evidence.** Trust transitions, rejection, failure, quarantine, and rollback are retained as causal records that inform subsequent analysis and operator inspection.
+
+The storyline therefore progresses from **observation**, to **interpretation**, to the **least invasive valid response**, and only then—when existing knowledge and installed capability are insufficient—to governed acquisition. This ordering is the central safety and efficiency claim of the architecture.
 
 This organization makes two distinctions explicit.
 
@@ -147,48 +131,39 @@ The ordering is intentional: `absorb` and `rebind` are cheaper and safer than `a
 
 This design counters a common failure mode in agentic systems: interpreting a changed environment as proof that the incumbent implementation is defective. An incumbent can be correct for a previous application version while an alternate adapter is now more appropriate. The verdict asks what action is supported by evidence, not which component is to blame.
 
-### 4.3 Event-Sourced Knowledge and Selection
+### 4.3 Event-Sourced Knowledge, Resolution, and Selection
 
 Evolution evidence is persisted through an append-only event store. Read models, including distilled knowledge and rebind preferences, are projections over that evidence rather than independent sources of truth. A preference extracted from a `rebind` verdict can influence selection, but it is intentionally weaker than structural constraints such as declared capability fit and environment affordances.
 
-The capability resolver operationalizes this distinction. It scores live candidates from declared matching, environmental compatibility, risk cost, trust, reliability, and—when present—distilled preference. A teacher recommendation cannot make an incompatible capability eligible; it is evidence that informs a deterministic resolution process, not a hidden control channel.
+Before generating new code, LeapFlow resolves a typed requirement against the live catalog. A satisfiable requirement becomes an explicit no-op or rebind result rather than a duplicate proposal. This **resolution-before-acquisition** rule operationalizes the least-invasive-response principle shown in Figure 1.
 
-## 5. From Evidence to Plugin Acquisition
+The capability resolver scores live candidates using declared matching, environmental compatibility, risk cost, trust, reliability, and—when present—distilled preference. A teacher recommendation cannot make an incompatible candidate eligible; it is evidence that informs a deterministic resolution process, not a hidden control channel.
 
-### 5.1 Resolution Before Acquisition
+The user-visible `evolution.enabled` setting, disabled by default, governs the only branch that may introduce a new capability: whether an `acquire` verdict may enter the proposal path. It does not disable world-model grading, knowledge distillation, or read-only selection guidance. The system can therefore learn from an environment while capability mutation remains disabled.
 
-Before generating new code, LeapFlow resolves the requirement against the live catalog. An already satisfiable requirement becomes an explicit no-op or rebind result rather than a duplicate proposal. This avoids capability proliferation and ensures that new code is the exception rather than the default response to change.
+## 5. Governed Plugin Acquisition
 
-The acquisition branch is gated by the user-visible `evolution.enabled` setting, which is disabled by default. The setting controls whether an `acquire` verdict may enter the capability-proposal path. It does not disable world-model grading, knowledge distillation, or read-only selection guidance. Consequently, the system can learn from an environment even while capability mutation remains disabled.
+### 5.1 Gate Sequence
 
-### 5.2 Governed Acquisition Pipeline
+Only an eligible, unresolved `acquire` requirement traverses the following sequence:
 
-An eligible acquisition follows a staged path:
+| Stage | Required result before the next stage |
+|---|---|
+| Evidence and resolution | A typed, task-relevant requirement remains unsatisfied by the live catalog. |
+| Proposal and generation | A candidate artifact is associated with its causal evidence and declared capability. |
+| Validation and compatibility | Syntax, structure, import/protocol conformance, and compatibility assessment succeed. |
+| Approval and sandboxing | The operator gate permits the mutation and the artifact passes bounded sandbox smoke checks. |
+| Registration and probation | The plugin enters at `DRAFT`, then accumulates behavior-test and outcome evidence. |
+| Trust or containment | Observed outcomes support advancement, demotion, quarantine, disablement, or rollback. |
 
-```text
-classified evidence
-  → typed capability requirement
-  → live-catalog resolution
-  → proposal
-  → generation
-  → syntax / structure / protocol validation
-  → compatibility assessment
-  → approval
-  → artifact write
-  → sandbox smoke test
-  → register at DRAFT
-  → behavior tests and probation
-  → trust accrual, verification, or quarantine
-```
-
-The pipeline is intentionally more restrictive than “LLM writes a file and imports it.” It provides an accountable answer to four questions that an unconstrained script cannot answer reliably:
+The sequence is intentionally more restrictive than “LLM writes a file and imports it.” It preserves the answer to four accountability questions:
 
 1. **Why was this capability needed?** The requirement is linked to source evidence and resolution results.
-2. **Why is this implementation admissible?** Validation, compatibility assessment, and approval must precede activation.
+2. **Why is this implementation admissible?** Validation, compatibility assessment, and approval precede activation.
 3. **What happens if it fails?** Outcomes drive demotion, quarantine, disablement, or rollback.
 4. **Can the decision be reconstructed?** Causal records include no-op, rejected, and failed branches, not only successful installation.
 
-### 5.3 Progressive Trust and Reversibility
+### 5.2 Progressive Trust and Reversibility
 
 New plugins start with limited trust. Trust can advance through observed success and can be reduced by consecutive failures; an internal defect can permanently freeze a capability. Plugins can also be isolated in a subprocess, invoked over bounded JSON-RPC, and removed from service through lifecycle governance.
 
@@ -229,23 +204,17 @@ A practical decision rule follows:
 
 ## 8. LeapSpace–LeapFlow–LeapBoard Causal Plane
 
-The three systems form complementary surfaces rather than a monolithic control loop.
+Figure 1 details the LeapSpace-to-LeapFlow execution and evolution pipeline. LeapBoard is deliberately not a control node in that figure; it completes the architecture as the human-observable presentation surface. The three systems therefore form complementary surfaces rather than a monolithic control loop.
 
-```text
-LeapSpace                         LeapFlow                         LeapBoard
-─────────                         ────────                         ─────────
-application state                 typed observation                causal views
-reference actions       ─────►    signal filtering                  watch updates
-LeapSignal records                world-model verdicts     ─────►  evolution lens
-sandboxed experiments             capability resolution             operator inspection
-                                  plugin governance                 notifications
-```
+| Surface | Primary responsibility | Causal output |
+|---|---|---|
+| **LeapSpace** | Controlled application environments, `LeapSignal` records, and task outcomes | Typed environmental and task-outcome observations |
+| **LeapFlow** | Filtering, world-model reasoning, capability resolution, and lifecycle governance | Read-only evolution, lifecycle, and provenance events |
+| **LeapBoard** | Causal views, watch updates, evolution lens, and operator inspection | Human-observable operational state |
 
-1. **LeapSpace observes and stages:** it makes environmental conditions and outcomes available through controlled application environments, signals, and an environment-source adapter.
-2. **LeapFlow reasons and governs:** it converts admissible observations into knowledge, resolutions, and—only where justified—governed proposals and lifecycle transitions.
-3. **LeapBoard exposes and explains:** it presents state and causal outcomes to the operator without bypassing the policy and approval chain.
+**Causal path:** **LeapSpace** → *typed observations* → **LeapFlow** → *causal events* → **LeapBoard**.
 
-This decomposition preserves a critical separation of powers. LeapSpace does not directly register production capabilities; LeapBoard does not approve or execute mutations; the world model does not directly install code. Each component contributes evidence, reasoning, governance, or visibility within its own boundary.
+This decomposition preserves a separation of powers: LeapSpace produces and stages evidence; LeapFlow reasons over admissible evidence and governs capability change; LeapBoard exposes causal state without bypassing policy or approval. LeapSpace does not register production capabilities, LeapBoard does not approve or execute mutations, and the world model does not install code directly.
 
 ## 9. Safety and Scientific Integrity Properties
 
@@ -269,7 +238,7 @@ The agent may improve its knowledge and selection policy without the authority t
 
 ### 9.5 Cold-Path Governance
 
-Retrospective grading, proposal processing, telemetry, and broad co-evolution sweeps should remain off the ordinary turn-critical path. Learning must not impose material latency or fragility on normal task execution.
+Retrospective grading, proposal processing, telemetry, and broad co-evolution sweeps are designed as cold-path work and should not execute synchronously inside the ordinary turn-critical loop. This reduces direct coupling to response latency; it does not prove that background workers consume no daemon scheduling or compute resources. Operational evaluation must therefore measure their effect on ordinary execution as well as their adaptation benefit.
 
 ## 10. Limitations and Non-Claims
 
@@ -322,3 +291,4 @@ The resulting system favors the least invasive valid response. It learns first, 
 | LeapBoard templates | [`src/leapflow/dashboard/templates.py`](../src/leapflow/dashboard/templates.py) |
 | Configuration and evolution gate | [`src/leapflow/config.py`](../src/leapflow/config.py) |
 | Engineering constraints | [`AGENTS.md`](../AGENTS.md) |
+| Architecture figure asset | [`assets/harness_evolution_architecture.png`](../assets/harness_evolution_architecture.png) |
