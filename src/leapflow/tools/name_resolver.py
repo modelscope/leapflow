@@ -28,28 +28,6 @@ ResolutionStatus = Literal["exact", "normalized", "aliased", "unknown"]
 ResolutionConfidence = Literal["high", "medium", "low"]
 RiskLevel = Literal["read_only", "mutating", "external"]
 
-_READ_ONLY_TOOLS = {
-    "file_list",
-    "file_read",
-    "time_get",
-    "env_info",
-    "text_search",
-    "skills_list",
-    "skill_view",
-    "memory_search",
-    # Network reads: a GET has no side effect, so the loop must not treat it as a
-    # mutation. Egress safety is enforced by the tool's own target gate, not by
-    # pretending the call mutates state.
-    "web_fetch",
-    # Verification/inspection tools: read-oriented for the loop even though some
-    # names contain a mutating signal (e.g. test_run) or execute via a gated
-    # underlying tool (test_run/lint_check delegate to the shell_run gate).
-    "test_run",
-    "lint_check",
-    "terminal_read",
-    "terminal_list",
-}
-
 _NO_EFFECT_CLAIMS = frozenset({"read_only", "none"})
 """The only declared ``risk_level`` values that assert a call has no effect.
 
@@ -127,10 +105,11 @@ class ToolSpec:
     description: str = ""
     parameters: frozenset[str] = field(default_factory=frozenset)
     required: frozenset[str] = field(default_factory=frozenset)
-    risk_level: RiskLevel = "read_only"
+    risk_level: RiskLevel = "mutating"
     mutates_state: bool = False
     effect_scope: str = "local"
     idempotency_scope: str = "turn"
+    execution_policy: str = ""
 
 
 @dataclass(frozen=True)
@@ -144,7 +123,7 @@ class ToolResolution:
     reason: str
     suggestions: tuple[str, ...] = ()
     auto_executable: bool = False
-    risk_level: RiskLevel = "read_only"
+    risk_level: RiskLevel = "mutating"
 
     @property
     def is_resolved(self) -> bool:
@@ -212,8 +191,7 @@ class ToolRegistry:
             metadata = function.get("x_leapflow", {}) or definition.get("x_leapflow", {}) or {}
             mutates_state = bool(metadata.get("mutates_state", False))
             risk_level = _resolve_risk_level(
-                name,
-                bridge_mutates=mutates_state,
+                mutates_state=mutates_state,
                 declared=str(metadata.get("risk_level") or ""),
             )
             specs[name] = ToolSpec(
@@ -224,7 +202,11 @@ class ToolRegistry:
                 risk_level=risk_level,
                 mutates_state=mutates_state,
                 effect_scope=str(metadata.get("effect_scope") or ("external" if risk_level == "external" else "local")),
-                idempotency_scope=str(metadata.get("idempotency_scope") or ("session" if risk_level == "external" else "turn")),
+                idempotency_scope=str(
+                    metadata.get("idempotency_scope")
+                    or ("session" if risk_level == "external" else "turn")
+                ),
+                execution_policy=str(metadata.get("execution_policy") or ""),
             )
         for name in handlers.keys():
             canonical = str(name).removeprefix("gp_")
@@ -232,13 +214,14 @@ class ToolRegistry:
                 mutates_state = False
                 # A handler with no schema declares nothing at all, so it gets the
                 # unclaimed default rather than being read as read-only.
-                risk_level = _resolve_risk_level(canonical, bridge_mutates=mutates_state)
+                risk_level = _resolve_risk_level(mutates_state=mutates_state)
                 specs[canonical] = ToolSpec(
                     name=canonical,
                     risk_level=risk_level,
                     mutates_state=mutates_state,
-                    effect_scope="external" if risk_level == "external" else "local",
-                    idempotency_scope="session" if risk_level == "external" else "turn",
+                    effect_scope="external",
+                    idempotency_scope="session",
+                    execution_policy="external_side_effect",
                 )
 
         validated_aliases: dict[str, str] = {}
@@ -360,32 +343,12 @@ class ToolRegistry:
         return tuple(shape_matches[:5])
 
 
-def _resolve_risk_level(name: str, *, bridge_mutates: bool, declared: str = "") -> RiskLevel:
-    """Classify a tool's *effect* for the execution policy.
-
-    ``declared`` is ``x_leapflow.risk_level``, and it is consulted rather than
-    honoured wholesale, because that key carries two different vocabularies. The
-    disclosure side (``CapabilityManifest``) grades how much a call needs to be
-    explained and approved -- ``none``/``read_only``/``low``/``medium``/``high`` --
-    while this side answers a narrower question: does the call have an effect, and
-    can it be replayed. "medium" is not an answer to that; copying it into this
-    field would put a value outside ``RiskLevel`` into a typed slot and match none
-    of the comparisons that read it.
-
-    So only the values where the two vocabularies genuinely agree are taken as a
-    claim of no effect. Everything else -- a graded risk, or no declaration at all
-    -- resolves to ``mutating``. Absence of a declaration is not a claim of
-    safety: read as one, a third-party tool with an innocuous name got the
-    ``read_only`` policy, which skips the execution ledger entirely, runs freely
-    in parallel, and is exempt from side-effect gating.
-
-    Order matters. An explicit no-effect claim outranks the name heuristic,
-    because the heuristic is a substring guess: ``test_run`` contains "run" but is
-    an inspection. A mutating *bridge* still wins over both, since a declaration
-    that contradicts the handler's own answer is the stale one.
-    """
-    if name.startswith(("gateway_", "hub_", "platform_")) or declared == "external":
+def _resolve_risk_level(*, mutates_state: bool, declared: str = "") -> RiskLevel:
+    """Classify effect risk from declarations without inspecting the tool name."""
+    if declared == "external":
         return "external"
-    if not bridge_mutates and (declared in _NO_EFFECT_CLAIMS or name in _READ_ONLY_TOOLS):
+    if not mutates_state and declared in _NO_EFFECT_CLAIMS:
         return "read_only"
+    if mutates_state or declared:
+        return "mutating"
     return "mutating"

@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 import pytest
 
+from leapflow.domain.adaptation_verdict import AdaptationVerdict
 from leapflow.domain.capability_requirement import CapabilityRequirement
 from leapflow.domain.environment_fingerprint import EnvironmentFingerprint
 from leapflow.domain.platform import Capability, PlatformID, PlatformManifest
+from leapflow.learning.degradation_sink import build_live_capability_resolver
 from leapflow.learning.plugin_stats import PluginUsageTracker
 from leapflow.learning.plugin_trust import PluginTrustLedger
 from leapflow.plugins.capability_resolver import (
@@ -88,6 +91,42 @@ class _Plugin:
 
     def bind_runtime(self, **deps: Any) -> None:
         return None
+
+
+def test_live_acquisition_gate_resolves_against_current_registry() -> None:
+    tool = ToolMetadata(
+        name="repo_read",
+        description="Read repository files",
+        parameters_schema={"type": "object", "properties": {}},
+        handler=_handler,
+        x_leapflow={"risk_level": "read_only", "category": "test"},
+        provides_capabilities=("repository.inspect",),
+    )
+    registry = SimpleNamespace(
+        plugins={"repository_builtin": _Plugin("repository_builtin", [tool])},
+        tool_owners={"repo_read": "repository_builtin"},
+        tool_handlers={"repo_read": _handler},
+        assemble=lambda: None,
+    )
+    resolve = build_live_capability_resolver(
+        registry_provider=lambda: registry,
+        environment_provider=lambda: _env(Capability.FILE_OPS),
+    )
+    available = AdaptationVerdict.create(
+        "acquire", "repository.inspect", "Repository inspection is required."
+    ).to_intent()
+    missing = AdaptationVerdict.create(
+        "acquire", "mail.send", "Mail delivery is required."
+    ).to_intent()
+
+    available_result = resolve(available, {"session_id": "s1", "workspace_id": "w1"})
+    missing_result = resolve(missing, {"session_id": "s1", "workspace_id": "w1"})
+
+    assert available_result["resolved"] is True
+    assert available_result["satisfied"] is True
+    assert available_result["selected_plugin_id"] == "repository_builtin"
+    assert missing_result["resolved"] is True
+    assert missing_result["satisfied"] is False
 
 
 def test_resolver_selects_highest_scoring_declared_candidate() -> None:

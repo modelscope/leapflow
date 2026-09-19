@@ -9,6 +9,7 @@ from leapflow.domain.capability_requirement import (
 from leapflow.domain.effect_scope import EffectScope, ScopeState
 from leapflow.domain.event_types import (
     CLIEventType,
+    EvolutionEventType,
     ImplicitFeedbackType,
     LearningEventType,
     NormalizedEventType,
@@ -16,7 +17,18 @@ from leapflow.domain.event_types import (
     UNDO_SHORTCUTS,
 )
 from leapflow.domain.environment_fingerprint import EnvironmentFingerprint
+from leapflow.domain.environment_signal import (
+    EnvironmentObservation,
+    InterfaceElement,
+    InterfaceSnapshot,
+)
 from leapflow.domain.events import SystemEvent, UIElement, UISnapshot
+from leapflow.domain.evolution_event import (
+    EvolutionContext,
+    EvolutionEvent,
+    EvolutionEventRecord,
+    EvolutionEventStore,
+)
 from leapflow.domain.evolution_intent import (
     WORLD_MODEL_INTENT,
     WORLD_MODEL_ORIGIN,
@@ -53,6 +65,11 @@ __all__ = [
     "CLIEventType",
     "CapabilityRequirement",
     "EffectScope",
+    "EvolutionContext",
+    "EvolutionEvent",
+    "EvolutionEventRecord",
+    "EvolutionEventStore",
+    "EvolutionEventType",
     "EvolutionIntent",
     "FiberState",
     "GapEvidence",
@@ -65,6 +82,9 @@ __all__ = [
     "DEFAULT_DARWIN_CAPABILITIES",
     "DistillationCandidate",
     "EnvironmentFingerprint",
+    "EnvironmentObservation",
+    "InterfaceElement",
+    "InterfaceSnapshot",
     "Episode",
     "IllegalStateTransition",
     "NoiseSignal",

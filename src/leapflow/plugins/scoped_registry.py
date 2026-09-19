@@ -44,6 +44,7 @@ class ScopedToolRegistry:
         """Wrap an existing ToolPluginRegistry instance."""
         self._registry = registry
         self._fibers: dict[str, PluginFiber] = {}
+        self._draft_plugins: dict[str, ToolPlugin] = {}
         self._plugin_modules: dict[str, str] = {}  # plugin_id → module path
         self._plugin_files: dict[str, Path] = {}  # plugin_id → installed source file
 
@@ -54,9 +55,63 @@ class ScopedToolRegistry:
         self._fibers[plugin_id] = fiber
         return fiber
 
+    def create_draft_fiber(self, plugin_id: str) -> PluginFiber:
+        """Create an isolated DRAFT fiber that cannot dispatch live tools."""
+        if plugin_id in self._fibers and not self._fibers[plugin_id].is_disposed:
+            raise ValueError(f"Plugin '{plugin_id}' already has a live fiber")
+        fiber = self.create_fiber(plugin_id)
+        fiber.mark_draft()
+        return fiber
+
     def get_fiber(self, plugin_id: str) -> Optional[PluginFiber]:
         """Get an existing fiber by plugin ID."""
         return self._fibers.get(plugin_id)
+
+    def stage_plugin(self, plugin: ToolPlugin, fiber: PluginFiber) -> None:
+        """Attach a plugin to a DRAFT fiber without publishing any handler."""
+        plugin_id = plugin.plugin_id
+        if fiber.plugin_id != plugin_id or fiber.state != FiberState.DRAFT:
+            raise ValueError("draft plugin and fiber identity/state do not match")
+        if self._registry.get_plugin(plugin_id) is not None:
+            raise ValueError(f"Duplicate plugin_id: {plugin_id!r}")
+        self._draft_plugins[plugin_id] = plugin
+        fiber.scope.effect(lambda pid=plugin_id: self._draft_plugins.pop(pid, None))
+        module_name = str(getattr(plugin, "__leapflow_plugin_module__", "") or "")
+        module = sys.modules.get(module_name) if module_name else None
+        if module is not None:
+            fiber.scope.effect(
+                lambda name=module_name, loaded=module: (
+                    sys.modules.pop(name, None)
+                    if sys.modules.get(name) is loaded
+                    else None
+                )
+            )
+
+    def promote_draft(self, plugin_id: str) -> PluginFiber:
+        """Atomically publish a tested DRAFT plugin into the live registry."""
+        fiber = self._fibers.get(plugin_id)
+        plugin = self._draft_plugins.get(plugin_id)
+        if fiber is None or plugin is None or fiber.state != FiberState.DRAFT:
+            raise ValueError(f"Plugin '{plugin_id}' has no staged DRAFT")
+        self.scoped_register(plugin, fiber)
+        try:
+            published = self._registry.publish_plugin_tools_atomic(plugin)
+            fiber.activate()
+        except Exception:
+            if fiber.state != FiberState.DISPOSED:
+                fiber.dispose()
+            self._fibers.pop(plugin_id, None)
+            raise
+        self._draft_plugins.pop(plugin_id, None)
+        logger.info("Promoted DRAFT plugin '%s' with %d tools", plugin_id, len(published))
+        return fiber
+
+    def discard_draft(self, plugin_id: str) -> None:
+        """Dispose an unpublished DRAFT and remove all staging metadata."""
+        fiber = self._fibers.pop(plugin_id, None)
+        self._draft_plugins.pop(plugin_id, None)
+        if fiber is not None and not fiber.is_disposed:
+            fiber.dispose()
 
     def scoped_register(self, plugin: ToolPlugin, fiber: PluginFiber) -> None:
         """Register a plugin with lifecycle tracking.

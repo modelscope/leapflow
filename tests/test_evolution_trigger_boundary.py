@@ -35,28 +35,21 @@ _CONTEXT_PY = Path(__file__).parents[1] / "src" / "leapflow" / "cli" / "context.
 # ════════════════════════════════════════════════════════════════
 
 
-def _learning_phase_body() -> ast.AST:
-    """Return the AST of ``_on_session_end_learning``'s trajectory-grading phase."""
+def _learning_boundary_body() -> ast.AST:
+    """Return the AST of the durable semantic session boundary."""
     tree = ast.parse(_CONTEXT_PY.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_on_session_end_learning":
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_learning_boundary":
             return node
-    raise AssertionError("_on_session_end_learning not found")
+    raise AssertionError("run_learning_boundary not found")
 
 
-def test_the_governance_sweep_is_not_nested_in_the_trajectory_branch() -> None:
-    """The defect, asserted structurally so a refactor cannot quietly re-nest it.
-
-    ``_run_coevolution_sweep`` documents that it "runs whether or not the teacher
-    proposed anything, so its no-op traces distinguish a quiet session from a sweep
-    that never ran". Nested inside ``if trajectory:`` it did neither, and three
-    reachability segments read "no sweep trace observed" on a live board for that
-    reason alone.
-    """
-    phase = _learning_phase_body()
-
+def test_the_governance_sweep_is_not_nested_in_the_teacher_job_branch() -> None:
+    """A boundary with no teacher job must still leave governance evidence."""
+    boundary = _learning_boundary_body()
     sweep_calls = [
-        node for node in ast.walk(phase)
+        node
+        for node in ast.walk(boundary)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "_run_coevolution_sweep"
@@ -64,12 +57,11 @@ def test_the_governance_sweep_is_not_nested_in_the_trajectory_branch() -> None:
     assert len(sweep_calls) == 1, "the sweep must be driven from exactly one place"
     sweep_line = sweep_calls[0].lineno
 
-    # Any `if` whose test mentions the trajectory must not contain the sweep call.
-    for node in ast.walk(phase):
+    for node in ast.walk(boundary):
         if not isinstance(node, ast.If):
             continue
         test_names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
-        if "trajectory" not in test_names:
+        if not ({"jobs", "finalizations"} & test_names):
             continue
         guarded = [
             child.lineno
@@ -78,15 +70,16 @@ def test_the_governance_sweep_is_not_nested_in_the_trajectory_branch() -> None:
             if hasattr(child, "lineno")
         ]
         assert sweep_line not in guarded, (
-            "the sweep is nested inside a trajectory guard again; an empty trajectory "
-            "would skip it and the board would report 'no sweep trace observed'"
+            "the sweep is nested inside teacher-work availability; a quiet boundary "
+            "would be indistinguishable from a sweep that never ran"
         )
 
 
-def test_an_empty_trajectory_still_reports_its_phase() -> None:
-    """The quiet path must remain observable, not silent."""
+def test_the_legacy_shutdown_only_learning_path_is_absent() -> None:
+    """Teacher work must be driven only by durable session finalization."""
     source = _CONTEXT_PY.read_text(encoding="utf-8")
-    assert '"note": "empty_trajectory"' in source
+    assert "_on_session_end_learning" not in source
+    assert "_drive_world_model_evolution" not in source
 
 
 # ════════════════════════════════════════════════════════════════
@@ -117,16 +110,21 @@ def test_cleanup_drives_the_boundary_through_the_public_entry_point() -> None:
 
 
 def test_the_daemon_exposes_the_boundary_as_an_rpc() -> None:
-    """It has to run in the daemon: that is the process holding the trajectory."""
-    from leapflow.daemon.protocol import METHOD_REGISTRY
+    """It has to run in the daemon: that process owns the durable event stream."""
+    from leapflow.daemon.protocol import LeapService, METHOD_REGISTRY
 
     assert METHOD_REGISTRY.get("evolution.run") == "evolution_run"
+    signature = inspect.signature(LeapService.evolution_run)
+    assert signature.parameters["session_id"].default is inspect.Parameter.empty
 
 
 def test_the_cli_can_run_the_boundary_without_stopping_the_daemon() -> None:
     from leapflow.cli.commands.evolve import cmd_evolve
 
     assert callable(cmd_evolve)
+    source = (Path(__file__).parents[1] / "src" / "leapflow" / "cli" / "cli.py").read_text()
+    assert '"--session"' in source
+    assert "required=True" in source
 
 
 def test_the_trajectory_buffer_is_bounded() -> None:
@@ -167,13 +165,15 @@ def producer() -> EvolutionProducer:
 
 
 def _run(producer: EvolutionProducer, queue: object) -> dict:
-    """Call the segment with a stubbed store, since the store lookup reads settings."""
-    original = producer._json_store
-    producer._json_store = lambda *args, **kwargs: queue  # type: ignore[assignment]
+    """Call the segment with a projection shaped from the supplied lifecycle rows."""
     try:
-        return producer._segment_lifecycle()
-    finally:
-        producer._json_store = original  # type: ignore[assignment]
+        proposals = [
+            {"status": item.status}
+            for item in queue.list_items(limit=0)  # type: ignore[attr-defined]
+        ]
+    except (AttributeError, OSError):
+        return producer._segment_lifecycle(None)
+    return producer._segment_lifecycle({"proposals": proposals})
 
 
 def test_a_queue_that_never_advances_is_not_wired(producer: EvolutionProducer) -> None:

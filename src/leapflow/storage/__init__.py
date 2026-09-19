@@ -11,6 +11,13 @@ Key infrastructure:
 from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
 from leapflow.storage.conversation_store import DuckDBConversationStore
 from leapflow.storage.duckdb_connect import DatabaseLockedError, connect, is_lock_error
+from leapflow.storage.capability_proposal_queue import EvolutionCapabilityProposalStore
+from leapflow.storage.distilled_knowledge_store import EvolutionDistilledKnowledgeStore
+from leapflow.storage.evolution_event_store import (
+    DuckDBEvolutionEventStore,
+    EvolutionTraceEventStore,
+)
+from leapflow.storage.plugin_outcome_store import EvolutionPluginOutcomeStore
 from leapflow.storage.session_store import LearningSessionStore
 from leapflow.storage.skill_docs import SkillDocStore
 from leapflow.storage.skill_library import SkillLibraryStore
@@ -21,6 +28,11 @@ __all__ = [
     "ConnectionHolder",
     "DatabaseLockedError",
     "DuckDBConversationStore",
+    "DuckDBEvolutionEventStore",
+    "EvolutionCapabilityProposalStore",
+    "EvolutionDistilledKnowledgeStore",
+    "EvolutionPluginOutcomeStore",
+    "EvolutionTraceEventStore",
     "LocalConnectionHolder",
     "LearningSessionStore",
     "SkillDocStore",

@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from leapflow.domain.tool_pipeline import ToolExecutionPipeline
+from leapflow.performance import LatencySummary, RollingLatency
 from leapflow.plugins.protocol import ToolMetadata, ToolPlugin
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,7 @@ class ToolPluginRegistry:
         self._version: int = 0
         self._last_bound_deps: dict[str, Any] = {}  # Track last-injected deps for re-injection on reload
         self._tool_pipeline = ToolExecutionPipeline()
+        self._snapshot_latency = RollingLatency()
 
         # ── Cross-cutting runtime gates ──
         self._file_read_gate: Any = None
@@ -257,22 +260,47 @@ class ToolPluginRegistry:
         )
 
     def publish_plugin_tools(self, plugin: ToolPlugin) -> list[str]:
-        """Publish an already-registered plugin's tools into the live catalog.
+        """Publish an already-registered plugin's tools into the live catalog."""
+        return self._publish_plugin_tools(plugin, strict=False)
 
-        assemble() runs once at boot; a plugin that arrives later (install,
-        hot-reload) makes its tools dispatchable through this method, keeping
-        the definitions, metadata, and handler table in one place instead of
-        letting callers write to the registry's internals.
+    def publish_plugin_tools_atomic(self, plugin: ToolPlugin) -> list[str]:
+        """Publish all tools or none, rejecting live-name collisions up front."""
+        return self._publish_plugin_tools(plugin, strict=True)
 
-        Returns the published tool names and bumps the version counter so
-        downstream caches (engine tool registry, PCD catalog) invalidate.
-        """
+    def _publish_plugin_tools(self, plugin: ToolPlugin, *, strict: bool) -> list[str]:
         tool_names = [tool.name for tool in plugin.tools]
+        if strict:
+            duplicates = sorted({name for name in tool_names if tool_names.count(name) > 1})
+            conflicts = sorted(
+                name
+                for name in tool_names
+                if name in self._tool_owner and self._tool_owner[name] != plugin.plugin_id
+            )
+            if duplicates or conflicts:
+                details = []
+                if duplicates:
+                    details.append(f"duplicate declarations: {duplicates}")
+                if conflicts:
+                    details.append(f"live conflicts: {conflicts}")
+                raise ValueError("plugin tool publication rejected: " + "; ".join(details))
         # Before the first assemble() the pending pass will pick these tools up
         # from the plugin itself; publishing now would duplicate every schema.
         if self._assembled:
-            for tool in plugin.tools:
-                self._index_tool(tool, plugin.plugin_id)
+            handlers_before = dict(self._tool_handlers)
+            owners_before = dict(self._tool_owner)
+            definitions_before = list(self._tool_definitions)
+            metadata_before = list(self._all_metadata)
+            conflicts_before = list(self._conflicts)
+            try:
+                for tool in plugin.tools:
+                    self._index_tool(tool, plugin.plugin_id)
+            except Exception:
+                self._tool_handlers = handlers_before
+                self._tool_owner = owners_before
+                self._tool_definitions = definitions_before
+                self._all_metadata = metadata_before
+                self._conflicts = conflicts_before
+                raise
         self._bump_version(
             "tools_published", plugin_id=plugin.plugin_id, tool_names=list(tool_names)
         )
@@ -417,6 +445,18 @@ class ToolPluginRegistry:
         if not self._assembled:
             self.assemble()
         return self._tool_handlers
+
+    def snapshot_handlers(self) -> dict[str, Any]:
+        """Return an immutable-by-convention turn snapshot and record copy latency."""
+        started_at = perf_counter()
+        try:
+            return dict(self.tool_handlers)
+        finally:
+            self._snapshot_latency.observe((perf_counter() - started_at) * 1000.0)
+
+    @property
+    def snapshot_latency(self) -> LatencySummary:
+        return self._snapshot_latency.snapshot()
 
     @property
     def all_metadata(self) -> list[ToolMetadata]:

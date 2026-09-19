@@ -21,7 +21,6 @@ from leapflow.engine.session_factory import (
     _default_stats_db_path,
     _load_or_new_trust_ledger,
     _resolve_stats_store,
-    _wire_plugin_stats_sink,
     persist_plugin_trust_state,
 )
 from leapflow.engine.turn_usage import TurnUsageTracker

@@ -12,16 +12,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Optional, Set
 
 from .task_graph import TaskGraph, TaskNode, TaskStatus, RetryPolicy
-from leapflow.skills.registry import SkillRegistry, SkillResult
-from leapflow.platform.protocol import HostRpc
+from leapflow.skills.registry import SkillRegistry
 
 logger = logging.getLogger(__name__)
 
 # Callback type for progress reporting
 NodeCallback = Callable[[TaskNode, TaskGraph], None]
+ActionDispatcher = Callable[[Dict[str, Any], str], Awaitable[Any]]
 
 
 class SchedulerError(Exception):
@@ -38,26 +38,30 @@ class TaskScheduler:
     Design principles:
     - Single-responsibility: only orchestrates execution order and concurrency
     - Open/closed: extensible dispatch via action_type routing
-    - Dependency inversion: depends on SkillRegistry and HostRpc abstractions
+    - Dependency inversion: delegates every operation through ActionDispatcher
     """
 
     def __init__(
         self,
         registry: SkillRegistry,
-        rpc: HostRpc,
         *,
         max_concurrency: int = 3,
         on_node_complete: Optional[NodeCallback] = None,
         on_node_failed: Optional[NodeCallback] = None,
         graph_planner: Optional[Any] = None,
+        action_dispatcher: Optional[ActionDispatcher] = None,
     ) -> None:
         self._registry = registry
-        self._rpc = rpc
         self._max_concurrency = max_concurrency
         self._on_node_complete = on_node_complete
         self._on_node_failed = on_node_failed
         self._graph_planner = graph_planner
+        self._action_dispatcher = action_dispatcher
         self._semaphore: Optional[asyncio.Semaphore] = None
+
+    def set_action_dispatcher(self, dispatcher: ActionDispatcher) -> None:
+        """Bind the runtime's single action execution entry point."""
+        self._action_dispatcher = dispatcher
 
     # ═══ Public API ═══
 
@@ -223,65 +227,45 @@ class TaskScheduler:
     async def _dispatch_action(
         self, node: TaskNode, params: Dict[str, Any]
     ) -> Any:
-        """Route execution to skill registry or RPC bridge based on action_type."""
-        if node.action_type == "skill":
-            result: SkillResult = await self._registry.invoke(
-                node.action,
-                user_goal=node.expected_effect or "",
-                **params,
-            )
-            if not result.ok:
-                raise RuntimeError(result.error or f"Skill '{node.action}' failed")
-            return result.output
-        elif node.action_type == "bridge":
-            return await self._dispatch_bridge(node, params)
-        else:
+        """Route every scheduled operation through the runtime action dispatcher."""
+        if node.action_type not in {"skill", "bridge"}:
             raise ValueError(f"Unknown action_type: '{node.action_type}'")
+        return await self._dispatch(node.action_type, node.action, params, node.expected_effect)
 
-    async def _dispatch_bridge(
-        self, node: TaskNode, params: Dict[str, Any]
+    async def _dispatch(
+        self,
+        action_type: str,
+        action_name: str,
+        params: Dict[str, Any],
+        user_goal: str,
     ) -> Any:
-        """Execute a bridge action, optionally wrapping with prediction loop."""
-        pl = self._registry.prediction_loop
-        if pl is not None and pl.enabled and node.expected_effect:
-            prediction = pl.create_from_react_prediction(
-                action_desc=f"dag_bridge:{node.action}",
-                predicted_effect=node.expected_effect,
-            )
-            await pl.capture_pre_snapshot()
-            result = await self._rpc.call(node.action, params or None)
-            await pl.verify_prediction(prediction)
-            return result
-        return await self._rpc.call(node.action, params or None)
+        dispatcher = self._action_dispatcher
+        if dispatcher is None:
+            raise SchedulerError("TaskScheduler requires the runtime action dispatcher")
+        result = await dispatcher(
+            {"type": action_type, "name": action_name, "payload": params},
+            user_goal or "",
+        )
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise RuntimeError(str(result.get("error") or f"Action '{action_name}' failed"))
+        if isinstance(result, dict) and "result" in result:
+            return result["result"]
+        return result
 
     async def _dispatch_fallback(
         self, node: TaskNode, fallback_action: str, params: Dict[str, Any]
     ) -> Any:
         """Execute fallback action on final failure.
 
-        Attempts skill registry first, falls back to bridge call.
-        Both paths are observable by the prediction loop when available.
+        Resolves the fallback kind, then delegates through the same action boundary.
         """
-        skill = self._registry.get(fallback_action)
-        if skill is not None:
-            result = await self._registry.invoke(
-                fallback_action, user_goal=node.expected_effect or "", **params,
-            )
-            if not result.ok:
-                raise RuntimeError(result.error or f"Fallback skill '{fallback_action}' failed")
-            return result.output
-        # Try as bridge method (with prediction wrap if available)
-        pl = self._registry.prediction_loop
-        if pl is not None and pl.enabled and node.expected_effect:
-            prediction = pl.create_from_react_prediction(
-                action_desc=f"dag_fallback:{fallback_action}",
-                predicted_effect=node.expected_effect,
-            )
-            await pl.capture_pre_snapshot()
-            result = await self._rpc.call(fallback_action, params or None)
-            await pl.verify_prediction(prediction)
-            return result
-        return await self._rpc.call(fallback_action, params or None)
+        action_type = "skill" if self._registry.get(fallback_action) is not None else "bridge"
+        return await self._dispatch(
+            action_type,
+            fallback_action,
+            params,
+            node.expected_effect,
+        )
 
     # ═══ Condition Evaluation ═══
 

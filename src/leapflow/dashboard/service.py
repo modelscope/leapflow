@@ -36,6 +36,14 @@ class DashboardDataProvider(Protocol):
         """Return signal flow health metrics."""
         ...
 
+    async def evolution_projection(self, *, session_id: str) -> dict[str, Any]:
+        """Return one session-scoped evolution projection."""
+        ...
+
+    async def evolution_projection_aggregate(self) -> dict[str, Any]:
+        """Return the explicitly cross-session evolution projection."""
+        ...
+
     async def hardware_inventory(self) -> dict[str, Any]:
         """Return the admitted device fleet grouped by declared class."""
         ...
@@ -66,6 +74,12 @@ class DaemonDataProvider:
                 "signal_stream": result.get("signal_stream", []),
             }
         return {"metrics": {}, "signal_stream": []}
+
+    async def evolution_projection(self, *, session_id: str) -> dict[str, Any]:
+        return dict(await self._client.evolution_projection(session_id=session_id) or {})
+
+    async def evolution_projection_aggregate(self) -> dict[str, Any]:
+        return dict(await self._client.evolution_projection_aggregate() or {})
 
     async def hardware_inventory(self) -> dict[str, Any]:
         """Return the device fleet, tolerating a daemon without the RPC.
@@ -518,7 +532,12 @@ class DashboardViewBuilder:
             return await self._build_device(template_name, intent, provider)
         payload_domain = _PAYLOAD_DOMAINS.get(template_name)
         if payload_domain is not None:
-            return await self._build_from_finding_payload(template_name, provider, *payload_domain)
+            return await self._build_from_finding_payload(
+                template_name,
+                provider,
+                *payload_domain,
+                session_id=intent.session_id,
+            )
         return await self._build_session(intent.template, provider)
 
     async def _build_device(
@@ -641,6 +660,8 @@ class DashboardViewBuilder:
         provider: DashboardDataProvider,
         finding_domain: str,
         data_key: str,
+        *,
+        session_id: str = "",
     ) -> dict[str, Any]:
         """Render a template from the newest finding of one producer domain.
 
@@ -650,6 +671,16 @@ class DashboardViewBuilder:
         """
         watch, domain_findings = await self._domain_watch_payload(provider, finding_domain)
         payload = dict(domain_findings[0].get("payload") or {}) if domain_findings else {}
+        event_projection: dict[str, Any] = {}
+        if finding_domain == "framework_evolution":
+            event_projection = await self._event_projection(provider, session_id=session_id)
+            if event_projection:
+                previous_summary = dict(payload.get("summary") or {})
+                payload.update(event_projection)
+                payload["summary"] = {
+                    **previous_summary,
+                    **dict(event_projection.get("summary") or {}),
+                }
         data = {
             "title": template.replace("_", " ").title(),
             data_key: payload,
@@ -690,7 +721,34 @@ class DashboardViewBuilder:
             notice = _hardware_notice(inventory, payload)
             if notice is not None:
                 data["notice"] = notice
-        return self._render(template, data)
+        rendered = self._render(template, data)
+        if event_projection:
+            rendered.setdefault("meta", {})["evolution_projection"] = {
+                "scope": event_projection.get("scope", "aggregate"),
+                "session_id": event_projection.get("session_id", ""),
+                "last_sequence": event_projection.get("last_sequence", 0),
+            }
+        return rendered
+
+    @staticmethod
+    async def _event_projection(
+        provider: DashboardDataProvider,
+        *,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """Read the canonical event projection, degrading for older daemons."""
+        try:
+            if session_id:
+                result = await provider.evolution_projection(session_id=session_id)
+            else:
+                result = await provider.evolution_projection_aggregate()
+        except (AttributeError, RuntimeError, TypeError):
+            logger.debug("dashboard: evolution projection unavailable", exc_info=True)
+            return {}
+        if not result.get("ok"):
+            return {}
+        projection = result.get("projection")
+        return dict(projection) if isinstance(projection, dict) else {}
 
     async def _build_session(self, template: str, provider: DashboardDataProvider) -> dict[str, Any]:
         # The session watch emits an insight finding whose payload carries the

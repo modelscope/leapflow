@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from typing import Any
 
 import pytest
 
@@ -19,6 +18,21 @@ from leapflow.plugins.sandbox.protocol import SandboxRequest, SandboxResponse
 
 class TestSandboxProtocol:
     """SandboxRequest/Response serialization roundtrips."""
+
+    def test_resource_limits_validate_configuration(self) -> None:
+        from leapflow.plugins.sandbox.sandbox_host import SandboxLimits
+
+        limits = SandboxLimits(
+            invoke_timeout_s=1.5,
+            shutdown_timeout_s=0.5,
+            cpu_time_s=7,
+            max_memory_bytes=128 * 1024 * 1024,
+        )
+        assert limits.cpu_time_s == 7
+        with pytest.raises(ValueError, match="timeouts"):
+            SandboxLimits(invoke_timeout_s=0)
+        with pytest.raises(ValueError, match="resource limits"):
+            SandboxLimits(max_memory_bytes=-1)
 
     def test_request_roundtrip_basic(self) -> None:
         req = SandboxRequest(
@@ -183,6 +197,7 @@ from hang_plugin import plugin
         resp = await host.invoke("hang_tool", {"params": {}})
         assert resp.ok is False
         assert "timed out" in resp.error
+        assert host._proc is None, "a timed-out worker must be terminated"
     finally:
         await host.stop()
 

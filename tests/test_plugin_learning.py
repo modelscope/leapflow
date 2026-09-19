@@ -12,14 +12,11 @@ from __future__ import annotations
 
 import pytest
 from typing import Any
-from unittest.mock import patch, MagicMock
 
 from leapflow.learning.plugin_trust import PluginTrustLedger, PluginTrustLevel
-from leapflow.learning.plugin_stats import PluginUsageTracker, PluginStats
+from leapflow.learning.plugin_stats import PluginUsageTracker
 from leapflow.learning.plugin_advisor import (
     PluginAdvisor,
-    PluginRecommendation,
-    get_default_advisor,
     set_default_advisor,
 )
 

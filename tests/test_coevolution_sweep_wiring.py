@@ -330,11 +330,14 @@ def test_active_proposal_ids_targets_the_newest_record_for_a_plugin(tmp_path):
     from leapflow.cli.context import Context
     from leapflow.domain.capability_requirement import CapabilityRequirement
     from leapflow.layout import ProfileLayout
-    from leapflow.storage.capability_proposal_queue import JsonCapabilityProposalQueue
+    from leapflow.storage.capability_proposal_queue import EvolutionCapabilityProposalStore
+    from leapflow.storage.evolution_event_store import DuckDBEvolutionEventStore
 
     layout = ProfileLayout(root=tmp_path / "profile", profile_id="p")
     layout.root.mkdir(parents=True, exist_ok=True)
-    queue = JsonCapabilityProposalQueue(layout.capability_proposal_queue_path)
+    queue = EvolutionCapabilityProposalStore(
+        DuckDBEvolutionEventStore(tmp_path / "events.duckdb"), profile_id="p"
+    )
     queue.enqueue(
         requirements=(
             CapabilityRequirement.create("chat.reply", "world_model", requirement_id="req-a"),
@@ -350,7 +353,10 @@ def test_active_proposal_ids_targets_the_newest_record_for_a_plugin(tmp_path):
     # Bump the second record so it is unambiguously the most recently touched.
     queue.update(newer.proposal_id, status="GENERATED")
 
-    ctx = _Ctx(settings=SimpleNamespace(profile_layout=layout))
+    ctx = _Ctx(
+        settings=SimpleNamespace(profile_layout=layout),
+        _capability_proposal_queue=queue,
+    )
     mapping = Context._active_proposal_ids(ctx)
     assert mapping["shared_plugin"] == newer.proposal_id
 

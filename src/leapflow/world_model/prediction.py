@@ -18,7 +18,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from leapflow.world_model.budget import LearningBudgetController
@@ -99,12 +99,10 @@ class PredictionOutcome:
 
 
 class PredictionLoop:
-    """Core on-policy learning engine: Predict → Execute → Compare → Learn.
+    """Legacy prediction and comparison model used by explicit observation flows.
 
-    Wraps action execution to transparently inject prediction and comparison.
-    When disabled or budget-exhausted, passes through execution unchanged.
-
-    Maintains a trajectory buffer for OPD trajectory-level teacher grading.
+    Action execution is owned by ``ActionExecutor``. This component may grade an
+    already-observed transition, but it never wraps or replays an action.
     """
 
     def __init__(
@@ -190,89 +188,6 @@ class PredictionLoop:
             )
         except Exception:
             logger.debug("record_failure failed", exc_info=True)
-
-    async def wrap_execution(
-        self,
-        action_desc: str,
-        execute_fn: Callable[..., Awaitable[Any]],
-        *args: Any,
-        fidelity: Optional["SnapshotFidelity"] = None,
-        **kwargs: Any,
-    ) -> Tuple[Any, Optional[PredictionOutcome]]:
-        """Wrap an action execution with the prediction-comparison loop.
-
-        Returns (execution_result, prediction_outcome_or_none).
-        """
-        if not self._enabled or not self._budget.has_tokens("prediction"):
-            result = await execute_fn(*args, **kwargs)
-            return result, None
-
-        try:
-            return await self._run_loop(action_desc, execute_fn, args, kwargs, fidelity)
-        except Exception:
-            logger.debug("prediction_loop.wrap_execution failed; executing raw", exc_info=True)
-            result = await execute_fn(*args, **kwargs)
-            return result, None
-
-    async def _run_loop(
-        self,
-        action_desc: str,
-        execute_fn: Callable[..., Awaitable[Any]],
-        args: tuple,
-        kwargs: dict,
-        fidelity: Optional["SnapshotFidelity"],
-    ) -> Tuple[Any, Optional[PredictionOutcome]]:
-        from leapflow.perception.state_snapshot import SnapshotFidelity
-
-        fid = fidelity or SnapshotFidelity.LIGHT
-
-        # Phase 1: Capture pre-state
-        pre = await self._snapshot.capture(fid)
-
-        # Phase 2: Predict
-        prediction = await self._predict(action_desc, pre)
-
-        # Phase 3: Execute
-        result = await execute_fn(*args, **kwargs)
-
-        # Phase 4: Capture post-state
-        post = await self._snapshot.capture(fid)
-
-        # Phase 5: Compare
-        outcome = await self._compare(prediction, pre, post)
-
-        # Phase 6: Store experience
-        exp_id = self._store.store(
-            action_description=action_desc,
-            app_context=pre.app_bundle_id,
-            predicted_effect=prediction.expected_effect,
-            actual_effect=outcome.actual_effect,
-            delta=outcome.delta,
-            pre_state_summary=pre.to_prompt_context(budget_tokens=100),
-            post_state_summary=post.to_prompt_context(budget_tokens=100),
-        )
-
-        outcome = replace(outcome, experience_id=exp_id)
-
-        # Phase 7: Accumulate trajectory for OPD grading
-        self._trajectory_buffer.append({
-            "experience_id": exp_id,
-            "action_description": action_desc,
-            "app_context": pre.app_bundle_id,
-            "predicted_effect": prediction.expected_effect,
-            "actual_effect": outcome.actual_effect,
-            "delta": outcome.delta,
-        })
-
-        self._budget.spend("prediction")
-
-        if self._on_outcome is not None:
-            try:
-                self._on_outcome(outcome)
-            except Exception:
-                logger.debug("on_prediction_outcome callback failed", exc_info=True)
-
-        return result, outcome
 
     async def _predict(self, action_desc: str, pre: "StateSnapshot") -> Prediction:
         """Generate a prediction using LLM with retrieval-augmented context."""

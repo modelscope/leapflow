@@ -13,14 +13,22 @@ The first works alone; the second only fills the gaps the first cannot see.
 """
 
 from leapflow.evolution.ledger import DEFAULT_EPISODE_TTL_S, EvolutionLedger
+from leapflow.evolution.projection import EvolutionProjectionRunner
+from leapflow.evolution.session_finalizer import SessionFinalization, SessionFinalizer
 from leapflow.evolution.sink import DEFAULT_BUFFER_SIZE, LedgerEvolutionSink
 from leapflow.evolution.sweep import CoevolutionSweep, SweepOutcome
+from leapflow.evolution.teacher_worker import DurableTeacherWorker, TeacherJobOutcome
 
 __all__ = [
     "DEFAULT_BUFFER_SIZE",
     "DEFAULT_EPISODE_TTL_S",
     "CoevolutionSweep",
+    "DurableTeacherWorker",
     "EvolutionLedger",
+    "EvolutionProjectionRunner",
     "LedgerEvolutionSink",
+    "SessionFinalization",
+    "SessionFinalizer",
     "SweepOutcome",
+    "TeacherJobOutcome",
 ]
