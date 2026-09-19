@@ -221,6 +221,7 @@ __marimo__/
 *.duckdb
 *.duckdb.wal
 .leapflow/
+.learnings/
 .idea/
 
 # Swift / Xcode
