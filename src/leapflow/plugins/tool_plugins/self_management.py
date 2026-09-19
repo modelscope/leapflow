@@ -10,10 +10,10 @@ Read-only governance (no approval needed):
     - plugin_propose  : create a side-effect-free proposal from capability-gap evidence
     - assess_compatibility : assess foreign plugin manifest compatibility with LeapFlow
 
-Generation (no approval needed — produces validated code without installing):
+Governed generation (proposal content approval, no installation yet):
     - plugin_generate : describe a capability need; the LLM produces conformant
-                        plugin code and it is rigorously validated. The validated
-                        code is returned; installation is a separate, gated step.
+                        plugin code, stores it in CAS, validates it, and requests
+                        content approval. Installation is a second gated step.
 
 State-mutating (REQUIRES approval — routed through the plugin_approval_gate):
     - plugin_install  : write validated code (from plugin_generate) or a
@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from leapflow.plugins.protocol import ToolMetadata
 
@@ -102,6 +102,7 @@ class SelfManagementPlugin:
         # lazily from the active profile layout so in-process CLI mode still
         # installs into a profile-scoped path rather than the package dir.
         self._plugin_install_dir: Optional[str] = None
+        self._plugin_staging_dir: Optional[str] = None
         # Optional MarketplaceClient used by the marketplace_name install branch.
         # None when no marketplace is configured; the branch then returns a
         # structured error.
@@ -109,15 +110,14 @@ class SelfManagementPlugin:
         # Hex-encoded Ed25519 public keys trusted to sign marketplace plugins.
         # When non-empty, marketplace installs require a valid signature.
         self._trusted_pubkeys: set[str] = set()
-        # Optional persistent store for PluginProposal review queue. When not
-        # injected, it is resolved lazily from ProfileLayout.plugin_proposals_path.
-        self._plugin_proposal_store: Any = None
-        # Acquisition-lifecycle ledger (PENDING -> GENERATED -> INSTALLED ->
-        # PROBATION -> VERIFIED/QUARANTINED). Distinct from the review store above:
-        # that one answers "should a human accept this proposal", this one tracks
-        # where the capability is in its journey, and is what AdaptiveEvolutionPolicy
-        # and LifecycleGovernor operate on.
+        # Sole acquisition-lifecycle ledger (PENDING -> GENERATED -> APPROVED ->
+        # INSTALLED -> PROBATION -> VERIFIED/QUARANTINED). Rich review content is
+        # embedded in the same record; AdaptiveEvolutionPolicy and LifecycleGovernor
+        # both operate on this store.
         self._capability_lifecycle_store: Any = None
+        self._proposal_orchestrator: Any = None
+        self._evolution_outbox: Any = None
+        self._evolution_profile_id: str = ""
         # Optional version store; lazily resolved from ProfileLayout.plugin_versions_dir.
         self._plugin_version_store: Any = None
         # Optional adaptive capability decision store; lazily resolved from
@@ -139,12 +139,15 @@ class SelfManagementPlugin:
             "llm_provider",
             "plugin_generation_enabled",
             "plugin_install_dir",
+            "plugin_staging_dir",
             "marketplace_client",
             "marketplace_trusted_pubkeys",
-            "plugin_proposal_store",
             "plugin_version_store",
             "capability_plan_store",
             "capability_lifecycle_store",
+            "proposal_orchestrator",
+            "evolution_outbox",
+            "evolution_profile_id",
         ]
 
     def bind_runtime(self, **deps: Any) -> None:
@@ -157,19 +160,26 @@ class SelfManagementPlugin:
         if "plugin_install_dir" in deps:
             value = deps["plugin_install_dir"]
             self._plugin_install_dir = str(value) if value else None
+        if "plugin_staging_dir" in deps:
+            value = deps["plugin_staging_dir"]
+            self._plugin_staging_dir = str(value) if value else None
         if "marketplace_client" in deps:
             self._marketplace_client = deps["marketplace_client"]
         if "marketplace_trusted_pubkeys" in deps:
             raw = deps["marketplace_trusted_pubkeys"] or ()
             self._trusted_pubkeys = {str(k).strip() for k in raw if str(k).strip()}
-        if "plugin_proposal_store" in deps:
-            self._plugin_proposal_store = deps["plugin_proposal_store"]
         if "plugin_version_store" in deps:
             self._plugin_version_store = deps["plugin_version_store"]
         if "capability_plan_store" in deps:
             self._capability_plan_store = deps["capability_plan_store"]
         if "capability_lifecycle_store" in deps:
             self._capability_lifecycle_store = deps["capability_lifecycle_store"]
+        if "proposal_orchestrator" in deps:
+            self._proposal_orchestrator = deps["proposal_orchestrator"]
+        if "evolution_outbox" in deps:
+            self._evolution_outbox = deps["evolution_outbox"]
+        if "evolution_profile_id" in deps:
+            self._evolution_profile_id = str(deps["evolution_profile_id"] or "")
 
     # ── Read-only introspection ────────────────────────────
 
@@ -303,9 +313,7 @@ class SelfManagementPlugin:
             "plugin_install_dir": install_dir,
             "marketplace_configured": self._marketplace_client is not None,
             "trusted_marketplace_pubkeys": len(self._trusted_pubkeys),
-            "proposal_store_available": (
-                self._plugin_proposal_store is not None or profile_layout is not None
-            ),
+            "proposal_store_available": self._capability_lifecycle_store is not None,
             "version_store_available": (
                 self._plugin_version_store is not None or profile_layout is not None
             ),
@@ -395,7 +403,7 @@ class SelfManagementPlugin:
             limitations.append("Marketplace installs require a configured marketplace client.")
         if not dependency_state["proposal_store_available"]:
             limitations.append(
-                "Plugin proposals require a profile layout or injected proposal store."
+                "Plugin proposals require the daemon-injected evolution lifecycle store."
             )
         if not dependency_state["version_store_available"]:
             limitations.append(
@@ -562,17 +570,17 @@ class SelfManagementPlugin:
             except (TypeError, ValueError) as exc:
                 return {"ok": False, "error": f"Proposal test case parsing failed: {exc}"}
 
-        try:
-            stored = self._proposal_store().save(proposal)
-        except (RuntimeError, OSError, ValueError, AttributeError) as exc:
-            return {"ok": False, "error": f"Proposal persistence failed: {exc}"}
-
-        lifecycle_id = self._open_lifecycle_record(stored, requested_capability)
+        lifecycle_id = self._open_lifecycle_record(proposal, requested_capability)
+        if not lifecycle_id:
+            return {
+                "ok": False,
+                "error": "Proposal persistence failed: lifecycle store unavailable",
+            }
 
         return {
             "ok": True,
             "action": "propose",
-            "proposal": stored.to_dict(),
+            "proposal": proposal.to_dict(),
             "lifecycle_proposal_id": lifecycle_id,
             "next_actions": [
                 "Review proposal fields and risk level.",
@@ -639,78 +647,102 @@ class SelfManagementPlugin:
             )
             result = await generator.generate_and_validate(request)
             if proposal_id:
+                lifecycle_id = self._lifecycle_proposal_id(source, proposal_id)
                 result["proposal_id"] = proposal_id
-                if result.get("ok"):
-                    self._mark_generation_started(source, proposal_id)
+                result["lifecycle_proposal_id"] = lifecycle_id
+                if result.get("ok") and lifecycle_id and self._proposal_orchestrator is not None:
+                    item = self._proposal_orchestrator.register_generated(
+                        lifecycle_id,
+                        str(result.get("code") or ""),
+                        validation={
+                            "ok": True,
+                            "stage": "passed",
+                            "compatibility_ok": True,
+                            "target_protocol": "ToolPlugin",
+                            "exposed_tools": list(result.get("exposed_tools") or ()),
+                        },
+                    )
+                    content_approval = await self._proposal_orchestrator.approve_content(
+                        lifecycle_id
+                    )
+                    result.update(
+                        {
+                            "generated_code_ref": item.generated_code_ref,
+                            "content_approved": content_approval.approved,
+                            "content_approval_id": content_approval.approval_id,
+                        }
+                    )
+                    if not content_approval.approved:
+                        result.update(
+                            {
+                                "ok": False,
+                                "error": content_approval.denial_message,
+                                "requires_approval": True,
+                            }
+                        )
+                elif result.get("ok"):
+                    result.update(
+                        {
+                            "ok": False,
+                            "error": "proposal orchestration unavailable; content approval cannot be recorded",
+                            "requires_approval": True,
+                        }
+                    )
             return result
-        except (AttributeError, RuntimeError) as exc:
+        except (AttributeError, KeyError, PermissionError, RuntimeError, ValueError) as exc:
             return {"ok": False, "error": f"Generation failed: {exc}"}
 
     def _resolve_generation_source(
         self, proposal_id: str
     ) -> tuple[str, str, str, tuple[str, ...]]:
-        """Resolve a generation request from *either* proposal store.
+        """Resolve either canonical lifecycle id or review alias from one store."""
+        try:
+            store = self._lifecycle_store()
+            item = store.get(proposal_id)
+            source = "lifecycle"
+            if item is None:
+                item = store.find_by_metadata("review_proposal_id", proposal_id)
+                source = "review"
+        except (RuntimeError, OSError, ValueError, AttributeError):
+            item = None
+            source = ""
+        if item is None:
+            return ("", "", "", ())
+        metadata = dict(item.metadata or {})
+        review_payload = metadata.get("review_proposal")
+        if isinstance(review_payload, Mapping):
+            from leapflow.domain.plugin_proposal import PluginProposal
 
-        Two stores can name a proposal, and both must reach generation:
-
-        * the **review store** (``JsonPluginProposalStore``) holds a rich
-          ``PluginProposal`` created by the manual ``plugin_propose`` UX flow;
-        * the **lifecycle queue** (``JsonCapabilityProposalQueue``) holds the
-          acquisition record the world-model driver enqueues -- a
-          ``prop-<hash>`` id keyed on the requirement, carrying the capability,
-          the ``plugin_id`` the sink stamped, and the hypothesis as its summary.
-
-        Before this, ``plugin_generate`` looked only in the review store, so a
-        world-model proposal could never be generated from its own id: Scene C could
-        not proceed from a real teacher verdict to a validated artifact. Returning a
-        normalised ``(source, plugin_id, description, provides_capabilities)`` unifies
-        the two consumption points without collapsing their distinct lifecycle
-        vocabularies. ``source`` is ``""`` when neither store knows the id.
-        """
-        review = self._proposal_store().get(proposal_id)
-        if review is not None:
+            review = PluginProposal.from_dict(review_payload)
             return (
-                "review",
+                source,
                 str(review.plugin_id),
                 str(review.capability_summary),
                 _declared_capabilities(review),
             )
-        try:
-            item = self._lifecycle_store().get(proposal_id)
-        except (RuntimeError, OSError, ValueError, AttributeError):
-            item = None
-        if item is not None:
-            requirements = [dict(r) for r in (item.requirements or ())]
-            capability = str((requirements[0].get("capability") if requirements else "") or "")
-            metadata = dict(item.metadata or {})
-            plugin_id = str(metadata.get("plugin_id") or "")
-            description = str(
-                metadata.get("capability_summary")
-                or (requirements[0].get("evidence") if requirements else "")
-                or capability
-            )
-            provides = (capability,) if capability else ()
-            return ("lifecycle", plugin_id, description, provides)
-        return ("", "", "", ())
+        requirements = [dict(requirement) for requirement in (item.requirements or ())]
+        capability = str((requirements[0].get("capability") if requirements else "") or "")
+        plugin_id = str(metadata.get("plugin_id") or "")
+        description = str(
+            metadata.get("capability_summary")
+            or (requirements[0].get("evidence") if requirements else "")
+            or capability
+        )
+        provides = (capability,) if capability else ()
+        return (source, plugin_id, description, provides)
 
-    def _mark_generation_started(self, source: str, proposal_id: str) -> None:
-        """Advance the proposal's status in whichever store owns it.
-
-        The two stores speak different vocabularies on purpose (see
-        ``evolution_contracts``): the review store moves to ``review`` (a human-accept
-        state), the lifecycle queue to ``GENERATED`` (an acquisition-lifecycle state
-        ``AdaptiveEvolutionPolicy`` reads next). Contained: a status write must not fail
-        a generation that already succeeded.
-        """
-        try:
-            if source == "review":
-                self._proposal_store().update_status(proposal_id, "review")
-            elif source == "lifecycle":
-                self._lifecycle_store().update(proposal_id, status="GENERATED")
-        except (RuntimeError, OSError, ValueError, AttributeError):
-            logger.debug(
-                "plugin_generate: could not advance %s status", proposal_id, exc_info=True
-            )
+    def _lifecycle_proposal_id(self, source: str, proposal_id: str) -> str:
+        if source == "lifecycle":
+            return proposal_id
+        if source == "review":
+            try:
+                item = self._lifecycle_store().find_by_metadata(
+                    "review_proposal_id", proposal_id
+                )
+            except (RuntimeError, OSError, ValueError, AttributeError):
+                item = None
+            return str(getattr(item, "proposal_id", "") or "")
+        return ""
 
     # ── Compatibility assessment (read-only) ─────────────────
 
@@ -826,12 +858,39 @@ class SelfManagementPlugin:
     ) -> Dict[str, Any]:
         """Install Python code/marketplace content or a real DSH source bundle."""
         proposal = None
+        lifecycle_id = ""
         if proposal_id:
-            proposal = self._proposal_store().get(proposal_id)
-            if proposal is None:
+            try:
+                store = self._lifecycle_store()
+                lifecycle = store.get(proposal_id)
+                if lifecycle is None:
+                    lifecycle = store.find_by_metadata("review_proposal_id", proposal_id)
+            except (RuntimeError, OSError, ValueError, AttributeError):
+                lifecycle = None
+            if lifecycle is None:
                 return {"ok": False, "error": f"Plugin proposal '{proposal_id}' not found"}
-            plugin_id = plugin_id or proposal.plugin_id
+            lifecycle_id = str(lifecycle.proposal_id)
+            metadata = dict(lifecycle.metadata or {})
+            review_payload = metadata.get("review_proposal")
+            if isinstance(review_payload, Mapping):
+                from leapflow.domain.plugin_proposal import PluginProposal
+
+                proposal = PluginProposal.from_dict(review_payload)
+                plugin_id = plugin_id or proposal.plugin_id
+            else:
+                plugin_id = plugin_id or str(metadata.get("plugin_id") or "")
         source_path = str(source_path or kwargs.get("source_path") or "")
+        if (
+            lifecycle_id
+            and not code
+            and not marketplace_name
+            and not source_path
+            and self._proposal_orchestrator is not None
+        ):
+            try:
+                code = self._proposal_orchestrator.generated_code(lifecycle_id)
+            except (KeyError, OSError, RuntimeError, ValueError) as exc:
+                return {"ok": False, "error": str(exc)}
         modes = sum(bool(value) for value in (code, marketplace_name, source_path))
         if modes != 1:
             return {
@@ -888,11 +947,31 @@ class SelfManagementPlugin:
         if not plugin_id:
             return {"ok": False, "error": "plugin_id is required unless source_path or proposal_id is provided"}
 
-        approved, denial = await self._check_approval(
-            "install", plugin_id, proposal_id=proposal_id, metadata=source_metadata,
-        )
-        if not approved:
-            return {"ok": False, "error": denial, "requires_approval": True}
+        if lifecycle_id:
+            if self._proposal_orchestrator is None:
+                return {
+                    "ok": False,
+                    "error": "proposal orchestration unavailable; mutation approval cannot be recorded",
+                    "requires_approval": True,
+                }
+            try:
+                mutation_approval = await self._proposal_orchestrator.authorize_mutation(
+                    lifecycle_id
+                )
+            except (KeyError, PermissionError, ValueError) as exc:
+                return {"ok": False, "error": str(exc), "requires_approval": True}
+            if not mutation_approval.approved:
+                return {
+                    "ok": False,
+                    "error": mutation_approval.denial_message,
+                    "requires_approval": True,
+                }
+        else:
+            approved, denial = await self._check_approval(
+                "install", plugin_id, proposal_id=proposal_id, metadata=source_metadata,
+            )
+            if not approved:
+                return {"ok": False, "error": denial, "requires_approval": True}
 
         from leapflow.plugins import get_registry
 
@@ -929,20 +1008,35 @@ class SelfManagementPlugin:
                 return {"ok": False, "error": "Must provide code, marketplace_name, or source_path"}
             if proposal_id:
                 result["proposal_id"] = proposal_id
-                if result.get("ok"):
-                    self._proposal_store().update_status(proposal_id, "approved")
+            if lifecycle_id and self._proposal_orchestrator is not None:
+                self._proposal_orchestrator.record_installed(lifecycle_id, result)
+                result["lifecycle_proposal_id"] = lifecycle_id
+            elif result.get("ok"):
+                from leapflow.domain.event_types import EvolutionEventType
+
+                persisted = await self._emit_plugin_event(
+                    EvolutionEventType.PLUGIN_INSTALLED,
+                    plugin_id=plugin_id,
+                    version_id=str(result.get("version") or version_label),
+                    payload={
+                        "action": "install",
+                        "installed_tools": list(result.get("installed_tools") or ()),
+                    },
+                    dedup_suffix=str(
+                        result.get("version")
+                        or source_metadata.get("bundle_sha256")
+                        or "installed"
+                    ),
+                )
+                if not persisted:
+                    result["audit_incomplete"] = True
             return result
         except (ImportError, AttributeError, OSError, RuntimeError, ValueError) as exc:
             logger.warning("plugin_install failed for %s: %s", plugin_id, exc, exc_info=True)
             return {"ok": False, "error": f"Install failed: {exc}"}
 
     def _resolve_install_dir(self) -> "Path":
-        """Resolve the profile-scoped directory for installed plugin code.
-
-        Precedence: the injected ``plugin_install_dir`` (from bind_runtime) ->
-        the active ``ProfileLayout.plugins_dir`` -> a plugins dir under the data
-        root. Always profile-scoped; never the Python package directory.
-        """
+        """Resolve the profile-scoped directory for installed plugin code."""
         from pathlib import Path
 
         if self._plugin_install_dir:
@@ -955,35 +1049,49 @@ class SelfManagementPlugin:
             return profile_layout.plugins_dir
         return Path(settings.layout.root) / "plugins"
 
-    def _proposal_store(self) -> Any:
-        """Resolve the profile-scoped proposal store."""
-        if self._plugin_proposal_store is not None:
-            return self._plugin_proposal_store
+    def _resolve_staging_dir(self) -> "Path":
+        """Resolve the profile-owned quarantine directory for candidate code."""
+        from pathlib import Path
+
+        if self._plugin_staging_dir:
+            return Path(self._plugin_staging_dir)
+        if self._plugin_install_dir:
+            return Path(self._plugin_install_dir) / ".staging"
         from leapflow.config import get_settings
-        from leapflow.storage.plugin_proposal_store import JsonPluginProposalStore
+
+        profile_layout = getattr(get_settings(), "profile_layout", None)
+        if profile_layout is not None:
+            return profile_layout.plugin_staging_dir
+        return self._resolve_install_dir() / ".staging"
+
+    @staticmethod
+    def _sandbox_settings() -> dict[str, int | float]:
+        """Return bounded sandbox configuration from the effective settings."""
+        from leapflow.config import get_settings
 
         settings = get_settings()
-        profile_layout = getattr(settings, "profile_layout", None)
-        if profile_layout is None:
-            raise RuntimeError("profile_layout is required for plugin proposal storage")
-        self._plugin_proposal_store = JsonPluginProposalStore(profile_layout.plugin_proposals_path)
-        return self._plugin_proposal_store
+        return {
+            "invoke_timeout_s": max(
+                0.1, float(getattr(settings, "plugin_sandbox_invoke_timeout_s", 15.0))
+            ),
+            "shutdown_timeout_s": max(
+                0.1, float(getattr(settings, "plugin_sandbox_shutdown_timeout_s", 3.0))
+            ),
+            "cpu_time_s": max(
+                0, int(getattr(settings, "plugin_sandbox_cpu_time_s", 30))
+            ),
+            "max_memory_bytes": max(
+                0, int(getattr(settings, "plugin_sandbox_max_memory_mb", 0))
+            )
+            * 1024
+            * 1024,
+        }
 
     def _lifecycle_store(self) -> Any:
         """Resolve the profile-scoped acquisition-lifecycle ledger."""
         if self._capability_lifecycle_store is not None:
             return self._capability_lifecycle_store
-        from leapflow.config import get_settings
-        from leapflow.storage.capability_proposal_queue import JsonCapabilityProposalQueue
-
-        settings = get_settings()
-        profile_layout = getattr(settings, "profile_layout", None)
-        if profile_layout is None:
-            raise RuntimeError("profile_layout is required for capability lifecycle storage")
-        self._capability_lifecycle_store = JsonCapabilityProposalQueue(
-            profile_layout.capability_proposal_queue_path
-        )
-        return self._capability_lifecycle_store
+        raise RuntimeError("capability lifecycle store was not injected by the runtime")
 
     def _open_lifecycle_record(self, proposal: Any, capability: str) -> str:
         """Open a PENDING lifecycle record correlated with a review proposal.
@@ -1013,6 +1121,7 @@ class SelfManagementPlugin:
                 metadata={
                     "plugin_id": proposal.plugin_id,
                     "review_proposal_id": proposal.proposal_id,
+                    "review_proposal": proposal.to_dict(),
                 },
             )
             self._trace_lifecycle_opened(item, proposal, requirement)
@@ -1091,8 +1200,14 @@ class SelfManagementPlugin:
     async def _install_from_code(
         self, plugin_id: str, code: str, *, proposal: Any = None, version_label: str = ""
     ) -> Dict[str, Any]:
-        """Re-validate, write to the profile dir, smoke test, then load in-process."""
+        """Validate in quarantine, then atomically publish one DRAFT fiber."""
+        import os
+        import shutil
+        import sys
+        import tempfile
+
         from leapflow.learning.plugin_generator import PluginValidator
+        from leapflow.plugins import get_scoped_registry
 
         validator = PluginValidator()
         vresult = await validator.validate(plugin_id, code)
@@ -1103,35 +1218,37 @@ class SelfManagementPlugin:
             }
 
         install_dir = self._resolve_install_dir()
+        staging_root = self._resolve_staging_dir()
         install_dir.mkdir(parents=True, exist_ok=True)
+        staging_root.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(tempfile.mkdtemp(prefix=f"{plugin_id}-", dir=staging_root))
+        staged_target = staging_dir / f"{plugin_id}.py"
         target = install_dir / f"{plugin_id}.py"
-        target.write_text(code)
-
-        # D3: real subprocess smoke test before the plugin is made live.
-        smoke_ok, smoke_err = await self._sandbox_smoke_test(plugin_id, install_dir)
-        if not smoke_ok:
-            self._safe_unlink(target)
-            return {"ok": False, "error": smoke_err}
-
-        result = self._register_inprocess(plugin_id, plugin_id, target)
-        if not result.get("ok"):
-            return result
-        if proposal is not None and getattr(proposal, "test_cases", ()):
-            ok, error, observations = await self._run_behavior_tests_for_plugin(
-                plugin_id, tuple(getattr(proposal, "test_cases", ()) or ())
-            )
-            result["behavior_tests"] = observations
-            if not ok:
-                from leapflow.plugins import get_scoped_registry
-
-                scoped = get_scoped_registry()
-                try:
-                    scoped.dispose_plugin(plugin_id, prune_metadata=True)
-                except KeyError:
-                    pass
-                self._safe_unlink(target)
-                return {"ok": False, "error": f"Behavior tests failed: {error}"}
+        previous_source = target.read_bytes() if target.exists() else None
+        previous_module = sys.modules.get(plugin_id)
+        scoped = get_scoped_registry()
+        promoted = False
         try:
+            staged_target.write_text(code, encoding="utf-8")
+            test_cases = tuple(getattr(proposal, "test_cases", ()) or ())
+            ok, error, observations = await self._sandbox_validate_candidate(
+                plugin_id,
+                staging_dir,
+                test_cases=test_cases,
+            )
+            if not ok:
+                return {"ok": False, "error": error, "behavior_tests": observations}
+
+            new_plugin, load_err = self._load_from_path(plugin_id, staged_target)
+            if new_plugin is None:
+                return {"ok": False, "error": load_err}
+            fiber = scoped.create_draft_fiber(plugin_id)
+            scoped.stage_plugin(new_plugin, fiber)
+            setattr(new_plugin, "__leapflow_plugin_path__", str(target))
+            os.replace(staged_target, target)
+            fiber = scoped.promote_draft(plugin_id)
+            promoted = True
+
             version_info = self._version_store().record_source(
                 plugin_id,
                 target,
@@ -1141,18 +1258,75 @@ class SelfManagementPlugin:
                     "proposal_id": getattr(proposal, "proposal_id", ""),
                 },
             )
-            result["version"] = version_info.get("version", "")
-        except (RuntimeError, OSError, ValueError, AttributeError) as exc:
-            logger.debug(
-                "plugin version recording skipped for %s: %s", plugin_id, exc, exc_info=True
-            )
-            version_info = {}
-        # An artifact this path installed is one self-evolution acquired, so later
-        # sweeps may verify its effect and reclaim it if nothing can ever select it.
-        # A hand-installed plugin is deliberately never recorded here.
-        self._record_acquisition(plugin_id)
-        self._trace_artifact_installed(plugin_id, proposal, version_info, result)
-        return result
+            result: Dict[str, Any] = {
+                "ok": True,
+                "action": "install",
+                "plugin_id": plugin_id,
+                "installed_tools": [tool.name for tool in new_plugin.tools],
+                "state": fiber.state.value,
+                "shadow_validated": True,
+                "behavior_tests": observations,
+                "version": version_info.get("version", ""),
+            }
+            self._record_acquisition(plugin_id)
+            self._trace_artifact_installed(plugin_id, proposal, version_info, result)
+            return result
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            if promoted:
+                try:
+                    scoped.dispose_plugin(plugin_id, prune_metadata=True)
+                except (KeyError, RuntimeError, ValueError):
+                    pass
+            else:
+                scoped.discard_draft(plugin_id)
+            if previous_source is None:
+                self._safe_unlink(target)
+            else:
+                target.write_bytes(previous_source)
+            if previous_module is None:
+                sys.modules.pop(plugin_id, None)
+            else:
+                sys.modules[plugin_id] = previous_module
+            return {"ok": False, "error": f"Install transaction failed: {exc}"}
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    async def _emit_plugin_event(
+        self,
+        event_type: str,
+        *,
+        plugin_id: str,
+        proposal_id: str = "",
+        version_id: str = "",
+        payload: Mapping[str, Any] | None = None,
+        dedup_suffix: str,
+    ) -> bool:
+        """Persist a plugin mutation fact through the daemon-owned outbox."""
+        outbox = self._evolution_outbox
+        if outbox is None or not self._evolution_profile_id:
+            return False
+        from leapflow.domain.evolution_event import EvolutionContext, EvolutionEvent
+
+        event = EvolutionEvent.create(
+            event_type,
+            context=EvolutionContext(
+                profile_id=self._evolution_profile_id,
+                proposal_id=proposal_id,
+                plugin_id=plugin_id,
+                version_id=version_id,
+                correlation_id=proposal_id or plugin_id,
+            ),
+            payload=dict(payload or {}),
+            producer="plugin.self_management",
+            privacy_class="profile",
+            dedup_key=f"{event_type}:{plugin_id}:{dedup_suffix}",
+        )
+        try:
+            await outbox.publish(event, critical=True)
+            return True
+        except Exception:  # noqa: BLE001 - mutation already happened; report audit gap
+            logger.error("plugin mutation event could not be persisted", exc_info=True)
+            return False
 
     @staticmethod
     def _record_acquisition(plugin_id: str) -> None:
@@ -1504,54 +1678,98 @@ class SelfManagementPlugin:
         return self._register_inprocess(plugin_id, module_name, installed_path)
 
     async def _sandbox_smoke_test(
-        self, module_name: str, install_dir: "Path", *, timeout_s: float = 15.0
+        self, module_name: str, install_dir: "Path", *, timeout_s: float | None = None
     ) -> tuple[bool, str]:
-        """Load the module in a sandbox worker and invoke its first tool once.
+        """Load a module in the bounded subprocess and invoke its first tool."""
+        limits = self._sandbox_settings()
+        if timeout_s is not None:
+            limits["invoke_timeout_s"] = max(0.1, float(timeout_s))
+        ok, error, _ = await self._sandbox_validate_candidate(
+            module_name,
+            install_dir,
+            test_cases=(),
+            limits=limits,
+        )
+        return ok, error
 
-        Returns (ok, error). A host-level failure (worker crash/timeout/comm
-        error, signalled by an empty ``error_type``) fails the test. A tool
-        that raises but is caught at the isolation boundary (non-empty
-        ``error_type``) still counts as success: the module loaded and the
-        handler is invocable, which is all the smoke test asserts.
-        """
-        import os
-
+    async def _sandbox_validate_candidate(
+        self,
+        module_name: str,
+        install_dir: "Path",
+        *,
+        test_cases: tuple[Any, ...],
+        limits: dict[str, int | float] | None = None,
+    ) -> tuple[bool, str, list[dict[str, Any]]]:
+        """Run smoke and proposal behavior tests without publishing host handlers."""
         from leapflow.plugins.sandbox.sandbox_host import SandboxHost
 
-        host = SandboxHost(module_name, invoke_timeout_s=timeout_s)
-        # The worker imports the plugin by module name; make the install dir
-        # importable for the child process during startup only.
-        started = False
-        original_pp = os.environ.get("PYTHONPATH")
-        os.environ["PYTHONPATH"] = os.pathsep.join(
-            [str(install_dir)] + ([original_pp] if original_pp else [])
+        sandbox_limits = dict(limits or self._sandbox_settings())
+        host = SandboxHost(
+            module_name,
+            python_paths=(str(install_dir),),
+            **sandbox_limits,
         )
+        started = False
+        observations: list[dict[str, Any]] = []
         try:
             await host.start()
             started = True
         except (OSError, RuntimeError, ValueError) as exc:
-            return False, f"Sandbox smoke test error: {exc}"
-        finally:
-            if original_pp is None:
-                os.environ.pop("PYTHONPATH", None)
-            else:
-                os.environ["PYTHONPATH"] = original_pp
+            return False, f"Sandbox smoke test error: {exc}", observations
         if not started:
-            return False, "Sandbox smoke test failed: worker did not start"
+            return False, "Sandbox smoke test failed: worker did not start", observations
 
         try:
             if not await host.ping():
-                return False, "Sandbox smoke test failed: worker did not respond"
+                return False, "Sandbox smoke test failed: worker did not respond", observations
             tool_names = await host.list_tools()
             if not tool_names:
-                return False, (
+                return (
+                    False,
                     "Sandbox smoke test failed: plugin exposed no tools "
-                    "(likely failed to import in isolation)"
+                    "(likely failed to import in isolation)",
+                    observations,
                 )
-            resp = await host.invoke(tool_names[0], {})
-            if not resp.ok and not resp.error_type:
-                return False, f"Sandbox smoke test failed: {resp.error}"
-            return True, ""
+            smoke = await host.invoke(tool_names[0], {})
+            if not smoke.ok and not smoke.error_type:
+                return False, f"Sandbox smoke test failed: {smoke.error}", observations
+            for index, case in enumerate(test_cases):
+                tool_name = str(getattr(case, "tool_name", "") or "")
+                if tool_name not in tool_names:
+                    return (
+                        False,
+                        f"Behavior tests failed: behavior test {index}: "
+                        f"tool {tool_name!r} not exposed",
+                        observations,
+                    )
+                arguments = dict(getattr(case, "arguments", {}) or {})
+                expected = dict(getattr(case, "expected_subset", {}) or {})
+                response = await host.invoke(tool_name, arguments)
+                if not response.ok:
+                    return (
+                        False,
+                        f"Behavior tests failed: behavior test {index}: "
+                        f"handler raised {response.error_type or 'SandboxError'}: {response.error}",
+                        observations,
+                    )
+                observations.append(
+                    {"tool_name": tool_name, "arguments": arguments, "result": response.result}
+                )
+                if not isinstance(response.result, dict):
+                    return (
+                        False,
+                        f"Behavior tests failed: behavior test {index}: result is not a dict",
+                        observations,
+                    )
+                for key, expected_value in expected.items():
+                    if response.result.get(key) != expected_value:
+                        return (
+                            False,
+                            f"Behavior tests failed: behavior test {index}: expected "
+                            f"{key}={expected_value!r}, got {response.result.get(key)!r}",
+                            observations,
+                        )
+            return True, "", observations
         finally:
             try:
                 await host.stop()
@@ -1568,22 +1786,21 @@ class SelfManagementPlugin:
         """
         import sys
 
-        from leapflow.plugins import get_registry, get_scoped_registry
+        from leapflow.plugins import get_scoped_registry
 
         new_plugin, load_err = self._load_from_path(module_name, target)
         if new_plugin is None:
             self._safe_unlink(target)
             return {"ok": False, "error": load_err}
 
-        reg = get_registry()
         scoped = get_scoped_registry()
-        fiber = scoped.create_fiber(plugin_id)
+        fiber = scoped.create_draft_fiber(plugin_id)
         try:
-            scoped.scoped_register(new_plugin, fiber)
-            fiber.activate()
-            installed_tools = reg.publish_plugin_tools(new_plugin)
+            scoped.stage_plugin(new_plugin, fiber)
+            fiber = scoped.promote_draft(plugin_id)
+            installed_tools = [tool.name for tool in new_plugin.tools]
         except (RuntimeError, ValueError, AttributeError, TypeError) as exc:
-            self._rollback_fiber(scoped, plugin_id, fiber)
+            scoped.discard_draft(plugin_id)
             sys.modules.pop(module_name, None)
             self._safe_unlink(target)
             return {"ok": False, "error": f"Registration failed: {exc}"}
@@ -1605,29 +1822,22 @@ class SelfManagementPlugin:
         the sandbox worker and every handler proxies to it via
         SandboxedToolPlugin. The worker is stopped when the fiber is disposed.
         """
-        import os
-
-        from leapflow.plugins import get_registry, get_scoped_registry
+        from leapflow.plugins import get_scoped_registry
         from leapflow.plugins.protocol import ToolMetadata
         from leapflow.plugins.sandbox.sandbox_host import SandboxHost, SandboxedToolPlugin
 
         install_dir = installed_path.parent
-        host = SandboxHost(module_name)
-        started = False
-        original_pp = os.environ.get("PYTHONPATH")
-        os.environ["PYTHONPATH"] = os.pathsep.join(
-            [str(install_dir)] + ([original_pp] if original_pp else [])
+        host = SandboxHost(
+            module_name,
+            python_paths=(str(install_dir),),
+            **self._sandbox_settings(),
         )
+        started = False
         try:
             await host.start()
             started = True
         except (OSError, RuntimeError, ValueError) as exc:
             return {"ok": False, "error": f"Sandbox start failed: {exc}"}
-        finally:
-            if original_pp is None:
-                os.environ.pop("PYTHONPATH", None)
-            else:
-                os.environ["PYTHONPATH"] = original_pp
         if not started:
             return {"ok": False, "error": "Sandbox start failed"}
 
@@ -1654,17 +1864,15 @@ class SelfManagementPlugin:
         ]
         sandboxed = SandboxedToolPlugin(plugin_id, "marketplace", metadatas, host)
 
-        reg = get_registry()
         scoped = get_scoped_registry()
-        fiber = scoped.create_fiber(plugin_id)
+        fiber = scoped.create_draft_fiber(plugin_id)
         try:
-            scoped.scoped_register(sandboxed, fiber)
-            fiber.activate()
-            installed_tools = reg.publish_plugin_tools(sandboxed)
-            # Stop the worker subprocess when the fiber is disposed.
-            fiber.scope.effect(lambda h=host: self._schedule_host_stop(h))
+            scoped.stage_plugin(sandboxed, fiber)
+            fiber.scope.async_effect(host.stop)
+            fiber = scoped.promote_draft(plugin_id)
+            installed_tools = [tool.name for tool in sandboxed.tools]
         except (RuntimeError, ValueError, AttributeError, TypeError) as exc:
-            self._rollback_fiber(scoped, plugin_id, fiber)
+            scoped.discard_draft(plugin_id)
             await host.stop()
             self._safe_unlink(installed_path)
             return {"ok": False, "error": f"Sandboxed registration failed: {exc}"}
@@ -1721,31 +1929,6 @@ class SelfManagementPlugin:
         return plugin_obj, ""
 
     @staticmethod
-    def _rollback_fiber(scoped: Any, plugin_id: str, fiber: Any) -> None:
-        """Dispose a fiber and drop it from the scoped registry (rollback path)."""
-        from leapflow.domain.plugin_fiber import FiberState
-
-        try:
-            if fiber.state == FiberState.ACTIVE:
-                fiber.begin_unload()
-            if fiber.state != FiberState.DISPOSED:
-                fiber.dispose()
-        except (RuntimeError, ValueError, AttributeError):
-            pass
-        scoped._fibers.pop(plugin_id, None)
-
-    @staticmethod
-    def _schedule_host_stop(host: Any) -> None:
-        """Best-effort async shutdown of a sandbox worker on fiber disposal."""
-        import asyncio
-
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        loop.create_task(host.stop())
-
-    @staticmethod
     def _safe_unlink(path: "Path") -> None:
         """Remove a written plugin file, ignoring absence/IO errors."""
         try:
@@ -1785,16 +1968,25 @@ class SelfManagementPlugin:
         if not proposal_id:
             return "", (), ""
         try:
-            proposal = self._proposal_store().get(proposal_id)
+            store = self._lifecycle_store()
+            lifecycle = store.get(proposal_id)
+            if lifecycle is None:
+                lifecycle = store.find_by_metadata("review_proposal_id", proposal_id)
         except (RuntimeError, OSError, ValueError, AttributeError) as exc:
             return (
                 proposal_id,
                 (),
                 f"Plugin proposal '{proposal_id}' unavailable for behavior tests: {exc}",
             )
-        if proposal is None:
+        if lifecycle is None:
             return proposal_id, (), f"Plugin proposal '{proposal_id}' not found for behavior tests"
-        return proposal_id, tuple(getattr(proposal, "test_cases", ()) or ()), ""
+        review_payload = dict(lifecycle.metadata or {}).get("review_proposal")
+        if not isinstance(review_payload, Mapping):
+            return proposal_id, (), ""
+        from leapflow.domain.plugin_proposal import PluginProposal
+
+        proposal = PluginProposal.from_dict(review_payload)
+        return proposal_id, tuple(proposal.test_cases), ""
 
     async def _run_behavior_tests_for_plugin(
         self, plugin_id: str, test_cases: tuple[Any, ...]
@@ -1870,13 +2062,16 @@ class SelfManagementPlugin:
         approved, denial = await self._check_approval("rollback", plugin_id)
         if not approved:
             return {"ok": False, "error": denial, "requires_approval": True}
-        try:
-            from leapflow.plugins import reload_plugin
+        from leapflow.plugins import reload_plugin
 
-            target = self._resolve_install_dir() / f"{plugin_id}.py"
-            entry = self._version_store().rollback(plugin_id, version, target)
+        target = self._resolve_install_dir() / f"{plugin_id}.py"
+        version_store = self._version_store()
+        metadata_snapshot = version_store.snapshot_state(plugin_id)
+        source_snapshot = target.read_bytes() if target.exists() else None
+        try:
+            entry = version_store.rollback(plugin_id, version, target)
             fiber = reload_plugin(plugin_id)
-            return {
+            response = {
                 "ok": True,
                 "action": "rollback",
                 "plugin_id": plugin_id,
@@ -1884,11 +2079,40 @@ class SelfManagementPlugin:
                 "state": fiber.state.value,
                 "new_generation": fiber.generation,
             }
-        except KeyError as exc:
-            return {"ok": False, "error": str(exc)}
-        except (RuntimeError, OSError, AttributeError) as exc:
+            from leapflow.domain.event_types import EvolutionEventType
+
+            persisted = await self._emit_plugin_event(
+                EvolutionEventType.PLUGIN_ROLLED_BACK,
+                plugin_id=plugin_id,
+                version_id=str(entry.get("version") or version),
+                payload=response,
+                dedup_suffix=f"{entry.get('version', version)}:{fiber.generation}",
+            )
+            if not persisted:
+                response["audit_incomplete"] = True
+            return response
+        except (KeyError, RuntimeError, OSError, AttributeError) as exc:
+            restoration_error = ""
+            try:
+                version_store.restore_source(target, source_snapshot)
+                version_store.restore_state(plugin_id, metadata_snapshot)
+                reload_plugin(plugin_id)
+            except (KeyError, RuntimeError, OSError, AttributeError) as restore_exc:
+                restoration_error = str(restore_exc)
+                logger.error(
+                    "plugin_rollback could not restore the previous runtime: %s",
+                    restore_exc,
+                    exc_info=True,
+                )
             logger.warning("plugin_rollback failed: %s", exc, exc_info=True)
-            return {"ok": False, "error": f"Rollback failed: {exc}"}
+            response = {
+                "ok": False,
+                "error": f"Rollback failed: {exc}",
+                "rolled_back": restoration_error == "",
+            }
+            if restoration_error:
+                response["rollback_error"] = restoration_error
+            return response
 
     async def _plugin_enable_handler(self, plugin_id: str, **kwargs: Any) -> Dict[str, Any]:
         """Re-enable a previously disabled plugin. REQUIRES approval.
@@ -2329,9 +2553,9 @@ class SelfManagementPlugin:
                     "description. The LLM produces code that conforms to the "
                     "ToolPlugin Protocol; it is then rigorously validated "
                     "(syntax, structure, import, protocol conformance). The "
-                    "isolated sandbox smoke test runs later, at install-time. "
-                    "Returns the validated code but DOES NOT install it — "
-                    "installation is a separate approval-gated step via plugin_install."
+                    "generated source is stored in CAS and receives explicit content "
+                    "approval. It DOES NOT install the plugin — installation requires "
+                    "a second, mutation-specific approval via plugin_install."
                 ),
                 parameters_schema={
                     "type": "object",
@@ -2346,7 +2570,7 @@ class SelfManagementPlugin:
                         },
                         "proposal_id": {
                             "type": "string",
-                            "description": "Optional PluginProposal id to generate from; fills plugin_id/description when omitted.",
+                            "description": "Optional lifecycle proposal id or review alias; fills plugin_id/description when omitted.",
                         },
                     },
                     "required": [],
@@ -2359,7 +2583,7 @@ class SelfManagementPlugin:
                     "requires_approval": False,
                     "effect_scope": "none",
                     "idempotency_scope": "turn",
-                    "summary": "generate a new plugin (produces code only, no install)",
+                    "summary": "generate, validate, persist, and approve proposal content",
                 },
                 provides_capabilities=("plugin.generate",),
             ),
@@ -2394,7 +2618,7 @@ class SelfManagementPlugin:
                         },
                         "proposal_id": {
                             "type": "string",
-                            "description": "Optional PluginProposal id to link into approval metadata and mark approved on success.",
+                            "description": "Optional lifecycle proposal id or review alias; requires prior content approval.",
                         },
                         "version_label": {
                             "type": "string",

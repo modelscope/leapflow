@@ -139,21 +139,24 @@ class MonitorCoordinator:
         """
         try:
             from leapflow.evolution import LedgerEvolutionSink
-            from leapflow.storage.evolution_trace_store import JsonEvolutionTraceStore
+            from leapflow.storage.evolution_event_store import EvolutionTraceEventStore
             from leapflow.telemetry.evolution_tap import install_sink
 
-            layout = getattr(settings, "profile_layout", None)
-            path = getattr(layout, "evolution_traces_path", None)
-            if path is None:
+            event_store = getattr(ctx, "_evolution_event_store", None)
+            if event_store is None:
                 return
+            trace_store = EvolutionTraceEventStore(
+                event_store,
+                profile_id=str(getattr(settings, "profile", "default")),
+            )
             sink = LedgerEvolutionSink(
-                store=JsonEvolutionTraceStore(path),
+                store=trace_store,
                 publish=self._make_evolution_publisher(ctx),
             )
             sink.register_atexit()
             install_sink(sink)
             self._evolution_sink = sink
-            logger.debug("daemon: evolution trace sink installed at %s", path)
+            logger.debug("daemon: evolution trace sink installed in evolution_events")
         except Exception:  # noqa: BLE001 - observability is never a startup dependency
             logger.debug("daemon: evolution trace sink not installed", exc_info=True)
 

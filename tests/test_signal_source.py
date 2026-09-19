@@ -7,7 +7,6 @@ InteractionSignal outputs compared to the original _extract_signal() if-chain.
 
 from __future__ import annotations
 
-import pytest
 
 from leapflow.perception.signal_source import (
     SignalSourceRegistry,
@@ -437,7 +436,6 @@ class TestExtractSignalDelegation:
         from unittest.mock import MagicMock
         from leapflow.perception.config import PerceptionConfig
         from leapflow.perception.session import PerceptionSession
-        from leapflow.perception.signal_source import SignalSourceRegistry
 
         config = PerceptionConfig(
             signal_channels=frozenset({"custom"}),

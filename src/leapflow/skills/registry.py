@@ -191,7 +191,8 @@ class SkillRegistry:
             if not pre.passed:
                 return SkillResult(ok=False, error=f"precondition_failed: {pre.reason}")
 
-        # Core execution closure for prediction loop wrapping
+        # The registry validates and invokes only. Cross-cutting evidence belongs to
+        # the runtime ActionExecutor so every entry point follows the same boundary.
         async def _execute_core() -> Any:
             from leapflow.utils.resilience import ResiliencePolicy, execute_with_resilience
             policy = ResiliencePolicy(timeout_s=self._timeout_for(skill))
@@ -199,20 +200,9 @@ class SkillRegistry:
                 lambda: skill.run(**validated), policy
             )
 
-        # Execute with optional prediction loop
         t0 = time.perf_counter()
-        prediction_outcome = None
         try:
-            if self._prediction_loop is not None:
-                user_goal = str(kwargs.get("user_goal", "") or "")
-                if user_goal and hasattr(self._prediction_loop, "set_goal"):
-                    self._prediction_loop.set_goal(user_goal)
-                action_desc = f"skill:{name}"
-                output, prediction_outcome = await self._prediction_loop.wrap_execution(
-                    action_desc, _execute_core,
-                )
-            else:
-                output = await _execute_core()
+            output = await _execute_core()
             elapsed = time.perf_counter() - t0
         except asyncio.TimeoutError:
             elapsed = time.perf_counter() - t0

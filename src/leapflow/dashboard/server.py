@@ -273,6 +273,7 @@ class DashboardServer:
             "template": request.query.get("template", ""),
             "device": request.query.get("device", ""),
             "channel": request.query.get("channel", ""),
+            "session_id": request.query.get("session_id", request.query.get("session", "")),
         })
         request_id = uuid.uuid4().hex
         try:

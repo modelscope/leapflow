@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 TransportFactory = Callable[[Mapping[str, Any]], HardwareTransport]
 
-_TRANSPORTS: dict[str, str] = {
+_BUILTIN_TRANSPORTS: dict[str, str] = {
     # kind -> "module:factory", imported lazily so that an optional dependency in
     # one transport cannot break registry loading for the others.
     "mock": "leapflow.hardware.transports.mock:build_transport",
@@ -35,6 +35,7 @@ _TRANSPORTS: dict[str, str] = {
     "host": "leapflow.hardware.transports.host:build_transport",
     "media": "leapflow.hardware.transports.media:build_transport",
 }
+_TRANSPORTS: dict[str, str] = dict(_BUILTIN_TRANSPORTS)
 
 _EP_GROUP = "leapflow.hardware.transports"
 _ep_scanned: bool = False
@@ -83,9 +84,14 @@ def _discover_entry_points() -> None:
 
 
 def available_transports() -> tuple[str, ...]:
-    """Return the registered transport kinds, sorted for stable reporting."""
+    """Return all registered transport kinds, including discovered extensions."""
     _discover_entry_points()
     return tuple(sorted(_TRANSPORTS))
+
+
+def builtin_transports() -> tuple[str, ...]:
+    """Return core kinds whose conformance is owned by this repository."""
+    return tuple(sorted(_BUILTIN_TRANSPORTS))
 
 
 def register_transport(kind: str, target: str) -> Callable[[], None]:
@@ -146,4 +152,9 @@ def build_transport(kind: str, config: Mapping[str, Any] | None = None) -> Hardw
     return factory(config or {})
 
 
-__all__ = ["available_transports", "build_transport", "register_transport"]
+__all__ = [
+    "available_transports",
+    "build_transport",
+    "builtin_transports",
+    "register_transport",
+]

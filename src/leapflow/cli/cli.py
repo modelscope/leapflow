@@ -291,8 +291,24 @@ def main(argv: list[str] | None = None) -> int:
         "evolve", help="Run the learning boundary now and report what it did"
     )
     evolve_parser.add_argument(
+        "--session",
+        required=True,
+        help="Exact session id whose new evidence should be finalized",
+    )
+    evolve_parser.add_argument(
         "--reason", default="manual",
         help="Label recorded with this run (default: manual)",
+    )
+    evolve_parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for the durable teacher job to reach a terminal state",
+    )
+    evolve_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=180.0,
+        help="Maximum wait time in seconds when --wait is set",
     )
     evolve_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
@@ -469,9 +485,8 @@ def main(argv: list[str] | None = None) -> int:
         from leapflow.cli.commands.dashboard import cmd_dashboard
         return cmd_dashboard(args)
 
-    # Evolve routes to leapd, which owns the context holding the trajectory buffer.
-    # Running it in this process would build a second, empty context and grade
-    # nothing, so no Context is initialized here either.
+    # Evolve routes to leapd, the sole writer of the durable event stream and
+    # teacher-job queue. A client-side Context would create a competing writer.
     if args.command == "evolve":
         from leapflow.cli.commands.evolve import cmd_evolve
         return cmd_evolve(args)

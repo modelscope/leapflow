@@ -131,6 +131,56 @@ def llm_registry() -> FakeLLMRegistry:
 class TestScopedToolRegistryFullLifecycle:
     """Full lifecycle: create fiber → register → assemble → dispose → tools gone."""
 
+    def test_draft_plugin_is_invisible_until_atomic_promotion(
+        self, fresh_tool_registry: ToolPluginRegistry
+    ) -> None:
+        from leapflow.domain.plugin_fiber import FiberState
+
+        fresh_tool_registry.assemble()
+        scoped = ScopedToolRegistry(fresh_tool_registry)
+        plugin = FakeToolPlugin(
+            _plugin_id="draft-plugin",
+            _tools=[_make_tool_metadata("draft_tool")],
+        )
+        fiber = scoped.create_draft_fiber(plugin.plugin_id)
+        scoped.stage_plugin(plugin, fiber)
+
+        assert fiber.state == FiberState.DRAFT
+        assert fresh_tool_registry.get_plugin(plugin.plugin_id) is None
+        assert "draft_tool" not in fresh_tool_registry.tool_handlers
+
+        promoted = scoped.promote_draft(plugin.plugin_id)
+
+        assert promoted.state == FiberState.ACTIVE
+        assert fresh_tool_registry.get_plugin(plugin.plugin_id) is plugin
+        assert "draft_tool" in fresh_tool_registry.snapshot_handlers()
+        assert fresh_tool_registry.snapshot_latency.count == 1
+
+    def test_atomic_promotion_rejects_collision_without_partial_publish(
+        self, fresh_tool_registry: ToolPluginRegistry
+    ) -> None:
+        incumbent = FakeToolPlugin(
+            _plugin_id="incumbent",
+            _tools=[_make_tool_metadata("shared_tool")],
+        )
+        fresh_tool_registry.register(incumbent)
+        fresh_tool_registry.assemble()
+        handlers_before = dict(fresh_tool_registry.tool_handlers)
+        scoped = ScopedToolRegistry(fresh_tool_registry)
+        candidate = FakeToolPlugin(
+            _plugin_id="candidate",
+            _tools=[_make_tool_metadata("candidate_tool"), _make_tool_metadata("shared_tool")],
+        )
+        fiber = scoped.create_draft_fiber(candidate.plugin_id)
+        scoped.stage_plugin(candidate, fiber)
+
+        with pytest.raises(ValueError, match="live conflicts"):
+            scoped.promote_draft(candidate.plugin_id)
+
+        assert fresh_tool_registry.tool_handlers == handlers_before
+        assert fresh_tool_registry.get_plugin(candidate.plugin_id) is None
+        assert scoped.get_fiber(candidate.plugin_id) is None
+
     def test_scoped_tool_registry_full_lifecycle(self, fresh_tool_registry: ToolPluginRegistry) -> None:
         plugin = FakeToolPlugin(
             _plugin_id="test-plugin",

@@ -71,6 +71,7 @@ class GatewayToolsPlugin:
                     "requires_approval": True,
                 },
                 mutates_state=True,
+                execution_policy="external_side_effect",
                 provides_capabilities=("platform.action",),
                 requires_capabilities=("platform.connect",),
                 requires_platform_capabilities=("file.ops",),
@@ -110,7 +111,10 @@ class GatewayToolsPlugin:
                     "schema_cost": "high",
                     "requires_approval": True,
                 },
+                mutates_state=True,
+                execution_policy="external_side_effect",
                 provides_capabilities=("platform.connect",),
+                requires_platform_capabilities=("file.ops",),
             ),
             ToolMetadata(
                 name="gateway_send",
@@ -148,6 +152,7 @@ class GatewayToolsPlugin:
                     "requires_approval": True,
                 },
                 mutates_state=True,
+                execution_policy="external_side_effect",
                 provides_capabilities=("platform.send_message",),
                 requires_capabilities=("platform.configure",),
                 requires_platform_capabilities=("file.ops",),
@@ -197,7 +202,10 @@ class GatewayToolsPlugin:
                     "schema_cost": "high",
                     "requires_approval": True,
                 },
+                mutates_state=True,
+                execution_policy="external_side_effect",
                 provides_capabilities=("platform.configure",),
+                requires_platform_capabilities=("file.ops",),
             ),
         ]
 

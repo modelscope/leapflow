@@ -125,8 +125,9 @@ def test_verdict_feeds_the_governor_and_quarantines_a_useless_artifact(tmp_path)
     """WM-6 + LF-10: repeated verification failure reclaims the artifact."""
     from leapflow.learning.plugin_trust import PluginTrustLedger
     from leapflow.plugins.lifecycle_governor import LifecycleGovernor
-    from leapflow.storage.capability_proposal_queue import JsonCapabilityProposalQueue
-    from leapflow.storage.plugin_outcome_store import JsonPluginOutcomeStore
+    from leapflow.storage.capability_proposal_queue import EvolutionCapabilityProposalStore
+    from leapflow.storage.evolution_event_store import DuckDBEvolutionEventStore
+    from leapflow.storage.plugin_outcome_store import EvolutionPluginOutcomeStore
 
     disabled: list[str] = []
 
@@ -135,11 +136,20 @@ def test_verdict_feeds_the_governor_and_quarantines_a_useless_artifact(tmp_path)
             disabled.append(plugin_id)
             return {"ok": True}
 
-    queue = JsonCapabilityProposalQueue(tmp_path / "q.json")
+    event_store = DuckDBEvolutionEventStore(tmp_path / "events.duckdb")
+    queue = EvolutionCapabilityProposalStore(event_store, profile_id="profile-1")
     item = queue.enqueue(requirements=[_requirement()], source="test")
+    queue.transition(item.proposal_id, "GENERATED", generated_code_ref="sha256:test")
+    queue.transition(
+        item.proposal_id,
+        "APPROVED",
+        proposal_approval_id="approval-content",
+        mutation_approval_id="approval-mutation",
+    )
+    queue.transition(item.proposal_id, "INSTALLED", install_result={"ok": True})
     governor = LifecycleGovernor(
         proposal_queue=queue,
-        outcome_store=JsonPluginOutcomeStore(tmp_path / "o.json"),
+        outcome_store=EvolutionPluginOutcomeStore(event_store, profile_id="profile-1"),
         lifecycle_actor=_Actor(),
         trust_ledger=PluginTrustLedger(),
         quarantine_after=3,
@@ -162,6 +172,7 @@ def test_verdict_feeds_the_governor_and_quarantines_a_useless_artifact(tmp_path)
 
     assert actions[-1] == "quarantine"
     assert disabled == ["gen_useless"]      # the useless artifact was reclaimed
+    event_store.close()
 
 
 # ── LF-10: the residual case the governor cannot reach ────────────────────────

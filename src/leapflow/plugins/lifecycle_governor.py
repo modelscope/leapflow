@@ -144,40 +144,51 @@ class LifecycleGovernor:
             side_effect_state=side_effect_state,
             metadata=metadata,
         )
+        internal_defect = hard_failure or str(failure_class) == "internal_defect"
         if ok:
             self._trust_ledger.record_success(plugin_id)
         else:
-            self._trust_ledger.record_failure(plugin_id, hard=hard_failure)
+            self._trust_ledger.record_failure(plugin_id, hard=internal_defect)
 
         trust = self._trust_ledger.level(plugin_id)
         failure_streak = self._outcome_store.failure_streak(plugin_id)
+        trust_state = {
+            "level": trust.name,
+            "failure_streak": failure_streak,
+            "frozen": self._trust_ledger.is_frozen(plugin_id),
+        }
         lifecycle_result: Mapping[str, Any] = {"ok": True}
         action = "probation_execute"
 
-        if hard_failure or failure_streak >= self._quarantine_after:
+        if internal_defect or failure_streak >= self._quarantine_after:
             action = "quarantine"
             if self._lifecycle_actor is not None:
                 lifecycle_result = await self._lifecycle_actor.disable(plugin_id=plugin_id)
-            self._proposal_queue.update(
+            self._transition(
                 proposal_id,
-                status="QUARANTINED" if lifecycle_result.get("ok", True) else "FAILED",
-                trust_state={"level": trust.name, "failure_streak": failure_streak},
+                "QUARANTINED" if lifecycle_result.get("ok", True) else "FAILED",
+                trust_state=trust_state,
                 test_results=[outcome],
                 install_result=lifecycle_result,
+                metadata={
+                    "terminal_reason": "internal_defect"
+                    if internal_defect
+                    else "failure_streak_exceeded"
+                },
             )
         elif trust >= self._verified_at:
             action = "verify"
-            self._proposal_queue.update(
+            self._transition(
                 proposal_id,
-                status="VERIFIED",
-                trust_state={"level": trust.name, "failure_streak": failure_streak},
+                "VERIFIED",
+                trust_state=trust_state,
                 test_results=[outcome],
             )
         else:
-            self._proposal_queue.update(
+            self._transition(
                 proposal_id,
-                status="PROBATION",
-                trust_state={"level": trust.name, "failure_streak": failure_streak},
+                "PROBATION",
+                trust_state=trust_state,
                 test_results=[outcome],
             )
         if action != "quarantine":
@@ -200,6 +211,22 @@ class LifecycleGovernor:
             lifecycle_result=lifecycle_result,
             outcome=outcome,
         )
+
+    def _transition(self, proposal_id: str, status: str, **changes: Any) -> None:
+        """Use the lifecycle state machine when the backing store exposes it."""
+        if not proposal_id:
+            return
+        transition = getattr(self._proposal_queue, "transition", None)
+        if callable(transition):
+            current = self._proposal_queue.get(proposal_id)
+            if current is None:
+                return
+            if current.status == status:
+                self._proposal_queue.update(proposal_id, **changes)
+            else:
+                transition(proposal_id, status, **changes)
+            return
+        self._proposal_queue.update(proposal_id, status=status, **changes)
 
 
 __all__ = ["LifecycleGovernanceResult", "LifecycleGovernor"]

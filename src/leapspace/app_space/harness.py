@@ -293,6 +293,21 @@ class LeapAppHarness:
             logger.error(
                 "verdict: task %s failed expect (exit %d)", config.id, result.returncode
             )
+        result_dir = state_root / config.id
+        await actor.fs_mkdir(str(result_dir))
+        await actor.fs_write(
+            str(result_dir / "result.json"),
+            json.dumps(
+                {
+                    "task_id": config.id,
+                    "outcome": "PASS" if result.returncode == 0 else "FAIL",
+                    "exit_code": result.returncode,
+                    "app_ids": list(config.app_ids),
+                    "observed_at": time.time(),
+                },
+                ensure_ascii=False,
+            ),
+        )
         return result.returncode
 
     async def _await_sentinel(

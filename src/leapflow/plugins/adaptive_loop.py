@@ -324,68 +324,6 @@ class AdaptivePluginLoop:
             rollback_available=rollback_available,
         )
 
-    async def apply_policy_decision(
-        self,
-        proposal: Any,
-        decision: Any,
-        *,
-        proposal_queue: Any = None,
-        generated_code: str = "",
-        version_label: str = "",
-    ) -> Mapping[str, Any]:
-        """Apply a policy decision through existing lifecycle boundaries.
-
-        This method only mutates the registry for explicit lifecycle decisions;
-        queue/status-only decisions update durable proposal state and return.
-        """
-        action = str(getattr(decision, "action", "") or "")
-        proposal_id = str(getattr(proposal, "proposal_id", "") or "")
-        plugin_id = _proposal_plugin_id(proposal)
-        decision_payload = (
-            decision.to_dict() if hasattr(decision, "to_dict") else {"action": action}
-        )
-
-        if action in {"observe_only", "propose", "request_approval", "none"}:
-            if proposal_queue is not None:
-                proposal_queue.update(proposal_id, policy_decision=decision_payload)
-            return {"ok": True, "action": action, "proposal_id": proposal_id}
-        if action == "generate":
-            if proposal_queue is not None:
-                proposal_queue.update(
-                    proposal_id, status="GENERATED", policy_decision=decision_payload
-                )
-            return {"ok": True, "action": "generate", "proposal_id": proposal_id}
-        if action == "install":
-            if self._lifecycle_actor is None:
-                return {"ok": False, "error": "lifecycle_actor is required for install"}
-            result = await self._lifecycle_actor.install(
-                plugin_id=plugin_id,
-                code=generated_code,
-                proposal_id=proposal_id,
-                version_label=version_label,
-            )
-            if proposal_queue is not None:
-                proposal_queue.update(
-                    proposal_id,
-                    status="INSTALLED" if result.get("ok") else "FAILED",
-                    policy_decision=decision_payload,
-                    install_result=result,
-                )
-            return result
-        if action in {"disable", "quarantine"}:
-            if self._lifecycle_actor is None:
-                return {"ok": False, "error": "lifecycle_actor is required for disable"}
-            result = await self._lifecycle_actor.disable(plugin_id=plugin_id)
-            if proposal_queue is not None:
-                proposal_queue.update(
-                    proposal_id,
-                    status="QUARANTINED" if result.get("ok") else "FAILED",
-                    policy_decision=decision_payload,
-                    install_result=result,
-                )
-            return result
-        return {"ok": False, "error": f"Unsupported policy action: {action}"}
-
     def _read_preferences(self) -> tuple[tuple[str, str], ...]:
         """The teacher's rebind recommendations, or nothing.
 
@@ -612,22 +550,6 @@ def _selected_delta(
         "added": {key: after_map[key] for key in sorted(after_map.keys() - before_map.keys())},
         "removed": {key: before_map[key] for key in sorted(before_map.keys() - after_map.keys())},
     }
-
-
-def _proposal_plugin_id(proposal: Any) -> str:
-    metadata = dict(getattr(proposal, "metadata", {}) or {})
-    if metadata.get("plugin_id"):
-        return str(metadata["plugin_id"])
-    if getattr(proposal, "install_result", None):
-        result = dict(getattr(proposal, "install_result") or {})
-        if result.get("plugin_id"):
-            return str(result["plugin_id"])
-    if getattr(proposal, "requirements", None):
-        for requirement in getattr(proposal, "requirements") or ():
-            if isinstance(requirement, Mapping):
-                cap = str(requirement.get("capability") or "generated")
-                return cap.replace(".", "_").replace("-", "_") + "_plugin"
-    return str(getattr(proposal, "proposal_id", "adaptive_plugin") or "adaptive_plugin")
 
 
 __all__ = [

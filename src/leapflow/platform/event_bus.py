@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
 from leapflow.domain.events import PRE_NORMALIZED_EVENT_PREFIXES, SystemEvent
 from leapflow.memory.providers.episodic import EpisodicMemoryProvider
@@ -19,7 +19,6 @@ from leapflow.platform.protocol import EventTypes
 from leapflow.platform.reorder_buffer import EventReorderBuffer
 
 if TYPE_CHECKING:
-    from leapflow.domain.effect_scope import EffectScope
     from leapflow.learning.event_consumer import EventConsumer
     from leapflow.privacy.policy import EventPrivacyFilter
 

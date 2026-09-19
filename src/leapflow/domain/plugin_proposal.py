@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 GapType = Literal["tool_plugin", "gateway_adapter", "signal_source", "llm_provider", "unknown"]
 ProposalStatus = Literal["draft", "review", "approved", "rejected"]
@@ -171,3 +171,49 @@ class PluginProposal:
             "proposed_tools": [item.to_dict() for item in self.proposed_tools],
             "test_cases": [item.to_dict() for item in self.test_cases],
         }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "PluginProposal":
+        """Rebuild a proposal embedded in an event-sourced lifecycle record."""
+        evidence = tuple(
+            GapEvidence.create(
+                str(item.get("evidence_type") or "unknown"),
+                str(item.get("summary") or ""),
+                confidence=float(item.get("confidence") or 0.0),
+                metadata=dict(item.get("metadata") or {}),
+            )
+            for item in raw.get("evidence", ())
+            if isinstance(item, Mapping)
+        )
+        tools = tuple(
+            ProposedToolSpec(
+                name=str(item.get("name") or "generated_tool"),
+                description=str(item.get("description") or ""),
+                risk_level=str(item.get("risk_level") or "read_only"),  # type: ignore[arg-type]
+                mutates_state=bool(item.get("mutates_state", False)),
+            )
+            for item in raw.get("proposed_tools", ())
+            if isinstance(item, Mapping)
+        )
+        tests = tuple(
+            BehaviorTestCase.create(
+                str(item.get("tool_name") or ""),
+                arguments=dict(item.get("arguments") or {}),
+                expected_subset=dict(item.get("expected_subset") or {}),
+                description=str(item.get("description") or ""),
+            )
+            for item in raw.get("test_cases", ())
+            if isinstance(item, Mapping)
+        )
+        return cls(
+            proposal_id=str(raw.get("proposal_id") or ""),
+            plugin_id=str(raw.get("plugin_id") or "generated_plugin"),
+            capability_summary=str(raw.get("capability_summary") or ""),
+            gap_type=str(raw.get("gap_type") or "tool_plugin"),  # type: ignore[arg-type]
+            risk_level=str(raw.get("risk_level") or "read_only"),  # type: ignore[arg-type]
+            status=str(raw.get("status") or "draft"),  # type: ignore[arg-type]
+            evidence=evidence,
+            proposed_tools=tools,
+            test_cases=tests,
+            created_at=float(raw.get("created_at") or 0.0),
+        )

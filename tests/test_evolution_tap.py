@@ -25,7 +25,10 @@ from types import SimpleNamespace
 
 from leapflow.domain.evolution_trace import EvolutionStage, EvolutionTrace
 from leapflow.evolution import LedgerEvolutionSink
-from leapflow.storage.evolution_trace_store import JsonEvolutionTraceStore
+from leapflow.storage.evolution_event_store import (
+    DuckDBEvolutionEventStore,
+    EvolutionTraceEventStore,
+)
 from leapflow.telemetry import evolution_tap
 
 
@@ -132,28 +135,33 @@ def test_flush_failure_loses_traces_rather_than_retrying_forever():
 # ── the store ────────────────────────────────────────────────────────────────
 
 
-def test_store_round_trip_is_newest_first(tmp_path):
-    store = JsonEvolutionTraceStore(tmp_path / "t.json")
+def test_store_round_trip_is_newest_sequence_first(tmp_path):
+    events = DuckDBEvolutionEventStore(tmp_path / "events.duckdb")
+    store = EvolutionTraceEventStore(events, profile_id="profile-1")
     store.append([{"trace_id": "a", "ts": 1.0}, {"trace_id": "b", "ts": 3.0}])
     store.append([{"trace_id": "c", "ts": 2.0}])
-    assert [r["trace_id"] for r in store.list_traces()] == ["b", "c", "a"]
+    assert [r["trace_id"] for r in store.list_traces()] == ["c", "b", "a"]
+    events.close()
 
 
-def test_store_trims_to_the_newest(tmp_path):
-    """Retention is a count, because the newest traces are what an incident needs."""
-    store = JsonEvolutionTraceStore(tmp_path / "t.json", max_traces=3)
+def test_store_limits_reads_without_trimming_event_history(tmp_path):
+    events = DuckDBEvolutionEventStore(tmp_path / "events.duckdb")
+    store = EvolutionTraceEventStore(events, profile_id="profile-1")
     store.append([{"trace_id": f"t{i}", "ts": float(i)} for i in range(10)])
-    kept = [r["trace_id"] for r in store.list_traces()]
+    kept = [r["trace_id"] for r in store.list_traces(limit=3)]
     assert kept == ["t9", "t8", "t7"]
-    assert store.count() == 3
+    assert store.count() == 10
+    events.close()
 
 
-def test_corrupt_store_reads_as_empty_rather_than_raising(tmp_path):
-    path = tmp_path / "t.json"
-    path.write_text("{ not json", encoding="utf-8")
-    store = JsonEvolutionTraceStore(path)
-    assert store.list_traces() == []
-    assert store.append([{"trace_id": "a", "ts": 1.0}]) == 1
+def test_store_deduplicates_replayed_trace_ids(tmp_path):
+    events = DuckDBEvolutionEventStore(tmp_path / "events.duckdb")
+    store = EvolutionTraceEventStore(events, profile_id="profile-1")
+    trace = {"trace_id": "a", "ts": 1.0}
+    assert store.append([trace]) == 1
+    assert store.append([trace]) == 0
+    assert store.count() == 1
+    events.close()
 
 
 # ── probe: registry version bump ─────────────────────────────────────────────
@@ -268,62 +276,6 @@ def test_the_pure_trust_ledger_gains_no_telemetry_dependency():
 
 
 # ── probe: the world model's unadmitted proposals ────────────────────────────
-
-
-def test_unadmitted_intents_are_recorded_because_nothing_else_records_them():
-    """The single most valuable trace: a proposal that entered no pipeline.
-
-    It writes no observation, so without this the board shows an idle pipeline
-    while the world model proposes on every session.
-    """
-    import asyncio
-    from dataclasses import dataclass
-
-    from leapflow.learning.world_model_driver import WorldModelEvolutionDriver
-
-    @dataclass
-    class _Intent:
-        intent_id: str = "wmi-1"
-        capability: str = "ui.chat.send"
-        hypothesis: str = "no way to send a chat message"
-        confidence: float = 0.8
-
-        def to_dict(self):
-            return {
-                "intent_id": self.intent_id,
-                "capability": self.capability,
-                "hypothesis": self.hypothesis,
-                "confidence": self.confidence,
-            }
-
-        def to_observation_result(self, **_kw):
-            return {"error_type": "world_model_intent", "capability": self.capability}
-
-    class _Teacher:
-        async def grade_and_propose(self, trajectory, goal):
-            return type("V", (), {"grades": (), "intents": (_Intent(),)})()
-
-    class _RejectingIntake:
-        """Mirrors a profile where ``world_model_intent`` is not an accepted kind."""
-
-        def observe_result(self, *_a, **_kw):
-            return None
-
-        def requirements(self, **_kw):
-            return ()
-
-    collector = _Collector()
-    evolution_tap.install_sink(collector)
-
-    driver = WorldModelEvolutionDriver(teacher=_Teacher(), intake=_RejectingIntake())
-    result = asyncio.run(driver.drive(trajectory=[{"step": 1}], goal="g"))
-
-    assert result.admitted_observation_ids == ()
-    assert _kinds(collector) == ["world_model_drive"]
-    detail = collector.traces[0].detail
-    assert detail["not_admitted_reason"]
-    assert detail["intents"][0]["hypothesis"] == "no way to send a chat message"
-    assert detail["admitted_observation_ids"] == []
 
 
 def test_producer_surfaces_unadmitted_proposals_from_traces():

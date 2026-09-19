@@ -54,7 +54,14 @@ def test_mutating_once_session_scoped_tool_runs_sequentially() -> None:
 
 
 def test_path_scoped_writes_parallel_iff_non_overlapping() -> None:
-    specs = {"file_write": ToolSpec(name="file_write", risk_level="mutating", mutates_state=True)}
+    specs = {
+        "file_write": ToolSpec(
+            name="file_write",
+            risk_level="mutating",
+            mutates_state=True,
+            execution_policy="mutating_idempotent",
+        )
+    }
     policy = _policy(specs)
 
     concurrent, sequential = policy.partition(
@@ -71,7 +78,12 @@ def test_path_scoped_writes_parallel_iff_non_overlapping() -> None:
 
 def test_mutating_idempotent_without_path_is_sequential() -> None:
     specs = {
-        "file_write": ToolSpec(name="file_write", risk_level="mutating", mutates_state=True),
+        "file_write": ToolSpec(
+            name="file_write",
+            risk_level="mutating",
+            mutates_state=True,
+            execution_policy="mutating_idempotent",
+        ),
         "file_read": ToolSpec(name="file_read", risk_level="read_only"),
     }
     concurrent, sequential = _policy(specs).partition([_tc("file_read", path="a"), _tc("file_write")])

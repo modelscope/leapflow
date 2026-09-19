@@ -46,10 +46,12 @@ class PluginVersionStore:
             "created_at": time.time(),
             "metadata": dict(metadata or {}),
         }
-        self._write_json(plugin_dir / "active.json", entry)
         index = [item for item in self._read_index(plugin_id) if item.get("version") != version_id]
         index.append(entry)
+        # Commit the active pointer last. A failed index write may leave an immutable
+        # snapshot behind, but it cannot make a partially recorded version active.
         self._write_json(plugin_dir / "versions.json", index)
+        self._write_json(plugin_dir / "active.json", entry)
         return entry
 
     def active(self, plugin_id: str) -> dict[str, Any] | None:
@@ -59,6 +61,32 @@ class PluginVersionStore:
 
     def versions(self, plugin_id: str) -> list[dict[str, Any]]:
         return self._read_index(plugin_id)
+
+    def snapshot_state(self, plugin_id: str) -> dict[str, Any]:
+        """Capture active pointer and version index for transactional rollback."""
+        return {
+            "active": self.active(plugin_id),
+            "versions": self.versions(plugin_id),
+        }
+
+    def restore_state(self, plugin_id: str, snapshot: dict[str, Any]) -> None:
+        """Restore metadata captured before a failed file/runtime mutation."""
+        plugin_dir = self._plugin_dir(plugin_id)
+        active_path = plugin_dir / "active.json"
+        active = snapshot.get("active")
+        if isinstance(active, dict):
+            self._write_json(active_path, active)
+        else:
+            active_path.unlink(missing_ok=True)
+        self._write_json(plugin_dir / "versions.json", list(snapshot.get("versions") or ()))
+
+    def restore_source(self, target_path: Path, data: bytes | None) -> None:
+        """Atomically restore a source snapshot, or remove a previously absent file."""
+        target = Path(target_path)
+        if data is None:
+            target.unlink(missing_ok=True)
+            return
+        self._write_bytes(target, data)
 
     def source_for(self, plugin_id: str, version: str) -> Path | None:
         for item in self._read_index(plugin_id):

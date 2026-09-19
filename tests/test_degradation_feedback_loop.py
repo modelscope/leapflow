@@ -23,7 +23,9 @@ from typing import Any
 import pytest
 
 from leapflow.domain.adaptation_verdict import AdaptationVerdict
-from leapflow.engine.engine import AgentEngine
+from leapflow.domain.event_types import EvolutionEventType
+from leapflow.domain.evolution_event import EvolutionContext, EvolutionEvent
+from leapflow.evolution.teacher_worker import DurableTeacherWorker
 from leapflow.learning.capability_observation import (
     CAPABILITY_DEGRADED,
     CapabilityEvidenceClassifier,
@@ -33,15 +35,25 @@ from leapflow.learning.degradation_sink import (
     build_degradation_sink,
     declared_capabilities_by_plugin,
 )
-from leapflow.learning.world_model_driver import WorldModelEvolutionDriver
 from leapflow.plugins.lifecycle_governor import LifecycleGovernor
 from leapflow.plugins.protocol import ToolMetadata
 from leapflow.storage.capability_observation_store import JsonCapabilityObservationStore
-from leapflow.storage.distilled_knowledge_store import JsonDistilledKnowledgeStore
-from leapflow.world_model.trajectory_grader import (
-    TeacherVerdict,
-    _degraded_capability_section,
-)
+from leapflow.storage.distilled_knowledge_store import EvolutionDistilledKnowledgeStore
+from leapflow.storage.evolution_event_store import DuckDBEvolutionEventStore
+from leapflow.world_model.trajectory_grader import _degraded_capability_section
+
+
+def _seed_verdict(events: DuckDBEvolutionEventStore, verdict: AdaptationVerdict) -> None:
+    """Commit one verdict as a durable fact, as the teacher worker would."""
+    events.append(
+        EvolutionEvent.create(
+            EvolutionEventType.TEACHER_VERDICT_RECORDED,
+            context=EvolutionContext(profile_id="p", decision_id=verdict.verdict_id),
+            payload=verdict.to_dict(),
+            producer="test",
+            dedup_key=f"teacher.verdict_recorded:{verdict.verdict_id}",
+        )
+    )
 
 
 def _tool(name: str, *capabilities: str) -> ToolMetadata:
@@ -96,7 +108,9 @@ def wired(tmp_path):
             ["unknown_tool", CAPABILITY_DEGRADED]
         ),
     )
-    knowledge = JsonDistilledKnowledgeStore(tmp_path / "dk.json")
+    knowledge_events = DuckDBEvolutionEventStore(tmp_path / "events.duckdb")
+    knowledge = EvolutionDistilledKnowledgeStore(knowledge_events, profile_id="p")
+    knowledge.refresh()
     registry = _registry(chat_reply_v1=(_tool("chat_reply", "chat.reply"),))
     outcomes = _Outcomes()
     governor = LifecycleGovernor(
@@ -109,7 +123,22 @@ def wired(tmp_path):
         ),
     )
     return SimpleNamespace(
-        service=service, knowledge=knowledge, governor=governor, outcomes=outcomes
+        service=service,
+        knowledge=knowledge,
+        events=knowledge_events,
+        governor=governor,
+        outcomes=outcomes,
+    )
+
+
+def _worker(wired: Any) -> DurableTeacherWorker:
+    """A worker built only far enough to exercise degradation enrichment."""
+    return DurableTeacherWorker(
+        store=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        teacher=SimpleNamespace(),
+        degraded_capabilities=wired.service.degraded_capabilities,
+        knowledge_projection=wired.knowledge,
     )
 
 
@@ -209,25 +238,16 @@ def test_the_teacher_is_shown_what_it_concluded_last_time(wired):
     """Without this the loop is open: the same evidence can only produce the same answer."""
     wired.outcomes.streak = 2
     _record(wired.governor, ok=False, failure_class="affordance_removed")
-    wired.knowledge.record(
+    _seed_verdict(
+        wired.events,
         AdaptationVerdict.create(
             "absorb", "chat.reply", "the send control moved to the toolbar"
-        )
+        ),
     )
+    wired.knowledge.refresh()
 
-    seen: list[Any] = []
+    facts = _worker(wired)._collect_degraded_capabilities()
 
-    class _Teacher:
-        async def grade_and_propose(self, trajectory, goal="", **kwargs):
-            seen.append(kwargs.get("degraded_capabilities"))
-            return TeacherVerdict()
-
-    driver = WorldModelEvolutionDriver(
-        teacher=_Teacher(), intake=wired.service, knowledge_store=wired.knowledge
-    )
-    asyncio.run(driver.drive([{"action": "a"}], "reply"))
-
-    facts = seen[0]
     assert facts[0]["prior_action"] == "absorb"
     assert "moved to the toolbar" in facts[0]["prior_knowledge"]
 
@@ -240,10 +260,7 @@ def test_a_capability_with_no_prior_verdict_is_unchanged(wired):
     wired.outcomes.streak = 2
     _record(wired.governor, ok=False)
 
-    driver = WorldModelEvolutionDriver(
-        teacher=SimpleNamespace(), intake=wired.service, knowledge_store=wired.knowledge
-    )
-    facts = driver._collect_degraded()
+    facts = _worker(wired)._collect_degraded_capabilities()
     assert facts and "prior_action" not in facts[0]
 
 
@@ -284,9 +301,12 @@ def test_recovery_retires_the_knowledge_that_described_the_failure(wired):
     No newer verdict is coming precisely because there is no longer anything wrong, so
     without this the knowledge outlives the failure and misleads every later session.
     """
-    wired.knowledge.record(
-        AdaptationVerdict.create("absorb", "chat.reply", "the control is missing")
+    wired.knowledge.count()  # projection is live
+    _seed_verdict(
+        wired.events,
+        AdaptationVerdict.create("absorb", "chat.reply", "the control is missing"),
     )
+    wired.knowledge.refresh()
     assert wired.knowledge.count() == 1
 
     wired.outcomes.streak = 0
@@ -296,9 +316,11 @@ def test_recovery_retires_the_knowledge_that_described_the_failure(wired):
 
 
 def test_a_still_failing_capability_keeps_its_knowledge(wired):
-    wired.knowledge.record(
-        AdaptationVerdict.create("absorb", "chat.reply", "the control is missing")
+    _seed_verdict(
+        wired.events,
+        AdaptationVerdict.create("absorb", "chat.reply", "the control is missing"),
     )
+    wired.knowledge.refresh()
     wired.outcomes.streak = 2
     _record(wired.governor, ok=False)
 
@@ -317,58 +339,6 @@ def test_retirement_without_a_knowledge_store_is_harmless(tmp_path):
     sink(plugin_id="v1", failure_streak=0, trust_level="DRAFT")  # must not raise
 
 
-# ── D3: the recommendation reaches the student ─────────────────────────────────
-
-
-def _reader(store: Any) -> AgentEngine:
-    engine = AgentEngine.__new__(AgentEngine)
-    engine._knowledge_store = store
-    engine._environment_fingerprint_id = ""
-    engine._settings = SimpleNamespace(distilled_knowledge_limit=12)
-    return engine
-
-
-def test_a_rebind_target_tells_the_student_what_to_prefer(tmp_path):
-    """Stored and never read by anyone is the failure mode this closes.
-
-    The student would be told a problem exists without being told the answer that was
-    already worked out.
-    """
-    store = JsonDistilledKnowledgeStore(tmp_path / "dk.json")
-    store.record(
-        AdaptationVerdict.create(
-            "rebind", "chat.reply", "the app is now v3", target="chat_reply_v3"
-        )
-    )
-
-    block = _reader(store)._distilled_knowledge_context()
-    assert "Prefer chat_reply_v3." in block
-
-
-def test_an_escalation_target_names_what_a_person_must_do(tmp_path):
-    store = JsonDistilledKnowledgeStore(tmp_path / "dk.json")
-    store.record(
-        AdaptationVerdict.create(
-            "escalate",
-            "drive.upload",
-            "uploading is refused",
-            target="grant the drive.file scope",
-        )
-    )
-
-    block = _reader(store)._distilled_knowledge_context()
-    assert "This needs a person to: grant the drive.file scope." in block
-
-
-def test_a_verdict_without_a_target_adds_no_hint(tmp_path):
-    store = JsonDistilledKnowledgeStore(tmp_path / "dk.json")
-    store.record(AdaptationVerdict.create("absorb", "chat.react", "it moved"))
-
-    block = _reader(store)._distilled_knowledge_context()
-    assert "- chat.react: it moved" in block
-    assert "Prefer" not in block and "needs a person" not in block
-
-
 # ── the whole loop, over two sessions ──────────────────────────────────────────
 
 
@@ -379,37 +349,25 @@ def test_two_sessions_close_the_loop(wired):
     governor was never constructed, so no evidence was produced, so no verdict was
     reachable, so nothing was distilled and nothing could be reconsidered.
     """
-    # Session one: the capability degrades and the teacher absorbs it.
+    worker = _worker(wired)
+
+    # Session one: the capability degrades and nothing is known yet.
     wired.outcomes.streak = 2
     _record(wired.governor, ok=False, failure_class="affordance_removed")
+    first = worker._collect_degraded_capabilities()
+    assert first and "prior_action" not in first[0], "nothing was known yet"
 
-    verdicts = (
+    # The teacher absorbs it -- committed as a durable verdict fact.
+    _seed_verdict(
+        wired.events,
         AdaptationVerdict.create("absorb", "chat.reply", "the control moved to the toolbar"),
     )
-    seen: list[Any] = []
-
-    class _Teacher:
-        def __init__(self, out) -> None:
-            self.out = out
-
-        async def grade_and_propose(self, trajectory, goal="", **kwargs):
-            seen.append(kwargs.get("degraded_capabilities"))
-            return TeacherVerdict(grades=(), verdicts=self.out)
-
-    first = WorldModelEvolutionDriver(
-        teacher=_Teacher(verdicts), intake=wired.service, knowledge_store=wired.knowledge
-    )
-    result = asyncio.run(first.drive([{"action": "a"}], "reply"))
-    assert result.distilled == ("chat.reply",)
-    assert seen[0] and "prior_action" not in seen[0][0], "nothing was known yet"
+    wired.knowledge.refresh()
 
     # Session two: it still fails, and now the teacher sees its own previous answer.
     _record(wired.governor, ok=False, failure_class="affordance_removed")
-    second = WorldModelEvolutionDriver(
-        teacher=_Teacher(()), intake=wired.service, knowledge_store=wired.knowledge
-    )
-    asyncio.run(second.drive([{"action": "a"}], "reply"))
-    assert seen[1][0]["prior_action"] == "absorb"
+    second = worker._collect_degraded_capabilities()
+    assert second[0]["prior_action"] == "absorb"
 
     # Session three: it works again, and the knowledge retires itself.
     wired.outcomes.streak = 0
@@ -433,20 +391,35 @@ def test_the_production_path_actually_builds_a_governor(tmp_path):
     layout = SimpleNamespace(
         distilled_knowledge_path=tmp_path / "dk.json",
         capability_observations_path=tmp_path / "obs.json",
-        capability_proposal_queue_path=tmp_path / "queue.json",
-        plugin_outcomes_path=tmp_path / "outcomes.json",
     )
+    from leapflow.storage.capability_proposal_queue import EvolutionCapabilityProposalStore
+    from leapflow.storage.distilled_knowledge_store import EvolutionDistilledKnowledgeStore
+    from leapflow.storage.evolution_event_store import DuckDBEvolutionEventStore
+    from leapflow.storage.plugin_outcome_store import EvolutionPluginOutcomeStore
+
     context = Context.__new__(Context)
     context.settings = SimpleNamespace(
+        profile="test",
         profile_layout=layout,
         distilled_knowledge_ttl_s=0.0,
         accepted_evidence_kinds=("capability_degraded",),
         workspace_root=str(tmp_path),
     )
+    event_store = DuckDBEvolutionEventStore(tmp_path / "events.duckdb")
+    context._capability_proposal_queue = EvolutionCapabilityProposalStore(
+        event_store, profile_id="test"
+    )
+    context._plugin_outcome_store = EvolutionPluginOutcomeStore(
+        event_store, profile_id="test"
+    )
+    context._evolution_knowledge_store = EvolutionDistilledKnowledgeStore(
+        event_store, profile_id="test"
+    )
 
     governor = context._resolve_lifecycle_governor()
 
     assert governor is not None, "the sweep would run with governor=None"
+    event_store.close()
     assert context._resolve_lifecycle_governor() is governor, "built once, not per sweep"
     # And the sink must be attached, or the chain is wired but silent.
     assert governor._degradation_sink is not None

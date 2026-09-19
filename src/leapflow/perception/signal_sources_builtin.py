@@ -13,7 +13,6 @@ from __future__ import annotations
 from typing import Any, Dict, FrozenSet, Optional
 
 from leapflow.perception.signal_source import (
-    SignalSource,
     SignalSourceRegistry,
     SignalTransformContext,
 )

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from leapflow.dashboard import (
@@ -20,10 +21,12 @@ class _FakeProvider:
         watches: list[dict],
         findings: list[dict],
         signal_result: dict[str, Any] | None = None,
+        evolution_projection: dict[str, Any] | None = None,
     ) -> None:
         self._watches = watches
         self._findings = findings
         self._signal_result = signal_result or {"metrics": {}, "signal_stream": []}
+        self._evolution_projection = evolution_projection or {}
 
     async def watches(self) -> list[dict[str, Any]]:
         return list(self._watches)
@@ -34,6 +37,15 @@ class _FakeProvider:
 
     async def signal_metrics(self) -> dict[str, Any]:
         return dict(self._signal_result)
+
+    async def evolution_projection(self, *, session_id: str) -> dict[str, Any]:
+        result = dict(self._evolution_projection)
+        result["session_id"] = session_id
+        result["scope"] = "session"
+        return {"ok": True, "projection": result}
+
+    async def evolution_projection_aggregate(self) -> dict[str, Any]:
+        return {"ok": True, "projection": dict(self._evolution_projection)}
 
 
 def _flatten(spec: dict) -> list[dict]:
@@ -506,10 +518,34 @@ def _evolution_provider(*, live_has_findings: bool = False) -> _FakeProvider:
 
 
 def _build(provider: _FakeProvider, template: str = "evolution") -> dict:
-    import asyncio
-
     builder = DashboardViewBuilder(TemplateLibrary())
     return asyncio.run(builder.build(DashboardIntent(template=template), provider))
+
+
+def test_evolution_view_overlays_the_event_projection_for_an_explicit_session():
+    provider = _evolution_provider()
+    provider._evolution_projection = {
+        "summary": {"episode_count": 2, "by_action": {"absorb": 1}},
+        "timeline": [{"title": "world_model → absorb", "summary": "repo.inspect"}],
+        "episodes": [{"episode_id": "ep-1", "status": "committed"}],
+        "mutation_matrix": [],
+        "degraded": False,
+    }
+    builder = DashboardViewBuilder(TemplateLibrary())
+    spec = asyncio.run(
+        builder.build(DashboardIntent(template="evolution", session_id="session-a"), provider)
+    )
+
+    stats = {
+        node["props"].get("label"): node["props"].get("value")
+        for node in _flatten(spec)
+        if node.get("type") == "Stat"
+    }
+    assert stats["Recent episodes"] == 2
+    assert stats["Plugins"] == 17
+    assert spec["meta"]["evolution_projection"]["session_id"] == "session-a"
+    timeline = next(node for node in _flatten(spec) if node.get("type") == "Timeline")
+    assert timeline["props"]["data"][0]["summary"] == "repo.inspect"
 
 
 def test_a_second_watch_on_a_domain_cannot_blank_the_board():

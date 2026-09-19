@@ -15,7 +15,6 @@ nothing else, which is why the knowledge field is mandatory rather than optional
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import pytest
@@ -25,7 +24,6 @@ from leapflow.domain.adaptation_verdict import (
     ADAPTATION_ACTIONS,
     AdaptationVerdict,
 )
-from leapflow.learning.world_model_driver import WorldModelEvolutionDriver
 from leapflow.world_model.trajectory_grader import TeacherVerdict, TrajectoryGrader
 
 
@@ -179,109 +177,24 @@ def test_a_goal_restatement_is_still_rejected():
     assert grader._parse_verdicts(payload, goal="chat cosmetic example") == ()
 
 
-# ── the driver dispatches by action ────────────────────────────────────────────
+# ── the teacher verdict carries all four actions ────────────────────────────────────────
 
 
-class _Teacher:
-    def __init__(self, verdict: TeacherVerdict) -> None:
-        self._verdict = verdict
-
-    async def grade_and_propose(self, trajectory, goal="", **kwargs):
-        return self._verdict
-
-
-class _Intake:
-    """Stands in for ``CapabilityObservationService``.
-
-    ``requirements`` derives a need for whatever was just observed, because that is what
-    a real store does: the driver asks at ``min_count=1``, so the observation written a
-    moment earlier already clears the threshold. A stub that returned nothing here would
-    quietly assert the opposite of the shipped contract -- that the driver queues an
-    acquisition the detector never turned into a requirement -- and the driver now
-    records that case as a ``requirement_not_derived`` no-op instead of acting on it.
-    """
-
-    def __init__(self) -> None:
-        self.observed: list[str] = []
-
-    def observe_result(self, result, **kwargs):
-        capability = str((result or {}).get("capability") or "")
-        if capability:
-            self.observed.append(capability)
-        return {"observation_id": "o1"}
-
-    def requirements(self, *, min_count: int = 1, limit: int = 50):
-        from leapflow.domain.capability_requirement import CapabilityRequirement
-
-        return tuple(
-            CapabilityRequirement.create(
-                capability,
-                "world_model",
-                max_risk_level="read_only",
-                requirement_id=f"req-{capability}",
-            )
-            for capability in dict.fromkeys(self.observed)
-        )
-
-
-def _drive(verdicts, sink=None):
-    queued: list[Any] = []
-    driver = WorldModelEvolutionDriver(
-        teacher=_Teacher(TeacherVerdict(grades=(), verdicts=tuple(verdicts))),
-        intake=_Intake(),
-        proposal_sink=sink or (lambda p: queued.append(p) or p.proposal_id),
-    )
-    return asyncio.run(driver.drive([{"action": "a"}], "reply in the thread")), queued
-
-
-def test_only_the_acquire_verdict_reaches_the_proposal_queue():
-    result, queued = _drive(
-        [
-            _verdict("absorb", "chat.react"),
-            _verdict("rebind", "chat.reply", target="chat_reply_v3"),
-            _verdict(ACQUIRE, "mail.send"),
-            _verdict("escalate", "drive.upload", target="grant drive.file"),
-        ]
-    )
-
-    assert result.to_dict()["by_action"] == {
-        "absorb": 1, "rebind": 1, "acquire": 1, "escalate": 1
-    }
-    assert len(queued) == 1
-    assert dict(queued[0].evidence[0].metadata)["capability"] == "mail.send"
-
-
-def test_the_cheap_verdicts_survive_on_the_result():
+def test_the_cheap_verdicts_survive_on_a_teacher_verdict():
     """Dropping them for not writing code would discard the common correct answer."""
-    result, _ = _drive(
-        [
+    teacher_verdict = TeacherVerdict(
+        grades=(),
+        verdicts=(
             _verdict("absorb", "chat.react"),
             _verdict("rebind", "chat.reply", target="chat_reply_v3"),
             _verdict("escalate", "drive.upload"),
-        ]
+        ),
     )
 
-    cheap = tuple(v for v in result.verdicts if not v.writes_code)
+    cheap = tuple(v for v in teacher_verdict.verdicts if not v.writes_code)
     assert {v.action for v in cheap} == {"absorb", "rebind", "escalate"}
     assert all(v.knowledge for v in cheap)
-
-
-def test_a_session_that_only_absorbed_is_not_reported_as_idle():
-    """The cheapest answer must be visible, or adapting well looks like doing nothing."""
-    result, queued = _drive([_verdict("absorb", "chat.react")])
-
-    assert queued == [], "absorb writes no code"
-    assert result.to_dict()["by_action"]["absorb"] == 1
-    assert len(result.verdicts) == 1
-    assert result.proposed == 0, "absorb is not a proposal"
-
-
-def test_a_teacher_with_nothing_to_say_stays_empty():
-    result, queued = _drive([])
-    assert result.verdicts == () and queued == []
-    assert result.to_dict()["by_action"] == {
-        "absorb": 0, "rebind": 0, "acquire": 0, "escalate": 0
-    }
+    assert teacher_verdict.intents == (), "none of the three cheap verdicts writes code"
 
 
 # ── review findings: the derivation must be pure and the rule single ───────────

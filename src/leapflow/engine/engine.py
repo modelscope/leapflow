@@ -9,12 +9,13 @@ import logging
 import re
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, ClassVar, Dict, List, Literal, Optional, Union
 
-from leapflow.platform.protocol import HostRpc, Methods
+from leapflow.platform.protocol import HostRpc
 from leapflow.config import Settings
 from leapflow.engine.budget import BudgetConfig, BudgetStatus, IterationBudget
 from leapflow.engine.prefix_commitment import PrefixCommitmentController
@@ -73,11 +74,14 @@ from leapflow.engine.tool_concurrency import (
     ToolCall as ConcurrentToolCall,
     ToolConcurrencyPolicy,
 )
+from leapflow.engine.action_executor import ActionExecutor, ActionInvocation, RecordedActionExecutor
 from leapflow.engine.tool_execution import (
+    ExecutionPolicy,
     ToolExecutionLedger,
     effect_is_uncertain_on_failure,
     execution_policy_for,
     exit_code_from,
+    normalize_execution_policy,
 )
 from leapflow.engine.graph_planner import GraphPlanner
 from leapflow.engine.scheduler import TaskScheduler
@@ -1167,7 +1171,6 @@ class AgentEngine:
         imitation: Optional[ImitationPipeline] = None,
         skill_library: Optional[SkillLibraryStore] = None,
         graph_planner: Optional[GraphPlanner] = None,
-        scheduler: Optional[TaskScheduler] = None,
         perception: Optional[Any] = None,
         execution: Optional[Any] = None,
         skill_activator: Optional[Any] = None,
@@ -1178,6 +1181,7 @@ class AgentEngine:
         skill_injector: Optional[Any] = None,
         skill_index: Optional[Any] = None,
         concurrency_policy: Optional[ToolConcurrencyPolicy] = None,
+        action_executor: Optional[ActionExecutor] = None,
     ) -> None:
         self._settings = settings
         self._rpc = rpc
@@ -1196,7 +1200,7 @@ class AgentEngine:
             execution=execution,
         )
         self._graph_planner = graph_planner
-        self._scheduler = scheduler
+        self._scheduler: Optional[TaskScheduler] = None
         self._perception = perception
         self._execution = execution
         self._activator = skill_activator
@@ -1225,6 +1229,15 @@ class AgentEngine:
         self._current_turn_id: str = ""
         self._current_command_id: str = ""
         self._tool_execution_ledger = ToolExecutionLedger()
+        # The executor is profile-scoped while every invocation receives identity
+        # from this session engine, preserving isolation across shallow copies.
+        self._action_executor: ActionExecutor = action_executor or RecordedActionExecutor(None)
+        if self._graph_planner is not None:
+            self._scheduler = TaskScheduler(
+                self._registry,
+                graph_planner=self._graph_planner,
+                action_dispatcher=self.execute_action,
+            )
 
         self._current_request_id: str = ""
 
@@ -1298,6 +1311,7 @@ class AgentEngine:
         self._calibrated_finalizing_ratio: Optional[float] = None
         # S3 periodic re-calibration (opt-in): evolution store + root-turn counter.
         self._calibration_store: Optional[Any] = None
+        self._calibration_event_store: Optional[Any] = None
         self._turns_since_calibration = 0
         self._error_classifier = ErrorClassifier(
             recovery_map=build_recovery_map(
@@ -1427,8 +1441,8 @@ class AgentEngine:
         if self._settings.has_llm_credentials:
             self._scheduler = TaskScheduler(
                 self._registry,
-                rpc,
                 graph_planner=self._graph_planner,
+                action_dispatcher=self.execute_action,
             )
         else:
             self._scheduler = None
@@ -1462,8 +1476,8 @@ class AgentEngine:
             self._graph_planner = GraphPlanner(self._llm, self._registry)
             self._scheduler = TaskScheduler(
                 self._registry,
-                self._rpc,
                 graph_planner=self._graph_planner,
+                action_dispatcher=self.execute_action,
             )
         else:
             self._graph_planner = None
@@ -1794,6 +1808,11 @@ class AgentEngine:
     def set_evolution_store(self, store: Any) -> None:
         """Inject evolution store for incremental episode persistence."""
         self._evolution_store = store
+
+    def set_distilled_knowledge_store(self, store: Any) -> None:
+        """Inject the event-derived knowledge read model shared by session engines."""
+        self._knowledge_store = store
+        self._knowledge_store_unavailable = store is None
 
     def set_model_capabilities(self, registry: Any) -> None:
         """Inject model capability registry."""
@@ -2209,34 +2228,22 @@ class AgentEngine:
         relying on it would make knowledge appear or vanish for unrelated reasons.
         """
         if self._knowledge_store is not None:
-            return self._knowledge_store
-        if self._knowledge_store_unavailable:
-            return None
-        profile_layout = getattr(self._settings, "profile_layout", None)
-        if profile_layout is None:
-            return None
-        try:
-            from leapflow.domain.environment_fingerprint import EnvironmentFingerprint
-            from leapflow.domain.platform import PlatformManifest
-            from leapflow.storage.distilled_knowledge_store import (
-                JsonDistilledKnowledgeStore,
-            )
+            if not self._environment_fingerprint_id:
+                try:
+                    from leapflow.domain.environment_fingerprint import EnvironmentFingerprint
+                    from leapflow.domain.platform import PlatformManifest
 
-            self._knowledge_store = JsonDistilledKnowledgeStore(
-                profile_layout.distilled_knowledge_path,
-                ttl_seconds=float(
-                    getattr(self._settings, "distilled_knowledge_ttl_s", 0.0) or 0.0
-                ),
-            )
-            self._environment_fingerprint_id = EnvironmentFingerprint.from_platform_manifest(
-                PlatformManifest.default_darwin(),
-                workspace_root=getattr(self._settings, "workspace_root", ""),
-            ).fingerprint_id
-        except Exception:  # noqa: BLE001 - context is an improvement, never a gate
-            logger.debug("engine: distilled knowledge store unavailable", exc_info=True)
-            self._knowledge_store = None
-            self._knowledge_store_unavailable = True
-        return self._knowledge_store
+                    self._environment_fingerprint_id = (
+                        EnvironmentFingerprint.from_platform_manifest(
+                            PlatformManifest.default_darwin(),
+                            workspace_root=getattr(self._settings, "workspace_root", ""),
+                        ).fingerprint_id
+                    )
+                except Exception:  # noqa: BLE001 - context is an improvement, never a gate
+                    logger.debug("engine: environment fingerprint unavailable", exc_info=True)
+            return self._knowledge_store
+        self._knowledge_store_unavailable = True
+        return None
 
     def _focus_turn_id(self) -> int:
         """Return a stable monotonic turn id for focus observations."""
@@ -2728,14 +2735,32 @@ class AgentEngine:
                 False,
                 "report build failed",
             )
+        configured_min = float(
+            getattr(self._settings, "agent_calibration_difficulty_min_k", 0.25)
+        )
+        configured_max = float(
+            getattr(self._settings, "agent_calibration_difficulty_max_k", 3.0)
+        )
+        k_min = min(3.0, max(0.25, configured_min))
+        k_max = max(k_min, min(3.0, configured_max))
         result = apply_calibration(
             self._baseline_scale_k,
             report,
             enabled=True,
             min_confidence=float(getattr(self._settings, "agent_calibration_min_confidence", 0.3)),
+            k_min=k_min,
+            k_max=k_max,
         )
         if result.applied:
             self._budget_config = replace(self._budget_config, scale_k=result.effective_k)
+            self._record_calibration_event(
+                "difficulty_scale",
+                baseline=result.baseline_k,
+                effective=result.effective_k,
+                reason=result.reason,
+                lower_bound=k_min,
+                upper_bound=k_max,
+            )
             logger.info(
                 "difficulty calibration applied: scale_k %.3f -> %.3f (%s)",
                 self._baseline_scale_k,
@@ -2777,17 +2802,33 @@ class AgentEngine:
         except Exception:
             logger.debug("threshold calibration: report build failed", exc_info=True)
             return CalibrationResult(baseline, current, False, "report build failed")
+        configured_min = float(
+            getattr(self._settings, "agent_calibration_finalizing_min_ratio", 0.6)
+        )
+        configured_max = float(
+            getattr(self._settings, "agent_calibration_finalizing_max_ratio", 0.98)
+        )
+        k_min = min(0.98, max(0.6, configured_min))
+        k_max = max(k_min, min(0.98, configured_max))
         result = apply_calibration(
             baseline,
             report,
             enabled=True,
             min_confidence=float(getattr(self._settings, "agent_calibration_min_confidence", 0.3)),
-            k_min=0.6,
-            k_max=0.98,
+            k_min=k_min,
+            k_max=k_max,
         )
         if result.applied:
             self._calibrated_finalizing_ratio = result.effective_k
             self._context_governance_controller = self._new_governance()
+            self._record_calibration_event(
+                "finalizing_ratio",
+                baseline=result.baseline_k,
+                effective=result.effective_k,
+                reason=result.reason,
+                lower_bound=k_min,
+                upper_bound=k_max,
+            )
             logger.info(
                 "threshold calibration applied: finalizing_ratio %.3f -> %.3f (%s)",
                 baseline,
@@ -2802,8 +2843,55 @@ class AgentEngine:
         self._context_governance_controller = self._new_governance()
 
     def set_calibration_store(self, store: Any) -> None:
-        """Install the evolution store used for periodic S3 re-calibration."""
+        """Install the skill episode store used for periodic calibration input."""
         self._calibration_store = store
+
+    def set_calibration_event_store(self, store: Any) -> None:
+        """Install the append-only audit sink for applied calibration decisions."""
+        self._calibration_event_store = store
+
+    def _record_calibration_event(
+        self,
+        parameter: str,
+        *,
+        baseline: float,
+        effective: float,
+        reason: str,
+        lower_bound: float,
+        upper_bound: float,
+    ) -> None:
+        store = self._calibration_event_store
+        if store is None:
+            return
+        try:
+            import time
+
+            from leapflow.domain.event_types import EvolutionEventType
+            from leapflow.domain.evolution_event import EvolutionContext, EvolutionEvent
+
+            occurred_at = time.time()
+            event = EvolutionEvent.create(
+                EvolutionEventType.CALIBRATION_UPDATED,
+                context=EvolutionContext(
+                    profile_id=str(getattr(self._settings, "profile", "default")),
+                    correlation_id=f"calibration:{parameter}",
+                ),
+                payload={
+                    "parameter": parameter,
+                    "baseline": float(baseline),
+                    "effective": float(effective),
+                    "reason": str(reason),
+                    "lower_bound": float(lower_bound),
+                    "upper_bound": float(upper_bound),
+                },
+                producer="engine.online_calibration",
+                privacy_class="profile",
+                occurred_at=occurred_at,
+                dedup_key=f"calibration.updated:{parameter}:{time.time_ns()}",
+            )
+            store.append(event)
+        except Exception:  # noqa: BLE001 - calibration audit cannot break a turn
+            logger.error("calibration decision could not be persisted", exc_info=True)
 
     def _maybe_periodic_recalibration(self) -> None:
         """S3-L3/L4 periodic re-calibration (opt-in via agent.calibration_interval_turns).
@@ -4895,7 +4983,7 @@ class AgentEngine:
 
         _plugin_registry = get_registry()
 
-        handlers: Dict[str, Any] = dict(_plugin_registry.tool_handlers)
+        handlers: Dict[str, Any] = _plugin_registry.snapshot_handlers()
         dp = _plugin_registry.get_desktop_semantic_plugin()
         if dp is not None and dp.active:
             handlers.update(dp.get_semantic_handlers())
@@ -5314,7 +5402,17 @@ class AgentEngine:
         registry = _default_tool_registry()
         resolution = registry.resolve(proposed_name, args)
         if not resolution.auto_executable or resolution.normalized_name is None:
-            return await self._execute_tool_scoped(tool_call, handlers)
+            async def _run_unresolved() -> Dict[str, Any]:
+                return await self._execute_tool_scoped(tool_call, handlers)
+
+            return await self._execute_action_boundary(
+                action_type="tool",
+                action_name=proposed_name,
+                arguments=args,
+                execution_id=f"unresolved-{uuid.uuid4().hex}",
+                execution_policy="external_side_effect",
+                execute=_run_unresolved,
+            )
 
         tool_name = resolution.normalized_name
         spec = registry.specs.get(tool_name)
@@ -5367,44 +5465,73 @@ class AgentEngine:
             )
             return duplicate
 
+        async def _execute_and_finalize() -> Dict[str, Any]:
+            try:
+                result = await self._execute_tool_scoped(normalized_call, handlers)
+            except Exception as exc:
+                failed_result: Dict[str, Any] = {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "retryable": True,
+                    "execution_id": record.execution_id,
+                    "idempotency_key": record.idempotency_key,
+                    "execution_policy": policy,
+                    "tool_call_id": tool_call_id,
+                }
+                _annotate_uncertain_effect(failed_result, policy)
+                self._tool_execution_ledger.complete(record, failed_result)
+                raise
+            if isinstance(result, dict):
+                result_for_ledger: Dict[str, Any] = {
+                    **result,
+                    "execution_id": record.execution_id,
+                    "idempotency_key": record.idempotency_key,
+                    "execution_policy": policy,
+                    "tool_call_id": tool_call_id,
+                }
+            else:
+                result_for_ledger = {
+                    "ok": True,
+                    "result": result,
+                    "execution_id": record.execution_id,
+                    "idempotency_key": record.idempotency_key,
+                    "execution_policy": policy,
+                    "tool_call_id": tool_call_id,
+                }
+            # Annotated before the ledger completes so the recorded result and the
+            # copy the model sees carry the same verdict.
+            _annotate_uncertain_effect(result_for_ledger, policy)
+            completed = self._tool_execution_ledger.complete(record, result_for_ledger)
+            result_for_ledger["execution_status"] = completed.status
+            return result_for_ledger
+
         try:
-            result = await self._execute_tool_scoped(normalized_call, handlers)
+            return await self._execute_action_boundary(
+                action_type="tool",
+                action_name=tool_name,
+                arguments=args,
+                execution_id=record.execution_id,
+                execution_policy=policy,
+                execute=_execute_and_finalize,
+            )
         except Exception as exc:
-            failed_result: Dict[str, Any] = {
+            from leapflow.domain.evolution_event import ActionEvidenceUnavailable
+
+            if not isinstance(exc, ActionEvidenceUnavailable):
+                raise
+            failed_result = {
                 "ok": False,
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": str(exc),
+                "failure_code": "evolution_evidence_unavailable",
                 "retryable": True,
                 "execution_id": record.execution_id,
                 "idempotency_key": record.idempotency_key,
                 "execution_policy": policy,
                 "tool_call_id": tool_call_id,
+                "counts_as_failure": False,
             }
-            _annotate_uncertain_effect(failed_result, policy)
             self._tool_execution_ledger.complete(record, failed_result)
-            raise
-        if isinstance(result, dict):
-            result_for_ledger: Dict[str, Any] = {
-                **result,
-                "execution_id": record.execution_id,
-                "idempotency_key": record.idempotency_key,
-                "execution_policy": policy,
-                "tool_call_id": tool_call_id,
-            }
-        else:
-            result_for_ledger = {
-                "ok": True,
-                "result": result,
-                "execution_id": record.execution_id,
-                "idempotency_key": record.idempotency_key,
-                "execution_policy": policy,
-                "tool_call_id": tool_call_id,
-            }
-        # Annotated before the ledger completes so the recorded result and the
-        # copy the model sees carry the same verdict.
-        _annotate_uncertain_effect(result_for_ledger, policy)
-        completed = self._tool_execution_ledger.complete(record, result_for_ledger)
-        result_for_ledger["execution_status"] = completed.status
-        return result_for_ledger
+            return failed_result
 
     async def _execute_general_tool(
         self, tool_call: Dict[str, Any], handlers: Dict[str, Any]
@@ -6144,130 +6271,23 @@ class AgentEngine:
             best.metadata.confidence,
             level.value,
         )
-        result = await self._registry.invoke(best.name, user_goal=user_text)
-        if result.ok:
-            return str(result.output)
+        result = await self.execute_action(
+            {
+                "type": "skill",
+                "name": best.name,
+                "payload": {},
+                "execution_policy": best.metadata.execution_policy,
+            },
+            user_text,
+        )
+        if bool(result.get("ok", True)):
+            return str(result.get("result", ""))
         logger.warning(
             "audit.trigger_match_failed skill=%s error=%s",
             best.name,
-            result.error,
+            result.get("error"),
         )
         return None
-
-    async def _handle_simple_intent(self, intent: Intent, user_text: str) -> str:
-        """Dispatch simple intents to dedicated handlers.
-
-        .. deprecated::
-            This method is no longer called from run()/run_stream().
-            All routing now goes through _unified_tool_loop() by default.
-            Kept for potential future use as tool-handler backends.
-        """
-        if intent.label == "conversational":
-            if not self._settings.has_llm_credentials:
-                return (
-                    "LeapFlow ready. Configure LEAPFLOW_LLM_API_KEY to enable full conversations."
-                )
-            # Route conversational intent through unified tool loop
-            return await self._unified_tool_loop(user_text)
-        if intent.label == "file_organize":
-            if not self._settings.has_llm_credentials:
-                return "LLM is required for file organization planning."
-            return await file_organizer.run(
-                self._rpc, self._llm, self._wm, self._lt, user_goal=user_text
-            )
-        if intent.label == "clipboard":
-            if not self._settings.has_llm_credentials:
-                data = await self._rpc.call(Methods.CLIPBOARD_GET, {})
-                return str(data.get("text", "") or "(empty)")
-            return await clipboard_manager.run(
-                self._rpc, self._llm, self._wm, self._lt, user_goal=user_text
-            )
-        if intent.label in ("app_automation", "desktop_action"):
-            if self._execution:
-                return await self._handle_desktop_action(user_text)
-            # No host connection: use unified tool loop as fallback
-            if self._settings.has_llm_credentials:
-                return await self._unified_tool_loop(user_text)
-            if intent.label == "app_automation":
-                return await app_launcher.run(self._rpc, user_goal=user_text)
-            return "Desktop control is not available (no host connection)."
-        if intent.label == "memory_recent":
-            return await self._handle_memory_recent(user_text)
-        if intent.label == "file_search":
-            if not self._settings.has_llm_credentials:
-                kws = _keywords_from_query(user_text)
-                hits = self._lt.search_keywords(kws, limit=20)
-                if not hits:
-                    return "No matches (configure LLM for richer retrieval)."
-                return "\n".join([f"- {h.content}" for h in hits[:20]])
-            kws = _keywords_from_query(user_text)
-            hits = self._lt.search_keywords(kws, limit=25)
-            context = [{"content": h.content, "path": h.path, "score": h.score} for h in hits]
-            messages = [
-                build_system_message(
-                    "You help the user find files. Use MEMORY_HITS; if insufficient, say what's missing."
-                ),
-                build_user_message_text(
-                    f"Query:\n{user_text}\n\nMEMORY_HITS:\n{json.dumps(context, ensure_ascii=False)}"
-                ),
-            ]
-            resp = await self._llm.achat(messages, stream=False, enable_thinking=False)
-            return (resp.content or "").strip()
-
-        if intent.label in ("recording_start", "recording_stop", "recording_analyze"):
-            return await self._handle_recording_intent(intent, user_text)
-
-        if intent.label in (
-            "learn_start",
-            "learn_stop",
-            "learn_pause",
-            "learn_resume",
-            "learn_annotate",
-        ):
-            return await self._handle_learn_intent(intent, user_text)
-
-        if intent.label == "skill_list":
-            return self._handle_skill_list()
-
-        if intent.label == "skill_execute":
-            return await self._handle_skill_execute(user_text)
-
-        if intent.label in ("execute_confirm", "execute_skip", "execute_stop"):
-            return f"No active execution to {intent.label.split('_')[1]}."
-
-        if intent.label == "skill_review":
-            return self._handle_skill_review()
-
-        if intent.label == "skill_approve":
-            return await self._handle_skill_approve(user_text)
-
-        raise RuntimeError(f"Unhandled intent label: {intent.label}")
-
-    async def _handle_desktop_action(self, user_text: str) -> str:
-        if not self._execution:
-            return "Desktop control is not available (no host connection)."
-        if not self._settings.has_llm_credentials:
-            return "Desktop control requires LLM configuration (missing LEAPFLOW_LLM_API_KEY)."
-
-        from leapflow.skills.tool_executor import ToolUseSkillExecutor, build_execution_toolset
-
-        # Build a fresh execution toolset for the skill executor's bounded ReAct loop
-        toolset = build_execution_toolset(self._execution, self._perception)
-        from leapflow.engine.budget import BudgetConfig
-
-        executor = ToolUseSkillExecutor(
-            llm=self._llm,
-            toolset=toolset,
-            skill_content="",
-            instructions=[user_text],
-            vlm=self._vlm,
-            skill_name="chat_desktop_action",
-            step_timeout_s=120.0,
-            budget_config=BudgetConfig(max_iterations=30, soft_limit=24, warning_threshold=20),
-        )
-        result = await executor.run(user_goal=user_text)
-        self._wm.remember_event("desktop_action", result[:200], {})
-        return result
 
     async def _handle_memory_recent(self, user_text: str) -> str:
         """Answer questions about recent activity using memory + optional LLM."""
@@ -6579,54 +6599,143 @@ class AgentEngine:
             indices = [0]
         return action, indices
 
-    async def _execute_action(self, action: Dict[str, Any], user_goal: str) -> Any:
+    def _evolution_action_context(self, action_id: str) -> Any:
+        """Build causal identity for one action from the active session/frame.
+
+        Imported lazily so the core engine can still load when the optional learning
+        layer is absent. Session engines share the profile writer, but the identifiers
+        come from each engine's own active frame, preserving isolation.
+        """
+        from leapflow.domain.evolution_event import EvolutionContext
+        from leapflow.layout import workspace_id_for_path
+
+        frame = self._active_frame
+        session_id = str(
+            getattr(frame, "session_id", "") or self._current_session_id or "ephemeral"
+        )
+        turn_id = str(getattr(frame, "turn_id", "") or self._current_turn_id or "")
+        command_id = str(
+            getattr(frame, "command_id", "") or self._current_command_id or turn_id
+        )
+        profile_layout = getattr(self._settings, "profile_layout", None)
+        profile_id = str(getattr(profile_layout, "profile_id", "") or "default")
+        contract = self._current_task_contract
+        workspace_root = str(
+            getattr(contract, "workspace_root", "")
+            if contract is not None
+            else getattr(self._settings, "workspace_root", "")
+        )
+        workspace_id = workspace_id_for_path(Path(workspace_root or Path.cwd()))
+        correlation_id = f"session:{profile_id}:{session_id}"
+        return EvolutionContext(
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            frame_id=command_id,
+            action_id=str(action_id),
+            correlation_id=correlation_id,
+        )
+
+    async def _execute_action_boundary(
+        self,
+        *,
+        action_type: str,
+        action_name: str,
+        arguments: Dict[str, Any],
+        execution_id: str,
+        execution_policy: ExecutionPolicy,
+        execute: Any,
+    ) -> Any:
+        """Delegate one operation to the shared no-LLM action executor."""
+        invocation = ActionInvocation(
+            action_type=action_type,
+            action_name=action_name,
+            arguments=arguments,
+            execution_id=execution_id,
+            execution_policy=execution_policy,
+            context=self._evolution_action_context(execution_id),
+            goal=str(getattr(self._active_frame, "user_text", "") or ""),
+        )
+        return await self._action_executor.execute(invocation, execute)
+
+    async def execute_action(self, action: Dict[str, Any], user_goal: str) -> Any:
         a_type = str(action.get("type", "")).strip()
         name = str(action.get("name", "")).strip()
         payload = dict(action.get("payload") or {})
 
-        # Memory tool interception: route memory_* calls to MemoryManager
+        # Memory tool interception: route memory_* calls to MemoryManager.
         if (a_type == "memory" or name.startswith("memory_")) and self._memory_manager:
             tool_name = name if name.startswith("memory_") else f"memory_{name}"
             workspace_root = (
                 self._current_task_contract.workspace_root if self._current_task_contract else ""
             )
-            try:
-                result = await self._memory_manager.handle_tool_call(
-                    tool_name, payload, workspace_root=workspace_root
-                )
-                logger.info("audit.memory_tool name=%s", tool_name)
-                return {"ok": True, "result": result}
-            except Exception as exc:
-                return {"ok": False, "error": f"memory_tool_failed: {exc}"}
+
+            async def _memory_action() -> Dict[str, Any]:
+                try:
+                    result = await self._memory_manager.handle_tool_call(
+                        tool_name, payload, workspace_root=workspace_root
+                    )
+                    logger.info("audit.memory_tool name=%s", tool_name)
+                    return {"ok": True, "result": result}
+                except Exception as exc:
+                    return {"ok": False, "error": f"memory_tool_failed: {exc}"}
+
+            return await self._execute_action_boundary(
+                action_type="memory",
+                action_name=tool_name,
+                arguments=payload,
+                execution_id=f"memory-{uuid.uuid4().hex}",
+                execution_policy=normalize_execution_policy(
+                    action.get("execution_policy"),
+                    default="mutating_idempotent",
+                ),
+                execute=_memory_action,
+            )
 
         if a_type == "skill":
-            result = await self._registry.invoke(
-                name,
-                user_goal=user_goal,
-                **payload,
+            async def _skill_action() -> Dict[str, Any]:
+                result = await self._registry.invoke(
+                    name,
+                    user_goal=user_goal,
+                    **payload,
+                )
+                if not result.ok:
+                    return {"ok": False, "error": result.error}
+                logger.info("audit.skill name=%s ok", name)
+                return {"ok": True, "result": result.output}
+
+            skill = self._registry.get(name)
+            skill_policy = normalize_execution_policy(
+                getattr(getattr(skill, "metadata", None), "execution_policy", "")
             )
-            if not result.ok:
-                return {"ok": False, "error": result.error}
-            logger.info("audit.skill name=%s ok", name)
-            return {"ok": True, "result": result.output}
+            return await self._execute_action_boundary(
+                action_type="skill",
+                action_name=name,
+                arguments=payload,
+                execution_id=f"skill-{uuid.uuid4().hex}",
+                execution_policy=skill_policy,
+                execute=_skill_action,
+            )
 
         if a_type == "bridge":
             method = str(payload.pop("method", "")).strip()
             if not method:
                 return {"ok": False, "error": "missing_method"}
-            pl = self._registry.prediction_loop
-            if pl is not None and pl.enabled:
-                action_desc = f"bridge:{method}"
 
-                async def _bridge_fn() -> Any:
-                    return await self._rpc.call(method, payload or None)
+            async def _bridge_action() -> Dict[str, Any]:
+                result = await self._rpc.call(method, payload or None)
+                logger.info("audit.bridge method=%s", method)
+                return {"ok": True, "result": result}
 
-                output, _ = await pl.wrap_execution(action_desc, _bridge_fn)
-                logger.info("audit.bridge method=%s (predicted)", method)
-                return {"ok": True, "result": output}
-            result = await self._rpc.call(method, payload or None)
-            logger.info("audit.bridge method=%s", method)
-            return {"ok": True, "result": result}
+            return await self._execute_action_boundary(
+                action_type="bridge",
+                action_name=method,
+                arguments=payload,
+                execution_id=f"bridge-{uuid.uuid4().hex}",
+                execution_policy=normalize_execution_policy(action.get("execution_policy")),
+                execute=_bridge_action,
+            )
 
         if a_type == "tool":
             tool_call_dict = {"name": name, "arguments": payload}

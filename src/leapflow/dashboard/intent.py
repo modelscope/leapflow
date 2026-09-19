@@ -2,8 +2,8 @@
 """DashboardIntent: the single normalized request behind ``/board`` and the tool.
 
 The **template** is the primary view dimension (a rendering lens). Most templates
-analyze the current session and need nothing else; a per-device view needs to know
-*which* device, so the intent also carries an optional target.
+analyze the current session and need nothing else; device and evolution views carry
+an explicit target so they never infer another client's state.
 
 ``device``/``channel`` are explicit fields rather than a generic params bag. The
 board's request surface is small and worth keeping legible, and a typed field is what
@@ -24,11 +24,12 @@ from leapflow.utils.shell_lex import split_args
 
 @dataclass(frozen=True)
 class DashboardIntent:
-    """A normalized dashboard request: which lens, and optionally which target."""
+    """A normalized dashboard request with explicit device or session scope."""
 
     template: str = ""
     device: str = ""
     channel: str = ""
+    session_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Return the wire form, omitting an absent target.
@@ -42,6 +43,8 @@ class DashboardIntent:
             payload["device"] = self.device
         if self.channel:
             payload["channel"] = self.channel
+        if self.session_id:
+            payload["session_id"] = self.session_id
         return payload
 
     @classmethod
@@ -52,6 +55,7 @@ class DashboardIntent:
             template=str(data.get("template", "") or "").strip(),
             device=str(data.get("device", "") or "").strip(),
             channel=str(data.get("channel", "") or "").strip(),
+            session_id=str(data.get("session_id", data.get("session", "")) or "").strip(),
         )
 
     @classmethod
@@ -67,10 +71,13 @@ class DashboardIntent:
         except ValueError:
             tokens = tuple((args or "").split())
         parts = [token.strip() for token in tokens if token.strip()]
+        template = parts[0] if parts else ""
+        is_evolution = template in {"evolution", "evolution_live", "causal_trace"}
         return cls(
-            template=parts[0] if parts else "",
-            device=parts[1] if len(parts) > 1 else "",
-            channel=parts[2] if len(parts) > 2 else "",
+            template=template,
+            device=parts[1] if len(parts) > 1 and not is_evolution else "",
+            channel=parts[2] if len(parts) > 2 and not is_evolution else "",
+            session_id=parts[1] if len(parts) > 1 and is_evolution else "",
         )
 
 

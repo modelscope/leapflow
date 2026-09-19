@@ -141,7 +141,8 @@ class EvolutionProducer:
         with it, and the failure it would report is its own.
         """
         try:
-            payload = self._build_payload(ctx)
+            projection = await self._event_projection(ctx)
+            payload = self._build_payload(ctx, event_projection=projection)
         except Exception:  # noqa: BLE001 - observability must not break the cycle
             # Logged at warning, not debug: every read inside is individually
             # guarded and degrades to an ``unverifiable`` row, so reaching this
@@ -225,19 +226,19 @@ class EvolutionProducer:
             )
         return rows
 
-    def _build_payload(self, ctx: ProducerContext) -> dict[str, Any]:
+    def _build_payload(
+        self,
+        ctx: ProducerContext,
+        *,
+        event_projection: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         snapshot = self._live_registry_snapshot()
-        rebuilt = self._episodes(ctx)
-        # ``None`` means the history could not be rebuilt; ``()`` means there is
-        # genuinely none. Collapsing the two would report a local defect as an
-        # absence of data -- the same conflation the reachability rows exist to
-        # prevent, and it would be inconsistent for this panel to commit it.
-        episodes: tuple[Any, ...] = rebuilt or ()
+        episodes: tuple[Any, ...] = ()
         # Traces are read before reachability because three of its rows are decided
         # by whether the cold-path sweep left a trace. Deriving them from anything
         # else is how they came to be hardcoded.
         traces = self._recent_traces()
-        reachability = self._reachability(snapshot, traces)
+        reachability = self._reachability(snapshot, traces, event_projection)
         payload: dict[str, Any] = {
             "observed_at": float(getattr(ctx, "now", 0.0) or 0.0),
             "roster": snapshot["roster"],
@@ -279,22 +280,28 @@ class EvolutionProducer:
         payload["trace_feed"] = self._trace_feed(traces)
         payload["unadmitted"] = self._unadmitted(traces)
         payload["reward_bandwidth"] = self._reward_bandwidth(traces, episodes)
-        if rebuilt is None:
+        payload["summary"] = self._summary(snapshot, reachability, episodes, traces)
+        if event_projection is None:
+            payload["degraded"] = True
             payload["degraded_kind"] = UNVERIFIABLE
             payload["degraded_reason"] = (
-                "The causal history could not be rebuilt: the decision or observation "
-                "records could not be read. This is a fault to investigate, not an "
-                "absence of activity. The live snapshot and pipeline reachability below "
-                "are unaffected."
+                "The append-only evolution projection could not be read. This is a "
+                "runtime fault, not an absence of activity."
             )
-        elif not episodes:
+            return payload
+
+        projected = dict(event_projection)
+        projected_summary = dict(projected.pop("summary", {}) or {})
+        payload.update(projected)
+        payload["summary"] = {**payload["summary"], **projected_summary}
+        if payload.get("degraded"):
             payload["degraded_kind"] = NO_EVIDENCE
             payload["degraded_reason"] = (
-                "No capability decision has been recorded yet, so there is no causal "
-                "history to rebuild. The live snapshot and pipeline reachability below "
-                "are unaffected."
+                "No evolution event has been recorded in this scope yet."
             )
-        payload["summary"] = self._summary(snapshot, reachability, episodes, traces)
+        else:
+            payload.pop("degraded_kind", None)
+            payload.pop("degraded_reason", None)
         return payload
 
     # ── live traces (facts no store retains) ─────────────────────────────
@@ -302,37 +309,24 @@ class EvolutionProducer:
     def _recent_traces(self) -> list[dict[str, Any]]:
         """Flush the probe buffer, then read the newest traces back.
 
-        Flushing here rather than on a separate schedule is what keeps the panel and
-        the file consistent: this producer is the only consumer, and it runs on the
-        monitor tick, which is the cold path the tap's contract requires. Probe sites
-        therefore only ever buffer.
-
-        Empty is the normal state -- no sink is installed outside the daemon, and a
-        framework that has not mutated has nothing to report. Distinguished from a
-        read failure only in the log, because unlike the episode history there is no
-        "records exist but are unreadable" case to mistake it for: the store treats a
-        corrupt file as empty by design.
+        Flushing here rather than on a separate schedule keeps the panel aligned
+        with the append-only event stream. Probe sites only buffer; the monitor tick
+        performs the durable write through the daemon-owned event store adapter.
         """
         try:
             from leapflow.telemetry.evolution_tap import current_sink
 
             sink = current_sink()
-            if sink is not None and hasattr(sink, "flush"):
+            if sink is None:
+                return []
+            if hasattr(sink, "flush"):
                 sink.flush()
-        except Exception:  # noqa: BLE001 - a failed flush costs freshness, not the cycle
-            logger.debug("evolution producer: trace flush failed", exc_info=True)
-        store = self._json_store(
-            "evolution_traces_path", "evolution_trace_store", "JsonEvolutionTraceStore"
-        )
-        if store is None:
-            return []
-        try:
             return [
                 dict(row)
-                for row in store.list_traces(limit=_MAX_TRACES)
+                for row in sink.list_traces(limit=_MAX_TRACES)
                 if isinstance(row, Mapping)
             ]
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - trace visibility must not break the cycle
             logger.debug("evolution producer: traces unreadable", exc_info=True)
             return []
 
@@ -467,43 +461,20 @@ class EvolutionProducer:
         order = (WIRED, NO_EVIDENCE, NOT_ADMITTED, UNVERIFIABLE)
         return [{"label": name, "value": counts[name]} for name in order if counts.get(name)]
 
-    def _episodes(self, ctx: ProducerContext) -> tuple[Any, ...] | None:
-        """Rebuild recent episodes from existing records.
-
-        Returns ``None`` when the history could not be rebuilt at all, and ``()``
-        when it was rebuilt and is genuinely empty. The caller depends on that
-        difference: "could not look" and "nothing to see" are different answers,
-        and only one of them is a fault.
-
-        The ledger reads the plan and observation stores, so it is resolved per
-        cycle for the same reason the stores are: the profile layout is bound
-        during deferred daemon initialisation.
-        """
-        plans = self._json_store(
-            "capability_plans_path", "capability_plan_store", "JsonCapabilityPlanStore"
-        )
-        if plans is None:
+    @staticmethod
+    async def _event_projection(ctx: ProducerContext) -> dict[str, Any] | None:
+        """Read the aggregate projection exposed by the daemon service facade."""
+        services = getattr(ctx, "services", None)
+        reader = getattr(services, "evolution_projection_aggregate", None)
+        if not callable(reader):
             return None
-        observations = self._json_store(
-            "capability_observations_path",
-            "capability_observation_store",
-            "JsonCapabilityObservationStore",
-        )
-        trust, _usage = self._trust_and_usage()
         try:
-            from leapflow.evolution import EvolutionLedger
-
-            ledger = EvolutionLedger(
-                plan_store=plans, observation_store=observations, trust_ledger=trust
-            )
-            return tuple(
-                ledger.recent_episodes(
-                    limit=_MAX_EPISODES, now=float(getattr(ctx, "now", 0.0) or 0.0)
-                )
-            )
-        except Exception:  # noqa: BLE001 - a missing timeline degrades the panel, not the cycle
-            logger.debug("evolution producer: ledger unavailable", exc_info=True)
+            result = await reader()
+        except Exception:  # noqa: BLE001 - observability degrades instead of failing
+            logger.debug("evolution producer: event projection unavailable", exc_info=True)
             return None
+        projection = result.get("projection") if isinstance(result, Mapping) else None
+        return dict(projection) if isinstance(projection, Mapping) else None
 
     @staticmethod
     def _timeline(episodes: Sequence[Any]) -> list[dict[str, Any]]:
@@ -843,7 +814,10 @@ class EvolutionProducer:
     # ── pipeline reachability ─────────────────────────────────────────────
 
     def _reachability(
-        self, snapshot: Mapping[str, Any], traces: Sequence[Mapping[str, Any]]
+        self,
+        snapshot: Mapping[str, Any],
+        traces: Sequence[Mapping[str, Any]],
+        event_projection: Mapping[str, Any] | None,
     ) -> list[dict[str, Any]]:
         """Report the runtime evidence for each pipeline segment.
 
@@ -863,7 +837,7 @@ class EvolutionProducer:
             self._segment_evidence_gate(settings),
             self._segment_authorising_origins(settings),
             self._segment_observations(observations),
-            self._segment_lifecycle(),
+            self._segment_lifecycle(event_projection),
             self._segment_plan_records(),
             self._segment_trust(snapshot),
         ]
@@ -999,51 +973,40 @@ class EvolutionProducer:
             next_step="Nothing to act on: no capability gap has been recorded yet.",
         )
 
-    def _segment_lifecycle(self) -> dict[str, Any]:
-        """Whether the trust/probation/quarantine tier is actually governing.
-
-        A non-empty queue used to be reported ``wired``, which read as the healthy
-        class beside a genuinely healthy ``Trust accrual``. On a real profile that
-        was 212 records, every one of them ``PENDING``, none carrying a policy
-        decision or install result, all of them written by ``plugin_propose`` and
-        nothing draining them: a monotonically growing dead end presented as a
-        working segment.
-
-        So the evidence is a *transition*, not a row count. Records existing prove
-        the queue is writable; a record past ``PENDING`` proves something reads it
-        back and advances it, which is the only thing this segment claims to check.
-        """
-        store = self._json_store("capability_proposal_queue_path", "capability_proposal_queue", "JsonCapabilityProposalQueue")
-        if store is None:
-            return self._row("lifecycle", "Lifecycle records", UNVERIFIABLE, "queue unreadable")
-        try:
-            items = store.list_items(limit=0)
-        except Exception:  # noqa: BLE001
-            logger.debug("evolution producer: lifecycle read failed", exc_info=True)
-            return self._row("lifecycle", "Lifecycle records", UNVERIFIABLE, "queue unreadable")
-        if items:
+    def _segment_lifecycle(
+        self, event_projection: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        """Report proposal lifecycle evidence from the append-only projection."""
+        if event_projection is None:
+            return self._row(
+                "lifecycle", "Lifecycle records", UNVERIFIABLE, "projection unreadable"
+            )
+        proposals = [
+            dict(item)
+            for item in event_projection.get("proposals", ())
+            if isinstance(item, Mapping)
+        ]
+        if proposals:
             counts: dict[str, int] = {}
-            for item in items:
-                status = str(getattr(item, "status", "") or "unknown")
+            for item in proposals:
+                status = str(item.get("status") or "unknown")
                 counts[status] = counts.get(status, 0) + 1
-            spread = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+            spread = ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
             advanced = sum(
-                count for status, count in counts.items()
+                count
+                for status, count in counts.items()
                 if status.upper() not in _LIFECYCLE_ENTRY_STATES
             )
             if advanced:
                 return self._row("lifecycle", "Lifecycle records", WIRED, spread)
-            # Entry state only. The queue is written but never read back, so the
-            # governor is not running -- and the row says which way the count grows.
             return self._row(
                 "lifecycle",
                 "Lifecycle records",
                 NO_EVIDENCE,
                 spread,
                 next_step=(
-                    f"{len(items)} record(s) have never left their entry state, so nothing "
-                    "reads the queue back. The governor advances a record only when the "
-                    "co-evolution sweep runs; until then the queue only grows."
+                    f"{len(proposals)} record(s) have never left their entry state; "
+                    "without the proposal orchestrator the queue only grows."
                 ),
             )
         return self._row(
@@ -1051,10 +1014,7 @@ class EvolutionProducer:
             "Lifecycle records",
             NO_EVIDENCE,
             "queue is empty",
-            next_step=(
-                "The governor has nothing to govern. A lifecycle record opens when "
-                "plugin_propose runs."
-            ),
+            next_step="A lifecycle record opens when plugin_propose runs.",
         )
 
     def _segment_plan_records(self) -> dict[str, Any]:

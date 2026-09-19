@@ -10,16 +10,13 @@ live ``plugin_propose -> plugin_generate -> plugin_install`` chain.
 
 Two distinct vocabularies meet here, and conflating them is the mistake to avoid:
 
-* ``domain.plugin_proposal.ProposalStatus`` -- ``draft | review | approved |
-  rejected`` -- is a **review** state: should a human accept this proposal?
-* ``storage.capability_proposal_queue.ProposalStatus`` -- ``PENDING | GENERATED |
-  APPROVED | INSTALLED | PROBATION | VERIFIED | REJECTED | FAILED | QUARANTINED``
-  -- is an **acquisition lifecycle** state: where is this capability in its
-  journey from hypothesis to trusted?
+* ``domain.plugin_proposal.ProposalStatus`` describes the immutable review content
+  embedded in the lifecycle event.
+* ``storage.capability_proposal_queue.ProposalStatus`` describes the governed
+  acquisition state from hypothesis through probation and verification.
 
-They are not duplicates and must not be merged into one field. A proposal that a
-human has ``approved`` may still be anywhere in its lifecycle. The lifecycle store
-below owns the second vocabulary.
+Both now travel in one append-only proposal record, but remain separate fields: a
+review decision is evidence for a lifecycle transition, not the lifecycle itself.
 """
 
 from __future__ import annotations

@@ -26,7 +26,6 @@ from leapflow.engine.intent_classifier import (
     IntentClassifier,
     LLMIntentClassifier,
 )
-from leapflow.engine.scheduler import TaskScheduler
 from leapflow.engine.session import SessionController
 from leapflow.recording.attention import build_attention_filters
 from leapflow.analysis.pipeline import ImitationPipeline
@@ -385,6 +384,21 @@ class Context:
             settings.duckdb_path,
             volatile_on_lock=True,
         )
+        # Long-running evolution evidence is profile-scoped and daemon-owned. The
+        # store schema initializes on a worker thread in ``initialize_critical``;
+        # the outbox stays on the event loop. Session engines share both while
+        # supplying their own causal identifiers.
+        self._evolution_event_store: Optional[Any] = None
+        self._evolution_artifact_store: Optional[Any] = None
+        self._evolution_outbox: Optional[Any] = None
+        self._action_recorder: Optional[Any] = None
+        self._action_executor: Optional[Any] = None
+        self._session_finalizer: Optional[Any] = None
+        self._teacher_worker: Optional[Any] = None
+        self._evolution_projection_runner: Optional[Any] = None
+        self._evolution_knowledge_store: Optional[Any] = None
+        self._capability_proposal_queue: Optional[Any] = None
+        self._plugin_outcome_store: Optional[Any] = None
 
         # Memory subsystem — provider-based architecture (dual-layer)
         working = WorkingMemoryProvider(max_tokens=settings.memory_working_max_tokens)
@@ -1403,6 +1417,60 @@ class Context:
         settings = self.settings
 
         await self.memory.initialize_all()
+        if self._action_recorder is None:
+            from leapflow.engine.action_executor import RecordedActionExecutor
+            from leapflow.evolution.action_recorder import ActionRecorder
+            from leapflow.evolution.artifact_store import ContentAddressedArtifactStore
+            from leapflow.evolution.outbox import EvolutionEventOutbox
+            from leapflow.evolution.projection import EvolutionProjectionRunner
+            from leapflow.evolution.session_finalizer import SessionFinalizer
+            from leapflow.storage.capability_proposal_queue import (
+                EvolutionCapabilityProposalStore,
+            )
+            from leapflow.storage.distilled_knowledge_store import (
+                EvolutionDistilledKnowledgeStore,
+            )
+            from leapflow.storage.evolution_event_store import DuckDBEvolutionEventStore
+            from leapflow.storage.plugin_outcome_store import EvolutionPluginOutcomeStore
+            from leapflow.version import __version__
+
+            self._evolution_event_store = await asyncio.to_thread(
+                DuckDBEvolutionEventStore,
+                self._db_holder,
+            )
+            self._evolution_artifact_store = ContentAddressedArtifactStore(
+                settings.profile_layout.evolution_artifacts_dir
+            )
+            self._evolution_outbox = EvolutionEventOutbox(self._evolution_event_store)
+            self._evolution_outbox.start()
+            self._action_recorder = ActionRecorder(
+                self._evolution_outbox,
+                producer_version=__version__,
+            )
+            self._action_executor = RecordedActionExecutor(self._action_recorder)
+            self._session_finalizer = SessionFinalizer(
+                self._evolution_event_store,
+                self._evolution_outbox,
+            )
+            self._evolution_projection_runner = EvolutionProjectionRunner(
+                self._evolution_event_store
+            )
+            self._evolution_knowledge_store = EvolutionDistilledKnowledgeStore(
+                self._evolution_event_store,
+                profile_id=settings.profile_layout.profile_id,
+                ttl_seconds=float(
+                    getattr(settings, "distilled_knowledge_ttl_s", 0.0) or 0.0
+                ),
+            )
+            await asyncio.to_thread(self._evolution_knowledge_store.refresh)
+            self._capability_proposal_queue = EvolutionCapabilityProposalStore(
+                self._evolution_event_store,
+                profile_id=settings.profile_layout.profile_id,
+            )
+            self._plugin_outcome_store = EvolutionPluginOutcomeStore(
+                self._evolution_event_store,
+                profile_id=settings.profile_layout.profile_id,
+            )
         if self.storage_volatile:
             _emit_status(
                 "Primary database is locked; running with volatile session storage."
@@ -1562,9 +1630,6 @@ class Context:
         # are assembled in initialize_deferred()
         
         graph_planner = GraphPlanner(self.llm, self.registry) if settings.has_llm_credentials else None
-        scheduler = TaskScheduler(
-            self.registry, self.rpc, graph_planner=graph_planner,
-        ) if graph_planner else None
 
         # Bind perception/execution to the desktop semantic plugin
         from leapflow.plugins import get_registry as _get_tool_registry
@@ -1885,7 +1950,6 @@ class Context:
             imitation=None,  # wired in initialize_deferred()
             skill_library=self.skill_lib,
             graph_planner=graph_planner,
-            scheduler=scheduler,
             perception=perception,
             execution=execution_adapter,
             skill_activator=None,  # wired in initialize_deferred()
@@ -1895,7 +1959,9 @@ class Context:
             evolution=self._evolution,
             skill_injector=skill_injector,
             skill_index=skill_index,
+            action_executor=self._action_executor,
         )
+        self.engine.set_distilled_knowledge_store(self._evolution_knowledge_store)
 
         # ── Wire CompressorConfig with archive_fn into engine ──
         from leapflow.engine.context_compressor import ContextCompressor
@@ -2471,6 +2537,56 @@ class Context:
                 experience_store=self.experience_store,
                 budget=self.learning_budget,
             )
+            if (
+                self._teacher_worker is None
+                and self._evolution_event_store is not None
+                and self._evolution_artifact_store is not None
+            ):
+                from leapflow.evolution.teacher_worker import DurableTeacherWorker
+                from leapflow.learning.degradation_sink import (
+                    build_live_capability_resolver,
+                )
+                from leapflow.plugins import get_registry
+                from leapflow.version import __version__
+
+                observation_service = self._capability_observation_service()
+                proposal_queue = (
+                    self._capability_proposal_queue
+                    if settings.evolution_enabled
+                    else None
+                )
+                acquisition_resolver = (
+                    build_live_capability_resolver(
+                        registry_provider=get_registry,
+                        environment_provider=self._current_environment_fingerprint,
+                    )
+                    if proposal_queue is not None
+                    else None
+                )
+                self._teacher_worker = DurableTeacherWorker(
+                    store=self._evolution_event_store,
+                    artifact_store=self._evolution_artifact_store,
+                    teacher=self.trajectory_grader,
+                    profile_id=settings.profile_layout.profile_id,
+                    producer_version=__version__,
+                    poll_interval_s=settings.evolution_teacher_poll_interval_s,
+                    lease_seconds=settings.evolution_teacher_lease_s,
+                    teacher_timeout_s=settings.evolution_teacher_timeout_s,
+                    max_attempts=settings.evolution_teacher_max_attempts,
+                    retry_backoff_s=settings.evolution_teacher_retry_backoff_s,
+                    proposal_queue=proposal_queue,
+                    acquisition_resolver=acquisition_resolver,
+                    authorising_origins=tuple(
+                        getattr(settings, "evolution_authorising_origins", ()) or ()
+                    ),
+                    degraded_capabilities=(
+                        observation_service.degraded_capabilities
+                        if observation_service is not None
+                        else None
+                    ),
+                    knowledge_projection=self._evolution_knowledge_store,
+                )
+                self._teacher_worker.start()
             self.registry.set_prediction_loop(self.prediction_loop)
 
             if perception_session is not None:
@@ -2664,6 +2780,7 @@ class Context:
             learnability_assessor=learnability_assessor,
             evolution_policy=self._evolution_policy,
             skill_store=self.skill_lib,
+            action_dispatcher=self.engine.execute_action if self.engine is not None else None,
         )
 
         # ── Wire deferred components to engine ──
@@ -2713,6 +2830,7 @@ class Context:
         try:
             if getattr(settings, "agent_calibration_enabled", False) and self._evolution_store is not None:
                 self.engine.set_calibration_store(self._evolution_store)
+                self.engine.set_calibration_event_store(self._evolution_event_store)
                 diff_result = await self._run_deferred_db(
                     lambda: self.engine.recalibrate_difficulty(self._evolution_store)
                 )
@@ -3114,6 +3232,46 @@ class Context:
         )
         return self._observation_service
 
+    async def record_environment_observation(self, observation: Any) -> None:
+        """Persist one typed environment observation and feed accepted gap evidence."""
+        outbox = self._evolution_outbox
+        if outbox is None:
+            raise RuntimeError("evolution event outbox unavailable")
+        from leapflow.domain.event_types import EvolutionEventType
+        from leapflow.domain.evolution_event import EvolutionContext, EvolutionEvent
+
+        context = EvolutionContext.create(
+            profile_id=self.settings.profile_layout.profile_id,
+            workspace_id=str(getattr(observation, "workspace_id", "") or ""),
+            session_id=str(getattr(observation, "session_id", "") or ""),
+            observation_id=str(observation.observation_id),
+            correlation_id=f"environment:{observation.source_id}:{observation.app_id}",
+        )
+        await outbox.publish(
+            EvolutionEvent.create(
+                EvolutionEventType.ENVIRONMENT_OBSERVED,
+                context=context,
+                payload=observation.to_dict(),
+                producer=f"environment.{observation.source_id}",
+                privacy_class="session" if context.session_id else "system",
+                occurred_at=observation.observed_at,
+                dedup_key=f"environment.observed:{observation.observation_id}",
+            )
+        )
+        service = self._capability_observation_service()
+        if service is None:
+            return
+        for result in observation.capability_results():
+            await asyncio.to_thread(
+                service.observe_result,
+                result,
+                environment=self._current_environment_dict(),
+                source="environment_probe",
+                session_id=context.session_id,
+                workspace_root=str(getattr(self.settings, "workspace_root", "") or ""),
+                metadata={"environment_observation_id": observation.observation_id},
+            )
+
     def _current_environment_fingerprint(self):
         """The environment a capability decision is made against, as a fingerprint.
 
@@ -3189,28 +3347,17 @@ class Context:
             from leapflow.learning.degradation_sink import build_degradation_sink
             from leapflow.plugins import get_registry
             from leapflow.plugins.lifecycle_governor import LifecycleGovernor
-            from leapflow.storage.capability_proposal_queue import (
-                JsonCapabilityProposalQueue,
-            )
-            from leapflow.storage.distilled_knowledge_store import (
-                JsonDistilledKnowledgeStore,
-            )
-            from leapflow.storage.plugin_outcome_store import JsonPluginOutcomeStore
 
             intake = self._capability_observation_service()
             if intake is None:
                 return None
-            knowledge_store = JsonDistilledKnowledgeStore(
-                profile_layout.distilled_knowledge_path,
-                ttl_seconds=float(
-                    getattr(settings, "distilled_knowledge_ttl_s", 0.0) or 0.0
-                ),
-            )
+            knowledge_store = self._evolution_knowledge_store
+            proposal_queue = self._capability_proposal_queue
+            if proposal_queue is None:
+                return None
             self._lifecycle_governor = LifecycleGovernor(
-                proposal_queue=JsonCapabilityProposalQueue(
-                    profile_layout.capability_proposal_queue_path
-                ),
-                outcome_store=JsonPluginOutcomeStore(profile_layout.plugin_outcomes_path),
+                proposal_queue=proposal_queue,
+                outcome_store=self._plugin_outcome_store,
                 # The approval-gated actor that actually disables a plugin. Without it the
                 # governor decided "quarantine" and nothing happened: trust dropped but the
                 # plugin kept serving, and the queue never advanced past PROBATION. Built
@@ -3294,13 +3441,9 @@ class Context:
         if profile_layout is None:
             return {}
         try:
-            from leapflow.storage.capability_proposal_queue import (
-                JsonCapabilityProposalQueue,
-            )
-
-            queue = JsonCapabilityProposalQueue(
-                profile_layout.capability_proposal_queue_path
-            )
+            queue = self._capability_proposal_queue
+            if queue is None:
+                return {}
             mapping: dict = {}
             # ``active()`` returns items newest-first (sorted by updated/created), so the
             # first mapping seen for a plugin is its most recent lifecycle record. Keep
@@ -3363,390 +3506,99 @@ class Context:
             logger.debug("co-evolution sweep unavailable", exc_info=True)
             return None
 
-    async def _drive_world_model_evolution(self, trajectory: list, goal: str):
-        """Let the world model propose capability gaps from episode hindsight.
-
-        Returns a ``WorldModelDriveResult`` (whose ``grades`` the caller reuses so
-        no second LLM call is made), or ``None`` when the driver cannot be
-        assembled -- in which case the caller falls back to plain grading.
-
-        Runs only at the session-end learning boundary, so it adds no per-turn
-        cost. Intents are written as ordinary structured evidence and are admitted
-        only if ``accepted_evidence_kinds`` includes ``world_model_intent``; the
-        driver never writes around that gate.
-        """
-        try:
-            from leapflow.learning.degradation_sink import (
-                build_alternatives_provider,
-                build_proposal_sink,
+    async def evolution_projection(
+        self,
+        *,
+        session_id: str = "",
+        aggregate: bool = False,
+        rebuild: bool = False,
+    ) -> dict[str, Any]:
+        """Return a checkpointed event projection for one session or the profile."""
+        runner = self._evolution_projection_runner
+        if runner is None:
+            return {"ok": False, "error": "evolution projection unavailable"}
+        if self._evolution_outbox is not None:
+            await self._evolution_outbox.flush()
+        profile_id = self.settings.profile_layout.profile_id
+        if aggregate:
+            projection = await runner.project_aggregate(
+                profile_id=profile_id,
+                rebuild=rebuild,
             )
-            from leapflow.plugins import get_registry
-            from leapflow.learning.world_model_driver import WorldModelEvolutionDriver
-            from leapflow.storage.capability_proposal_queue import (
-                JsonCapabilityProposalQueue,
+        else:
+            if not session_id:
+                return {"ok": False, "error": "session_id is required"}
+            projection = await runner.project_session(
+                profile_id=profile_id,
+                session_id=session_id,
+                rebuild=rebuild,
             )
-            from leapflow.storage.distilled_knowledge_store import (
-                JsonDistilledKnowledgeStore,
-            )
+        return {"ok": True, "projection": projection}
 
-            settings = self.settings
-            profile_layout = getattr(settings, "profile_layout", None)
-            if profile_layout is None or self.trajectory_grader is None:
-                return None
-            # The shared service, so the requirements the teacher reads are the ones
-            # the degradation sink wrote.
-            service = self._capability_observation_service()
-            if service is None:
-                return None
-            driver = WorldModelEvolutionDriver(
-                teacher=self.trajectory_grader,
-                intake=service,
-                # The C1 channel. Without it the cheap verdicts are graded, traced and
-                # discarded, so the teacher judges correctly and the next session
-                # repeats the same mistake.
-                knowledge_store=JsonDistilledKnowledgeStore(
-                    profile_layout.distilled_knowledge_path,
-                    ttl_seconds=float(
-                        getattr(settings, "distilled_knowledge_ttl_s", 0.0) or 0.0
-                    ),
-                ),
-                # The last hop of the acquisition chain. Without it an ``acquire``
-                # verdict became a requirement and stopped: resolution reported the
-                # capability unmet forever and the only verdict that leads to code had
-                # no effect. Queueing is not acting -- the queue is read by the
-                # dashboard and the self-management tools, which gate on approval.
-                # The fact the rebind/acquire choice is defined by. A teacher that
-                # cannot see whether another provider exists is guessing between them.
-                alternatives_for=build_alternatives_provider(
-                    registry_provider=get_registry,
-                    affordances_provider=self._current_affordances,
-                ),
-                # The last hop of the acquisition chain, and the one the switch governs.
-                # Queueing is still not acting -- the queue is read by the dashboard and the
-                # self-management tools, which gate on approval -- so this is the outermost
-                # of several gates rather than the only one.
-                #
-                # ``None`` when self-evolution is off, which says more than an empty queue
-                # would: the teacher still judges and still records that nothing installed
-                # can serve the capability, and that conclusion reaches the user as
-                # knowledge instead of as a proposal to build something.
-                proposal_sink=(
-                    build_proposal_sink(
-                        queue=JsonCapabilityProposalQueue(
-                            profile_layout.capability_proposal_queue_path
-                        ),
-                    )
-                    if getattr(settings, "evolution_enabled", False)
-                    else None
-                ),
-                # P5 authority in the production path: only an authorised requirement
-                # origin may drive an acquisition. Rebind-vs-acquire (whether an
-                # installed provider already covers the capability) is decided upstream
-                # by the teacher from failed-outcome hindsight and the alternatives it
-                # was shown -- a declared-fitness re-check here would re-introduce the
-                # semantic-regression blind spot -- so the driver adds authority only.
-                authorising_origins=tuple(
-                    getattr(settings, "evolution_authorising_origins", ()) or ()
-                ),
-            )
-            return await driver.drive(
-                trajectory,
-                goal,
-                environment=self._current_environment_fingerprint(),
-                workspace_root=str(getattr(settings, "workspace_root", "") or ""),
-            )
-        except (ImportError, AttributeError, OSError, RuntimeError, TypeError, ValueError):
-            logger.debug("world-model evolution driver unavailable", exc_info=True)
-            return None
-
-    async def run_learning_boundary(self, *, reason: str = "shutdown") -> dict[str, Any]:
-        """Run the learning boundary once and report what it did.
-
-        This is the only place capability evolution is driven from, so *when* it is
-        called decides when the framework can evolve at all. It used to be reachable
-        only from :meth:`cleanup`, which in daemon mode means process shutdown: a
-        daemon that ran for a week never evolved, one killed with SIGKILL never
-        evolved at all, and the single flush at the end mixed every session and every
-        workspace of that lifetime into one episode carrying the last user's goal.
-
-        Named and public so a semantic boundary can drive it -- a finished session,
-        or an explicit ``leap evolve`` -- instead of only the process dying.
-        ``reason`` is recorded rather than inspected: the pipeline does the same work
-        either way, and the label is what lets a reader tell a shutdown flush from a
-        session boundary from a hand-run one.
-        """
+    async def run_learning_boundary(
+        self,
+        *,
+        reason: str = "manual",
+        session_id: str = "",
+        workspace_root: str = "",
+        session_generation: int = 0,
+        wait: bool = False,
+        timeout_s: float = 180.0,
+    ) -> dict[str, Any]:
+        """Seal session evidence and enqueue durable hindsight grading."""
+        finalizer = self._session_finalizer
+        if finalizer is None:
+            return {"ok": False, "error": "evolution event store unavailable"}
         started = time.perf_counter()
-        before = len(self.prediction_loop.trajectory_buffer) if self.prediction_loop else 0
-        await self._on_session_end_learning()
+        profile_id = self.settings.profile_layout.profile_id
+        model = str(getattr(self.settings, "llm_model", "") or "")
+        if session_id:
+            from leapflow.layout import workspace_id_for_path
+
+            workspace_id = (
+                workspace_id_for_path(Path(workspace_root).expanduser().resolve())
+                if workspace_root
+                else ""
+            )
+            finalizations = [
+                await finalizer.finalize(
+                    profile_id=profile_id,
+                    workspace_id=workspace_id,
+                    session_id=session_id,
+                    session_generation=session_generation,
+                    reason=reason,
+                    model=model,
+                )
+            ]
+        elif reason == "shutdown":
+            finalizations = await finalizer.finalize_pending_sessions(
+                profile_id=profile_id,
+                reason=reason,
+                model=model,
+            )
+        else:
+            return {"ok": False, "error": "session_id is required", "reason": reason}
+
+        worker = self._teacher_worker
+        if worker is not None:
+            worker.wake()
+        jobs = [item.job_id for item in finalizations if item.job_id]
+        job_state: dict[str, Any] | None = None
+        if wait and jobs and worker is not None:
+            job_state = await worker.wait_for_job(jobs[0], timeout_s=timeout_s)
+        sweep = await self._run_coevolution_sweep()
         return {
             "ok": True,
             "reason": reason,
-            "trajectory_steps": before,
+            "session_id": session_id,
+            "queued": bool(jobs),
+            "episode_ids": [item.episode_id for item in finalizations if item.episode_id],
+            "job_ids": jobs,
+            "trajectory_steps": sum(item.evidence_count for item in finalizations),
+            "job": job_state,
+            "sweep": sweep.to_dict() if sweep is not None else None,
             "duration_s": round(time.perf_counter() - started, 3),
         }
-
-    async def _on_session_end_learning(self) -> None:
-        """End-of-session OPD learning pipeline (8 phases) with full observability.
-
-        Executes in order:
-        1. Trajectory grading (teacher with full hindsight) — grades consumed by replay_engine
-        2. Off-policy experience replay (high-delta)
-        3. Curiosity-targeted replay (high-curiosity apps) — curiosity fed to attention_tuner
-        4. Regression-gated self-distillation (causal rules)
-        5. Attention statistics feedback (AttentionTuner)
-        6. Long-term memory maintenance (prune old rows)
-        7. Budget rebalancing from session outcomes
-        8. VLM Tier 3 verification (if enabled)
-        """
-        observer = self._pipeline_observer
-        if observer is None:
-            # Deferred init never completed (degraded/critical-only mode):
-            # no learning components were assembled, nothing to flush.
-            logger.debug("Session-end learning skipped: pipeline observer not initialized")
-            return
-        pipeline_start = time.perf_counter()
-        phases_ok = 0
-        phases_failed = 0
-        trajectory: list = []
-
-        # Phase 1: Trajectory grading — FIX A5-1: grades now consumed by replay_engine
-        if self.trajectory_grader is not None and self.prediction_loop is not None:
-            observer.on_phase_start("trajectory_grading")
-            t0 = time.perf_counter()
-            try:
-                trajectory, goal = self.prediction_loop.flush_trajectory()
-                phase_detail: dict[str, Any] = {}
-                if trajectory:
-                    # The world model is the first driver of capability evolution:
-                    # the same hindsight call that grades the episode also proposes
-                    # any capability it found missing, and those proposals enter the
-                    # ordinary governed evidence path. Admission is still gated by
-                    # ``accepted_evidence_kinds``, so this is inert until opted in.
-                    drive = await self._drive_world_model_evolution(trajectory, goal)
-                    grades = list(drive.grades) if drive is not None else None
-                    if grades is None:
-                        grades = await self.trajectory_grader.grade_trajectory(
-                            trajectory, goal=goal,
-                        )
-                    if grades and self.replay_engine is not None:
-                        self.replay_engine.set_replay_priorities(grades)
-                    phase_detail["actions_graded"] = len(grades) if grades else 0
-                    if drive is not None:
-                        phase_detail.update(drive.to_dict())
-                else:
-                    phase_detail.update({"actions_graded": 0, "note": "empty_trajectory"})
-                # Cold-path governance sweep: effect verification, quarantine drain,
-                # reclamation. Outside the trajectory branch, because its whole
-                # purpose is that its no-op traces distinguish a quiet session from a
-                # sweep that never ran -- and nested inside it, an empty trajectory
-                # skipped the sweep entirely and produced exactly the ambiguity it
-                # was written to remove. Three reachability segments read
-                # "no sweep trace observed" on a live board for that reason alone.
-                #
-                # Nothing here depends on the trajectory: the sweep reads the process
-                # observation buffer and the proposal queue, both of which carry work
-                # from turns that predate this boundary.
-                sweep = await self._run_coevolution_sweep()
-                if sweep is not None:
-                    phase_detail.update(sweep.to_dict())
-                observer.on_phase_success(
-                    "trajectory_grading", time.perf_counter() - t0, phase_detail,
-                )
-                phases_ok += 1
-            except Exception as exc:
-                observer.on_phase_failure("trajectory_grading", exc, time.perf_counter() - t0)
-                phases_failed += 1
-
-        # Phase 2: Off-policy replay
-        if self.replay_engine is not None:
-            observer.on_phase_start("off_policy_replay")
-            t0 = time.perf_counter()
-            try:
-                insights = await self.replay_engine.replay_session()
-                observer.on_phase_success(
-                    "off_policy_replay", time.perf_counter() - t0,
-                    {"insights_discovered": len(insights) if insights else 0},
-                )
-                phases_ok += 1
-            except Exception as exc:
-                observer.on_phase_failure("off_policy_replay", exc, time.perf_counter() - t0)
-                phases_failed += 1
-
-        # Phase 3: Curiosity-targeted replay — FIX A5-2: feed curiosity to attention_tuner
-        if self.replay_engine is not None and self.active_observer is not None:
-            observer.on_phase_start("curiosity_replay")
-            t0 = time.perf_counter()
-            try:
-                curious_apps = self.active_observer.drain_high_curiosity_apps()
-                for app_ctx in curious_apps:
-                    await self.replay_engine.replay_targeted(app_ctx)
-                tuner = getattr(self, "attention_tuner", None)
-                if tuner is not None and curious_apps:
-                    tuner.boost_curiosity_domains(curious_apps)
-                observer.on_phase_success(
-                    "curiosity_replay", time.perf_counter() - t0,
-                    {"curious_apps": len(curious_apps)},
-                )
-                phases_ok += 1
-            except Exception as exc:
-                observer.on_phase_failure("curiosity_replay", exc, time.perf_counter() - t0)
-                phases_failed += 1
-
-        # Phase 4: Regression-gated self-distillation
-        if self.replay_engine is not None and trajectory:
-            observer.on_phase_start("regression_distillation")
-            t0 = time.perf_counter()
-            try:
-                if self.replay_engine.detect_regression(trajectory):
-                    distilled = await self.replay_engine.self_distill()
-                    observer.on_phase_success(
-                        "regression_distillation", time.perf_counter() - t0,
-                        {"regression_detected": True, "rules_distilled": len(distilled)},
-                    )
-                else:
-                    observer.on_phase_success(
-                        "regression_distillation", time.perf_counter() - t0,
-                        {"regression_detected": False},
-                    )
-                phases_ok += 1
-            except Exception as exc:
-                observer.on_phase_failure("regression_distillation", exc, time.perf_counter() - t0)
-                phases_failed += 1
-
-        # Phase 5: Attention statistics feedback
-        tuner = getattr(self, "attention_tuner", None)
-        if tuner is not None and trajectory:
-            observer.on_phase_start("attention_feedback")
-            t0 = time.perf_counter()
-            try:
-                from collections import defaultdict
-                app_sums: dict = defaultdict(lambda: [0.0, 0])
-                for step in trajectory:
-                    app = step.get("app_context", "")
-                    delta = step.get("delta", 0.0)
-                    if app:
-                        app_sums[app][0] += delta
-                        app_sums[app][1] += 1
-                app_deltas = {a: s[0] / s[1] for a, s in app_sums.items() if s[1] > 0}
-                if app_deltas:
-                    tuner.on_session_stats(app_deltas)
-                observer.on_phase_success(
-                    "attention_feedback", time.perf_counter() - t0,
-                    {"apps_tracked": len(app_deltas)},
-                )
-                phases_ok += 1
-            except Exception as exc:
-                observer.on_phase_failure("attention_feedback", exc, time.perf_counter() - t0)
-                phases_failed += 1
-
-        # Phase 6: Long-term memory maintenance
-        observer.on_phase_start("memory_prune")
-        t0 = time.perf_counter()
-        try:
-            pruned = self.lt.prune(max_age_days=self.settings.memory_prune_age_days)
-            observer.on_phase_success(
-                "memory_prune", time.perf_counter() - t0,
-                {"rows_pruned": pruned or 0},
-            )
-            phases_ok += 1
-        except Exception as exc:
-            observer.on_phase_failure("memory_prune", exc, time.perf_counter() - t0)
-            phases_failed += 1
-
-        # Phase 6.5: Skill inactivity decay (C4 — after memory prune, before budget rebalance)
-        if self._evolution_policy is not None and self.skill_lib is not None:
-            observer.on_phase_start("skill_decay")
-            t0 = time.perf_counter()
-            try:
-                all_skills = self.skill_lib.load_all_active_parameterized()
-                decayed_count = 0
-                for skill in all_skills:
-                    last_used = skill.get("updated_at", 0.0)
-                    days_inactive = (time.time() - last_used) / 86400.0
-                    if days_inactive > 30:  # Only decay after 30 days of inactivity
-                        outcome = self._evolution_policy.decay_inactive(
-                            skill.get("name", ""),
-                            current_confidence=skill.get("confidence", 0.5),
-                            current_version=skill.get("version", 1),
-                            last_used_ts=last_used,
-                        )
-                        if outcome.tier_changed:
-                            self.skill_lib.update_skill_confidence(
-                                skill.get("name", ""), outcome.new_confidence
-                            )
-                            decayed_count += 1
-                observer.on_phase_success(
-                    "skill_decay", time.perf_counter() - t0,
-                    {"skills_decayed": decayed_count, "skills_checked": len(all_skills)},
-                )
-                phases_ok += 1
-            except Exception as exc:
-                observer.on_phase_failure("skill_decay", exc, time.perf_counter() - t0)
-                phases_failed += 1
-
-        # Phase 7: Budget rebalancing
-        budget = getattr(self, "learning_budget", None)
-        if budget is not None:
-            observer.on_phase_start("budget_rebalance")
-            t0 = time.perf_counter()
-            try:
-                skills_discovered = 0
-                regressions_detected = 0
-                avg_delta = 0.0
-                if trajectory:
-                    deltas = [s.get("delta", 0.0) for s in trajectory if isinstance(s, dict)]
-                    avg_delta = sum(deltas) / max(len(deltas), 1)
-                    regressions_detected = sum(
-                        1 for s in trajectory
-                        if isinstance(s, dict) and s.get("verdict") == "regressed"
-                    )
-                replay_engine = getattr(self, "replay_engine", None)
-                if replay_engine is not None:
-                    skills_discovered = getattr(replay_engine, "session_discoveries", 0)
-                budget.rebalance_from_session_outcome(
-                    skills_discovered=skills_discovered,
-                    regressions_detected=regressions_detected,
-                    avg_prediction_delta=avg_delta,
-                )
-                observer.on_phase_success(
-                    "budget_rebalance", time.perf_counter() - t0,
-                    {"avg_delta": round(avg_delta, 4), "regressions": regressions_detected},
-                )
-                phases_ok += 1
-            except Exception as exc:
-                observer.on_phase_failure("budget_rebalance", exc, time.perf_counter() - t0)
-                phases_failed += 1
-
-        # Phase 8: VLM Tier 3 verification
-        if self.settings.causal_tier3_enabled:
-            observer.on_phase_start("vlm_tier3")
-            t0 = time.perf_counter()
-            try:
-                ps = self.perception_session
-                if ps is not None:
-                    pipeline = ps.causal_pipeline
-                    graph = ps.causal_graph
-
-                    async def _vlm_call(prompt: str) -> str:
-                        vlm = self.vlm or self.llm
-                        resp = await vlm.achat(
-                            [{"role": "user", "content": prompt}],
-                            stream=False,
-                            enable_thinking=False,
-                        )
-                        return (resp.content or "").strip()
-
-                    await pipeline.run_vlm_verification(graph, vlm_call=_vlm_call)
-                observer.on_phase_success("vlm_tier3", time.perf_counter() - t0, {})
-                phases_ok += 1
-            except Exception as exc:
-                observer.on_phase_failure("vlm_tier3", exc, time.perf_counter() - t0)
-                phases_failed += 1
-
-        # Pipeline complete
-        observer.on_pipeline_complete(
-            time.perf_counter() - pipeline_start, phases_ok, phases_failed,
-        )
 
     _NORMALIZER_FACTORIES: dict[str, type] = {}
 
@@ -3829,6 +3681,13 @@ class Context:
             db_executor.shutdown(wait=True, cancel_futures=True)
             self._deferred_db_executor = None
 
+        teacher_worker = getattr(self, "_teacher_worker", None)
+        if teacher_worker is not None:
+            try:
+                await teacher_worker.close()
+            except Exception:
+                logger.warning("Teacher worker shutdown failed", exc_info=True)
+
         # Persist evolution episodes to DuckDB before shutdown
         evo_store = getattr(self, "_evolution_store", None)
         if evo_store is not None and self._evolution is not None:
@@ -3903,11 +3762,23 @@ class Context:
             await self.event_bus.shutdown()
         except Exception:
             logger.debug("EventBus shutdown failed", exc_info=True)
-        # OPD end-of-session learning pipeline
-        if self.settings.replay_on_session_end:
+        # Seal every session independently. The teacher worker is already stopped,
+        # so newly queued jobs remain durable and are reclaimed on the next start.
+        try:
             await self.run_learning_boundary(reason="shutdown")
+        except Exception:
+            logger.warning("Evolution session finalization failed", exc_info=True)
         # Persist session summary before memory shutdown
         await self._persist_session_summary()
+        # Drain the append-only evolution outbox while the shared DuckDB holder is
+        # still alive. A shutdown may happen immediately after a mutating action, and
+        # losing its completion fact would make recovery guess whether it ran.
+        evolution_outbox = getattr(self, "_evolution_outbox", None)
+        if evolution_outbox is not None:
+            try:
+                await evolution_outbox.close()
+            except Exception:
+                logger.exception("Evolution event outbox shutdown failed")
         # Shutdown all memory providers (stops GC, closes DB)
         await self.memory.shutdown_all()
         if isinstance(self.rpc, CuaDriverClient):

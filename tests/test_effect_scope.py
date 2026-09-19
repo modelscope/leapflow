@@ -390,7 +390,9 @@ class TestScopeBoundSubscription:
 
         scope = EffectScope("sub_scope")
         called: list = []
-        cb = lambda event: called.append(event)
+
+        def cb(event):
+            called.append(event)
 
         bus.subscribe(cb, scope=scope)
         assert id(cb) in bus._subscribers
@@ -405,7 +407,9 @@ class TestScopeBoundSubscription:
         bus._subscribers = {}
 
         scope = EffectScope("unrelated")
-        cb = lambda event: None
+
+        def cb(event):
+            return None
 
         bus.subscribe(cb)  # no scope
         scope.dispose()
@@ -418,9 +422,15 @@ class TestScopeBoundSubscription:
         bus._subscribers = {}
 
         scope = EffectScope("shared")
-        cb1 = lambda e: None
-        cb2 = lambda e: None
-        cb3 = lambda e: None  # unbound
+
+        def cb1(event):
+            return None
+
+        def cb2(event):
+            return None
+
+        def cb3(event):  # unbound
+            return None
 
         bus.subscribe(cb1, scope=scope)
         bus.subscribe(cb2, scope=scope)

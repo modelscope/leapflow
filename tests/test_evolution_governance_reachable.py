@@ -2,10 +2,9 @@
 """P2(a): the evolution governance tier becomes reachable.
 
 `AdaptiveEvolutionPolicy` and `LifecycleGovernor` implement trust, probation and
-quarantine. Everything they need was built and path-declared -- and orphaned:
-`JsonCapabilityProposalQueue`, `JsonPluginOutcomeStore`, and both
-`ProfileLayout` paths had no references outside their own modules, so nothing in
-production could ever reach the machinery.
+quarantine. These tests guard the production wiring after proposal and outcome
+persistence moved onto the append-only evolution event stream; no profile-local
+JSON queue may be required for the governance cycle.
 
 These tests cover the two halves of the fix:
 
@@ -35,13 +34,15 @@ from leapflow.plugins.evolution_contracts import (
 from leapflow.plugins.lifecycle_governor import LifecycleGovernor
 from leapflow.storage.capability_proposal_queue import (
     CapabilityProposalItem,
-    JsonCapabilityProposalQueue,
+    EvolutionCapabilityProposalStore,
 )
-from leapflow.storage.plugin_outcome_store import JsonPluginOutcomeStore
+from leapflow.storage.evolution_event_store import DuckDBEvolutionEventStore
+from leapflow.storage.plugin_outcome_store import EvolutionPluginOutcomeStore
 
 
-def _queue(tmp_path) -> JsonCapabilityProposalQueue:
-    return JsonCapabilityProposalQueue(tmp_path / "lifecycle.json")
+def _queue(tmp_path) -> EvolutionCapabilityProposalStore:
+    events = DuckDBEvolutionEventStore(tmp_path / "events.duckdb")
+    return EvolutionCapabilityProposalStore(events, profile_id="profile-1")
 
 
 def _requirement() -> CapabilityRequirement:
@@ -56,8 +57,12 @@ def _requirement() -> CapabilityRequirement:
 def test_shipped_types_satisfy_the_new_protocols(tmp_path):
     item = CapabilityProposalItem(proposal_id="p1", status="PENDING", requirements=())
     assert isinstance(item, EvolutionProposalView)
-    assert isinstance(_queue(tmp_path), EvolutionLifecycleStore)
-    assert isinstance(JsonPluginOutcomeStore(tmp_path / "o.json"), OutcomeStore)
+    queue = _queue(tmp_path)
+    assert isinstance(queue, EvolutionLifecycleStore)
+    assert isinstance(
+        EvolutionPluginOutcomeStore(queue._event_store, profile_id="profile-1"),
+        OutcomeStore,
+    )
 
 
 def test_policy_accepts_any_conforming_view():
@@ -132,7 +137,9 @@ def test_review_and_lifecycle_vocabularies_are_distinct():
 def test_full_governance_cycle_on_the_shipped_stores(tmp_path):
     """PENDING -> generate decision -> outcomes -> quarantine, all real components."""
     queue = _queue(tmp_path)
-    outcomes = JsonPluginOutcomeStore(tmp_path / "outcomes.json")
+    outcomes = EvolutionPluginOutcomeStore(
+        queue._event_store, profile_id="profile-1"
+    )
     trust = PluginTrustLedger()
     item = queue.enqueue(
         requirements=[_requirement()],
@@ -147,8 +154,16 @@ def test_full_governance_cycle_on_the_shipped_stores(tmp_path):
         item, trust_level=PluginTrustLevel.DRAFT
     )
     assert decision.action == "generate"
+    queue.transition(item.proposal_id, "GENERATED", generated_code_ref="sha256:test")
+    queue.transition(
+        item.proposal_id,
+        "APPROVED",
+        proposal_approval_id="approval-content",
+        mutation_approval_id="approval-mutation",
+    )
+    queue.transition(item.proposal_id, "INSTALLED", install_result={"ok": True})
 
-    # The governor transitions that same record from execution outcomes.
+    # The governor transitions that same installed record from execution outcomes.
     disabled: list[str] = []
 
     class _Actor:
@@ -176,28 +191,34 @@ def test_full_governance_cycle_on_the_shipped_stores(tmp_path):
     assert queue.get(item.proposal_id).status == "QUARANTINED"
 
 
-def test_requarantined_record_is_reset_in_place_but_memory_survives_elsewhere(tmp_path):
-    """Re-proposing after quarantine resets the record; the safety memory does not live there.
+def test_requarantined_record_remains_terminal_and_safety_memory_survives(tmp_path):
+    """Re-proposing the same identity cannot erase a quarantine fact.
 
-    ``proposal_id`` is a content hash of the requirement payload, so re-proposing
-    the same capability reuses the id and resets it to ``PENDING`` -- the
-    quarantine history is *overwritten* at the proposal layer rather than a second
-    record being created. That is safe only because the trigger the governor
-    actually consults lives elsewhere: the outcome store's ``failure_streak`` and
-    the trust ledger's freeze both persist independently, so a re-proposed plugin
-    does not get a clean slate where it matters.
+    ``proposal_id`` is a content hash of stable requirement identity. The event-sourced
+    store returns the terminal record instead of resetting it to ``PENDING``; a genuinely
+    new attempt must carry a new requirement identity and therefore preserves audit history.
     """
     queue = _queue(tmp_path)
     first = queue.enqueue(requirements=[_requirement()], source="plugin_propose")
-    queue.update(first.proposal_id, status="QUARANTINED")
+    queue.transition(first.proposal_id, "GENERATED", generated_code_ref="sha256:test")
+    queue.transition(
+        first.proposal_id,
+        "APPROVED",
+        proposal_approval_id="approval-content",
+        mutation_approval_id="approval-mutation",
+    )
+    queue.transition(first.proposal_id, "INSTALLED", install_result={"ok": True})
+    queue.transition(first.proposal_id, "QUARANTINED")
     second = queue.enqueue(requirements=[_requirement()], source="plugin_propose")
 
     assert second.proposal_id == first.proposal_id      # content-addressed
-    assert second.status == "PENDING"                    # reset, ready to retry
-    assert len(queue.list_items(limit=0)) == 1           # replaced, not appended
+    assert second.status == "QUARANTINED"                # terminal fact is preserved
+    assert len(queue.list_items(limit=0)) == 1
 
-    # The memory that gates a retry survives the reset.
-    outcomes = JsonPluginOutcomeStore(tmp_path / "outcomes.json")
+    # Independent safety evidence remains queryable with the terminal proposal.
+    outcomes = EvolutionPluginOutcomeStore(
+        queue._event_store, profile_id="profile-1"
+    )
     for _ in range(3):
         outcomes.add_outcome(plugin_id="p", tool_name="t", ok=False)
     assert outcomes.failure_streak("p") == 3
@@ -212,14 +233,10 @@ def test_requarantined_record_is_reset_in_place_but_memory_survives_elsewhere(tm
 
 def _plugin_with_stores(tmp_path):
     from leapflow.plugins.tool_plugins.self_management import SelfManagementPlugin
-    from leapflow.storage.plugin_proposal_store import JsonPluginProposalStore
 
     plugin = SelfManagementPlugin()
     queue = _queue(tmp_path)
-    plugin.bind_runtime(
-        plugin_proposal_store=JsonPluginProposalStore(tmp_path / "review.json"),
-        capability_lifecycle_store=queue,
-    )
+    plugin.bind_runtime(capability_lifecycle_store=queue)
     return plugin, queue
 
 
@@ -255,23 +272,19 @@ def test_plugin_propose_opens_a_correlated_lifecycle_record(tmp_path):
     assert decision.action == "generate"
 
 
-def test_propose_still_succeeds_when_the_lifecycle_ledger_fails(tmp_path):
-    """Bookkeeping must never fail the proposal the caller asked for."""
+def test_propose_fails_closed_when_the_lifecycle_ledger_fails(tmp_path):
+    """A proposal without its sole durable lifecycle record must not escape."""
     from leapflow.plugins.tool_plugins.self_management import SelfManagementPlugin
-    from leapflow.storage.plugin_proposal_store import JsonPluginProposalStore
 
     class _Broken:
         def enqueue(self, **kwargs):
             raise OSError("disk on fire")
 
     plugin = SelfManagementPlugin()
-    plugin.bind_runtime(
-        plugin_proposal_store=JsonPluginProposalStore(tmp_path / "review.json"),
-        capability_lifecycle_store=_Broken(),
-    )
+    plugin.bind_runtime(capability_lifecycle_store=_Broken())
     result = _propose(plugin, requested_capability="chat.reply", risk_level="read_only")
-    assert result["ok"] is True                 # the proposal survived
-    assert result["lifecycle_proposal_id"] == ""  # ...and the failure is visible
+    assert result["ok"] is False
+    assert "persistence failed" in result["error"].lower()
 
 
 def test_lifecycle_record_carries_the_declared_risk_ceiling(tmp_path):
@@ -284,18 +297,11 @@ def test_lifecycle_record_carries_the_declared_risk_ceiling(tmp_path):
     assert dict(record.requirements[0])["max_risk_level"] == "medium"
 
 
-# ── plugin_generate bridges *both* proposal stores (G3) ───────────────────────
+# ── plugin_generate resolves canonical ids and review aliases (G3) ────────────
 
 
 def test_generate_resolves_a_world_model_lifecycle_proposal(tmp_path):
-    """A world-model queue id must reach generation, not only a review-store id.
-
-    The world-model driver enqueues into the lifecycle queue (``prop-<hash>``); before
-    the bridge, ``plugin_generate`` looked only in the review store, so Scene C could
-    never proceed from a real teacher verdict. This drives the resolver that closes
-    that gap -- no LLM needed, because it is the resolution, not the generation, under
-    test.
-    """
+    """Both a canonical lifecycle id and its review alias resolve from one store."""
     from leapflow.domain.capability_requirement import CapabilityRequirement
 
     plugin, queue = _plugin_with_stores(tmp_path)
@@ -318,11 +324,11 @@ def test_generate_resolves_a_world_model_lifecycle_proposal(tmp_path):
     assert provides == ("chat.reply",)          # capability preserved for generation
     assert description                          # non-empty description derived
 
-    # A review-store id still resolves as its own source, unchanged.
+    # A review alias resolves through metadata on the same lifecycle record.
     review = _propose(plugin, requested_capability="chat.send", risk_level="read_only")
     assert plugin._resolve_generation_source(
         review["proposal"]["proposal_id"]
     )[0] == "review"
 
-    # An id neither store knows resolves to nothing, so generate returns not-found.
+    # An unknown id resolves to nothing, so generation returns not-found.
     assert plugin._resolve_generation_source("prop-does-not-exist")[0] == ""

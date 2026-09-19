@@ -76,6 +76,39 @@ class LearningEventType:
     COLD_START_PROMPT = "learning.cold_start_prompt"
 
 
+class EvolutionEventType:
+    """Append-only facts emitted by the governed evolution pipeline."""
+
+    ACTION_STARTED = "action.started"
+    ACTION_COMPLETED = "action.completed"
+    ACTION_FAILED = "action.failed"
+    SESSION_FINALIZED = "session.finalized"
+    TEACHER_JOB_QUEUED = "teacher.job_queued"
+    TEACHER_JOB_FAILED = "teacher.job_failed"
+    TEACHER_GRADED = "teacher.graded"
+    TEACHER_VERDICT_RECORDED = "teacher.verdict_recorded"
+    KNOWLEDGE_RETRACTED = "knowledge.retracted"
+    ENVIRONMENT_OBSERVED = "environment.observed"
+    REQUIREMENT_RESOLVED = "requirement.resolved"
+    PROPOSAL_CREATED = "proposal.created"
+    PROPOSAL_UPDATED = "proposal.updated"
+    PROPOSAL_GENERATED = "proposal.generated"
+    PROPOSAL_APPROVED = "proposal.approved"
+    PROPOSAL_REJECTED = "proposal.rejected"
+    PROPOSAL_FAILED = "proposal.failed"
+    PROPOSAL_SUPERSEDED = "proposal.superseded"
+    PROPOSAL_EXPIRED = "proposal.expired"
+    PROPOSAL_NO_OP = "proposal.no_op"
+    PLUGIN_INSTALLED = "plugin.installed"
+    PLUGIN_PROBATION_STARTED = "plugin.probation_started"
+    PLUGIN_VERIFIED = "plugin.verified"
+    PLUGIN_QUARANTINED = "plugin.quarantined"
+    PLUGIN_ROLLED_BACK = "plugin.rolled_back"
+    FRAMEWORK_TRACE_RECORDED = "framework.trace_recorded"
+    PLUGIN_OUTCOME_RECORDED = "plugin.outcome_recorded"
+    CALIBRATION_UPDATED = "calibration.updated"
+
+
 class CLIEventType:
     """Synthetic events from CLI interaction layer."""
 

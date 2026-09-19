@@ -76,6 +76,7 @@ class ToolMetadata:
     # which supports both generated-plugin **kwargs handlers and older params-dict handlers.
     x_leapflow: dict[str, Any] = field(default_factory=dict)
     mutates_state: bool = False
+    execution_policy: str = ""
     # Declarative capability metadata consumed by the capability resolver and
     # environment-fit scoring. ``provides_capabilities`` are abstract capability
     # tags this tool offers (matched against a requirement). ``requires_capabilities``
@@ -108,6 +109,8 @@ class ToolMetadata:
         x_leapflow = dict(self.x_leapflow)
         if self.mutates_state:
             x_leapflow.setdefault("mutates_state", True)
+        if self.execution_policy:
+            x_leapflow.setdefault("execution_policy", self.execution_policy)
         if self.provides_capabilities:
             x_leapflow.setdefault("provides_capabilities", list(self.provides_capabilities))
         if self.requires_capabilities:

@@ -192,6 +192,8 @@ class AdaptationVerdict:
             "max_risk_level": str(self.max_risk_level),
             "expected_effect": self.expected_effect,
             "target_affordance": self.target_affordance,
+            "evidence_ids": list(self.evidence_ids),
+            "created_at": self.created_at,
         }
 
 
