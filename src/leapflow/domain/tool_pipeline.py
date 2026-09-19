@@ -17,10 +17,82 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
+
+
+class _ToolExecutionDeadline:
+    """Pauses one tool deadline while the tool awaits a human decision."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, timeout_s: float) -> None:
+        self._loop = loop
+        self._remaining_s = timeout_s
+        self._scope: asyncio.Timeout | None = None
+        self._pause_depth = 0
+
+    def bind(self, scope: asyncio.Timeout) -> None:
+        """Bind the active ``asyncio.timeout`` scope to this deadline."""
+        self._scope = scope
+
+    def pause(self) -> None:
+        """Suspend deadline accounting until the matching resume call."""
+        if self._pause_depth == 0:
+            scope = self._scope
+            if scope is None:
+                return
+            deadline = scope.when()
+            self._remaining_s = max(0.0, (deadline or self._loop.time()) - self._loop.time())
+            scope.reschedule(None)
+        self._pause_depth += 1
+
+    def resume(self) -> None:
+        """Resume deadline accounting after the outermost human wait finishes."""
+        if self._pause_depth == 0:
+            return
+        self._pause_depth -= 1
+        if self._pause_depth == 0 and self._scope is not None:
+            self._scope.reschedule(self._loop.time() + self._remaining_s)
+
+
+_current_tool_execution_deadline: ContextVar[_ToolExecutionDeadline | None] = ContextVar(
+    "leapflow_tool_execution_deadline", default=None,
+)
+
+
+@asynccontextmanager
+async def pause_tool_execution_timeout_for_human_decision() -> AsyncIterator[None]:
+    """Exclude human approval time from the active tool execution timeout.
+
+    Outside an engine-managed tool invocation this is intentionally a no-op, so
+    approval surfaces can use it without coupling themselves to a caller.
+    """
+    deadline = _current_tool_execution_deadline.get()
+    if deadline is None:
+        yield
+        return
+    deadline.pause()
+    try:
+        yield
+    finally:
+        deadline.resume()
+
+
+async def run_tool_with_timeout(
+    awaitable: Awaitable[Dict[str, Any]], timeout_s: float,
+) -> Dict[str, Any]:
+    """Run a tool with a deadline that pauses only for human decisions."""
+    controller = _ToolExecutionDeadline(asyncio.get_running_loop(), timeout_s)
+    token = _current_tool_execution_deadline.set(controller)
+    try:
+        async with asyncio.timeout(timeout_s) as scope:
+            controller.bind(scope)
+            return await awaitable
+    finally:
+        _current_tool_execution_deadline.reset(token)
 
 
 @dataclass
@@ -126,16 +198,17 @@ class ToolExecutionPipeline:
             The final result dict (possibly transformed by after hooks).
 
         Timeout: when ``context.annotations['timeout']`` is set (the engine
-        passes the per-tool timeout there), the handler invocation is wrapped
-        in ``asyncio.wait_for``. A timeout raises ``asyncio.TimeoutError`` so
-        the caller's existing timeout handling stays authoritative. When no
-        timeout is annotated the handler is called directly (no wrapping).
+        passes the per-tool timeout there), the handler invocation receives an
+        execution deadline. Human approval waits explicitly pause that deadline;
+        a timeout still raises ``asyncio.TimeoutError`` so the caller's existing
+        timeout handling stays authoritative. When no timeout is annotated the
+        handler is called directly (no wrapping).
         """
         timeout = context.annotations.get("timeout")
 
         async def _run_handler() -> Dict[str, Any]:
             if timeout is not None:
-                return await asyncio.wait_for(handler(context), timeout=timeout)
+                return await run_tool_with_timeout(handler(context), timeout)
             return await handler(context)
 
         if not self._interceptors:

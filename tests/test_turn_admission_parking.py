@@ -219,3 +219,28 @@ async def test_coordinator_parks_the_slot_while_a_prompt_is_pending() -> None:
     assert decision == ["allow_once"]
     assert adm.snapshot()["available"] == 1
     assert adm.snapshot()["parked"] == 0
+
+
+@pytest.mark.asyncio
+async def test_coordinator_pauses_the_tool_deadline_for_a_pending_approval() -> None:
+    """An unanswered daemon prompt must not consume its tool's execution budget."""
+    from leapflow.daemon.approval_coordinator import ApprovalCoordinator
+    from leapflow.daemon.protocol import StreamChunk
+    from leapflow.domain.tool_pipeline import run_tool_with_timeout
+    from leapflow.security.approval import ApprovalRequest
+
+    coordinator = ApprovalCoordinator()
+    queue: asyncio.Queue[StreamChunk] = asyncio.Queue()
+    request = ApprovalRequest(category="file.write", detail="write delayed-output.py")
+
+    task = asyncio.create_task(run_tool_with_timeout(
+        coordinator.request_approval(request, (queue, "req-1")), 0.02,
+    ))
+    chunk = await asyncio.wait_for(queue.get(), timeout=1.0)
+    pending_id = chunk.metadata["approval"]["pending_id"]
+
+    await asyncio.sleep(0.05)
+    assert not task.done(), "a pending approval must not expire with the tool deadline"
+
+    await coordinator.resolve(pending_id, "allow_once")
+    assert await asyncio.wait_for(task, timeout=1.0) == "allow_once"
