@@ -402,6 +402,9 @@ class Settings:
     evolution_teacher_max_attempts: int = 3
     evolution_teacher_retry_backoff_s: float = 5.0
     evolution_autonomy_level: str = "generate_only"
+    # How many hours a capability proposal stays active before the cold-path
+    # sweep expires it. 0 disables TTL-based expiry entirely.
+    proposal_ttl_hours: int = 72
     environment_mode: str = "production"
     environment_leapspace_enabled: bool = False
     environment_leapspace_state_root: str = ""
@@ -1019,6 +1022,7 @@ def _build_settings_from_env(
     evolution_autonomy_level = os.getenv(
         "LEAPFLOW_EVOLUTION_AUTONOMY_LEVEL", "generate_only"
     ).strip()
+    proposal_ttl_hours = int(os.getenv("LEAPFLOW_PROPOSAL_TTL_HOURS", "72"))
     environment_mode = os.getenv("LEAPFLOW_ENVIRONMENT_MODE", "production").strip().lower()
     environment_leapspace_enabled = _bool(
         "LEAPFLOW_ENVIRONMENT_LEAPSPACE_ENABLED", "false"
@@ -1491,6 +1495,7 @@ def _build_settings_from_env(
         evolution_teacher_max_attempts=evolution_teacher_max_attempts,
         evolution_teacher_retry_backoff_s=evolution_teacher_retry_backoff_s,
         evolution_autonomy_level=evolution_autonomy_level,
+        proposal_ttl_hours=proposal_ttl_hours,
         environment_mode=environment_mode,
         environment_leapspace_enabled=environment_leapspace_enabled,
         environment_leapspace_state_root=environment_leapspace_state_root,

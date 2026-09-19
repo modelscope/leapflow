@@ -279,6 +279,58 @@ def test_schema_upgrades_a_v1_database_in_order(tmp_path: Path) -> None:
     connection.close()
 
 
+def test_schema_heals_an_intermediate_build_with_preexisting_objects(tmp_path: Path) -> None:
+    """An intermediate build recorded version 2 but already created a later
+    migration's object (``idx_evo_event_sequence``). Non-idempotent DDL then aborts
+    startup with 'Index ... already exists'. Every migration must be idempotent so
+    such a database self-heals in place, and re-running is a no-op.
+    """
+    from leapflow.storage import schema as schema_mod
+
+    connection = duckdb.connect(str(tmp_path / "intermediate.duckdb"))
+    for table_def in schema_mod.TABLES:
+        connection.execute(table_def.ddl)
+        for idx_sql in table_def.indexes:
+            connection.execute(idx_sql)
+    # Real migration-2 objects, plus the sequence index a later build created under v2.
+    schema_mod._apply_evolution_tables(connection)
+    connection.execute(
+        "CREATE UNIQUE INDEX idx_evo_event_sequence ON evolution_events(sequence)"
+    )
+    # A real database that reached v2 recorded the base version first, then v2.
+    connection.execute("INSERT INTO _schema_version VALUES (1, 0.0)")
+    connection.execute("INSERT INTO _schema_version VALUES (2, 0.0)")
+
+    assert ensure_schema(connection) == CURRENT_SCHEMA_VERSION
+    assert ensure_schema(connection) == CURRENT_SCHEMA_VERSION, "re-run must be a no-op"
+    assert [
+        row[0]
+        for row in connection.execute(
+            "SELECT version FROM _schema_version ORDER BY version"
+        ).fetchall()
+    ] == list(range(1, CURRENT_SCHEMA_VERSION + 1))
+    # The healed database is functional: the global sequence exists and advances.
+    assert connection.execute("SELECT nextval('evolution_event_sequence')").fetchone()[0] >= 1
+    connection.close()
+
+
+def test_every_evolution_migration_is_idempotent(tmp_path: Path) -> None:
+    """Applying each migration twice against the same connection must not raise.
+
+    Guards the class of defect directly: a non-idempotent ``CREATE`` in any migration
+    is a latent startup crash the first time it meets a pre-existing object.
+    """
+    from leapflow.storage import schema as schema_mod
+
+    connection = duckdb.connect(str(tmp_path / "idem.duckdb"))
+    for table_def in schema_mod.TABLES:
+        connection.execute(table_def.ddl)
+    for migration in schema_mod.MIGRATIONS:
+        migration.apply(connection)
+        migration.apply(connection)  # second application must be a safe no-op
+    connection.close()
+
+
 def test_event_payload_is_deeply_immutable_and_hash_checked() -> None:
     source = {"nested": {"items": [1, 2]}}
     event = EvolutionEvent.create(

@@ -43,7 +43,7 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "INSTALLED": frozenset({"PROBATION", "QUARANTINED", "FAILED"}),
     "PROBATION": frozenset({"VERIFIED", "QUARANTINED", "FAILED"}),
     "VERIFIED": frozenset({"PROBATION", "QUARANTINED", "FAILED"}),
-    "QUARANTINED": frozenset({"FAILED"}),
+    "QUARANTINED": frozenset({"FAILED", "PROBATION"}),
     "REJECTED": frozenset(),
     "FAILED": frozenset(),
     "SUPERSEDED": frozenset(),
@@ -72,6 +72,7 @@ class CapabilityProposalItem:
     trust_state: Mapping[str, Any] = field(default_factory=dict)
     created_at: float = 0.0
     updated_at: float = 0.0
+    expires_at: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +93,7 @@ class CapabilityProposalItem:
             "trust_state": dict(self.trust_state),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "expires_at": self.expires_at,
             "metadata": dict(self.metadata),
         }
 
@@ -118,6 +120,7 @@ class CapabilityProposalItem:
             trust_state=dict(data.get("trust_state") or {}),
             created_at=float(data.get("created_at") or 0.0),
             updated_at=float(data.get("updated_at") or 0.0),
+            expires_at=_coerce_optional_float(data.get("expires_at")),
             metadata=dict(data.get("metadata") or {}),
         )
 
@@ -141,9 +144,16 @@ _STATUS_EVENT_TYPES: dict[str, str] = {
 class EvolutionCapabilityProposalStore:
     """Event-sourced capability proposal lifecycle used by production runtime."""
 
-    def __init__(self, event_store: Any, *, profile_id: str) -> None:
+    def __init__(
+        self,
+        event_store: Any,
+        *,
+        profile_id: str,
+        proposal_ttl_hours: int = 72,
+    ) -> None:
         self._event_store = event_store
         self._profile_id = str(profile_id)
+        self._proposal_ttl_hours = max(0, int(proposal_ttl_hours))
         self._lock = threading.RLock()
 
     def enqueue(
@@ -194,6 +204,11 @@ class EvolutionCapabilityProposalStore:
             if existing is not None:
                 return existing, None
             now = time.time() if occurred_at is None else float(occurred_at)
+            expires_at = (
+                now + self._proposal_ttl_hours * 3600.0
+                if self._proposal_ttl_hours > 0
+                else None
+            )
             item = CapabilityProposalItem(
                 proposal_id=proposal_id,
                 status="PENDING",
@@ -204,6 +219,7 @@ class EvolutionCapabilityProposalStore:
                 observation_ids=tuple(str(item) for item in observation_ids),
                 created_at=now,
                 updated_at=now,
+                expires_at=expires_at,
                 metadata=dict(metadata or {}),
             )
             return item, self._state_event(item, previous_status="")
@@ -285,6 +301,7 @@ class EvolutionCapabilityProposalStore:
                 ),
                 created_at=item.created_at,
                 updated_at=time.time(),
+                expires_at=item.expires_at,
                 metadata={**dict(item.metadata), **dict(metadata or {})},
             )
             return self._append_state(updated, previous_status=item.status)
@@ -427,6 +444,15 @@ def _proposal_identity(
         },
     }
     return "prop-" + content_hash(material)[:16]
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _coerce_status(value: Any) -> ProposalStatus:

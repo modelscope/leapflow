@@ -5,6 +5,16 @@ Single source of truth for all table schemas. Each store registers its
 schema here rather than running ad-hoc CREATE TABLE in its own __init__.
 
 Migration is version-tracked via a ``_schema_version`` table.
+
+**Every migration must be idempotent.** The version integer records how far a
+database has been advanced, but it cannot guarantee that a migration's *contents*
+match the physical objects present -- an intermediate build may have created an
+object under a different version, and a crash between a DDL statement and the
+version bump can leave a migration half-applied. So every statement uses
+``CREATE ... IF NOT EXISTS`` / ``DROP ... IF EXISTS`` / ``ADD COLUMN IF NOT EXISTS``
+and re-running it against a database that already holds the object is a safe no-op.
+A non-idempotent ``CREATE`` here is a latent startup crash: it aborts the whole
+bootstrap transaction the first time a pre-existing object is met.
 """
 from __future__ import annotations
 
@@ -375,7 +385,7 @@ def _apply_evolution_tables(conn: duckdb.DuckDBPyConnection) -> None:
     """Create the append-only event stream and durable cold-path work queues."""
     statements = (
         """
-        CREATE TABLE evolution_events (
+        CREATE TABLE IF NOT EXISTS evolution_events (
             sequence BIGINT NOT NULL,
             event_id VARCHAR PRIMARY KEY,
             event_type VARCHAR NOT NULL,
@@ -407,7 +417,7 @@ def _apply_evolution_tables(conn: duckdb.DuckDBPyConnection) -> None:
         )
         """,
         """
-        CREATE TABLE evolution_teacher_jobs (
+        CREATE TABLE IF NOT EXISTS evolution_teacher_jobs (
             job_id VARCHAR PRIMARY KEY,
             profile_id VARCHAR NOT NULL,
             workspace_id VARCHAR NOT NULL DEFAULT '',
@@ -433,10 +443,10 @@ def _apply_evolution_tables(conn: duckdb.DuckDBPyConnection) -> None:
             UNIQUE(profile_id, episode_id)
         )
         """,
-        "CREATE INDEX idx_evo_event_session ON evolution_events(profile_id, session_id, sequence)",
-        "CREATE INDEX idx_evo_event_correlation ON evolution_events(profile_id, correlation_id, sequence)",
-        "CREATE INDEX idx_evo_event_type ON evolution_events(profile_id, event_type, sequence)",
-        "CREATE INDEX idx_evo_teacher_status ON evolution_teacher_jobs(profile_id, status, next_attempt_at)",
+        "CREATE INDEX IF NOT EXISTS idx_evo_event_session ON evolution_events(profile_id, session_id, sequence)",
+        "CREATE INDEX IF NOT EXISTS idx_evo_event_correlation ON evolution_events(profile_id, correlation_id, sequence)",
+        "CREATE INDEX IF NOT EXISTS idx_evo_event_type ON evolution_events(profile_id, event_type, sequence)",
+        "CREATE INDEX IF NOT EXISTS idx_evo_teacher_status ON evolution_teacher_jobs(profile_id, status, next_attempt_at)",
     )
     for statement in statements:
         conn.execute(statement)
@@ -445,11 +455,11 @@ def _apply_evolution_tables(conn: duckdb.DuckDBPyConnection) -> None:
 def _apply_evolution_sequence(conn: duckdb.DuckDBPyConnection) -> None:
     """Create a database-global cursor after any pre-sequence event rows."""
     conn.execute(
-        "CREATE UNIQUE INDEX idx_evo_event_sequence ON evolution_events(sequence)"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_evo_event_sequence ON evolution_events(sequence)"
     )
     row = conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM evolution_events").fetchone()
     start = max(1, int(row[0] if row else 1))
-    conn.execute(f"CREATE SEQUENCE evolution_event_sequence START {start}")
+    conn.execute(f"CREATE SEQUENCE IF NOT EXISTS evolution_event_sequence START {start}")
 
 
 def _apply_teacher_job_context(conn: duckdb.DuckDBPyConnection) -> None:
@@ -473,7 +483,7 @@ def _apply_evolution_projection(conn: duckdb.DuckDBPyConnection) -> None:
     """Create checkpointed read models derived exclusively from the event stream."""
     conn.execute(
         """
-        CREATE TABLE evolution_projections (
+        CREATE TABLE IF NOT EXISTS evolution_projections (
             projection_name VARCHAR NOT NULL,
             profile_id VARCHAR NOT NULL,
             scope_key VARCHAR NOT NULL,
@@ -490,7 +500,7 @@ def _apply_proposal_event_index(conn: duckdb.DuckDBPyConnection) -> None:
     """Retire the unused work table and index event-sourced proposal replay."""
     conn.execute("DROP TABLE IF EXISTS evolution_proposal_work")
     conn.execute(
-        "CREATE INDEX idx_evo_event_proposal "
+        "CREATE INDEX IF NOT EXISTS idx_evo_event_proposal "
         "ON evolution_events(profile_id, proposal_id, sequence)"
     )
 

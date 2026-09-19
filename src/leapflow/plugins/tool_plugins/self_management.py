@@ -1,7 +1,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 """Self-Management plugin — lets the Agent introspect and manage its own plugin composition.
 
-This is the Phase 2.4 Self-Modification MVP. It exposes twelve tools:
+This is the Phase 2.4 Self-Modification MVP. It exposes thirteen tools:
 
 Read-only governance (no approval needed):
     - plugin_list     : list all registered plugins across Tool/Gateway/LLM subsystems
@@ -1477,9 +1477,11 @@ class SelfManagementPlugin:
             if not result.get("ok"):
                 return result
             try:
-                version_info = self._version_store().record_source(
+                version_store = self._version_store()
+                version_info = version_store.record_bundle(
                     prepared.plugin_id,
                     prepared.wrapper_path,
+                    prepared.final_root,
                     version=version_label,
                     metadata={
                         "source": "dsh_source",
@@ -2051,14 +2053,9 @@ class SelfManagementPlugin:
         except (ImportError, ValueError):
             is_dsh = False
         if is_dsh:
-            return {
-                "ok": False,
-                "error": (
-                    "DSH bundle rollback is not supported in P0; reinstall the desired "
-                    "source bundle after removing the current plugin"
-                ),
-                "failure_code": "dsh_rollback_unsupported",
-            }
+            return await self._plugin_rollback_dsh(
+                plugin_id, version, **kwargs
+            )
         approved, denial = await self._check_approval("rollback", plugin_id)
         if not approved:
             return {"ok": False, "error": denial, "requires_approval": True}
@@ -2108,6 +2105,70 @@ class SelfManagementPlugin:
             response = {
                 "ok": False,
                 "error": f"Rollback failed: {exc}",
+                "rolled_back": restoration_error == "",
+            }
+            if restoration_error:
+                response["rollback_error"] = restoration_error
+            return response
+
+    async def _plugin_rollback_dsh(
+        self, plugin_id: str, version: str, **kwargs: Any
+    ) -> Dict[str, Any]:
+        """Rollback a DSH bundle plugin to a recorded directory-level snapshot."""
+        approved, denial = await self._check_approval("rollback", plugin_id)
+        if not approved:
+            return {"ok": False, "error": denial, "requires_approval": True}
+
+        from leapflow.plugins import reload_plugin
+
+        version_store = self._version_store()
+        wrapper_target = self._resolve_install_dir() / f"{plugin_id}.py"
+        bundle_target = self._resolve_dsh_install_dir() / plugin_id
+        metadata_snapshot = version_store.snapshot_state(plugin_id)
+        wrapper_snapshot = wrapper_target.read_bytes() if wrapper_target.exists() else None
+        try:
+            _result = version_store.rollback_bundle(
+                plugin_id, version, wrapper_target, bundle_target
+            )
+            fiber = reload_plugin(plugin_id)
+            response: Dict[str, Any] = {
+                "ok": True,
+                "action": "rollback",
+                "plugin_id": plugin_id,
+                "version": version,
+                "bundle": True,
+                "state": fiber.state.value,
+                "new_generation": fiber.generation,
+            }
+            from leapflow.domain.event_types import EvolutionEventType
+
+            persisted = await self._emit_plugin_event(
+                EvolutionEventType.PLUGIN_ROLLED_BACK,
+                plugin_id=plugin_id,
+                version_id=version,
+                payload=response,
+                dedup_suffix=f"{version}:{fiber.generation}",
+            )
+            if not persisted:
+                response["audit_incomplete"] = True
+            return response
+        except (KeyError, RuntimeError, OSError, AttributeError, FileNotFoundError) as exc:
+            restoration_error = ""
+            try:
+                version_store.restore_source(wrapper_target, wrapper_snapshot)
+                version_store.restore_state(plugin_id, metadata_snapshot)
+                reload_plugin(plugin_id)
+            except (KeyError, RuntimeError, OSError, AttributeError) as restore_exc:
+                restoration_error = str(restore_exc)
+                logger.error(
+                    "DSH bundle rollback could not restore the previous runtime: %s",
+                    restore_exc,
+                    exc_info=True,
+                )
+            logger.warning("DSH bundle rollback failed: %s", exc, exc_info=True)
+            response = {
+                "ok": False,
+                "error": f"DSH bundle rollback failed: {exc}",
                 "rolled_back": restoration_error == "",
             }
             if restoration_error:
@@ -2277,6 +2338,108 @@ class SelfManagementPlugin:
             return {"ok": False, "error": f"Plugin '{plugin_id}' not scoped-registered"}
         except RuntimeError as exc:
             return {"ok": False, "error": f"Reload failed: {exc}"}
+
+    async def _plugin_unquarantine_handler(self, plugin_id: str, **kwargs: Any) -> Dict[str, Any]:
+        """Restore a quarantined plugin to probation for re-evaluation."""
+        if plugin_id == "self_management":
+            return {"ok": False, "error": "Cannot unquarantine self_management (not quarantined)"}
+
+        # Approval gate — forces HIGH risk via platform="plugin_management"
+        approved, denial = await self._check_approval(
+            "unquarantine", plugin_id,
+            metadata={"platform": "plugin_management"},
+        )
+        if not approved:
+            return {"ok": False, "error": denial, "requires_approval": True}
+
+        # Confirm the plugin is actually in QUARANTINED status via proposal store
+        lifecycle_store = self._capability_lifecycle_store
+        proposal = None
+        quarantine_reason = ""
+        if lifecycle_store is not None:
+            try:
+                for item in lifecycle_store.list_items(status="QUARANTINED", limit=0):
+                    pid = str(item.metadata.get("plugin_id") or "")
+                    if pid == plugin_id:
+                        proposal = item
+                        quarantine_reason = str(item.metadata.get("terminal_reason") or "")
+                        break
+            except (AttributeError, RuntimeError) as exc:
+                logger.warning("unquarantine: proposal lookup failed: %s", exc)
+
+        if proposal is None:
+            return {
+                "ok": False,
+                "error": f"Plugin '{plugin_id}' is not in QUARANTINED status",
+            }
+
+        # Unfreeze the trust ledger — resets to DRAFT
+        unfrozen = False
+        try:
+            from leapflow.learning.plugin_advisor import get_default_advisor
+
+            advisor = get_default_advisor()
+            if advisor is not None:
+                unfrozen = advisor._trust_ledger.unfreeze(plugin_id)
+        except (ImportError, AttributeError, RuntimeError) as exc:
+            logger.warning("unquarantine: trust unfreeze failed: %s", exc)
+
+        # Transition proposal: QUARANTINED -> PROBATION
+        try:
+            lifecycle_store.transition(
+                proposal.proposal_id,
+                "PROBATION",
+                metadata={"unquarantine_reason": "manual_recovery"},
+            )
+        except (ValueError, KeyError, RuntimeError) as exc:
+            return {
+                "ok": False,
+                "error": f"Proposal transition failed: {exc}",
+                "trust_unfrozen": unfrozen,
+            }
+
+        # Reload the plugin fiber
+        reload_ok = False
+        reload_error = ""
+        try:
+            from leapflow.plugins import reload_plugin
+
+            reload_plugin(plugin_id)
+            reload_ok = True
+        except (KeyError, RuntimeError, ImportError) as exc:
+            reload_error = str(exc)
+            logger.warning("unquarantine: reload failed: %s", exc)
+
+        # Emit PLUGIN_UNQUARANTINED event
+        try:
+            from leapflow.domain.event_types import EvolutionEventType
+
+            await self._emit_plugin_event(
+                EvolutionEventType.PLUGIN_UNQUARANTINED,
+                plugin_id=plugin_id,
+                proposal_id=proposal.proposal_id,
+                payload={
+                    "plugin_id": plugin_id,
+                    "original_quarantine_reason": quarantine_reason,
+                    "trust_unfrozen": unfrozen,
+                    "reload_ok": reload_ok,
+                },
+                dedup_suffix=f"{proposal.proposal_id}:unquarantine",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("unquarantine event emission failed", exc_info=True)
+
+        response: Dict[str, Any] = {
+            "ok": True,
+            "plugin_id": plugin_id,
+            "status": "PROBATION",
+            "trust": "DRAFT",
+            "trust_unfrozen": unfrozen,
+            "reload_ok": reload_ok,
+        }
+        if reload_error:
+            response["reload_error"] = reload_error
+        return response
 
     async def _plugin_disable_handler(self, plugin_id: str, **kwargs: Any) -> Dict[str, Any]:
         """Disable a plugin by disposing its fiber. REQUIRES approval.
@@ -2776,6 +2939,37 @@ class SelfManagementPlugin:
                 },
                 mutates_state=True,
                 provides_capabilities=("plugin.remove",),
+                requires_platform_capabilities=("file.ops",),
+            ),
+            ToolMetadata(
+                name="plugin_unquarantine",
+                description=(
+                    "Restore a quarantined plugin to probation status for re-evaluation. "
+                    "Unfreezes the trust ledger, transitions the proposal back to PROBATION, "
+                    "and reloads the plugin. REQUIRES APPROVAL."
+                ),
+                parameters_schema={
+                    "type": "object",
+                    "properties": {
+                        "plugin_id": {
+                            "type": "string",
+                            "description": "The plugin identifier to unquarantine.",
+                        },
+                    },
+                    "required": ["plugin_id"],
+                },
+                handler=self._plugin_unquarantine_handler,
+                x_leapflow={
+                    "category": "plugin_management",
+                    "risk_level": "high",
+                    "schema_cost": "medium",
+                    "requires_approval": True,
+                    "effect_scope": "local",
+                    "idempotency_scope": "session",
+                    "summary": "restore a quarantined plugin to probation (approval required)",
+                },
+                mutates_state=True,
+                provides_capabilities=("plugin.unquarantine",),
                 requires_platform_capabilities=("file.ops",),
             ),
             ToolMetadata(

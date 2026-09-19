@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
+import shutil
+import tarfile
 import time
 from pathlib import Path
 from typing import Any
@@ -104,6 +107,144 @@ class PluginVersionStore:
         self._write_bytes(target, source.read_bytes())
         entry = self.record_source(plugin_id, target, version=version, metadata={"rollback": True})
         return entry
+
+    # ── bundle (directory-level) snapshots ────────────────────────────
+
+    def record_bundle(
+        self,
+        plugin_id: str,
+        wrapper_path: Path,
+        bundle_dir: Path,
+        *,
+        version: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a tar.gz archive of *wrapper_path* and *bundle_dir* and record it."""
+        wrapper = Path(wrapper_path)
+        bundle = Path(bundle_dir)
+        if not wrapper.is_file():
+            raise FileNotFoundError(f"Wrapper not found: {wrapper}")
+        if not bundle.is_dir():
+            raise NotADirectoryError(f"Bundle directory not found: {bundle}")
+
+        # Derive version from combined content hash when unspecified.
+        sha_hasher = hashlib.sha256()
+        sha_hasher.update(wrapper.read_bytes())
+        for p in sorted(bundle.rglob("*")):
+            if p.is_file():
+                sha_hasher.update(p.read_bytes())
+        bundle_sha256 = sha_hasher.hexdigest()
+        version_id = str(version or f"sha-{bundle_sha256[:12]}")
+
+        plugin_dir = self._plugin_dir(plugin_id)
+        versions_dir = plugin_dir / "versions"
+        versions_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = versions_dir / f"{version_id}_bundle.tar.gz"
+
+        # Build archive in memory then write atomically.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            tar.add(str(wrapper), arcname=f"wrapper/{wrapper.name}")
+            tar.add(str(bundle), arcname="bundle")
+        archive_bytes = buf.getvalue()
+        self._write_bytes(archive_path, archive_bytes)
+
+        entry: dict[str, Any] = {
+            "plugin_id": plugin_id,
+            "version": version_id,
+            "source_path": str(wrapper),
+            "snapshot_path": str(archive_path),
+            "sha256": hashlib.sha256(wrapper.read_bytes()).hexdigest(),
+            "bundle_sha256": bundle_sha256,
+            "is_bundle": True,
+            "created_at": time.time(),
+            "metadata": dict(metadata or {}),
+        }
+        index = [
+            item for item in self._read_index(plugin_id)
+            if item.get("version") != version_id
+        ]
+        index.append(entry)
+        self._write_json(plugin_dir / "versions.json", index)
+        self._write_json(plugin_dir / "active.json", entry)
+        return entry
+
+    def rollback_bundle(
+        self,
+        plugin_id: str,
+        version: str,
+        wrapper_target: Path,
+        bundle_target_dir: Path,
+    ) -> dict[str, Any]:
+        """Restore a bundle snapshot previously recorded with *record_bundle*."""
+        entry: dict[str, Any] | None = None
+        for item in self._read_index(plugin_id):
+            if str(item.get("version")) == str(version) and item.get("is_bundle"):
+                entry = item
+                break
+        if entry is None:
+            raise KeyError(f"Bundle version not found: {plugin_id}@{version}")
+        archive_path = Path(str(entry["snapshot_path"]))
+        if not archive_path.exists():
+            raise FileNotFoundError(f"Bundle archive missing: {archive_path}")
+
+        expected_sha = str(entry.get("bundle_sha256", ""))
+        wrapper_dest = Path(wrapper_target)
+        bundle_dest = Path(bundle_target_dir)
+
+        # Extract into a temporary staging directory, then promote.
+        staging = bundle_dest.parent / f".rollback_staging_{plugin_id}_{os.getpid()}"
+        try:
+            if staging.exists():
+                shutil.rmtree(staging)
+            staging.mkdir(parents=True, exist_ok=True)
+            with tarfile.open(archive_path, "r:gz") as tar:
+                tar.extractall(staging, filter="data")
+
+            # Locate extracted artefacts.
+            extracted_wrapper_dir = staging / "wrapper"
+            extracted_bundle_dir = staging / "bundle"
+            if not extracted_bundle_dir.is_dir():
+                raise RuntimeError("Archive does not contain a bundle directory")
+            wrapper_files = list(extracted_wrapper_dir.iterdir()) if extracted_wrapper_dir.is_dir() else []
+            if not wrapper_files:
+                raise RuntimeError("Archive does not contain a wrapper file")
+            extracted_wrapper = wrapper_files[0]
+
+            # Verify SHA-256 integrity.
+            sha_hasher = hashlib.sha256()
+            sha_hasher.update(extracted_wrapper.read_bytes())
+            for p in sorted(extracted_bundle_dir.rglob("*")):
+                if p.is_file():
+                    sha_hasher.update(p.read_bytes())
+            actual_sha = sha_hasher.hexdigest()
+            if expected_sha and actual_sha != expected_sha:
+                raise RuntimeError(
+                    f"Bundle integrity check failed: expected {expected_sha[:16]}…, "
+                    f"got {actual_sha[:16]}…"
+                )
+
+            # Promote: replace wrapper and bundle directory atomically-ish.
+            wrapper_dest.parent.mkdir(parents=True, exist_ok=True)
+            self._write_bytes(wrapper_dest, extracted_wrapper.read_bytes())
+            if bundle_dest.exists():
+                shutil.rmtree(bundle_dest)
+            shutil.copytree(extracted_bundle_dir, bundle_dest)
+
+            # Update version index to mark this version active.
+            result_entry = dict(entry)
+            result_entry["metadata"] = {**result_entry.get("metadata", {}), "rollback": True}
+            idx = [
+                item for item in self._read_index(plugin_id)
+                if item.get("version") != version
+            ]
+            idx.append(result_entry)
+            plugin_dir = self._plugin_dir(plugin_id)
+            self._write_json(plugin_dir / "versions.json", idx)
+            self._write_json(plugin_dir / "active.json", result_entry)
+            return {"ok": True, "plugin_id": plugin_id, "version": version, "bundle": True}
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
     def _plugin_dir(self, plugin_id: str) -> Path:
         return self._root / str(plugin_id)

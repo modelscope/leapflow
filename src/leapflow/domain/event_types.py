@@ -103,6 +103,7 @@ class EvolutionEventType:
     PLUGIN_PROBATION_STARTED = "plugin.probation_started"
     PLUGIN_VERIFIED = "plugin.verified"
     PLUGIN_QUARANTINED = "plugin.quarantined"
+    PLUGIN_UNQUARANTINED = "plugin.unquarantined"
     PLUGIN_ROLLED_BACK = "plugin.rolled_back"
     FRAMEWORK_TRACE_RECORDED = "framework.trace_recorded"
     PLUGIN_OUTCOME_RECORDED = "plugin.outcome_recorded"
