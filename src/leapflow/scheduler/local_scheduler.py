@@ -16,6 +16,7 @@ import logging
 import time
 from typing import Optional
 
+from leapflow.scheduler.execution_log import ExecutionLogStore
 from leapflow.scheduler.store import TaskStore
 from leapflow.scheduler.triggers import create_trigger
 from leapflow.scheduler.types import ArmedTask, SkillExecutor, TaskState
@@ -38,11 +39,13 @@ class LocalScheduler:
         *,
         tick_seconds: int = 60,
         grace_seconds: float = 120.0,
+        execution_log: Optional["ExecutionLogStore"] = None,
     ) -> None:
         self._store = store
         self._executor = executor
         self._tick_seconds = tick_seconds
         self._grace_seconds = grace_seconds
+        self._execution_log = execution_log
         self._task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
         self._running = False
         self._wake_event: asyncio.Event = asyncio.Event()
@@ -140,7 +143,18 @@ class LocalScheduler:
         self._store.advance_next_due(task.task_id, new_due)
 
         # Execute
+        execution_id: Optional[str] = None
         try:
+            # Record execution start (contained — logging failures never crash the tick)
+            if self._execution_log is not None:
+                try:
+                    execution_id = self._execution_log.record_start(
+                        task_id=task.task_id,
+                        trigger_type=task.trigger_type,
+                    )
+                except Exception:
+                    logger.debug("Failed to record execution start for %s", task.task_id[:8], exc_info=True)
+
             self._store.update_state(task.task_id, TaskState.EXECUTING.value)
 
             parameters = (
@@ -166,9 +180,28 @@ class LocalScheduler:
                 task.task_id[:8],
                 result.get("ok", False),
             )
+
+            # Record success (contained)
+            if self._execution_log is not None and execution_id is not None:
+                try:
+                    summary = str(result.get("output", ""))[:200] if result.get("ok") else ""
+                    self._execution_log.record_finish(
+                        execution_id, "success", result_summary=summary,
+                    )
+                except Exception:
+                    logger.debug("Failed to record execution finish for %s", task.task_id[:8], exc_info=True)
         except Exception as e:
             self._store.update_state(task.task_id, TaskState.FAILED.value)
             logger.error("Task %s failed: %s", task.task_id[:8], e)
+
+            # Record failure (contained)
+            if self._execution_log is not None and execution_id is not None:
+                try:
+                    self._execution_log.record_finish(
+                        execution_id, "failed", error=str(e)[:500],
+                    )
+                except Exception:
+                    logger.debug("Failed to record execution failure for %s", task.task_id[:8], exc_info=True)
 
     # ------------------------------------------------------------------
     # Fast-forward

@@ -75,7 +75,7 @@ def render_tool_payload(console: "LeapConsole", payload: dict[str, Any]) -> None
 
 
 def build_usage_payload(ctx: "Context") -> dict[str, Any]:
-    """Build a serializable token usage summary."""
+    """Build a serializable token usage summary with cost and latency."""
     engine = ctx.engine
     if engine is None:
         return {"ok": False, "error": "No active engine — send a message first."}
@@ -91,20 +91,60 @@ def build_usage_payload(ctx: "Context") -> dict[str, Any]:
         caps = cap_registry.resolve(ctx.settings.llm_model)
         context_length = int(caps.context_length)
 
+    # Cost computation (graceful: missing pricing => cost unknown)
+    cost_payload: dict[str, Any] = {"dollar_cost": None, "session_dollar_cost": None}
+    try:
+        from leapflow.engine.cost_calculator import compute_cost, format_cost
+
+        pricing_config = ctx.settings.usage_pricing
+        if pricing_config:
+            result = compute_cost(
+                prompt_tokens=summary.prompt_tokens,
+                completion_tokens=summary.completion_tokens,
+                cached_tokens=summary.cached_tokens,
+                model=summary.model or ctx.settings.llm_model,
+                pricing_config=pricing_config,
+            )
+            cost_payload["dollar_cost"] = result.dollar_cost
+            cost_payload["dollar_cost_formatted"] = format_cost(result.dollar_cost)
+            cost_payload["pricing_source"] = result.pricing_source
+    except Exception:  # noqa: BLE001 — never let cost accounting break /usage
+        pass
+
+    # Latency aggregation (read-only snapshots from existing instrumentation)
+    latency_payload: dict[str, Any] = {}
+    try:
+        from leapflow.performance import LatencySummary, aggregate_latency_snapshots
+
+        snapshots: dict[str, LatencySummary] = {}
+
+        # Plugin registry snapshot latency
+        registry = getattr(engine, "_plugin_registry", None) or getattr(engine, "plugin_registry", None)
+        if registry is not None and hasattr(registry, "snapshot_latency"):
+            snapshots["plugin_snapshot"] = registry.snapshot_latency()
+
+        if snapshots:
+            latency_payload = aggregate_latency_snapshots(snapshots)
+    except Exception:  # noqa: BLE001
+        pass
+
     return {
         "ok": True,
         "model": ctx.settings.llm_model,
         "prompt_tokens": int(summary.prompt_tokens),
         "completion_tokens": int(summary.completion_tokens),
         "total_tokens": int(summary.total_tokens),
+        "cached_tokens": int(summary.cached_tokens),
         "turn_count": int(getattr(engine, "turn_count", 0)),
         "context_used": int(getattr(engine, "context_token_count", 0)),
         "context_length": context_length,
+        **cost_payload,
+        "latency": latency_payload,
     }
 
 
 def render_usage_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
-    """Render a serializable token usage summary."""
+    """Render a serializable token usage summary with cost and latency."""
     from leapflow.cli.tui_app.status import _compact_tokens
 
     if not payload.get("ok", True):
@@ -115,6 +155,7 @@ def render_usage_payload(console: "LeapConsole", payload: dict[str, Any]) -> Non
     prompt_tokens = int(payload.get("prompt_tokens") or 0)
     completion_tokens = int(payload.get("completion_tokens") or 0)
     total_tokens = int(payload.get("total_tokens") or 0)
+    cached_tokens = int(payload.get("cached_tokens") or 0)
     turn_count = int(payload.get("turn_count") or 0)
     context_used = int(payload.get("context_used") or 0)
     context_length = int(payload.get("context_length") or 0)
@@ -123,13 +164,40 @@ def render_usage_payload(console: "LeapConsole", payload: dict[str, Any]) -> Non
         f"  Input tokens:    {_compact_tokens(prompt_tokens):>8}  ({prompt_tokens:,})",
         f"  Output tokens:   {_compact_tokens(completion_tokens):>8}  ({completion_tokens:,})",
         f"  Total tokens:    {_compact_tokens(total_tokens):>8}  ({total_tokens:,})",
-        f"  Turns:           {turn_count}",
     ]
+    if cached_tokens > 0:
+        lines.append(
+            f"  Cached tokens:   {_compact_tokens(cached_tokens):>8}  ({cached_tokens:,})"
+        )
+    lines.append(f"  Turns:           {turn_count}")
     if context_length > 0:
         pct = int(context_used * 100 / context_length)
         lines.append(
             f"  Context:         {_compact_tokens(context_used)}/{_compact_tokens(context_length)} ({pct}%)"
         )
+
+    # Cost line (graceful: only shown when pricing is configured)
+    dollar_cost = payload.get("dollar_cost")
+    if dollar_cost is not None:
+        cost_str = payload.get("dollar_cost_formatted", f"${dollar_cost:.4f}")
+        lines.append(f"  Turn cost:       {cost_str}")
+    session_cost = payload.get("session_dollar_cost")
+    if session_cost is not None:
+        lines.append(f"  Session cost:    ${session_cost:.4f}")
+
+    # Latency summary (read-only aggregation)
+    latency = payload.get("latency") or {}
+    if latency:
+        lines.append("  Latency (ms):")
+        for label, snap in latency.items():
+            p50 = snap.get("p50_ms", 0)
+            p95 = snap.get("p95_ms", 0)
+            p99 = snap.get("p99_ms", 0)
+            count = snap.get("count", 0)
+            lines.append(
+                f"    {label:20s} p50={p50:>7.1f}  p95={p95:>7.1f}  p99={p99:>7.1f}  n={count}"
+            )
+
     for line in lines:
         console.system(line)
     console.print()
@@ -1931,6 +1999,20 @@ async def command_execute(
         return await _execute_scheduler_arm(ctx, args)
     if name == "task":
         return _execute_scheduler_task(ctx)
+    if name == "schedule" or name.startswith("schedule "):
+        sched_args = name[len("schedule"):].strip()
+        if sched_args:
+            sched_args = sched_args + (" " + args if args else "")
+        else:
+            sched_args = args
+        return build_schedule_payload(ctx, sched_args)
+    if name == "checkpoint" or name.startswith("checkpoint "):
+        ckpt_args = name[len("checkpoint"):].strip()
+        if ckpt_args:
+            ckpt_args = ckpt_args + (" " + args if args else "")
+        else:
+            ckpt_args = args
+        return build_checkpoint_payload(ctx, ckpt_args, session_id=session_id)
     if name == "board" or name.startswith("board "):
         return await _execute_dashboard(ctx, name, args, session_id=session_id)
     if _is_plugin_command(name):
@@ -1941,6 +2023,184 @@ async def command_execute(
             plugin_args = args
         return await build_plugin_payload(ctx, plugin_args)
     return {"ok": False, "message": f"Unknown command: /{name}"}
+
+
+def build_checkpoint_payload(ctx: "Context", args: str = "", session_id: str = "") -> dict[str, Any]:
+    """Handle /checkpoint list and /checkpoint rollback commands."""
+    store = getattr(ctx, "_file_checkpoint_store", None)
+    if store is None:
+        return {
+            "ok": False,
+            "message": "File checkpoint is not enabled. Set checkpoint.file_rollback_enabled=true.",
+        }
+
+    parts = args.strip().split(None, 1)
+    verb = parts[0].lower() if parts else "list"
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if verb == "list" or not args.strip():
+        sid = session_id or getattr(getattr(ctx, "engine", None), "_current_session_id", "") or ""
+        checkpoints = store.list_turns(sid, limit=20)
+        if not checkpoints:
+            return {"ok": True, "message": "No file checkpoints found for this session."}
+        lines = ["Recent file checkpoints:"]
+        for cp in checkpoints:
+            import datetime
+            ts = datetime.datetime.fromtimestamp(cp.created_at).strftime("%Y-%m-%d %H:%M:%S")
+            paths = [s.path for s in cp.snapshots]
+            summary = ", ".join(paths[:3])
+            if len(paths) > 3:
+                summary += f" (+{len(paths) - 3} more)"
+            lines.append(f"  {cp.turn_id}  {ts}  [{len(cp.snapshots)} file(s)]: {summary}")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    if verb == "rollback":
+        turn_id = rest
+        if not turn_id:
+            return {"ok": False, "message": "Usage: /checkpoint rollback <turn_id>"}
+        result = store.rollback_turn(turn_id)
+        lines = [f"Rollback of turn {turn_id}:"]
+        if result.restored:
+            lines.append(f"  Restored: {', '.join(result.restored)}")
+        if result.skipped:
+            lines.append(f"  Skipped (unchanged): {', '.join(result.skipped)}")
+        if result.failed:
+            for path, reason in result.failed:
+                lines.append(f"  Failed: {path} — {reason}")
+        ok = len(result.failed) == 0
+        return {"ok": ok, "message": "\n".join(lines)}
+
+    return {"ok": False, "message": f"Unknown checkpoint subcommand: {verb}. Use list or rollback."}
+
+
+def build_schedule_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
+    """Handle /schedule list, /schedule history, and /schedule cancel commands."""
+    from leapflow.scheduler.coordinator import TaskCoordinator
+    from leapflow.scheduler.execution_log import DuckDBExecutionLogStore
+    from leapflow.scheduler.store import TaskStore
+
+    # Resolve coordinator from context — same wiring as /arm and /task
+    coordinator: TaskCoordinator | None = getattr(ctx, "coordinator", None)
+    task_store: TaskStore | None = None
+
+    if coordinator is not None:
+        task_store = coordinator._store  # noqa: SLF001
+    else:
+        # Fallback: build a read-only TaskStore from settings
+        try:
+            task_store = TaskStore(ctx.settings.duckdb_path)
+        except Exception:
+            pass
+
+    parts = args.strip().split(None, 1)
+    verb = parts[0].lower() if parts else "list"
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    # ── /schedule list (default) ─────────────────────────────────────
+    if verb == "list" or not args.strip():
+        if task_store is None:
+            return {"ok": True, "message": "No scheduler active."}
+        try:
+            tasks = task_store.load_all()
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to load tasks: {exc}"}
+        if not tasks:
+            return {"ok": True, "message": "No scheduled tasks."}
+        import time as _time
+        now = _time.time()
+        lines = ["Active scheduled tasks:"]
+        for t in tasks:
+            tid = t.task_id[:8]
+            trigger = t.trigger_type
+            if t.trigger_type == "interval":
+                sec = (t.trigger_config or {}).get("interval_seconds", 0)
+                if sec < 60:
+                    trigger = f"every {int(sec)}s"
+                elif sec < 3600:
+                    trigger = f"every {int(sec / 60)}m"
+                else:
+                    trigger = f"every {int(sec / 3600)}h"
+            elif t.trigger_type == "cron":
+                trigger = (t.trigger_config or {}).get("expression", "cron")
+            if t.next_due_at > 0:
+                delta = t.next_due_at - now
+                if delta <= 0:
+                    next_str = "now"
+                elif delta < 60:
+                    next_str = f"{int(delta)}s"
+                elif delta < 3600:
+                    next_str = f"{int(delta / 60)}m"
+                else:
+                    next_str = f"{int(delta / 3600)}h"
+            else:
+                next_str = "-"
+            enabled = t.state not in ("suspended", "done", "failed")
+            lines.append(
+                f"  {tid}  skill={t.skill_name}  trigger={trigger}"
+                f"  next={next_str}  enabled={enabled}"
+            )
+        return {"ok": True, "message": "\n".join(lines)}
+
+    # ── /schedule history [task_id] ──────────────────────────────────
+    if verb == "history":
+        # Build an execution log store from the same DB
+        log_store = None
+        if coordinator is not None and coordinator._execution_log is not None:  # noqa: SLF001
+            log_store = coordinator._execution_log  # noqa: SLF001
+        else:
+            try:
+                log_store = DuckDBExecutionLogStore(ctx.settings.duckdb_path)
+            except Exception:
+                pass
+        if log_store is None:
+            return {"ok": False, "message": "Execution log is not available."}
+        task_id = rest or None
+        try:
+            records = log_store.get_history(task_id=task_id, limit=30)
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to read execution history: {exc}"}
+        if not records:
+            label = f" for task {task_id[:8]}" if task_id else ""
+            return {"ok": True, "message": f"No execution history{label}."}
+        import datetime
+        lines = ["Recent executions:"]
+        for r in records:
+            ts = datetime.datetime.fromtimestamp(r.started_at).strftime("%Y-%m-%d %H:%M:%S")
+            detail = r.result_summary or r.error or ""
+            detail_str = f"  {detail[:80]}" if detail else ""
+            lines.append(f"  {r.task_id[:8]}  [{ts}]  {r.status}{detail_str}")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    # ── /schedule cancel <task_id> ───────────────────────────────────
+    if verb == "cancel":
+        task_id = rest
+        if not task_id:
+            return {"ok": False, "message": "Usage: /schedule cancel <task_id>"}
+        if task_store is None:
+            return {"ok": False, "message": "No scheduler active."}
+        # Try the coordinator's cancel (which also stops cloud workers)
+        if coordinator is not None:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # We are inside an async context already; just call directly
+                    # But build_schedule_payload is sync, so use store directly
+                    task_store.update_state(task_id, "suspended")
+                else:
+                    loop.run_until_complete(coordinator.cancel(task_id))
+            except ValueError as exc:
+                return {"ok": False, "message": str(exc)}
+            except Exception:
+                task_store.update_state(task_id, "suspended")
+        else:
+            try:
+                task_store.update_state(task_id, "suspended")
+            except Exception as exc:
+                return {"ok": False, "message": f"Failed to cancel: {exc}"}
+        return {"ok": True, "message": f"Cancelled task {task_id[:8]}."}
+
+    return {"ok": False, "message": f"Unknown schedule subcommand: {verb}. Use list, history, or cancel."}
 
 
 async def _ensure_session_watch_refresh(

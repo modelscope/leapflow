@@ -24,6 +24,7 @@ from leapflow.engine.failure_envelope import (
     RecoveryHint,
     SideEffectState,
 )
+from leapflow.llm.credential_state import AllCredentialsExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +211,9 @@ class UnifiedErrorClassifier:
         if isinstance(exc, _INTERNAL_DEFECT_TYPES):
             return self.classify_internal_defect(exc, provider=provider, model=model)
 
+        if isinstance(exc, AllCredentialsExhausted):
+            return self._classify_credentials_exhausted(exc, provider=provider, model=model)
+
         category = self._classifier.classify(exc)
         category_str = category.value
 
@@ -232,6 +236,45 @@ class UnifiedErrorClassifier:
                 arguments={"provider": provider, "model": model} if provider or model else None,
             ),
             provider_hint=hint,
+        )
+
+    def _classify_credentials_exhausted(
+        self,
+        exc: AllCredentialsExhausted,
+        *,
+        provider: str = "",
+        model: str = "",
+    ) -> FailureEnvelope:
+        """Classify a fully-drained credential pool as admin-required.
+
+        Reached by exception type, not message text: when every credential for
+        every provider is dead or cooling down, no retry / failover / rotation
+        can proceed — an operator must add or restore a key. Mapped to
+        ``auth_permanent`` (permanent auth semantics) with ``ADMIN_REQUIRED``
+        recoverability so the turn halts with an actionable reason instead of
+        looping through recovery strategies that have nothing left to try.
+        """
+        logger.error("all LLM credentials exhausted: %s", exc)
+        return FailureEnvelope.create(
+            source=FailureSource.LLM,
+            category=ErrorCategory.AUTH_PERMANENT.value,
+            failure_class="auth_permanent",
+            failure_code="llm_credentials_exhausted",
+            message=str(exc)[:500],
+            recoverability=Recoverability.ADMIN_REQUIRED,
+            side_effect_state=SideEffectState.NONE,
+            context=FailureContext.from_dict_args(
+                tool_name="",
+                arguments={"provider": provider or exc.provider, "model": model}
+                if (provider or exc.provider or model) else None,
+            ),
+            provider_hint=RecoveryHint(
+                hint_text=(
+                    "All configured LLM API keys are unusable "
+                    f"({exc.dead} revoked/billing-dead, {exc.cooling_down} rate-limited). "
+                    "Add or restore a valid key, or wait for rate limits to reset."
+                )
+            ),
         )
 
     def classify_tool_result(

@@ -15,6 +15,7 @@ import re
 import time
 from typing import List, Optional
 
+from leapflow.scheduler.execution_log import ExecutionLogStore
 from leapflow.scheduler.store import TaskStore
 from leapflow.scheduler.triggers import create_trigger
 from leapflow.scheduler.types import ArmedTask, ExecutionTier, TaskState, TaskStatus
@@ -120,11 +121,13 @@ class TaskCoordinator:
         local_scheduler: Optional["LocalScheduler"] = None,
         cloud_dispatcher: Optional["CloudDispatcher"] = None,
         default_tier: str = "auto",
+        execution_log: Optional[ExecutionLogStore] = None,
     ) -> None:
         self._store = store
         self._local = local_scheduler
         self._cloud = cloud_dispatcher
         self._default_tier = default_tier
+        self._execution_log = execution_log
 
     # ------------------------------------------------------------------
     # Public API
@@ -241,7 +244,7 @@ class TaskCoordinator:
         return self._store.load_all()
 
     async def logs(self, task_id: str, tail: int = 50) -> List[str]:
-        """Get logs (local: from last execution, cloud: from Studio logs)."""
+        """Get logs (local: from execution log store, cloud: from Studio logs)."""
         task = self._store.load(task_id)
         if task is None:
             raise ValueError(f"Task not found: {task_id}")
@@ -249,8 +252,39 @@ class TaskCoordinator:
         if task.execution_tier == ExecutionTier.CLOUD.value and self._cloud and task.cloud_worker_id:
             return await self._cloud.logs(task.cloud_worker_id, tail=tail)
 
-        # Local tasks: no log store yet, return placeholder
+        # Local tasks: pull from execution log store
+        if self._execution_log is not None:
+            try:
+                records = self._execution_log.get_history(task_id=task_id, limit=tail)
+                if records:
+                    lines: List[str] = []
+                    for r in records:
+                        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r.started_at))
+                        detail = r.result_summary or r.error or ""
+                        lines.append(f"[{ts}] {r.status}" + (f" — {detail}" if detail else ""))
+                    return lines
+            except Exception:
+                logger.debug("Failed to read execution log for %s", task_id[:8], exc_info=True)
+
         return [f"[local] Task {task_id[:8]}: state={task.state}, runs={task.run_count}"]
+
+    def get_execution_history(
+        self,
+        task_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List:
+        """Return recent execution log records (newest first).
+
+        Delegates to the injected :class:`ExecutionLogStore`.  Returns an
+        empty list when no store is available.
+        """
+        if self._execution_log is None:
+            return []
+        try:
+            return self._execution_log.get_history(task_id=task_id, limit=limit)
+        except Exception:
+            logger.debug("Failed to read execution history", exc_info=True)
+            return []
 
     # ------------------------------------------------------------------
     # Tier decision heuristic

@@ -1286,6 +1286,79 @@ class Context:
                 execution=execution_adapter,
             )
 
+    def _register_file_checkpoint_interceptor(self, settings: Settings) -> None:
+        """Register the file checkpoint interceptor on the tool pipeline.
+
+        Creates a DuckDB-backed checkpoint store and registers the interceptor
+        (priority 40) so it runs after approval and before audit.
+        """
+        from leapflow.engine.file_checkpoint import FileCheckpointInterceptor
+        from leapflow.plugins import get_registry
+        from leapflow.storage.file_checkpoint_store import DuckDBFileCheckpointStore
+
+        profile_layout = settings.profile_layout
+        db_path = profile_layout.checkpoint_db_path
+
+        # Use CacheLayout for temp copies of large files (session-scoped, sensitive)
+        cache_layout = profile_layout.cache
+        temp_dir = cache_layout.category_dir(
+            scope="profile", category="file_checkpoints",
+        )
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        checkpoint_store = DuckDBFileCheckpointStore(db_path)
+        self._file_checkpoint_store = checkpoint_store
+
+        # Opportunistic startup cleanup: purge expired checkpoints on the cold
+        # path.  Guarded so a cleanup failure never blocks startup.
+        if settings.checkpoint_ttl_hours > 0:
+            try:
+                purged = checkpoint_store.cleanup(
+                    max_age_hours=float(settings.checkpoint_ttl_hours),
+                )
+                if purged:
+                    logger.debug(
+                        "file_checkpoint: startup cleanup purged %d expired rows", purged,
+                    )
+            except Exception:
+                logger.debug("file_checkpoint: startup cleanup failed", exc_info=True)
+
+        def _get_turn_id() -> str:
+            engine = self.engine
+            if engine is not None:
+                return getattr(engine, "_current_turn_id", "") or ""
+            return ""
+
+        def _get_session_id() -> str:
+            engine = self.engine
+            if engine is not None:
+                return getattr(engine, "_current_session_id", "") or ""
+            return ""
+
+        def _parameters_schema_lookup(tool_name: str) -> dict:
+            """Look up parameters_schema from ToolPluginRegistry metadata."""
+            registry = get_registry()
+            for meta in registry.all_metadata:
+                if meta.name == tool_name:
+                    return meta.parameters_schema
+            return {}
+
+        interceptor = FileCheckpointInterceptor(
+            store=checkpoint_store,
+            max_inline_bytes=settings.checkpoint_max_inline_bytes,
+            temp_dir=temp_dir,
+            get_turn_id=_get_turn_id,
+            get_session_id=_get_session_id,
+            parameters_schema_lookup=_parameters_schema_lookup,
+        )
+
+        pipeline = get_registry().tool_pipeline
+        pipeline.register(interceptor)
+        logger.info(
+            "File checkpoint interceptor registered (priority=%d, max_inline=%d)",
+            interceptor.priority, settings.checkpoint_max_inline_bytes,
+        )
+
     def _bind_hardware_experience(self) -> None:
         """Give the hardware registry the experience store once it exists.
 
@@ -1991,6 +2064,8 @@ class Context:
             keep_tail=settings.compress_keep_tail,
             max_output_chars=settings.max_tool_output_chars,
             summarize_fn=_summarize_via_llm if settings.has_llm_credentials else None,
+            protect_first_n=settings.compression_protect_first_n,
+            summarize_keep_recent=settings.compression_keep_recent_n,
         )
 
         # ── Initialize DuckDBConversationStore ──
@@ -2087,6 +2162,13 @@ class Context:
         if self._conversation_store:
             self.engine.set_conversation_store(self._conversation_store)
 
+        # ── File Checkpoint Interceptor (P1-2) ──
+        if settings.checkpoint_file_rollback_enabled:
+            try:
+                self._register_file_checkpoint_interceptor(settings)
+            except Exception:
+                logger.debug("File checkpoint interceptor registration skipped", exc_info=True)
+
         # ── Wire ResearchLedgerStore into engine (S1 durable Orient) ──
         if self._research_ledger_store:
             self.engine.set_research_ledger_store(self._research_ledger_store)
@@ -2123,6 +2205,7 @@ class Context:
                 executor=sub_executor,
                 max_depth=settings.agent_subagent_max_depth,
                 max_concurrent=settings.agent_subagent_max_concurrent,
+                event_bus=self.event_bus,
             )
             _tool_reg_sub.set_subagent_manager(self._subagent_manager)
             logger.info("SubagentManager wired with delegate_task tool")
@@ -2142,6 +2225,7 @@ class Context:
                     stagnation_window=settings.guardrail_stagnation_window,
                     min_success_rate=settings.guardrail_min_success_rate,
                     max_consecutive_same=settings.guardrail_max_consecutive_same,
+                    max_calls_per_turn=settings.guardrail_max_calls_per_turn,
                 )
                 logger.debug("Tool loop guardrails enabled")
             else:
@@ -2187,23 +2271,75 @@ class Context:
             try:
                 aux = self.auxiliary
 
+                def _advisory_label(score: float) -> str:
+                    """Map a [0,1] advisory score to a human-readable label."""
+                    if score >= 0.8:
+                        return "CRITICAL"
+                    if score >= 0.6:
+                        return "HIGH"
+                    if score >= 0.4:
+                        return "MODERATE"
+                    if score >= 0.2:
+                        return "LOW"
+                    return "SAFE"
+
                 class _SmartApprovalGate:
-                    """LLM-assisted shell approval adapter that preserves policy authority."""
+                    """LLM-assisted approval adapter that surfaces advisory risk.
+
+                    Intercepts the orchestrator's human-prompt gate so the
+                    ApprovalRequest is enriched with an advisory risk score
+                    right before it is rendered.  The advisory is purely
+                    informational — it MUST NOT change the decision path,
+                    lower the deterministic RiskLevel, or auto-approve/deny.
+                    """
 
                     def __init__(self, delegate: Any) -> None:
                         self._delegate = delegate
+                        # Replace the orchestrator's inner gate with self so
+                        # request_approval() flows through advisory enrichment.
+                        self._inner_gate = delegate._gate
+                        delegate._gate = self
+
+                    # -- ApprovalGate protocol (called by the orchestrator) --
+
+                    async def request_approval(self, request: Any) -> Any:
+                        """Enrich *request* with advisory then forward to the real gate."""
+                        enriched = await self._attach_advisory(request)
+                        return await self._inner_gate.request_approval(enriched)
+
+                    # -- Public wrappers for shell / evaluate callers --
 
                     async def evaluate(self, action: Any) -> Any:
                         return await self._delegate.evaluate(action)
 
                     async def check(self, command: str) -> bool:
-                        try:
-                            risk = await aux.classify_risk(command)
-                        except Exception:
-                            risk = 0.5
-                        if risk < 0.3:
-                            logger.debug("smart_approval: low auxiliary risk hint (risk=%.2f)", risk)
                         return await self._delegate.check(command)
+
+                    # -- Advisory enrichment (cold-path, best-effort) --
+
+                    async def _attach_advisory(self, request: Any) -> Any:
+                        from leapflow.config import get_settings
+
+                        if not getattr(get_settings(), "approval_advisory_risk_enabled", False):
+                            return request
+                        try:
+                            command_text = request.detail or ""
+                            score = await aux.classify_risk(command_text)
+                            label = _advisory_label(score)
+                            from dataclasses import replace as _replace
+
+                            new_display = {
+                                **request.display,
+                                "advisory": f"AI risk assessment: {label} ({score:.2f})",
+                            }
+                            new_metadata = {
+                                **request.metadata,
+                                "advisory_risk": {"score": score, "label": label},
+                            }
+                            return _replace(request, display=new_display, metadata=new_metadata)
+                        except Exception:
+                            logger.debug("advisory risk enrichment failed", exc_info=True)
+                            return request
 
                 from leapflow.tools.shell_tools import set_approval_gate
                 set_approval_gate(_SmartApprovalGate(self._approval_orchestrator))

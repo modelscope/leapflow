@@ -138,6 +138,9 @@ class SlashCommandCompleter(Completer):
         if text.startswith("/board "):
             yield from self._board_completions(text)
             return
+        if text.startswith("/schedule "):
+            yield from self._schedule_completions(text)
+            return
 
         query = text.lstrip("/").lower()
         for command, description in self._commands:
@@ -183,6 +186,29 @@ class SlashCommandCompleter(Completer):
             yield Completion(
                 name, start_position=start, display=name,
                 display_meta=_truncate_meta("Open this lens"),
+            )
+
+    _SCHEDULE_VERBS: tuple[tuple[str, str], ...] = (
+        ("list", "List active scheduled tasks"),
+        ("history", "Show recent execution log entries"),
+        ("cancel", "Cancel/disable a scheduled task"),
+    )
+
+    def _schedule_completions(self, text: str) -> "Iterable[Completion]":
+        """Offer subcommands after ``/schedule ``."""
+        tail = text[len("/schedule "):]
+        parts = tail.split()
+        # After the subcommand, the user types a task_id — no static completion.
+        if len(parts) > 1 or (parts and tail.endswith(" ")):
+            return
+        prefix = parts[0].lower() if parts else ""
+        start = -len(prefix)
+        for verb, description in self._SCHEDULE_VERBS:
+            if prefix and not verb.startswith(prefix):
+                continue
+            yield Completion(
+                verb, start_position=start, display=verb,
+                display_meta=_truncate_meta(description),
             )
 
     def _config_completions(self, text: str) -> "Iterable[Completion]":

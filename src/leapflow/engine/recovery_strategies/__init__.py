@@ -29,13 +29,18 @@ __all__ = [
 ]
 
 
-def default_strategies() -> list:
-    """Return all built-in strategies in priority order (lowest priority number first)."""
+def default_strategies(credential_availability=None) -> list:
+    """Return all built-in strategies in priority order (lowest priority number first).
+
+    ``credential_availability`` (typically the active ``FailoverChain``) lets
+    ``CredentialRotateStrategy`` bow out when no rotatable credential remains,
+    so provider failover takes over instead of looping.
+    """
     return [
         ContextCompressStrategy(),
         MultimodalStripStrategy(),
         ProviderFailoverStrategy(),
-        CredentialRotateStrategy(),
+        CredentialRotateStrategy(credential_availability=credential_availability),
         ThinkingDisableStrategy(),
         NativeToTextFallbackStrategy(),
         ToolSchemaExpandStrategy(),

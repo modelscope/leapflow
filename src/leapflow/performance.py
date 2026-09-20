@@ -64,4 +64,24 @@ def _percentile(sorted_samples: list[float], quantile: float) -> float:
     return sorted_samples[lower] * (1.0 - weight) + sorted_samples[upper] * weight
 
 
-__all__ = ["LatencySummary", "RollingLatency"]
+def aggregate_latency_snapshots(
+    snapshots: dict[str, LatencySummary],
+) -> dict[str, dict[str, int | float]]:
+    """Build a read-only aggregation of named latency snapshots.
+
+    Accepts a mapping of ``{label: LatencySummary}`` — each snapshot is
+    already computed (cold-path sorted inside ``RollingLatency.snapshot()``);
+    this helper simply converts them to plain dicts keyed by label, suitable
+    for serialisation into a board/usage payload.
+
+    Returns only entries with ``count > 0`` to avoid noise.
+    This is a pure read of existing data — no hot-path cost.
+    """
+    result: dict[str, dict[str, int | float]] = {}
+    for label, snap in snapshots.items():
+        if snap.count > 0:
+            result[label] = snap.to_dict()
+    return result
+
+
+__all__ = ["LatencySummary", "RollingLatency", "aggregate_latency_snapshots"]

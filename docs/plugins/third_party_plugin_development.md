@@ -164,6 +164,33 @@ omit approval/idempotency metadata.
 ### 2.3 GatewayAdapterPlugin Protocol
 
 ```python
+@dataclass(frozen=True)
+class PlatformCapabilities:
+    """Typed declaration of what a platform adapter natively supports."""
+    supports_streaming: bool = False
+    supports_rich_text: bool = False
+    supports_images: bool = False
+    supports_files: bool = False
+    supports_reactions: bool = False
+    supports_threads: bool = False
+    supports_group_chat: bool = False
+    supports_edit: bool = False
+    supports_async_delivery: bool = True
+    splits_long_messages: bool = False
+    max_message_length: int = 4000
+
+@runtime_checkable
+class PlatformAdapter(Protocol):
+    @property
+    def platform_id(self) -> str: ...
+    @property
+    def capabilities(self) -> PlatformCapabilities: ...
+    # Legacy class-level flags retained for structural compatibility:
+    supports_async_delivery: bool
+    splits_long_messages: bool
+    max_message_length: int
+    ...
+
 @runtime_checkable
 class GatewayAdapterPlugin(Protocol):
     @property
@@ -180,6 +207,10 @@ class GatewayAdapterPlugin(Protocol):
 
     def create_adapter(self, config: Dict[str, Any]) -> PlatformAdapter: ...
 ```
+
+`PlatformAdapterMixin` provides a default `capabilities` property that builds
+from the three legacy class-level flags.  Adapters that natively support
+additional features (images, threading, editing, …) override the property.
 
 ### 2.4 LLMProviderPlugin Protocol
 

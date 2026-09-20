@@ -462,6 +462,15 @@ class ProfileLayout:
         return HardwareLayout(self.root / "hardware")
 
     @property
+    def checkpoint_db_path(self) -> Path:
+        """DuckDB store for file checkpoint snapshots.
+
+        Separate from leap.duckdb because checkpoint blobs grow on a different
+        curve and are pruned on their own TTL schedule.
+        """
+        return self.db_dir / "checkpoint.duckdb"
+
+    @property
     def instrument_db_path(self) -> Path:
         """Downsampled hardware time series and parameter experience.
 
