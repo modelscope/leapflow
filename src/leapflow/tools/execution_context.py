@@ -184,33 +184,6 @@ def _active_orchestrator() -> Any:
         return None
 
 
-def is_approval_bypass_active() -> bool:
-    """Return whether approval prompts are bypassed for this turn.
-
-    The single predicate every gate consults, so a bypass cannot mean "approved"
-    at one gate and "still ask" at the next. It covers both the config/env level
-    (``approval_bypass``) and the session level (the user picked "Allow ALL for
-    this session", which arms ``SessionAwareGate._bypass_all``).
-
-    The session flag is reached through ``_delegate`` as well as ``_gate``: the
-    in-process CLI installs a wrapper gate, and looking only at ``_gate`` would
-    miss the bypass in exactly that mode.
-    """
-    ctx = current_tool_context()
-    if ctx is None:
-        return False
-    if getattr(ctx, "approval_bypass", False):
-        return True
-    orchestrator = _active_orchestrator()
-    if orchestrator is None:
-        return False
-    gate = getattr(orchestrator, "_gate", None)
-    if gate is None:
-        delegate = getattr(orchestrator, "_delegate", None)
-        if delegate is not None:
-            gate = getattr(delegate, "_gate", None)
-    return bool(gate is not None and getattr(gate, "_bypass_all", False))
-
 
 async def require_workspace_access(
     path: Path,
@@ -222,9 +195,9 @@ async def require_workspace_access(
 ) -> dict[str, Any] | None:
     """Gate access to *path*. Returns None when permitted, else a refusal dict.
 
-    The whole sequence lives here — boundary check, bypass, human approval,
-    refusal — because it used to be spelled out per call site and only the shell
-    path ever got it right. The other eleven returned the refusal directly, so
+    The whole sequence lives here — boundary check, policy, approval, refusal —
+    because it used to be spelled out per call site and only the shell path ever
+    got it right. The other eleven returned the refusal directly, so
     ``file_list``/``code_search`` refused in 39ms with a message claiming approval
     was required, and ignored a session-wide "Allow ALL" that the shell honoured.
 
@@ -236,8 +209,6 @@ async def require_workspace_access(
     """
     refusal = workspace_scope_refusal(path, operation=operation)
     if refusal is None:
-        return None
-    if is_approval_bypass_active():
         return None
 
     orchestrator = _active_orchestrator()

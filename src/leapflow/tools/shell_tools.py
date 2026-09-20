@@ -21,7 +21,6 @@ from typing import Any, Dict, FrozenSet, Optional, Protocol, runtime_checkable
 
 from leapflow.tools.execution_context import (
     current_tool_context,
-    is_approval_bypass_active,
     is_within_allowed_roots,
     require_workspace_access,
     resolve_workspace_path,
@@ -273,7 +272,7 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
         if scope_error:
             return scope_error
 
-    if _is_dangerous(command) and not is_approval_bypass_active():
+    if _is_dangerous(command):
         approved, message = await _approve_command(command, cwd)
         if not approved:
             return {"ok": False, "error": message}
