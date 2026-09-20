@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
-from leapflow.perception.active_signal_source import ActiveSignalSource, EmitCallback
+from leapflow.perception.active_signal_source import ActiveSignalSource
 from leapflow.perception.active_sources.telegram_bot import TelegramBotSignalSource
 from leapflow.perception.types import InteractionSignal
 

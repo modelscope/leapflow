@@ -14,7 +14,7 @@ Teacher/student asymmetry comes from *information context*, not model capability
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, Mapping, Sequence
 
 if TYPE_CHECKING:
@@ -362,6 +362,7 @@ class TeacherVerdict:
 
     grades: tuple[ActionGrade, ...] = ()
     verdicts: tuple[AdaptationVerdict, ...] = ()
+    raw_payload: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def intents(self) -> tuple[EvolutionIntent, ...]:
@@ -426,6 +427,7 @@ class TrajectoryGrader:
         goal: str = "",
         *,
         degraded_capabilities: Sequence[Mapping[str, Any]] = (),
+        raise_on_error: bool = False,
     ) -> "TeacherVerdict":
         """Grade the trajectory *and* propose capability gaps, in one LLM call.
 
@@ -446,8 +448,11 @@ class TrajectoryGrader:
 
         traj_text = self._format_trajectory(trajectory)
         payload = await self._call_teacher_raw(
-            traj_text, goal, propose_gaps=True,
+            traj_text,
+            goal,
+            propose_gaps=True,
             degraded_capabilities=degraded_capabilities,
+            raise_on_error=raise_on_error,
         )
         self._budget.spend("grading")
 
@@ -455,6 +460,7 @@ class TrajectoryGrader:
         return TeacherVerdict(
             tuple(grades),
             self._parse_verdicts(payload, goal, degraded_capabilities),
+            dict(payload),
         )
 
     async def _call_teacher_raw(
@@ -464,6 +470,7 @@ class TrajectoryGrader:
         *,
         propose_gaps: bool = False,
         degraded_capabilities: Sequence[Mapping[str, Any]] = (),
+        raise_on_error: bool = False,
     ) -> dict:
         """Single LLM call: teacher evaluates with full hindsight.
 
@@ -493,6 +500,8 @@ class TrajectoryGrader:
             )
             return extract_json_object(resp.content or "") or {}
         except Exception:
+            if raise_on_error:
+                raise
             logger.debug("trajectory_grader.call_teacher failed", exc_info=True)
             return {}
 

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Callable, List
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any, List
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -597,7 +597,6 @@ class TestPerceptionSessionIntegration:
 
     def _make_session(self, active_source_manager=None):
         """Build a minimal PerceptionSession for testing active source hooks."""
-        from unittest.mock import MagicMock
         from leapflow.perception.config import PerceptionConfig
         from leapflow.perception.session import PerceptionSession
 
@@ -651,7 +650,6 @@ class TestPerceptionSessionIntegration:
         self,
     ) -> None:
         """PerceptionSession.stop() completes bounded by shutdown_timeout_s even with hung sources."""
-        from unittest.mock import MagicMock
         from leapflow.perception.config import PerceptionConfig
         from leapflow.perception.session import PerceptionSession
         from leapflow.domain.trajectory import RecordingMode

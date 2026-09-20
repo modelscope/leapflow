@@ -451,6 +451,7 @@ class RuntimeLeapService:
         self._active_engine_request_id: str = ""
         self._active_engines: dict[str, Any] = {}
         self._observation: Any | None = None
+        self._environment_source_manager: Any | None = None
         self._engine_request_ledger: dict[str, dict[str, Any]] = {}
         self._request_ledger_ttl_s = max(1.0, float(getattr(settings, "daemon_request_ledger_ttl_s", 600.0) or 600.0))
         self._request_ledger_max_entries = max(1, int(getattr(settings, "daemon_request_ledger_max_entries", 128) or 128))
@@ -477,6 +478,7 @@ class RuntimeLeapService:
         self._approval_coordinator.install_gate(ctx, self)
         install_learn_notifications(ctx, self.notification_bus)
         self._ctx = ctx
+        await self._start_environment_sources(ctx)
         if self._auto_start_deferred:
             self.start_deferred_init()
         # Monitor: start only when scheduler is enabled (coordinator checks internally)
@@ -504,6 +506,38 @@ class RuntimeLeapService:
                     logger.debug("daemon: observation subsystem start failed", exc_info=True)
                     self._observation = None
 
+    async def _start_environment_sources(self, ctx: Any) -> None:
+        """Start explicitly enabled experiment sources inside the daemon lifecycle."""
+        settings = getattr(ctx, "settings", self._settings)
+        if str(getattr(settings, "environment_mode", "production")) != "experiment":
+            return
+        if not bool(getattr(settings, "environment_leapspace_enabled", False)):
+            return
+        state_root = str(getattr(settings, "environment_leapspace_state_root", "") or "")
+        session_id = str(getattr(settings, "environment_leapspace_session_id", "") or "")
+        if not state_root or not session_id:
+            logger.warning(
+                "LeapSpace environment source requires both state_root and session_id"
+            )
+            return
+        from leapflow.layout import workspace_id_for_path
+        from leapflow.perception.environment_source import EnvironmentSourceManager
+        from leapflow.perception.leapspace_source import LeapSpaceEnvironmentSource
+
+        manager = EnvironmentSourceManager(ctx.record_environment_observation)
+        manager.register(
+            LeapSpaceEnvironmentSource(
+                state_root,
+                workspace_id=workspace_id_for_path(self._workspace_root()),
+                session_id=session_id,
+                poll_interval_s=float(
+                    getattr(settings, "environment_leapspace_poll_interval_s", 0.5)
+                ),
+            )
+        )
+        await manager.start()
+        self._environment_source_manager = manager
+
     def start_deferred_init(self) -> None:
         """Start background non-critical initialization once."""
         if self._ctx is None:
@@ -517,6 +551,10 @@ class RuntimeLeapService:
             return
         ctx = self._ctx
         self._ctx = None
+        environment_sources = self._environment_source_manager
+        self._environment_source_manager = None
+        if environment_sources is not None:
+            await environment_sources.close()
         # Stop background deferred init first: its yield points allow cleanup
         # to interleave with a half-initialized context otherwise.
         task = self._deferred_init_task
@@ -935,6 +973,82 @@ class RuntimeLeapService:
 
     async def session_analyze(self) -> dict[str, Any]:
         return await self._session_coordinator.analyze(self._monitors, self._ctx, self._settings)
+
+    async def evolution_run(
+        self,
+        *,
+        session_id: str,
+        reason: str = "manual",
+        wait: bool = False,
+        timeout_s: float = 180.0,
+    ) -> dict[str, Any]:
+        """Finalize one explicitly named session in the daemon-owned event stream."""
+        ctx = self._ctx
+        if ctx is None:
+            return {"ok": False, "error": "daemon context unavailable"}
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_session_id:
+            return {"ok": False, "error": "session_id is required"}
+        session_registry = self._session_coordinator.registry
+        session_context = (
+            session_registry.get(normalized_session_id)
+            if session_registry is not None
+            else None
+        )
+        workspace_root = (
+            str(session_context.workspace_root) if session_context is not None else ""
+        )
+        if wait:
+            try:
+                await asyncio.wait_for(
+                    ctx._ensure_deferred(),
+                    timeout=self._DEFERRED_WAIT_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.info("Deferred init still running; teacher job will remain queued")
+        try:
+            return await ctx.run_learning_boundary(
+                reason=str(reason or "manual"),
+                session_id=normalized_session_id,
+                workspace_root=workspace_root,
+                wait=bool(wait),
+                timeout_s=min(max(0.1, float(timeout_s)), 600.0),
+            )
+        except Exception as exc:  # noqa: BLE001 - reported to the caller, never fatal
+            logger.warning("daemon: learning boundary failed: %s", exc, exc_info=True)
+            return {
+                "ok": False,
+                "error": str(exc),
+                "reason": str(reason or "manual"),
+                "session_id": normalized_session_id,
+            }
+
+    async def evolution_projection(
+        self,
+        *,
+        session_id: str,
+        rebuild: bool = False,
+    ) -> dict[str, Any]:
+        ctx = self._ctx
+        if ctx is None:
+            return {"ok": False, "error": "daemon context unavailable"}
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_session_id:
+            return {"ok": False, "error": "session_id is required"}
+        return await ctx.evolution_projection(
+            session_id=normalized_session_id,
+            rebuild=bool(rebuild),
+        )
+
+    async def evolution_projection_aggregate(
+        self,
+        *,
+        rebuild: bool = False,
+    ) -> dict[str, Any]:
+        ctx = self._ctx
+        if ctx is None:
+            return {"ok": False, "error": "daemon context unavailable"}
+        return await ctx.evolution_projection(aggregate=True, rebuild=bool(rebuild))
 
     def _ensure_session_registry(self, base_engine: Any) -> Any:
         return self._session_coordinator.ensure_registry(base_engine, self._settings)
@@ -1395,7 +1509,7 @@ class RuntimeLeapService:
 
         from leapflow.plugins import get_registry as _get_tool_registry
 
-        handler = dict(_get_tool_registry().tool_handlers).get(tool_name)
+        handler = _get_tool_registry().snapshot_handlers().get(tool_name)
         if handler is None:
             return {
                 "ok": False, "code": "tool_unavailable", "device": device, "channel": channel,
@@ -1593,6 +1707,15 @@ class RuntimeLeapService:
             "deferred_init": self._deferred_init_status(ctx),
             "watch_summary": await self._monitor_coordinator.get_summary(),
             "host_backend": host,
+            "environment_sources": {
+                "active": list(self._environment_source_manager.source_ids)
+                if self._environment_source_manager is not None
+                else [],
+                "dropped": self._environment_source_manager.dropped_count
+                if self._environment_source_manager is not None
+                else 0,
+            },
+            "evolution_performance": self._evolution_performance_status(ctx),
             # Whether *this* daemon process still matches the source tree on
             # disk (None when outside a git checkout, e.g. a packaged install).
             "build": {**self._build_info.to_dict(), "stale": build_stale},
@@ -1604,6 +1727,27 @@ class RuntimeLeapService:
         ctx = self._ctx
         settings = getattr(ctx, "settings", self._settings) if ctx is not None else self._settings
         return Path(str(getattr(settings, "workspace_root", os.getcwd()))).expanduser().resolve()
+
+    @staticmethod
+    def _evolution_performance_status(ctx: Any) -> dict[str, Any]:
+        """Expose bounded p50/p95/p99 snapshots without adding hot-path I/O."""
+        from dataclasses import asdict, is_dataclass
+
+        from leapflow.plugins import get_registry
+
+        result: dict[str, Any] = {}
+        components = {
+            "action_recorder": getattr(ctx, "_action_recorder", None),
+            "outbox": getattr(ctx, "_evolution_outbox", None),
+            "projection": getattr(ctx, "_evolution_projection_runner", None),
+            "teacher": getattr(ctx, "_teacher_worker", None),
+        }
+        for name, component in components.items():
+            metrics = getattr(component, "metrics", None)
+            if metrics is not None:
+                result[name] = asdict(metrics) if is_dataclass(metrics) else metrics
+        result["registry_snapshot"] = get_registry().snapshot_latency.to_dict()
+        return result
 
     def _turn_admission_status(self, *, queued_delta: int = 0) -> dict[str, Any]:
         snapshot = dict(self._turn_admission.snapshot())

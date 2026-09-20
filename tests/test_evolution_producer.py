@@ -116,8 +116,10 @@ def _install_registry(monkeypatch, registry, *, trust=None, usage=None, fibers=N
     """
     import leapflow.plugins as plugins_pkg
     from leapflow.monitor import evolution_producer as mod
+    from leapflow.telemetry import evolution_tap
 
     monkeypatch.setattr(plugins_pkg, "get_registry", lambda: registry, raising=False)
+    monkeypatch.setattr(evolution_tap, "current_sink", lambda: None)
     monkeypatch.setattr(
         mod.EvolutionProducer, "_trust_and_usage", staticmethod(lambda: (trust, usage))
     )
@@ -377,9 +379,12 @@ def test_store_backed_segments_report_evidence_when_data_exists(monkeypatch):
         def unresolved(self, **_kw):
             return [{"observation_id": "o1"}, {"observation_id": "o2"}]
 
-    class _Queue:
-        def list_items(self, **_kw):
-            return [SimpleNamespace(status="PENDING"), SimpleNamespace(status="PROBATION")]
+    class _Projected(EvolutionProducer):
+        async def _event_projection(self, ctx):
+            return {
+                "proposals": [{"status": "PENDING"}, {"status": "PROBATION"}],
+                "degraded": False,
+            }
 
     class _Plans:
         def latest(self):
@@ -387,7 +392,6 @@ def test_store_backed_segments_report_evidence_when_data_exists(monkeypatch):
 
     stores = {
         "capability_observations_path": _Obs(),
-        "capability_proposal_queue_path": _Queue(),
         "capability_plans_path": _Plans(),
     }
     _install_registry(monkeypatch, _Registry({}))
@@ -397,7 +401,7 @@ def test_store_backed_segments_report_evidence_when_data_exists(monkeypatch):
         staticmethod(lambda layout_attr, *a, **k: stores.get(layout_attr)),
     )
 
-    rows = _rows(_observe()[0])
+    rows = _rows(_observe(_Projected())[0])
     assert rows["observations"]["status"] == WIRED
     assert "2 open" in rows["observations"]["evidence"]
     assert rows["lifecycle"]["status"] == WIRED
@@ -559,6 +563,12 @@ def test_evolution_template_binds_only_shapes_its_renderers_read():
         "evolution.reclaim_candidates",
         "evolution.reward_bandwidth.by_reason",
         "evolution.summary.suggestions",
+        # Not this producer's: derived by the view service from the retained finding
+        # list, which is the only thing carrying history across daemon restarts. It
+        # is deliberately outside the ``evolution.*`` namespace so that ownership is
+        # readable from the bind alone, and listed here because this assertion checks
+        # every bind in the template rather than only the producer's own.
+        "evidence_trend.series",
     }
     #: Every shipped renderer that coerces ``props.data`` with ``asArray``.
     DATA_LIST_COMPONENTS = (
@@ -691,12 +701,12 @@ def test_unrebuildable_history_is_not_reported_as_no_activity(monkeypatch):
     _install_registry(monkeypatch, _Registry({}))
 
     class _Broken(EvolutionProducer):
-        def _episodes(self, ctx):
+        async def _event_projection(self, ctx):
             return None
 
     class _Empty(EvolutionProducer):
-        def _episodes(self, ctx):
-            return ()
+        async def _event_projection(self, ctx):
+            return {}
 
     broken = asyncio.run(_Broken().observe(_ctx()))[0].payload
     empty = asyncio.run(_Empty().observe(_ctx()))[0].payload

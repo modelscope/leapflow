@@ -11,9 +11,6 @@ Verifies the complete loop:
 This is the ultimate self-evolution capability demonstration.
 """
 
-import asyncio
-from pathlib import Path
-from typing import Any
 
 import pytest
 

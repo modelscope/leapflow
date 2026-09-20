@@ -293,6 +293,8 @@ def test_engine_recalibrate_difficulty_applies_and_resets(tmp_path) -> None:
     """
     import dataclasses
 
+    from leapflow.domain.event_types import EvolutionEventType
+    from leapflow.storage.evolution_event_store import DuckDBEvolutionEventStore
     from leapflow.storage.evolution_store import DuckDBEvolutionStore
 
     settings = dataclasses.replace(make_settings(str(tmp_path)), agent_calibration_enabled=True)
@@ -304,10 +306,12 @@ def test_engine_recalibrate_difficulty_applies_and_resets(tmp_path) -> None:
     lt = SemanticMemoryProvider(source=settings.duckdb_path)
     imm = EpisodicMemoryProvider()
     store = DuckDBEvolutionStore(str(tmp_path / "evo.duckdb"))
+    audit_store = DuckDBEvolutionEventStore(tmp_path / "audit.duckdb")
     try:
         reg = build_default_registry(rpc, llm, wm, lt)
         classifier = _FixedClassifier("complex")
         engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
+        engine.set_calibration_event_store(audit_store)
         baseline = engine._budget_config.scale_k
 
         # 20 over-predicted turns: high difficulty costs *less* effort than low.
@@ -324,10 +328,17 @@ def test_engine_recalibrate_difficulty_applies_and_resets(tmp_path) -> None:
         assert result.applied is True
         assert engine._budget_config.scale_k < baseline          # over-predicted -> reduce
         assert 0.25 <= engine._budget_config.scale_k <= 3.0       # clamped
+        events = audit_store.read(
+            profile_id=settings.profile,
+            event_type=EvolutionEventType.CALIBRATION_UPDATED,
+        )
+        assert len(events) == 1
+        assert events[0].event.payload["parameter"] == "difficulty_scale"
 
         engine.reset_calibration()
         assert engine._budget_config.scale_k == baseline          # exact revert
     finally:
+        audit_store.close()
         store.close()
         lt.close()
 

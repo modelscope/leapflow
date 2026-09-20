@@ -21,13 +21,12 @@ from leapflow.engine.session_factory import (
     _default_stats_db_path,
     _load_or_new_trust_ledger,
     _resolve_stats_store,
-    _wire_plugin_stats_sink,
     persist_plugin_trust_state,
 )
 from leapflow.engine.turn_usage import TurnUsageTracker
 from leapflow.learning.plugin_stats import PluginUsageTracker
 from leapflow.learning.plugin_stats_store import PluginStatsStore
-from leapflow.learning.plugin_trust import PluginTrustLedger, PluginTrustLevel
+from leapflow.learning.plugin_trust import PluginTrustLedger, PluginTrustLevel, trust_history
 
 
 def _db(tmp_path: Path) -> Path:
@@ -402,3 +401,59 @@ class TestUsageSinkWiring:
         advisor = pa.get_default_advisor()
         assert advisor is not None
         assert advisor._usage_tracker._samples == {}
+
+
+class TestTrustTransitionHistory:
+    """Trust transition time-series persistence and query."""
+
+    def test_trust_transition_persisted_to_history_table(self, tmp_path: Path) -> None:
+        """A promotion writes a row to plugin_trust_transitions with correct levels."""
+        store = PluginStatsStore(_db(tmp_path))
+        ledger = _PersistingTrustLedger(candidate_at=5, store=store)
+        for _ in range(5):
+            ledger.record_success("alpha")
+        assert ledger.level("alpha") is PluginTrustLevel.CANDIDATE
+
+        records = trust_history(_db(tmp_path))
+        assert len(records) == 1
+        rec = records[0]
+        assert rec.plugin_id == "alpha"
+        assert rec.from_level == PluginTrustLevel.DRAFT
+        assert rec.to_level == PluginTrustLevel.CANDIDATE
+        assert rec.trigger == "success"
+        assert rec.consecutive_ok == 5
+        assert rec.consecutive_fail == 0
+        assert rec.transitioned_at is not None
+
+    def test_trust_history_query_by_plugin_id(self, tmp_path: Path) -> None:
+        """Querying by plugin_id returns only matching records."""
+        store = PluginStatsStore(_db(tmp_path))
+        ledger = _PersistingTrustLedger(candidate_at=2, store=store)
+        # Drive two plugins to CANDIDATE.
+        for _ in range(2):
+            ledger.record_success("plug_a")
+        for _ in range(2):
+            ledger.record_success("plug_b")
+        assert ledger.level("plug_a") is PluginTrustLevel.CANDIDATE
+        assert ledger.level("plug_b") is PluginTrustLevel.CANDIDATE
+
+        all_records = trust_history(_db(tmp_path))
+        assert len(all_records) == 2
+
+        a_records = trust_history(_db(tmp_path), plugin_id="plug_a")
+        assert len(a_records) == 1
+        assert a_records[0].plugin_id == "plug_a"
+
+        b_records = trust_history(_db(tmp_path), plugin_id="plug_b")
+        assert len(b_records) == 1
+        assert b_records[0].plugin_id == "plug_b"
+
+    def test_trust_history_cold_path_only(self, tmp_path: Path) -> None:
+        """A single success (no promotion) writes NO row to trust_transitions."""
+        store = PluginStatsStore(_db(tmp_path))
+        ledger = _PersistingTrustLedger(candidate_at=5, store=store)
+        ledger.record_success("beta")  # streak 1, no level change
+        assert ledger.level("beta") is PluginTrustLevel.DRAFT
+
+        records = trust_history(_db(tmp_path))
+        assert records == []

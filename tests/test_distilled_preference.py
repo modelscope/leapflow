@@ -21,6 +21,8 @@ from typing import Any
 from leapflow.domain.adaptation_verdict import AdaptationVerdict
 from leapflow.domain.capability_requirement import CapabilityRequirement
 from leapflow.domain.environment_fingerprint import EnvironmentFingerprint
+from leapflow.domain.event_types import EvolutionEventType
+from leapflow.domain.evolution_event import EvolutionContext, EvolutionEvent
 from leapflow.domain.platform import Capability, PlatformID, PlatformManifest
 from leapflow.plugins.capability_resolver import (
     _DEFAULT_SCORERS,
@@ -30,7 +32,29 @@ from leapflow.plugins.capability_resolver import (
     EnvironmentAffordanceScorer,
     ResolverContext,
 )
-from leapflow.storage.distilled_knowledge_store import JsonDistilledKnowledgeStore
+from leapflow.storage.distilled_knowledge_store import EvolutionDistilledKnowledgeStore
+from leapflow.storage.evolution_event_store import DuckDBEvolutionEventStore
+
+
+def _seed(events: DuckDBEvolutionEventStore, verdict: AdaptationVerdict, seq: int = 0) -> None:
+    events.append(
+        EvolutionEvent.create(
+            EvolutionEventType.TEACHER_VERDICT_RECORDED,
+            context=EvolutionContext(profile_id="p", decision_id=verdict.verdict_id),
+            payload=verdict.to_dict(),
+            producer="test",
+            dedup_key=f"teacher.verdict_recorded:{verdict.verdict_id}:{seq}",
+        )
+    )
+
+
+def _knowledge(tmp_path, *verdicts: AdaptationVerdict):
+    events = DuckDBEvolutionEventStore(tmp_path / "events.duckdb")
+    for index, verdict in enumerate(verdicts):
+        _seed(events, verdict, index)
+    store = EvolutionDistilledKnowledgeStore(events, profile_id="p")
+    store.refresh()
+    return events, store
 
 
 def _env(*affordances: str) -> EnvironmentFingerprint:
@@ -73,49 +97,56 @@ def test_only_rebind_verdicts_become_selection_preferences(tmp_path):
     Admitting either would turn an instruction to a human into a machine's selection
     preference, which is the one direction this channel must never go.
     """
-    store = JsonDistilledKnowledgeStore(tmp_path / "dk.json")
-    store.record(
+    events, store = _knowledge(
+        tmp_path,
         AdaptationVerdict.create(
             "rebind", "chat.reply", "the app is now v2", target="chat_reply_v2_native"
-        )
-    )
-    store.record(AdaptationVerdict.create("absorb", "chat.react", "the control moved"))
-    store.record(
+        ),
+        AdaptationVerdict.create("absorb", "chat.react", "the control moved"),
         AdaptationVerdict.create(
             "escalate", "drive.upload", "refused", target="grant the drive.file scope"
-        )
+        ),
     )
 
     assert store.rebind_preferences() == (("chat.reply", "chat_reply_v2_native"),)
+    events.close()
 
 
 def test_a_rebind_without_a_target_is_not_a_preference(tmp_path):
-    store = JsonDistilledKnowledgeStore(tmp_path / "dk.json")
-    store.record(AdaptationVerdict.create("rebind", "chat.reply", "something moved"))
+    events, store = _knowledge(
+        tmp_path,
+        AdaptationVerdict.create("rebind", "chat.reply", "something moved"),
+    )
     assert store.rebind_preferences() == ()
+    events.close()
 
 
 def test_a_preference_retires_with_the_knowledge_behind_it(tmp_path):
     """Nothing to unlearn: the entry stops being read when it stops being true."""
-    store = JsonDistilledKnowledgeStore(tmp_path / "dk.json")
-    store.record(
-        AdaptationVerdict.create("rebind", "chat.reply", "v2 now", target="chat_reply_v2")
+    events, store = _knowledge(
+        tmp_path,
+        AdaptationVerdict.create("rebind", "chat.reply", "v2 now", target="chat_reply_v2"),
     )
     assert store.rebind_preferences()
 
     store.retract("chat.reply", reason="observed working again")
     assert store.rebind_preferences() == ()
+    events.close()
 
 
 def test_a_newer_verdict_supersedes_the_preference(tmp_path):
-    store = JsonDistilledKnowledgeStore(tmp_path / "dk.json")
-    store.record(
-        AdaptationVerdict.create("rebind", "chat.reply", "v2 now", target="chat_reply_v2")
-    )
-    store.record(
-        AdaptationVerdict.create("rebind", "chat.reply", "v3 now", target="chat_reply_v3")
+    import time
+
+    events, store = _knowledge(
+        tmp_path,
+        AdaptationVerdict.create("rebind", "chat.reply", "v2 now", target="chat_reply_v2"),
+        AdaptationVerdict.create(
+            "rebind", "chat.reply", "v3 now", target="chat_reply_v3",
+            created_at=time.time() + 10,
+        ),
     )
     assert store.rebind_preferences() == (("chat.reply", "chat_reply_v3"),)
+    events.close()
 
 
 # ── preference, not gate ──────────────────────────────────────────────────────
@@ -190,8 +221,9 @@ def test_the_engine_reads_preferences_per_resolution_not_once():
     """
     from leapflow.engine.engine import AgentEngine
 
-    tmp = Path(tempfile.mkdtemp())
-    store = JsonDistilledKnowledgeStore(tmp / "dk.json")
+    events = DuckDBEvolutionEventStore(Path(tempfile.mkdtemp()) / "events.duckdb")
+    store = EvolutionDistilledKnowledgeStore(events, profile_id="p")
+    store.refresh()
     engine = AgentEngine.__new__(AgentEngine)
     engine._knowledge_store = store
     engine._knowledge_store_unavailable = False
@@ -199,12 +231,15 @@ def test_the_engine_reads_preferences_per_resolution_not_once():
     engine._settings = SimpleNamespace(distilled_knowledge_limit=12)
 
     assert engine._rebind_preferences() == ()
-    store.record(
-        AdaptationVerdict.create("rebind", "chat.reply", "v2 now", target="chat_reply_v2")
+    _seed(
+        events,
+        AdaptationVerdict.create("rebind", "chat.reply", "v2 now", target="chat_reply_v2"),
     )
+    store.refresh()
     assert engine._rebind_preferences() == (("chat.reply", "chat_reply_v2"),)
     store.retract("chat.reply")
     assert engine._rebind_preferences() == ()
+    events.close()
 
 
 def test_a_failing_store_costs_a_preference_not_a_resolution():

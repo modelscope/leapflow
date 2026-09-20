@@ -34,7 +34,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from leapspace.app_space.utils import check
+from leapspace.app_space.state import check
 
 if TYPE_CHECKING:
     from leapspace.app_space.actor import LeapAppActor

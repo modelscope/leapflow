@@ -592,7 +592,7 @@ class TestMcpToolExecutionPolicy:
         policy = execution_policy_for("some_mcp_tool", spec)
         assert policy == "read_only"
 
-    def test_non_mcp_tool_without_metadata_stays_idempotent(self) -> None:
+    def test_any_tool_without_metadata_fails_safe_as_external(self) -> None:
         from leapflow.engine.tool_execution import execution_policy_for
 
         @dataclass
@@ -604,8 +604,8 @@ class TestMcpToolExecutionPolicy:
             category: str = "general"
 
         spec = FakeSpec()
-        policy = execution_policy_for("some_tool", spec)
-        assert policy == "mutating_idempotent"
+        assert execution_policy_for("file_read", spec) == "external_side_effect"
+        assert execution_policy_for("gateway_send", spec) == "external_side_effect"
 
 
 # ════════════════════════════════════════════════════════════════

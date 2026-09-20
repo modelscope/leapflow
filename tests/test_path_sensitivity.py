@@ -42,6 +42,18 @@ def test_risk_classifier_uses_configured_layout_root_for_shell_config_mentions(t
         configure_path_sensitivity_roots((Path("~/.leapflow").expanduser(),))
 
 
+def test_shell_sensitive_config_detection_inspects_path_operands_not_text() -> None:
+    classifier = DefaultRiskClassifier()
+
+    assert classifier.assess(ActionDescriptor.shell("cat .env")).level == RiskLevel.HIGH
+    assert classifier.assess(ActionDescriptor.shell("printf secret > .env")).level == RiskLevel.HIGH
+    assert classifier.assess(ActionDescriptor.shell('echo "config.yaml"')).level == RiskLevel.LOW
+    assert classifier.assess(ActionDescriptor.shell("grep config.yaml README.md")).level == RiskLevel.LOW
+    assert classifier.assess(
+        ActionDescriptor.shell("awk '{print $1}' ~/.leapflow/config/user.yaml")
+    ).level == RiskLevel.HIGH
+
+
 def test_path_sensitivity_classifies_new_layout_categories(tmp_path) -> None:
     data_root = tmp_path / "custom-leap-home"
     configure_path_sensitivity_roots((data_root,))

@@ -15,6 +15,9 @@ from __future__ import annotations
 import pytest
 from typing import Any
 
+from leapflow.storage.capability_proposal_queue import EvolutionCapabilityProposalStore
+from leapflow.storage.evolution_event_store import DuckDBEvolutionEventStore
+
 
 # ════════════════════════════════════════════════════════════════
 # Testing infrastructure
@@ -90,13 +93,13 @@ def self_mgmt_plugin():
     reg.assemble()
     plugin = reg.get_plugin("self_management")
     
-    # Reset gate to None so tests start from fail-closed state
-    plugin._plugin_approval_gate = None
-    
+    # Reset every mutable runtime dependency on the module-level plugin singleton.
+    _reset_install_deps(plugin)
+
     yield plugin
-    
-    # Cleanup: ensure gate and process-global registry state are reset after test
-    plugin._plugin_approval_gate = None
+
+    # Cleanup: ensure runtime deps and process-global registry state are reset after test.
+    _reset_install_deps(plugin)
     _reset_tool_registry_state()
 
 
@@ -881,9 +884,11 @@ class TestP1Features:
 
     @pytest.mark.asyncio
     async def test_plugin_propose_from_explicit_request(self, self_mgmt_plugin: Any, tmp_path: Any) -> None:
-        from leapflow.storage.plugin_proposal_store import JsonPluginProposalStore
-        store = JsonPluginProposalStore(tmp_path / "proposals.json")
-        self_mgmt_plugin.bind_runtime(plugin_proposal_store=store)
+        store = EvolutionCapabilityProposalStore(
+            DuckDBEvolutionEventStore(tmp_path / "proposals.duckdb"),
+            profile_id="profile-1",
+        )
+        self_mgmt_plugin.bind_runtime(capability_lifecycle_store=store)
 
         result = await self_mgmt_plugin._plugin_propose_handler(
             requested_capability="Validate JSON and pretty-print it",
@@ -900,12 +905,16 @@ class TestP1Features:
             "json_pretty_print",
         ]
         assert result["next_actions"]
-        assert store.get(proposal["proposal_id"]) is not None
+        assert store.find_by_metadata("review_proposal_id", proposal["proposal_id"]) is not None
 
     @pytest.mark.asyncio
     async def test_plugin_propose_from_unknown_tool_evidence(self, self_mgmt_plugin: Any, tmp_path: Any) -> None:
-        from leapflow.storage.plugin_proposal_store import JsonPluginProposalStore
-        self_mgmt_plugin.bind_runtime(plugin_proposal_store=JsonPluginProposalStore(tmp_path / "proposals.json"))
+        self_mgmt_plugin.bind_runtime(
+            capability_lifecycle_store=EvolutionCapabilityProposalStore(
+                DuckDBEvolutionEventStore(tmp_path / "proposals.duckdb"),
+                profile_id="profile-1",
+            )
+        )
 
         evidence = {
             "error_type": "unknown_tool",
@@ -927,9 +936,6 @@ class TestP1Features:
 
     @pytest.mark.asyncio
     async def test_plugin_propose_rejects_empty_request(self, self_mgmt_plugin: Any, tmp_path: Any) -> None:
-        from leapflow.storage.plugin_proposal_store import JsonPluginProposalStore
-        self_mgmt_plugin.bind_runtime(plugin_proposal_store=JsonPluginProposalStore(tmp_path / "proposals.json"))
-
         result = await self_mgmt_plugin._plugin_propose_handler(requested_capability="")
 
         assert result["ok"] is False
@@ -939,21 +945,34 @@ class TestP1Features:
     async def test_proposal_governed_generate_and_install(
         self, self_mgmt_plugin: Any, tmp_path: Any
     ) -> None:
+        from leapflow.evolution.artifact_store import ContentAddressedArtifactStore
         from leapflow.plugins import get_registry
-        from leapflow.storage.plugin_proposal_store import JsonPluginProposalStore
+        from leapflow.plugins.adaptive_policy import AdaptiveEvolutionPolicy
+        from leapflow.plugins.proposal_orchestrator import ProposalOrchestrator
 
         class _FakeLLM:
             async def achat(self, messages):  # type: ignore[no-untyped-def]
                 return _valid_plugin_src("proposal_echo", "proposal_echo_tool")
 
-        store = JsonPluginProposalStore(tmp_path / "proposals.json")
+        lifecycle = EvolutionCapabilityProposalStore(
+            DuckDBEvolutionEventStore(tmp_path / "lifecycle.duckdb"),
+            profile_id="profile-1",
+        )
+        approval_gate = FakeApprovalGate(approved=True)
+        orchestrator = ProposalOrchestrator(
+            queue=lifecycle,
+            artifact_store=ContentAddressedArtifactStore(tmp_path / "artifacts"),
+            approval_gate=approval_gate,
+            policy=AdaptiveEvolutionPolicy(autonomy_level="generate_only"),
+        )
         self_mgmt_plugin.bind_runtime(
-            plugin_proposal_store=store,
+            capability_lifecycle_store=lifecycle,
+            proposal_orchestrator=orchestrator,
             llm_provider=_FakeLLM(),
             plugin_generation_enabled=True,
             plugin_install_dir=str(tmp_path / "plugins"),
         )
-        self_mgmt_plugin._plugin_approval_gate = FakeApprovalGate(approved=True)
+        self_mgmt_plugin._plugin_approval_gate = approval_gate
 
         proposed = await self_mgmt_plugin._plugin_propose_handler(
             requested_capability="Echo a message from a generated plugin",
@@ -972,7 +991,8 @@ class TestP1Features:
         generated = await self_mgmt_plugin._plugin_generate_handler(proposal_id=proposal_id)
         assert generated["ok"], generated
         assert generated["proposal_id"] == proposal_id
-        assert store.get(proposal_id).status == "review"
+        lifecycle_id = generated["lifecycle_proposal_id"]
+        assert lifecycle.get(lifecycle_id).status == "APPROVED"
 
         installed = await self_mgmt_plugin._plugin_install_handler(
             proposal_id=proposal_id,
@@ -981,7 +1001,7 @@ class TestP1Features:
         assert installed["ok"], installed
         assert installed["proposal_id"] == proposal_id
         assert installed["behavior_tests"][0]["result"] == {"ok": True, "echoed": "hi"}
-        assert store.get(proposal_id).status == "approved"
+        assert lifecycle.get(lifecycle_id).status == "INSTALLED"
         assert "proposal_echo_tool" in get_registry().tool_handlers
         try:
             result = await get_registry().tool_handlers["proposal_echo_tool"](message="hi")
@@ -1325,10 +1345,14 @@ def _reset_install_deps(plugin: Any) -> None:
     """Reset install-related runtime deps a fixture does not clear."""
     plugin._plugin_approval_gate = None
     plugin._plugin_install_dir = None
+    plugin._plugin_staging_dir = None
     plugin._marketplace_client = None
     plugin._trusted_pubkeys = set()
-    plugin._plugin_proposal_store = None
     plugin._plugin_version_store = None
+    plugin._capability_lifecycle_store = None
+    plugin._proposal_orchestrator = None
+    plugin._evolution_outbox = None
+    plugin._evolution_profile_id = ""
 
 
 class TestPluginInstallPath:
@@ -1365,6 +1389,77 @@ class TestPluginInstallPath:
             handler = reg.tool_handlers["tst_inproc_tool"]
             invoked = await handler(message="hi")
             assert invoked == {"ok": True, "echoed": "hi"}
+        finally:
+            _cleanup_installed(plugin_id)
+            _reset_install_deps(self_mgmt_plugin)
+
+    @pytest.mark.asyncio
+    async def test_install_behavior_failure_never_publishes_or_commits_source(
+        self, self_mgmt_plugin: Any, tmp_path: Any
+    ) -> None:
+        from leapflow.domain.plugin_proposal import BehaviorTestCase, PluginProposal
+        from leapflow.evolution.artifact_store import ContentAddressedArtifactStore
+        from leapflow.plugins import get_registry, get_scoped_registry
+        from leapflow.plugins.adaptive_policy import AdaptiveEvolutionPolicy
+        from leapflow.plugins.proposal_orchestrator import ProposalOrchestrator
+        from leapflow.storage.plugin_version_store import PluginVersionStore
+
+        plugin_id = "tst_shadow_failure"
+        tool_name = "tst_shadow_failure_tool"
+        install_dir = tmp_path / "plugins"
+        staging_dir = tmp_path / "staging"
+        version_store = PluginVersionStore(tmp_path / "versions")
+        proposal = PluginProposal.create(
+            plugin_id=plugin_id,
+            capability_summary="Must fail before publication",
+            proposed_tools=(),
+            test_cases=(
+                BehaviorTestCase.create(
+                    tool_name,
+                    arguments={"message": "x"},
+                    expected_subset={"echoed": "different"},
+                ),
+            ),
+        )
+        lifecycle = EvolutionCapabilityProposalStore(
+            DuckDBEvolutionEventStore(tmp_path / "lifecycle.duckdb"),
+            profile_id="profile-1",
+        )
+        approval_gate = FakeApprovalGate(approved=True)
+        orchestrator = ProposalOrchestrator(
+            queue=lifecycle,
+            artifact_store=ContentAddressedArtifactStore(tmp_path / "artifacts"),
+            approval_gate=approval_gate,
+            policy=AdaptiveEvolutionPolicy(autonomy_level="generate_only"),
+        )
+        self_mgmt_plugin._plugin_approval_gate = approval_gate
+        self_mgmt_plugin.bind_runtime(
+            plugin_install_dir=str(install_dir),
+            plugin_staging_dir=str(staging_dir),
+            plugin_version_store=version_store,
+            capability_lifecycle_store=lifecycle,
+            proposal_orchestrator=orchestrator,
+        )
+        lifecycle_id = self_mgmt_plugin._open_lifecycle_record(
+            proposal, "Must fail before publication"
+        )
+        code = _valid_plugin_src(plugin_id, tool_name)
+        orchestrator.register_generated(lifecycle_id, code, validation={"ok": True, "compatibility_ok": True})
+        await orchestrator.approve_content(lifecycle_id)
+        try:
+            result = await self_mgmt_plugin._plugin_install_handler(
+                proposal_id=proposal.proposal_id,
+                code=code,
+            )
+
+            assert result["ok"] is False
+            assert "Behavior tests failed" in result["error"]
+            assert get_registry().get_plugin(plugin_id) is None
+            assert get_scoped_registry().get_fiber(plugin_id) is None
+            assert tool_name not in get_registry().tool_handlers
+            assert not (install_dir / f"{plugin_id}.py").exists()
+            assert list(staging_dir.iterdir()) == []
+            assert version_store.active(plugin_id) is None
         finally:
             _cleanup_installed(plugin_id)
             _reset_install_deps(self_mgmt_plugin)
@@ -1415,10 +1510,21 @@ class TestPluginInstallPath:
         tool_name = "tst_versioned_tool"
         install_dir = tmp_path / "plugins"
         version_store = PluginVersionStore(tmp_path / "versions")
+
+        class _Outbox:
+            def __init__(self) -> None:
+                self.events = []
+
+            async def publish(self, event, *, critical=False):
+                self.events.append((event, critical))
+
+        outbox = _Outbox()
         self_mgmt_plugin._plugin_approval_gate = FakeApprovalGate(approved=True)
         self_mgmt_plugin.bind_runtime(
             plugin_install_dir=str(install_dir),
             plugin_version_store=version_store,
+            evolution_outbox=outbox,
+            evolution_profile_id="profile-1",
         )
 
         def source(label: str) -> str:
@@ -1453,6 +1559,8 @@ class TestPluginInstallPath:
             assert rollback["ok"], rollback
             assert rollback["version"] == "v0"
             assert (await get_registry().tool_handlers[tool_name](message="x"))["version"] == "v0"
+            assert outbox.events[-1][0].event_type == "plugin.rolled_back"
+            assert outbox.events[-1][1] is True
         finally:
             _cleanup_installed(plugin_id)
             _reset_install_deps(self_mgmt_plugin)
@@ -1462,34 +1570,45 @@ class TestPluginInstallPath:
         self, self_mgmt_plugin: Any, tmp_path: Any
     ) -> None:
         from leapflow.domain.plugin_proposal import BehaviorTestCase, PluginProposal
+        from leapflow.evolution.artifact_store import ContentAddressedArtifactStore
         from leapflow.plugins import get_registry
-        from leapflow.storage.plugin_proposal_store import JsonPluginProposalStore
+        from leapflow.plugins.adaptive_policy import AdaptiveEvolutionPolicy
+        from leapflow.plugins.proposal_orchestrator import ProposalOrchestrator
         from leapflow.storage.plugin_version_store import PluginVersionStore
 
         plugin_id = "tst_behavior_reload_plug"
         tool_name = "tst_behavior_reload_tool"
         install_dir = tmp_path / "plugins"
-        proposal_store = JsonPluginProposalStore(tmp_path / "proposals.json")
         version_store = PluginVersionStore(tmp_path / "versions")
-        proposal = proposal_store.save(
-            PluginProposal.create(
-                plugin_id=plugin_id,
-                capability_summary="Echo a message and preserve the expected behavior marker",
-                proposed_tools=(),
-                test_cases=(
-                    BehaviorTestCase.create(
-                        tool_name,
-                        arguments={"message": "x"},
-                        expected_subset={"ok": True, "echoed": "x", "version": "good"},
-                    ),
+        proposal = PluginProposal.create(
+            plugin_id=plugin_id,
+            capability_summary="Echo a message and preserve the expected behavior marker",
+            proposed_tools=(),
+            test_cases=(
+                BehaviorTestCase.create(
+                    tool_name,
+                    arguments={"message": "x"},
+                    expected_subset={"ok": True, "echoed": "x", "version": "good"},
                 ),
-            )
+            ),
         )
-        self_mgmt_plugin._plugin_approval_gate = FakeApprovalGate(approved=True)
+        lifecycle = EvolutionCapabilityProposalStore(
+            DuckDBEvolutionEventStore(tmp_path / "lifecycle.duckdb"),
+            profile_id="profile-1",
+        )
+        approval_gate = FakeApprovalGate(approved=True)
+        orchestrator = ProposalOrchestrator(
+            queue=lifecycle,
+            artifact_store=ContentAddressedArtifactStore(tmp_path / "artifacts"),
+            approval_gate=approval_gate,
+            policy=AdaptiveEvolutionPolicy(autonomy_level="generate_only"),
+        )
+        self_mgmt_plugin._plugin_approval_gate = approval_gate
         self_mgmt_plugin.bind_runtime(
             plugin_install_dir=str(install_dir),
-            plugin_proposal_store=proposal_store,
             plugin_version_store=version_store,
+            capability_lifecycle_store=lifecycle,
+            proposal_orchestrator=orchestrator,
         )
 
         def source(label: str) -> str:
@@ -1498,10 +1617,17 @@ class TestPluginInstallPath:
                 f"return {{'ok': True, 'echoed': message, 'version': {label!r}}}",
             )
 
+        lifecycle_id = self_mgmt_plugin._open_lifecycle_record(
+            proposal, "Echo a message and preserve the expected behavior marker"
+        )
+        good_source = source("good")
+        orchestrator.register_generated(lifecycle_id, good_source, validation={"ok": True, "compatibility_ok": True})
+        await orchestrator.approve_content(lifecycle_id)
+
         try:
             install = await self_mgmt_plugin._plugin_install_handler(
                 proposal_id=proposal.proposal_id,
-                code=source("good"),
+                code=good_source,
                 version_label="good",
             )
             assert install["ok"], install

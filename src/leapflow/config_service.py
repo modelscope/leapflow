@@ -300,6 +300,10 @@ _FIELD_DESCRIPTIONS = {
     "agent.calibration_enabled": "Enable S3-L3 online difficulty calibration: apply the offline S3-L2 report's bounded suggested weight scale to the difficulty->budget sensitivity (scale_k), derived from the baseline and clamped/reversible (default off).",
     "agent.calibration_min_confidence": "Minimum calibration-report confidence required before an online difficulty-weight adjustment is applied (guards against acting on thin data).",
     "agent.calibration_interval_turns": "Re-run online difficulty/threshold calibration every N root turns as outcome data accumulates (0 = one-shot at startup only; requires calibration enabled).",
+    "agent.calibration_difficulty_min_k": "Operator floor for calibrated difficulty scaling, clamped by the built-in safety envelope.",
+    "agent.calibration_difficulty_max_k": "Operator ceiling for calibrated difficulty scaling, clamped by the built-in safety envelope.",
+    "agent.calibration_finalizing_min_ratio": "Operator floor for calibrated finalization ratio, never below the safety minimum.",
+    "agent.calibration_finalizing_max_ratio": "Operator ceiling for calibrated finalization ratio, never above the safety maximum.",
     "agent.compression_writeback": "Persist structural context compression back into the loop's message history so append-only frozen segments stay byte-stable across rounds (continuous prefix-cache reuse). Opt-in; the recent raw tail is preserved (default off).",
     "agent.reentry_enabled": "Enable event-driven re-entry: allow tasks to register a resume trigger (schedule_reentry) that seeds a future run from the saved orientation (default off).",
     "agent.reentry_tick_seconds": "How often (seconds) the daemon dispatches due re-entry triggers as isolated subagents (only when reentry is enabled).",
@@ -323,6 +327,10 @@ _FIELD_DESCRIPTIONS = {
     "signal.noise_path_fragments": "Path fragments treated as monitor/display noise for fs.change events, e.g. OS caches and tool state directories.",
     "signal.noise_dir_names": "Directory names treated as monitor/display noise for fs.change events.",
     "signal.noise_suffixes": "Filename suffixes treated as transient fs.change noise, e.g. WAL/SHM/journal/temp/log files.",
+    "plugins.sandbox_invoke_timeout_s": "Maximum seconds for one Python sandbox RPC; requires daemon restart.",
+    "plugins.sandbox_shutdown_timeout_s": "Maximum graceful shutdown wait for a Python sandbox worker; requires daemon restart.",
+    "plugins.sandbox_cpu_time_s": "CPU-time ceiling in seconds for each Python sandbox worker; zero disables it.",
+    "plugins.sandbox_max_memory_mb": "Address-space ceiling in megabytes for each Python sandbox worker; zero disables it.",
     "plugins.dsh_invoke_timeout_s": "Maximum seconds for one restricted DSH tool invocation; requires daemon restart.",
     "plugins.dsh_discovery_timeout_s": "Maximum seconds for restricted DSH runtime discovery; requires daemon restart.",
     "plugins.dsh_max_message_bytes": "Maximum bytes in one DSH worker NDJSON protocol message; requires daemon restart.",
@@ -346,6 +354,17 @@ _FIELD_DESCRIPTIONS = {
         "approval, sandboxing and trust all still apply, and every plugin change asks for "
         "your approval individually."
     ),
+    "evolution.teacher_poll_interval_s": "Seconds between durable teacher queue polls.",
+    "evolution.teacher_lease_s": "Lease duration for one claimed hindsight teacher job.",
+    "evolution.teacher_timeout_s": "Maximum seconds for one hindsight teacher call.",
+    "evolution.teacher_max_attempts": "Maximum attempts before a teacher job fails permanently.",
+    "evolution.teacher_retry_backoff_s": "Base retry delay for failed teacher jobs.",
+    "evolution.autonomy_level": "Maximum automatic proposal action; approvals remain mandatory.",
+    "environment.mode": "Environment-source mode: production or experiment.",
+    "environment.leapspace_enabled": "Enable the LeapSpace filesystem source in experiment mode.",
+    "environment.leapspace_state_root": "Host-visible LeapSpace state directory.",
+    "environment.leapspace_session_id": "Session receiving LeapSpace environment evidence.",
+    "environment.leapspace_poll_interval_s": "Seconds between LeapSpace state scans.",
 }
 
 _SECTION_CATEGORIES = {

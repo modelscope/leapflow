@@ -101,7 +101,35 @@ class ApprovalCoordinator:
             # a marketplace client from settings. Both are injected via the same
             # bind_runtime path; self_management declares them as dependencies.
             plugin_install_dir = self._resolve_plugin_install_dir(settings)
+            profile_layout = getattr(settings, "profile_layout", None)
+            plugin_staging_dir = (
+                str(profile_layout.plugin_staging_dir) if profile_layout is not None else None
+            )
             marketplace_client = self._build_marketplace_client(settings, plugin_install_dir)
+            proposal_orchestrator = None
+            try:
+                from leapflow.plugins.adaptive_policy import AdaptiveEvolutionPolicy
+                from leapflow.plugins.proposal_orchestrator import ProposalOrchestrator
+                artifact_store = getattr(ctx, "_evolution_artifact_store", None)
+                proposal_queue = getattr(ctx, "_capability_proposal_queue", None)
+                if (
+                    profile_layout is not None
+                    and artifact_store is not None
+                    and proposal_queue is not None
+                ):
+                    proposal_orchestrator = ProposalOrchestrator(
+                        queue=proposal_queue,
+                        artifact_store=artifact_store,
+                        approval_gate=orchestrator,
+                        policy=AdaptiveEvolutionPolicy(
+                            autonomy_level=str(
+                                getattr(settings, "evolution_autonomy_level", "generate_only")
+                            )
+                        ),
+                    )
+                    ctx._proposal_orchestrator = proposal_orchestrator
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+                logger.warning("ProposalOrchestrator setup failed", exc_info=True)
             _tool_registry.bind_runtime(
                 plugin_approval_gate=orchestrator,
                 hardware_approval_gate=orchestrator,
@@ -110,10 +138,17 @@ class ApprovalCoordinator:
                     getattr(settings, "plugin_generation_enabled", False)
                 ),
                 plugin_install_dir=plugin_install_dir,
+                plugin_staging_dir=plugin_staging_dir,
                 marketplace_client=marketplace_client,
                 marketplace_trusted_pubkeys=tuple(
                     getattr(settings, "plugin_marketplace_trusted_pubkeys", ()) or ()
                 ),
+                proposal_orchestrator=proposal_orchestrator,
+                capability_lifecycle_store=getattr(
+                    ctx, "_capability_proposal_queue", None
+                ),
+                evolution_outbox=getattr(ctx, "_evolution_outbox", None),
+                evolution_profile_id=str(getattr(settings, "profile", "default")),
             )
 
             class _FileReadGate:
@@ -259,7 +294,12 @@ class ApprovalCoordinator:
         ))
         try:
             async with parked_for_human_decision():
-                result = await future
+                from leapflow.domain.tool_pipeline import (
+                    pause_tool_execution_timeout_for_human_decision,
+                )
+
+                async with pause_tool_execution_timeout_for_human_decision():
+                    result = await future
             return str(result.get("decision") or "deny")
         finally:
             self._approval_pending.pop(pending_id, None)

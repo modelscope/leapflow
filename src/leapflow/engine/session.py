@@ -14,7 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set
 
 from leapflow.engine.confirmation import ConfirmationHandler, ConfirmLevel, IOProvider
 from leapflow.analysis.pipeline import ImitationPipeline
@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 LearnCompleteCallback = Callable[["LearnResult"], None]
 ProgressCallback = Optional[Callable[[str, int, int], None]]
 StepProgressCallback = Optional[Callable[[int, int, str], None]]
+ActionDispatcher = Callable[[Dict[str, Any], str], Awaitable[Any]]
 
 
 class SessionMode(Enum):
@@ -107,6 +108,7 @@ class SessionController:
         learnability_assessor: Optional[Any] = None,
         evolution_policy: Optional[SkillEvolutionPolicy] = None,
         skill_store: Optional[Any] = None,
+        action_dispatcher: Optional[ActionDispatcher] = None,
     ) -> None:
         self._pipeline = pipeline
         self._registry = registry
@@ -121,6 +123,7 @@ class SessionController:
         self._learnability_assessor = learnability_assessor
         self._evolution_policy = evolution_policy
         self._skill_store = skill_store
+        self._action_dispatcher = action_dispatcher
 
         self._mode = SessionMode.IDLE
         self._session: Optional[LearningSession] = None
@@ -733,15 +736,13 @@ class SessionController:
 
         t0 = time.perf_counter()
         try:
-            result = await self._registry.invoke(
-                skill_name, **invoke_kwargs
-            )
+            result = await self._dispatch_skill(skill, invoke_kwargs)
             elapsed = time.perf_counter() - t0
             exec_result = ExecutionResult(
-                ok=result.ok,
+                ok=bool(result.get("ok", True)),
                 skill_name=skill_name,
-                output=result.output,
-                error=result.error,
+                output=result.get("result"),
+                error=str(result.get("error") or "") or None,
                 duration_s=elapsed,
             )
         except Exception as e:
@@ -842,14 +843,39 @@ class SessionController:
                 break
         return results
 
+    async def _dispatch_skill(
+        self,
+        skill: Skill,
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        dispatcher = self._action_dispatcher
+        if dispatcher is None:
+            raise SessionError("SessionController requires the runtime action dispatcher")
+        result = await dispatcher(
+            {
+                "type": "skill",
+                "name": skill.name,
+                "payload": params,
+                "execution_policy": skill.metadata.execution_policy,
+            },
+            "",
+        )
+        if isinstance(result, Mapping):
+            return dict(result)
+        return {"ok": True, "result": result}
+
     def _build_step_executor(self, skill: Any, params: Optional[Dict[str, Any]]):
         """Build a per-instruction step executor for step-through mode."""
         async def _executor(step_idx: int, step_desc: str) -> Dict[str, Any]:
             invoke_params = dict(params or {})
             if skill.instructions:
                 invoke_params["instruction_idx"] = step_idx
-            result = await self._registry.invoke(skill.name, **invoke_params)
-            return {"ok": result.ok, "output": result.output, "error": result.error}
+            result = await self._dispatch_skill(skill, invoke_params)
+            return {
+                "ok": bool(result.get("ok", True)),
+                "output": result.get("result"),
+                "error": result.get("error"),
+            }
         return _executor
 
     def find_skill(self, phrase: str, threshold: float = 0.5) -> Optional[str]:

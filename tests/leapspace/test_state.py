@@ -1,19 +1,38 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Tests for leapspace.app_space.utils: check() lines and path conventions."""
+"""Tests for leapspace.app_space.state: check() lines, path conventions, and the
+LS-1 decoupling contract (state helpers import with cua_sandbox absent)."""
 
 import asyncio
+import importlib
 import platform
+import sys
 
 import pytest
 
-pytest.importorskip("cua_sandbox")  # leapspace extra only (utils imports cua_sandbox)
-
-from leapspace.app_space.utils import (
+# No cua_sandbox importorskip: the whole point of LS-1 is that these helpers are
+# importable without the host SDK. This test runs on any host.
+from leapspace.app_space.state import (
     check,
     get_image_venv_python,
     get_sandbox_state_dir,
     load_action,
 )
+
+
+def test_state_module_imports_without_the_sandbox_sdk():
+    """LS-1: importing state must not require cua_sandbox.
+
+    Loads the module in a fresh import with cua_sandbox forced absent. Before the
+    split this was impossible -- ``from cua_sandbox import Image`` sat at module
+    scope, so the in-box verdict and pure helpers could not import off-sandbox.
+    """
+    saved = {k: v for k, v in sys.modules.items() if k == "cua_sandbox"}
+    sys.modules["cua_sandbox"] = None  # any import attempt raises ImportError
+    try:
+        importlib.reload(importlib.import_module("leapspace.app_space.state"))
+    finally:
+        sys.modules.pop("cua_sandbox", None)
+        sys.modules.update(saved)
 
 
 def test_check_pass_line(capsys):

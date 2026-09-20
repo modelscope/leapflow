@@ -128,6 +128,12 @@ class Settings:
     # When non-empty, marketplace installs MUST carry a valid signature from
     # one of these keys; empty tuple -> checksum-only integrity verification.
     plugin_marketplace_trusted_pubkeys: tuple[str, ...] = ()
+    # Python plugin sandbox limits. Zero CPU/memory disables that individual
+    # operating-system limit; request and shutdown timeouts are always bounded.
+    plugin_sandbox_invoke_timeout_s: float = 15.0
+    plugin_sandbox_shutdown_timeout_s: float = 3.0
+    plugin_sandbox_cpu_time_s: int = 30
+    plugin_sandbox_max_memory_mb: int = 0
     # Restricted DeepSeek Harness / Cordis bridge runtime. These are cold-path
     # process limits; changing them requires rebuilding daemon-owned plugin
     # wrappers and therefore takes effect after daemon restart.
@@ -390,6 +396,20 @@ class Settings:
     # driver is the world model" -- other origins keep being recorded and resolved,
     # but can no longer authorise acquiring new code.
     evolution_authorising_origins: tuple[str, ...] = ()
+    evolution_teacher_poll_interval_s: float = 1.0
+    evolution_teacher_lease_s: float = 120.0
+    evolution_teacher_timeout_s: float = 180.0
+    evolution_teacher_max_attempts: int = 3
+    evolution_teacher_retry_backoff_s: float = 5.0
+    evolution_autonomy_level: str = "generate_only"
+    # How many hours a capability proposal stays active before the cold-path
+    # sweep expires it. 0 disables TTL-based expiry entirely.
+    proposal_ttl_hours: int = 72
+    environment_mode: str = "production"
+    environment_leapspace_enabled: bool = False
+    environment_leapspace_state_root: str = ""
+    environment_leapspace_session_id: str = ""
+    environment_leapspace_poll_interval_s: float = 0.5
     # Which registered policy chooses among admissible tool candidates. ``greedy``
     # is the shipped default and reproduces the selection made before the policy
     # seam existed: highest weighted score, stable tie-break.
@@ -524,6 +544,10 @@ class Settings:
     agent_calibration_enabled: bool = False
     agent_calibration_min_confidence: float = 0.3
     agent_calibration_interval_turns: int = 0
+    agent_calibration_difficulty_min_k: float = 0.25
+    agent_calibration_difficulty_max_k: float = 3.0
+    agent_calibration_finalizing_min_ratio: float = 0.6
+    agent_calibration_finalizing_max_ratio: float = 0.98
     agent_compression_writeback: bool = False
     agent_reentry_enabled: bool = False
     agent_reentry_tick_seconds: float = 30.0
@@ -980,6 +1004,38 @@ def _build_settings_from_env(
         for origin in os.getenv("LEAPFLOW_EVOLUTION_AUTHORISING_ORIGINS", "").split(",")
         if origin.strip()
     )
+    evolution_teacher_poll_interval_s = float(
+        os.getenv("LEAPFLOW_EVOLUTION_TEACHER_POLL_INTERVAL_S", "1.0")
+    )
+    evolution_teacher_lease_s = float(
+        os.getenv("LEAPFLOW_EVOLUTION_TEACHER_LEASE_S", "120.0")
+    )
+    evolution_teacher_timeout_s = float(
+        os.getenv("LEAPFLOW_EVOLUTION_TEACHER_TIMEOUT_S", "180.0")
+    )
+    evolution_teacher_max_attempts = int(
+        os.getenv("LEAPFLOW_EVOLUTION_TEACHER_MAX_ATTEMPTS", "3")
+    )
+    evolution_teacher_retry_backoff_s = float(
+        os.getenv("LEAPFLOW_EVOLUTION_TEACHER_RETRY_BACKOFF_S", "5.0")
+    )
+    evolution_autonomy_level = os.getenv(
+        "LEAPFLOW_EVOLUTION_AUTONOMY_LEVEL", "generate_only"
+    ).strip()
+    proposal_ttl_hours = int(os.getenv("LEAPFLOW_PROPOSAL_TTL_HOURS", "72"))
+    environment_mode = os.getenv("LEAPFLOW_ENVIRONMENT_MODE", "production").strip().lower()
+    environment_leapspace_enabled = _bool(
+        "LEAPFLOW_ENVIRONMENT_LEAPSPACE_ENABLED", "false"
+    )
+    environment_leapspace_state_root = os.getenv(
+        "LEAPFLOW_ENVIRONMENT_LEAPSPACE_STATE_ROOT", ""
+    ).strip()
+    environment_leapspace_session_id = os.getenv(
+        "LEAPFLOW_ENVIRONMENT_LEAPSPACE_SESSION_ID", ""
+    ).strip()
+    environment_leapspace_poll_interval_s = float(
+        os.getenv("LEAPFLOW_ENVIRONMENT_LEAPSPACE_POLL_INTERVAL_S", "0.5")
+    )
     selection_policy = os.getenv("LEAPFLOW_SELECTION_POLICY", "greedy").strip() or "greedy"
     replay_on_session_end = _bool("LEAPFLOW_REPLAY_ON_SESSION_END", "true")
     distilled_knowledge_ttl_s = float(
@@ -1084,6 +1140,18 @@ def _build_settings_from_env(
     agent_calibration_enabled = os.getenv("LEAPFLOW_AGENT_CALIBRATION_ENABLED", "0").strip().lower() in ("1", "true", "yes")
     agent_calibration_min_confidence = float(os.getenv("LEAPFLOW_AGENT_CALIBRATION_MIN_CONFIDENCE", "0.3"))
     agent_calibration_interval_turns = int(os.getenv("LEAPFLOW_AGENT_CALIBRATION_INTERVAL_TURNS", "0"))
+    agent_calibration_difficulty_min_k = float(
+        os.getenv("LEAPFLOW_AGENT_CALIBRATION_DIFFICULTY_MIN_K", "0.25")
+    )
+    agent_calibration_difficulty_max_k = float(
+        os.getenv("LEAPFLOW_AGENT_CALIBRATION_DIFFICULTY_MAX_K", "3.0")
+    )
+    agent_calibration_finalizing_min_ratio = float(
+        os.getenv("LEAPFLOW_AGENT_CALIBRATION_FINALIZING_MIN_RATIO", "0.6")
+    )
+    agent_calibration_finalizing_max_ratio = float(
+        os.getenv("LEAPFLOW_AGENT_CALIBRATION_FINALIZING_MAX_RATIO", "0.98")
+    )
     agent_compression_writeback = os.getenv("LEAPFLOW_AGENT_COMPRESSION_WRITEBACK", "0").strip().lower() in ("1", "true", "yes")
     agent_reentry_enabled = os.getenv("LEAPFLOW_AGENT_REENTRY_ENABLED", "0").strip().lower() in ("1", "true", "yes")
     agent_reentry_tick_seconds = float(os.getenv("LEAPFLOW_AGENT_REENTRY_TICK_SECONDS", "30"))
@@ -1107,6 +1175,18 @@ def _build_settings_from_env(
     tools_lint_command = os.getenv("LEAPFLOW_TOOLS_LINT_COMMAND", "").strip()
     tools_terminal_session_enabled = os.getenv("LEAPFLOW_TOOLS_TERMINAL_SESSION_ENABLED", "1").strip().lower() in ("1", "true", "yes")
     tools_verify_edits = os.getenv("LEAPFLOW_TOOLS_VERIFY_EDITS", "1").strip().lower() in ("1", "true", "yes")
+    plugin_sandbox_invoke_timeout_s = float(
+        os.getenv("LEAPFLOW_PLUGIN_SANDBOX_INVOKE_TIMEOUT_S", "15")
+    )
+    plugin_sandbox_shutdown_timeout_s = float(
+        os.getenv("LEAPFLOW_PLUGIN_SANDBOX_SHUTDOWN_TIMEOUT_S", "3")
+    )
+    plugin_sandbox_cpu_time_s = int(
+        os.getenv("LEAPFLOW_PLUGIN_SANDBOX_CPU_TIME_S", "30")
+    )
+    plugin_sandbox_max_memory_mb = int(
+        os.getenv("LEAPFLOW_PLUGIN_SANDBOX_MAX_MEMORY_MB", "0")
+    )
     plugins_dsh_invoke_timeout_s = float(os.getenv("LEAPFLOW_PLUGINS_DSH_INVOKE_TIMEOUT_S", "30"))
     plugins_dsh_discovery_timeout_s = float(os.getenv("LEAPFLOW_PLUGINS_DSH_DISCOVERY_TIMEOUT_S", "10"))
     plugins_dsh_max_message_bytes = int(os.getenv("LEAPFLOW_PLUGINS_DSH_MAX_MESSAGE_BYTES", "1000000"))
@@ -1409,6 +1489,18 @@ def _build_settings_from_env(
         evolution_enabled=evolution_enabled,
         accepted_evidence_kinds=accepted_evidence_kinds,
         evolution_authorising_origins=evolution_authorising_origins,
+        evolution_teacher_poll_interval_s=evolution_teacher_poll_interval_s,
+        evolution_teacher_lease_s=evolution_teacher_lease_s,
+        evolution_teacher_timeout_s=evolution_teacher_timeout_s,
+        evolution_teacher_max_attempts=evolution_teacher_max_attempts,
+        evolution_teacher_retry_backoff_s=evolution_teacher_retry_backoff_s,
+        evolution_autonomy_level=evolution_autonomy_level,
+        proposal_ttl_hours=proposal_ttl_hours,
+        environment_mode=environment_mode,
+        environment_leapspace_enabled=environment_leapspace_enabled,
+        environment_leapspace_state_root=environment_leapspace_state_root,
+        environment_leapspace_session_id=environment_leapspace_session_id,
+        environment_leapspace_poll_interval_s=environment_leapspace_poll_interval_s,
         selection_policy=selection_policy,
         replay_on_session_end=replay_on_session_end,
         distilled_knowledge_ttl_s=distilled_knowledge_ttl_s,
@@ -1498,6 +1590,10 @@ def _build_settings_from_env(
         agent_calibration_enabled=agent_calibration_enabled,
         agent_calibration_min_confidence=agent_calibration_min_confidence,
         agent_calibration_interval_turns=agent_calibration_interval_turns,
+        agent_calibration_difficulty_min_k=agent_calibration_difficulty_min_k,
+        agent_calibration_difficulty_max_k=agent_calibration_difficulty_max_k,
+        agent_calibration_finalizing_min_ratio=agent_calibration_finalizing_min_ratio,
+        agent_calibration_finalizing_max_ratio=agent_calibration_finalizing_max_ratio,
         agent_compression_writeback=agent_compression_writeback,
         agent_reentry_enabled=agent_reentry_enabled,
         agent_reentry_tick_seconds=agent_reentry_tick_seconds,
@@ -1520,6 +1616,10 @@ def _build_settings_from_env(
         tools_lint_command=tools_lint_command,
         tools_terminal_session_enabled=tools_terminal_session_enabled,
         tools_verify_edits=tools_verify_edits,
+        plugin_sandbox_invoke_timeout_s=plugin_sandbox_invoke_timeout_s,
+        plugin_sandbox_shutdown_timeout_s=plugin_sandbox_shutdown_timeout_s,
+        plugin_sandbox_cpu_time_s=plugin_sandbox_cpu_time_s,
+        plugin_sandbox_max_memory_mb=plugin_sandbox_max_memory_mb,
         plugins_dsh_invoke_timeout_s=plugins_dsh_invoke_timeout_s,
         plugins_dsh_discovery_timeout_s=plugins_dsh_discovery_timeout_s,
         plugins_dsh_max_message_bytes=plugins_dsh_max_message_bytes,

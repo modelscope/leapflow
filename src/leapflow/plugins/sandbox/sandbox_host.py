@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import uuid
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence
 
 from leapflow.plugins.protocol import ToolMetadata
 from leapflow.plugins.sandbox.protocol import SandboxRequest, SandboxResponse
@@ -21,19 +23,56 @@ from leapflow.plugins.sandbox.protocol import SandboxRequest, SandboxResponse
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class SandboxLimits:
+    """Cold-path process and RPC limits for one sandbox worker."""
+
+    invoke_timeout_s: float = 30.0
+    shutdown_timeout_s: float = 3.0
+    cpu_time_s: int = 0
+    max_memory_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        if self.invoke_timeout_s <= 0 or self.shutdown_timeout_s <= 0:
+            raise ValueError("sandbox timeouts must be positive")
+        if self.cpu_time_s < 0 or self.max_memory_bytes < 0:
+            raise ValueError("sandbox resource limits cannot be negative")
+
+
 class SandboxHost:
     """Manages a worker subprocess for one sandboxed plugin."""
 
     def __init__(
-        self, plugin_module_path: str, *, invoke_timeout_s: float = 30.0
+        self,
+        plugin_module_path: str,
+        *,
+        invoke_timeout_s: float = 30.0,
+        shutdown_timeout_s: float = 3.0,
+        cpu_time_s: int = 0,
+        max_memory_bytes: int = 0,
+        python_paths: Sequence[str] = (),
     ) -> None:
         self._module_path = plugin_module_path
-        self._invoke_timeout_s = invoke_timeout_s
+        self._python_paths = tuple(str(path) for path in python_paths if str(path))
+        self._limits = SandboxLimits(
+            invoke_timeout_s=float(invoke_timeout_s),
+            shutdown_timeout_s=float(shutdown_timeout_s),
+            cpu_time_s=int(cpu_time_s),
+            max_memory_bytes=int(max_memory_bytes),
+        )
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._lock = asyncio.Lock()  # serialize stdin/stdout access
 
     async def start(self) -> None:
         """Launch the worker subprocess."""
+        env = dict(os.environ)
+        env["LEAPFLOW_SANDBOX_CPU_TIME_S"] = str(self._limits.cpu_time_s)
+        env["LEAPFLOW_SANDBOX_MAX_MEMORY_BYTES"] = str(self._limits.max_memory_bytes)
+        if self._python_paths:
+            current = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = os.pathsep.join(
+                [*self._python_paths, *([current] if current else [])]
+            )
         self._proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -42,6 +81,7 @@ class SandboxHost:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         logger.info(
             "Sandbox worker started for %s (pid %s)",
@@ -91,7 +131,7 @@ class SandboxHost:
                 self._proc.stdin.write((req.to_json() + "\n").encode())
                 await self._proc.stdin.drain()
                 line = await asyncio.wait_for(
-                    self._proc.stdout.readline(), timeout=self._invoke_timeout_s
+                    self._proc.stdout.readline(), timeout=self._limits.invoke_timeout_s
                 )
                 if not line:
                     return SandboxResponse(
@@ -101,10 +141,11 @@ class SandboxHost:
                     )
                 return SandboxResponse.from_json(line.decode().strip())
             except asyncio.TimeoutError:
+                await self._kill_worker()
                 return SandboxResponse(
                     request_id=req.request_id,
                     ok=False,
-                    error=f"Sandbox invoke timed out after {self._invoke_timeout_s}s",
+                    error=f"Sandbox invoke timed out after {self._limits.invoke_timeout_s}s",
                 )
             except (ConnectionResetError, OSError, ValueError) as exc:
                 return SandboxResponse(
@@ -122,7 +163,9 @@ class SandboxHost:
                 req = SandboxRequest(request_id="shutdown", method="shutdown")
                 self._proc.stdin.write((req.to_json() + "\n").encode())
                 await self._proc.stdin.drain()
-            await asyncio.wait_for(self._proc.wait(), timeout=3.0)
+            await asyncio.wait_for(
+                self._proc.wait(), timeout=self._limits.shutdown_timeout_s
+            )
         except (asyncio.TimeoutError, ConnectionResetError, OSError):
             try:
                 self._proc.kill()
@@ -132,6 +175,18 @@ class SandboxHost:
         finally:
             self._proc = None
             logger.info("Sandbox worker stopped for %s", self._module_path)
+
+    async def _kill_worker(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            proc.kill()
+            await proc.wait()
+        except (ProcessLookupError, OSError):
+            pass
+        finally:
+            self._proc = None
 
 
 class SandboxedToolPlugin:

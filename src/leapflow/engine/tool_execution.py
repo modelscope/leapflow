@@ -8,7 +8,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass, replace
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, cast
 
 ExecutionPolicy = Literal["read_only", "mutating_idempotent", "mutating_once", "external_side_effect"]
 ExecutionStatus = Literal["reserved", "running", "completed", "failed_retryable", "failed_final"]
@@ -43,17 +43,21 @@ def exit_code_from(result: Any) -> int | None:
             return value
     return None
 
-_EXTERNAL_TOOLS = frozenset({
-    "shell_run",
-    "scm_sync",
-    "gateway_send",
-    "gateway_connect",
-    "platform_action",
-    "platform_connect",
-    "hub_push",
-    "hub_pull",
-    "hub_sync",
-})
+EXECUTION_POLICIES: frozenset[str] = frozenset(
+    {"read_only", "mutating_idempotent", "mutating_once", "external_side_effect"}
+)
+
+
+def normalize_execution_policy(
+    value: Any,
+    *,
+    default: ExecutionPolicy = "external_side_effect",
+) -> ExecutionPolicy:
+    """Validate a declared policy, using a conservative fallback when absent."""
+    candidate = str(value or "")
+    if candidate in EXECUTION_POLICIES:
+        return cast(ExecutionPolicy, candidate)
+    return default
 
 
 def canonical_json(value: Any) -> str:
@@ -62,30 +66,31 @@ def canonical_json(value: Any) -> str:
 
 
 def execution_policy_for(tool_name: str, spec: Any | None = None) -> ExecutionPolicy:
-    """Classify a tool into an idempotency policy using registry metadata.
+    """Resolve execution policy exclusively from declared registry metadata.
 
-    MCP tools without ``x_leapflow`` default to ``external_side_effect`` rather
-    than ``mutating_idempotent``, because a tool whose metadata is unknown may
-    have external side effects and replaying it could be harmful.
+    ``tool_name`` remains part of the API for diagnostics, but never influences
+    classification. Missing or contradictory metadata fails safe as an external
+    side effect instead of guessing from a vendor or verb embedded in the name.
     """
-    name = str(tool_name or "").removeprefix("gp_")
+    del tool_name
+    if spec is None:
+        return "external_side_effect"
+    declared = str(getattr(spec, "execution_policy", "") or "")
+    if declared in EXECUTION_POLICIES:
+        return cast(ExecutionPolicy, declared)
     risk_level = str(getattr(spec, "risk_level", "") or "")
     mutates_state = bool(getattr(spec, "mutates_state", False))
     idempotency_scope = str(getattr(spec, "idempotency_scope", "") or "")
     effect_scope = str(getattr(spec, "effect_scope", "") or "")
-    category = str(getattr(spec, "category", "") or "")
-    if risk_level == "read_only" and not mutates_state:
+    if risk_level == "read_only" and not mutates_state and effect_scope != "external":
         return "read_only"
-    if name in _EXTERNAL_TOOLS or risk_level == "external" or effect_scope == "external":
+    if effect_scope == "external" or risk_level == "external":
         return "external_side_effect"
     if idempotency_scope == "session":
         return "mutating_once"
-    # MCP tools without explicit x_leapflow metadata must not fall through to
-    # mutating_idempotent ("safe to repeat").  A tool whose side-effect profile
-    # is unknown is conservatively treated as having external effects.
-    if category == "mcp" and not risk_level:
+    if mutates_state:
         return "external_side_effect"
-    return "mutating_idempotent"
+    return "external_side_effect"
 
 
 def build_idempotency_key(

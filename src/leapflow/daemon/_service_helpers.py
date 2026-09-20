@@ -218,3 +218,7 @@ class ProducerServices:
         return await self._service._session_coordinator.should_refresh(
             self._service._ctx, messages
         )
+
+    async def evolution_projection_aggregate(self) -> dict[str, Any]:
+        """Expose only the explicitly aggregate event projection to producers."""
+        return await self._service.evolution_projection_aggregate()

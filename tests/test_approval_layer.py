@@ -369,7 +369,7 @@ async def test_runtime_database_read_is_hardline_blocked(tmp_path: Path) -> None
 
 
 # ════════════════════════════════════════════════════════════════
-# _bypass_all session bypass: security hardening (issue #30)
+# _bypass_all session bypass semantics
 # ════════════════════════════════════════════════════════════════
 
 
@@ -406,31 +406,42 @@ def _high_risk_permanent() -> RiskAssessment:
 
 
 @pytest.mark.asyncio
-async def test_bypass_all_does_not_auto_approve_high_no_permanent() -> None:
-    """_bypass_all must not auto-approve HIGH+allow_permanent=False actions.
-
-    This is the core of the _bypass_all privilege-escalation fix: a session
-    bypass earned from a low-risk approval must not silently extend to
-    plugin installs, external sends, or other actions the risk classifier
-    marked as non-reusable.
-    """
-    delegate = _Gate(ApprovalDecision.ALLOW_ONCE)
+async def test_bypass_all_auto_approves_high_no_permanent() -> None:
+    """Session bypass covers every action that can reach an approval prompt."""
+    delegate = _Gate(ApprovalDecision.DENY)
     gate = SessionAwareGate(delegate)
-    # Arm the bypass.
     gate._bypass_all = True
 
     request = ApprovalRequest(
         category="platform.action",
         detail="plugin install",
         risk=_high_risk_no_permanent(),
-        choices=("allow_once", "allow_session", "deny"),
+        choices=("allow_once", "allow_session", "allow_all_session", "deny"),
         default_choice="deny",
     )
     decision = await gate.request_approval(request)
 
-    # The delegate must have been consulted -- bypass did not fire.
+    assert delegate.requests == []
+    assert decision == ApprovalDecision.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_high_risk_request_can_arm_and_reuse_session_bypass() -> None:
+    """The bypass choice remains valid even when persistent grants are forbidden."""
+    delegate = _Gate(ApprovalDecision.ALLOW_ALL_SESSION)
+    gate = SessionAwareGate(delegate)
+    request = ApprovalRequest(
+        category="platform.action",
+        detail="plugin install",
+        risk=_high_risk_no_permanent(),
+        choices=ApprovalOrchestrator._choices(allow_permanent=False),
+        default_choice="deny",
+    )
+
+    assert await gate.request_approval(request) == ApprovalDecision.ALLOW
+    assert gate._bypass_all is True
+    assert await gate.request_approval(request) == ApprovalDecision.ALLOW
     assert len(delegate.requests) == 1
-    assert decision == ApprovalDecision.ALLOW_ONCE
 
 
 @pytest.mark.asyncio
@@ -456,12 +467,7 @@ async def test_bypass_all_still_auto_approves_low_and_medium_risk() -> None:
 
 @pytest.mark.asyncio
 async def test_bypass_all_auto_approves_high_with_allow_permanent() -> None:
-    """HIGH + allow_permanent=True (e.g. hardware) is still bypassed.
-
-    The fix gates only on the *combination* of high risk and non-reusable
-    consent, so hardware writes that declare allow_permanent=True are
-    unaffected.
-    """
+    """The bypass also covers high-risk actions eligible for persistence."""
     delegate = _Gate(ApprovalDecision.DENY)
     gate = SessionAwareGate(delegate)
     gate._bypass_all = True
@@ -479,17 +485,15 @@ async def test_bypass_all_auto_approves_high_with_allow_permanent() -> None:
     assert delegate.requests == []
 
 
-@pytest.mark.asyncio
-async def test_choices_exclude_allow_all_session_when_not_permanent() -> None:
-    """allow_all_session must not be offered for non-reusable actions."""
+def test_choices_offer_session_bypass_without_offering_persistent_grant() -> None:
+    """Session bypass is universal while profile persistence stays risk-bound."""
     choices_restricted = ApprovalOrchestrator._choices(allow_permanent=False)
     choices_full = ApprovalOrchestrator._choices(allow_permanent=True)
 
-    assert "allow_all_session" not in choices_restricted
+    assert "allow_all_session" in choices_restricted
     assert "allow_always" not in choices_restricted
     assert "allow_all_session" in choices_full
     assert "allow_always" in choices_full
-    # Core choices are always present.
     assert "allow_once" in choices_restricted
     assert "allow_session" in choices_restricted
     assert "deny" in choices_restricted
@@ -523,13 +527,9 @@ async def test_delegate_decision_outside_choices_falls_back_to_deny() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bypass_all_and_choices_validation_combined() -> None:
-    """Full chain: bypass armed → HIGH non-reusable → fallthrough → delegate
-    returns out-of-choices → denied.
-
-    Exercises all three fixes together as defence-in-depth.
-    """
-    delegate = _Gate(ApprovalDecision.ALLOW_ALL_SESSION)
+async def test_bypass_all_skips_delegate_for_high_external_action() -> None:
+    """A high-risk external action is auto-approved once bypass is armed."""
+    delegate = _Gate(ApprovalDecision.DENY)
     gate = SessionAwareGate(delegate)
     gate._bypass_all = True
 
@@ -543,26 +543,17 @@ async def test_bypass_all_and_choices_validation_combined() -> None:
             explanation="external platform send",
             allow_permanent=False,
         ),
-        choices=("allow_once", "allow_session", "deny", "deny_always"),
+        choices=ApprovalOrchestrator._choices(allow_permanent=False),
         default_choice="deny",
     )
-    decision = await gate.request_approval(request)
 
-    # Fix 1: bypass fell through (HIGH + !allow_permanent).
-    # Fix 3: delegate returned ALLOW_ALL_SESSION not in choices → deny.
-    assert decision == ApprovalDecision.DENY
-    assert len(delegate.requests) == 1
-    assert gate._bypass_all is True  # not disarmed, still set from before
+    assert await gate.request_approval(request) == ApprovalDecision.ALLOW
+    assert delegate.requests == []
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_high_no_permanent_through_full_chain() -> None:
-    """End-to-end: orchestrator + SessionAwareGate for a plugin_management action.
-
-    Verifies the orchestrator builds the right choices and the gate enforces
-    them when a delegate tries to escalate.
-    """
-    # Delegate always tries ALLOW_ALL_SESSION -- a realistic UI misconfig.
+async def test_orchestrator_high_no_permanent_can_arm_bypass() -> None:
+    """A high-risk prompt may explicitly arm the session-wide bypass."""
     delegate = _Gate(ApprovalDecision.ALLOW_ALL_SESSION)
     gate = SessionAwareGate(delegate)
     orchestrator = ApprovalOrchestrator(gate)
@@ -576,16 +567,14 @@ async def test_orchestrator_high_no_permanent_through_full_chain() -> None:
 
     result = await orchestrator.evaluate(action)
 
-    # The risk classifier forces HIGH + allow_permanent=False.
     assert result.risk.level == RiskLevel.HIGH
     assert result.risk.allow_permanent is False
-    # The delegate returned ALLOW_ALL_SESSION which was not in choices → deny.
-    assert result.approved is False
-    assert gate._bypass_all is False
+    assert result.approved is True
+    assert gate._bypass_all is True
 
 
 # ════════════════════════════════════════════════════════════════
-# Irreversible / external-output physical writes under bypass (issue #34)
+# Irreversible / external-output physical writes under bypass
 # ════════════════════════════════════════════════════════════════
 
 
@@ -617,17 +606,9 @@ def _critical_no_permanent() -> RiskAssessment:
 
 
 @pytest.mark.asyncio
-async def test_bypass_all_does_not_auto_approve_irreversible_hardware_write() -> None:
-    """An irreversible physical write must fall through, not be blanket-approved.
-
-    Before #34, ``_tier_for`` marked in-envelope physical writes
-    allow_permanent=True, so an irreversible DISPENSE reached the gate as
-    HIGH+allow_permanent=True and was silently authorised by a session-wide
-    bypass earned from a lower-risk approval. With the tightening it arrives
-    as HIGH+allow_permanent=False, so the bypass must fall through to the
-    delegate for per-invocation consent.
-    """
-    delegate = _Gate(ApprovalDecision.ALLOW_ONCE)
+async def test_bypass_all_auto_approves_irreversible_hardware_write() -> None:
+    """Explicit session bypass covers irreversible but approvable actions."""
+    delegate = _Gate(ApprovalDecision.DENY)
     gate = SessionAwareGate(delegate)
     gate._bypass_all = True
 
@@ -635,36 +616,21 @@ async def test_bypass_all_does_not_auto_approve_irreversible_hardware_write() ->
         category="device.dispense",
         detail="aspirate 10 uL",
         risk=_irreversible_hardware_write(),
-        choices=("allow_once", "allow_session", "deny"),
+        choices=ApprovalOrchestrator._choices(allow_permanent=False),
         default_choice="deny",
     )
-    decision = await gate.request_approval(request)
 
-    # The delegate was consulted -- the bypass did not fire.
-    assert len(delegate.requests) == 1
-    assert decision == ApprovalDecision.ALLOW_ONCE
+    assert await gate.request_approval(request) == ApprovalDecision.ALLOW
+    assert delegate.requests == []
 
 
-@pytest.mark.asyncio
-async def test_bypass_all_does_not_auto_approve_critical_no_permanent() -> None:
-    """CRITICAL + allow_permanent=False must fall through under a session bypass.
+def test_policy_blocks_critical_action_before_session_bypass() -> None:
+    """Critical actions are denied before any session bypass can be consulted."""
+    from leapflow.security.policy import ApprovalPolicyEngine, PolicyVerdict
 
-    The fallthrough covers both HIGH and CRITICAL; this guards the CRITICAL
-    arm so a session-wide bypass cannot blanket-approve, for example, a write
-    that could only be classified as an unresolvable/hardline command.
-    """
-    delegate = _Gate(ApprovalDecision.ALLOW_ONCE)
-    gate = SessionAwareGate(delegate)
-    gate._bypass_all = True
-
-    request = ApprovalRequest(
-        category="device.actuate",
-        detail="unresolvable device command",
-        risk=_critical_no_permanent(),
-        choices=("allow_once", "allow_session", "deny"),
-        default_choice="deny",
+    decision = ApprovalPolicyEngine().evaluate(
+        ActionDescriptor.shell("unresolvable device command"),
+        _critical_no_permanent(),
     )
-    decision = await gate.request_approval(request)
 
-    assert len(delegate.requests) == 1
-    assert decision == ApprovalDecision.ALLOW_ONCE
+    assert decision.verdict is PolicyVerdict.DENY

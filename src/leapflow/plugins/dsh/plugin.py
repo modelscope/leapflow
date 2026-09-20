@@ -66,13 +66,20 @@ class DshBridgePlugin:
                 "category": "bridge",
                 "runtime": "node",
                 "bridge": "dsh_ndjson_v1",
-                "risk_level": "external" if self._descriptor.permissions else "medium",
-                "requires_approval": False,
-                "execution_policy": "parallel_safe",
+                "risk_level": "external" if self._descriptor.permissions else "read_only",
+                "requires_approval": bool(self._descriptor.permissions),
+                "effect_scope": "external" if self._descriptor.permissions else "none",
+                "idempotency_scope": "session" if self._descriptor.permissions else "turn",
+                "execution_policy": (
+                    "external_side_effect" if self._descriptor.permissions else "read_only"
+                ),
                 "source_bundle_sha256": self._descriptor.bundle_sha256,
                 "limitations": list(self._descriptor.limitations),
             },
-            mutates_state=False,
+            mutates_state=bool(self._descriptor.permissions),
+            execution_policy=(
+                "external_side_effect" if self._descriptor.permissions else "read_only"
+            ),
         )
 
     async def _invoke(self, tool_name: str, arguments: dict[str, Any]) -> Any:

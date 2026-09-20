@@ -70,6 +70,7 @@ class ShellTerminalPlugin:
                     "idempotency_scope": "session",
                 },
                 mutates_state=True,
+                execution_policy="external_side_effect",
                 # Grounded in leapflow.domain.platform.Capability.SHELL_EXEC:
                 # a host without shell execution cannot run this tool, which
                 # environment-fit scoring uses to exclude it rather than fail
@@ -110,6 +111,7 @@ class ShellTerminalPlugin:
                     "effect_scope": "external",
                 },
                 mutates_state=True,
+                execution_policy="external_side_effect",
                 provides_capabilities=("shell.session_create",),
                 requires_platform_capabilities=("shell.exec",),
             ),
@@ -140,6 +142,7 @@ class ShellTerminalPlugin:
                     "effect_scope": "external",
                 },
                 mutates_state=True,
+                execution_policy="external_side_effect",
                 provides_capabilities=("shell.session_input",),
                 requires_platform_capabilities=("shell.exec",),
             ),
@@ -191,6 +194,7 @@ class ShellTerminalPlugin:
                     "requires_approval": False,
                 },
                 mutates_state=True,
+                execution_policy="external_side_effect",
                 provides_capabilities=("shell.session_destroy",),
                 requires_platform_capabilities=("shell.exec",),
             ),

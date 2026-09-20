@@ -2,18 +2,20 @@
 """Plugin lifecycle state machine (PluginFiber).
 
 Manages the runtime lifecycle of a single plugin instance through a
-six-state finite automaton with generation tracking:
+seven-state finite automaton with generation tracking:
 
-    PENDING → LOADING → ACTIVE → UNLOADING → DISPOSED
+    PENDING → DRAFT → ACTIVE → UNLOADING → DISPOSED
+    PENDING → LOADING → ACTIVE
               LOADING → FAILED → LOADING (retry)
-    PENDING → ACTIVE (fast path for plugins with no async init)
-    PENDING/LOADING/FAILED → DISPOSED (early cleanup)
+    PENDING → ACTIVE (fast path for trusted built-ins)
+    PENDING/DRAFT/LOADING/FAILED → DISPOSED (early cleanup)
 
 Each fiber owns an EffectScope; dispose() always cascades scope cleanup.
 Generation counter provides identity across reload cycles.
 
 States:
     PENDING   — created, awaiting activation or async init
+    DRAFT     — isolated and testable, not published to the live registry
     LOADING   — async initialization in progress (dependency resolution)
     ACTIVE    — fully operational, tools available
     FAILED    — initialization failed, retryable via retry()/begin_loading()
@@ -47,6 +49,7 @@ def _next_generation() -> int:
 class FiberState(enum.Enum):
     """Plugin fiber lifecycle states."""
     PENDING = "pending"
+    DRAFT = "draft"
     LOADING = "loading"
     ACTIVE = "active"
     FAILED = "failed"
@@ -59,7 +62,13 @@ class IllegalStateTransition(RuntimeError):
 
 
 _VALID_TRANSITIONS: dict[FiberState, set[FiberState]] = {
-    FiberState.PENDING: {FiberState.ACTIVE, FiberState.LOADING, FiberState.DISPOSED},
+    FiberState.PENDING: {
+        FiberState.DRAFT,
+        FiberState.ACTIVE,
+        FiberState.LOADING,
+        FiberState.DISPOSED,
+    },
+    FiberState.DRAFT: {FiberState.ACTIVE, FiberState.DISPOSED},
     FiberState.LOADING: {FiberState.ACTIVE, FiberState.FAILED, FiberState.DISPOSED},
     FiberState.ACTIVE: {FiberState.UNLOADING},
     FiberState.FAILED: {FiberState.LOADING, FiberState.DISPOSED},
@@ -112,8 +121,12 @@ class PluginFiber:
         """The stored error from a failed loading attempt, if any."""
         return self._error
 
+    def mark_draft(self) -> None:
+        """Transition a newly created fiber into isolated validation."""
+        self._transition(FiberState.DRAFT)
+
     def activate(self) -> None:
-        """Transition from PENDING or LOADING to ACTIVE."""
+        """Transition from PENDING, DRAFT, or LOADING to ACTIVE."""
         self._transition(FiberState.ACTIVE)
 
     def begin_loading(self) -> None:

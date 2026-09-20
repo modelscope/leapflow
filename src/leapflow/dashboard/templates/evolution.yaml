@@ -166,6 +166,38 @@ layout:
                 props:
                   label: "Pipeline evidence"
                   value: "{{ evolution.summary.segments_with_evidence }}/{{ evolution.summary.segments_total }}"
+          # ── The evolution axis ──────────────────────────────────────────
+          # Gated on the *series*, not on having two of them: the renderer draws a
+          # lone sample as a marker, and "one observation, here it is" is the most
+          # important reading a board has on the day its subject starts evolving.
+          # Every other panel on this page is a cross-section of one instant; this
+          # is the only one that answers which way the framework is moving. It sits
+          # outside the tabs with the posture strip because that question is not a
+          # detail of any one tab.
+          #
+          # Bound at ``evidence_trend`` rather than ``evolution.evidence_trend``:
+          # the producer owns the ``evolution.*`` namespace, and this series is
+          # derived by the view service from retained findings, which are the only
+          # thing that carries history across daemon restarts.
+          - type: AreaChart
+            when: evidence_trend.series
+            props:
+              title: "Pipeline evidence over time"
+              bind: evidence_trend.series
+              caption: "One point per recorded change in framework state, oldest first."
+          - type: Row
+            when: evidence_trend.series
+            props:
+              variant: meta
+            children:
+              - type: Stat
+                props:
+                  label: "Samples"
+                  value: "{{ evidence_trend.samples }}"
+              - type: Stat
+                props:
+                  label: "Net change"
+                  value: "{{ evidence_trend.delta }}"
           - type: Markdown
             when: evolution.degraded_reason
             props:
@@ -413,8 +445,8 @@ layout:
               - type: Section
                 when: evolution.roster
                 props:
-                  title: "Plugin roster and trust"
-                  subtitle: "Read live from the registry and trust ledger every cycle."
+                  title: "Plugin roster and maturity"
+                  subtitle: "Read live from the registry and maturity ledger every cycle."
                 children:
                   - type: BarChart
                     when: evolution.provenance_mix
@@ -424,7 +456,7 @@ layout:
                   - type: BarChart
                     when: evolution.trust_mix
                     props:
-                      title: "Plugins by trust class"
+                      title: "Plugins by maturity"
                       bind: evolution.trust_mix
                   # Deliberately no live counters here. This finding dedups on a
                   # content fingerprint, so a rendered metric that changes every tick
@@ -441,7 +473,7 @@ layout:
                         - key: fiber_state
                           label: "Fiber"
                         - key: trust_level
-                          label: "Trust"
+                          label: "Maturity"
                         - key: selectable
                           label: "Selectable"
                         - key: ever_used
@@ -471,7 +503,7 @@ layout:
                         - key: plugin_id
                           label: "Plugin"
                         - key: trust_level
-                          label: "Trust"
+                          label: "Maturity"
                         - key: selectable
                           label: "Selectable"
                         - key: ever_used
