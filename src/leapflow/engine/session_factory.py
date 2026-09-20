@@ -354,6 +354,7 @@ def build_session_engine(
     session_id: str,
     working_memory: Any,
     workspace_root: str | Path | None = None,
+    resume_session_id: Optional[str] = None,
 ) -> Any:
     """Return a per-session engine sharing ``base_engine``'s wired services.
 
@@ -368,6 +369,12 @@ def build_session_engine(
     bridge, and the context compressor — which operates on passed messages and
     keeps its archive_fn wiring) are shared by reference. The engine's single-turn
     internals are unchanged.
+
+    When ``resume_session_id`` is supplied the factory applies the PCD
+    cache-aware resume path (5c): if a persisted prefix snapshot exists and
+    ``session_resume_cache_policy`` is ``cache_priority`` the engine freezes the
+    persisted system prompt / tool schema so the first resumed turn is a provider
+    prefix-cache hit. Best-effort: any failure degrades to a normal resume.
     """
     engine = copy.copy(base_engine)  # shallow copy: own __dict__, shared attr refs
     engine._settings = _settings_for_workspace(
@@ -396,4 +403,13 @@ def build_session_engine(
     engine._cancel_requested = False
     engine._active_task = None
     engine._session_turn_count = 0
+    # PCD cache-aware resume (5c): freeze the persisted prefix so the first
+    # resumed turn reproduces the committed system prompt / tool schema and hits
+    # the provider prefix cache. Best-effort — a missing snapshot, an
+    # incompatible store, or a disabled cache policy degrades to a normal resume.
+    if resume_session_id:
+        try:
+            engine.apply_resume_cache_snapshot(str(resume_session_id))
+        except Exception:  # noqa: BLE001 - resume freeze is an optimization, never fatal
+            logger.debug("session.resume cache snapshot apply failed", exc_info=True)
     return engine

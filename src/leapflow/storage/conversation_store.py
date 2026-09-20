@@ -78,6 +78,19 @@ class ConversationSearchResult:
     created_at: float
 
 
+@dataclass(frozen=True)
+class SessionSnapshot:
+    """Immutable snapshot of PCD-relevant session state for cache-aware resumption.
+
+    Persisted alongside the session so that a resumed session can restore the
+    exact system prompt, tool schema, and disclosure level that produced the
+    last prefix-cache-friendly prompt assembly.
+    """
+    system_prompt: Optional[str] = None
+    tool_schema: Optional[str] = None
+    disclosure_level: Optional[str] = None
+
+
 @runtime_checkable
 class ConversationStore(Protocol):
     """Protocol for conversation persistence (DIP)."""
@@ -102,6 +115,14 @@ class ConversationStore(Protocol):
         role_filter: Optional[str] = None,
         cwd: Optional[str] = None,
     ) -> List[ConversationSearchResult]: ...
+    def update_session_snapshot(
+        self,
+        session_id: str,
+        system_prompt: Optional[str],
+        tool_schema: Optional[str],
+        disclosure_level: Optional[str],
+    ) -> None: ...
+    def get_session_snapshot(self, session_id: str) -> Optional[SessionSnapshot]: ...
     def close(self) -> None: ...
 
 
@@ -161,6 +182,16 @@ class DuckDBConversationStore:
             self._conn.execute("ALTER TABLE conversation_sessions ADD COLUMN summary VARCHAR DEFAULT ''")
         except Exception:
             pass  # Column already exists
+        # Migration: PCD cache-aware session snapshot columns
+        for col, col_type in (
+            ("system_prompt_snapshot", "TEXT"),
+            ("tool_schema_snapshot", "TEXT"),
+            ("disclosure_level", "TEXT"),
+        ):
+            try:
+                self._conn.execute(f"ALTER TABLE conversation_sessions ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass  # Column already exists
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_messages (
                 message_id VARCHAR PRIMARY KEY,
@@ -736,6 +767,64 @@ class DuckDBConversationStore:
                 self._holder.close()
             except Exception:
                 pass
+
+    def update_session_snapshot(
+        self,
+        session_id: str,
+        system_prompt: Optional[str],
+        tool_schema: Optional[str],
+        disclosure_level: Optional[str],
+    ) -> None:
+        """Persist the PCD session snapshot for cache-aware resumption.
+
+        Updates the system prompt, tool schema JSON, and disclosure level
+        columns on the ``conversation_sessions`` row identified by
+        *session_id*. Callers are responsible for serialising the tool
+        schema to a JSON string before passing it here.
+        """
+        now = time.time()
+        self._execute_write(
+            """
+            UPDATE conversation_sessions SET
+                system_prompt_snapshot = ?,
+                tool_schema_snapshot = ?,
+                disclosure_level = ?,
+                updated_at = ?
+            WHERE session_id = ?
+            """,
+            [system_prompt, tool_schema, disclosure_level, now, session_id],
+        )
+
+    def get_session_snapshot(self, session_id: str) -> Optional[SessionSnapshot]:
+        """Read the persisted PCD session snapshot.
+
+        Returns ``None`` when the session does not exist or when all three
+        snapshot columns are NULL (legacy sessions that predate the PCD
+        cache-aware migration).
+        """
+        try:
+            row = self._conn.execute(
+                """
+                SELECT system_prompt_snapshot, tool_schema_snapshot, disclosure_level
+                FROM conversation_sessions
+                WHERE session_id = ?
+                """,
+                [session_id],
+            ).fetchone()
+        except Exception:
+            # Column may not exist in a database that has not been migrated yet.
+            logger.debug("conversation_store: snapshot read failed", exc_info=True)
+            return None
+        if row is None:
+            return None
+        # All NULL means no snapshot was ever persisted.
+        if row[0] is None and row[1] is None and row[2] is None:
+            return None
+        return SessionSnapshot(
+            system_prompt=row[0],
+            tool_schema=row[1],
+            disclosure_level=row[2],
+        )
 
     def _row_to_session(self, row: tuple) -> ConversationSession:
         meta = {}

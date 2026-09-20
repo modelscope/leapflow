@@ -104,7 +104,7 @@ _BOOTSTRAP_ONLY_SETTINGS = frozenset({
     "perceptual_field_config",
 })
 
-_SECRET_SETTINGS = frozenset({"llm_api_key", "vlm_api_key", "llm_aux_api_key"})
+_SECRET_SETTINGS = frozenset({"llm_api_key", "vlm_api_key", "llm_aux_api_key", "compression_api_key"})
 
 _FIELD_DESCRIPTIONS = {
     "mcp.approval_mode": (
@@ -344,6 +344,15 @@ _FIELD_DESCRIPTIONS = {
         "policies that once shipped here were removed after measurement, and why a "
         "third-party policy can register through the entry point group when that changes."
     ),
+    "compression.provider": "Dedicated LLM provider for context compression (empty = reuse primary).",
+    "compression.model": "Model for context compression (empty = reuse primary model).",
+    "compression.api_key": "API key for the compression provider, stored in the local secret vault.",
+    "compression.base_url": "Base URL for the compression provider (empty = reuse primary URL).",
+    "session.resume_cache_policy": (
+        "Session resume strategy for PCD cache-aware resumption. 'cache_priority' "
+        "restores the persisted tool schema to maximise prefix-cache hits; "
+        "'tool_freshness' re-discovers tools at resume time."
+    ),
     "evolution.enabled": (
         "Whether the agent may propose acquiring a NEW capability for itself. Off by "
         "default. The world model runs either way: it reviews every session, records what "
@@ -390,6 +399,8 @@ _SECTION_CATEGORIES = {
     "gateway": "Gateway",
     "privacy": "Safety",
     "approval": "Safety",
+    "compression": "LLM Provider",
+    "session": "Storage",
     "cache": "Storage",
     "runtime": "Runtime",
     "mock": "Runtime",
@@ -430,6 +441,7 @@ _VALUE_HINTS = {
     "web.transport": "auto|httpx|curl",
     "web.extractor": "auto|stdlib",
     "web.private_targets": "approval|deny|allow",
+    "session.resume_cache_policy": "cache_priority|tool_freshness",
     # Callable rather than a literal: the valid ids come from the live policy
     # registry, which a third-party package can add to through an entry point. A
     # hardcoded enumeration here would silently omit every such policy and would
@@ -461,6 +473,7 @@ _PROFILE_FILE_BY_SECTION = {
     "gateway": "gateway.yaml",
     "privacy": "privacy.yaml",
     "approval": "approval.yaml",
+    "compression": "llm.yaml",
     "cache": "cache.yaml",
 }
 

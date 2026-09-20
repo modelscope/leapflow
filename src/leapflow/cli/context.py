@@ -99,6 +99,103 @@ if TYPE_CHECKING:
     from leapflow.storage.skill_library import StoredSkill
 
 
+def _select_cache_strategy(
+    base_url: str,
+    *,
+    provider_id: str | None = None,
+) -> Any:
+    """Select prompt cache strategy based on the active provider's capabilities.
+
+    Resolution order:
+    1. Explicit *provider_id* (structured, preferred when available).
+    2. URL-inferred plugin id (best-effort fallback — see ``_resolve_cache_type``).
+
+    Mapping from ``cache_type`` capability to strategy:
+
+    - ``explicit_breakpoint`` → ``AnthropicCacheStrategy()``
+    - ``auto_prefix``         → ``PrefixCacheOptimizer()``
+    - ``none``                → ``NoCacheStrategy()``
+    - (unknown / absent)      → ``PrefixCacheOptimizer()``  (safe default)
+    """
+    from leapflow.engine.prompt_cache import (
+        AnthropicCacheStrategy,
+        NoCacheStrategy,
+        PrefixCacheOptimizer,
+    )
+
+    cache_type = _resolve_cache_type(base_url, provider_id=provider_id)
+
+    if cache_type == "explicit_breakpoint":
+        return AnthropicCacheStrategy()
+    elif cache_type == "none":
+        return NoCacheStrategy()
+    # auto_prefix or any unrecognised value — safe default.
+    return PrefixCacheOptimizer()
+
+
+def _resolve_cache_type(
+    base_url: str,
+    *,
+    provider_id: str | None = None,
+) -> str:
+    """Determine the ``cache_type`` capability for the active provider.
+
+    Resolution strategy (Config-Driven first, URL fallback second):
+
+    1. **Explicit provider_id** — when the caller already knows the provider
+       identity (e.g. from a future ``settings.llm_provider`` field), look
+       up the plugin directly.  This is the authoritative path.
+    2. **URL best-effort fallback** — when no explicit id is available,
+       infer a probable plugin id from the ``base_url``:
+
+       - Host contains ``anthropic.com``          → ``"anthropic"``
+       - Path contains an ``/anthropic`` segment   → ``"anthropic"``
+         (covers ``/anthropic``, ``/anthropic/v1/messages``, etc.)
+       - Everything else                           → ``"openai"``
+
+       *This is a heuristic, not a contract.*  It exists because LeapFlow's
+       provider instantiation is currently URL-implicit (``_configure_llm_clients``
+       always creates ``OpenAIChat``).  When a structured ``llm_provider``
+       setting is added, the caller should pass it as *provider_id* and
+       the URL fallback becomes a no-op.
+
+    Falls back to ``"auto_prefix"`` if the resolved plugin is not
+    registered or does not declare ``cache_type``.
+    """
+    from urllib.parse import urlparse
+
+    from leapflow.llm.provider_registry import get_default_registry
+
+    registry = get_default_registry()
+
+    # ── 1. Explicit provider_id (authoritative) ──────────────────────────
+    if provider_id:
+        plugin = registry.get_plugin(provider_id)
+        if plugin is not None:
+            return str(plugin.capabilities.get("cache_type", "auto_prefix"))
+        # Explicit id given but plugin not registered → safe default.
+        return "auto_prefix"
+
+    # ── 2. URL best-effort fallback ──────────────────────────────────────
+    # NOTE: This is an approximate heuristic, not a hard contract.
+    # It mirrors how _configure_llm_clients selects provider behaviour
+    # from the URL today.  Prefer passing provider_id when available.
+    parsed = urlparse((base_url or "").strip())
+    host = (parsed.hostname or "").lower()
+    # Split path into non-empty segments for segment-level matching.
+    path_segments = [s for s in (parsed.path or "").lower().split("/") if s]
+
+    if "anthropic.com" in host or "anthropic" in path_segments:
+        plugin_id = "anthropic"
+    else:
+        plugin_id = "openai"
+
+    plugin = registry.get_plugin(plugin_id)
+    if plugin is not None:
+        return str(plugin.capabilities.get("cache_type", "auto_prefix"))
+    return "auto_prefix"
+
+
 class _TUIApprovalGate:
     """Approval gate that delegates to the active TUI surface when available."""
 
@@ -1981,9 +2078,10 @@ class Context:
         compressor_config.archive_fn = _archive_to_semantic
         self.engine._compressor = ContextCompressor(compressor_config)
 
-        # ── Enable PrefixCacheOptimizer ──
-        from leapflow.engine.prompt_cache import PrefixCacheOptimizer
-        self.engine.set_cache_strategy(PrefixCacheOptimizer())
+        # ── Enable capability-driven cache strategy (P0-OPT-1) ──
+        self.engine.set_cache_strategy(
+            _select_cache_strategy(settings.llm_base_url)
+        )
 
         # ── Wire ConversationStore into engine for session persistence ──
         if self._conversation_store:

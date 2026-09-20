@@ -9,6 +9,7 @@ import logging
 import re
 import sys
 import time
+import types
 import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
@@ -18,7 +19,11 @@ from typing import Any, AsyncIterator, ClassVar, Dict, List, Literal, Optional, 
 from leapflow.platform.protocol import HostRpc
 from leapflow.config import Settings
 from leapflow.engine.budget import BudgetConfig, BudgetStatus, IterationBudget
-from leapflow.engine.prefix_commitment import PrefixCommitmentController
+from leapflow.engine.prefix_commitment import (
+    CommitmentStatus,
+    PrefixCommitmentController,
+    _system_prompt_hash,
+)
 from leapflow.engine.research_ledger import ResearchLedger
 from leapflow.engine.agent_loop import AgentLoopFrame
 from leapflow.engine.context_compressor import CompressorConfig, ContextCompressor
@@ -30,6 +35,7 @@ from leapflow.engine.context_control import (
     ToolEvidenceBuilder,
 )
 from leapflow.engine.context_disclosure import (
+    CacheBoundary,
     DisclosureLevel,
     DisclosurePlanner,
     DisclosureRuntimeState,
@@ -49,7 +55,7 @@ from leapflow.engine.execution_trace import ExecutionMode, ExecutionTrace
 from leapflow.engine.intent_classifier import Intent, IntentClassifier
 from leapflow.engine.message_healer import MessageHealer
 from leapflow.engine.message_sanitizer import MessageSanitizer
-from leapflow.engine.prompt_cache import CacheStrategy
+from leapflow.engine.prompt_cache import AnthropicCacheStrategy, CacheStrategy
 from leapflow.engine.stale_stream import (
     StaleStreamError,
     stale_guarded_stream,
@@ -772,6 +778,35 @@ def _build_permission_recovery_text(failure: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_native_tool_assistant_message(
+    native_calls: List[Any],
+    *,
+    thinking_content: Any = None,
+) -> Dict[str, Any]:
+    """Build a provider-valid assistant message that precedes tool results.
+
+    ``reasoning_content`` is protocol continuation data for thinking-capable
+    OpenAI-compatible providers such as DeepSeek. It is intentionally preserved
+    verbatim only when the provider returned it, while the visible preamble stays
+    excluded from the model context and durable transcript.
+    """
+    message: Dict[str, Any] = {"role": "assistant", "content": ""}
+    if isinstance(thinking_content, str) and thinking_content:
+        message["reasoning_content"] = thinking_content
+    message["tool_calls"] = [
+        {
+            "id": call.id,
+            "type": "function",
+            "function": {
+                "name": call.name,
+                "arguments": json.dumps(call.arguments, ensure_ascii=False),
+            },
+        }
+        for call in native_calls
+    ]
+    return message
+
+
 def _extract_recent_tool_failures(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Return recent consecutive tool failure payloads, most recent first."""
     failures: List[Dict[str, Any]] = []
@@ -1105,11 +1140,24 @@ class StreamEvent:
 
 @dataclass(frozen=True)
 class _PromptAssembly:
-    """Resolved prompt pieces for a unified-loop turn."""
+    """Resolved prompt pieces for a unified-loop turn.
+
+    *system* is the **stable** system prompt (identity + capabilities +
+    tool catalog + guidelines).  It should be byte-identical across turns
+    when disclosure level and tool set have not changed — maximising
+    DeepSeek automatic prefix cache hits.
+
+    *volatile_context* holds per-turn dynamic content (memory, knowledge,
+    semantic focus, session summary) that must still reach the model but
+    must **not** be part of the cacheable system-prompt prefix.  The loop
+    injects it as a separate system message placed after *system* and
+    before *prior_turns*.
+    """
 
     system: str
     plan: PromptAssemblyPlan
     prior_turns: List[Dict[str, Any]]
+    volatile_context: str = ""
 
 
 @dataclass(frozen=True)
@@ -1386,6 +1434,26 @@ class AgentEngine:
 
         # B4: Output sanitization (None = disabled)
         self._sanitizer: MessageSanitizer | None = None
+
+        # PCD cache-aware: frozen state for session restore (set by load_session
+        # or session_factory when resuming a committed session; cleared on next
+        # turn's _assemble_unified_prompt after being consumed).
+        self._frozen_system_prompt: Optional[str] = None
+        self._frozen_tool_schema: Optional[str] = None
+        # PCD cache-aware: last-round tracking for snapshot persistence
+        self._last_system_prompt: str = ""
+        self._last_tool_definitions_json: str = ""
+        self._last_disclosure_level: str = ""
+        # PCD cache-aware: cache boundary from current assembly plan
+        self._current_cache_boundary: CacheBoundary = CacheBoundary.NONE
+        # PCD cache-aware: posture tracking for commitment breaking
+        self._prev_context_posture: str = "baseline"
+        # PCD cache-aware: dedicated compression provider (None = use primary)
+        self._compression_provider: Optional[LLMProvider] = None
+        try:
+            self._compression_provider = self._build_compression_provider()
+        except Exception:  # noqa: BLE001 - degrade to primary, never crash init
+            logger.debug("compression provider build failed at init", exc_info=True)
 
         # Recovery coordinator infrastructure
         self._unified_classifier = UnifiedErrorClassifier(self._error_classifier)
@@ -1903,10 +1971,73 @@ class AgentEngine:
                 elif role == "assistant":
                     self._wm.remember_chat(build_assistant_message(content))
             logger.info("session.resume loaded %d messages from %s", len(messages), session_id)
+            self.apply_resume_cache_snapshot(session_id)
             return True
         except Exception:
             logger.debug("session.resume failed", exc_info=True)
             return False
+
+    def freeze_prefix_for_resume(
+        self,
+        *,
+        system_prompt: Optional[str],
+        tool_schema: Optional[str],
+        disclosure_level: Optional[str],
+    ) -> None:
+        """Freeze a persisted prefix so the next turn reproduces it verbatim (5c).
+
+        Sets the resume-freeze fields consumed once by the next
+        ``_assemble_unified_prompt`` and force-commits the controller so the
+        first resumed turn enters ``COMMITTED`` and the provider prefix cache is
+        hit immediately. The commitment is re-applied inside prompt assembly
+        because ``_begin_turn_context`` resets the controller at each turn start;
+        the frozen fields (independent of commitment state) are what survive to
+        drive that re-application.
+        """
+        self._frozen_system_prompt = system_prompt or None
+        self._frozen_tool_schema = tool_schema or None
+        self._last_disclosure_level = str(disclosure_level or "")
+        self._prefix_commitment.force_commit()
+
+    def apply_resume_cache_snapshot(self, session_id: str) -> bool:
+        """Load and apply a persisted prefix snapshot on resume (5c).
+
+        Honors ``session_resume_cache_policy``: ``cache_priority`` (default)
+        freezes the persisted system prompt / tool schema so the first resumed
+        turn is a cache hit; ``tool_freshness`` skips the freeze and lets normal
+        PCD rediscover tools. Best-effort and gated on a conversation store that
+        implements ``get_session_snapshot``; any failure or missing snapshot
+        degrades to a normal (non-frozen) resume. Returns whether a freeze was
+        applied.
+        """
+        if not session_id or not self._conversation_store:
+            return False
+        policy = str(
+            getattr(self._settings, "session_resume_cache_policy", "cache_priority")
+            or "cache_priority"
+        )
+        if policy != "cache_priority":
+            return False
+        getter = getattr(self._conversation_store, "get_session_snapshot", None)
+        if getter is None:
+            return False
+        try:
+            snapshot = getter(session_id)
+        except Exception:  # noqa: BLE001 - resume must never fail on an aux read
+            logger.debug("session.resume snapshot load failed", exc_info=True)
+            return False
+        if snapshot is None:
+            return False
+        system_prompt = getattr(snapshot, "system_prompt", None)
+        if not system_prompt:
+            return False
+        self.freeze_prefix_for_resume(
+            system_prompt=system_prompt,
+            tool_schema=getattr(snapshot, "tool_schema", None),
+            disclosure_level=getattr(snapshot, "disclosure_level", None),
+        )
+        logger.info("session.resume applied cache-priority prefix freeze for %s", session_id)
+        return True
 
     def cancel(self) -> None:
         """Request cancellation of the active run/run_stream call.
@@ -1997,6 +2128,10 @@ class AgentEngine:
         self._last_disclosure_metadata = {}
         self._context_governance_controller.reset_turn_scope()
         self._prefix_commitment.reset()
+        # PCD cache-aware: reset per-turn commitment tracking so a new task
+        # starts uncommitted with no cache boundary until it re-earns one.
+        self._prev_context_posture = "baseline"
+        self._current_cache_boundary = CacheBoundary.NONE
         if self._research_ledger_store is not None and self._current_session_id:
             self._research_ledger.load_state(
                 self._research_ledger_store.load(self._current_session_id)
@@ -2355,7 +2490,12 @@ class AgentEngine:
             active_capability_plan=self._active_capability_plan,
         )
         try:
-            plan = self._disclosure_planner.plan(tool_definitions, runtime)
+            # PCD cache-aware: pass commitment state and cache-benefit signal
+            # so the planner can produce COMMITTED / SOFT / NONE boundary.
+            cache_kwargs = self._cache_aware_plan_kwargs()
+            plan = self._disclosure_planner.plan(
+                tool_definitions, runtime, **cache_kwargs,
+            )
         except (TypeError, ValueError, RuntimeError) as exc:
             logger.warning("disclosure planning failed; falling back to full context: %s", exc)
             plan = DisclosurePlanner().full_plan(
@@ -2381,9 +2521,41 @@ class AgentEngine:
             tool_catalog=tool_catalog,
             app_connector_section=app_connector_section,
             skill_section=skill_section,
-            memory_context=memory_context,
         )
         system = self._append_task_contract_to_system(system)
+        # Volatile context (memory, knowledge, semantic focus) is assembled
+        # separately and injected as an independent message so the system
+        # prompt prefix stays byte-stable across turns for DeepSeek automatic
+        # prefix caching.  The model still receives the full context.
+        volatile_context = memory_context
+        # PCD cache-aware (5c): a resumed, cache-priority session reuses the
+        # persisted system prompt and tool schema verbatim on its first turn so
+        # the provider's prefix cache is hit immediately. ``_begin_turn_context``
+        # has already reset the commitment controller this turn, so the frozen
+        # state is re-applied here (after reset) and consumed once -- the frozen
+        # fields are cleared so subsequent turns return to normal PCD dynamics.
+        if self._frozen_system_prompt is not None:
+            system = self._frozen_system_prompt
+            frozen_defs = self._parse_tool_schema(self._frozen_tool_schema)
+            if frozen_defs:
+                names = tuple(
+                    n for n in (self._tool_def_name(td) for td in frozen_defs) if n
+                )
+                plan = replace(
+                    plan,
+                    tool_definitions=tuple(frozen_defs),
+                    catalog_definitions=tuple(frozen_defs),
+                    selected_tool_names=names,
+                )
+            self._prefix_commitment.force_commit()
+            self._frozen_system_prompt = None
+            self._frozen_tool_schema = None
+        # PCD cache-aware (5b): remember exactly what this turn assembled so the
+        # turn-end persistence path can snapshot the committed prefix and the
+        # commitment evaluator can freeze against a stable system-prompt hash.
+        self._last_system_prompt = system
+        self._last_tool_definitions_json = self._safe_tools_json(plan.tool_definitions)
+        self._last_disclosure_level = plan.level.value
         self._last_disclosure_metadata = {
             **plan.metadata(),
             "context_planes": [ContextPlane.TASK_SEMANTIC.value, ContextPlane.CONTROL_PLANE.value],
@@ -2394,7 +2566,10 @@ class AgentEngine:
             ),
         }
         prior_turns = self._prior_turns_for_plan(plan)
-        return _PromptAssembly(system=system, plan=plan, prior_turns=prior_turns)
+        return _PromptAssembly(
+            system=system, plan=plan, prior_turns=prior_turns,
+            volatile_context=volatile_context,
+        )
 
     def _recent_tool_categories(self) -> frozenset[str]:
         """Return capability categories used by native tool_calls in the prior turn.
@@ -2610,8 +2785,16 @@ class AgentEngine:
         *,
         tools: Any = None,
         round_number: int = 0,
+        defer_cache_optimization: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Compress and hard-gate messages before sending them to the provider."""
+        """Compress and hard-gate messages before sending them to the provider.
+
+        ``defer_cache_optimization`` supports the unified loops' two-phase cold
+        path: preparation first produces the current round's context snapshot,
+        then prefix commitment is evaluated from that snapshot, and finally the
+        provider cache markers are applied with the newly resolved boundary.
+        Other callers retain the legacy one-step behaviour by default.
+        """
         context_length = self._active_context_length()
         token_count = self._context_controller.estimator.estimate_messages(messages)
         # P2-2: extract findings from messages that may be discarded by compression
@@ -2633,9 +2816,8 @@ class AgentEngine:
         compression_trace = self._compressor.last_trace.as_dict()
         prepared = self._compressor.preflight_check(prepared, context_length=context_length)
         prepared = self._ensure_task_contract_message(prepared)
-        if self._cache_strategy:
-            prepared = self._cache_strategy.optimize(prepared)
-            prepared = self._ensure_task_contract_message(prepared)
+        if not defer_cache_optimization:
+            prepared = self._apply_message_cache_strategy(prepared)
         decision = self._context_controller.prepare(
             prepared,
             tools=tools,
@@ -2701,6 +2883,23 @@ class AgentEngine:
         if compressed:
             self._usage_tracker.mark_compression()
         return prepared
+
+    def _apply_message_cache_strategy(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Apply provider cache markers using the current round's boundary.
+
+        This is a cold-path transport transformation. Unified loops call it
+        after ``_evaluate_prefix_commitment`` so the first round that commits
+        immediately receives the COMMITTED system-prompt split; context
+        compression, governance, and token accounting remain marker-agnostic.
+        """
+        if not self._cache_strategy:
+            return messages
+        prepared = self._cache_strategy.optimize(
+            messages, cache_boundary=self._current_cache_boundary
+        )
+        return self._ensure_task_contract_message(prepared)
 
     def recalibrate_difficulty(self, store: Any) -> Any:
         """S3-L3: apply offline calibration (S3-L2) to the difficulty weight.
@@ -3116,15 +3315,76 @@ class AgentEngine:
             )
         return self._full_tools_tokens
 
-    def _evaluate_prefix_commitment(self, budget: IterationBudget) -> None:
-        """Evaluate the adaptive prefix-commitment decision (observe-only, W2 slice 2).
+    def _cache_aware_plan_kwargs(self) -> dict:
+        """Build keyword arguments for ``DisclosurePlanner.plan`` cache-aware path.
 
-        Computes whether the task should commit to a stable, cacheable prefix and
-        records the decision in the context snapshot for observability. Does not
-        yet enforce (freeze disclosure / lock tools / cache-aware compression) --
-        that is W2 slice 3. Reuses the token counts already produced by
-        ``_prepare_llm_messages`` plus the post-retarget budget headroom, so it is
-        cheap (no re-estimation of the message body) and changes no behavior.
+        Cold-path helper (once per round).  Three cases:
+
+        1. **Already committed with enforcement** — pass the frozen disclosure
+           snapshot so the planner reproduces a byte-stable prefix.
+        2. **Uncommitted with positive projected savings** — pass
+           ``cache_benefit=True`` so the planner emits a ``SOFT`` boundary,
+           which instructs ``PrefixCacheOptimizer`` to reorder messages for
+           prefix stability *before* formal commitment.
+        3. **Otherwise** — return an empty dict (backward-compatible ``NONE``).
+
+        SOFT does **not** freeze disclosure level or lock the tool set — it
+        only influences message cache layout (PCD minimum-sufficiency preserved).
+        """
+        commitment = self._prefix_commitment
+        enforcement = commitment.enforcement
+
+        # Case 1: already committed with active enforcement
+        if commitment.committed and enforcement is not None:
+            return {
+                "commitment_status": CommitmentStatus.COMMITTED,
+                "committed_level": DisclosureLevel(enforcement.frozen_level),
+                "committed_tool_names": enforcement.frozen_tool_names,
+            }
+
+        # Case 2: uncommitted — evaluate cache benefit from prior-round snapshot
+        snap = self._last_context_snapshot
+        if not snap or commitment.committed:
+            return {}
+        msg_tokens = int(snap.get("message_tokens", 0) or 0)
+        disclosed_tool_tokens = int(snap.get("tool_schema_tokens", 0) or 0)
+        if msg_tokens <= 0:
+            return {}  # no prior-round data yet (first round)
+        est_full = msg_tokens + self._full_tool_schema_tokens()
+        est_pcd = msg_tokens + disclosed_tool_tokens
+        # Use budget max_iterations as a generous upper bound for remaining;
+        # the real commitment gate in _evaluate_prefix_commitment uses actual
+        # budget.remaining, so this only controls the soft-benefit signal.
+        remaining = max(1, self._budget_config.max_iterations - 1)
+        savings = commitment.projected_savings(
+            remaining_rounds=remaining,
+            est_full_prefix_tokens=est_full,
+            est_pcd_prefix_tokens=est_pcd,
+        )
+        if savings > 0:
+            return {
+                "commitment_status": CommitmentStatus.UNCOMMITTED,
+                "cache_benefit": True,
+            }
+        return {}
+
+    def _evaluate_prefix_commitment(self, budget: IterationBudget) -> None:
+        """Evaluate the adaptive prefix-commitment decision and apply enforcement.
+
+        Two phases run once per round on the cold path (never per token):
+
+        1. **Observe** -- compute whether the task should commit to a stable,
+           cacheable prefix and record the decision in the context snapshot for
+           observability. Reuses the token counts already produced by
+           ``_prepare_llm_messages`` plus the post-retarget budget headroom, so
+           no message body is re-estimated.
+        2. **Enforce** (W2 slice 3) -- once committed, freeze the disclosure
+           snapshot via :meth:`PrefixCommitmentController.enforce` and switch the
+           session onto the ``COMMITTED`` cache boundary so the marker
+           application in ``_prepare_llm_messages`` / before ``achat`` can cache
+           the stable prefix. When enforcement is absent (never committed, or
+           broken via :meth:`break_commitment`) the boundary falls back to
+           ``NONE`` and normal PCD dynamics resume next round.
         """
         snap = self._last_context_snapshot
         if not snap:
@@ -3145,6 +3405,122 @@ class AgentEngine:
         )
         snap["prefix_commitment"] = state.as_dict()
         snap["prefix_committed"] = state.committed
+
+        # Enforce (2c): freeze the disclosure snapshot and switch to the
+        # committed cache boundary. ``enforce`` is idempotent while an
+        # enforcement is active (returns the existing snapshot), so this is
+        # cheap to call every round. The frozen values are the disclosure
+        # decision this turn recorded in ``_last_disclosure_metadata`` plus the
+        # hash of the system prompt actually assembled this turn.
+        boundary = CacheBoundary.NONE
+        if state.committed:
+            meta = self._last_disclosure_metadata
+            enforcement = self._prefix_commitment.enforce(
+                str(meta.get("level", DisclosureLevel.CORE.value)),
+                tuple(meta.get("tools", ()) or ()),
+                _system_prompt_hash(self._last_system_prompt),
+                int(self._session_turn_count),
+            )
+            if enforcement is not None:
+                boundary = CacheBoundary.COMMITTED
+                snap["prefix_enforcement"] = {
+                    "frozen_level": enforcement.frozen_level,
+                    "frozen_tool_count": len(enforcement.frozen_tool_names),
+                    "committed_at_turn": enforcement.committed_at_turn,
+                }
+        else:
+            # P0-OPT-2: promote to SOFT when projected savings are positive.
+            # This lets PrefixCacheOptimizer stabilize the prefix layout in
+            # pre-commitment rounds without freezing disclosure or tools.
+            savings = self._prefix_commitment.projected_savings(
+                remaining_rounds=budget.remaining,
+                est_full_prefix_tokens=est_full,
+                est_pcd_prefix_tokens=est_pcd,
+            )
+            if savings > 0:
+                boundary = CacheBoundary.SOFT
+        self._current_cache_boundary = boundary
+        snap["cache_boundary"] = boundary.value
+
+    def _maybe_break_commitment(
+        self,
+        *,
+        posture_changed: bool = False,
+        tool_error: bool = False,
+        slash_command: bool = False,
+        transform_retry: bool = False,
+    ) -> bool:
+        """Break prefix-commitment enforcement on a structural prefix disruption.
+
+        Delegates the decision to
+        :meth:`PrefixCommitmentController.should_break_commitment` and, when it
+        fires, clears the enforcement (the commitment *decision* stays monotonic)
+        and drops the cache boundary back to ``NONE`` so the next round assembles
+        a fresh, non-frozen prefix. Returns whether a break occurred.
+        """
+        if not self._prefix_commitment.enforcement:
+            return False
+        if not self._prefix_commitment.should_break_commitment(
+            posture_changed=posture_changed,
+            tool_error=tool_error,
+            slash_command=slash_command,
+            transform_retry=transform_retry,
+        ):
+            return False
+        self._prefix_commitment.break_commitment()
+        self._current_cache_boundary = CacheBoundary.NONE
+        return True
+
+    @staticmethod
+    def _tool_def_name(tool_def: Any) -> str:
+        """Extract the tool name from an OpenAI-style tool definition, else ''."""
+        if not isinstance(tool_def, dict):
+            return ""
+        fn = tool_def.get("function")
+        if isinstance(fn, dict):
+            return str(fn.get("name", "") or "")
+        return str(tool_def.get("name", "") or "")
+
+    @staticmethod
+    def _safe_tools_json(tool_definitions: Any) -> str:
+        """Serialize tool definitions to a JSON string, degrading to '' on error."""
+        try:
+            return json.dumps(list(tool_definitions or ()), ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return ""
+
+    @staticmethod
+    def _parse_tool_schema(schema_json: Optional[str]) -> List[Dict[str, Any]]:
+        """Parse a persisted tool-schema JSON string into a list, else empty."""
+        if not schema_json:
+            return []
+        try:
+            parsed = json.loads(schema_json)
+        except (ValueError, TypeError):
+            return []
+        if isinstance(parsed, list):
+            return [td for td in parsed if isinstance(td, dict)]
+        return []
+
+    def _tools_kwarg_with_cache_marker(self, tools_kwarg: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a tools kwarg with the committed tool-cache marker applied.
+
+        Cold-path helper invoked once per round right before ``achat``. Only the
+        Anthropic strategy supports a frozen tool-array cache breakpoint and only
+        when the boundary is ``COMMITTED``; every other case returns the kwarg
+        unchanged (byte-identical to before). The marker is applied to a copy, so
+        the caller's ``tools_kwarg`` (which may still be mutated by mid-turn tool
+        expansion) is never touched.
+        """
+        tools = tools_kwarg.get("tools")
+        if not tools or self._current_cache_boundary is not CacheBoundary.COMMITTED:
+            return tools_kwarg
+        if not isinstance(self._cache_strategy, AnthropicCacheStrategy):
+            return tools_kwarg
+        marked = AnthropicCacheStrategy._apply_tool_cache_marker(
+            tools, self._current_cache_boundary
+        )
+        return {**tools_kwarg, "tools": marked}
 
     def _recovery_audit_path(self) -> Any:
         """Return the profile-owned path for the recovery audit trail, if declared.
@@ -3357,7 +3733,15 @@ class AgentEngine:
     # ── Unified Tool Loop (chat scenarios) ───────────────────────────────
 
     def _new_compressor(self) -> ContextCompressor:
-        """Fresh context compressor (per engine, or per isolated child frame)."""
+        """Fresh context compressor (per engine, or per isolated child frame).
+
+        The summarization callback is routed through the dedicated compression
+        provider when one is configured (``self._compression_provider``),
+        falling back to the primary LLM otherwise. Routing compression to a
+        separate provider keeps the main conversation's cache prefix intact:
+        an interleaved compression call on the primary provider would otherwise
+        break the byte-stable prefix the prefix cache depends on.
+        """
         ctx_len = self._settings.llm_context_length
         return ContextCompressor(
             CompressorConfig(
@@ -3366,8 +3750,92 @@ class AgentEngine:
                 threshold=self._settings.compress_threshold,
                 keep_tail=self._settings.compress_keep_tail,
                 max_output_chars=self._settings.max_tool_output_chars,
+                summarize_fn=self._make_compression_summarize_fn(),
             )
         )
+
+    def _make_compression_summarize_fn(self) -> Any:
+        """Build a summarize callback that prefers the dedicated compression provider.
+
+        Returns ``None`` when no provider is available (neither a dedicated
+        compression provider nor a primary LLM), so the compressor degrades to
+        its deterministic non-LLM fallback rather than crashing. The provider is
+        resolved lazily at call time so a compression provider built after the
+        compressor still takes effect.
+        """
+        async def _summarize(prompt: str) -> str:
+            provider = self._compression_provider or self._llm
+            if provider is None:
+                return ""
+            resp = await provider.achat(
+                [build_user_message_text(prompt)],
+                stream=False,
+                enable_thinking=False,
+            )
+            return (getattr(resp, "content", "") or "").strip()
+
+        return _summarize
+
+    def _build_compression_provider(self) -> Optional[LLMProvider]:
+        """Build a dedicated LLM provider for context compression, or ``None``.
+
+        Activates only when ``compression_provider`` or ``compression_model`` is
+        configured. Empty ``compression_*`` fields fall back to the primary
+        LLM's corresponding ``llm_*`` configuration, so a partial configuration
+        (e.g. only a cheaper model on the same endpoint) is valid. Constructs an
+        ``OpenAIChat`` provider directly, mirroring how the primary LLM is built
+        (the primary is an ``OpenAIChat`` wired in the CLI context), so the
+        compression endpoint speaks the same OpenAI-compatible protocol.
+
+        Returns ``None`` when unconfigured (the common path) so behaviour is
+        byte-identical to before. A construction failure degrades to ``None``
+        (compression then uses the primary provider) rather than crashing engine
+        construction — an auxiliary provider must never fail a turn.
+        """
+        settings = self._settings
+        provider_name = str(getattr(settings, "compression_provider", "") or "").strip()
+        model = str(getattr(settings, "compression_model", "") or "").strip()
+        if not provider_name and not model:
+            return None
+        api_key = str(getattr(settings, "compression_api_key", "") or "").strip()
+        base_url = str(getattr(settings, "compression_base_url", "") or "").strip()
+        # Empty compression_* fields fall back to the primary LLM configuration.
+        # Credentials are already resolved from ``secret://`` refs at config-load
+        # time (config_loader), so they are used verbatim here just like the
+        # primary provider does with ``settings.llm_api_key``. Primary provider
+        # behavior is inferred from its OpenAI-compatible base URL; there is no
+        # separate ``llm.provider`` setting.
+        effective_provider = provider_name
+        effective_model = model or str(getattr(settings, "llm_model", "") or "")
+        effective_api_key = api_key or str(getattr(settings, "llm_api_key", "") or "")
+        effective_base_url = base_url or str(getattr(settings, "llm_base_url", "") or "")
+        if not effective_api_key or not effective_base_url or not effective_model:
+            logger.debug(
+                "compression provider not built: incomplete config "
+                "(model=%s base_url set=%s api_key set=%s)",
+                effective_model, bool(effective_base_url), bool(effective_api_key),
+            )
+            return None
+        try:
+            from leapflow.llm.openai_provider import OpenAIChat
+
+            provider = OpenAIChat(
+                api_key=effective_api_key,
+                base_url=effective_base_url,
+                model=effective_model,
+                max_retries=int(getattr(settings, "llm_max_retries", 3) or 3),
+                provider=effective_provider or None,
+            )
+            logger.info(
+                "compression provider built: model=%s (independent of primary)",
+                effective_model,
+            )
+            return provider
+        except (ImportError, RuntimeError, ValueError, TypeError, KeyError) as exc:
+            logger.warning(
+                "compression provider construction failed; using primary provider: %s", exc
+            )
+            return None
 
     def _new_governance(self) -> ContextGovernanceController:
         """Fresh context-governance controller (per engine, or per child frame)."""
@@ -3617,11 +4085,15 @@ class AgentEngine:
         # this turn's own tool_calls for the *next* turn's plan.
         self._last_turn_tool_categories = frozenset()
 
-        messages: List[Dict[str, Any]] = [
-            build_system_message(assembly.system),
-            *assembly.prior_turns,
-            build_user_message_text(user_text),
-        ]
+        messages: List[Dict[str, Any]] = [build_system_message(assembly.system)]
+        if assembly.volatile_context:
+            messages.append({
+                "role": "system",
+                "content": assembly.volatile_context,
+                "_volatile_context": True,
+            })
+        messages.extend(assembly.prior_turns)
+        messages.append(build_user_message_text(user_text))
 
         content = ""
         fatal_error: Optional[str] = None
@@ -3680,17 +4152,29 @@ class AgentEngine:
                 healed,
                 tools=tools_kwarg.get("tools"),
                 round_number=budget.used,
+                defer_cache_optimization=True,
             )
             self._widen_budget_for_difficulty(budget)
             self._update_progress_and_stall(frame)
             self._evaluate_prefix_commitment(budget)
+            # PCD 2d: a posture upgrade or slash injection disrupts the frozen
+            # prefix, so break enforcement and resume normal PCD next round.
+            _posture_now = str(self._last_context_snapshot.get("context_posture") or "baseline")
+            self._maybe_break_commitment(
+                posture_changed=_posture_now != self._prev_context_posture,
+                slash_command=user_text.startswith("/"),
+            )
+            self._prev_context_posture = _posture_now
+            # Apply markers only after this round's commitment evaluation (and
+            # any same-round break), eliminating the first-commit boundary skew.
+            compressed = self._apply_message_cache_strategy(compressed)
 
             try:
                 resp = await self._llm.achat(
                     compressed,
                     stream=False,
                     enable_thinking=planned_enable_thinking,
-                    **tools_kwarg,
+                    **self._tools_kwarg_with_cache_marker(tools_kwarg),
                 )
             except Exception as exc:
                 _clear_indicator()
@@ -3740,6 +4224,9 @@ class AgentEngine:
                     continue
 
                 elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                    # PCD 2d: a recovery transform rewrites the request, breaking
+                    # the frozen prefix; drop enforcement so the retry re-plans.
+                    self._maybe_break_commitment(transform_retry=True)
                     # Handle native_to_text locally (needs local var mutation)
                     if decision.strategy_key == "native_to_text":
                         tools_kwarg = {}
@@ -3812,21 +4299,10 @@ class AgentEngine:
 
             native_calls = getattr(resp, "tool_calls", None) or []
             if native_calls:
-                # Preamble exclusion: content alongside tool_calls is ephemeral
-                # reasoning — exclude it from the message context to prevent
-                # the next LLM turn from repeating it in the final answer.
-                assistant_msg: Dict[str, Any] = {"role": "assistant", "content": ""}
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments, ensure_ascii=False),
-                        },
-                    }
-                    for tc in native_calls
-                ]
+                assistant_msg = _build_native_tool_assistant_message(
+                    native_calls,
+                    thinking_content=getattr(resp, "thinking_content", None),
+                )
                 messages.append(assistant_msg)
                 self._persist_message(
                     session_id, "assistant", "", tool_calls=assistant_msg.get("tool_calls")
@@ -3863,6 +4339,9 @@ class AgentEngine:
                 )
                 if retryable_unknown and not unknown_tool_retry_used:
                     unknown_tool_retry_used = True
+                    # PCD 2d: the frozen tool subset proved insufficient; break
+                    # enforcement before escalating to the full catalog.
+                    self._maybe_break_commitment(tool_error=True)
                     tools_kwarg = self._expand_tools_kwarg_full(tools_kwarg, tool_defs)
                     use_native_tools = bool(tools_kwarg)
                     messages.append(
@@ -3910,6 +4389,9 @@ class AgentEngine:
                 continue
 
             self._persist_message(session_id, "assistant", content)
+            # PCD 5b: snapshot the assembled prefix so a cache-priority resume
+            # can reproduce it verbatim and hit the provider cache immediately.
+            self._persist_session_snapshot(session_id)
             tool_call = self._parse_tool_call_from_content(content)
 
             if tool_call is None:
@@ -3991,6 +4473,8 @@ class AgentEngine:
 
             if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
                 unknown_tool_retry_used = True
+                # PCD 2d: frozen tool subset insufficient; break enforcement.
+                self._maybe_break_commitment(tool_error=True)
                 messages.append(build_user_message_text(_unknown_tool_retry_prompt(result)))
                 continue
 
@@ -4212,11 +4696,15 @@ class AgentEngine:
         # this turn's own tool_calls for the *next* turn's plan.
         self._last_turn_tool_categories = frozenset()
 
-        messages: List[Dict[str, Any]] = [
-            build_system_message(assembly.system),
-            *assembly.prior_turns,
-            build_user_message_text(user_text),
-        ]
+        messages: List[Dict[str, Any]] = [build_system_message(assembly.system)]
+        if assembly.volatile_context:
+            messages.append({
+                "role": "system",
+                "content": assembly.volatile_context,
+                "_volatile_context": True,
+            })
+        messages.extend(assembly.prior_turns)
+        messages.append(build_user_message_text(user_text))
 
         content = ""
         fatal_error: Optional[str] = None
@@ -4276,10 +4764,22 @@ class AgentEngine:
                 healed,
                 tools=tools_kwarg.get("tools") if use_native_tools else None,
                 round_number=budget.used,
+                defer_cache_optimization=True,
             )
             self._widen_budget_for_difficulty(budget)
             self._update_progress_and_stall(self._active_frame)
             self._evaluate_prefix_commitment(budget)
+            # PCD 2d: a posture upgrade or slash injection disrupts the frozen
+            # prefix, so break enforcement and resume normal PCD next round.
+            _posture_now = str(self._last_context_snapshot.get("context_posture") or "baseline")
+            self._maybe_break_commitment(
+                posture_changed=_posture_now != self._prev_context_posture,
+                slash_command=user_text.startswith("/"),
+            )
+            self._prev_context_posture = _posture_now
+            # Match the non-streaming loop: provider markers see the boundary
+            # resolved from this round's freshly prepared context snapshot.
+            compressed = self._apply_message_cache_strategy(compressed)
 
             content = ""
 
@@ -4289,7 +4789,7 @@ class AgentEngine:
                         compressed,
                         stream=False,
                         enable_thinking=planned_enable_thinking,
-                        **tools_kwarg,
+                        **self._tools_kwarg_with_cache_marker(tools_kwarg),
                     )
                 except Exception as exc:
                     _clear_indicator()
@@ -4338,6 +4838,8 @@ class AgentEngine:
                             )
                         continue
                     elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                        # PCD 2d: recovery transform breaks the frozen prefix.
+                        self._maybe_break_commitment(transform_retry=True)
                         if decision.strategy_key == "native_to_text":
                             tools_kwarg = {}
                             use_native_tools = False
@@ -4394,23 +4896,14 @@ class AgentEngine:
                     # (excluded from context to prevent repetition, but valuable for user visibility)
                     if content:
                         yield StreamEvent(type="thinking", content=content)
-                    # Preamble exclusion: content alongside tool_calls is ephemeral
-                    # reasoning — exclude from context to prevent final-answer repetition.
-                    # Clear the local copy too: on a later halt/break this must not
-                    # leak as the turn's final answer ahead of a synthesized one.
+                    # Clear the visible preamble so it cannot become a final answer.
+                    # Provider continuation reasoning remains on the assistant tool
+                    # message, where DeepSeek requires it for the following request.
                     content = ""
-                    assistant_msg: Dict[str, Any] = {"role": "assistant", "content": ""}
-                    assistant_msg["tool_calls"] = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments, ensure_ascii=False),
-                            },
-                        }
-                        for tc in native_calls
-                    ]
+                    assistant_msg = _build_native_tool_assistant_message(
+                        native_calls,
+                        thinking_content=thinking,
+                    )
                     messages.append(assistant_msg)
                     self._persist_message(
                         session_id,
@@ -4598,6 +5091,8 @@ class AgentEngine:
                                 )
                             continue
                         elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                            # PCD 2d: recovery transform breaks the frozen prefix.
+                            self._maybe_break_commitment(transform_retry=True)
                             self._execute_transform_decision(decision, messages)
                             coordinator.on_strategy_outcome(decision.decision_id, True)
                             continue
@@ -4628,6 +5123,17 @@ class AgentEngine:
                     content = "".join(content_parts).strip()
                     if self._sanitizer:
                         content = self._sanitizer.sanitize(content)
+                    # Streaming text path: achat_stream() yields only text
+                    # chunks — no response object carries usage.  Record the
+                    # API call so the tracker counts it; token counters stay
+                    # at zero when the provider's stream omits usage data.
+                    _stream_resp = types.SimpleNamespace(
+                        usage=None,
+                        model=getattr(self._llm, "model", ""),
+                    )
+                    self._record_llm_call_telemetry(
+                        _stream_resp, recovery=turn_recovery,
+                    )
                 else:
                     try:
                         resp = await self._llm.achat(
@@ -4672,6 +5178,8 @@ class AgentEngine:
                                 )
                             continue
                         elif decision.action == RecoveryAction.TRANSFORM_AND_RETRY:
+                            # PCD 2d: recovery transform breaks the frozen prefix.
+                            self._maybe_break_commitment(transform_retry=True)
                             self._execute_transform_decision(decision, messages)
                             coordinator.on_strategy_outcome(decision.decision_id, True)
                             continue
@@ -4720,6 +5228,9 @@ class AgentEngine:
                         continue
 
             self._persist_message(session_id, "assistant", content)
+            # PCD 5b: snapshot the assembled prefix so a cache-priority resume
+            # can reproduce it verbatim and hit the provider cache immediately.
+            self._persist_session_snapshot(session_id)
             tool_call = self._parse_tool_call_from_content(content)
 
             if tool_call is None:
@@ -4857,6 +5368,8 @@ class AgentEngine:
 
             if _is_retryable_unknown_tool_result(result) and not unknown_tool_retry_used:
                 unknown_tool_retry_used = True
+                # PCD 2d: frozen tool subset insufficient; break enforcement.
+                self._maybe_break_commitment(tool_error=True)
                 messages.append(build_user_message_text(_unknown_tool_retry_prompt(result)))
                 continue
 
@@ -6098,6 +6611,34 @@ class AgentEngine:
             )
         except Exception:
             logger.debug("session.persist_message failed", exc_info=True)
+
+    def _persist_session_snapshot(self, session_id: Optional[str]) -> None:
+        """Persist the current committed prefix for cache-priority resume (5b).
+
+        Records the system prompt, tool schema (JSON), and disclosure level that
+        this turn actually assembled so a later ``build_session_engine`` resume
+        can reproduce a byte-identical prefix and hit the provider cache on its
+        first request. Fire-and-forget and gated on session persistence: an
+        auxiliary snapshot must never fail or slow the main turn.
+        """
+        if not session_id or not self._conversation_store:
+            return
+        if not self._settings.session_persistence_enabled:
+            return
+        if not self._last_system_prompt:
+            return
+        updater = getattr(self._conversation_store, "update_session_snapshot", None)
+        if updater is None:
+            return
+        try:
+            updater(
+                session_id,
+                system_prompt=self._last_system_prompt,
+                tool_schema=self._last_tool_definitions_json or None,
+                disclosure_level=self._last_disclosure_level or None,
+            )
+        except Exception:
+            logger.debug("session.persist_snapshot failed", exc_info=True)
 
     async def _prefetch_and_freeze_memory(self, user_text: str) -> str:
         """Prefetch memory context and freeze snapshot for session duration.

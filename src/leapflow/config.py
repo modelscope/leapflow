@@ -636,6 +636,17 @@ class Settings:
 
     # ── Session Persistence ──
     session_persistence_enabled: bool = True
+    # Session resume cache strategy: cache_priority keeps the persisted tool
+    # schema so the LLM prefix cache hits; tool_freshness re-discovers tools.
+    session_resume_cache_policy: str = "cache_priority"
+
+    # ── Compression Provider (PCD Cache-Aware) ──
+    # Dedicated provider for context compression. Empty strings fall back to
+    # the primary LLM provider/model/key/url respectively.
+    compression_provider: str = ""
+    compression_model: str = ""
+    compression_api_key: str = ""  # supports secret:// refs like llm_api_key
+    compression_base_url: str = ""
 
     # ── Multi-Provider LLM ──
     llm_fallback_providers: str = ""  # JSON array of fallback provider configs
@@ -1279,6 +1290,13 @@ def _build_settings_from_env(
 
     # Session Persistence
     session_persistence_enabled = _bool("LEAPFLOW_SESSION_PERSISTENCE_ENABLED", "true")
+    session_resume_cache_policy = os.getenv("LEAPFLOW_SESSION_RESUME_CACHE_POLICY", "cache_priority").strip()
+
+    # Compression Provider (PCD Cache-Aware)
+    compression_provider = os.getenv("LEAPFLOW_COMPRESSION_PROVIDER", "").strip()
+    compression_model = os.getenv("LEAPFLOW_COMPRESSION_MODEL", "").strip()
+    compression_api_key = os.getenv("LEAPFLOW_COMPRESSION_API_KEY", "").strip()
+    compression_base_url = os.getenv("LEAPFLOW_COMPRESSION_BASE_URL", "").strip()
 
     # Multi-Provider LLM
     llm_fallback_providers = os.getenv("LEAPFLOW_LLM_FALLBACK_PROVIDERS", "").strip()
@@ -1691,6 +1709,12 @@ def _build_settings_from_env(
         guardrail_min_success_rate=guardrail_min_success_rate,
         # Session Persistence
         session_persistence_enabled=session_persistence_enabled,
+        session_resume_cache_policy=session_resume_cache_policy,
+        # Compression Provider (PCD Cache-Aware)
+        compression_provider=compression_provider,
+        compression_model=compression_model,
+        compression_api_key=compression_api_key,
+        compression_base_url=compression_base_url,
         # Multi-Provider LLM
         llm_fallback_providers=llm_fallback_providers,
         llm_aux_model=llm_aux_model,
@@ -1809,6 +1833,19 @@ def validate_settings(settings: Settings) -> list[str]:
         warnings.append(
             "llm_aux_model is set but no API key available (neither aux nor primary). "
             "Auxiliary LLM calls will fail."
+        )
+
+    if settings.session_resume_cache_policy not in ("cache_priority", "tool_freshness"):
+        warnings.append(
+            f"session_resume_cache_policy='{settings.session_resume_cache_policy}' is not "
+            "a recognised value; expected 'cache_priority' or 'tool_freshness'. "
+            "Defaulting to cache_priority behaviour."
+        )
+
+    if settings.compression_model and not settings.compression_api_key and not settings.llm_api_key:
+        warnings.append(
+            "compression_model is set but no API key available (neither compression nor primary). "
+            "Compression LLM calls will fail."
         )
 
     if settings.llm_fallback_providers:
