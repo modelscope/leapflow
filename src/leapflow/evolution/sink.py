@@ -3,7 +3,7 @@
 
 The probe's contract is "accept and return", so ``record`` only appends to a bounded
 deque. Persistence happens when someone calls :meth:`flush` -- the daemon's monitor
-cycle, or process exit -- which keeps a file write out of the plugin registry's
+cycle, or process exit -- which keeps an event-store write out of the plugin registry's
 version bump and the trust ledger's level transition.
 
 The buffer is bounded and drops *oldest* on overflow. That is the right direction
@@ -90,6 +90,12 @@ class LedgerEvolutionSink:
     def pending(self) -> tuple[EvolutionTrace, ...]:
         """Buffered traces not yet flushed, for a reader that wants live state."""
         return tuple(self._buffer)
+
+    def list_traces(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Read persisted traces through the configured event-store adapter."""
+        if self._store is None or not hasattr(self._store, "list_traces"):
+            return []
+        return [dict(item) for item in self._store.list_traces(limit=limit)]
 
     @property
     def stats(self) -> dict[str, int]:

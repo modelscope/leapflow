@@ -18,9 +18,46 @@ from types import SimpleNamespace
 from typing import Any
 
 from leapflow.domain.adaptation_verdict import AdaptationVerdict
+from leapflow.domain.capability_requirement import CapabilityRequirement
 from leapflow.learning.capability_gap_detector import CapabilityGapDetector
-from leapflow.learning.degradation_sink import build_proposal_sink
-from leapflow.storage.capability_proposal_queue import JsonCapabilityProposalQueue
+from leapflow.storage.capability_proposal_queue import EvolutionCapabilityProposalStore
+from leapflow.storage.evolution_event_store import DuckDBEvolutionEventStore
+
+
+def _enqueue(queue: Any, proposal: Any) -> str:
+    """The acquisition chain's last hop, inlined: intent -> requirement -> queue.
+
+    Mirrors ``DurableTeacherWorker._plan_acquisitions`` exactly -- a requirement keyed
+    on the capability, clamped risk, ``world_model`` source -- so the queue's dedup and
+    risk-clamp contract stays under test without the deleted proposal sink.
+    """
+    evidence = tuple(getattr(proposal, "evidence", ()) or ())
+    metadata = dict(getattr(evidence[0], "metadata", {})) if evidence else {}
+    capability = str(metadata.get("capability") or "").strip()
+    if not capability:
+        return ""
+    requirement = CapabilityRequirement.create(
+        capability,
+        "world_model",
+        evidence=str(getattr(proposal, "capability_summary", "") or capability),
+        max_risk_level=str(getattr(proposal, "risk_level", "read_only")),
+        requirement_id=f"req-wm-{capability}",
+    )
+    try:
+        item = queue.enqueue(
+            requirements=(requirement,),
+            source="world_model",
+            risk={"max_risk_level": requirement.max_risk_level},
+        )
+    except Exception:  # noqa: BLE001 - queueing must not fail the session
+        return ""
+    return str(getattr(item, "proposal_id", ""))
+
+
+def _queue(tmp_path: Path) -> EvolutionCapabilityProposalStore:
+    return EvolutionCapabilityProposalStore(
+        DuckDBEvolutionEventStore(tmp_path / "events.duckdb"), profile_id="profile-1"
+    )
 
 
 def _proposal(capability: str, *, risk: str = "read_only") -> Any:
@@ -39,8 +76,8 @@ def test_an_acquire_verdict_reaches_the_proposal_queue(tmp_path):
     Resolution would report the capability unmet forever, so the teacher's most expensive
     verdict -- the only one that leads to code -- had no effect whatsoever.
     """
-    queue = JsonCapabilityProposalQueue(tmp_path / "q.json")
-    identifier = build_proposal_sink(queue=queue)(_proposal("mail.send"))
+    queue = _queue(tmp_path)
+    identifier = _enqueue(queue, _proposal("mail.send"))
 
     assert identifier
     items = queue.list_items()
@@ -57,12 +94,11 @@ def test_the_same_capability_does_not_pile_up_across_sessions(tmp_path):
     would face a growing pile of identical items, and the queue's depth would measure how
     long the process had been running rather than how much was outstanding.
     """
-    queue = JsonCapabilityProposalQueue(tmp_path / "q.json")
-    sink = build_proposal_sink(queue=queue)
+    queue = _queue(tmp_path)
 
-    first = sink(_proposal("mail.send"))
-    second = sink(_proposal("mail.send"))
-    other = sink(_proposal("chat.reply"))
+    first = _enqueue(queue, _proposal("mail.send"))
+    second = _enqueue(queue, _proposal("mail.send"))
+    other = _enqueue(queue, _proposal("chat.reply"))
 
     assert first == second, "the same capability must resolve to the same proposal"
     assert other != first
@@ -76,8 +112,8 @@ def test_the_queued_requirement_keeps_the_clamped_risk(tmp_path):
     to ``read_only`` enter the queue asking for everything -- the exact opposite of what
     the clamp exists for.
     """
-    queue = JsonCapabilityProposalQueue(tmp_path / "q.json")
-    build_proposal_sink(queue=queue)(_proposal("shell.run", risk="external"))
+    queue = _queue(tmp_path)
+    _enqueue(queue, _proposal("shell.run", risk="external"))
 
     requirement = queue.list_items()[0].requirements[0]
     assert requirement["max_risk_level"] == "read_only", "the model cannot widen its own ask"
@@ -85,10 +121,9 @@ def test_the_queued_requirement_keeps_the_clamped_risk(tmp_path):
 
 def test_a_proposal_without_a_capability_is_refused(tmp_path):
     """The queue has nothing to deduplicate on and resolution nothing to satisfy."""
-    queue = JsonCapabilityProposalQueue(tmp_path / "q.json")
-    sink = build_proposal_sink(queue=queue)
+    queue = _queue(tmp_path)
 
-    assert sink(SimpleNamespace(evidence=(), proposal_id="p1")) == ""
+    assert _enqueue(queue, SimpleNamespace(evidence=(), proposal_id="p1")) == ""
     assert queue.list_items() == []
 
 
@@ -99,7 +134,7 @@ def test_a_failing_queue_does_not_fail_the_session(tmp_path):
         def enqueue(self, **kwargs):
             raise OSError("disk full")
 
-    assert build_proposal_sink(queue=_Broken())(_proposal("mail.send")) == ""
+    assert _enqueue(_Broken(), _proposal("mail.send")) == ""
 
 
 # ── the audit itself, kept honest ─────────────────────────────────────────────

@@ -522,6 +522,57 @@ class DaemonClient:
         """Ensure a session-analysis watch and run one analysis cycle now."""
         return dict(await self.request("session.analyze") or {})
 
+    async def evolution_run(
+        self,
+        *,
+        session_id: str,
+        reason: str = "manual",
+        wait: bool = False,
+        timeout_s: float = 180.0,
+    ) -> dict[str, Any]:
+        """Finalize one named session and optionally await its teacher job."""
+        return dict(
+            await self.request(
+                "evolution.run",
+                {
+                    "session_id": session_id,
+                    "reason": reason,
+                    "wait": wait,
+                    "timeout_s": timeout_s,
+                },
+            )
+            or {}
+        )
+
+    async def evolution_projection(
+        self,
+        *,
+        session_id: str,
+        rebuild: bool = False,
+    ) -> dict[str, Any]:
+        """Return the event projection for one explicitly named session."""
+        return dict(
+            await self.request(
+                "evolution.projection",
+                {"session_id": session_id, "rebuild": rebuild},
+            )
+            or {}
+        )
+
+    async def evolution_projection_aggregate(
+        self,
+        *,
+        rebuild: bool = False,
+    ) -> dict[str, Any]:
+        """Return the explicitly cross-session profile projection."""
+        return dict(
+            await self.request(
+                "evolution.projection.aggregate",
+                {"rebuild": rebuild},
+            )
+            or {}
+        )
+
     async def signal_record(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Inject a signal event into the daemon's EventBus."""
         return dict(await self.request(

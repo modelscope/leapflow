@@ -5,15 +5,12 @@ Verifies that the minimal asyncio-based HTTP server correctly serves
 plugin manifests and code files, matching the API expected by HttpMarketplaceSource.
 """
 
-import asyncio
 import json
 from pathlib import Path
-from typing import List
 
 import pytest
 import httpx
 
-from leapflow.plugins.marketplace.manifest import PluginManifest
 from leapflow.plugins.marketplace.server import MarketplaceServer
 
 

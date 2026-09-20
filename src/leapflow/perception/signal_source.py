@@ -14,7 +14,7 @@ Design: transform-only (stateless). Sources are pure functions of
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, FrozenSet, Optional, Protocol, runtime_checkable
 
 from leapflow.perception.types import InteractionSignal
 

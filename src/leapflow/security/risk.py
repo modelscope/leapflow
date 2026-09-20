@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -511,18 +512,89 @@ class DefaultRiskClassifier:
     def _matched_reasons(command: str, rules: tuple[tuple[re.Pattern[str], str], ...]) -> list[str]:
         return [reason for pattern, reason in rules if pattern.search(command)]
 
-    @staticmethod
-    def _mentions_sensitive_config(command: str) -> bool:
-        lowered = command.lower().replace("\\", "/")
-        configured_roots = tuple(
-            str(root).lower().replace("\\", "/").rstrip("/")
-            for root in configured_path_sensitivity_roots()
+    _SHELL_CONTROL_OPERATORS = frozenset({"&&", "||", ";", "|", "&"})
+    _SHELL_REDIRECTION_OPERATORS = frozenset({">", ">>", "<", "<<", "<<<"})
+    _SHELL_FILE_ACCESS_COMMANDS = frozenset({
+        ".", "awk", "cat", "chmod", "chown", "cp", "cut", "diff", "find", "grep", "head",
+        "less", "ln", "ls", "more", "mv", "rg", "ripgrep", "rm", "sed", "sort", "source",
+        "stat", "tail", "tee", "test", "touch", "uniq", "vim",
+    })
+    _SHELL_PATTERN_ARGUMENT_COMMANDS = frozenset({"awk", "grep", "rg", "ripgrep", "sed"})
+    _SENSITIVE_CONFIG_SUFFIXES = (
+        "/.leapflow/config.yaml", "/.leapflow/workspace.yaml", "/config/user.yaml",
+        "/mcp_servers.json", "/workspace.yaml", "/tui_history",
+    )
+
+    @classmethod
+    def _mentions_sensitive_config(cls, command: str) -> bool:
+        """Return whether a shell command addresses a sensitive path operand.
+
+        Commands are tokenized before inspecting path operands so text such as
+        ``echo config.yaml`` is not confused with file access. Shell parsing
+        failures retain the command's other risk matches but do not promote an
+        arbitrary substring to a sensitive-config operation.
+        """
+        try:
+            tokens = shlex.split(command, posix=True, comments=False)
+        except ValueError:
+            return False
+
+        segment: list[str] = []
+        for token in [*tokens, ";"]:
+            if token in cls._SHELL_CONTROL_OPERATORS:
+                if cls._segment_mentions_sensitive_config(segment):
+                    return True
+                segment = []
+            else:
+                segment.append(token)
+        return False
+
+    @classmethod
+    def _segment_mentions_sensitive_config(cls, segment: list[str]) -> bool:
+        if not segment:
+            return False
+
+        for index, token in enumerate(segment):
+            if token in cls._SHELL_REDIRECTION_OPERATORS:
+                if index + 1 < len(segment) and cls._is_sensitive_shell_path(segment[index + 1]):
+                    return True
+                continue
+            match = re.match(r"^(?:\\d*(?:>>?|<<?<?))(.+)$", token)
+            if match and cls._is_sensitive_shell_path(match.group(1)):
+                return True
+
+        command_index = next(
+            (index for index, token in enumerate(segment) if not token.startswith("-") and "=" not in token),
+            None,
         )
+        if command_index is None:
+            return False
+        command = segment[command_index].lower()
+        if command not in cls._SHELL_FILE_ACCESS_COMMANDS:
+            return False
+
+        operands = [token for token in segment[command_index + 1:] if not token.startswith("-")]
+        if command in cls._SHELL_PATTERN_ARGUMENT_COMMANDS and operands:
+            operands = operands[1:]
+        return any(cls._is_sensitive_shell_path(token) for token in operands)
+
+    @classmethod
+    def _is_sensitive_shell_path(cls, token: str) -> bool:
+        candidate = token.split("=", 1)[-1].strip().replace("\\", "/")
+        if not candidate or candidate.startswith(("http://", "https://")):
+            return False
+        expanded = str(Path(candidate).expanduser()).replace("\\", "/")
+        lowered = expanded.lower().rstrip("/")
+        if Path(expanded).name.lower() in cls._SENSITIVE_NAMES:
+            return True
+        if any(part in lowered for part in cls._SENSITIVE_PARTS):
+            return True
+        if lowered.endswith(cls._SENSITIVE_CONFIG_SUFFIXES):
+            return True
         return any(
-            token in lowered
-            for token in (
-                ".env", "vault.json", "vault.key", "secrets.yaml", "config/user.yaml",
-                "mcp_servers.json", "workspace.yaml", ".leapflow/config.yaml", "tui_history",
-                "profiles/", "config.yaml", *configured_roots,
+            lowered == root or lowered.startswith(root + "/")
+            for root in (
+                str(path).lower().replace("\\", "/").rstrip("/")
+                for path in configured_path_sensitivity_roots()
             )
         )

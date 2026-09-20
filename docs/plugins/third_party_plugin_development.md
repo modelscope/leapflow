@@ -117,6 +117,7 @@ class ToolMetadata:
     handler: Callable[..., Any]
     x_leapflow: dict[str, Any] = field(default_factory=dict)
     mutates_state: bool = False
+    execution_policy: str = ""
 
     def to_openai_schema(self) -> dict[str, Any]:
         """Generate OpenAI function-calling schema dict."""
@@ -135,13 +136,14 @@ class ToolMetadata:
     "x_leapflow": {
       "category": "integration",
       "mutates_state": true,
-      "risk_level": "medium"
+      "risk_level": "medium",
+      "execution_policy": "mutating_once"
     }
   }
 }
 ```
 
-When `mutates_state=True`, `to_openai_schema()` folds it into `x_leapflow.mutates_state` so schema-only consumers can classify side-effecting tools without accessing the metadata object.
+When `mutates_state=True`, `to_openai_schema()` folds it into `x_leapflow.mutates_state`. A non-empty `execution_policy` is folded into `x_leapflow.execution_policy` as well, so schema-only consumers use the same declared execution semantics as the runtime.
 
 **`x_leapflow` well-known keys:**
 
@@ -157,6 +159,7 @@ omit approval/idempotency metadata.
 | `schema_cost` | `str` | `"low"` / `"medium"` / `"high"` — token cost hint for PCD |
 | `requires_approval` | `bool` | Whether the engine gates this tool behind approval |
 | `mutates_state` | `bool` | Auto-populated from the field when `True` |
+| `execution_policy` | `str` | `read_only`, `mutating_idempotent`, `mutating_once`, or `external_side_effect`; undeclared policies fail safe as external |
 
 ### 2.3 GatewayAdapterPlugin Protocol
 
@@ -388,6 +391,7 @@ ToolMetadata(
     parameters_schema={...},
     handler=handle_delete,
     mutates_state=True,
+    execution_policy="external_side_effect",
     x_leapflow={
         "category": "cloud_ops",
         "risk_level": "high",
@@ -396,7 +400,7 @@ ToolMetadata(
 )
 ```
 
-For platform actions (gateway send, external API write), use `ActionDescriptor.platform_action(platform, action, metadata)` within the handler to explicitly request gate evaluation.
+For platform actions (gateway send, external API write), use `execution_policy="external_side_effect"` and `ActionDescriptor.platform_action(platform, action, metadata)`. The action descriptor requests approval; the execution policy controls durable evidence, duplicate suppression, batch stopping, and uncertain-effect reporting. Runtime policy is derived only from these declarations, never from the tool name.
 
 ### 3.6 Code Quality
 
@@ -426,9 +430,9 @@ The following is the ordered sequence from plugin source to tool invocation:
 
 ### Step 4: PluginFiber Lifecycle
 
-5. **`ScopedToolRegistry.adopt_existing_plugins()`**: Called on first `leapflow.plugins.get_scoped_registry()` access. It creates a `PluginFiber` for every already-registered plugin and uses the fast path `PENDING → ACTIVE` for the current built-in/profile ToolPlugin runtime. The `PluginFiber` domain type also supports `LOADING` and `FAILED` retry states for future async initialization paths, but the scoped registry does not yet run a dependency-driven async activation loop.
+5. **`ScopedToolRegistry.adopt_existing_plugins()`**: Called on first `leapflow.plugins.get_scoped_registry()` access. It creates a `PluginFiber` for every already-registered plugin. Dependency-free built-ins use `PENDING → ACTIVE`; dependency-bearing plugins use `PENDING → LOADING → ACTIVE` when providers become available.
 
-Fiber domain state machine: `PENDING → LOADING → ACTIVE → UNLOADING → DISPOSED` (with `LOADING → FAILED → LOADING` retry path). Current ToolPlugin registration uses the fast path `PENDING → ACTIVE`; `LOADING`/`FAILED` are available primitives, not automatic dependency orchestration.
+Fiber domain state machine: `PENDING → DRAFT → ACTIVE → UNLOADING → DISPOSED` for isolated candidates, plus `PENDING → LOADING → ACTIVE` and `LOADING → FAILED → LOADING` for dependency-driven activation. DRAFT plugins expose no live handlers until atomic promotion.
 
 ### Step 5: Per-Turn Engine Assembly
 
@@ -485,7 +489,7 @@ Typical interceptor use cases include audit logging, execution timeout, approval
 
 ### Dependency Binding and Activation
 
-Plugins declare `dependencies`, and `ToolPluginRegistry.bind_runtime()` distributes matching runtime dependencies in topological plugin order. Current ToolPlugin activation still uses the `ScopedToolRegistry` fast path (`PENDING → ACTIVE`) after registration; plugins that require a dependency should degrade gracefully in their handler when the dependency is not bound. A future async activation loop may use the `LOADING`/`FAILED` states for dependency-driven retries, but that is not yet automatic.
+Plugins declare `dependencies`, and `ToolPluginRegistry.bind_runtime()` distributes matching runtime dependencies in topological plugin order. `ScopedToolRegistry` activates dependency-free plugins immediately and keeps dependency-bearing fibers in `LOADING` until their providers are active; handlers must still degrade gracefully when optional runtime dependencies are absent.
 
 ---
 
@@ -530,7 +534,7 @@ description:
 - **`--id <plugin_id>`** — override the auto-derived plugin id (a slug of the
   description). A colliding id is rejected cleanly.
 
-Generation is controlled by `plugin.generation_enabled` (enabled by default in current config; disable via `/config set plugin.generation_enabled false`) and requires an LLM provider. Installation still remains a separate approval-gated action.
+Generation is controlled by `plugin.generation_enabled` and requires an LLM provider. Proposal-backed generation stores validated source in profile CAS and requires explicit content approval. Installation remains a separate mutation approval.
 
 **Difference from the `plugin_generate` agent tool**: `/plugin generate` is a
 *user-initiated* control-plane command — the user's invocation is the consent, so it

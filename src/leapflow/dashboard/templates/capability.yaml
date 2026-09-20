@@ -117,7 +117,7 @@ layout:
                 - key: plugin_id
                   label: "Plugin"
                 - key: trust_level
-                  label: "Trust"
+                  label: "Maturity"
                 - key: failure_streak
                   label: "Failures"
               bind: capability_plan.governance_results

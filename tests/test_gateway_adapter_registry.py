@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import sys
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from leapflow.gateway.adapter_registry import GatewayAdapterRegistry, BuiltinAdapterPlugin
+from leapflow.gateway.adapter_registry import GatewayAdapterRegistry
 from leapflow.gateway.scoped_adapter_registry import ScopedGatewayAdapterRegistry
 from leapflow.gateway.protocol import PlatformAdapter
 

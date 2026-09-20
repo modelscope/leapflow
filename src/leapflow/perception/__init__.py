@@ -15,6 +15,7 @@ from leapflow.perception.active_signal_source import (
     EmitCallback,
 )
 from leapflow.perception.config import PerceptionConfig, SamplingConfig, ScorerConfig
+from leapflow.perception.environment_source import EnvironmentSource, EnvironmentSourceManager
 from leapflow.perception.session import PerceptionSession
 from leapflow.perception.signal_source import (
     SignalSource,
@@ -38,6 +39,8 @@ __all__ = [
     "ActiveSourceManager",
     "DiscordBotSignalSource",
     "EmitCallback",
+    "EnvironmentSource",
+    "EnvironmentSourceManager",
     "FeishuIMSignalSource",
     "FileWatchSignalSource",
     "SlackBotSignalSource",

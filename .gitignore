@@ -221,6 +221,7 @@ __marimo__/
 *.duckdb
 *.duckdb.wal
 .leapflow/
+.learnings/
 .idea/
 
 # Swift / Xcode
@@ -234,6 +235,7 @@ Package.resolved
 # OSHost socket path (runtime)
 leapflow.sock
 
-temp
+# Entire temp directory is ignored (scratch / transient artifacts only).
+temp/
 .DS_Store
 AGENTS.md

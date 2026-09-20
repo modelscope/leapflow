@@ -27,6 +27,7 @@ class PluginStatsStore:
         self._db_path = db_path
         self._table_created = False
         self._usage_table_created = False
+        self._transitions_table_created = False
 
     def _connect(self):
         """Get a DuckDB connection using the centralized factory."""
@@ -64,6 +65,54 @@ class PluginStatsStore:
             )
         """)
         self._usage_table_created = True
+
+    def _ensure_transitions_table(self, conn) -> None:
+        """Create the trust transitions time-series table if it does not exist."""
+        if self._transitions_table_created:
+            return
+        conn.execute("""
+            CREATE SEQUENCE IF NOT EXISTS seq_trust_transition_id START 1
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS plugin_trust_transitions (
+                id INTEGER PRIMARY KEY DEFAULT nextval('seq_trust_transition_id'),
+                plugin_id TEXT NOT NULL,
+                from_level INTEGER NOT NULL,
+                to_level INTEGER NOT NULL,
+                trigger TEXT NOT NULL,
+                consecutive_ok INTEGER,
+                consecutive_fail INTEGER,
+                transitioned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self._transitions_table_created = True
+
+    def record_trust_transition(
+        self,
+        plugin_id: str,
+        from_level: int,
+        to_level: int,
+        trigger: str,
+        consecutive_ok: int | None = None,
+        consecutive_fail: int | None = None,
+    ) -> bool:
+        """Record a trust level transition. Best-effort, never fails a turn."""
+        conn = self._connect()
+        if conn is None:
+            return False
+        try:
+            self._ensure_transitions_table(conn)
+            conn.execute(
+                "INSERT INTO plugin_trust_transitions "
+                "(plugin_id, from_level, to_level, trigger, consecutive_ok, consecutive_fail) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [plugin_id, from_level, to_level, trigger, consecutive_ok, consecutive_fail],
+            )
+            return True
+        except Exception:  # noqa: BLE001 - trust history is best-effort
+            return False
+        finally:
+            conn.close()
 
     def save_trust_state(self, state: Dict[str, Any]) -> bool:
         """Persist trust ledger state. Returns True on success."""

@@ -248,6 +248,34 @@ class LeapService(Protocol):
         """Ensure a session-analysis watch and run one analysis cycle now."""
         ...
 
+    async def evolution_run(
+        self,
+        *,
+        session_id: str,
+        reason: str = "manual",
+        wait: bool = False,
+        timeout_s: float = 180.0,
+    ) -> Dict[str, Any]:
+        """Finalize one explicitly named session and enqueue durable teacher work."""
+        ...
+
+    async def evolution_projection(
+        self,
+        *,
+        session_id: str,
+        rebuild: bool = False,
+    ) -> Dict[str, Any]:
+        """Return the event projection for one explicitly named session."""
+        ...
+
+    async def evolution_projection_aggregate(
+        self,
+        *,
+        rebuild: bool = False,
+    ) -> Dict[str, Any]:
+        """Return the explicitly cross-session profile projection."""
+        ...
+
     async def status(self, session_id: str = "") -> Dict[str, Any]:
         """Return daemon status (uptime, connections, db path, etc.).
 
@@ -480,6 +508,9 @@ METHOD_REGISTRY: Dict[str, str] = {
     "session.history": "session_history",
     "session.detail": "session_detail",
     "session.analyze": "session_analyze",
+    "evolution.run": "evolution_run",
+    "evolution.projection": "evolution_projection",
+    "evolution.projection.aggregate": "evolution_projection_aggregate",
     "daemon.status": "status",
     "daemon.shutdown": "shutdown",
     "host.status": "host_status",

@@ -36,7 +36,7 @@ from leapflow.hardware.transport import (
     TransportStatus,
     WriteOutcome,
 )
-from leapflow.hardware.transports import available_transports, build_transport
+from leapflow.hardware.transports import build_transport, builtin_transports
 
 
 def _conformance_context(transport_kind: str, config: dict[str, Any]) -> HardwareContext:
@@ -253,7 +253,7 @@ def test_every_registered_transport_is_covered_or_declared_external() -> None:
     notices later.
     """
     covered = {case.kind for case in _TRANSPORT_CASES} | _EXTERNAL_ONLY_TRANSPORTS
-    missing = set(available_transports()) - covered
+    missing = set(builtin_transports()) - covered
     assert not missing, (
         f"transports {sorted(missing)} are registered but not conformance-tested; "
         "add a case to _TRANSPORT_CASES or justify it in _EXTERNAL_ONLY_TRANSPORTS"

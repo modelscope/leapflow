@@ -12,7 +12,7 @@
 
 | Term | Definition |
 |------|-----------|
-| **PluginFiber** | A per-plugin lifecycle state-machine instance (`domain/plugin_fiber.py`). Tracks runtime state transitions (PENDING/LOADING/ACTIVE/FAILED/UNLOADING/DISPOSED) and owns an EffectScope for deterministic cleanup. |
+| **PluginFiber** | A per-plugin lifecycle state-machine instance (`domain/plugin_fiber.py`). Tracks runtime state transitions (PENDING/DRAFT/LOADING/ACTIVE/FAILED/UNLOADING/DISPOSED) and owns an EffectScope for deterministic cleanup. |
 | **EffectScope** | Hierarchical, LIFO-ordered cleanup collector (`domain/effect_scope.py`). Guarantees safe teardown on dispose. |
 | **Trust Level** | Progressive reliability gradient (DRAFT → CANDIDATE → VERIFIED → PRODUCTION) earned by consecutive successes, persisted in DuckDB. |
 | **Generation Counter** | Module-level monotonic integer; each new PluginFiber receives a unique generation. Engine caches key on `(id(plugin), generation)` to detect reloads. |
@@ -56,8 +56,9 @@ A plugin's state is the **composition** of three independent axes: Runtime, Trus
 
 | State | Meaning | Transitions out |
 |-------|---------|----------------|
-| `PENDING` | Created, awaiting activation or async init | `LOADING`, `ACTIVE` (fast path), `DISPOSED` |
-| `LOADING` | Async initialization in progress (dependency resolution) | `ACTIVE`, `FAILED`, `UNLOADING` |
+| `PENDING` | Created, awaiting activation or async init | `DRAFT`, `LOADING`, `ACTIVE` (trusted fast path), `DISPOSED` |
+| `DRAFT` | Isolated candidate; no live handlers are published | `ACTIVE`, `DISPOSED` |
+| `LOADING` | Async initialization in progress (dependency resolution) | `ACTIVE`, `FAILED`, `DISPOSED` |
 | `ACTIVE` | Fully operational, tools registered and available | `UNLOADING` |
 | `FAILED` | Initialization failed; retryable via `retry()`/`begin_loading()` | `LOADING`, `DISPOSED` |
 | `UNLOADING` | Graceful teardown in progress | `DISPOSED` |
@@ -129,9 +130,9 @@ A plugin's state is the **composition** of three independent axes: Runtime, Trus
 | Dimension | Built-in Plugins | Third-Party Plugins |
 |-----------|-----------------|---------------------|
 | **Discovery** | Hardcoded module list in `plugins/tool_plugins/__init__.py` → `get_all_plugins()` | Profile-dir install (`plugin_install` tool) or marketplace fetch |
-| **Boot sequence** | `discover_builtin()` → `register()` → `bind_runtime()` → `assemble()` → `adopt_existing_plugins()` | `plugin_install` → validate → sandbox smoke → register → fiber activate |
+| **Boot sequence** | `discover_builtin()` → `register()` → `bind_runtime()` → `assemble()` → `adopt_existing_plugins()` | `plugin_install` → staging → bounded sandbox smoke/behavior tests → DRAFT fiber → atomic publish |
 | **Initial trust** | Implicitly DRAFT (but never demoted/frozen in practice — no failure path for well-tested built-ins) | Explicitly DRAFT; must earn promotion through usage |
-| **Fiber creation** | `adopt_existing_plugins()` at first `get_scoped_registry()` access; starts in ACTIVE | `create_fiber()` → `scoped_register()` → `activate()` during install |
+| **Fiber creation** | `adopt_existing_plugins()` at first `get_scoped_registry()` access; starts in ACTIVE | `create_draft_fiber()` → `stage_plugin()` → `promote_draft()` after tests |
 | **Approval** | None for registration (they ARE the system); mutations still gated | ALL mutations gated (HIGH risk, no permanent grants) |
 | **Isolation** | In-process (same asyncio loop) | Optionally sandboxed (subprocess JSON-RPC via `SandboxHost`); `requires_sandbox` manifest flag defaults `True` |
 | **Reload** | `reload(plugin_id)` via scoped registry; version bump + cache invalidation | Same mechanism, but PRODUCTION trust → auto-approve; below PRODUCTION → explicit approval |
@@ -147,11 +148,11 @@ A plugin's state is the **composition** of three independent axes: Runtime, Trus
 | **plugin_list** | Agent tool | None | Always | — | No (read-only) |
 | **plugin_status** | Agent tool | None | Always | — | No (read-only) |
 | **plugin_versions** | Agent tool | None | Always | `ProfileLayout.plugin_versions_dir` | No (read-only) |
-| **plugin_propose** | Agent tool | None | Always (proposal only, no LLM/file/runtime mutation) | `ProfileLayout.plugin_proposals_path` | No (proposal store write only) |
+| **plugin_propose** | Agent tool | None | Always (proposal only, no runtime mutation) | Event-sourced lifecycle store | Yes — `proposal.created` |
 | **assess_compatibility** | Agent tool | None | Always (read-only manifest assessment; no file/runtime mutation) | — | No (read-only) |
-| **plugin_generate** | Agent tool | None | Always (code generation only, no filesystem write) | `plugin_generation_enabled` must be `True`; needs `llm_provider` bound | No (ephemeral output) |
+| **plugin_generate** | Agent tool | Content approval | Never for proposal-backed generation | `plugin_generation_enabled`; LLM provider; CAS | Yes — generated artifact and approval lifecycle events |
 | **/plugin generate** | User (slash command) | None (user invocation = consent) | Always auto-approved (user-initiated); installs at DRAFT trust level | `plugin_generation_enabled` must be `True`; needs an LLM provider | Yes — install action descriptor recorded |
-| **plugin_install** | Agent tool | `ApprovalGate` → HIGH, `allow_permanent=False` | Never (always requires human) | `plugin_install_dir`, proposal/version stores, `plugin_marketplace_root/url`, `plugin_marketplace_trusted_pubkeys` | Yes — action descriptor metadata recorded |
+| **plugin_install** | Agent tool | `ApprovalGate` → HIGH, `allow_permanent=False` | Never (always requires human) | `plugin_install_dir`, event lifecycle/version stores, `plugin_marketplace_root/url`, `plugin_marketplace_trusted_pubkeys` | Yes — action descriptor and lifecycle event recorded |
 | **plugin_rollback** | Agent tool | `ApprovalGate` → HIGH, `allow_permanent=False` | Never (always requires human) | `ProfileLayout.plugin_versions_dir` | Yes |
 | **plugin_reload** | Agent tool | `ApprovalGate` → HIGH, `allow_permanent=False` | Trust == PRODUCTION (auto-approved) | proposal/version stores when behavior tests or version labels are used | Yes |
 | **plugin_disable** | Agent tool | `ApprovalGate` → HIGH, `allow_permanent=False` | Never (always requires human) | — | Yes |
@@ -174,8 +175,8 @@ A plugin's state is the **composition** of three independent axes: Runtime, Trus
 **Trigger**: User or agent decides a new capability is needed.
 
 **Sequence**:
-1. **Generate** (optional): `plugin_generate(description="...")` → LLM produces code → `PluginValidator` multi-stage check (syntax → structure → runtime protocol conformance). Returns validated code blob. No filesystem write.
-2. **Install request**: `plugin_install(code=<blob>)` or `plugin_install(marketplace_name="...")`.
+1. **Generate**: `plugin_generate(proposal_id="...")` → LLM produces code → `PluginValidator` multi-stage check → profile CAS write → explicit proposal-content approval. No live registry mutation occurs.
+2. **Install request**: `plugin_install(proposal_id="...")` resolves the approved CAS artifact and requests a separate mutation approval. Direct code/marketplace installs still use the mutation gate.
    - **Compatibility pre-gate (marketplace path only)**: the resolved manifest is run through `assess_plugin()` (the Compatibility Assessment Engine) *before* anything else. An `INCOMPATIBLE` verdict is **rejected here with a structured error, before any file write**; an `ADAPTABLE` verdict proceeds and its adaptation notes are attached to the install result.
 3. **Approval gate**: `ActionDescriptor.platform_action("plugin_management", "install", {...})` → `gate.evaluate()` → user prompted (HIGH risk, one-time).
 4. **Duplicate check**: If `plugin_id` already exists in registry → immediate rejection with error.
@@ -491,7 +492,7 @@ These require human/product input and are not answerable from code alone:
 | Plugin discovery (built-in) | `src/leapflow/plugins/tool_plugins/__init__.py` |
 | Self-management tools (12 tools) | `src/leapflow/plugins/tool_plugins/self_management.py` |
 | Proposal domain records | `src/leapflow/domain/plugin_proposal.py` |
-| Proposal persistence | `src/leapflow/storage/plugin_proposal_store.py` |
+| Proposal persistence | `src/leapflow/storage/capability_proposal_queue.py` (`EvolutionCapabilityProposalStore`) |
 | Behavior test execution | `src/leapflow/learning/plugin_behavior_tests.py` |
 | Version snapshot store | `src/leapflow/storage/plugin_version_store.py` |
 | Trust ledger | `src/leapflow/learning/plugin_trust.py` |

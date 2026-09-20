@@ -32,6 +32,7 @@ lifecycle actor, reached through ``LifecycleGovernor``.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -63,6 +64,8 @@ class SweepOutcome:
     verdicts: tuple[EffectVerdict, ...] = ()
     quarantined: tuple[Mapping[str, Any], ...] = ()
     reclamation: tuple[ReclamationCandidate, ...] = ()
+    expired: int = 0
+    superseded: int = 0
 
     @property
     def verified(self) -> int:
@@ -83,12 +86,14 @@ class SweepOutcome:
             "effect_unverifiable": self.unverifiable,
             "quarantined": len(self.quarantined),
             "reclamation_candidates": [c.plugin_id for c in self.reclamation],
+            "expired": self.expired,
+            "superseded": self.superseded,
         }
 
 
 @dataclass
 class CoevolutionSweep:
-    """Runs effect verification, quarantine governance and reclamation.
+    """Runs effect verification, quarantine governance, proposal expiry and reclamation.
 
     All collaborators are optional: a sweep with nothing wired emits the
     corresponding no-op traces and returns an empty outcome, which is what keeps
@@ -100,6 +105,8 @@ class CoevolutionSweep:
     verifier: CapabilityEffectVerifier = field(default_factory=CapabilityEffectVerifier)
     reaper: UnselectableArtifactReaper = field(default_factory=UnselectableArtifactReaper)
     proposal_ids: Mapping[str, str] = field(default_factory=dict)
+    orchestrator: Any = None  # ProposalOrchestrator, optional
+    proposal_store: Any = None  # EvolutionCapabilityProposalStore, optional
 
     async def run(
         self,
@@ -117,8 +124,12 @@ class CoevolutionSweep:
         """
         verdicts = await self._verify(verifications)
         quarantined = await self._drain()
+        expired, superseded = self._sweep_proposal_expiry()
         reclamation = self._reclaim(acquired_plugin_ids, resolutions)
-        return SweepOutcome(verdicts, quarantined, reclamation)
+        return SweepOutcome(
+            verdicts, quarantined, reclamation,
+            expired=expired, superseded=superseded,
+        )
 
     # ── effect verification (L3 closure) ──────────────────────────────────
 
@@ -294,6 +305,98 @@ class CoevolutionSweep:
                 detail=candidate.to_dict(),
             )
         return found
+
+    # ── proposal TTL and supersession ─────────────────────────────────────
+
+    def _sweep_proposal_expiry(self) -> tuple[int, int]:
+        """Expire stale proposals and supersede outdated ones."""
+        if self.orchestrator is None or self.proposal_store is None:
+            self._emit(
+                EvolutionStage.LEARN, "proposal_expiry",
+                summary="proposal store or orchestrator not available",
+                detail={"expired": 0, "superseded": 0, "no_op": True},
+            )
+            return 0, 0
+        try:
+            now = time.time()
+            active = self.proposal_store.active(limit=0)
+        except Exception:  # noqa: BLE001
+            logger.debug("sweep: could not read active proposals", exc_info=True)
+            return 0, 0
+
+        expired_count = superseded_count = 0
+        for item in active:
+            try:
+                # 1) TTL expiry
+                if item.expires_at is not None and now >= item.expires_at:
+                    self.orchestrator.expire(item.proposal_id, reason="ttl_exceeded")
+                    expired_count += 1
+                    self._emit(
+                        EvolutionStage.LEARN, "proposal_expiry",
+                        correlation={"proposal_id": item.proposal_id},
+                        summary=f"{item.proposal_id}: ttl_exceeded",
+                        detail={"proposal_id": item.proposal_id, "reason": "ttl_exceeded"},
+                    )
+                    continue
+                # 2) Supersession: same requirements hash, newer proposal exists
+                if self._has_newer_proposal(item, active):
+                    self.orchestrator.supersede(
+                        item.proposal_id,
+                        replacement_id=self._newest_for_requirements(item, active),
+                        reason="newer_proposal_exists",
+                    )
+                    superseded_count += 1
+                    self._emit(
+                        EvolutionStage.LEARN, "proposal_expiry",
+                        correlation={"proposal_id": item.proposal_id},
+                        summary=f"{item.proposal_id}: superseded by newer proposal",
+                        detail={"proposal_id": item.proposal_id, "reason": "newer_proposal_exists"},
+                    )
+            except Exception:  # noqa: BLE001 - one bad proposal must not stop the sweep
+                logger.debug("sweep: proposal expiry failed for %s", item.proposal_id, exc_info=True)
+
+        if not expired_count and not superseded_count:
+            self._emit(
+                EvolutionStage.LEARN, "proposal_expiry",
+                summary="no proposal expired or superseded",
+                detail={"expired": 0, "superseded": 0, "no_op": True},
+            )
+        return expired_count, superseded_count
+
+    @staticmethod
+    def _requirements_hash(item: Any) -> str:
+        """Stable content hash of a proposal's requirement set."""
+        from leapflow.domain.evolution_event import content_hash
+
+        reqs = [dict(r) for r in (item.requirements or ())]
+        return content_hash(reqs)
+
+    @classmethod
+    def _has_newer_proposal(cls, candidate: Any, active: Sequence[Any]) -> bool:
+        """Return True if a newer active proposal exists for the same requirements."""
+        candidate_hash = cls._requirements_hash(candidate)
+        for other in active:
+            if other.proposal_id == candidate.proposal_id:
+                continue
+            if cls._requirements_hash(other) == candidate_hash:
+                if (other.created_at or 0.0) > (candidate.created_at or 0.0):
+                    return True
+        return False
+
+    @classmethod
+    def _newest_for_requirements(cls, candidate: Any, active: Sequence[Any]) -> str:
+        """Return the proposal_id of the newest active proposal with the same requirements."""
+        candidate_hash = cls._requirements_hash(candidate)
+        newest_id = candidate.proposal_id
+        newest_at = candidate.created_at or 0.0
+        for other in active:
+            if other.proposal_id == candidate.proposal_id:
+                continue
+            if cls._requirements_hash(other) == candidate_hash:
+                if (other.created_at or 0.0) > newest_at:
+                    newest_id = other.proposal_id
+                    newest_at = other.created_at or 0.0
+        return newest_id
 
     @staticmethod
     def _emit(stage: EvolutionStage, kind: str, **kwargs: Any) -> None:

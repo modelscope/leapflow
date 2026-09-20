@@ -411,25 +411,14 @@ class ProfileLayout:
         return self.plugins_dir / "dsh"
 
     @property
-    def plugin_proposals_path(self) -> Path:
-        # Profile-scoped review queue for capability-gap → plugin proposals.
-        # It is durable user/profile state, not runtime scratch.
-        return self.root / "plugins" / "proposals.json"
+    def plugin_staging_dir(self) -> Path:
+        """Profile-owned quarantine area for plugin candidates under validation."""
+        return self.plugins_dir / ".staging"
 
     @property
     def capability_observations_path(self) -> Path:
         # Profile-scoped durable observation backlog for structured capability gaps.
         return self.root / "plugins" / "capability_observations.json"
-
-    @property
-    def capability_proposal_queue_path(self) -> Path:
-        # Profile-scoped adaptive proposal queue derived from capability observations.
-        return self.root / "plugins" / "proposal_queue.json"
-
-    @property
-    def plugin_outcomes_path(self) -> Path:
-        # Profile-scoped execution outcome audit for adaptive plugin lifecycle governance.
-        return self.root / "plugins" / "outcomes.json"
 
     @property
     def distilled_knowledge_path(self) -> Path:
@@ -446,12 +435,14 @@ class ProfileLayout:
         return self.root / "plugins" / "capability_plans.json"
 
     @property
-    def evolution_traces_path(self) -> Path:
-        # Profile-scoped framework self-evolution traces: registry mutations, trust
-        # transitions, world-model proposals, and lifecycle openings. Beside the
-        # capability stores because the causal ledger reads them together; distinct
-        # from them because these are facts no other store retains.
-        return self.root / "plugins" / "evolution_traces.json"
+    def evolution_artifacts_dir(self) -> Path:
+        """Content-addressed artifacts referenced by the evolution event log.
+
+        Large or sensitive payloads never belong in DuckDB event JSON. Generated
+        source, teacher responses, validation reports and replay media are stored by
+        digest here; the event stream carries only bounded metadata and the digest.
+        """
+        return self.root / "artifacts" / "sha256"
 
     @property
     def plugin_versions_dir(self) -> Path:
@@ -534,6 +525,7 @@ class ProfileLayout:
             self.skills_dir,
             self.plugins_dir,
             self.dsh_plugins_dir,
+            self.plugin_staging_dir,
             self.audit_dir,
             self.history_dir,
             self.runtime_dir,

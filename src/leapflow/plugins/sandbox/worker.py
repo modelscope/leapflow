@@ -20,12 +20,29 @@ import asyncio
 import importlib
 import json
 import logging
+import os
 import sys
 from typing import Any, Callable, Dict
 
 from leapflow.plugins.sandbox.protocol import SandboxRequest, SandboxResponse
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_resource_limits() -> None:
+    """Apply host-declared OS limits before importing untrusted plugin code."""
+    cpu_time_s = max(0, int(os.getenv("LEAPFLOW_SANDBOX_CPU_TIME_S", "0")))
+    max_memory_bytes = max(0, int(os.getenv("LEAPFLOW_SANDBOX_MAX_MEMORY_BYTES", "0")))
+    if not cpu_time_s and not max_memory_bytes:
+        return
+    try:
+        import resource
+    except ImportError as exc:  # pragma: no cover - non-POSIX safety path
+        raise RuntimeError("sandbox resource limits are unavailable on this platform") from exc
+    if cpu_time_s:
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_time_s, cpu_time_s))
+    if max_memory_bytes:
+        resource.setrlimit(resource.RLIMIT_AS, (max_memory_bytes, max_memory_bytes))
 
 
 async def _serve(plugin_module_path: str) -> None:
@@ -107,4 +124,5 @@ async def _invoke(
 
 if __name__ == "__main__":
     module_path = sys.argv[1] if len(sys.argv) > 1 else ""
+    _apply_resource_limits()
     asyncio.run(_serve(module_path))

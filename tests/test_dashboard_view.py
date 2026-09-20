@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from leapflow.dashboard import (
@@ -20,10 +21,12 @@ class _FakeProvider:
         watches: list[dict],
         findings: list[dict],
         signal_result: dict[str, Any] | None = None,
+        evolution_projection: dict[str, Any] | None = None,
     ) -> None:
         self._watches = watches
         self._findings = findings
         self._signal_result = signal_result or {"metrics": {}, "signal_stream": []}
+        self._evolution_projection = evolution_projection or {}
 
     async def watches(self) -> list[dict[str, Any]]:
         return list(self._watches)
@@ -34,6 +37,15 @@ class _FakeProvider:
 
     async def signal_metrics(self) -> dict[str, Any]:
         return dict(self._signal_result)
+
+    async def evolution_projection(self, *, session_id: str) -> dict[str, Any]:
+        result = dict(self._evolution_projection)
+        result["session_id"] = session_id
+        result["scope"] = "session"
+        return {"ok": True, "projection": result}
+
+    async def evolution_projection_aggregate(self) -> dict[str, Any]:
+        return {"ok": True, "projection": dict(self._evolution_projection)}
 
 
 def _flatten(spec: dict) -> list[dict]:
@@ -149,7 +161,43 @@ async def test_builder_exposes_template_switcher_meta() -> None:
     assert "finance" not in spec["meta"]["templates"]
     assert "research" not in spec["meta"]["templates"]
     assert "sentiment" not in spec["meta"]["templates"]
-    assert {"finance", "research", "sentiment"}.issubset(set(spec["meta"]["hidden_templates"]))
+    assert {"causal_trace", "evolution_live", "finance", "research", "sentiment"}.issubset(
+        set(spec["meta"]["hidden_templates"])
+    )
+
+
+def test_causal_trace_is_hidden_but_renderable_as_a_read_only_lens() -> None:
+    spec = _build(_evolution_provider(), template="causal_trace")
+
+    assert spec["meta"]["active_template"] == "causal_trace"
+    assert "causal_trace" not in spec["meta"]["templates"]
+    assert "causal_trace" in spec["meta"]["hidden_templates"]
+    assert {"Page", "Grid"}.issubset({node["type"] for node in _flatten(spec)})
+    assert not [node for node in _flatten(spec) if "action" in node]
+
+
+def test_evolution_live_is_hidden_and_binds_the_authoritative_snapshot() -> None:
+    provider = _evolution_provider()
+    provider._findings[0]["payload"].update({
+        "traces": [{"trace_id": "t-1", "stage": "observe", "kind": "interface_drift", "ts": 1.0}],
+        "summary": {
+            "episode_count": 1,
+            "segments_with_evidence": 2,
+            "segments_total": 4,
+            "unadmitted_intent_count": 0,
+            "regression_count": 0,
+        },
+    })
+
+    spec = _build(provider, template="evolution_live")
+    custom = [node for node in _flatten(spec) if node["type"] == "Custom"]
+
+    assert spec["meta"]["active_template"] == "evolution_live"
+    assert "evolution_live" not in spec["meta"]["templates"]
+    assert "evolution_live" in spec["meta"]["hidden_templates"]
+    assert custom[0]["props"]["render"] == "evolutionLive"
+    assert custom[0]["props"]["data"]["traces"][0]["kind"] == "interface_drift"
+    assert not [node for node in _flatten(spec) if "action" in node]
 
 
 async def test_builder_signals_template_renders_dense_operational_layout() -> None:
@@ -243,6 +291,22 @@ async def test_view_hub_backpressure_drops_when_full() -> None:
     assert hub.broadcast({"n": 2}) == 0  # queue full -> dropped, not blocked
     await hub.shutdown()
     assert hub.subscriber_count == 0
+
+
+async def test_view_hub_requests_snapshot_resync_after_a_drop() -> None:
+    hub = ViewHub(maxsize=1)
+    queue = hub.subscribe("slow")
+    assert hub.broadcast({"n": 1}) == 1
+    assert hub.broadcast({"n": 2}) == 0
+    assert (await queue.get())["n"] == 1
+
+    # The first delivery after capacity returns is the resync instruction. The
+    # dropped current increment is intentionally not replayed; fetchView() is the
+    # authoritative recovery path.
+    assert hub.broadcast({"n": 3}) == 0
+    assert (await queue.get())["type"] == "view.resync"
+    assert hub.broadcast({"n": 4}) == 1
+    assert (await queue.get())["n"] == 4
 
 
 # ── An empty hardware board must say why ────────────────────────────────────
@@ -454,10 +518,34 @@ def _evolution_provider(*, live_has_findings: bool = False) -> _FakeProvider:
 
 
 def _build(provider: _FakeProvider, template: str = "evolution") -> dict:
-    import asyncio
-
     builder = DashboardViewBuilder(TemplateLibrary())
     return asyncio.run(builder.build(DashboardIntent(template=template), provider))
+
+
+def test_evolution_view_overlays_the_event_projection_for_an_explicit_session():
+    provider = _evolution_provider()
+    provider._evolution_projection = {
+        "summary": {"episode_count": 2, "by_action": {"absorb": 1}},
+        "timeline": [{"title": "world_model → absorb", "summary": "repo.inspect"}],
+        "episodes": [{"episode_id": "ep-1", "status": "committed"}],
+        "mutation_matrix": [],
+        "degraded": False,
+    }
+    builder = DashboardViewBuilder(TemplateLibrary())
+    spec = asyncio.run(
+        builder.build(DashboardIntent(template="evolution", session_id="session-a"), provider)
+    )
+
+    stats = {
+        node["props"].get("label"): node["props"].get("value")
+        for node in _flatten(spec)
+        if node.get("type") == "Stat"
+    }
+    assert stats["Recent episodes"] == 2
+    assert stats["Plugins"] == 17
+    assert spec["meta"]["evolution_projection"]["session_id"] == "session-a"
+    timeline = next(node for node in _flatten(spec) if node.get("type") == "Timeline")
+    assert timeline["props"]["data"][0]["summary"] == "repo.inspect"
 
 
 def test_a_second_watch_on_a_domain_cannot_blank_the_board():

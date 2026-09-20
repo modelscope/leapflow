@@ -64,7 +64,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from leapspace.app_space.utils import get_sandbox_state_dir, write_atomic
+from leapspace.app_space.state import get_sandbox_state_dir, write_atomic
 
 # Widget types an agent may act on; self-check requires each to be named.
 INTERACTIVE_TYPES: tuple[type[QWidget], ...] = (
@@ -93,6 +93,16 @@ class BaseLeapApp(QMainWindow, ABC, metaclass=_LeapAppMeta):
     app_id: ClassVar[str]
     app_title: ClassVar[str]
     version: ClassVar[str]
+
+    # App-level affordances this version of the surface offers, e.g.
+    # ``("app.chat.v2",)``. Declared, never inferred: a capability provider states
+    # which affordances it needs (``requires_environment_affordances``) and the
+    # resolver excludes one the environment does not offer, so this is the channel
+    # that lets an app version express "the way to do this changed". Deliberately
+    # separate from *host* platform capabilities -- an app affordance is a property
+    # of the surface, not of the machine. Empty by default: an app that models no
+    # affordance simply says nothing.
+    affordances: ClassVar[tuple[str, ...]] = ()
 
     # Hook points this app opens to task hooks; apps extend with their own
     # before_xxx/after_xxx points (a superset tuple, always keeping
@@ -367,6 +377,18 @@ class BaseLeapApp(QMainWindow, ABC, metaclass=_LeapAppMeta):
             "app_title": self.app_title,
             "version": self.version,
             "interface": sorted(self._interface),
+            # App-level affordances this version declares (see the ClassVar). Part of
+            # the ground truth because an environment probe compares them across
+            # versions to tell an affordance migration from a pure rename.
+            "affordances": list(type(self).affordances),
+            # Role-aware structural view of the bound interface, derived from the
+            # live widget tree (not the declared name list). This is the AX-like
+            # signal LeapFlow's perception reads to tell one control from another
+            # and to name *which* element changed -- a renamed or removed control
+            # shows up here as a changed role/name set, which a bare name list can
+            # show only as "the set changed". Additive: consumers that read only
+            # ``interface`` are unaffected.
+            "elements": self._structure(),
             "a11y_violations": list(self._violations),
             "data": self._snapshot_data(),
         }
@@ -379,3 +401,24 @@ class BaseLeapApp(QMainWindow, ABC, metaclass=_LeapAppMeta):
             self._state_dir / "events.jsonl",
             "".join(json.dumps(event) + "\n" for event in self._events),
         )
+
+    def _structure(self) -> list[dict[str, Any]]:
+        """Role-aware view of the bound interface: ``[{name, role, enabled}]``.
+
+        ``role`` is the Qt widget class (``QPushButton``, ``QLineEdit``, ...), the
+        closest headless analogue of an accessibility role. Derived from the live
+        widget objects ``bind`` recorded, so it tracks the real UI rather than a
+        declaration. Each widget read is guarded: a persist during teardown (the
+        C++ object already gone) must degrade to a stable placeholder, never crash
+        the ground-truth write.
+        """
+        structure: list[dict[str, Any]] = []
+        for name in sorted(self._interface):
+            widget = self._interface[name]
+            try:
+                role = type(widget).__name__
+                enabled = bool(widget.isEnabled())
+            except RuntimeError:
+                role, enabled = "QWidget", True
+            structure.append({"name": name, "role": role, "enabled": enabled})
+        return structure

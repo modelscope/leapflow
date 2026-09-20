@@ -4,8 +4,8 @@
 Design:
 - Write-behind: buffer episodes in-memory, flush to DuckDB periodically or on shutdown
 - Read-through: on initialize, load recent episodes from DuckDB into in-memory provider
-- Schema is simple: one table with JSON-serialized episode data
-- Idempotent schema creation (no migration chains)
+- Schema is managed by the shared ordered migration/bootstrap layer
+- Episode payloads remain JSON-serialized inside typed skill tables
 - Write-retry with jitter for concurrent access
 
 This module does NOT replace EvolutionMemoryProvider — it augments it with persistence.
@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
+from leapflow.storage.schema import ensure_schema
 from leapflow.storage.write_buffer import execute_with_retry
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ class DuckDBEvolutionStore:
             source = LocalConnectionHolder(Path(source))
         self._holder = source
         self._db_path = str(self._holder.db_path)
-        self._initialize_schema()
+        ensure_schema(self._conn)
 
     @property
     def _conn(self) -> Any:
@@ -49,33 +50,6 @@ class DuckDBEvolutionStore:
         of them.
         """
         return self._holder.connection
-
-    def _initialize_schema(self) -> None:
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS skill_episodes (
-                episode_id VARCHAR PRIMARY KEY,
-                skill_name VARCHAR NOT NULL,
-                actions_json VARCHAR DEFAULT '[]',
-                outcome VARCHAR DEFAULT '',
-                reward DOUBLE DEFAULT 0.0,
-                context_json VARCHAR DEFAULT '{}',
-                created_at DOUBLE DEFAULT 0.0
-            )
-        """)
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_episodes_skill
-            ON skill_episodes (skill_name, created_at DESC)
-        """)
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS skill_patterns (
-                pattern_id VARCHAR PRIMARY KEY,
-                skill_name VARCHAR NOT NULL,
-                pattern_json VARCHAR DEFAULT '{}',
-                confidence DOUBLE DEFAULT 0.0,
-                episode_count INTEGER DEFAULT 0,
-                created_at DOUBLE DEFAULT 0.0
-            )
-        """)
 
     def _execute_write(self, sql: str, params: Any = None) -> None:
         execute_with_retry(self._conn, sql, params)

@@ -34,9 +34,9 @@ def _settings(**overrides: Any) -> SimpleNamespace:
 
 def test_self_evolution_is_off_by_default():
     """Acquiring a capability is the least reversible thing the system decides."""
-    from leapflow.config import get_settings
+    from leapflow.config import Settings
 
-    assert get_settings().evolution_enabled is False
+    assert Settings.__dataclass_fields__["evolution_enabled"].default is False
 
 
 def test_the_switch_is_discoverable_through_the_config_control_plane():

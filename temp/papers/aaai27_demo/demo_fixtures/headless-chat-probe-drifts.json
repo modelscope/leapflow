@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "kind": "leapspace_structural_drift_fixture",
+  "evidence_level": "real_headless_structural_seam",
+  "source_test": "temp/leapspace_exp/evo-02/tests/test_environment_source_live.py",
+  "description": "The exact value-free before/after identities exercised by the real offscreen PyQt6 structural-seam test. This fixture is distinct from task-001's message_input rename scenario.",
+  "drifts": [
+    {
+      "drift_id": "chat-probe.send-button.rename.v1",
+      "class": "interface_rename",
+      "reversible": true,
+      "before": {
+        "app_id": "chat_probe",
+        "version": "1.0",
+        "elements": [
+          {"name": "message_input", "role": "QLineEdit"},
+          {"name": "send_button", "role": "QPushButton"}
+        ]
+      },
+      "after": {
+        "app_id": "chat_probe",
+        "version": "1.1",
+        "elements": [
+          {"name": "message_input", "role": "QLineEdit"},
+          {"name": "dispatch_button", "role": "QPushButton"}
+        ]
+      },
+      "capability_precondition": {
+        "capability": "chat.reply",
+        "bound_names": ["send_button"]
+      },
+      "expected": {
+        "evidence_kind": "interface_drift",
+        "requirement_origin": "environment_probe",
+        "admission": "experiment_opt_in_only"
+      }
+    },
+    {
+      "drift_id": "chat-probe.benign-emoji-added.v1",
+      "class": "benign_negative_control",
+      "reversible": true,
+      "before": {
+        "app_id": "chat_probe",
+        "version": "1.0",
+        "elements": [
+          {"name": "message_input", "role": "QLineEdit"},
+          {"name": "send_button", "role": "QPushButton"}
+        ]
+      },
+      "after": {
+        "app_id": "chat_probe",
+        "version": "1.1-benign",
+        "elements": [
+          {"name": "message_input", "role": "QLineEdit"},
+          {"name": "send_button", "role": "QPushButton"},
+          {"name": "emoji_picker", "role": "QPushButton"}
+        ]
+      },
+      "capability_precondition": {
+        "capability": "chat.reply",
+        "bound_names": ["send_button"]
+      },
+      "expected": {
+        "evidence_kind": "none",
+        "requirement_count": 0
+      }
+    }
+  ]
+}

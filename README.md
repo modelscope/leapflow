@@ -904,6 +904,52 @@ Full authoring walkthrough: see the [Plugin Developer Guide](temp/deepseek_harne
 
 ---
 
+## World-Model-Driven Self-Evolution
+
+LeapFlow's Harness can **autonomously evolve its plugin composition** in response to dynamic environment changes. A world-model trajectory grader retrospectively evaluates execution evidence and produces a four-value **adaptation verdict** — `absorb` (update knowledge), `rebind` (select a better installed capability), `acquire` (generate a new plugin), or `escalate` (defer to a human) — so most adaptation happens without writing any code at all.
+
+When a genuine capability gap is detected, the evolution pipeline governs the entire journey from observation to production:
+
+```
+environment observation
+    → adaptation verdict (absorb / rebind / acquire / escalate)
+    → capability gap detection
+    → resolution-first check (existing catalog)
+    → proposal
+    → LLM code generation
+    → multi-stage validation (syntax → import → Protocol conformance → sandbox smoke)
+    → dual approval (content + plugin mutation)
+    → install at DRAFT trust
+    → progressive trust accrual (DRAFT → CANDIDATE → VERIFIED → PRODUCTION)
+    → governance (quarantine, rollback, proposal sweep)
+```
+
+### Enabling Self-Evolution
+
+Self-evolution is **disabled by default** as a safety constraint — the agent must be explicitly granted the ability to acquire new capabilities:
+
+```bash
+leap config set evolution.enabled true
+```
+
+When disabled, the world model still produces adaptation verdicts and distils knowledge (absorb/rebind paths remain active), but the `acquire` path that generates and installs new plugins is gated off.
+
+### Key Features
+
+- **Resolution-first** — before proposing a new plugin, the pipeline checks whether an existing capability already satisfies the requirement; duplicates are never created
+- **Dual approval gate** — generated content is reviewed for correctness, and the plugin mutation itself requires a separate HIGH-risk approval (no permanent grants)
+- **Progressive trust lifecycle** — new plugins start at DRAFT and promote through CANDIDATE → VERIFIED → PRODUCTION on consecutive successes; repeated failures trigger automatic demotion
+- **Sandbox isolation** — untrusted plugins run in a subprocess over JSON-RPC with bounded invocation timeouts
+- **Append-only causal audit trail** — 22 event types record the full causal chain from environment observation through install, validation, approval, trust transitions, and terminal outcomes
+- **Cold-path governance** — all evolution machinery (trust ledgers, proposal queues, sweep) runs on boot/reload/dispose paths with zero per-turn overhead
+- **Quarantine with recovery** — a plugin that fails hard is frozen at DRAFT with a quarantine record; it can be investigated and restored or removed
+- **DSH bundle rollback** — profile plugins maintain versioned source snapshots; `plugin_rollback` restores a previous version and hot-reloads it
+- **Proposal TTL and automated sweep** — stale proposals expire after a configurable TTL and are cleaned up by a periodic sweep
+
+For the formal specification — including system roles, architectural thesis, validation stages, and governance contracts — see [World-Model Plugin & Harness Evolution](docs/world_model_plugin_harness_evolution.md).
+
+---
+
 ## LeapBoard — Monitoring Dashboard
 
 > **Signals into insight.**

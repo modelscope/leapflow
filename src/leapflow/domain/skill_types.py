@@ -114,6 +114,7 @@ class SkillMetadata:
     source_repo_id: str = ""           # Hub repo_id (hub source only)
     source_version: str = ""           # Hub version (hub source only)
     source_hub_type: str = ""          # hub_type (hub source only)
+    execution_policy: str = "external_side_effect"
 
     @property
     def tier(self) -> SkillTier:
