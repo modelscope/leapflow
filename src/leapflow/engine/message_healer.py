@@ -190,12 +190,30 @@ class MessageHealer:
 
         Prevents role alternation violations on resume or after compression
         where the last message is a tool result without a following assistant reply.
+
+        Skips insertion when the trailing tool results have a valid preceding
+        assistant message with ``tool_calls`` — this is the normal native-tool
+        loop where the API expects to generate the next response after tool
+        results.  A synthetic assistant injected here would break thinking-mode
+        providers (e.g. DeepSeek) that require ``reasoning_content`` on every
+        assistant message in the history.
         """
         if not messages:
             return messages
 
         if messages[-1].get("role") != "tool":
             return messages
+
+        # Walk backwards: if the trailing tool block has a valid parent
+        # (an assistant message with tool_calls), the sequence is a normal
+        # mid-turn tool call — no synthetic closer needed.
+        for msg in reversed(messages):
+            role = msg.get("role", "")
+            if role == "tool":
+                continue
+            if role == "assistant" and msg.get("tool_calls"):
+                return messages  # valid parent found — keep the sequence open
+            break  # different role without tool_calls — orphaned tail
 
         return messages + [
             {"role": "assistant", "content": "Operation interrupted. Continuing..."}

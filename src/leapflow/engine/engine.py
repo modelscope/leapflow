@@ -4232,6 +4232,9 @@ class AgentEngine:
                         tools_kwarg = {}
                         use_native_tools = False
                         transform_ok = True
+                    elif decision.strategy_key == "thinking_disable":
+                        planned_enable_thinking = False
+                        transform_ok = True
                     else:
                         transform_ok = self._execute_transform_decision(decision, messages)
                     if transform_ok:
@@ -4843,6 +4846,8 @@ class AgentEngine:
                         if decision.strategy_key == "native_to_text":
                             tools_kwarg = {}
                             use_native_tools = False
+                        elif decision.strategy_key == "thinking_disable":
+                            planned_enable_thinking = False
                         else:
                             self._execute_transform_decision(decision, messages)
                         coordinator.on_strategy_outcome(decision.decision_id, True)
