@@ -223,6 +223,62 @@ class DominationGuard:
         pass
 
 
+class TurnCapGuard:
+    """Enforce a hard ceiling on tool invocations within a single agent turn.
+
+    Counts only the tool calls added *during the current turn*, not calls from
+    prior turns that may be present in the conversation history.  A deferred
+    baseline is captured on the first ``check()`` after ``reset()`` so that
+    pre-existing calls in ``assembly.prior_turns`` are excluded.
+
+    The engine must call ``reset()`` at each turn boundary (done inside
+    ``_begin_turn_context``) and prime the baseline by calling ``check()``
+    on the initial message list before any tool calls are executed.  The
+    resulting halt is ``progress_independent`` because an unbounded turn is a
+    resource hazard regardless of whether the task is making headway.
+    """
+
+    def __init__(self, *, max_calls: int = 50) -> None:
+        self._max_calls = max_calls
+        # Deferred baseline: set on the first check() after reset() to the
+        # number of pre-existing tool calls in the conversation history.
+        self._baseline: Optional[int] = None
+
+    @staticmethod
+    def _count_calls(history: List[Dict[str, Any]]) -> int:
+        return sum(
+            len(msg.get("tool_calls") or [])
+            for msg in history
+            if msg.get("role") == "assistant"
+        )
+
+    def check(self, history: List[Dict[str, Any]]) -> GuardrailViolation:
+        total = self._count_calls(history)
+        if self._baseline is None:
+            # First check this turn: snapshot the count of pre-existing calls
+            # so only calls added after this point count towards the cap.
+            self._baseline = total
+            return GuardrailViolation(violated=False)
+        calls_this_turn = total - self._baseline
+        if calls_this_turn >= self._max_calls:
+            return GuardrailViolation(
+                violated=True,
+                severity="halt",
+                progress_independent=True,
+                reason=(
+                    f"Turn tool-call cap reached ({calls_this_turn}/{self._max_calls})"
+                ),
+                suggestion=(
+                    "Provide the best answer with the information gathered so far."
+                ),
+            )
+        return GuardrailViolation(violated=False)
+
+    def reset(self) -> None:
+        """Clear the per-turn baseline so the next check() re-snapshots."""
+        self._baseline = None
+
+
 class CompositeGuardrail:
     """Composite of multiple guards — runs all, returns first halt or worst warning."""
 
@@ -234,11 +290,13 @@ class CompositeGuardrail:
         stagnation_window: int = 10,
         min_success_rate: float = 0.2,
         max_consecutive_same: int = 5,
+        max_calls_per_turn: int = 50,
     ) -> None:
         self._guards: List[ToolLoopGuard] = guards or [
             RepetitionGuard(max_repeats=max_repeats),
             StagnationGuard(window=stagnation_window, min_success_rate=min_success_rate),
             DominationGuard(max_consecutive_same=max_consecutive_same),
+            TurnCapGuard(max_calls=max_calls_per_turn),
         ]
 
     def check(self, history: List[Dict[str, Any]]) -> GuardrailViolation:

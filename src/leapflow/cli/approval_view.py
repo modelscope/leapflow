@@ -138,6 +138,10 @@ def _render(request: ApprovalRequest, choices: list[ApprovalChoice], *, show_det
             for line in textwrap.wrap(reason, width=72) or [reason]:
                 body.append(f"- {line}\n", style="dim")
             body.append("\n")
+        advisory = str(request.display.get("advisory") or "")
+        if advisory:
+            body.append(advisory + "\n", style="bold cyan")
+            body.append("(This is an AI advisory — the authoritative risk level is above.)\n\n", style="dim")
         for idx, choice in enumerate(choices, start=1):
             body.append(f"  {idx}. {choice.label}\n", style="bold" if choice.key == request.default_choice else "")
         console.print(Panel(
@@ -150,6 +154,9 @@ def _render(request: ApprovalRequest, choices: list[ApprovalChoice], *, show_det
         sys.stderr.write(f"⚠ {title}\n\n{summary}\n\n{detail}\n\n")
         if reason:
             sys.stderr.write(f"Why approval is needed: {reason}\n\n")
+        advisory = str(request.display.get("advisory") or "")
+        if advisory:
+            sys.stderr.write(f"{advisory}\n(This is an AI advisory — the authoritative risk level is above.)\n\n")
         for idx, choice in enumerate(choices, start=1):
             sys.stderr.write(f"  {idx}. {choice.label}\n")
         sys.stderr.flush()

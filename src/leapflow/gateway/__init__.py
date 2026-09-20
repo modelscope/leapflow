@@ -31,6 +31,7 @@ from leapflow.gateway.protocol import (
     MessageSource,
     OutboundContent,
     PlatformAdapter,
+    PlatformCapabilities,
     PlatformStatus,
     SendResult,
     SendTarget,
@@ -52,6 +53,7 @@ __all__ = [
     # Adapter contract
     "PlatformAdapter",
     "PlatformAdapterMixin",
+    "PlatformCapabilities",
     # Adapter plugin registry
     "GatewayAdapterPlugin",
     "GatewayAdapterRegistry",

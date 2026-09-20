@@ -143,6 +143,13 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     # Scheduler
     CommandDef("arm", "Schedule a skill for timed execution", "Scheduler", args_hint="<skill> <cron>"),
     CommandDef("task", "List scheduled tasks", "Scheduler"),
+    CommandDef("schedule", "List active scheduled tasks", "Scheduler", aliases=("schedule list",), args_hint="[list|history|cancel] ...", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
+    CommandDef("schedule history", "Show recent execution log entries", "Scheduler", args_hint="[task_id]", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
+    CommandDef("schedule cancel", "Cancel/disable a scheduled task", "Scheduler", args_hint="<task_id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+
+    # File Checkpoint
+    CommandDef("checkpoint", "List recent file checkpoints for this session", "File Checkpoint", aliases=("checkpoint list",), args_hint="[list]", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
+    CommandDef("checkpoint rollback", "Rollback files to a checkpoint snapshot", "File Checkpoint", args_hint="<turn_id>", effect=CommandEffect.DESTRUCTIVE, execution=CommandExecution.SHORT_OPERATION),
 
     # Board & Monitors (LeapBoard) — one analysis target (current session),
     # rendered through a selectable template lens.

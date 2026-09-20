@@ -160,6 +160,11 @@ class CompressorConfig:
     drop_token_ratio: float = 0.95
     enabled_stages: List[str] = field(default_factory=lambda: ["trim", "summarize", "archive", "drop"])
 
+    # SummarizeStage head protection — how many initial user/assistant
+    # exchanges after the system prompt are shielded from summarization
+    # on the very first compression pass.
+    protect_first_n: int = _DEFAULT_PROTECT_FIRST_N
+
     # Dedup: collapse identical tool results above this size
     dedup_min_chars: int = 200
 
@@ -182,9 +187,11 @@ class CompressorConfig:
         # Keep a generous recent window so immediate context is never lost: honor
         # an explicit larger ``keep_tail``, else apply a safe floor (Summarize
         # keeps more than Drop, and Drop — the last resort — still keeps several
-        # recent turns rather than nuking to a handful).
-        self.summarize_keep_recent = max(self.keep_tail, _DEFAULT_SUMMARIZE_KEEP_RECENT)
-        self.drop_keep_recent = max(self.keep_tail, _DEFAULT_SUMMARIZE_KEEP_RECENT)
+        # recent turns rather than nuking to a handful).  The floor is the
+        # Settings-backed ``summarize_keep_recent`` (default 6), NOT the
+        # module-level constant, so hot-reload is honoured.
+        self.summarize_keep_recent = max(self.keep_tail, self.summarize_keep_recent)
+        self.drop_keep_recent = max(self.keep_tail, self.summarize_keep_recent)
 
         self._base_trim_threshold = self.trim_threshold_chars
         self._apply_adaptive_scaling()
@@ -850,12 +857,21 @@ class ContextCompressor:
         """Return the most recent compression trace."""
         return self._last_trace
 
-    def reconfigure(self, *, token_budget: int = 0, context_length: int = 0) -> None:
+    def reconfigure(
+        self,
+        *,
+        token_budget: int = 0,
+        context_length: int = 0,
+        protect_first_n: int = 0,
+        keep_recent_n: int = 0,
+    ) -> None:
         """Update runtime budget/context and rebuild affected stages.
 
         Only TrimStage is rebuilt — SummarizeStage and other stateful stages
         retain their iterative summary history and compression counters so
         that a hot-reload mid-session does not break summary continuity.
+        ``protect_first_n`` and ``keep_recent_n`` are patched in-place on the
+        live SummarizeStage for the same reason.
         """
         changed = False
         if token_budget > 0 and token_budget != self._config.token_budget:
@@ -884,6 +900,17 @@ class ContextCompressor:
                 self._config.context_length,
                 self._config.trim_threshold_chars,
             )
+        # Patch SummarizeStage in-place so iterative summary state is preserved.
+        if protect_first_n > 0 or keep_recent_n > 0:
+            for stage in self._stages:
+                if stage.name == "summarize" and isinstance(stage, SummarizeStage):
+                    if protect_first_n > 0:
+                        stage._protect_first_n = protect_first_n  # type: ignore[attr-defined]
+                        self._config.protect_first_n = protect_first_n
+                    if keep_recent_n > 0:
+                        stage._keep_recent = keep_recent_n  # type: ignore[attr-defined]
+                        self._config.summarize_keep_recent = keep_recent_n
+                    break
 
     def _build_stages(self, config: CompressorConfig) -> List[CompressionStage]:
         """Build stage chain from config."""
@@ -902,6 +929,7 @@ class ContextCompressor:
                 summarize_fn=config.summarize_fn,
                 append_only=config.summarize_append_only,
                 token_ratio=config.summarize_token_ratio,
+                protect_first_n=config.protect_first_n,
             ),
             "archive": ArchiveStage(
                 threshold_messages=config.archive_threshold_messages,

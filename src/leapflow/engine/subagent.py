@@ -21,7 +21,7 @@ import contextvars
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,68 @@ DELEGATE_BLOCKED_TOOLS: FrozenSet[str] = frozenset({
     "research_note", "gp_research_note",
     "schedule_reentry", "gp_schedule_reentry",
 })
+
+
+# ── Lifecycle events (frozen; safe to pass across asyncio tasks) ──
+
+
+@dataclass(frozen=True)
+class SubagentStarted:
+    """Emitted when a subagent execution begins."""
+
+    parent_session_id: str
+    subagent_id: str
+    goal: str
+    depth: int
+    timestamp: float = field(default_factory=time.time)
+
+    @property
+    def event_type(self) -> str:
+        return "subagent.started"
+
+    def to_payload(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class SubagentCompleted:
+    """Emitted when a subagent finishes successfully."""
+
+    parent_session_id: str
+    subagent_id: str
+    goal: str
+    summary: str
+    success: bool
+    duration_s: float
+    tool_calls: int = 0
+    timestamp: float = field(default_factory=time.time)
+
+    @property
+    def event_type(self) -> str:
+        return "subagent.completed"
+
+    def to_payload(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class SubagentFailed:
+    """Emitted when a subagent execution fails or is cancelled."""
+
+    parent_session_id: str
+    subagent_id: str
+    goal: str
+    error: str
+    duration_s: float
+    status: str = "failed"  # "failed" | "cancelled"
+    timestamp: float = field(default_factory=time.time)
+
+    @property
+    def event_type(self) -> str:
+        return "subagent.failed"
+
+    def to_payload(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -119,13 +181,30 @@ class SubagentManager:
         max_depth: int = _MAX_SPAWN_DEPTH,
         max_concurrent: int = _MAX_CONCURRENT_CHILDREN,
         on_complete: Optional[Callable[[SubagentResult], None]] = None,
+        event_bus: Optional[Any] = None,
     ) -> None:
         self._executor = executor
         self._max_depth = max_depth
         self._max_concurrent = max_concurrent
         self._on_complete = on_complete
+        self._event_bus = event_bus
         self._active: Dict[str, asyncio.Task[SubagentResult]] = {}
         self._semaphore = asyncio.Semaphore(max_concurrent)
+
+    def _emit_event(self, event: Any) -> None:
+        """Fire-and-forget an event on the bus; never fail the caller."""
+        if self._event_bus is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self._event_bus.handle_event(
+                    event.event_type,
+                    event.to_payload(),
+                )
+            )
+        except Exception:
+            logger.debug("subagent event emission suppressed", exc_info=True)
 
     async def delegate(self, config: SubagentConfig) -> SubagentResult:
         """Delegate a task to a subagent with isolation.
@@ -155,6 +234,14 @@ class SubagentManager:
             )
 
         session_id = f"sub_{uuid.uuid4().hex[:12]}"
+        parent_sid = config.parent_session_id or ""
+
+        self._emit_event(SubagentStarted(
+            parent_session_id=parent_sid,
+            subagent_id=session_id,
+            goal=config.goal,
+            depth=config.depth,
+        ))
 
         async with self._semaphore:
             t0 = time.monotonic()
@@ -181,6 +268,28 @@ class SubagentManager:
                 )
             finally:
                 _current_depth.reset(depth_token)
+
+            # Lifecycle events: completed vs failed/cancelled
+            elapsed = result.elapsed_s or (time.monotonic() - t0)
+            if result.status == "completed":
+                self._emit_event(SubagentCompleted(
+                    parent_session_id=parent_sid,
+                    subagent_id=result.session_id or session_id,
+                    goal=config.goal,
+                    summary=result.summary[:200],
+                    success=True,
+                    duration_s=elapsed,
+                    tool_calls=result.tool_calls,
+                ))
+            else:
+                self._emit_event(SubagentFailed(
+                    parent_session_id=parent_sid,
+                    subagent_id=result.session_id or session_id,
+                    goal=config.goal,
+                    error=result.error or result.status,
+                    duration_s=elapsed,
+                    status=result.status,
+                ))
 
             if self._on_complete:
                 try:

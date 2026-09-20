@@ -1710,6 +1710,51 @@ class AgentEngine:
         logger.warning("Unknown transform strategy: %s", strategy_key)
         return True
 
+    def _post_failover_recompress(
+        self,
+        messages: list,
+        coordinator: "RecoveryCoordinator",
+        failover_decision: "RecoveryDecision",
+    ) -> bool:
+        """Recompress messages when a failover landed on a smaller-window provider.
+
+        Called immediately after ``RecoveryAction.FAILOVER`` is applied. If the
+        new provider's context window is smaller than the estimated prompt
+        payload, a force-compress pass is run on the message list so the
+        retry does not waste a round trip or fail.
+
+        Compression is non-side-effecting, so ``SideEffectState`` gating
+        permits it unconditionally.
+
+        Returns True if recompression was applied, False if it was not needed.
+        """
+        new_window = self._active_context_length()
+        estimated = self._context_controller.estimator.estimate_messages(messages)
+        if estimated <= new_window:
+            return False
+
+        logger.info(
+            "provider_context_handoff: recompressing after failover "
+            "(estimated=%d tokens > new_window=%d)",
+            estimated, new_window,
+        )
+        messages[:] = self._compressor.force_compress(messages)
+        self._usage_tracker.mark_compression()
+
+        # Record the handoff recompression through the coordinator audit trail.
+        coordinator.on_strategy_outcome(
+            failover_decision.decision_id, True,
+        )
+        self._audit_sink.update_outcome(
+            failover_decision.decision_id,
+            "success",
+            reason=(
+                f"post-failover recompression applied: "
+                f"{estimated} tokens compressed to fit {new_window} window"
+            ),
+        )
+        return True
+
     def _check_guardrail(
         self,
         messages: List[Dict[str, Any]],
@@ -2095,12 +2140,31 @@ class AgentEngine:
         Overshooting a model's real limit is recoverable: the provider reports
         overflow and recovery routes it to context compression. Silently running
         at a fraction of the window is not — nothing surfaces it.
+
+        When the LLM backend is a FailoverChain, ``context_length`` reflects
+        the *active* provider's declared window — which may be smaller than
+        the primary's after a failover.  The live chain value is folded into
+        the budget so post-failover turns compress against the right limit.
         """
         budget = max(1, int(getattr(self._settings, "llm_context_length", 0) or 1))
+
+        # Chain-aware: FailoverChain.context_length tracks the active provider.
+        llm_backend = getattr(self, "_llm", None)
+        chain_cl = getattr(llm_backend, "context_length", None) if llm_backend is not None else None
+        if chain_cl is not None:
+            budget = min(budget, max(1, int(chain_cl)))
+
+        # Use the active model name for capability lookup when the chain
+        # exposes it, so a failover to a different model resolves the right
+        # registry entry instead of the primary's.
+        active_model = (
+            getattr(llm_backend, "model", None) if llm_backend is not None else None
+        ) or self._settings.llm_model
+
         if self._model_capabilities is None:
             return budget
         try:
-            caps = self._model_capabilities.resolve(self._settings.llm_model)
+            caps = self._model_capabilities.resolve(active_model)
         except Exception:
             logger.debug("model capability lookup failed", exc_info=True)
             return budget
@@ -2148,6 +2212,10 @@ class AgentEngine:
             pass
         self._current_task_contract = self._build_task_contract(user_text)
         self._current_turn_id = self._current_task_contract.task_id
+        # Reset per-turn guardrail state so counters (TurnCapGuard) only
+        # reflect calls made in THIS turn, not the full session.
+        if self._guardrail is not None:
+            self._guardrail.reset()
         self._current_command_id = self._current_task_contract.task_id
         self._tool_execution_ledger.reset(store=self._conversation_store)
         try:
@@ -3751,6 +3819,8 @@ class AgentEngine:
                 keep_tail=self._settings.compress_keep_tail,
                 max_output_chars=self._settings.max_tool_output_chars,
                 summarize_fn=self._make_compression_summarize_fn(),
+                protect_first_n=self._settings.compression_protect_first_n,
+                summarize_keep_recent=self._settings.compression_keep_recent_n,
             )
         )
 
@@ -4105,7 +4175,10 @@ class AgentEngine:
         )
         recovery_budget.start_deadline()
         self._recovery_coordinator = RecoveryCoordinator(
-            strategies=default_strategies(),
+            strategies=default_strategies(
+                credential_availability=self._llm
+                if hasattr(self._llm, "has_rotatable_credentials") else None,
+            ),
             budget=recovery_budget,
         )
         self._recovery_coordinator.new_turn(turn_id=budget.used)
@@ -4120,6 +4193,12 @@ class AgentEngine:
         _signal_watermark = [time.time()]
 
         session_id = self._ensure_session_for_frame(frame, user_text)
+
+        # Prime per-turn guardrail baselines with the initial message state
+        # (prior turns only) so that TurnCapGuard counts only calls added
+        # during THIS turn, not the pre-existing prior-turn calls.
+        if self._guardrail is not None:
+            self._guardrail.check(messages)
 
         while not budget.exhausted:
             if self._cancel_requested:
@@ -4248,6 +4327,7 @@ class AgentEngine:
                 elif decision.action == RecoveryAction.FAILOVER:
                     if hasattr(self._llm, "_failover"):
                         self._llm._failover(f"recovery: {decision.reason}")
+                    self._post_failover_recompress(messages, coordinator, decision)
                     coordinator.on_strategy_outcome(decision.decision_id, True)
                     continue
 
@@ -4721,7 +4801,10 @@ class AgentEngine:
         )
         recovery_budget.start_deadline()
         self._recovery_coordinator = RecoveryCoordinator(
-            strategies=default_strategies(),
+            strategies=default_strategies(
+                credential_availability=self._llm
+                if hasattr(self._llm, "has_rotatable_credentials") else None,
+            ),
             budget=recovery_budget,
         )
         self._recovery_coordinator.new_turn(turn_id=budget.used)
@@ -4737,6 +4820,10 @@ class AgentEngine:
 
         self._cancel_requested = False
         _signal_watermark = [time.time()]
+
+        # Prime per-turn guardrail baselines (mirrors _run_agent_loop).
+        if self._guardrail is not None:
+            self._guardrail.check(messages)
 
         while not budget.exhausted:
             if self._cancel_requested:
@@ -4855,6 +4942,7 @@ class AgentEngine:
                     elif decision.action == RecoveryAction.FAILOVER:
                         if hasattr(self._llm, "_failover"):
                             self._llm._failover(f"recovery: {decision.reason}")
+                        self._post_failover_recompress(messages, coordinator, decision)
                         coordinator.on_strategy_outcome(decision.decision_id, True)
                         continue
                     else:
@@ -5104,6 +5192,7 @@ class AgentEngine:
                         elif decision.action == RecoveryAction.FAILOVER:
                             if hasattr(self._llm, "_failover"):
                                 self._llm._failover(f"recovery: {decision.reason}")
+                            self._post_failover_recompress(messages, coordinator, decision)
                             coordinator.on_strategy_outcome(decision.decision_id, True)
                             continue
                         else:
@@ -5191,6 +5280,7 @@ class AgentEngine:
                         elif decision.action == RecoveryAction.FAILOVER:
                             if hasattr(self._llm, "_failover"):
                                 self._llm._failover(f"recovery: {decision.reason}")
+                            self._post_failover_recompress(messages, coordinator, decision)
                             coordinator.on_strategy_outcome(decision.decision_id, True)
                             continue
                         else:
@@ -5678,6 +5768,14 @@ class AgentEngine:
                             {"name": str(skipped_tc.name), "arguments": skipped_tc.arguments}
                         )
                         skipped_name = str(skipped_call["name"])
+                        skipped_result = _skipped_after_failure_result(normalized_name, result)
+                        self._append_skipped_tool_message(
+                            skipped_tc.id,
+                            skipped_name,
+                            skipped_result,
+                            messages=messages,
+                            result_budget=result_budget,
+                        )
                         executed.append(
                             {
                                 "id": skipped_tc.id,
@@ -5686,7 +5784,7 @@ class AgentEngine:
                                     skipped_call.get("original_tool_name") or skipped_tc.name
                                 ),
                                 "arguments": skipped_tc.arguments,
-                                "result": _skipped_after_failure_result(normalized_name, result),
+                                "result": skipped_result,
                             }
                         )
                     logger.info(
@@ -5791,13 +5889,23 @@ class AgentEngine:
                         skipped_original = original_names_by_id.get(
                             str(skipped_ctc.id), skipped_ctc.name
                         )
+                        skipped_result = _skipped_after_failure_result(
+                            ctc.name, effective_result
+                        )
+                        self._append_skipped_tool_message(
+                            skipped_ctc.id,
+                            skipped_ctc.name,
+                            skipped_result,
+                            messages=messages,
+                            result_budget=result_budget,
+                        )
                         executed.append(
                             {
                                 "id": skipped_ctc.id,
                                 "name": skipped_ctc.name,
                                 "original_tool_name": skipped_original,
                                 "arguments": skipped_ctc.arguments,
-                                "result": _skipped_after_failure_result(ctc.name, effective_result),
+                                "result": skipped_result,
                             }
                         )
                     logger.info(
@@ -5853,13 +5961,21 @@ class AgentEngine:
                     skipped_original = original_names_by_id.get(
                         str(skipped_ctc.id), skipped_ctc.name
                     )
+                    skipped_result = _skipped_after_failure_result(ctc.name, result)
+                    self._append_skipped_tool_message(
+                        skipped_ctc.id,
+                        skipped_ctc.name,
+                        skipped_result,
+                        messages=messages,
+                        result_budget=result_budget,
+                    )
                     executed.append(
                         {
                             "id": skipped_ctc.id,
                             "name": skipped_ctc.name,
                             "original_tool_name": skipped_original,
                             "arguments": skipped_ctc.arguments,
-                            "result": _skipped_after_failure_result(ctc.name, result),
+                            "result": skipped_result,
                         }
                     )
                 logger.info(
@@ -5868,6 +5984,38 @@ class AgentEngine:
                 )
                 break
         return executed
+
+    def _append_skipped_tool_message(
+        self,
+        tool_call_id: Any,
+        tool_name: str,
+        result: Dict[str, Any],
+        *,
+        messages: List[Dict[str, Any]],
+        result_budget: int,
+    ) -> None:
+        """Append and persist a tool-result message for a call skipped by side-effect gating.
+
+        The assistant message that opened this batch already advertised every
+        ``tool_call_id`` it emitted. A call skipped after an earlier side-effect
+        failure is never executed, but it still needs a matching ``role="tool"``
+        message: without one the next request carries an assistant message with N
+        tool_calls but fewer than N tool responses, and the provider rejects it
+        with HTTP 400 ("insufficient tool messages following tool_calls message").
+        The message is written to both the in-memory history and the durable
+        transcript so a turn later rebuilt from persistence stays valid too.
+        """
+        result_text = _truncate_result_for_budget(result, result_budget)
+        messages.append(
+            {"role": "tool", "tool_call_id": tool_call_id, "content": result_text}
+        )
+        self._persist_message(
+            self._current_session_id,
+            "tool",
+            result_text,
+            tool_name=tool_name,
+            tool_call_id=str(tool_call_id),
+        )
 
     def _tool_execution_context(self) -> Any | None:
         """Build the tool context from the current task contract, if any."""

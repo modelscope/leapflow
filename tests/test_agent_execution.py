@@ -802,6 +802,62 @@ def test_progress_independent_halt_fires_while_progressing() -> None:
             lt.close()
 
 
+def test_turn_cap_guard_per_turn_semantics() -> None:
+    """TurnCapGuard must count only the current turn's tool calls.
+
+    Scenario: turn 1 makes 8 tool calls (cap=10). After reset + prime,
+    turn 2 makes 3 calls. Turn 2 must NOT be halted because turn 1's
+    8 calls are excluded by the per-turn baseline. A single turn that
+    exceeds the cap MUST halt."""
+    from leapflow.engine.tool_guardrails import TurnCapGuard
+
+    def _assistant_with_n_calls(n: int, start_id: int = 0) -> list:
+        """Build n assistant messages, each with one tool_call."""
+        return [
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": start_id + i, "function": {"name": "t", "arguments": "{}"}}],
+            }
+            for i in range(n)
+        ]
+
+    guard = TurnCapGuard(max_calls=10)
+
+    # ── Turn 1 ──
+    prior_turns: list = []  # empty at start
+    messages_t1: list = [{"role": "user", "content": "turn-1"}]
+    # Prime baseline (prior turns = 0 calls)
+    guard.reset()
+    guard.check(messages_t1)
+
+    # Simulate 8 tool calls during turn 1
+    messages_t1.extend(_assistant_with_n_calls(8))
+    v = guard.check(messages_t1)
+    assert not v.violated, "8 calls under cap of 10 should not halt"
+
+    # ── Turn 2 ──
+    # Prior turns now include turn 1's 8 calls
+    prior_turns = list(messages_t1)
+    messages_t2: list = prior_turns + [{"role": "user", "content": "turn-2"}]
+    guard.reset()
+    guard.check(messages_t2)  # Prime: baseline captures 8 prior calls
+
+    # Add 3 new calls in turn 2
+    messages_t2.extend(_assistant_with_n_calls(3, start_id=100))
+    v = guard.check(messages_t2)
+    assert not v.violated, "Turn 2 has only 3 calls; prior turn's 8 must be excluded"
+
+    # ── Single turn exceeding cap ──
+    guard.reset()
+    over_msgs: list = [{"role": "user", "content": "big-turn"}]
+    guard.check(over_msgs)  # Prime baseline (0 prior calls)
+    over_msgs.extend(_assistant_with_n_calls(12))
+    v = guard.check(over_msgs)
+    assert v.violated, "12 calls in one turn must trigger the cap"
+    assert v.severity == "halt"
+    assert v.progress_independent
+
+
 def test_synthesize_forced_answer_returns_model_answer() -> None:
     """When the loop stops without a written answer, a single tool-free round lets
     the model answer from the gathered context instead of emitting the canned
@@ -1156,8 +1212,63 @@ async def test_side_effect_failure_stops_remaining_native_tool_batch() -> None:
             assert results[1]["result"]["execution_skipped"] is True
             assert results[1]["result"]["counts_as_failure"] is False
             assert AgentEngine._count_consecutive_tool_failures(messages) == 1
+            # Every emitted tool_call must get a matching tool-result message,
+            # even the one skipped by the batch stop: otherwise the next request
+            # carries an assistant tool_calls message with fewer responses than
+            # calls and the provider rejects it with HTTP 400 ("insufficient tool
+            # messages following tool_calls message").
+            tool_msgs = [m for m in messages if m.get("role") == "tool"]
+            assert {m["tool_call_id"] for m in tool_msgs} == {"tc1", "tc2"}
         finally:
             lt.close()
+
+
+def test_message_healer_synthesizes_missing_tool_results() -> None:
+    """An assistant tool_calls message missing a response is repaired, not sent broken.
+
+    This is the boundary guard for the provider contract that produced the
+    observed HTTP 400 ("insufficient tool messages following tool_calls
+    message"): every tool_call_id must be followed by a role=tool message,
+    whatever upstream path (batch stop, cancellation, compression) dropped it.
+    """
+    import json as _json
+
+    from leapflow.engine.message_healer import MessageHealer
+
+    healer = MessageHealer()
+    messages = [
+        {"role": "user", "content": "do two things"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {"name": "platform_action", "arguments": "{}"},
+                },
+                {
+                    "id": "call_b",
+                    "type": "function",
+                    "function": {"name": "file_list", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_a", "content": '{"ok": false}'},
+        # call_b has no response -> the provider would reject the whole request.
+    ]
+
+    healed = healer.heal(messages)
+
+    # Both calls now have contiguous responses, in emission order.
+    tool_ids = [m["tool_call_id"] for m in healed if m.get("role") == "tool"]
+    assert tool_ids == ["call_a", "call_b"]
+    synth = next(m for m in healed if m.get("tool_call_id") == "call_b")
+    payload = _json.loads(synth["content"])
+    assert payload["execution_skipped"] is True
+    assert payload["counts_as_failure"] is False
+    # A well-formed history is left untouched (idempotent, no duplicate results).
+    assert healer.heal(healed) == healed
 
 
 @pytest.mark.asyncio

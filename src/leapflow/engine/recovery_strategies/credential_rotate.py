@@ -6,6 +6,8 @@ Handles auth errors and rate limiting by rotating to alternate credentials
 """
 from __future__ import annotations
 
+from typing import Protocol, runtime_checkable
+
 from leapflow.engine.failure_envelope import FailureEnvelope
 from leapflow.engine.recovery_budget import RecoveryBudget
 from leapflow.engine.recovery_coordinator import RecoveryState
@@ -16,6 +18,17 @@ from leapflow.engine.recovery_decision import (
 )
 
 
+@runtime_checkable
+class CredentialAvailability(Protocol):
+    """Inspector for whether alternate credentials remain worth rotating to.
+
+    Structural (duck-typed) so the engine can inject the ``FailoverChain``
+    without this module importing the ``llm`` layer.
+    """
+
+    def has_rotatable_credentials(self) -> bool: ...
+
+
 class CredentialRotateStrategy:
     """Rotate credentials on authentication or rate-limit failures.
 
@@ -23,6 +36,9 @@ class CredentialRotateStrategy:
     attempts to switch to alternate credentials from the configured pool.
     Credential rotation is a form of failover at the authentication level.
     """
+
+    def __init__(self, credential_availability: CredentialAvailability | None = None) -> None:
+        self._availability = credential_availability
 
     @property
     def key(self) -> str:
@@ -46,8 +62,15 @@ class CredentialRotateStrategy:
 
     def can_apply(self, envelope: FailureEnvelope, state: RecoveryState,
                   budget: RecoveryBudget | None = None) -> bool:
-        """Applicable when credential rotation budget remains."""
+        """Applicable when rotation budget and a rotatable credential remain.
+
+        Bows out when the pool reports no rotatable credential left (all keys
+        dead or cooling down): rotating again would only loop, so
+        ``ProviderFailoverStrategy`` should take over instead.
+        """
         if budget is not None and not budget.can_rotate():
+            return False
+        if self._availability is not None and not self._availability.has_rotatable_credentials():
             return False
         return True
 

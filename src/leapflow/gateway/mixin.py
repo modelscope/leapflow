@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from leapflow.gateway.protocol import OutboundContent, SendResult, SendTarget
+from leapflow.gateway.protocol import OutboundContent, PlatformCapabilities, SendResult, SendTarget
 
 
 class PlatformAdapterMixin:
@@ -32,6 +32,18 @@ class PlatformAdapterMixin:
     supports_async_delivery: bool = True
     splits_long_messages: bool = False
     max_message_length: int = 4000
+
+    @property
+    def capabilities(self) -> PlatformCapabilities:
+        """Derive capabilities from existing class-level flags.
+
+        Concrete adapters may override to declare additional capabilities.
+        """
+        return PlatformCapabilities(
+            supports_async_delivery=self.supports_async_delivery,
+            splits_long_messages=self.splits_long_messages,
+            max_message_length=self.max_message_length,
+        )
 
     # ── Message editing ──────────────────────────────────────
 

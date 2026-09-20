@@ -5,8 +5,9 @@ Repairs (inspired by hermes message_sanitization.py):
 1. Empty content → placeholder
 2. Consecutive same-role merging (respects tool_calls metadata)
 3. Orphan tool result removal
-4. Malformed tool_call argument JSON repair
-5. Interrupted tool sequence closing (tail role=tool gets synthetic assistant)
+4. Missing tool result synthesis (assistant tool_calls without a response)
+5. Malformed tool_call argument JSON repair
+6. Interrupted tool sequence closing (tail role=tool gets synthetic assistant)
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ class MessageHealer:
         messages = self._repair_tool_call_arguments(messages)
         messages = self._fix_role_alternation(messages)
         messages = self._fix_orphan_tool_results(messages)
+        messages = self._fix_missing_tool_results(messages)
         messages = self._close_interrupted_tool_sequence(messages)
         return messages
 
@@ -101,6 +103,82 @@ class MessageHealer:
             else:
                 result.append(msg)
         return result
+
+    def _fix_missing_tool_results(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Synthesize a tool result for any tool_call left without a response.
+
+        Per the OpenAI tool protocol, an assistant message carrying
+        ``tool_calls`` must be followed by exactly one ``role="tool"`` message per
+        ``tool_call_id``; a missing one triggers HTTP 400 ("insufficient tool
+        messages following tool_calls message"). This can arise when a tool batch
+        is stopped early (side-effect gating), a turn is cancelled mid-batch, or
+        compression drops a result. Rather than let the request fail, emit a
+        synthetic non-executed result for each unanswered call, inserted right
+        after the existing tool run so the pairing stays contiguous.
+
+        This is the reverse of :meth:`_fix_orphan_tool_results` and completes the
+        invariant guard. It is a transient boundary repair on the copy sent to
+        the provider; it does not mutate durable history.
+        """
+        # A tool_call is considered answered if any tool message anywhere carries
+        # its id, so a result that survived out of position is not duplicated.
+        responded: set[str] = set()
+        for msg in messages:
+            if msg.get("role") == "tool":
+                call_id = str(msg.get("tool_call_id", ""))
+                if call_id:
+                    responded.add(call_id)
+
+        result: List[Dict[str, Any]] = []
+        synthesized = 0
+        index = 0
+        total = len(messages)
+        while index < total:
+            msg = messages[index]
+            result.append(msg)
+            tool_calls = msg.get("tool_calls") if msg.get("role") == "assistant" else None
+            if not tool_calls:
+                index += 1
+                continue
+            # Copy the contiguous run of tool results that already follow.
+            cursor = index + 1
+            while cursor < total and messages[cursor].get("role") == "tool":
+                result.append(messages[cursor])
+                cursor += 1
+            # Append a placeholder for each still-unanswered call, in emission order.
+            for call in tool_calls:
+                call_id = str(call.get("id") or call.get("call_id") or "")
+                if call_id and call_id not in responded:
+                    result.append(self._synthetic_tool_result(call_id))
+                    responded.add(call_id)
+                    synthesized += 1
+            index = cursor
+
+        if synthesized:
+            logger.debug(
+                "message_healer: synthesized %d missing tool result(s)", synthesized
+            )
+        return result
+
+    @staticmethod
+    def _synthetic_tool_result(tool_call_id: str) -> Dict[str, Any]:
+        """Build a minimal, provider-valid tool result for an unanswered tool_call."""
+        content = json.dumps(
+            {
+                "ok": False,
+                "execution_skipped": True,
+                "skipped_reason": "no_result_recorded",
+                "note": (
+                    "This tool call produced no result (batch stopped, cancelled, "
+                    "or truncated). Re-issue it if the action is still needed."
+                ),
+                "counts_as_failure": False,
+            },
+            ensure_ascii=False,
+        )
+        return {"role": "tool", "tool_call_id": str(tool_call_id), "content": content}
 
     def _repair_tool_call_arguments(
         self, messages: List[Dict[str, Any]]

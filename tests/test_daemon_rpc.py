@@ -1681,6 +1681,8 @@ async def test_runtime_service_slash_metadata_payloads() -> None:
         prompt_tokens = 12
         completion_tokens = 8
         total_tokens = 20
+        cached_tokens = 0
+        model = "test-model"
 
     class FakeUsageTracker:
         def summary(self) -> FakeSummary:
