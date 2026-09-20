@@ -39,6 +39,13 @@ _TRIM_CEILING_CHARS = 120_000
 _TRIM_CONTEXT_DIVISOR = 50
 _TRIM_BUDGET_ACTIVATION_RATIO = 0.15
 
+# ── Summarize-stage head/tail protection defaults ─────────────────────
+# Aligned with hermes context_compressor (first_n=3, last_n=6). These are
+# module-level constants rather than Settings-backed values; the engine agent
+# (Wave 2) will wire them into Settings if needed.
+_DEFAULT_PROTECT_FIRST_N = 3
+_DEFAULT_SUMMARIZE_KEEP_RECENT = 6
+
 # Tool-result budget scaling. The divisor is picked so a 128K window lands near
 # the historical 3000-char budget, keeping small windows behaving as before while
 # large ones actually widen: 128K/40 ~ 3.2K, 1M/40 -> 25K (ceiling-bound).
@@ -176,8 +183,8 @@ class CompressorConfig:
         # an explicit larger ``keep_tail``, else apply a safe floor (Summarize
         # keeps more than Drop, and Drop — the last resort — still keeps several
         # recent turns rather than nuking to a handful).
-        self.summarize_keep_recent = max(self.keep_tail, 8)
-        self.drop_keep_recent = max(self.keep_tail, 6)
+        self.summarize_keep_recent = max(self.keep_tail, _DEFAULT_SUMMARIZE_KEEP_RECENT)
+        self.drop_keep_recent = max(self.keep_tail, _DEFAULT_SUMMARIZE_KEEP_RECENT)
 
         self._base_trim_threshold = self.trim_threshold_chars
         self._apply_adaptive_scaling()
@@ -422,11 +429,12 @@ class SummarizeStage:
         self,
         *,
         threshold_messages: int = 16,
-        keep_recent: int = 6,
+        keep_recent: int = _DEFAULT_SUMMARIZE_KEEP_RECENT,
         summarize_fn: Optional[SummarizeFn] = None,
         summary_target_ratio: float = 0.2,
         append_only: bool = True,
         token_ratio: float = 0.5,
+        protect_first_n: int = _DEFAULT_PROTECT_FIRST_N,
     ) -> None:
         self._threshold = threshold_messages
         self._keep_recent = keep_recent
@@ -434,6 +442,7 @@ class SummarizeStage:
         self._summary_target_ratio = summary_target_ratio
         self._append_only = append_only
         self._token_ratio = token_ratio
+        self._protect_first_n = protect_first_n
         self._previous_summary: Optional[str] = None
         self._compression_count: int = 0
         self._last_savings_ratio: float = 1.0
@@ -511,7 +520,7 @@ class SummarizeStage:
         if self._append_only or self._compression_count > 0:
             protect_first_n = 0
         else:
-            protect_first_n = min(2, len(messages) - head_count)
+            protect_first_n = min(self._protect_first_n, len(messages) - head_count)
 
         middle_start = stable_count + protect_first_n
         middle_start = self._align_boundary_forward(messages, middle_start)

@@ -19,9 +19,11 @@ never presents an empty or contradictory tool contract to the model.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
+
+from leapflow.engine.prefix_commitment import CommitmentStatus
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,25 @@ class ReasoningDisclosure(str, Enum):
     OFF = "off"
     AUTO = "auto"
     ON = "on"
+
+
+class CacheBoundary(str, Enum):
+    """Cache optimization boundary for the prompt prefix.
+
+    NONE:      No cache optimization — the planner runs normal PCD.
+    SOFT:      The stable prefix is *marked* for opportunistic caching but
+               disclosure is not frozen.  The provider may cache the prefix;
+               if the next turn's PCD computation yields a different level the
+               cache simply misses.
+    COMMITTED: Disclosure level **and** tool set are frozen to the values
+               captured by :class:`CommitmentEnforcement`.  The planner
+               reproduces the committed plan verbatim so the provider can
+               rely on a byte-stable prefix.
+    """
+
+    NONE = "none"
+    SOFT = "soft"
+    COMMITTED = "committed"
 
 
 @dataclass(frozen=True)
@@ -144,6 +165,20 @@ class PromptAssemblyPlan:
     expanded_categories: tuple[str, ...] = ()
     context_planes: tuple[str, ...] = ()
     max_prior_turns: int = 2
+    cache_boundary: CacheBoundary = CacheBoundary.NONE
+    stable_tool_names: tuple[str, ...] = ()
+
+    def with_cache_boundary(
+        self,
+        cache_boundary: CacheBoundary,
+        stable_tool_names: tuple[str, ...] = (),
+    ) -> PromptAssemblyPlan:
+        """Return a copy with the given cache boundary and stable tool set."""
+        return replace(
+            self,
+            cache_boundary=cache_boundary,
+            stable_tool_names=stable_tool_names,
+        )
 
     def metadata(self) -> dict[str, Any]:
         """Return a JSON-serializable disclosure summary."""
@@ -160,6 +195,7 @@ class PromptAssemblyPlan:
             "native_tools": self.native_tools,
             "stream_mode": self.stream_mode,
             "risk_level": self.risk_level,
+            "cache_boundary": self.cache_boundary.value,
         }
 
 
@@ -198,13 +234,45 @@ class DisclosurePlanner:
         self,
         tool_definitions: Sequence[Mapping[str, Any]],
         runtime: DisclosureRuntimeState,
+        *,
+        commitment_status: CommitmentStatus | None = None,
+        committed_level: DisclosureLevel | None = None,
+        committed_tool_names: tuple[str, ...] = (),
+        cache_benefit: bool = False,
     ) -> PromptAssemblyPlan:
-        """Build a prompt assembly plan from structural runtime facts only."""
+        """Build a prompt assembly plan from structural runtime facts only.
+
+        Cache-aware parameters (all optional, backward-compatible):
+
+        *   *commitment_status* — current :class:`CommitmentStatus`.  When
+            ``COMMITTED`` the plan freezes disclosure at *committed_level*
+            with *committed_tool_names* (PCD minimum-sufficiency preserved;
+            does **not** force FULL).
+        *   *committed_level* / *committed_tool_names* — the frozen snapshot
+            from :class:`CommitmentEnforcement`.  Ignored unless
+            ``commitment_status is COMMITTED``.
+        *   *cache_benefit* — ``True`` when the amortization model shows
+            positive savings for an uncommitted prefix.  Produces a ``SOFT``
+            cache boundary annotation.
+        """
+        # ── Cache-COMMITTED: reproduce the committed disclosure verbatim ──
+        if (
+            commitment_status is CommitmentStatus.COMMITTED
+            and committed_level is not None
+        ):
+            return self._committed_plan(
+                tool_definitions, runtime, committed_level, committed_tool_names,
+            )
+
+        # ── Normal PCD logic ──────────────────────────────────────────────
         manifests = self.manifests or build_capability_manifests(tool_definitions)
         manifest_by_name = {m.name: m for m in manifests if m.name}
 
         if runtime.slash_command or runtime.context_posture in {"research", "expanding", "converging", "finalizing"} or runtime.recent_failure:
-            return self.full_plan(tool_definitions, runtime, _full_reason(runtime))
+            result = self.full_plan(tool_definitions, runtime, _full_reason(runtime))
+            if commitment_status is CommitmentStatus.UNCOMMITTED and cache_benefit:
+                result = result.with_cache_boundary(CacheBoundary.SOFT)
+            return result
 
         core_defs, core_names = _core_whitelist(tool_definitions, manifest_by_name)
         expanded_defs: list[Mapping[str, Any]] = list(core_defs)
@@ -244,7 +312,7 @@ class DisclosurePlanner:
                 else "tier0/0.5: static core whitelist"
             )
         scoped_manifests = [manifest_by_name[name] for name in expanded_names if name in manifest_by_name]
-        return PromptAssemblyPlan(
+        result = PromptAssemblyPlan(
             level=level,
             tool_definitions=tuple(expanded_defs),
             catalog_definitions=tuple(tool_definitions),
@@ -266,6 +334,66 @@ class DisclosurePlanner:
             expanded_categories=tuple(expanded_categories),
             context_planes=("task_semantic", "control_plane"),
             max_prior_turns=6 if expanded_categories else 2,
+        )
+        if commitment_status is CommitmentStatus.UNCOMMITTED and cache_benefit:
+            result = result.with_cache_boundary(CacheBoundary.SOFT)
+        return result
+
+    def _committed_plan(
+        self,
+        tool_definitions: Sequence[Mapping[str, Any]],
+        runtime: DisclosureRuntimeState,
+        frozen_level: DisclosureLevel,
+        frozen_tool_names: tuple[str, ...],
+    ) -> PromptAssemblyPlan:
+        """Build a cache-frozen plan that reproduces the committed disclosure.
+
+        Instead of re-evaluating PCD gates, the plan uses the exact
+        level/tools captured by ``CommitmentEnforcement``.  The remaining
+        fields (memory, history, reasoning, etc.) are derived from the frozen
+        level so the plan is coherent but never *escalates* beyond what was
+        committed — preserving the PCD minimum-sufficiency invariant.
+        """
+        if frozen_level == DisclosureLevel.FULL:
+            base = self.full_plan(
+                tool_definitions, runtime,
+                f"cache: committed (frozen {frozen_level.value})",
+            )
+        else:
+            committed_set = set(frozen_tool_names)
+            frozen_defs = tuple(
+                td for td in tool_definitions if _tool_name(td) in committed_set
+            ) if committed_set else tuple(tool_definitions)
+            manifests = self.manifests or build_capability_manifests(tool_definitions)
+            scoped = [m for m in manifests if m.name in committed_set]
+            is_expanded = frozen_level != DisclosureLevel.CORE
+            base = PromptAssemblyPlan(
+                level=frozen_level,
+                tool_definitions=frozen_defs,
+                catalog_definitions=tuple(tool_definitions),
+                memory=(
+                    MemoryDisclosure.QUERY_RETRIEVAL if is_expanded
+                    else MemoryDisclosure.SESSION_SUMMARY
+                ),
+                history=(
+                    HistoryDisclosure.RECENT if is_expanded
+                    else HistoryDisclosure.SHORT
+                ),
+                reasoning=(
+                    ReasoningDisclosure.AUTO
+                    if runtime.enable_thinking and is_expanded
+                    else ReasoningDisclosure.OFF
+                ),
+                native_tools=runtime.native_tools_enabled and bool(frozen_defs),
+                stream_mode="tool_aware" if is_expanded else "direct",
+                risk_level=_highest_risk(scoped),
+                reason=f"cache: committed (frozen {frozen_level.value})",
+                selected_tool_names=frozen_tool_names,
+                context_planes=("task_semantic", "control_plane"),
+                max_prior_turns=6 if is_expanded else 2,
+            )
+        return base.with_cache_boundary(
+            CacheBoundary.COMMITTED, frozen_tool_names,
         )
 
     def full_plan(

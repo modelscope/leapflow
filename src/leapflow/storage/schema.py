@@ -28,7 +28,7 @@ import duckdb
 logger = logging.getLogger(__name__)
 
 BASE_SCHEMA_VERSION = 1
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -505,12 +505,29 @@ def _apply_proposal_event_index(conn: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+def _apply_session_snapshot_columns(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add PCD cache-aware session snapshot columns to conv_sessions.
+
+    These columns persist the system prompt, tool schema, and disclosure level
+    at the time a session was last active, enabling prefix-cache-friendly
+    session resumption.
+    """
+    statements = (
+        "ALTER TABLE conv_sessions ADD COLUMN IF NOT EXISTS system_prompt_snapshot TEXT",
+        "ALTER TABLE conv_sessions ADD COLUMN IF NOT EXISTS tool_schema_snapshot TEXT",
+        "ALTER TABLE conv_sessions ADD COLUMN IF NOT EXISTS disclosure_level TEXT",
+    )
+    for statement in statements:
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[MigrationDef, ...] = (
     MigrationDef(2, "evolution event stream", _apply_evolution_tables),
     MigrationDef(3, "database-global evolution cursor", _apply_evolution_sequence),
     MigrationDef(4, "durable teacher job context", _apply_teacher_job_context),
     MigrationDef(5, "checkpointed evolution projections", _apply_evolution_projection),
     MigrationDef(6, "event-sourced proposal index", _apply_proposal_event_index),
+    MigrationDef(7, "PCD session snapshot columns", _apply_session_snapshot_columns),
 )
 
 

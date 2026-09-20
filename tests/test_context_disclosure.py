@@ -141,7 +141,11 @@ def test_disclosure_planner_never_performs_text_fitting() -> None:
 
     signature = inspect.signature(DisclosurePlanner.plan)
     assert "user_text" not in signature.parameters
-    assert list(signature.parameters)[1:] == ["tool_definitions", "runtime"]
+    assert list(signature.parameters)[1:3] == ["tool_definitions", "runtime"]
+    # Cache-aware keyword-only params are structural (enums / bools), not text
+    for extra in ("commitment_status", "committed_level", "committed_tool_names", "cache_benefit"):
+        if extra in signature.parameters:
+            assert signature.parameters[extra].kind == inspect.Parameter.KEYWORD_ONLY
     assert "active_capability_plan" in DisclosureRuntimeState.__dataclass_fields__
 
 

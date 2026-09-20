@@ -29,6 +29,27 @@ _RETRYABLE_ERRORS = (
 )
 
 
+def _sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Strip internal ``_``-prefixed keys from messages before sending to the provider API.
+
+    LeapFlow uses underscore-prefixed keys (``_volatile_context``,
+    ``_compressed_summary``, ``_frozen_memory``, ``_DB_PERSISTED_*``, etc.) as
+    in-band metadata for cache strategy and context management.  These keys must
+    not leak into HTTP request bodies sent to the model provider.
+
+    Standard OpenAI API fields (``role``, ``content``, ``tool_calls``,
+    ``tool_call_id``, ``name``, ``cache_control``, etc.) never start with ``_``
+    and are therefore always preserved.
+
+    Returns a **new list of shallow-copied dicts** — the caller's original
+    *messages* list is never mutated.
+    """
+    return [
+        {k: v for k, v in msg.items() if not k.startswith("_")}
+        for msg in messages
+    ]
+
+
 def _extract_cached_tokens(usage: Any) -> int:
     """Best-effort cached-prompt-token count across OpenAI-compatible providers.
 
@@ -194,6 +215,7 @@ class OpenAIChat(LLMProvider):
         on_chunk: ChunkCallback = None,
         **kwargs: Any,
     ) -> OpenAIChatResponse:
+        messages = _sanitize_messages(messages)
         last_err: Optional[BaseException] = None
         for attempt in range(self._max_retries):
             try:
@@ -356,6 +378,7 @@ class OpenAIChat(LLMProvider):
         enable_thinking: bool = False,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
+        messages = _sanitize_messages(messages)
         create_kwargs = {
             "model": kwargs.pop("model", self._model),
             "messages": messages,
@@ -397,6 +420,7 @@ class OpenAIChat(LLMProvider):
         **kwargs: Any,
     ) -> OpenAIChatResponse:
         """Synchronous chat with retry (uses the synchronous OpenAI client)."""
+        messages = _sanitize_messages(messages)
 
         last_err: Optional[BaseException] = None
         for attempt in range(self._max_retries):

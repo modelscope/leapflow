@@ -53,6 +53,11 @@ dev = [
     "pytest-cov>=5.0",
 ]
 hub = ["modelscope-hub>=0.1.0"]
+# Native Anthropic Messages API provider. Optional: the core install uses the
+# OpenAI-compatible transport by default; this extra enables AnthropicChat for
+# endpoints that speak the Anthropic wire format (api.anthropic.com, DeepSeek
+# /anthropic compat endpoint, etc.).
+anthropic = ["anthropic>=0.39"]
 # Better main-content extraction for web_fetch. Optional because the stdlib
 # extractor always ships: this upgrades quality, it does not enable the feature.
 web = ["trafilatura>=2.2"]

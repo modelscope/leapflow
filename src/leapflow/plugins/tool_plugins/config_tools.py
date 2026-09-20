@@ -34,8 +34,8 @@ class ConfigToolsPlugin:
             ToolMetadata(
                 name="config_list",
                 description=(
-                    "List LeapFlow's own writable settings (model, provider, daemon, memory, "
-                    "perception, gateway, \u2026) with current values. Use this to discover the exact "
+                    "List LeapFlow's own writable settings (LLM model and endpoint, daemon, memory, "
+                    "perception, gateway, …) with current values. Use this to discover the exact "
                     "key before changing anything. Optionally narrow by `category`. This is the "
                     "only correct way to inspect LeapFlow configuration \u2014 never read config files "
                     "from disk."
@@ -65,9 +65,11 @@ class ConfigToolsPlugin:
             ToolMetadata(
                 name="config_get",
                 description=(
-                    "Read one LeapFlow setting by key (e.g. 'llm.model', 'daemon.log_level'), "
-                    "returning its current value, type, scopes, and whether a change needs a "
-                    "daemon restart. Never read LeapFlow config files from disk \u2014 use this."
+                    "Read one LeapFlow setting by key (e.g. 'llm.model', 'llm.base_url', "
+                    "'daemon.log_level'), returning its current value, type, scopes, and whether a "
+                    "change needs a daemon restart. There is no 'llm.provider' key: provider behavior "
+                    "is inferred from the OpenAI-compatible 'llm.base_url'. Never read LeapFlow config "
+                    "files from disk — use this."
                 ),
                 parameters_schema={
                     "type": "object",
@@ -91,11 +93,12 @@ class ConfigToolsPlugin:
             ToolMetadata(
                 name="config_set",
                 description=(
-                    "Change one LeapFlow setting by key, e.g. switch the model with "
-                    "key='llm.model'. Values are validated and coerced; credentials are stored in "
-                    "the vault automatically. Call config_list or config_get first if unsure of "
-                    "the key. The result states whether a `leap daemon restart` is required. "
-                    "Never edit LeapFlow config files directly."
+                    "Change one LeapFlow setting by key, e.g. switch an OpenAI-compatible LLM with "
+                    "key='llm.model' and key='llm.base_url'. There is no 'llm.provider' key: provider "
+                    "behavior is inferred from the endpoint. Values are validated and coerced; credentials "
+                    "are stored in the vault automatically. Call config_list or config_get first if unsure "
+                    "of the key. The result states whether a `leap daemon restart` is required. Never edit "
+                    "LeapFlow config files directly."
                 ),
                 parameters_schema={
                     "type": "object",
