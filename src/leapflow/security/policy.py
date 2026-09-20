@@ -42,14 +42,15 @@ class ApprovalPolicyEngine:
         self._bypass = bypass
 
     def evaluate(self, action: ActionDescriptor, risk: RiskAssessment) -> PolicyDecision:
-        # Hardline/CRITICAL always denied regardless of bypass
+        # Hardline/CRITICAL actions are not approvable and therefore never reach
+        # either config-level or session-level bypass handling.
         if risk.hardline or risk.level == RiskLevel.CRITICAL:
             return PolicyDecision(
                 verdict=PolicyVerdict.DENY,
                 reason="; ".join(risk.reasons) or "hardline_block",
                 allow_permanent=False,
             )
-        # Bypass mode: auto-allow everything below CRITICAL
+        # Config bypass auto-allows every action that remains approvable.
         if self._bypass:
             return PolicyDecision(verdict=PolicyVerdict.ALLOW, reason="bypass_mode")
         # Normal rule-based evaluation

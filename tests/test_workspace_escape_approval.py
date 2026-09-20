@@ -9,7 +9,7 @@ ignored a session-wide "Allow ALL" that the shell honoured.
 
 These tests pin the three properties that were broken:
   1. every entry point routes through the approval gate,
-  2. every entry point honours the one bypass predicate,
+  2. every entry point keeps the approval chain observable under bypass,
   3. the escape is risk-classified so the policy engine always asks.
 """
 from __future__ import annotations
@@ -23,7 +23,6 @@ from leapflow.security.actions import ActionKind
 from leapflow.security.risk import DefaultRiskClassifier, RiskLevel
 from leapflow.tools.execution_context import (
     ToolExecutionContext,
-    is_approval_bypass_active,
     require_workspace_access,
     reset_tool_context,
     set_tool_context,
@@ -140,27 +139,22 @@ async def test_entry_point_asks_before_leaving_the_workspace(
     _ENTRY_POINTS,
     ids=[f"{m}.{a}" for m, a, _, _ in _ENTRY_POINTS],
 )
-async def test_entry_point_honours_the_bypass(
+async def test_entry_point_uses_unified_approval_chain_under_bypass(
     tmp_path, module_name, attr, build_params, expected_effect,
 ) -> None:
-    """A session-wide bypass must not stop at the shell.
-
-    The file tools used to ignore it entirely, so a user who had granted
-    "Allow ALL for this session" still got refused by ``file_list`` while
-    ``shell_run`` ran freely — the worst possible split.
-    """
+    """Bypass is decided by the orchestrator rather than a tool-local shortcut."""
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "a.txt").write_text("a", encoding="utf-8")
 
-    gate = RecordingOrchestrator(approved=False)
+    gate = RecordingOrchestrator(approved=True)
     token = set_tool_context(_context(tmp_path, gate, bypass=True))
     try:
         result = await _handler(module_name, attr)(build_params(outside))
     finally:
         reset_tool_context(token)
 
-    assert gate.actions == [], f"{attr} prompted despite an active bypass"
+    assert len(gate.actions) == 1, f"{attr} bypassed the unified approval chain"
     assert result.get("error_type") != "outside_workspace"
 
 
@@ -234,35 +228,6 @@ async def test_paths_inside_the_workspace_are_not_gated(tmp_path) -> None:
     assert result is None
     assert gate.actions == []
 
-
-# ── one bypass predicate ─────────────────────────────────────────────────────
-
-def test_bypass_predicate_penetrates_a_wrapper_gate(tmp_path) -> None:
-    """The in-process CLI wraps the gate; looking only at ``_gate`` misses it."""
-
-    class SessionGate:
-        _bypass_all = True
-
-    class Orchestrator:
-        _gate = SessionGate()
-
-    class WrapperGate:
-        def __init__(self, delegate: Any) -> None:
-            self._delegate = delegate
-
-    token = set_tool_context(_context(tmp_path, WrapperGate(Orchestrator())))
-    try:
-        assert is_approval_bypass_active() is True
-    finally:
-        reset_tool_context(token)
-
-
-def test_bypass_predicate_is_false_without_a_grant(tmp_path) -> None:
-    token = set_tool_context(_context(tmp_path, RecordingOrchestrator(approved=True)))
-    try:
-        assert is_approval_bypass_active() is False
-    finally:
-        reset_tool_context(token)
 
 
 # ── the escape is always risk-classified above the auto-allow floor ──────────

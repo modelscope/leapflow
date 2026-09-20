@@ -217,15 +217,12 @@ class ApprovalOrchestrator:
 
     @staticmethod
     def _choices(allow_permanent: bool) -> tuple[str, ...]:
-        base = ["allow_once", "allow_session"]
+        # Session bypass is explicit consent for every action that can reach an
+        # approval prompt. ``allow_permanent`` governs only persistence beyond
+        # the current session, never the meaning of “Allow ALL for this session”.
+        base = ["allow_once", "allow_session", "allow_all_session"]
         if allow_permanent:
-            # Session-wide and profile-wide grants are only offered when
-            # the risk classifier explicitly permits reuse.  Actions
-            # whose ``allow_permanent`` is False (plugin management,
-            # external sends, credential reads, etc.) must never be
-            # auto-approved by a session bypass earned from a lower-risk
-            # approval.
-            base.extend(["allow_all_session", "allow_always"])
+            base.append("allow_always")
         base.extend(["deny", "deny_always", "show_details"])
         return tuple(base)
 
