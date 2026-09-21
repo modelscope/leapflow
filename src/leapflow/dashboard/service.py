@@ -52,6 +52,10 @@ class DashboardDataProvider(Protocol):
         """Return one device's channels, sampled values, controls and previews."""
         ...
 
+    async def subagent_state(self) -> dict[str, Any]:
+        """Return subagent delegation state (active, recent, stats, config)."""
+        ...
+
 
 class DaemonDataProvider:
     """Adapt a DaemonClient's ``watch_*`` RPCs to the provider protocol."""
@@ -93,6 +97,16 @@ class DaemonDataProvider:
     async def hardware_device(self, device_id: str) -> dict[str, Any]:
         """Return one device's live view, tolerating a daemon without the RPC."""
         return await self._hardware_call(lambda: self._client.hardware_device(device_id))
+
+    async def subagent_state(self) -> dict[str, Any]:
+        """Return subagent delegation state, tolerating a daemon without the RPC."""
+        try:
+            return dict(await self._client.subagent_state() or {})
+        except AttributeError:
+            return {}
+        except Exception:  # noqa: BLE001 - one panel must not lose the board
+            logger.debug("dashboard: subagent state read failed", exc_info=True)
+            return {}
 
     @staticmethod
     async def _hardware_call(call: Any) -> dict[str, Any]:
@@ -528,6 +542,8 @@ class DashboardViewBuilder:
         template_name = intent.template
         if template_name == "signals":
             return await self._build_signals(template_name, provider)
+        if template_name == "subagents":
+            return await self._build_subagents(template_name, provider)
         if template_name == HARDWARE_TEMPLATE and intent.device:
             return await self._build_device(template_name, intent, provider)
         payload_domain = _PAYLOAD_DOMAINS.get(template_name)
@@ -815,6 +831,73 @@ class DashboardViewBuilder:
                 if isinstance(provenance, dict):
                     meta["provenance"] = provenance
         return spec
+
+    async def _build_subagents(self, template: str, provider: DashboardDataProvider) -> dict[str, Any]:
+        """Build subagent monitor view from live SubagentManager state."""
+        state = await provider.subagent_state()
+        active = state.get("active") or []
+        recent = state.get("recent") or []
+        stats = state.get("stats") or {}
+        config = state.get("config") or {}
+
+        # Build timeline items from recent history
+        recent_timeline = [
+            {
+                "title": item.get("goal", "")[:80],
+                "summary": (
+                    f"{item.get('status', '')} in {item.get('duration_s', 0)}s"
+                    f" ({item.get('tool_calls', 0)} tools)"
+                ),
+                "severity": "success" if item.get("status") == "completed" else "error",
+                "ts": item.get("timestamp", 0),
+            }
+            for item in recent
+        ] or None
+
+        # Build delegation tree (parent→child from recent + active)
+        all_entries = list(active) + list(recent)
+        delegation_tree = [
+            {
+                "parent_session_id": _short_id(entry.get("parent_session_id")),
+                "subagent_id": _short_id(entry.get("subagent_id")),
+                "goal": entry.get("goal", "")[:80],
+                "depth": entry.get("depth", 0),
+                "status": entry.get("status", "running"),
+                "duration_s": entry.get("duration_s", entry.get("elapsed_s", "—")),
+            }
+            for entry in all_entries
+        ] or None
+
+        # Distributions for charts
+        depth_dist = _distribution(all_entries, "depth") if all_entries else None
+        outcome_dist = _distribution(
+            [{"outcome": r.get("status", "unknown")} for r in recent],
+            "outcome",
+        ) if recent else None
+
+        total_tool_calls = sum(r.get("tool_calls", 0) for r in recent)
+        finished = stats.get("completed", 0) + stats.get("failed", 0)
+        total_duration = round(stats.get("avg_duration", 0) * finished, 1)
+
+        data: dict[str, Any] = {
+            "title": "Sub-Agent Monitor",
+            "subagent": {
+                "active": active or None,
+                "active_count": len(active),
+                "recent": recent or None,
+                "recent_timeline": recent_timeline,
+                "stats": stats if stats.get("total_delegated", 0) > 0 else None,
+                "config": config or None,
+                "delegation_tree": delegation_tree,
+                "depth_distribution": depth_dist,
+                "outcome_distribution": outcome_dist,
+                "total_tool_calls": total_tool_calls,
+                "total_duration": total_duration,
+            },
+        }
+        if not state or stats.get("total_delegated", 0) == 0:
+            data["empty"] = {"state": "no_delegations", "config": config}
+        return self._render(template, data)
 
     async def _build_signals(self, template: str, provider: DashboardDataProvider) -> dict[str, Any]:
         """Build signal flow observation view."""

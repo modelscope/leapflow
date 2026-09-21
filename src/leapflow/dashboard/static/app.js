@@ -26,6 +26,9 @@
   let _signalRefreshTimer = null;
   let _signalEventCount = 0;
 
+  // ── Subagent auto-refresh state ──
+  let _subagentRefreshTimer = null;
+
   function getCurrentTemplate() { return current.template || ""; }
 
   function startSignalAutoRefresh() {
@@ -37,6 +40,17 @@
 
   function stopSignalAutoRefresh() {
     if (_signalRefreshTimer) { clearInterval(_signalRefreshTimer); _signalRefreshTimer = null; }
+  }
+
+  function startSubagentAutoRefresh() {
+    stopSubagentAutoRefresh();
+    _subagentRefreshTimer = setInterval(function () {
+      if (getCurrentTemplate() === "subagents") fetchView();
+    }, 4000);
+  }
+
+  function stopSubagentAutoRefresh() {
+    if (_subagentRefreshTimer) { clearInterval(_subagentRefreshTimer); _subagentRefreshTimer = null; }
   }
 
   function incrementSignalCounter() {
@@ -119,7 +133,12 @@
       "Envelope conformance": "Envelope conformance", "Window conformance": "Window conformance",
       "Device events": "Device events", "Sampling health": "Sampling health",
       "Learned command outcomes": "Learned command outcomes", "inside": "inside", "near": "near",
-      "outside": "outside", "unknown": "unknown"
+      "outside": "outside", "unknown": "unknown",
+      "Sub-Agent Monitor": "Sub-Agent Monitor", "No subagent activity": "No subagent activity", "This board shows delegated task execution. No subagent has been dispatched yet.": "This board shows delegated task execution. No subagent has been dispatched yet.", "What are subagents?": "What are subagents?", "> Subagents are spawned when the main agent delegates a task via `delegate_task`. Each runs in an isolated context with its own tool set and message history. Only the summary flows back to the parent. Activity will appear here once a delegation occurs.": "> Subagents are spawned when the main agent delegates a task via `delegate_task`. Each runs in an isolated context with its own tool set and message history. Only the summary flows back to the parent. Activity will appear here once a delegation occurs.",
+      "Max depth": "Max depth", "Max concurrent": "Max concurrent", "Summary budget": "Summary budget", "Delegation overview": "Delegation overview", "Aggregate counters for all subagent executions in this daemon lifetime.": "Aggregate counters for all subagent executions in this daemon lifetime.", "Active": "Active", "Completed": "Completed", "Failed": "Failed", "Avg duration": "Avg duration", "Success rate": "Success rate",
+      "Active subagents": "Active subagents", "Currently running delegated tasks.": "Currently running delegated tasks.", "ID": "ID", "Goal": "Goal", "Depth": "Depth", "Elapsed (s)": "Elapsed (s)", "Parent": "Parent", "Recent completions": "Recent completions", "Last 50 subagent executions, newest first.": "Last 50 subagent executions, newest first.",
+      "Execution detail": "Execution detail", "Tabular view of recent subagent runs with outcome and duration.": "Tabular view of recent subagent runs with outcome and duration.", "Duration (s)": "Duration (s)", "Delegation Tree": "Delegation Tree", "Parent → child relationships": "Parent → child relationships", "How tasks were delegated across depth levels.": "How tasks were delegated across depth levels.", "Child": "Child",
+      "Configuration": "Configuration", "Current subagent isolation settings.": "Current subagent isolation settings.", "Statistics": "Statistics", "Delegation by depth": "Delegation by depth", "How many subagents ran at each recursion depth.": "How many subagents ran at each recursion depth.", "Executions by depth": "Executions by depth", "Outcomes": "Outcomes", "Distribution of subagent execution outcomes.": "Distribution of subagent execution outcomes.", "Executions by outcome": "Executions by outcome", "Cumulative metrics": "Cumulative metrics", "Total delegated": "Total delegated", "Total tool calls": "Total tool calls", "Total duration": "Total duration"
     },
     zh: {
       "All": "全部",
@@ -149,7 +168,12 @@
       "Envelope conformance": "包络遵从性", "Window conformance": "窗口遵从性",
       "Device events": "设备事件", "Sampling health": "采样健康度",
       "Learned command outcomes": "已学习的命令结果", "inside": "范围内", "near": "接近边界",
-      "outside": "越界", "unknown": "未知"
+      "outside": "越界", "unknown": "未知",
+      "Sub-Agent Monitor": "子代理监控", "No subagent activity": "无子代理活动", "This board shows delegated task execution. No subagent has been dispatched yet.": "此面板显示委托任务执行情况。目前尚未派发子代理。", "What are subagents?": "什么是子代理？", "> Subagents are spawned when the main agent delegates a task via `delegate_task`. Each runs in an isolated context with its own tool set and message history. Only the summary flows back to the parent. Activity will appear here once a delegation occurs.": "> 当主代理通过 `delegate_task` 委托任务时会创建子代理。每个子代理运行在隔离的上下文中，拥有独立的工具集和消息历史。只有摘要会返回给父代理。一旦发生委托，活动将显示在此处。",
+      "Max depth": "最大深度", "Max concurrent": "最大并发", "Summary budget": "摘要预算", "Delegation overview": "委托概览", "Aggregate counters for all subagent executions in this daemon lifetime.": "此 daemon 生命周期内所有子代理执行的汇总计数。", "Active": "活跃", "Completed": "已完成", "Failed": "失败", "Avg duration": "平均耗时", "Success rate": "成功率",
+      "Active subagents": "活跃子代理", "Currently running delegated tasks.": "当前正在运行的委托任务。", "ID": "标识", "Goal": "目标", "Depth": "深度", "Elapsed (s)": "已用时间 (s)", "Parent": "父代理", "Recent completions": "最近完成", "Last 50 subagent executions, newest first.": "最近50次子代理执行，最新优先。",
+      "Execution detail": "执行详情", "Tabular view of recent subagent runs with outcome and duration.": "最近子代理运行的表格视图，含结果和耗时。", "Duration (s)": "耗时 (s)", "Delegation Tree": "委托树", "Parent → child relationships": "父→子关系", "How tasks were delegated across depth levels.": "任务在各深度层级间的委托方式。", "Child": "子代理",
+      "Configuration": "配置", "Current subagent isolation settings.": "当前子代理隔离设置。", "Statistics": "统计", "Delegation by depth": "按深度委托", "How many subagents ran at each recursion depth.": "每个递归深度运行了多少子代理。", "Executions by depth": "按深度执行次数", "Outcomes": "执行结果", "Distribution of subagent execution outcomes.": "子代理执行结果分布。", "Executions by outcome": "按结果执行次数", "Cumulative metrics": "累计指标", "Total delegated": "总委托数", "Total tool calls": "总工具调用", "Total duration": "总耗时"
     },
     fr: {
       "All": "Tout", "connecting…": "connexion", "live": "connecté", "reconnecting…": "reconnexion", "seconds ago": "il y a {count} s", "minutes ago": "il y a {count} min", "hours ago": "il y a {count} h",
@@ -167,7 +191,12 @@
       "Envelope conformance": "Conformité à l'enveloppe", "Window conformance": "Conformité des fenêtres",
       "Device events": "Événements matériels", "Sampling health": "Santé de l'échantillonnage",
       "Learned command outcomes": "Résultats de commandes appris", "inside": "dans les limites",
-      "near": "proche de la limite", "outside": "hors limites", "unknown": "inconnu"
+      "near": "proche de la limite", "outside": "hors limites", "unknown": "inconnu",
+      "Sub-Agent Monitor": "Moniteur de sous-agents", "No subagent activity": "Aucune activité de sous-agent", "This board shows delegated task execution. No subagent has been dispatched yet.": "Ce tableau affiche l'exécution des tâches déléguées. Aucun sous-agent n'a encore été lancé.", "What are subagents?": "Que sont les sous-agents ?", "> Subagents are spawned when the main agent delegates a task via `delegate_task`. Each runs in an isolated context with its own tool set and message history. Only the summary flows back to the parent. Activity will appear here once a delegation occurs.": "> Les sous-agents sont créés lorsque l'agent principal délègue une tâche via `delegate_task`. Chacun s'exécute dans un contexte isolé avec ses propres outils et historique de messages. Seul le résumé remonte au parent. L'activité apparaîtra ici dès qu'une délégation aura lieu.",
+      "Max depth": "Profondeur max", "Max concurrent": "Simultanéité max", "Summary budget": "Budget de résumé", "Delegation overview": "Vue d'ensemble des délégations", "Aggregate counters for all subagent executions in this daemon lifetime.": "Compteurs agrégés de toutes les exécutions de sous-agents durant la vie de ce daemon.", "Active": "Actifs", "Completed": "Terminés", "Failed": "Échoués", "Avg duration": "Durée moy.", "Success rate": "Taux de réussite",
+      "Active subagents": "Sous-agents actifs", "Currently running delegated tasks.": "Tâches déléguées en cours d'exécution.", "ID": "ID", "Goal": "Objectif", "Depth": "Profondeur", "Elapsed (s)": "Écoulé (s)", "Parent": "Parent", "Recent completions": "Complétions récentes", "Last 50 subagent executions, newest first.": "50 dernières exécutions de sous-agents, plus récentes d'abord.",
+      "Execution detail": "Détail d'exécution", "Tabular view of recent subagent runs with outcome and duration.": "Vue tabulaire des exécutions récentes avec résultat et durée.", "Duration (s)": "Durée (s)", "Delegation Tree": "Arbre de délégation", "Parent → child relationships": "Relations parent → enfant", "How tasks were delegated across depth levels.": "Comment les tâches ont été déléguées à travers les niveaux.", "Child": "Enfant",
+      "Configuration": "Configuration", "Current subagent isolation settings.": "Paramètres d'isolation actuels des sous-agents.", "Statistics": "Statistiques", "Delegation by depth": "Délégation par profondeur", "How many subagents ran at each recursion depth.": "Nombre de sous-agents exécutés à chaque profondeur de récursion.", "Executions by depth": "Exécutions par profondeur", "Outcomes": "Résultats", "Distribution of subagent execution outcomes.": "Distribution des résultats d'exécution des sous-agents.", "Executions by outcome": "Exécutions par résultat", "Cumulative metrics": "Métriques cumulées", "Total delegated": "Total délégué", "Total tool calls": "Total d'appels d'outils", "Total duration": "Durée totale"
     },
     es: {
       "All": "Todo", "connecting…": "conectando", "live": "conectado", "reconnecting…": "reconectando", "seconds ago": "hace {count} s", "minutes ago": "hace {count} min", "hours ago": "hace {count} h",
@@ -185,7 +214,12 @@
       "Envelope conformance": "Conformidad con la envolvente", "Window conformance": "Conformidad de ventanas",
       "Device events": "Eventos del dispositivo", "Sampling health": "Salud del muestreo",
       "Learned command outcomes": "Resultados de comandos aprendidos", "inside": "dentro",
-      "near": "cerca del límite", "outside": "fuera", "unknown": "desconocido"
+      "near": "cerca del límite", "outside": "fuera", "unknown": "desconocido",
+      "Sub-Agent Monitor": "Monitor de subagentes", "No subagent activity": "Sin actividad de subagentes", "This board shows delegated task execution. No subagent has been dispatched yet.": "Este panel muestra la ejecución de tareas delegadas. Aún no se ha lanzado ningún subagente.", "What are subagents?": "¿Qué son los subagentes?", "> Subagents are spawned when the main agent delegates a task via `delegate_task`. Each runs in an isolated context with its own tool set and message history. Only the summary flows back to the parent. Activity will appear here once a delegation occurs.": "> Los subagentes se crean cuando el agente principal delega una tarea mediante `delegate_task`. Cada uno se ejecuta en un contexto aislado con su propio conjunto de herramientas e historial de mensajes. Solo el resumen vuelve al padre. La actividad aparecerá aquí una vez que ocurra una delegación.",
+      "Max depth": "Profundidad máx.", "Max concurrent": "Concurrencia máx.", "Summary budget": "Presupuesto de resumen", "Delegation overview": "Resumen de delegaciones", "Aggregate counters for all subagent executions in this daemon lifetime.": "Contadores agregados de todas las ejecuciones de subagentes en la vida de este daemon.", "Active": "Activos", "Completed": "Completados", "Failed": "Fallidos", "Avg duration": "Duración prom.", "Success rate": "Tasa de éxito",
+      "Active subagents": "Subagentes activos", "Currently running delegated tasks.": "Tareas delegadas en ejecución.", "ID": "ID", "Goal": "Objetivo", "Depth": "Profundidad", "Elapsed (s)": "Transcurrido (s)", "Parent": "Padre", "Recent completions": "Completados recientes", "Last 50 subagent executions, newest first.": "Últimas 50 ejecuciones de subagentes, más recientes primero.",
+      "Execution detail": "Detalle de ejecución", "Tabular view of recent subagent runs with outcome and duration.": "Vista tabular de ejecuciones recientes con resultado y duración.", "Duration (s)": "Duración (s)", "Delegation Tree": "Árbol de delegación", "Parent → child relationships": "Relaciones padre → hijo", "How tasks were delegated across depth levels.": "Cómo se delegaron las tareas entre niveles de profundidad.", "Child": "Hijo",
+      "Configuration": "Configuración", "Current subagent isolation settings.": "Configuración actual de aislamiento de subagentes.", "Statistics": "Estadísticas", "Delegation by depth": "Delegación por profundidad", "How many subagents ran at each recursion depth.": "Cuántos subagentes se ejecutaron en cada profundidad de recursión.", "Executions by depth": "Ejecuciones por profundidad", "Outcomes": "Resultados", "Distribution of subagent execution outcomes.": "Distribución de resultados de ejecución de subagentes.", "Executions by outcome": "Ejecuciones por resultado", "Cumulative metrics": "Métricas acumuladas", "Total delegated": "Total delegado", "Total tool calls": "Total de llamadas", "Total duration": "Duración total"
     },
     ar: {
       "All": "الكل", "connecting…": "جارٍ الاتصال", "live": "متصل", "reconnecting…": "جارٍ إعادة الاتصال", "seconds ago": "قبل {count} ث", "minutes ago": "قبل {count} د", "hours ago": "قبل {count} س",
@@ -203,7 +237,12 @@
       "Envelope conformance": "مطابقة الحدود", "Window conformance": "مطابقة النوافذ",
       "Device events": "أحداث الجهاز", "Sampling health": "سلامة أخذ العينات",
       "Learned command outcomes": "نتائج الأوامر المُتعلَّمة", "inside": "داخل الحدود",
-      "near": "قريب من الحد", "outside": "خارج الحدود", "unknown": "مجهول"
+      "near": "قريب من الحد", "outside": "خارج الحدود", "unknown": "مجهول",
+      "Sub-Agent Monitor": "مراقب الوكلاء الفرعيين", "No subagent activity": "لا يوجد نشاط للوكلاء الفرعيين", "This board shows delegated task execution. No subagent has been dispatched yet.": "تعرض هذه اللوحة تنفيذ المهام المفوَّضة. لم يتم إرسال أي وكيل فرعي بعد.", "What are subagents?": "ما هي الوكلاء الفرعيون؟", "> Subagents are spawned when the main agent delegates a task via `delegate_task`. Each runs in an isolated context with its own tool set and message history. Only the summary flows back to the parent. Activity will appear here once a delegation occurs.": "> يتم إنشاء الوكلاء الفرعيين عندما يفوّض الوكيل الرئيسي مهمة عبر `delegate_task`. يعمل كل منهم في سياق معزول بأدواته وسجل رسائله الخاص. يُرجَع الملخص فقط إلى الوكيل الأب. سيظهر النشاط هنا عند حدوث تفويض.",
+      "Max depth": "أقصى عمق", "Max concurrent": "أقصى تزامن", "Summary budget": "ميزانية الملخص", "Delegation overview": "نظرة عامة على التفويض", "Aggregate counters for all subagent executions in this daemon lifetime.": "عدادات تراكمية لجميع عمليات تنفيذ الوكلاء الفرعيين خلال حياة هذا الـ daemon.", "Active": "نشط", "Completed": "مكتمل", "Failed": "فشل", "Avg duration": "متوسط المدة", "Success rate": "معدل النجاح",
+      "Active subagents": "الوكلاء الفرعيون النشطون", "Currently running delegated tasks.": "المهام المفوّضة قيد التنفيذ حالياً.", "ID": "المعرّف", "Goal": "الهدف", "Depth": "العمق", "Elapsed (s)": "المنقضي (ث)", "Parent": "الأب", "Recent completions": "الإنجازات الأخيرة", "Last 50 subagent executions, newest first.": "آخر 50 عملية تنفيذ للوكلاء الفرعيين، الأحدث أولاً.",
+      "Execution detail": "تفاصيل التنفيذ", "Tabular view of recent subagent runs with outcome and duration.": "عرض جدولي لعمليات التنفيذ الأخيرة مع النتيجة والمدة.", "Duration (s)": "المدة (ث)", "Delegation Tree": "شجرة التفويض", "Parent → child relationships": "علاقات الأب → الابن", "How tasks were delegated across depth levels.": "كيف تم تفويض المهام عبر مستويات العمق.", "Child": "الابن",
+      "Configuration": "الإعدادات", "Current subagent isolation settings.": "إعدادات العزل الحالية للوكلاء الفرعيين.", "Statistics": "الإحصائيات", "Delegation by depth": "التفويض حسب العمق", "How many subagents ran at each recursion depth.": "عدد الوكلاء الفرعيين الذين عملوا في كل مستوى تكرار.", "Executions by depth": "عمليات التنفيذ حسب العمق", "Outcomes": "النتائج", "Distribution of subagent execution outcomes.": "توزيع نتائج تنفيذ الوكلاء الفرعيين.", "Executions by outcome": "عمليات التنفيذ حسب النتيجة", "Cumulative metrics": "مقاييس تراكمية", "Total delegated": "إجمالي المفوّض", "Total tool calls": "إجمالي استدعاءات الأدوات", "Total duration": "المدة الإجمالية"
     },
     ru: {
       "All": "Все", "connecting…": "подключение", "live": "подключено", "reconnecting…": "переподключение", "seconds ago": "{count} с назад", "minutes ago": "{count} мин назад", "hours ago": "{count} ч назад",
@@ -221,7 +260,12 @@
       "Envelope conformance": "Соответствие допускам", "Window conformance": "Соответствие окон",
       "Device events": "События устройства", "Sampling health": "Состояние опроса",
       "Learned command outcomes": "Изученные результаты команд", "inside": "в допуске",
-      "near": "у границы", "outside": "вне допуска", "unknown": "неизвестно"
+      "near": "у границы", "outside": "вне допуска", "unknown": "неизвестно",
+      "Sub-Agent Monitor": "Монитор субагентов", "No subagent activity": "Нет активности субагентов", "This board shows delegated task execution. No subagent has been dispatched yet.": "Эта панель показывает выполнение делегированных задач. Ни один субагент ещё не был запущен.", "What are subagents?": "Что такое субагенты?", "> Subagents are spawned when the main agent delegates a task via `delegate_task`. Each runs in an isolated context with its own tool set and message history. Only the summary flows back to the parent. Activity will appear here once a delegation occurs.": "> Субагенты создаются, когда основной агент делегирует задачу через `delegate_task`. Каждый работает в изолированном контексте со своим набором инструментов и историей сообщений. Только резюме возвращается родителю. Активность появится здесь при делегировании.",
+      "Max depth": "Макс. глубина", "Max concurrent": "Макс. параллельно", "Summary budget": "Лимит резюме", "Delegation overview": "Обзор делегирования", "Aggregate counters for all subagent executions in this daemon lifetime.": "Суммарные счётчики всех выполнений субагентов за время работы daemon.", "Active": "Активные", "Completed": "Завершены", "Failed": "Ошибки", "Avg duration": "Сред. длительность", "Success rate": "Успешность",
+      "Active subagents": "Активные субагенты", "Currently running delegated tasks.": "Делегированные задачи, выполняющиеся сейчас.", "ID": "ID", "Goal": "Цель", "Depth": "Глубина", "Elapsed (s)": "Прошло (с)", "Parent": "Родитель", "Recent completions": "Недавние завершения", "Last 50 subagent executions, newest first.": "Последние 50 выполнений субагентов, новейшие первыми.",
+      "Execution detail": "Детали выполнения", "Tabular view of recent subagent runs with outcome and duration.": "Табличное представление недавних выполнений с результатом и длительностью.", "Duration (s)": "Длит. (с)", "Delegation Tree": "Дерево делегирования", "Parent → child relationships": "Связи родитель → потомок", "How tasks were delegated across depth levels.": "Как задачи делегировались по уровням глубины.", "Child": "Потомок",
+      "Configuration": "Конфигурация", "Current subagent isolation settings.": "Текущие настройки изоляции субагентов.", "Statistics": "Статистика", "Delegation by depth": "Делегирование по глубине", "How many subagents ran at each recursion depth.": "Сколько субагентов работало на каждой глубине рекурсии.", "Executions by depth": "Выполнения по глубине", "Outcomes": "Исходы", "Distribution of subagent execution outcomes.": "Распределение результатов выполнения субагентов.", "Executions by outcome": "Выполнения по результату", "Cumulative metrics": "Накопительные метрики", "Total delegated": "Всего делегировано", "Total tool calls": "Всего вызовов", "Total duration": "Общая длительность"
     }
   };
   const I18N_LIVE = {
@@ -465,6 +509,12 @@
         injectSignalRefreshBtn();
       } else if (prevTemplate === "signals" && newTemplate !== "signals") {
         stopSignalAutoRefresh();
+      }
+      // Manage subagent auto-refresh lifecycle on template switch
+      if (newTemplate === "subagents") {
+        startSubagentAutoRefresh();
+      } else if (prevTemplate === "subagents" && newTemplate !== "subagents") {
+        stopSubagentAutoRefresh();
       }
     } catch (err) {
       const detail = err && typeof err === "object"
@@ -1966,6 +2016,10 @@
         updateSignalTimeline(window._signalStream);
         // Increment live event counter
         incrementSignalCounter();
+      }
+      else if (msg.type === "subagent.started" || msg.type === "subagent.completed" || msg.type === "subagent.failed") {
+        // Subagent lifecycle event: refresh the view if on subagents template
+        if (getCurrentTemplate() === "subagents") fetchView();
       }
       else if (msg.type === "view.replace" && msg.spec) { render(msg.spec); }
     };

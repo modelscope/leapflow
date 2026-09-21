@@ -366,11 +366,16 @@ class PromptAssembler:
             skill_section=skill_section,
         )
         system = self._append_task_contract_to_system(system)
+        # Active subagent status — injected only at EXPANDED/FULL level and
+        # only when at least one subagent is in-flight (zero cost otherwise).
+        subagent_status = self._active_subagent_status_section(plan)
         # Volatile context (memory, knowledge, semantic focus) is assembled
         # separately and injected as an independent message so the system
         # prompt prefix stays byte-stable across turns for DeepSeek automatic
         # prefix caching.  The model still receives the full context.
-        volatile_context = memory_context
+        volatile_context = "\n\n".join(
+            part for part in (memory_context, subagent_status) if part
+        )
         # PCD cache-aware (5c): a resumed, cache-priority session reuses the
         # persisted system prompt and tool schema verbatim on its first turn so
         # the provider's prefix cache is hit immediately. ``_begin_turn_context``
@@ -713,4 +718,25 @@ class PromptAssembler:
             return build_app_connector_prompt_section()
         except Exception:
             logger.debug("app connector prompt section unavailable", exc_info=True)
+            return ""
+
+    def _active_subagent_status_section(self, plan: PromptAssemblyPlan) -> str:
+        """Render active-subagent status for the volatile prompt context.
+
+        Returns an empty string (zero cost) when any of the following hold:
+        - The PCD level is CORE (simple queries need no subagent awareness).
+        - No SubagentManager is available.
+        - No subagents are currently in-flight.
+        """
+        if plan.level == DisclosureLevel.CORE:
+            return ""
+        try:
+            from leapflow.plugins import get_registry
+
+            manager = getattr(get_registry(), "_subagent_manager", None)
+            if manager is None or not manager.has_active():
+                return ""
+            return manager.render_active_status()
+        except Exception:  # noqa: BLE001 - context is an improvement, never a gate
+            logger.debug("subagent status section unavailable", exc_info=True)
             return ""

@@ -24,23 +24,23 @@ class LearningMetrics:
     """Quantitative learning effectiveness metrics for a time window."""
     window_start_ts: float = 0.0
     window_end_ts: float = 0.0
-    
+
     # Skill lifecycle
     skills_created: int = 0
     skills_promoted: int = 0  # Tier advanced
     skills_demoted: int = 0   # Tier regressed
     skills_deactivated: int = 0  # Confidence below threshold
-    
+
     # PatternMiner
     patterns_discovered: int = 0
     patterns_accepted: int = 0  # User confirmed/used the suggestion
     patterns_rejected: int = 0  # User dismissed
-    
+
     # Execution quality
     executions_total: int = 0
     executions_successful: int = 0
     regressions_detected: int = 0
-    
+
     # Coverage
     tasks_matched_skill: int = 0
     tasks_total: int = 0
@@ -88,7 +88,7 @@ class LearningMetrics:
 
 class LearningEffectivenessTracker:
     """Tracks learning metrics over rolling time windows.
-    
+
     Accumulates events and periodically emits metrics summaries
     to audit log for observability.
     """
@@ -148,11 +148,11 @@ class LearningEffectivenessTracker:
         now = time.time()
         if now - self._last_emit_ts < self._emit_interval:
             return None
-        
+
         self._last_emit_ts = now
         summary = self._current.summary()
         logger.info("LearningEffectiveness: %s", summary)
-        
+
         # Rotate window if exceeded
         if now - self._current.window_start_ts >= self._window_duration:
             self._current.window_end_ts = now
@@ -160,13 +160,13 @@ class LearningEffectivenessTracker:
             if len(self._history) > 30:  # Keep last 30 windows
                 self._history = self._history[-30:]
             self._current = LearningMetrics(window_start_ts=now)
-        
+
         return summary
 
     @property
     def current_metrics(self) -> LearningMetrics:
         return self._current
 
-    @property 
+    @property
     def history(self) -> List[LearningMetrics]:
         return self._history

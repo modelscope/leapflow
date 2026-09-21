@@ -3,10 +3,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -83,35 +82,31 @@ class TestTaskStatePaused:
         due = tmp_store.get_due_tasks(time.time())
         assert len(due) == 0
 
-    def test_pause_and_resume_via_coordinator(self, tmp_store: TaskStore, sample_task: ArmedTask):
+    @pytest.mark.asyncio
+    async def test_pause_and_resume_via_coordinator(self, tmp_store: TaskStore, sample_task: ArmedTask):
         """pause_task sets PAUSED; resume_task re-arms + recalculates next_due."""
         tmp_store.save(sample_task)
         coordinator = TaskCoordinator(store=tmp_store)
 
         # Pause
-        asyncio.get_event_loop().run_until_complete(
-            coordinator.pause_task(sample_task.task_id)
-        )
+        await coordinator.pause_task(sample_task.task_id)
         loaded = tmp_store.load(sample_task.task_id)
         assert loaded is not None
         assert loaded.state == TaskState.PAUSED.value
 
         # Resume
-        asyncio.get_event_loop().run_until_complete(
-            coordinator.resume_task(sample_task.task_id)
-        )
+        await coordinator.resume_task(sample_task.task_id)
         loaded = tmp_store.load(sample_task.task_id)
         assert loaded is not None
         assert loaded.state == TaskState.ARMED.value
         # next_due should be recalculated (in the future)
         assert loaded.next_due_at > time.time() - 1
 
-    def test_pause_nonexistent_raises(self, tmp_store: TaskStore):
+    @pytest.mark.asyncio
+    async def test_pause_nonexistent_raises(self, tmp_store: TaskStore):
         coordinator = TaskCoordinator(store=tmp_store)
         with pytest.raises(ValueError, match="Task not found"):
-            asyncio.get_event_loop().run_until_complete(
-                coordinator.pause_task("nonexistent")
-            )
+            await coordinator.pause_task("nonexistent")
 
 
 class TestUpdateTask:
@@ -144,23 +139,21 @@ class TestUpdateTask:
         loaded = tmp_store.load(sample_task.task_id)
         assert loaded.state == TaskState.PAUSED.value
 
-    def test_coordinator_update_task_changes_trigger_expr(self, tmp_store: TaskStore, sample_task: ArmedTask):
+    @pytest.mark.asyncio
+    async def test_coordinator_update_task_changes_trigger_expr(self, tmp_store: TaskStore, sample_task: ArmedTask):
         """Coordinator.update_task parses a new expression and recalculates."""
         tmp_store.save(sample_task)
         coordinator = TaskCoordinator(store=tmp_store)
-        updated = asyncio.get_event_loop().run_until_complete(
-            coordinator.update_task(sample_task.task_id, trigger_expr="10m")
-        )
+        updated = await coordinator.update_task(sample_task.task_id, trigger_expr="10m")
         assert updated.trigger_type == "interval"
         assert updated.trigger_config == {"interval_seconds": 600}
         assert updated.next_due_at > time.time()
 
-    def test_coordinator_update_task_not_found(self, tmp_store: TaskStore):
+    @pytest.mark.asyncio
+    async def test_coordinator_update_task_not_found(self, tmp_store: TaskStore):
         coordinator = TaskCoordinator(store=tmp_store)
         with pytest.raises(ValueError, match="Task not found"):
-            asyncio.get_event_loop().run_until_complete(
-                coordinator.update_task("nonexistent", trigger_expr="5m")
-            )
+            await coordinator.update_task("nonexistent", trigger_expr="5m")
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +196,8 @@ class TestRetryFields:
 class TestRetryLogic:
     """Retry behavior in LocalScheduler._execute_task."""
 
-    def test_failed_task_retries_with_backoff(self, tmp_store: TaskStore):
+    @pytest.mark.asyncio
+    async def test_failed_task_retries_with_backoff(self, tmp_store: TaskStore):
         """A failed task with retries remaining gets re-armed with backoff."""
         executor = _StubExecutor(ok=False)
         scheduler = LocalScheduler(store=tmp_store, executor=executor)
@@ -222,9 +216,7 @@ class TestRetryLogic:
         tmp_store.save(task)
 
         now = time.time()
-        asyncio.get_event_loop().run_until_complete(
-            scheduler._execute_task(task, now)
-        )
+        await scheduler._execute_task(task, now)
 
         loaded = tmp_store.load("retry_backoff")
         assert loaded is not None
@@ -234,7 +226,8 @@ class TestRetryLogic:
         assert loaded.next_due_at >= now + 9
         assert loaded.next_due_at <= now + 15
 
-    def test_retries_exhausted_sets_failed(self, tmp_store: TaskStore):
+    @pytest.mark.asyncio
+    async def test_retries_exhausted_sets_failed(self, tmp_store: TaskStore):
         """When retries are exhausted, state becomes FAILED and retry_count resets."""
         executor = _StubExecutor(ok=False)
         scheduler = LocalScheduler(store=tmp_store, executor=executor)
@@ -253,16 +246,15 @@ class TestRetryLogic:
         tmp_store.save(task)
 
         now = time.time()
-        asyncio.get_event_loop().run_until_complete(
-            scheduler._execute_task(task, now)
-        )
+        await scheduler._execute_task(task, now)
 
         loaded = tmp_store.load("exhaust_retry")
         assert loaded is not None
         assert loaded.state == TaskState.FAILED.value
         assert loaded.retry_count == 0  # reset for potential manual re-arm
 
-    def test_success_resets_retry_count(self, tmp_store: TaskStore):
+    @pytest.mark.asyncio
+    async def test_success_resets_retry_count(self, tmp_store: TaskStore):
         """A successful execution resets retry_count to 0."""
         executor = _StubExecutor(ok=True)
         scheduler = LocalScheduler(store=tmp_store, executor=executor)
@@ -281,16 +273,15 @@ class TestRetryLogic:
         tmp_store.save(task)
 
         now = time.time()
-        asyncio.get_event_loop().run_until_complete(
-            scheduler._execute_task(task, now)
-        )
+        await scheduler._execute_task(task, now)
 
         loaded = tmp_store.load("success_reset")
         assert loaded is not None
         assert loaded.retry_count == 0
         assert loaded.state == TaskState.ARMED.value
 
-    def test_exception_triggers_retry(self, tmp_store: TaskStore):
+    @pytest.mark.asyncio
+    async def test_exception_triggers_retry(self, tmp_store: TaskStore):
         """A hard exception also triggers retry logic."""
         executor = _StubExecutor(raise_exc=RuntimeError("connection refused"))
         scheduler = LocalScheduler(store=tmp_store, executor=executor)
@@ -309,16 +300,15 @@ class TestRetryLogic:
         tmp_store.save(task)
 
         now = time.time()
-        asyncio.get_event_loop().run_until_complete(
-            scheduler._execute_task(task, now)
-        )
+        await scheduler._execute_task(task, now)
 
         loaded = tmp_store.load("exc_retry")
         assert loaded is not None
         assert loaded.state == TaskState.ARMED.value
         assert loaded.retry_count == 1
 
-    def test_no_retry_when_max_retries_zero(self, tmp_store: TaskStore):
+    @pytest.mark.asyncio
+    async def test_no_retry_when_max_retries_zero(self, tmp_store: TaskStore):
         """Tasks with max_retries=0 go straight to FAILED on exception."""
         executor = _StubExecutor(raise_exc=RuntimeError("boom"))
         scheduler = LocalScheduler(store=tmp_store, executor=executor)
@@ -335,19 +325,104 @@ class TestRetryLogic:
         )
         tmp_store.save(task)
 
-        asyncio.get_event_loop().run_until_complete(
-            scheduler._execute_task(task, time.time())
-        )
+        await scheduler._execute_task(task, time.time())
 
         loaded = tmp_store.load("no_retry")
         assert loaded is not None
         assert loaded.state == TaskState.FAILED.value
 
+    @pytest.mark.asyncio
+    async def test_ok_false_no_retries_marks_failed(self, tmp_store: TaskStore):
+        """ok=False + max_retries=0 → task must be FAILED, not re-armed."""
+        executor = _StubExecutor(ok=False)
+        scheduler = LocalScheduler(store=tmp_store, executor=executor)
+
+        task = ArmedTask(
+            task_id="soft_fail_no_retry",
+            skill_name="fragile",
+            trigger_type="interval",
+            trigger_config={"interval_seconds": 300},
+            state=TaskState.ARMED.value,
+            next_due_at=time.time() - 1,
+            max_retries=0,
+            retry_count=0,
+        )
+        tmp_store.save(task)
+
+        await scheduler._execute_task(task, time.time())
+
+        loaded = tmp_store.load("soft_fail_no_retry")
+        assert loaded is not None
+        assert loaded.state == TaskState.FAILED.value
+
+    @pytest.mark.asyncio
+    async def test_ok_false_no_retries_records_execution_log(self, tmp_store: TaskStore):
+        """Execution log records the failure when ok=False and max_retries=0."""
+        executor = _StubExecutor(ok=False)
+        mock_log = MagicMock()
+        mock_log.record_start.return_value = "exec-001"
+        scheduler = LocalScheduler(
+            store=tmp_store, executor=executor, execution_log=mock_log,
+        )
+
+        task = ArmedTask(
+            task_id="log_fail",
+            skill_name="fragile",
+            trigger_type="interval",
+            trigger_config={"interval_seconds": 300},
+            state=TaskState.ARMED.value,
+            next_due_at=time.time() - 1,
+            max_retries=0,
+            retry_count=0,
+        )
+        tmp_store.save(task)
+
+        await scheduler._execute_task(task, time.time())
+
+        # Verify execution log recorded both start and failure finish
+        mock_log.record_start.assert_called_once()
+        mock_log.record_finish.assert_called_once()
+        finish_args = mock_log.record_finish.call_args
+        assert finish_args[0][0] == "exec-001"  # execution_id
+        assert finish_args[0][1] == "failed"     # status
+
+    @pytest.mark.asyncio
+    async def test_ok_false_no_retries_triggers_delivery(self, tmp_store: TaskStore):
+        """Delivery callback is invoked on ok=False with max_retries=0."""
+        executor = _StubExecutor(ok=False)
+        send_fn = MagicMock()
+        scheduler = LocalScheduler(
+            store=tmp_store, executor=executor,
+            send_fn=send_fn, delivery_enabled=True,
+        )
+
+        task = ArmedTask(
+            task_id="deliver_fail",
+            skill_name="fragile",
+            trigger_type="interval",
+            trigger_config={"interval_seconds": 300},
+            state=TaskState.ARMED.value,
+            next_due_at=time.time() - 1,
+            max_retries=0,
+            retry_count=0,
+            parameters={"delivery_target": {"platform": "test", "chat_id": "c1"}},
+        )
+        tmp_store.save(task)
+
+        await scheduler._execute_task(task, time.time())
+
+        # Delivery was called with failure info
+        send_fn.assert_called_once()
+        msg = send_fn.call_args[0][2]  # third positional arg = message text
+        assert "Failed" in msg
+        assert "no retries" in msg.lower() or "ok=False" in msg
+
 
 class TestArmRetryDefaults:
     """Coordinator.arm() applies default retry settings from config."""
 
-    def test_arm_uses_config_defaults(self, tmp_store: TaskStore):
+    @pytest.mark.asyncio
+    async def test_arm_uses_config_defaults(self, tmp_store: TaskStore):
         """arm() picks up default_max_retries and default_retry_backoff_s."""
         local_sched = AsyncMock()
         local_sched.register = AsyncMock()
@@ -360,13 +435,12 @@ class TestArmRetryDefaults:
             default_retry_backoff_s=30.0,
         )
 
-        task = asyncio.get_event_loop().run_until_complete(
-            coordinator.arm("my_skill", "5m")
-        )
+        task = await coordinator.arm("my_skill", "5m")
         assert task.max_retries == 5
         assert task.retry_backoff_s == 30.0
 
-    def test_arm_per_task_overrides_config(self, tmp_store: TaskStore):
+    @pytest.mark.asyncio
+    async def test_arm_per_task_overrides_config(self, tmp_store: TaskStore):
         """Per-task retry values override the config defaults."""
         local_sched = AsyncMock()
         local_sched.register = AsyncMock()
@@ -379,9 +453,7 @@ class TestArmRetryDefaults:
             default_retry_backoff_s=30.0,
         )
 
-        task = asyncio.get_event_loop().run_until_complete(
-            coordinator.arm("my_skill", "5m", max_retries=1, retry_backoff_s=10.0)
-        )
+        task = await coordinator.arm("my_skill", "5m", max_retries=1, retry_backoff_s=10.0)
         assert task.max_retries == 1
         assert task.retry_backoff_s == 10.0
 

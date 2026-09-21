@@ -250,7 +250,7 @@ class RiskAssessment:
 
 class DangerousOperationDetector:
     """Detects high-risk operations that require elevated confirmation.
-    
+
     Identifies:
     - Batch operations exceeding threshold
     - Irreversible operations (delete, format, overwrite)
@@ -279,18 +279,18 @@ class DangerousOperationDetector:
         """Assess the risk level of an operation."""
         risks: List[str] = []
         severity = 0.0
-        
+
         # Check irreversible
         if action in self._irreversible_actions:
             risks.append("irreversible_operation")
             severity = max(severity, 0.8)
-        
+
         # Check batch size
         batch_size = params.get("batch_size", params.get("count", 1))
         if isinstance(batch_size, int) and batch_size > self._batch_threshold:
             risks.append(f"batch_operation ({batch_size} items)")
             severity = max(severity, 0.6)
-        
+
         # Check sensitive paths
         target_path = params.get("path", params.get("target", ""))
         if isinstance(target_path, str) and target_path:
@@ -306,12 +306,12 @@ class DangerousOperationDetector:
                     risks.append(f"sensitive_path ({sensitive})")
                     severity = max(severity, 0.9)
                     break
-        
+
         # Check wildcards / recursive
         if any(params.get(k) for k in ("recursive", "wildcard", "glob")):
             risks.append("broad_scope (recursive/wildcard)")
             severity = max(severity, 0.5)
-        
+
         return RiskAssessment(
             action=action,
             severity=severity,

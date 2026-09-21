@@ -17,12 +17,13 @@ Fits leapflow's architecture:
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextvars
 import logging
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Deque, Dict, FrozenSet, List, Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +34,13 @@ _SUMMARY_MAX_CHARS = 4000
 # Depth of the subagent frame currently executing, propagated across the await
 # chain so a nested delegate_task can compute its child's depth. 0 = top level.
 #
-# Safe by construction: set() and reset() (in SubagentManager.delegate below)
-# execute inside the same call with no Task boundary in between --
-# execute_subagent() (including EngineFrameSubagentExecutor's full-loop path,
-# engine.py::_run_child_frame) resolves to a single value without ever
-# yielding back through the parent engine's run_stream() generator. It
-# therefore never crosses a per-chunk asyncio.create_task() boundary the way
-# the daemon's leapd_approval_route once did (see the contract note on that
-# ContextVar in daemon/service.py). If a future executor lets a subagent's
-# progress stream back out through run_stream() before it completes, re-verify
-# this invariant and, if violated, pin a shared contextvars.Context the same
-# way server.py::_dispatch_stream does.
+# The ContextVar is set in SubagentManager.delegate() BEFORE the executor
+# coroutine is wrapped in asyncio.create_task().  Python copies the current
+# contextvars.Context at task-creation time, so the child task (and anything
+# the executor await-chains into, including EngineFrameSubagentExecutor's
+# engine.py::_run_child_frame) sees the correct depth.  The parent resets its
+# own token in the finally block, which is safe because each Task owns an
+# independent snapshot.
 _current_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
     "leapflow_subagent_depth", default=0
 )
@@ -153,6 +150,9 @@ class SubagentResult:
     tool_calls: int = 0
     error: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Optional raw message list for persistence; None when the executor
+    # handles persistence internally (e.g. EngineFrameSubagentExecutor).
+    messages: Optional[List[Dict[str, Any]]] = None
 
 
 @runtime_checkable
@@ -182,13 +182,24 @@ class SubagentManager:
         max_concurrent: int = _MAX_CONCURRENT_CHILDREN,
         on_complete: Optional[Callable[[SubagentResult], None]] = None,
         event_bus: Optional[Any] = None,
+        conversation_store: Optional[Any] = None,
     ) -> None:
         self._executor = executor
         self._max_depth = max_depth
         self._max_concurrent = max_concurrent
         self._on_complete = on_complete
         self._event_bus = event_bus
+        # Late-bound conversation store (DIP).  When present, the subagent's
+        # message transcript is persisted after execution for auditability.
+        # Absence degrades gracefully — no persistence, no crash.
+        self._conversation_store = conversation_store
         self._active: Dict[str, asyncio.Task[SubagentResult]] = {}
+        self._active_meta: Dict[str, Dict[str, Any]] = {}
+        self._recent: Deque[Dict[str, Any]] = collections.deque(maxlen=50)
+        self._total_delegated: int = 0
+        self._total_completed: int = 0
+        self._total_failed: int = 0
+        self._total_duration: float = 0.0
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
     def _emit_event(self, event: Any) -> None:
@@ -214,6 +225,9 @@ class SubagentManager:
         - Concurrent child limit
         - Tool blocking
         - Summary truncation
+
+        The executor coroutine is wrapped in an ``asyncio.Task`` and registered
+        in ``_active`` so that ``cancel_all()`` can cancel in-flight subagents.
         """
         if config.depth >= self._max_depth:
             return SubagentResult(
@@ -234,6 +248,7 @@ class SubagentManager:
             )
 
         session_id = f"sub_{uuid.uuid4().hex[:12]}"
+        task_key = config.metadata.get("subagent_id") or session_id
         parent_sid = config.parent_session_id or ""
 
         self._emit_event(SubagentStarted(
@@ -242,13 +257,28 @@ class SubagentManager:
             goal=config.goal,
             depth=config.depth,
         ))
+        self._total_delegated += 1
+        self._active_meta[task_key] = {
+            "subagent_id": session_id,
+            "goal": config.goal[:200],
+            "depth": config.depth,
+            "parent_session_id": parent_sid,
+            "start_time": time.time(),
+        }
 
         async with self._semaphore:
             t0 = time.monotonic()
+            # Set the depth ContextVar BEFORE creating the task so that the
+            # task's copied context snapshot carries the correct value.
             depth_token = _current_depth.set(config.depth)
+            task = asyncio.create_task(
+                self._executor.execute_subagent(config),
+                name=f"subagent:{task_key}",
+            )
+            self._active[task_key] = task
             try:
-                result = await self._executor.execute_subagent(config)
-                result = self._trim_summary(result, config.summary_max_chars)
+                raw_result = await task
+                result = self._trim_summary(raw_result, config.summary_max_chars)
             except asyncio.CancelledError:
                 result = SubagentResult(
                     session_id=session_id,
@@ -267,10 +297,30 @@ class SubagentManager:
                     error=str(e),
                 )
             finally:
+                self._active.pop(task_key, None)
+                self._active_meta.pop(task_key, None)
                 _current_depth.reset(depth_token)
 
             # Lifecycle events: completed vs failed/cancelled
             elapsed = result.elapsed_s or (time.monotonic() - t0)
+            # Track stats and add to recent history
+            self._total_duration += elapsed
+            recent_entry: Dict[str, Any] = {
+                "subagent_id": result.session_id or session_id,
+                "goal": config.goal[:200],
+                "depth": config.depth,
+                "parent_session_id": parent_sid,
+                "status": result.status,
+                "duration_s": round(elapsed, 2),
+                "tool_calls": result.tool_calls,
+                "timestamp": time.time(),
+            }
+            if result.status == "completed":
+                self._total_completed += 1
+            else:
+                self._total_failed += 1
+                recent_entry["error"] = result.error or result.status
+            self._recent.append(recent_entry)
             if result.status == "completed":
                 self._emit_event(SubagentCompleted(
                     parent_session_id=parent_sid,
@@ -291,6 +341,16 @@ class SubagentManager:
                     status=result.status,
                 ))
 
+            # Persist the subagent's conversation transcript when a store is
+            # available and the executor exposed raw messages.  Engine-frame
+            # subagents persist internally so result.messages is None for them.
+            self._persist_conversation(
+                session_id=result.session_id or session_id,
+                parent_session_id=parent_sid,
+                goal=config.goal,
+                messages=result.messages,
+            )
+
             if self._on_complete:
                 try:
                     self._on_complete(result)
@@ -306,14 +366,118 @@ class SubagentManager:
         tasks = [self.delegate(config) for config in configs]
         return list(await asyncio.gather(*tasks, return_exceptions=False))
 
+    def has_active(self) -> bool:
+        """Return True when at least one subagent task is in-flight.
+
+        Designed for zero-cost prompt-assembly gating: callers skip all
+        formatting work when this returns False.
+        """
+        return bool(self._active)
+
+    def render_active_status(self) -> str:
+        """Render a compact Markdown section describing in-flight subagents.
+
+        Returns an empty string when no subagents are active (zero cost).
+        The output is suitable for injection into the system-prompt volatile
+        context at EXPANDED or FULL disclosure levels.
+        """
+        if not self._active:
+            return ""
+        lines: list[str] = ["## Active Delegated Tasks"]
+        for task_key, task in self._active.items():
+            task_name = getattr(task, "get_name", lambda: task_key)()
+            # Extract goal from task name pattern "subagent:<key>"
+            label = task_name.replace("subagent:", "") if task_name.startswith("subagent:") else task_key
+            lines.append(f"- {label}: running")
+        return "\n".join(lines)
+
     def cancel_all(self) -> int:
         """Cancel all active subagent tasks. Returns count cancelled."""
         cancelled = 0
-        for task in self._active.values():
+        for task_key, task in list(self._active.items()):
             if not task.done():
                 task.cancel()
                 cancelled += 1
+                logger.debug("cancel_all: cancelled subagent task %s", task_key)
         return cancelled
+
+    def get_active_state(self) -> Dict[str, Any]:
+        """Return a snapshot of current subagent state for dashboard/RPC.
+
+        Returns a dict with four keys:
+        - active: currently running subagents (list of dicts)
+        - recent: last N completed/failed (list of dicts, newest first)
+        - stats: aggregate counters (total_delegated, completed, failed, avg_duration, success_rate)
+        - config: current configuration (max_depth, max_concurrent, summary_max_chars)
+        """
+        now = time.time()
+        active_list = []
+        for task_key, meta in self._active_meta.items():
+            entry = dict(meta)
+            entry["elapsed_s"] = round(now - meta.get("start_time", now), 2)
+            active_list.append(entry)
+        total_finished = self._total_completed + self._total_failed
+        return {
+            "active": active_list,
+            "recent": list(reversed(self._recent)),  # newest first
+            "stats": {
+                "total_delegated": self._total_delegated,
+                "completed": self._total_completed,
+                "failed": self._total_failed,
+                "avg_duration": (
+                    round(self._total_duration / total_finished, 2)
+                    if total_finished > 0 else 0.0
+                ),
+                "success_rate": (
+                    round(self._total_completed / total_finished, 4)
+                    if total_finished > 0 else 0.0
+                ),
+            },
+            "config": {
+                "max_depth": self._max_depth,
+                "max_concurrent": self._max_concurrent,
+                "summary_max_chars": _SUMMARY_MAX_CHARS,
+            },
+        }
+
+    def _persist_conversation(
+        self,
+        *,
+        session_id: str,
+        parent_session_id: str,
+        goal: str,
+        messages: Optional[List[Dict[str, Any]]],
+    ) -> None:
+        """Persist the subagent's message transcript if a store is available.
+
+        Graceful degradation: if *conversation_store* is ``None`` or *messages*
+        is ``None`` (engine-frame path persists internally), this is a no-op.
+        Persistence errors are logged and swallowed — never fail the caller.
+        """
+        if self._conversation_store is None or not messages:
+            return
+        try:
+            store = self._conversation_store
+            store.create_session(
+                session_id,
+                title=goal[:80].replace("\n", " ").strip() or "subagent",
+                parent_session_id=parent_session_id or None,
+                source="subagent",
+            )
+            for msg in messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                tc_raw = msg.get("tool_calls")
+                store.append_message(
+                    session_id,
+                    role,
+                    content,
+                    tool_name=msg.get("tool_name"),
+                    tool_call_id=msg.get("tool_call_id"),
+                    tool_calls=tc_raw if isinstance(tc_raw, list) else None,
+                )
+        except Exception:
+            logger.debug("subagent session persistence failed", exc_info=True)
 
     def _trim_summary(self, result: SubagentResult, max_chars: int = _SUMMARY_MAX_CHARS) -> SubagentResult:
         """Ensure summary fits within parent's budget."""
@@ -329,8 +493,13 @@ class SubagentManager:
                 tool_calls=result.tool_calls,
                 error=result.error,
                 metadata=result.metadata,
+                messages=result.messages,
             )
         return result
+
+
+# Risk levels that are safe to execute without approval.
+_SAFE_RISK_LEVELS: FrozenSet[str] = frozenset({"read_only", "none"})
 
 
 class DefaultSubagentExecutor:
@@ -338,6 +507,12 @@ class DefaultSubagentExecutor:
 
     Creates a fresh message context with restricted tools and runs the
     standard LLM→tool loop until goal completion or budget exhaustion.
+
+    When a ``tool_pipeline`` is provided, every tool invocation goes through
+    the same interceptor chain (approval, audit, timeout) the main agent
+    uses — "one approval chain" per AGENTS.md. When absent, the executor
+    degrades fail-closed: tools whose declared ``risk_level`` is not
+    ``read_only``/``none`` are refused rather than silently executed.
     """
 
     def __init__(
@@ -347,11 +522,22 @@ class DefaultSubagentExecutor:
         tool_handlers: Dict[str, Any],
         tool_definitions: list,
         settings: Any = None,
+        tool_pipeline: Optional[Any] = None,
     ) -> None:
         self._llm = llm
         self._tool_handlers = tool_handlers
         self._tool_definitions = tool_definitions
         self._settings = settings
+        self._tool_pipeline = tool_pipeline
+        # Build a lookup from tool name → x_leapflow metadata for fail-closed
+        # gating when the pipeline is absent.
+        self._tool_risk: Dict[str, str] = {}
+        for td in tool_definitions:
+            fn = td.get("function", {})
+            name = fn.get("name", "")
+            x = fn.get("x_leapflow", {})
+            if name and isinstance(x, dict):
+                self._tool_risk[name] = x.get("risk_level", "mutating")
 
     async def execute_subagent(self, config: SubagentConfig) -> SubagentResult:
         """Run isolated subagent with restricted tool access."""
@@ -461,7 +647,9 @@ class DefaultSubagentExecutor:
                     result_text = _json_sub.dumps({"ok": False, "error": f"Tool blocked: {tc.name}"})
                 else:
                     try:
-                        result = await handler(tc.arguments)
+                        result = await self._execute_tool(
+                            tc.name, tc.arguments, handler,
+                        )
                         governance.compact_tool_result(tc.name, tc.arguments, result)
                         result_text = _json_sub.dumps(result, default=str, ensure_ascii=False)
                     except Exception as e:
@@ -481,7 +669,55 @@ class DefaultSubagentExecutor:
             status="completed",
             elapsed_s=time.monotonic() - t0,
             tool_calls=tool_call_count,
+            messages=messages,
         )
+
+    # ------------------------------------------------------------------
+    # Tool execution — pipeline-gated or fail-closed
+    # ------------------------------------------------------------------
+
+    async def _execute_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        handler: Any,
+    ) -> Any:
+        """Execute a single tool call through the pipeline or fail-closed."""
+        pipeline = self._tool_pipeline
+
+        if pipeline is not None and pipeline.interceptor_count > 0:
+            # Route through the shared ToolExecutionPipeline so approval,
+            # audit, and timeout interceptors apply identically to the main
+            # agent loop.
+            from leapflow.domain.tool_pipeline import ToolCallContext
+            from leapflow.plugins.handler_invocation import invoke_tool_handler
+
+            risk = self._tool_risk.get(tool_name, "mutating")
+            ctx = ToolCallContext(
+                tool_name=tool_name,
+                arguments=arguments,
+                metadata={"risk_level": risk, "source": "subagent"},
+            )
+
+            async def _invoke(c: ToolCallContext) -> Dict[str, Any]:
+                return await invoke_tool_handler(handler, c.arguments)
+
+            return await pipeline.execute(ctx, _invoke)
+
+        # Fail-closed: no pipeline means no approval chain is available.
+        # Only allow tools with a safe declared risk_level.
+        risk_level = self._tool_risk.get(tool_name, "mutating")
+        if risk_level not in _SAFE_RISK_LEVELS:
+            return {
+                "ok": False,
+                "error": (
+                    f"Tool '{tool_name}' (risk_level={risk_level}) blocked: "
+                    "no approval pipeline available in subagent executor."
+                ),
+            }
+
+        from leapflow.plugins.handler_invocation import invoke_tool_handler
+        return await invoke_tool_handler(handler, arguments)
 
 
 def build_subagent_tool_filter(
@@ -543,12 +779,19 @@ class EngineFrameSubagentExecutor:
         if config.context:
             goal = f"{config.goal}\n\nContext:\n{config.context}"
         try:
-            summary = await self._run_child(
+            child_result = await self._run_child(
                 goal,
                 depth=config.depth,
                 tool_filter=frozenset(available),
                 enable_thinking=False,
             )
+            # _run_subagent_goal returns (summary, tool_calls); gracefully
+            # handle the legacy str return for backward compatibility.
+            if isinstance(child_result, tuple):
+                summary_text, child_tool_calls = child_result
+            else:
+                summary_text = child_result
+                child_tool_calls = 0
         except Exception as exc:  # isolate subagent failure from the parent loop
             return SubagentResult(
                 session_id=session_id, goal=config.goal,
@@ -557,6 +800,7 @@ class EngineFrameSubagentExecutor:
             )
         return SubagentResult(
             session_id=session_id, goal=config.goal,
-            summary=(summary or "")[:config.summary_max_chars],
+            summary=(summary_text or "")[:config.summary_max_chars],
             status="completed", elapsed_s=time.monotonic() - t0,
+            tool_calls=child_tool_calls,
         )

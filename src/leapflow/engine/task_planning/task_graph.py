@@ -74,6 +74,9 @@ class TaskNode:
     timeout_seconds: float = 300.0
     repeat_count: int = 1
     repeat_until: Optional[str] = None
+    # Execution mode: "default" routes through ActionDispatcher;
+    # "agent" routes through SubagentExecutor (opt-in per node).
+    execution_mode: str = "default"
 
     # Runtime state (mutated during execution)
     status: TaskStatus = TaskStatus.PENDING
@@ -169,6 +172,7 @@ class TaskGraph:
                 timeout_seconds=node_data.get("timeout_seconds", 300.0),
                 repeat_count=int(node_data.get("repeat_count", 1)),
                 repeat_until=node_data.get("repeat_until"),
+                execution_mode=node_data.get("execution_mode", "default"),
             )
             graph.nodes[node.id] = node
 
@@ -193,6 +197,7 @@ class TaskGraph:
                 "timeout_seconds": node.timeout_seconds,
                 "repeat_count": node.repeat_count,
                 "repeat_until": node.repeat_until,
+                "execution_mode": node.execution_mode,
                 "status": node.status.value,
                 "result": node.result,
                 "error": node.error,

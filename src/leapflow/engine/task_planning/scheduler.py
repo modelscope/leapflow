@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any, Awaitable, Callable, Dict, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Optional, Protocol, Set, runtime_checkable
 
 from .task_graph import TaskGraph, TaskNode, TaskStatus, RetryPolicy
 from leapflow.skills.registry import SkillRegistry
@@ -22,6 +22,20 @@ logger = logging.getLogger(__name__)
 # Callback type for progress reporting
 NodeCallback = Callable[[TaskNode, TaskGraph], None]
 ActionDispatcher = Callable[[Dict[str, Any], str], Awaitable[Any]]
+
+
+@runtime_checkable
+class SubagentNodeExecutor(Protocol):
+    """Protocol for executing agent-mode DAG nodes via a subagent.
+
+    This re-uses the same contract as ``SubagentExecutor`` in
+    :mod:`leapflow.engine.subagent`, declared separately here so the
+    task-planning sub-package has no module-level cross-sub-package import
+    (per engine architecture rules).
+    """
+
+    async def execute_subagent(self, config: Any) -> Any:
+        ...
 
 
 class SchedulerError(Exception):
@@ -50,6 +64,7 @@ class TaskScheduler:
         on_node_failed: Optional[NodeCallback] = None,
         graph_planner: Optional[Any] = None,
         action_dispatcher: Optional[ActionDispatcher] = None,
+        subagent_executor: Optional[SubagentNodeExecutor] = None,
     ) -> None:
         self._registry = registry
         self._max_concurrency = max_concurrency
@@ -57,11 +72,16 @@ class TaskScheduler:
         self._on_node_failed = on_node_failed
         self._graph_planner = graph_planner
         self._action_dispatcher = action_dispatcher
+        self._subagent_executor = subagent_executor
         self._semaphore: Optional[asyncio.Semaphore] = None
 
     def set_action_dispatcher(self, dispatcher: ActionDispatcher) -> None:
         """Bind the runtime's single action execution entry point."""
         self._action_dispatcher = dispatcher
+
+    def set_subagent_executor(self, executor: Optional[SubagentNodeExecutor]) -> None:
+        """Bind an optional subagent executor for agent-mode DAG nodes."""
+        self._subagent_executor = executor
 
     # ═══ Public API ═══
 
@@ -227,10 +247,51 @@ class TaskScheduler:
     async def _dispatch_action(
         self, node: TaskNode, params: Dict[str, Any]
     ) -> Any:
-        """Route every scheduled operation through the runtime action dispatcher."""
+        """Route every scheduled operation through the appropriate executor.
+
+        When ``node.execution_mode`` is ``"agent"`` and a
+        :class:`SubagentNodeExecutor` has been injected, the node is
+        delegated to a subagent via :class:`SubagentConfig`.  Otherwise the
+        default :class:`ActionDispatcher` path is used (unchanged).
+        """
+        if node.execution_mode == "agent":
+            return await self._dispatch_agent_node(node, params)
         if node.action_type not in {"skill", "bridge"}:
             raise ValueError(f"Unknown action_type: '{node.action_type}'")
         return await self._dispatch(node.action_type, node.action, params, node.expected_effect)
+
+    async def _dispatch_agent_node(
+        self, node: TaskNode, params: Dict[str, Any]
+    ) -> Any:
+        """Dispatch a node through SubagentExecutor (agent execution mode).
+
+        Fails gracefully when no executor is configured: the node is marked
+        as failed with a clear diagnostic rather than silently falling back
+        to the default path (an agent-mode node is a deliberate intent).
+        """
+        if self._subagent_executor is None:
+            raise SchedulerError(
+                f"Node '{node.id}' requires execution_mode='agent' but no "
+                "SubagentExecutor is configured on TaskScheduler"
+            )
+        # Build SubagentConfig from the node (function-local import to avoid
+        # cross-sub-package module-level dependency per engine architecture).
+        from leapflow.engine.subagent import SubagentConfig
+
+        goal = params.get("instruction") or node.expected_effect or node.name
+        context = params.get("context", "")
+        config = SubagentConfig(
+            goal=goal,
+            context=context,
+            metadata={"source": "task_graph", "node_id": node.id},
+        )
+        result = await self._subagent_executor.execute_subagent(config)
+        # SubagentResult → extract summary as the node result
+        status = getattr(result, "status", "completed")
+        if status != "completed":
+            error = getattr(result, "error", None) or getattr(result, "summary", "agent execution failed")
+            raise RuntimeError(f"Agent-mode node '{node.id}' failed: {error}")
+        return getattr(result, "summary", str(result))
 
     async def _dispatch(
         self,

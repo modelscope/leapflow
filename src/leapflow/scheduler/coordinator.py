@@ -18,7 +18,13 @@ from typing import Any, Callable, List, Optional
 from leapflow.scheduler.execution_log import ExecutionLogStore
 from leapflow.scheduler.store import TaskStore
 from leapflow.scheduler.triggers import create_trigger
-from leapflow.scheduler.types import ArmedTask, ExecutionTier, TaskState, TaskStatus
+from leapflow.scheduler.types import (
+    ArmedTask,
+    ExecutionTier,
+    SchedulerExecutionMode,
+    TaskState,
+    TaskStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +117,16 @@ class _RoutingExecutor:
     Satisfies the ``SkillExecutor`` Protocol.  The ``LocalScheduler`` holds one
     executor; this wrapper lets it transparently delegate agent-mode tasks to
     ``AgentSkillExecutor`` while keeping the existing call site unchanged.
+
+    Routing covers every ``execution_mode`` value with no gaps:
+    - ``"agent"`` (:attr:`SchedulerExecutionMode.AGENT`) → the lazily built
+      agent executor, but only when an ``agent_factory`` is wired.
+    - anything else — ``"script"``, ``None``, a missing key, or an unknown
+      string — falls through to the default (script) executor.
+
+    The agent executor is built once on first use and cached: scheduler ticks
+    are a cold path, but a task may fire many times and must not pay
+    construction cost or spawn a fresh executor on every fire.
     """
 
     def __init__(
@@ -125,7 +141,7 @@ class _RoutingExecutor:
     async def execute(self, skill_name: str, parameters: dict) -> dict:
         if (
             isinstance(parameters, dict)
-            and parameters.get("execution_mode") == "agent"
+            and parameters.get("execution_mode") == SchedulerExecutionMode.AGENT.value
             and self._agent_factory is not None
         ):
             if self._agent is None:

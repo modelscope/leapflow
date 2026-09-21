@@ -113,11 +113,20 @@ class AgentSkillExecutor:
         )
 
         # Build the concrete executor (same pattern as engine wiring).
+        # Attempt to inject the shared tool pipeline for approval gating.
+        # If unavailable, the executor degrades fail-closed (read_only only).
+        tool_pipeline = None
+        try:
+            from leapflow.plugins import get_registry
+            tool_pipeline = get_registry().tool_pipeline
+        except Exception:
+            logger.debug("scheduler: tool_pipeline unavailable, fail-closed mode")
         subagent_executor = DefaultSubagentExecutor(
             llm=self._llm,
             tool_handlers=self._tool_handlers,
             tool_definitions=self._tool_definitions,
             settings=self._settings,
+            tool_pipeline=tool_pipeline,
         )
 
         # Wrap with the manager for lifecycle, depth-gating, and trimming.
@@ -146,4 +155,5 @@ class AgentSkillExecutor:
             "ok": False,
             "output": output_text,
             "error": result.error or result.status,
+            "context": f"{skill_name}: {instruction[:80]}",
         }

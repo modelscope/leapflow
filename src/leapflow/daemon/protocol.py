@@ -541,4 +541,5 @@ METHOD_REGISTRY: Dict[str, str] = {
     "gateway.send": "gateway_send",
     "events.subscribe": "subscribe_notifications",
     "monitor.signal_metrics": "monitor_signal_metrics",
+    "subagent.state": "subagent_state",
 }

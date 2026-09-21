@@ -334,6 +334,11 @@ def main(argv: list[str] | None = None) -> int:
     hw_replay = hw_sub.add_parser("replay", parents=[hw_json], help="Replay a raw NDJSON segment through the event detector")
     hw_replay.add_argument("segment_path", help="Path to the NDJSON segment file")
 
+    # leap doctor
+    doctor_parser = subparsers.add_parser("doctor", help="Run system health diagnostics")
+    doctor_parser.add_argument("--fix", action="store_true", help="Attempt to auto-fix simple issues (e.g. missing directories)")
+    doctor_parser.add_argument("--section", choices=["platform", "config", "connectivity", "state", "tools"], help="Only run checks for this section")
+
     # leap config
     config_parser = subparsers.add_parser("config", help="View and update LeapFlow configuration")
     config_sub = config_parser.add_subparsers(dest="config_action")
@@ -385,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Pre-parse: detect if first non-flag arg is a known subcommand ──
     # If not, treat everything non-flag as a chat prompt.
-    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon", "config", "board", "hw", "evolve"}
+    known_commands = {"teach", "run", "skills", "relearn", "host", "daemon", "config", "board", "hw", "evolve", "doctor"}
     effective_argv = list(argv) if argv is not None else sys.argv[1:]
 
     # Find first non-flag argument, skipping values owned by global options.
@@ -466,6 +471,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "config":
         from leapflow.cli.commands.config import cmd_config
         return cmd_config(args)
+
+    # Doctor does not need full Context initialization
+    if args.command == "doctor":
+        from leapflow.cli.commands.doctor_cmd import cmd_doctor
+        return cmd_doctor(args)
 
     # Host command does not need Context initialization
     if args.command == "host":

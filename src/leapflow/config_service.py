@@ -262,6 +262,7 @@ _FIELD_DESCRIPTIONS = {
     "scheduler.agent_tool_blocklist": "Comma-separated tool names blocked during agent-mode scheduled execution (e.g. schedule_reentry to prevent recursive scheduling).",
     "scheduler.default_max_retries": "Default retry attempts for failed scheduled tasks. Applied when arm() does not specify per-task retries. 0 disables retry.",
     "scheduler.default_retry_backoff_s": "Base backoff interval in seconds for exponential retry delay (backoff_s * 2^attempt). Applied when arm() does not specify per-task backoff.",
+    "scheduler.delivery_enabled": "Enable post-execution result delivery to a gateway platform (opt-in, default off).",
     "dashboard.enabled": "Enable the local monitoring web dashboard.",
     "dashboard.bind": "Address the dashboard web server binds to (keep loopback).",
     "dashboard.port": "TCP port for the local dashboard web server.",

@@ -783,6 +783,11 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 await cmd_hub(ctx, hub_args)
                 return
 
+            if canonical == "btw":
+                from leapflow.cli.commands.btw_handler import handle_btw
+                await handle_btw(ctx, console, cmd_args)
+                return
+
             if canonical == "run":
                 trigger_or_name = cmd_args
                 if trigger_or_name.startswith("--skill "):

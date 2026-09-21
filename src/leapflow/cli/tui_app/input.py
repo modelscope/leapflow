@@ -190,11 +190,14 @@ class SlashCommandCompleter(Completer):
 
     _SCHEDULE_VERBS: tuple[tuple[str, str], ...] = (
         ("list", "List active scheduled tasks"),
+        ("status", "Show detailed status for one task (mode, runs, history)"),
         ("history", "Show recent execution log entries"),
         ("cancel", "Cancel/disable a scheduled task"),
         ("pause", "Pause a scheduled task (stops firing)"),
         ("resume", "Resume a paused scheduled task"),
         ("edit", "Edit a task's trigger expression"),
+        ("run", "Immediately execute a scheduled task (fire once)"),
+        ("doctor", "Show scheduler diagnostics and health summary"),
     )
 
     def _schedule_completions(self, text: str) -> "Iterable[Completion]":

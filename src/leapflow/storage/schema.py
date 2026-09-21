@@ -28,7 +28,7 @@ import duckdb
 logger = logging.getLogger(__name__)
 
 BASE_SCHEMA_VERSION = 1
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -505,6 +505,25 @@ def _apply_proposal_event_index(conn: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+def _apply_skill_curation_table(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the skill curation lifecycle management table."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_curation (
+            skill_name TEXT PRIMARY KEY,
+            state TEXT NOT NULL DEFAULT 'active',
+            pinned BOOLEAN NOT NULL DEFAULT FALSE,
+            last_activity_at DOUBLE,
+            created_at DOUBLE NOT NULL,
+            archive_reason TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_curation_state ON skill_curation(state)"
+    )
+
+
 def _apply_session_snapshot_columns(conn: duckdb.DuckDBPyConnection) -> None:
     """Add PCD cache-aware session snapshot columns to conv_sessions.
 
@@ -528,6 +547,7 @@ MIGRATIONS: tuple[MigrationDef, ...] = (
     MigrationDef(5, "checkpointed evolution projections", _apply_evolution_projection),
     MigrationDef(6, "event-sourced proposal index", _apply_proposal_event_index),
     MigrationDef(7, "PCD session snapshot columns", _apply_session_snapshot_columns),
+    MigrationDef(8, "skill curation lifecycle", _apply_skill_curation_table),
 )
 
 

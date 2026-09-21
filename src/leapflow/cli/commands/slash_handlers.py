@@ -1954,6 +1954,32 @@ def build_orient_payload(ctx: "Context") -> dict[str, Any]:
     }
 
 
+async def _execute_doctor(ctx: "Context", args: str = "") -> dict[str, Any]:
+    """Run ``leap doctor`` checks and return a serializable payload."""
+    from leapflow.cli.doctor import (
+        build_doctor_checks,
+        build_doctor_payload,
+        run_doctor,
+    )
+
+    settings = ctx.settings
+    should_fix = "--fix" in args
+    section_filter: str | None = None
+    parts = args.strip().split()
+    for i, tok in enumerate(parts):
+        if tok == "--section" and i + 1 < len(parts):
+            section_filter = parts[i + 1]
+            break
+
+    checks = build_doctor_checks(settings)
+    aggregate, details = await run_doctor(
+        checks,
+        should_fix=should_fix,
+        section_filter=section_filter,
+    )
+    return build_doctor_payload(aggregate, details)
+
+
 async def command_execute(
     ctx: "Context", name: str, args: str = "", session_id: str = "",
 ) -> dict[str, Any]:
@@ -2022,6 +2048,11 @@ async def command_execute(
         else:
             plugin_args = args
         return await build_plugin_payload(ctx, plugin_args)
+    if name == "btw":
+        from leapflow.cli.commands.btw_handler import build_btw_payload
+        return await build_btw_payload(ctx, args)
+    if name == "doctor":
+        return await _execute_doctor(ctx, args)
     return {"ok": False, "message": f"Unknown command: /{name}"}
 
 
@@ -2135,8 +2166,10 @@ def build_schedule_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
             else:
                 next_str = "-"
             enabled = t.state not in ("suspended", "done", "failed", "paused")
+            params = t.parameters if isinstance(t.parameters, dict) else {}
+            mode = params.get("execution_mode") or "script"
             lines.append(
-                f"  {tid}  skill={t.skill_name}  trigger={trigger}"
+                f"  {tid}  skill={t.skill_name}  mode={mode}  trigger={trigger}"
                 f"  next={next_str}  enabled={enabled}"
             )
         return {"ok": True, "message": "\n".join(lines)}
@@ -2171,6 +2204,73 @@ def build_schedule_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
             lines.append(f"  {r.task_id[:8]}  [{ts}]  {r.status}{detail_str}")
         return {"ok": True, "message": "\n".join(lines)}
 
+    # ── /schedule status <task_id> ───────────────────────────────────
+    if verb == "status":
+        task_id = rest
+        if not task_id:
+            return {"ok": False, "message": "Usage: /schedule status <task_id>"}
+        if task_store is None:
+            return {"ok": False, "message": "No scheduler active."}
+        task = task_store.load(task_id)
+        if task is None:
+            return {"ok": False, "message": f"Task not found: {task_id}"}
+        import time as _time_st
+        params = task.parameters if isinstance(task.parameters, dict) else {}
+        mode = params.get("execution_mode") or "script"
+        now = _time_st.time()
+        if task.next_due_at > 0:
+            delta = task.next_due_at - now
+            next_str = "now" if delta <= 0 else (
+                f"{int(delta)}s" if delta < 60 else (
+                    f"{int(delta / 60)}m" if delta < 3600 else f"{int(delta / 3600)}h"
+                )
+            )
+        else:
+            next_str = "-"
+        runs = f"{task.run_count}" + (f"/{task.max_runs}" if task.max_runs > 0 else "")
+        lines = [
+            f"Task {task.task_id[:8]} status:",
+            f"  skill: {task.skill_name}",
+            f"  state: {task.state}",
+            f"  mode: {mode}",
+            f"  trigger: {task.trigger_type}",
+            f"  next due: {next_str}",
+            f"  runs: {runs}",
+            f"  retries: {task.retry_count}/{task.max_retries}",
+        ]
+        # Agent-mode sub-status: agent tasks run an isolated, bounded sub-agent
+        # (depth-gated at 1) on each fire; the per-fire outcome is reflected in
+        # the recent execution history below rather than a live sub-agent handle.
+        if mode == "agent":
+            lines.append("  sub-agent: isolated LLM tool loop (max_depth=1)")
+        # Recent execution history (agent or script) — the observable trace of
+        # what each fire actually did.
+        log_store = None
+        if coordinator is not None and coordinator._execution_log is not None:  # noqa: SLF001
+            log_store = coordinator._execution_log  # noqa: SLF001
+        else:
+            try:
+                log_store = DuckDBExecutionLogStore(ctx.settings.duckdb_path)
+            except Exception:
+                log_store = None
+        records = []
+        if log_store is not None:
+            try:
+                records = log_store.get_history(task_id=task.task_id, limit=5)
+            except Exception:
+                records = []
+        if records:
+            import datetime as _dt_st
+            lines.append("  recent runs:")
+            for r in records:
+                ts = _dt_st.datetime.fromtimestamp(r.started_at).strftime("%Y-%m-%d %H:%M:%S")
+                detail = (r.result_summary or r.error or "")[:80]
+                detail_str = f" — {detail}" if detail else ""
+                lines.append(f"    [{ts}] {r.status}{detail_str}")
+        else:
+            lines.append("  recent runs: none")
+        return {"ok": True, "message": "\n".join(lines)}
+
     # ── /schedule cancel <task_id> ───────────────────────────────────
     if verb == "cancel":
         task_id = rest
@@ -2178,26 +2278,31 @@ def build_schedule_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
             return {"ok": False, "message": "Usage: /schedule cancel <task_id>"}
         if task_store is None:
             return {"ok": False, "message": "No scheduler active."}
-        # Try the coordinator's cancel (which also stops cloud workers)
+
+        # Prefer coordinator for unified cancellation (including cloud workers)
         if coordinator is not None:
-            import asyncio
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # We are inside an async context already; just call directly
-                    # But build_schedule_payload is sync, so use store directly
-                    task_store.update_state(task_id, "suspended")
-                else:
-                    loop.run_until_complete(coordinator.cancel(task_id))
+                import asyncio as _asyncio_cancel
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    pool.submit(
+                        _asyncio_cancel.run, coordinator.cancel(task_id),
+                    ).result(timeout=30)
             except ValueError as exc:
                 return {"ok": False, "message": str(exc)}
-            except Exception:
-                task_store.update_state(task_id, "suspended")
+            except Exception as exc:
+                # Coordinator failed, fallback to direct state update
+                try:
+                    task_store.update_state(task_id, "suspended")
+                except Exception:
+                    return {"ok": False, "message": f"Failed to cancel: {exc}"}
         else:
             try:
                 task_store.update_state(task_id, "suspended")
             except Exception as exc:
                 return {"ok": False, "message": f"Failed to cancel: {exc}"}
+
         return {"ok": True, "message": f"Cancelled task {task_id[:8]}."}
 
     # ── /schedule pause <task_id> ────────────────────────────────────
@@ -2218,26 +2323,14 @@ def build_schedule_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
         task_id = rest
         if not task_id:
             return {"ok": False, "message": "Usage: /schedule resume <task_id>"}
-        if coordinator is not None:
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Sync fallback: recalculate next_due and set armed
-                    _resume_task_sync(task_store, task_id)
-                else:
-                    loop.run_until_complete(coordinator.resume_task(task_id))
-            except ValueError as exc:
-                return {"ok": False, "message": str(exc)}
-            except Exception:
-                _resume_task_sync(task_store, task_id)
-        elif task_store is not None:
-            try:
-                _resume_task_sync(task_store, task_id)
-            except Exception as exc:
-                return {"ok": False, "message": f"Failed to resume: {exc}"}
-        else:
+        if task_store is None:
             return {"ok": False, "message": "No scheduler active."}
+        try:
+            _resume_task_sync(task_store, task_id)
+        except ValueError as exc:
+            return {"ok": False, "message": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to resume: {exc}"}
         return {"ok": True, "message": f"Resumed task {task_id[:8]}."}
 
     # ── /schedule edit <task_id> <trigger_expr> ──────────────────────
@@ -2246,27 +2339,91 @@ def build_schedule_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
         if len(edit_parts) < 2:
             return {"ok": False, "message": "Usage: /schedule edit <task_id> <trigger_expr>"}
         task_id, trigger_expr = edit_parts[0], edit_parts[1]
-        if coordinator is not None:
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    _edit_task_sync(task_store, task_id, trigger_expr)
-                else:
-                    loop.run_until_complete(coordinator.update_task(task_id, trigger_expr=trigger_expr))
-            except ValueError as exc:
-                return {"ok": False, "message": str(exc)}
-            except Exception as exc:
-                return {"ok": False, "message": f"Failed to edit: {exc}"}
-        elif task_store is not None:
-            try:
-                _edit_task_sync(task_store, task_id, trigger_expr)
-            except Exception as exc:
-                return {"ok": False, "message": f"Failed to edit: {exc}"}
-        else:
+        if task_store is None:
             return {"ok": False, "message": "No scheduler active."}
+        try:
+            _edit_task_sync(task_store, task_id, trigger_expr)
+        except ValueError as exc:
+            return {"ok": False, "message": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to edit: {exc}"}
         return {"ok": True, "message": f"Updated task {task_id[:8]} trigger to: {trigger_expr}"}
-    return {"ok": False, "message": f"Unknown schedule subcommand: {verb}. Use list, history, cancel, pause, resume, or edit."}
+
+    # ── /schedule run <task_id> ─────────────────────────────────────
+    if verb == "run":
+        task_id = rest
+        if not task_id:
+            return {"ok": False, "message": "Usage: /schedule run <task_id>"}
+        if task_store is None:
+            return {"ok": False, "message": "No scheduler active."}
+        task = task_store.load(task_id)
+        if task is None:
+            return {"ok": False, "message": f"Task not found: {task_id}"}
+        # Execute immediately via the coordinator's underlying local scheduler.
+        import asyncio as _asyncio_run
+        import json as _json_run
+        if coordinator is not None and coordinator._local is not None:  # noqa: SLF001
+            try:
+                local_sched = coordinator._local  # noqa: SLF001
+                params = (
+                    task.parameters
+                    if isinstance(task.parameters, dict)
+                    else _json_run.loads(task.parameters)
+                )
+                coro = local_sched._executor.execute(task.skill_name, params)  # noqa: SLF001
+                # Always use a worker thread so asyncio.run() gets its own loop,
+                # avoiding deprecated get_event_loop() and working regardless of
+                # whether the caller is already inside a running loop.
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    result = pool.submit(
+                        _asyncio_run.run, coro,
+                    ).result(timeout=120)
+                ok = result.get("ok", False)
+                output = str(result.get("output", ""))[:200] if ok else str(result.get("error", ""))[:200]
+                return {"ok": True, "message": f"Task {task_id[:8]} executed: ok={ok}\n{output}".strip()}
+            except Exception as exc:
+                return {"ok": False, "message": f"Manual execution failed: {exc}"}
+        return {"ok": False, "message": "No local scheduler available to execute the task."}
+
+    # ── /schedule doctor ─────────────────────────────────────────
+    if verb == "doctor":
+        if task_store is None:
+            return {"ok": True, "message": "No scheduler active."}
+        import time as _time_doc
+        try:
+            tasks = task_store.load_all()
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to load tasks: {exc}"}
+        now = _time_doc.time()
+        # Count by state
+        state_counts: dict[str, int] = {}
+        stale_tasks: list[str] = []
+        near_exhaustion: list[str] = []
+        for t in tasks:
+            state_counts[t.state] = state_counts.get(t.state, 0) + 1
+            # Stale: armed but next_due is in the past
+            if t.state == "armed" and t.next_due_at > 0 and t.next_due_at < now - 120:
+                stale_tasks.append(f"{t.task_id[:8]} (overdue {int(now - t.next_due_at)}s)")
+            # Near retry exhaustion
+            if t.max_retries > 0 and t.retry_count >= t.max_retries - 1 and t.state not in ("done", "suspended", "failed"):
+                near_exhaustion.append(f"{t.task_id[:8]} (retry {t.retry_count}/{t.max_retries})")
+
+        lines = ["Scheduler Diagnostics:"]
+        lines.append(f"  Total tasks: {len(tasks)}")
+        for state, count in sorted(state_counts.items()):
+            lines.append(f"  {state}: {count}")
+        if stale_tasks:
+            lines.append(f"  Stale (next_due in past): {', '.join(stale_tasks)}")
+        else:
+            lines.append("  Stale: none")
+        if near_exhaustion:
+            lines.append(f"  Near retry exhaustion: {', '.join(near_exhaustion)}")
+        else:
+            lines.append("  Near retry exhaustion: none")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    return {"ok": False, "message": f"Unknown schedule subcommand: {verb}. Use list, status, history, cancel, pause, resume, edit, run, or doctor."}
 
 
 def _resume_task_sync(task_store: Any, task_id: str) -> None:
@@ -3246,6 +3403,83 @@ def _execute_skill(ctx: "Context", name: str, args: str) -> dict[str, Any]:
             return {"ok": True, "message": f"Skill '{skill_name}' deleted."}
         return {"ok": False, "message": f"Skill '{skill_name}' not found."}
 
+    # ── /skill curator subcommands ──
+    if name == "skill curator" or full_cmd == "skill curator":
+        curator = getattr(ctx, "skill_curator", None)
+        if curator is None:
+            return {"ok": False, "message": "Skill curator is not initialized."}
+        # Parse subcommand from args
+        sub_parts = args.strip().split(None, 1) if args.strip() else []
+        sub_cmd = sub_parts[0] if sub_parts else ""
+        sub_args = sub_parts[1] if len(sub_parts) > 1 else ""
+
+        if not sub_cmd:
+            # Show curation report
+            report = curator.get_curation_report()
+            lines = [
+                "Skill Curation Report",
+                f"  Total: {report.total}  Active: {report.active}  "
+                f"Stale: {report.stale}  Archived: {report.archived}  "
+                f"Pinned: {report.pinned}",
+            ]
+            return {"ok": True, "message": "\n".join(lines)}
+
+        if sub_cmd == "sweep":
+            report = curator.apply_automatic_transitions()
+            t_count = len(report.transitions)
+            lines = [
+                f"Sweep complete: {t_count} transition(s).",
+                f"  Active: {report.active}  Stale: {report.stale}  "
+                f"Archived: {report.archived}  Pinned: {report.pinned}",
+            ]
+            if report.transitions:
+                for t in report.transitions:
+                    lines.append(
+                        f"  {t.skill_name}: {t.from_state.value} → {t.to_state.value} ({t.reason})"
+                    )
+            return {"ok": True, "message": "\n".join(lines)}
+
+        if sub_cmd == "archive":
+            parts = sub_args.strip().split(None, 1)
+            skill_name = parts[0] if parts else ""
+            reason = parts[1] if len(parts) > 1 else ""
+            if not skill_name:
+                return {"ok": False, "message": "Usage: /skill curator archive <name> [reason]"}
+            try:
+                curator.archive(skill_name, reason)
+                return {"ok": True, "message": f"Skill '{skill_name}' archived."}
+            except KeyError as e:
+                return {"ok": False, "message": str(e)}
+
+        if sub_cmd == "reactivate":
+            skill_name = sub_args.strip()
+            if not skill_name:
+                return {"ok": False, "message": "Usage: /skill curator reactivate <name>"}
+            try:
+                curator.reactivate(skill_name)
+                return {"ok": True, "message": f"Skill '{skill_name}' reactivated."}
+            except KeyError as e:
+                return {"ok": False, "message": str(e)}
+
+        if sub_cmd == "pin":
+            skill_name = sub_args.strip()
+            if not skill_name:
+                return {"ok": False, "message": "Usage: /skill curator pin <name>"}
+            curator.pin(skill_name)
+            return {"ok": True, "message": f"Skill '{skill_name}' pinned."}
+
+        if sub_cmd == "unpin":
+            skill_name = sub_args.strip()
+            if not skill_name:
+                return {"ok": False, "message": "Usage: /skill curator unpin <name>"}
+            try:
+                curator.unpin(skill_name)
+                return {"ok": True, "message": f"Skill '{skill_name}' unpinned."}
+            except KeyError as e:
+                return {"ok": False, "message": str(e)}
+
+        return {"ok": False, "message": f"Unknown curator command: {sub_cmd}"}
+
     return {"ok": False, "message": f"Unknown skill command: /{full_cmd}"}
 
 
@@ -3339,6 +3573,9 @@ def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> N
     if view == "dashboard":
         _render_dashboard_view(console, payload)
         return
+    if view == "btw":
+        _render_btw_view(console, payload)
+        return
 
     msg = payload.get("message")
     if msg:
@@ -3363,6 +3600,15 @@ def _ago(ts: Any) -> str:
     if delta < 86400:
         return f"{delta // 3600}h ago"
     return f"{delta // 86400}d ago"
+
+
+def _render_btw_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    """Render a /btw side question answer in the TUI (daemon path)."""
+    answer = str(payload.get("answer") or "")
+    if answer:
+        console.markdown(answer)
+    else:
+        console.system("(no answer)")
 
 
 def _board_page_url() -> str:
