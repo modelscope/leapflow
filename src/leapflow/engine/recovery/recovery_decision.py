@@ -12,10 +12,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from leapflow.engine.failure_envelope import FailureEnvelope
+from leapflow.engine.recovery.failure_envelope import FailureEnvelope
 
 if TYPE_CHECKING:
-    from leapflow.engine.interaction_request import InteractionRequest
+    from leapflow.engine.recovery.interaction_request import InteractionRequest
 
 
 class RecoveryAction(Enum):

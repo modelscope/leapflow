@@ -27,9 +27,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from leapflow.engine.prefix_commitment import PrefixCommitmentController
-from leapflow.engine.recovery_coordinator import RecoveryCoordinator
+from leapflow.engine.recovery.recovery_coordinator import RecoveryCoordinator
 from leapflow.engine.research_ledger import ResearchLedger
-from leapflow.engine.tool_execution import ToolExecutionLedger
+from leapflow.engine.tools.tool_execution import ToolExecutionLedger
 from leapflow.engine.turn_usage import TurnUsageTracker
 from leapflow.learning.plugin_trust import PluginTrustLedger
 

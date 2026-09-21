@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Protocol, runtime_checkable
 
-from leapflow.engine.context_disclosure import CacheBoundary
+from leapflow.engine.context.context_disclosure import CacheBoundary
 
 # ── System-prompt static/dynamic split anchors ────────────────────────────
 # These are deterministic structural markers — no NL fitting.  They mirror

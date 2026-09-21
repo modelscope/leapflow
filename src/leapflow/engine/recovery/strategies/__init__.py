@@ -7,14 +7,14 @@ credential rotation, etc.).
 """
 from __future__ import annotations
 
-from leapflow.engine.recovery_strategies.context_compress import ContextCompressStrategy
-from leapflow.engine.recovery_strategies.credential_rotate import CredentialRotateStrategy
-from leapflow.engine.recovery_strategies.jittered_retry import JitteredRetryStrategy
-from leapflow.engine.recovery_strategies.multimodal_strip import MultimodalStripStrategy
-from leapflow.engine.recovery_strategies.native_to_text import NativeToTextFallbackStrategy
-from leapflow.engine.recovery_strategies.provider_failover import ProviderFailoverStrategy
-from leapflow.engine.recovery_strategies.thinking_disable import ThinkingDisableStrategy
-from leapflow.engine.recovery_strategies.tool_schema_expand import ToolSchemaExpandStrategy
+from leapflow.engine.recovery.strategies.context_compress import ContextCompressStrategy
+from leapflow.engine.recovery.strategies.credential_rotate import CredentialRotateStrategy
+from leapflow.engine.recovery.strategies.jittered_retry import JitteredRetryStrategy
+from leapflow.engine.recovery.strategies.multimodal_strip import MultimodalStripStrategy
+from leapflow.engine.recovery.strategies.native_to_text import NativeToTextFallbackStrategy
+from leapflow.engine.recovery.strategies.provider_failover import ProviderFailoverStrategy
+from leapflow.engine.recovery.strategies.thinking_disable import ThinkingDisableStrategy
+from leapflow.engine.recovery.strategies.tool_schema_expand import ToolSchemaExpandStrategy
 
 __all__ = [
     "ContextCompressStrategy",

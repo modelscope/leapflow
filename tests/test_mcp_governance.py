@@ -25,7 +25,7 @@ from leapflow.security.orchestrator import ApprovalOrchestrator
 from leapflow.security.policy import ApprovalPolicyEngine
 from leapflow.security.risk import DefaultRiskClassifier, RiskLevel
 from leapflow.tools.name_resolver import ToolRegistry
-from leapflow.engine.tool_execution import effect_is_uncertain_on_failure, execution_policy_for
+from leapflow.engine.tools.tool_execution import effect_is_uncertain_on_failure, execution_policy_for
 
 
 # ════════════════════════════════════════════════════════════════
@@ -345,7 +345,7 @@ def test_read_only_mcp_tool_stays_replayable() -> None:
 
 def test_mcp_schema_carries_disclosure_metadata() -> None:
     """PCD reads risk_level and requires_approval; both must be present."""
-    from leapflow.engine.context_disclosure import CapabilityManifest
+    from leapflow.engine.context.context_disclosure import CapabilityManifest
 
     manifest = CapabilityManifest.from_tool_definition(_schema().to_openai_function())
     assert manifest.category == "mcp"

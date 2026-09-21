@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from leapflow.engine.tool_execution import effect_is_uncertain_on_failure, execution_policy_for
+from leapflow.engine.tools.tool_execution import effect_is_uncertain_on_failure, execution_policy_for
 from leapflow.hardware.context import (
     HC_VERSION,
     Channel,

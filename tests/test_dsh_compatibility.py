@@ -396,6 +396,18 @@ async def test_self_management_dsh_install_reload_status_and_remove(
         def versions(self, plugin_id):
             return []
 
+        def snapshot_state(self, plugin_id):
+            return {"active": self.active(plugin_id), "versions": self.versions(plugin_id)}
+
+        def restore_state(self, plugin_id, snapshot):
+            pass
+
+        def restore_source(self, target_path, data):
+            pass
+
+        def rollback_bundle(self, plugin_id, version, wrapper_target, bundle_target_dir):
+            raise KeyError(f"Bundle version not found: {plugin_id}@{version}")
+
     manager = SelfManagementPlugin()
     manager._plugin_install_dir = str(tmp_path / "plugins")
     manager._plugin_version_store = VersionStore()

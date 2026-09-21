@@ -6,10 +6,10 @@ Applies decorrelated jitter backoff with category-specific delay parameters.
 """
 from __future__ import annotations
 
-from leapflow.engine.failure_envelope import FailureEnvelope, Recoverability
-from leapflow.engine.recovery_budget import RecoveryBudget
-from leapflow.engine.recovery_coordinator import RecoveryState
-from leapflow.engine.recovery_decision import (
+from leapflow.engine.recovery.failure_envelope import FailureEnvelope, Recoverability
+from leapflow.engine.recovery.recovery_budget import RecoveryBudget
+from leapflow.engine.recovery.recovery_coordinator import RecoveryState
+from leapflow.engine.recovery.recovery_decision import (
     BackoffConfig,
     RecoveryAction,
     RecoveryDecision,

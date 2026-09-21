@@ -16,9 +16,9 @@ from typing import Any, Protocol
 
 # Imported at runtime (no import cycle): the audit entry's annotations must stay
 # resolvable for typing.get_type_hints() introspection, not just static checks.
-from leapflow.engine.failure_envelope import FailureEnvelope
-from leapflow.engine.recovery_budget import RecoveryBudget
-from leapflow.engine.recovery_decision import RecoveryDecision
+from leapflow.engine.recovery.failure_envelope import FailureEnvelope
+from leapflow.engine.recovery.recovery_budget import RecoveryBudget
+from leapflow.engine.recovery.recovery_decision import RecoveryDecision
 
 logger = logging.getLogger(__name__)
 

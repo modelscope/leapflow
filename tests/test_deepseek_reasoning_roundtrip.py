@@ -2,7 +2,7 @@
 """Regression tests for thinking-provider native tool-call continuation."""
 from __future__ import annotations
 
-from leapflow.engine.engine import _build_native_tool_assistant_message
+from leapflow.engine._message_helpers import _build_native_tool_assistant_message
 from leapflow.llm.base import ToolCallInfo
 
 

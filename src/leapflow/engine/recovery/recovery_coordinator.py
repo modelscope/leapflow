@@ -12,17 +12,17 @@ import time
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-from leapflow.engine.failure_envelope import FailureEnvelope, Recoverability, SideEffectState
-from leapflow.engine.interaction_request import (
+from leapflow.engine.recovery.failure_envelope import FailureEnvelope, Recoverability, SideEffectState
+from leapflow.engine.recovery.interaction_request import (
     InteractionRequest,
     InteractionType,
     Severity,
     SuggestedAction,
     TimeoutBehavior,
 )
-from leapflow.engine.oneshot_guard import OneShotGuard
-from leapflow.engine.recovery_budget import RecoveryBudget
-from leapflow.engine.recovery_decision import (
+from leapflow.engine.recovery.oneshot_guard import OneShotGuard
+from leapflow.engine.recovery.recovery_budget import RecoveryBudget
+from leapflow.engine.recovery.recovery_decision import (
     RecoveryAction,
     RecoveryDecision,
     RetrySemantics,

@@ -629,7 +629,7 @@ def handle_status(ctx: "Context", console: "LeapConsole", args: str) -> None:
         info.append("Session:   ", style="dim")
         info.append(f"{session_id}\n")
 
-    from leapflow.engine.session import SessionMode
+    from leapflow.engine.session.session import SessionMode
     mode = "idle"
     if ctx.session:
         if ctx.session.mode == SessionMode.LEARNING:
@@ -2855,7 +2855,7 @@ def build_status_payload(ctx: "Context") -> dict[str, Any]:
     platform_status = "connected" if (hasattr(ctx.rpc, "connected") and ctx.rpc.connected) else "mock"
     cwd = os.getcwd().replace(os.path.expanduser("~"), "~")
 
-    from leapflow.engine.session import SessionMode
+    from leapflow.engine.session.session import SessionMode
     mode = "idle"
     if ctx.session:
         if ctx.session.mode == SessionMode.LEARNING:
@@ -2966,7 +2966,7 @@ async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]
     Returns ``session_mode`` in the payload so the TUI client can track
     whether it should route subsequent inputs as annotations.
     """
-    from leapflow.engine.session import SessionMode
+    from leapflow.engine.session.session import SessionMode
 
     full_cmd = name + (" " + args if args else "")
     if full_cmd in ("teach start", "teach") or full_cmd.startswith("teach start "):

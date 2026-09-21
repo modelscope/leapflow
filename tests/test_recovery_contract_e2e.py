@@ -19,17 +19,17 @@ import time
 
 import pytest
 
-from leapflow.engine.failure_envelope import (
+from leapflow.engine.recovery.failure_envelope import (
     FailureContext,
     FailureEnvelope,
     FailureSource,
     Recoverability,
     SideEffectState,
 )
-from leapflow.engine.recovery_budget import RecoveryBudget
-from leapflow.engine.recovery_coordinator import RecoveryCoordinator
-from leapflow.engine.recovery_decision import RecoveryAction
-from leapflow.engine.recovery_strategies import default_strategies
+from leapflow.engine.recovery.recovery_budget import RecoveryBudget
+from leapflow.engine.recovery.recovery_coordinator import RecoveryCoordinator
+from leapflow.engine.recovery.recovery_decision import RecoveryAction
+from leapflow.engine.recovery.strategies import default_strategies
 
 # Actions that re-run work and can therefore duplicate an already-applied effect.
 _AUTOMATIC_RETRY_ACTIONS = frozenset({
@@ -293,7 +293,7 @@ def test_side_effect_state_survives_the_envelope_roundtrip() -> None:
 
 def test_classifier_maps_external_side_effect_to_a_gated_state() -> None:
     """An outbound external call must never be classified as effect-free."""
-    from leapflow.engine.unified_classifier import UnifiedErrorClassifier
+    from leapflow.engine.recovery.unified_classifier import UnifiedErrorClassifier
 
     mapped = UnifiedErrorClassifier._side_effect_state_from_policy("external_side_effect")
     idempotent = UnifiedErrorClassifier._side_effect_state_from_policy("mutating_idempotent")

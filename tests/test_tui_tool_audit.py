@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 
 from leapflow.cli.tui_app.stream import StreamRenderer
-from leapflow.engine.engine import _tool_args_metadata, _tool_result_metadata
+from leapflow.engine._message_helpers import _tool_args_metadata, _tool_result_metadata
 
 CMD = (
     'curl -s "https://query1.finance.yahoo.com/v8/finance/chart/BABA" 2>/dev/null | python3 -c "\n'
@@ -185,8 +185,8 @@ def test_hidden_tools_release_their_slot() -> None:
 
 def test_exit_code_is_read_under_either_key_name() -> None:
     """Shell tools emit `returncode`; evidence and UI read `exit_code`."""
-    from leapflow.engine.context_control import ToolEvidenceBuilder
-    from leapflow.engine.tool_execution import exit_code_from
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
+    from leapflow.engine.tools.tool_execution import exit_code_from
 
     assert exit_code_from({"returncode": 2}) == 2
     assert exit_code_from({"exit_code": 3}) == 3

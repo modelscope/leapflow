@@ -73,7 +73,8 @@ def _build_engine(
     compression_base_url: str = "",
 ):
     """Build a base AgentEngine with configurable compression settings."""
-    from leapflow.engine.engine import AgentEngine, build_default_registry
+    from leapflow.engine.engine import AgentEngine
+    from leapflow.engine import build_default_registry
     from leapflow.memory import (
         EpisodicMemoryProvider,
         SemanticMemoryProvider,

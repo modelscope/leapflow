@@ -15,19 +15,19 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from leapflow.engine.engine import AgentEngine
-from leapflow.engine.recovery_coordinator import RecoveryCoordinator
-from leapflow.engine.recovery_decision import (
+from leapflow.engine.recovery.recovery_coordinator import RecoveryCoordinator
+from leapflow.engine.recovery.recovery_decision import (
     RecoveryAction,
     RecoveryDecision,
     RetrySemantics,
 )
-from leapflow.engine.failure_envelope import (
+from leapflow.engine.recovery.failure_envelope import (
     FailureContext,
     FailureEnvelope,
     FailureSource,
     Recoverability,
 )
-from leapflow.engine.recovery_budget import RecoveryBudget
+from leapflow.engine.recovery.recovery_budget import RecoveryBudget
 from leapflow.llm.model_capabilities import ModelCapabilityRegistry
 
 
@@ -355,3 +355,34 @@ class TestFailoverContextBudgetCoherence:
         # Restore primary
         engine._llm = _FakeChain(128_000, model="primary-model")
         assert AgentEngine._active_context_length(engine) == 128_000
+
+
+# ═══════════════════════════════════════════════════════════════
+# Real-instance construction proof — regression contract
+# ═══════════════════════════════════════════════════════════════
+
+
+def test_real_agent_engine_construction_proof(tmp_path) -> None:
+    """Build AgentEngine for real so attribute fakes above stay honest."""
+    from conftest import StubLLM, make_settings
+    from leapflow.engine import build_default_registry
+    from leapflow.engine.intent_classifier import Intent
+    from leapflow.memory.providers.episodic import EpisodicMemoryProvider
+    from leapflow.memory.providers.semantic import SemanticMemoryProvider
+    from leapflow.memory.providers.working import WorkingMemoryProvider
+    from leapflow.platform.mock import MockBridge
+
+    class _Classifier:
+        async def classify(self, user_text: str) -> Intent:
+            return Intent(label="complex", reason="test")
+
+    settings = make_settings(str(tmp_path))
+    rpc = MockBridge()
+    llm = StubLLM(["ok"])
+    wm = WorkingMemoryProvider(max_tokens=2048)
+    lt = SemanticMemoryProvider(source=settings.duckdb_path)
+    imm = EpisodicMemoryProvider()
+    reg = build_default_registry(rpc, llm, wm, lt)
+    engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, _Classifier())
+    assert AgentEngine._active_context_length(engine) == settings.llm_context_length
+    lt.close()

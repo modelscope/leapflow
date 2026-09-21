@@ -919,7 +919,7 @@ def test_credentialed_url_is_not_echoed_into_approval(monkeypatch) -> None:
 
 def test_failure_evidence_keeps_status_and_body(monkeypatch) -> None:
     """A compacted HTTP failure must still explain itself to the model."""
-    from leapflow.engine.context_control import ToolEvidenceBuilder
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
 
     failure = {
         "ok": False,
@@ -941,8 +941,9 @@ def test_failure_evidence_keeps_status_and_body(monkeypatch) -> None:
 
 def test_web_fetch_is_read_only_for_the_execution_ledger() -> None:
     """read_only is the whole point: retries stay safe and batches keep running."""
-    from leapflow.engine.engine import _SIDE_EFFECT_STOP_POLICIES, _default_tool_registry
-    from leapflow.engine.tool_execution import (
+    from leapflow.engine._message_helpers import _SIDE_EFFECT_STOP_POLICIES
+    from leapflow.engine._tool_helpers import _default_tool_registry
+    from leapflow.engine.tools.tool_execution import (
         effect_is_uncertain_on_failure,
         execution_policy_for,
     )
@@ -956,7 +957,7 @@ def test_web_fetch_is_read_only_for_the_execution_ledger() -> None:
 
 def test_web_fetch_is_disclosed_in_the_core_tier() -> None:
     """A network capability the model cannot see is why it fell back to shell."""
-    from leapflow.engine.context_disclosure import DisclosurePlanner, DisclosureRuntimeState
+    from leapflow.engine.context.context_disclosure import DisclosurePlanner, DisclosureRuntimeState
     from leapflow.plugins import get_registry
     _tool_reg = get_registry()
     TOOL_DEFINITIONS = _tool_reg.tool_definitions
@@ -971,7 +972,7 @@ def test_web_fetch_is_disclosed_in_the_core_tier() -> None:
 
 
 def test_evidence_builder_caps_fetched_bodies() -> None:
-    from leapflow.engine.context_control import ToolEvidenceBuilder
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
 
     builder = ToolEvidenceBuilder(max_content_chars=400)
     result = {

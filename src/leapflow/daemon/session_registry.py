@@ -81,7 +81,7 @@ class SessionRegistry:
         single-session daemon is unchanged.
     build_engine:
         ``(base_engine, session_id, working_memory) -> engine`` — normally
-        ``leapflow.engine.session_factory.build_session_engine`` (adapted).
+        ``leapflow.engine.session.session_factory.build_session_engine`` (adapted).
     build_working_memory:
         ``() -> WorkingMemoryProvider`` — a fresh per-session working memory.
     max_sessions / idle_ttl_s:

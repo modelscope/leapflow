@@ -18,15 +18,16 @@ from leapflow.platform.event_bus import EventBus
 from leapflow.platform.mock import MockBridge
 from leapflow.config import Settings, _build_settings_from_env
 from leapflow.config_loader import config_signature, load_config_bundle
-from leapflow.engine.context_compressor import adaptive_tool_result_chars
-from leapflow.engine.engine import AgentEngine, build_default_registry
-from leapflow.engine.graph_planner import GraphPlanner
+from leapflow.engine.context.context_compressor import adaptive_tool_result_chars
+from leapflow.engine.engine import AgentEngine
+from leapflow.engine._tool_helpers import build_default_registry
+from leapflow.engine.task_planning.graph_planner import GraphPlanner
 from leapflow.engine.intent_classifier import (
     FallbackClassifier,
     IntentClassifier,
     LLMIntentClassifier,
 )
-from leapflow.engine.session import SessionController
+from leapflow.engine.session.session import SessionController
 from leapflow.recording.attention import build_attention_filters
 from leapflow.analysis.pipeline import ImitationPipeline
 from leapflow.storage.session_store import LearningSessionStore
@@ -1588,7 +1589,7 @@ class Context:
 
         await self.memory.initialize_all()
         if self._action_recorder is None:
-            from leapflow.engine.action_executor import RecordedActionExecutor
+            from leapflow.engine.tools.action_executor import RecordedActionExecutor
             from leapflow.evolution.action_recorder import ActionRecorder
             from leapflow.evolution.artifact_store import ContentAddressedArtifactStore
             from leapflow.evolution.outbox import EvolutionEventOutbox
@@ -2046,7 +2047,7 @@ class Context:
 
         # ── Build CompressorConfig with LLM callbacks ──
 
-        from leapflow.engine.context_compressor import CompressorConfig
+        from leapflow.engine.context.context_compressor import CompressorConfig
 
         async def _summarize_via_llm(prompt: str) -> str:
             from leapflow.llm.message_builder import build_user_message_text
@@ -2136,7 +2137,7 @@ class Context:
         self.engine.set_distilled_knowledge_store(self._evolution_knowledge_store)
 
         # ── Wire CompressorConfig with archive_fn into engine ──
-        from leapflow.engine.context_compressor import ContextCompressor
+        from leapflow.engine.context.context_compressor import ContextCompressor
 
         async def _archive_to_semantic(messages: List[Dict[str, Any]]) -> None:
             """Archive evicted messages to SemanticMemoryProvider."""
@@ -2219,7 +2220,7 @@ class Context:
         # ── Wire tool loop guardrails (progress-aware; thresholds from config) ──
         try:
             if getattr(settings, "guardrail_enabled", True):
-                from leapflow.engine.tool_guardrails import CompositeGuardrail
+                from leapflow.engine.tools.tool_guardrails import CompositeGuardrail
                 self.engine._guardrail = CompositeGuardrail(
                     max_repeats=settings.guardrail_max_repeats,
                     stagnation_window=settings.guardrail_stagnation_window,

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Protocol, Sequence, runtime_checkable
 
-from leapflow.engine.context_compressor import estimate_text_tokens as _estimate_text_tokens
+from leapflow.engine.context.context_compressor import estimate_text_tokens as _estimate_text_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +458,7 @@ class ToolEvidenceBuilder:
                 out.append(prefix + self._compact_entry(node))
 
     def _shell_evidence(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        from leapflow.engine.tool_execution import exit_code_from
+        from leapflow.engine.tools.tool_execution import exit_code_from
 
         return {
             "ok": bool(result.get("ok", True)),

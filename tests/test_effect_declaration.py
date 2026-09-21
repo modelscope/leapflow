@@ -78,9 +78,9 @@ def test_whitespace_is_trimmed():
 
 
 def _drive_engine_outcome(item):
-    from leapflow.engine.engine import AgentEngine
+    from leapflow.engine.learning_bridge import LearningBridge
 
-    AgentEngine._record_coevolution_outcome(item)
+    LearningBridge._record_coevolution_outcome(item)
 
 
 def _registry_with_tool(tool_name: str, plugin_id: str):

@@ -12,7 +12,7 @@ from leapflow.domain.evolution_event import (
     EvolutionContext,
     EvolutionEvent,
 )
-from leapflow.engine.tool_execution import ExecutionPolicy
+from leapflow.engine.tools.tool_execution import ExecutionPolicy
 
 logger = logging.getLogger(__name__)
 

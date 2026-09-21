@@ -299,13 +299,17 @@ class TestPlatformCapabilities:
         adapter = WebhookAdapter(port=0)
         assert adapter.capabilities.supports_edit is False
         import asyncio
-        result = asyncio.get_event_loop().run_until_complete(
-            adapter.edit_message(
-                SendTarget(platform="webhook", chat_id="c"),
-                "mid",
-                OutboundContent(text="edited"),
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                adapter.edit_message(
+                    SendTarget(platform="webhook", chat_id="c"),
+                    "mid",
+                    OutboundContent(text="edited"),
+                )
             )
-        )
+        finally:
+            loop.close()
         assert result.ok is False
         assert "not supported" in result.error
 

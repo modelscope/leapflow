@@ -65,7 +65,7 @@ class OrchestrationPlugin:
 
     async def _capability_expand_handler(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handler for capability_expand tool."""
-        from leapflow.engine.context_disclosure import build_capability_manifests
+        from leapflow.engine.context.context_disclosure import build_capability_manifests
 
         category = str(params.get("category") or "").strip().lower()
         if not category:

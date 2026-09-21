@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import pytest
 
-from leapflow.engine.failure_envelope import (
+from leapflow.engine.recovery.failure_envelope import (
     FailureEnvelope,
     FailureSource,
     Recoverability,
     SideEffectState,
 )
-from leapflow.engine.unified_classifier import UnifiedErrorClassifier
+from leapflow.engine.recovery.unified_classifier import UnifiedErrorClassifier
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 
 import pytest  # noqa: F401
 
-from leapflow.engine.context_disclosure import CacheBoundary
+from leapflow.engine.context.context_disclosure import CacheBoundary
 from leapflow.engine.prompt_cache import (
     AnthropicCacheStrategy,
     NoCacheStrategy,

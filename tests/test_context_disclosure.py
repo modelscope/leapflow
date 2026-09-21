@@ -1,7 +1,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from __future__ import annotations
 
-from leapflow.engine.context_disclosure import (
+from leapflow.engine.context.context_disclosure import (
     CapabilityManifest,
     DisclosureLevel,
     DisclosurePlanner,

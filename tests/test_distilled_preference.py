@@ -220,6 +220,7 @@ def test_the_engine_reads_preferences_per_resolution_not_once():
     it is used.
     """
     from leapflow.engine.engine import AgentEngine
+    from leapflow.engine.prompt_assembler import PromptAssembler
 
     events = DuckDBEvolutionEventStore(Path(tempfile.mkdtemp()) / "events.duckdb")
     store = EvolutionDistilledKnowledgeStore(events, profile_id="p")
@@ -229,16 +230,17 @@ def test_the_engine_reads_preferences_per_resolution_not_once():
     engine._knowledge_store_unavailable = False
     engine._environment_fingerprint_id = ""
     engine._settings = SimpleNamespace(distilled_knowledge_limit=12)
+    engine._prompt_assembler = PromptAssembler(engine)
 
-    assert engine._rebind_preferences() == ()
+    assert engine._prompt_assembler._rebind_preferences() == ()
     _seed(
         events,
         AdaptationVerdict.create("rebind", "chat.reply", "v2 now", target="chat_reply_v2"),
     )
     store.refresh()
-    assert engine._rebind_preferences() == (("chat.reply", "chat_reply_v2"),)
+    assert engine._prompt_assembler._rebind_preferences() == (("chat.reply", "chat_reply_v2"),)
     store.retract("chat.reply")
-    assert engine._rebind_preferences() == ()
+    assert engine._prompt_assembler._rebind_preferences() == ()
     events.close()
 
 
@@ -258,4 +260,6 @@ def test_a_failing_store_costs_a_preference_not_a_resolution():
     engine._environment_fingerprint_id = ""
     engine._settings = SimpleNamespace(distilled_knowledge_limit=12)
 
-    assert engine._rebind_preferences() == ()
+    from leapflow.engine.prompt_assembler import PromptAssembler
+    engine._prompt_assembler = PromptAssembler(engine)
+    assert engine._prompt_assembler._rebind_preferences() == ()

@@ -24,7 +24,7 @@ SUBJECT_PATHS = (
     "src/leapflow/learning/",
     "src/leapflow/analysis/",
     "src/leapflow/skills/",
-    "src/leapflow/engine/session.py",
+    "src/leapflow/engine/session/session.py",
     "src/leapflow/storage/",
 )
 

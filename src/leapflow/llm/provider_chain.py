@@ -364,7 +364,7 @@ class FailoverChain(LLMProvider):
         module scope would create a cycle; it is resolved on first use instead.
         """
         if self._error_classifier is None:
-            from leapflow.engine.error_classifier import ErrorClassifier
+            from leapflow.engine.recovery.error_classifier import ErrorClassifier
             self._error_classifier = ErrorClassifier()
         return self._error_classifier
 
