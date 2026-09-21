@@ -253,6 +253,46 @@ def test_stream_renderer_keeps_regular_json_examples() -> None:
     assert '"enabled": true' in text
 
 
+def test_sanitize_preserves_python_traceback_angles() -> None:
+    """D1: angle-bracketed Python identifiers must survive Markdown rendering."""
+    from leapflow.cli.tui_app.stream import _escape_traceback_angles, _sanitize_final_response
+
+    text = 'File "<string>", line 8, in <module>\nKeyError: \'ts\''
+    escaped = _escape_traceback_angles(text)
+    assert '`<string>`' in escaped
+    assert '`<module>`' in escaped
+
+    sanitized = _sanitize_final_response(text)
+    assert '`<string>`' in sanitized or '<string>' in sanitized
+    assert '`<module>`' in sanitized or '<module>' in sanitized
+    assert 'KeyError' in sanitized
+
+
+def test_sanitize_preserves_various_traceback_identifiers() -> None:
+    """All common Python traceback angle-bracket forms are protected."""
+    from leapflow.cli.tui_app.stream import _escape_traceback_angles
+
+    cases = [
+        '<stdin>', '<lambda>', '<listcomp>', '<dictcomp>',
+        '<setcomp>', '<genexpr>', '<frozen importlib._bootstrap>',
+        '<built-in function exec>', '<ipython-input-42-abc123>',
+        '<cell line: 5>',
+    ]
+    for token in cases:
+        result = _escape_traceback_angles(f'File "{token}", line 1')
+        assert '`' in result, f'{token} was not escaped: {result}'
+        assert token.strip('<>').split()[0] in result
+
+
+def test_sanitize_does_not_escape_regular_html_tags() -> None:
+    """Non-traceback angle brackets (real HTML) must not be escaped."""
+    from leapflow.cli.tui_app.stream import _escape_traceback_angles
+
+    text = '<div>hello</div> and <span>world</span>'
+    result = _escape_traceback_angles(text)
+    assert result == text  # unchanged
+
+
 def test_global_resume_routes_to_interactive(monkeypatch) -> None:
     from leapflow.cli import cli
 
