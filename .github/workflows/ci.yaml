@@ -70,6 +70,9 @@ jobs:
 
   # ── L2: main lane ──────────────────────────────────────────────────────
   # Everything, unscoped, across the supported matrix.
+  # Coverage XML + artifact are generated only on the canonical environment
+  # (Ubuntu + Python 3.12) to avoid duplicate artifacts without doubling
+  # the test runtime.
   main:
     if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
@@ -103,7 +106,29 @@ jobs:
         run: uv run python tools/sync_fixtures.py --check
 
       - name: Mock layer — full
-        run: uv run pytest tests/ -q -m "not e2e" --tb=short -n auto
+        run: |
+          COV_FLAGS=""
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" && "${{ matrix.python-version }}" == "3.12" ]]; then
+            COV_FLAGS="--cov=leapflow --cov-report=term-missing:skip-covered --cov-report=xml:coverage.xml"
+          fi
+          uv run pytest tests/ -q -m "not e2e" --tb=short -n auto $COV_FLAGS
+
+      - name: Upload coverage artifact
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Coverage summary
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: |
+          if [ -f coverage.xml ]; then
+            RATE=$(python3 -c 'import xml.etree.ElementTree as ET; r=ET.parse("coverage.xml").getroot(); print(round(float(r.attrib.get("line-rate",0))*100,1))')
+            echo "### Coverage: ${RATE}%" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Real layer — full
         run: uv run pytest tests/journeys -q -m e2e --tb=short -n 4

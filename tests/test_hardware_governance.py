@@ -38,13 +38,14 @@ from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
 from leapflow.hardware.risk import build_risk_classifier
 from leapflow.hardware.tools import HardwareTools, build_hardware_tools
 from leapflow.security.actions import ActionDescriptor, ActionKind
-from leapflow.security.approval import ApprovalDecision, ApprovalRequest, SessionAwareGate
+from leapflow.security.approval import ApprovalDecision, SessionAwareGate
 from leapflow.security.grants import ApprovalScope, grant_key
 from leapflow.security.orchestrator import ApprovalOrchestrator
 from leapflow.security.permission_failures import is_permission_hard_stop_payload
 from leapflow.security.policy import ApprovalPolicyEngine
 from leapflow.security.risk import DefaultRiskClassifier, RiskLevel
 from leapflow.tools.name_resolver import ToolRegistry
+from tests._harness.hardware_stubs import ScriptedHuman, with_transport_config
 
 SESSION = "session-under-test"
 
@@ -211,18 +212,8 @@ def bench_node_context() -> HardwareContext:
 # ════════════════════════════════════════════════════════════════
 
 
-class ScriptedHuman:
-    """Stands in for the person at the prompt. The only fake in the chain."""
-
-    def __init__(self, *decisions: ApprovalDecision) -> None:
-        self._decisions = list(decisions)
-        self.prompts: list[ApprovalRequest] = []
-
-    async def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
-        self.prompts.append(request)
-        if not self._decisions:
-            return ApprovalDecision.DENY
-        return self._decisions.pop(0) if len(self._decisions) > 1 else self._decisions[0]
+# ScriptedHuman and with_transport_config live in tests/_harness/hardware_stubs
+# and are imported at the top of this file.
 
 
 class _StaticProvider:
@@ -277,16 +268,8 @@ async def _describe(bench: Bench, device_id: str) -> None:
     await bench.tools.hw_describe(device_id=device_id)
 
 
-def with_transport_config(context: HardwareContext, **overrides: Any) -> HardwareContext:
-    """Return *context* with its transport config merged with *overrides*.
-
-    Lets a test change device behaviour -- inject a failure, remove halt support,
-    open an interlock -- without restating the whole declaration.
-    """
-    from dataclasses import replace
-
-    merged = {**dict(context.transport.config), **overrides}
-    return replace(context, transport=replace(context.transport, config=merged))
+# with_transport_config lives in tests/_harness/hardware_stubs
+# and is imported at the top of this file.
 
 
 def with_values(context: HardwareContext, **values: Any) -> HardwareContext:

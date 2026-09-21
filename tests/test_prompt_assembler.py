@@ -2,6 +2,7 @@
 """Unit tests for PromptAssembler — the engine's per-turn prompt/context assembly."""
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -332,6 +333,3 @@ class TestAutoExtractFindings:
         payload = {"ok": False, "error": "something went wrong" + "x" * 400}
         messages = [{"role": "tool", "content": json.dumps(payload)}]
         assert PromptAssembler._auto_extract_findings(messages) == []
-
-
-import json
