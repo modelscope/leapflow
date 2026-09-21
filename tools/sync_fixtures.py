@@ -12,13 +12,21 @@ Usage::
 
     python tools/sync_fixtures.py            # write fixtures, report changes
     python tools/sync_fixtures.py --check    # fail if fixtures are out of date
+    python tools/sync_fixtures.py --list-unused  # report cassette dirs/files not
+                                                 # referenced by current journeys
 
 ``--check`` is what CI runs: it turns provider drift into a red build with a diff
 rather than a silent divergence.
+
+``--list-unused`` is a read-only diagnostic: it reports cassette directories whose
+names do not match any current journey ID declared in ``tests/journeys/``. It
+never deletes data. Conservative matching means it may miss stale individual
+cassette files inside valid directories — that level requires a runtime run.
 """
 
 from __future__ import annotations
 
+import ast
 import argparse
 import json
 import sys
@@ -39,6 +47,7 @@ FIXTURE_ROOT = REPO_ROOT / "tests" / "_fixtures" / "llm_responses"
 # asks: "what does a successful body look like", "what does an error body look
 # like", "which usage fields do providers actually send".
 SHAPES_FILE = "response_shapes.json"
+JOURNEY_DIR = REPO_ROOT / "tests" / "journeys"
 
 
 def _sse_payloads(frames: Iterable[bytes]) -> list[dict[str, Any]]:
@@ -178,6 +187,82 @@ def _dedupe(shapes: list[Any]) -> list[Any]:
     return [seen[key] for key in sorted(seen)]
 
 
+def _declared_journey_ids() -> set[str]:
+    """Parse journey IDs from ``tests/journeys/test_*.py`` modules.
+
+    Each journey module calls ``journeys("<id>", ...)`` with a string-literal
+    first argument. This parser extracts those IDs from the AST rather than
+    importing the modules (which require pytest fixtures and the full harness).
+    """
+    ids: set[str] = set()
+    if not JOURNEY_DIR.is_dir():
+        return ids
+    for path in sorted(JOURNEY_DIR.glob("test_*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "journeys"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                ids.add(node.args[0].value)
+    return ids
+
+
+def _list_unused() -> int:
+    """Read-only diagnostic: report cassette directories not referenced by journeys.
+
+    This only checks at the *directory* level (one directory = one journey's
+    cassette store). Individual cassette files inside a recognized directory
+    cannot be statically matched to runtime fingerprints, so they are not
+    reported — that would require an actual replay run.
+
+    Returns 0 always (unused entries are informational, not an error).
+    """
+    journey_ids = _declared_journey_ids()
+    if not journey_ids:
+        print("warning: no journey IDs found; check tests/journeys/ exists")
+        return 0
+
+    unused_dirs: list[str] = []
+    total_dirs = 0
+    for root in (CASSETTE_ROOT, RECORDING_ROOT):
+        if not root.is_dir():
+            continue
+        for child in sorted(root.iterdir()):
+            if not child.is_dir():
+                continue
+            total_dirs += 1
+            if child.name not in journey_ids:
+                rel = child.relative_to(REPO_ROOT)
+                unused_dirs.append(str(rel))
+
+    if unused_dirs:
+        print(
+            f"{len(unused_dirs)} cassette director(ies) not referenced by any "
+            f"current journey ({total_dirs} total, {len(journey_ids)} journey IDs):\n"
+        )
+        for path in unused_dirs:
+            print(f"  {path}")
+        print(
+            "\nThese directories may be stale. Review before removing — "
+            "a recording directory may hold valuable provider-traffic evidence "
+            "even after its journey is renamed."
+        )
+    else:
+        print(
+            f"all {total_dirs} cassette director(ies) match a declared journey "
+            f"({len(journey_ids)} journey IDs)"
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Write or verify the derived fixtures."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -186,7 +271,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Fail when the committed fixtures differ from the cassettes",
     )
+    parser.add_argument(
+        "--list-unused",
+        action="store_true",
+        help=(
+            "Read-only: report cassette directories/files not referenced by "
+            "current journey declarations. Never deletes data."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.list_unused:
+        return _list_unused()
 
     if not CASSETTE_ROOT.is_dir() and not RECORDING_ROOT.is_dir():
         print(

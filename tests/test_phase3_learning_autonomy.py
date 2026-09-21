@@ -691,7 +691,7 @@ def _make_trust_bench(
     )
     registry.load()
 
-    from tests.test_hardware_governance import ScriptedHuman
+    from tests._harness.hardware_stubs import ScriptedHuman
 
     human = ScriptedHuman(ApprovalDecision.ALLOW_ONCE)
     gate = SessionAwareGate(human)
