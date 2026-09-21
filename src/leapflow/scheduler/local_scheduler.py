@@ -165,6 +165,34 @@ class LocalScheduler:
             result = await self._executor.execute(task.skill_name, parameters)
             self._store.increment_run_count(task.task_id)
 
+            ok = result.get("ok", False)
+
+            # Check result-level failure for retry (result returned ok=False)
+            if not ok and task.max_retries > 0:
+                reloaded = self._store.load(task.task_id)
+                current_retry = reloaded.retry_count if reloaded else 0
+                if current_retry < task.max_retries:
+                    self._retry_task(task, current_retry, execution_id)
+                    return
+                # Retries exhausted from soft failure
+                self._store.update_task(task.task_id, state=TaskState.FAILED.value, retry_count=0)
+                logger.warning(
+                    "Task %s failed after %d retries (soft failure)",
+                    task.task_id[:8], task.max_retries,
+                )
+                if self._execution_log is not None and execution_id is not None:
+                    try:
+                        self._execution_log.record_finish(
+                            execution_id, "failed", result_summary="retries exhausted",
+                        )
+                    except Exception:
+                        pass
+                return
+
+            # Reset retry_count on success
+            if ok and task.retry_count > 0:
+                self._store.update_task(task.task_id, retry_count=0)
+
             # Check max_runs exhaustion
             updated = self._store.load(task.task_id)
             if updated and updated.max_runs > 0 and updated.run_count >= updated.max_runs:
@@ -178,21 +206,35 @@ class LocalScheduler:
             logger.info(
                 "Task %s executed: ok=%s",
                 task.task_id[:8],
-                result.get("ok", False),
+                ok,
             )
 
             # Record success (contained)
             if self._execution_log is not None and execution_id is not None:
                 try:
-                    summary = str(result.get("output", ""))[:200] if result.get("ok") else ""
+                    summary = str(result.get("output", ""))[:200] if ok else ""
                     self._execution_log.record_finish(
                         execution_id, "success", result_summary=summary,
                     )
                 except Exception:
                     logger.debug("Failed to record execution finish for %s", task.task_id[:8], exc_info=True)
         except Exception as e:
-            self._store.update_state(task.task_id, TaskState.FAILED.value)
-            logger.error("Task %s failed: %s", task.task_id[:8], e)
+            # Hard exception path: retry if budget allows
+            if task.max_retries > 0:
+                reloaded = self._store.load(task.task_id)
+                current_retry = reloaded.retry_count if reloaded else 0
+                if current_retry < task.max_retries:
+                    self._retry_task(task, current_retry, execution_id, error=str(e))
+                    return
+                # Retries exhausted
+                self._store.update_task(task.task_id, state=TaskState.FAILED.value, retry_count=0)
+                logger.error(
+                    "Task %s failed after %d retries: %s",
+                    task.task_id[:8], task.max_retries, e,
+                )
+            else:
+                self._store.update_state(task.task_id, TaskState.FAILED.value)
+                logger.error("Task %s failed: %s", task.task_id[:8], e)
 
             # Record failure (contained)
             if self._execution_log is not None and execution_id is not None:
@@ -202,6 +244,39 @@ class LocalScheduler:
                     )
                 except Exception:
                     logger.debug("Failed to record execution failure for %s", task.task_id[:8], exc_info=True)
+
+    def _retry_task(
+        self,
+        task: ArmedTask,
+        current_retry: int,
+        execution_id: Optional[str] = None,
+        error: str = "",
+    ) -> None:
+        """Schedule a retry with exponential backoff."""
+        new_retry = current_retry + 1
+        backoff = task.retry_backoff_s * (2 ** current_retry)
+        retry_due = time.time() + backoff
+        self._store.update_task(
+            task.task_id,
+            retry_count=new_retry,
+            next_due_at=retry_due,
+            state=TaskState.ARMED.value,
+        )
+        logger.info(
+            "Task %s retry %d/%d in %.0fs",
+            task.task_id[:8], new_retry, task.max_retries, backoff,
+        )
+        # Record retry (contained)
+        if self._execution_log is not None and execution_id is not None:
+            try:
+                self._execution_log.record_finish(
+                    execution_id,
+                    "retry",
+                    result_summary=f"retry {new_retry}/{task.max_retries}",
+                    error=error[:500] if error else "",
+                )
+            except Exception:
+                logger.debug("Failed to record retry for %s", task.task_id[:8], exc_info=True)
 
     # ------------------------------------------------------------------
     # Fast-forward

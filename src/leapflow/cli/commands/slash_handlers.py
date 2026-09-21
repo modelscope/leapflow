@@ -2134,7 +2134,7 @@ def build_schedule_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
                     next_str = f"{int(delta / 3600)}h"
             else:
                 next_str = "-"
-            enabled = t.state not in ("suspended", "done", "failed")
+            enabled = t.state not in ("suspended", "done", "failed", "paused")
             lines.append(
                 f"  {tid}  skill={t.skill_name}  trigger={trigger}"
                 f"  next={next_str}  enabled={enabled}"
@@ -2200,7 +2200,110 @@ def build_schedule_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
                 return {"ok": False, "message": f"Failed to cancel: {exc}"}
         return {"ok": True, "message": f"Cancelled task {task_id[:8]}."}
 
-    return {"ok": False, "message": f"Unknown schedule subcommand: {verb}. Use list, history, or cancel."}
+    # ── /schedule pause <task_id> ────────────────────────────────────
+    if verb == "pause":
+        task_id = rest
+        if not task_id:
+            return {"ok": False, "message": "Usage: /schedule pause <task_id>"}
+        if task_store is None:
+            return {"ok": False, "message": "No scheduler active."}
+        try:
+            task_store.update_state(task_id, "paused")
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to pause: {exc}"}
+        return {"ok": True, "message": f"Paused task {task_id[:8]}."}
+
+    # ── /schedule resume <task_id> ───────────────────────────────────
+    if verb == "resume":
+        task_id = rest
+        if not task_id:
+            return {"ok": False, "message": "Usage: /schedule resume <task_id>"}
+        if coordinator is not None:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Sync fallback: recalculate next_due and set armed
+                    _resume_task_sync(task_store, task_id)
+                else:
+                    loop.run_until_complete(coordinator.resume_task(task_id))
+            except ValueError as exc:
+                return {"ok": False, "message": str(exc)}
+            except Exception:
+                _resume_task_sync(task_store, task_id)
+        elif task_store is not None:
+            try:
+                _resume_task_sync(task_store, task_id)
+            except Exception as exc:
+                return {"ok": False, "message": f"Failed to resume: {exc}"}
+        else:
+            return {"ok": False, "message": "No scheduler active."}
+        return {"ok": True, "message": f"Resumed task {task_id[:8]}."}
+
+    # ── /schedule edit <task_id> <trigger_expr> ──────────────────────
+    if verb == "edit":
+        edit_parts = rest.split(None, 1)
+        if len(edit_parts) < 2:
+            return {"ok": False, "message": "Usage: /schedule edit <task_id> <trigger_expr>"}
+        task_id, trigger_expr = edit_parts[0], edit_parts[1]
+        if coordinator is not None:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    _edit_task_sync(task_store, task_id, trigger_expr)
+                else:
+                    loop.run_until_complete(coordinator.update_task(task_id, trigger_expr=trigger_expr))
+            except ValueError as exc:
+                return {"ok": False, "message": str(exc)}
+            except Exception as exc:
+                return {"ok": False, "message": f"Failed to edit: {exc}"}
+        elif task_store is not None:
+            try:
+                _edit_task_sync(task_store, task_id, trigger_expr)
+            except Exception as exc:
+                return {"ok": False, "message": f"Failed to edit: {exc}"}
+        else:
+            return {"ok": False, "message": "No scheduler active."}
+        return {"ok": True, "message": f"Updated task {task_id[:8]} trigger to: {trigger_expr}"}
+    return {"ok": False, "message": f"Unknown schedule subcommand: {verb}. Use list, history, cancel, pause, resume, or edit."}
+
+
+def _resume_task_sync(task_store: Any, task_id: str) -> None:
+    """Sync fallback: recalculate next_due and re-arm a paused task."""
+    from leapflow.scheduler.triggers import create_trigger as _create_trigger
+    import time as _t
+
+    task = task_store.load(task_id)
+    if task is None:
+        raise ValueError(f"Task not found: {task_id}")
+    trigger = _create_trigger(
+        task.trigger_type,
+        task.trigger_config if isinstance(task.trigger_config, dict) else {},
+    )
+    trigger.advance(_t.time())
+    task_store.update_task(
+        task_id,
+        state="armed",
+        next_due_at=trigger.next_due_at,
+    )
+
+
+def _edit_task_sync(task_store: Any, task_id: str, trigger_expr: str) -> None:
+    """Sync fallback: parse a new trigger expression and update the task."""
+    from leapflow.scheduler.coordinator import parse_trigger_expression
+    from leapflow.scheduler.triggers import create_trigger as _create_trigger
+    import time as _t
+
+    trigger_type, trigger_config = parse_trigger_expression(trigger_expr)
+    trigger = _create_trigger(trigger_type, trigger_config)
+    trigger.advance(_t.time())
+    task_store.update_task(
+        task_id,
+        trigger_type=trigger_type,
+        trigger_config=trigger_config,
+        next_due_at=trigger.next_due_at,
+    )
 
 
 async def _ensure_session_watch_refresh(
