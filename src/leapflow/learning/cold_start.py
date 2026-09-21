@@ -39,7 +39,7 @@ class ColdStartConfig:
 
 class ColdStartManager:
     """Manages cold start phase transitions and adaptive thresholds.
-    
+
     Monitors system data accumulation and adjusts PatternMiner/suggestion
     thresholds accordingly. Exits cold start automatically when sufficient
     data is available.
@@ -79,7 +79,7 @@ class ColdStartManager:
 
     def should_prompt_user(self) -> Optional[str]:
         """Check if we should prompt user to use teach mode.
-        
+
         Returns suggestion message or None.
         """
         if self._config.mode != "prompt":
@@ -88,7 +88,7 @@ class ColdStartManager:
             return None
         if self._phase != ColdStartPhase.EMPTY:
             return None
-        
+
         elapsed = time.time() - self._start_ts
         if elapsed >= self._config.prompt_user_after_s:
             self._user_prompted = True
@@ -113,7 +113,7 @@ class ColdStartManager:
             if self._events_seen >= self._config.min_events_for_warming:
                 self._phase = ColdStartPhase.WARMING
                 logger.info("ColdStart: advanced to WARMING (events=%d)", self._events_seen)
-        
+
         if self._phase == ColdStartPhase.WARMING:
             if (self._events_seen >= self._config.min_events_for_ready
                     and self._skills_count >= self._config.min_skills_for_ready):

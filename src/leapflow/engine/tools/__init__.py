@@ -30,6 +30,12 @@ from leapflow.engine.tools.tool_guardrails import (
     StagnationGuard,
     TurnCapGuard,
 )
+from leapflow.engine.tools.tool_search import (
+    ListingLevel,
+    ToolSearchIndex,
+    entries_from_tool_definitions,
+    render_tool_listing,
+)
 
 __all__ = [
     "ActionExecutor",
@@ -40,6 +46,7 @@ __all__ = [
     "ExecutionPolicy",
     "ExecutionTrace",
     "GuardrailViolation",
+    "ListingLevel",
     "RecordedActionExecutor",
     "RepetitionGuard",
     "StagnationGuard",
@@ -47,10 +54,13 @@ __all__ = [
     "ToolConcurrencyPolicy",
     "ToolExecutionLedger",
     "ToolExecutionRecord",
+    "ToolSearchIndex",
     "TurnCapGuard",
     "build_idempotency_key",
     "effect_is_uncertain_on_failure",
+    "entries_from_tool_definitions",
     "execution_policy_for",
     "exit_code_from",
     "normalize_execution_policy",
+    "render_tool_listing",
 ]

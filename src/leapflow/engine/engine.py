@@ -1596,12 +1596,15 @@ class AgentEngine:
         depth: int,
         tool_filter: "frozenset[str] | None" = None,
         enable_thinking: bool = False,
-    ) -> str:
+    ) -> "tuple[str, int]":
         """Run a subagent goal as an isolated child frame through the full loop.
 
         Bridge for ``EngineFrameSubagentExecutor`` (opt-in full-loop subagents):
         the child frame's fresh subsystems + per-frame swap keep the subagent
         from contaminating the parent turn's state.
+
+        Returns ``(summary_text, tool_calls)`` so the executor can populate
+        ``SubagentResult.tool_calls`` with the real count.
         """
         frame = self._build_child_frame(
             goal,
@@ -1609,7 +1612,11 @@ class AgentEngine:
             tool_filter=tool_filter,
             enable_thinking=enable_thinking,
         )
-        return await self._run_child_frame(frame)
+        summary = await self._run_child_frame(frame)
+        tool_calls = 0
+        if frame.usage_tracker is not None:
+            tool_calls = frame.usage_tracker.summary().tool_calls
+        return summary, tool_calls
 
     def _build_frame(
         self,

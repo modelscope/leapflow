@@ -773,6 +773,7 @@ class Settings:
     scheduler_agent_tool_blocklist: str = ""  # comma-separated tool names
     scheduler_default_max_retries: int = 2
     scheduler_default_retry_backoff_s: float = 60.0
+    scheduler_delivery_enabled: bool = False  # opt-in: deliver results to gateway
 
     # ── Usage Pricing (config-driven cost accounting) ──
     # Mapping keyed by model family or exact model name, each entry providing
@@ -1437,6 +1438,7 @@ def _build_settings_from_env(
     scheduler_agent_tool_blocklist = os.getenv("LEAPFLOW_SCHEDULER_AGENT_TOOL_BLOCKLIST", "")
     scheduler_default_max_retries = int(os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_MAX_RETRIES", "2"))
     scheduler_default_retry_backoff_s = float(os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_RETRY_BACKOFF_S", "60.0"))
+    scheduler_delivery_enabled = _bool("LEAPFLOW_SCHEDULER_DELIVERY_ENABLED", "false")
 
     # Dashboard
     dashboard_enabled = _bool("LEAPFLOW_DASHBOARD_ENABLED", "true")
@@ -1829,6 +1831,7 @@ def _build_settings_from_env(
         scheduler_agent_tool_blocklist=scheduler_agent_tool_blocklist,
         scheduler_default_max_retries=scheduler_default_max_retries,
         scheduler_default_retry_backoff_s=scheduler_default_retry_backoff_s,
+        scheduler_delivery_enabled=scheduler_delivery_enabled,
         # Dashboard
         dashboard_enabled=dashboard_enabled,
         dashboard_bind=dashboard_bind,

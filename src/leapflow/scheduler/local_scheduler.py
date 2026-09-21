@@ -14,7 +14,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from leapflow.scheduler.execution_log import ExecutionLogStore
 from leapflow.scheduler.store import TaskStore
@@ -22,6 +22,10 @@ from leapflow.scheduler.triggers import create_trigger
 from leapflow.scheduler.types import ArmedTask, SkillExecutor, TaskState
 
 logger = logging.getLogger(__name__)
+
+# Type alias for the optional delivery callback.
+# Signature: send_fn(platform, chat_id, message_text) -> None
+DeliverySendFn = Callable[[str, str, str], Any]
 
 
 class LocalScheduler:
@@ -40,12 +44,16 @@ class LocalScheduler:
         tick_seconds: int = 60,
         grace_seconds: float = 120.0,
         execution_log: Optional["ExecutionLogStore"] = None,
+        send_fn: Optional[DeliverySendFn] = None,
+        delivery_enabled: bool = False,
     ) -> None:
         self._store = store
         self._executor = executor
         self._tick_seconds = tick_seconds
         self._grace_seconds = grace_seconds
         self._execution_log = execution_log
+        self._send_fn = send_fn
+        self._delivery_enabled = delivery_enabled
         self._task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
         self._running = False
         self._wake_event: asyncio.Event = asyncio.Event()
@@ -144,6 +152,7 @@ class LocalScheduler:
 
         # Execute
         execution_id: Optional[str] = None
+        t_start = time.time()
         try:
             # Record execution start (contained — logging failures never crash the tick)
             if self._execution_log is not None:
@@ -166,28 +175,54 @@ class LocalScheduler:
             self._store.increment_run_count(task.task_id)
 
             ok = result.get("ok", False)
+            duration = time.time() - t_start
 
-            # Check result-level failure for retry (result returned ok=False)
-            if not ok and task.max_retries > 0:
-                reloaded = self._store.load(task.task_id)
-                current_retry = reloaded.retry_count if reloaded else 0
-                if current_retry < task.max_retries:
-                    self._retry_task(task, current_retry, execution_id)
+            # Check result-level failure (result returned ok=False)
+            if not ok:
+                if task.max_retries > 0:
+                    reloaded = self._store.load(task.task_id)
+                    current_retry = reloaded.retry_count if reloaded else 0
+                    if current_retry < task.max_retries:
+                        self._retry_task(task, current_retry, execution_id)
+                        return
+                    # Retries exhausted from soft failure
+                    self._store.update_task(task.task_id, state=TaskState.FAILED.value, retry_count=0)
+                    logger.warning(
+                        "Task %s failed after %d retries (soft failure)",
+                        task.task_id[:8], task.max_retries,
+                    )
+                    if self._execution_log is not None and execution_id is not None:
+                        try:
+                            self._execution_log.record_finish(
+                                execution_id, "failed", result_summary="retries exhausted",
+                            )
+                        except Exception:
+                            pass
+                    self._attempt_delivery(
+                        task, success=False, error="retries exhausted", duration_s=duration,
+                    )
                     return
-                # Retries exhausted from soft failure
-                self._store.update_task(task.task_id, state=TaskState.FAILED.value, retry_count=0)
-                logger.warning(
-                    "Task %s failed after %d retries (soft failure)",
-                    task.task_id[:8], task.max_retries,
-                )
-                if self._execution_log is not None and execution_id is not None:
-                    try:
-                        self._execution_log.record_finish(
-                            execution_id, "failed", result_summary="retries exhausted",
-                        )
-                    except Exception:
-                        pass
-                return
+                else:
+                    # No retries configured: mark as FAILED immediately
+                    self._store.update_state(task.task_id, TaskState.FAILED.value)
+                    logger.error(
+                        "Task %s execution returned ok=False with no retries configured",
+                        task.task_id[:8],
+                    )
+                    if self._execution_log is not None and execution_id is not None:
+                        try:
+                            self._execution_log.record_finish(
+                                execution_id, "failed",
+                                result_summary=str(result.get("output", ""))[:200],
+                            )
+                        except Exception:
+                            logger.debug("Failed to record execution failure for %s", task.task_id[:8], exc_info=True)
+                    self._attempt_delivery(
+                        task, success=False,
+                        error="ok=False (no retries configured)",
+                        duration_s=duration,
+                    )
+                    return
 
             # Reset retry_count on success
             if ok and task.retry_count > 0:
@@ -210,15 +245,21 @@ class LocalScheduler:
             )
 
             # Record success (contained)
+            output_summary = str(result.get("output", ""))[:200] if ok else ""
             if self._execution_log is not None and execution_id is not None:
                 try:
-                    summary = str(result.get("output", ""))[:200] if ok else ""
                     self._execution_log.record_finish(
-                        execution_id, "success", result_summary=summary,
+                        execution_id, "success", result_summary=output_summary,
                     )
                 except Exception:
                     logger.debug("Failed to record execution finish for %s", task.task_id[:8], exc_info=True)
+
+            # Post-execution delivery
+            self._attempt_delivery(
+                task, success=ok, summary=output_summary, duration_s=duration,
+            )
         except Exception as e:
+            duration = time.time() - t_start
             # Hard exception path: retry if budget allows
             if task.max_retries > 0:
                 reloaded = self._store.load(task.task_id)
@@ -244,6 +285,11 @@ class LocalScheduler:
                     )
                 except Exception:
                     logger.debug("Failed to record execution failure for %s", task.task_id[:8], exc_info=True)
+
+            # Post-execution delivery (failure)
+            self._attempt_delivery(
+                task, success=False, error=str(e)[:200], duration_s=duration,
+            )
 
     def _retry_task(
         self,
@@ -312,3 +358,57 @@ class LocalScheduler:
 
         if forwarded:
             logger.info("Fast-forwarded %d overdue tasks", forwarded)
+
+    # ------------------------------------------------------------------
+    # Post-execution delivery
+    # ------------------------------------------------------------------
+
+    def _attempt_delivery(
+        self,
+        task: ArmedTask,
+        *,
+        success: bool,
+        summary: str = "",
+        error: str = "",
+        duration_s: float = 0.0,
+    ) -> None:
+        """Attempt result delivery to the task's delivery_target (non-fatal).
+
+        Skipped when delivery is disabled, no send_fn is wired, or the task has
+        no ``delivery_target`` in its parameters.
+        """
+        if not self._delivery_enabled or self._send_fn is None:
+            return
+
+        params = task.parameters if isinstance(task.parameters, dict) else {}
+        target = params.get("delivery_target")
+        if not isinstance(target, dict):
+            return
+        platform = str(target.get("platform", "")).strip()
+        chat_id = str(target.get("chat_id", "")).strip()
+        if not platform or not chat_id:
+            return
+
+        status_label = "✅ Success" if success else "❌ Failed"
+        detail = summary[:200] if success else (error[:200] if error else "unknown")
+        dur_str = f"{duration_s:.1f}s" if duration_s > 0 else "-"
+        message = (
+            f"[Scheduler] {task.skill_name} ({task.task_id[:8]})\n"
+            f"Status: {status_label}\n"
+            f"Duration: {dur_str}\n"
+            f"Detail: {detail}"
+        )
+
+        try:
+            result = self._send_fn(platform, chat_id, message)
+            # Handle coroutine return from async send_fn
+            if asyncio.iscoroutine(result):
+                asyncio.ensure_future(result)
+            logger.debug("Delivery sent for task %s", task.task_id[:8])
+        except Exception:
+            # Delivery failure is NON-FATAL per design.
+            logger.warning(
+                "Delivery failed for task %s (non-fatal)",
+                task.task_id[:8],
+                exc_info=True,
+            )

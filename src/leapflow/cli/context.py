@@ -1791,15 +1791,15 @@ class Context:
         )
 
         self.registry = build_default_registry(self.rpc, self.llm, self.wm, self.lt)
-        
+
         # Store scorers for deferred phase
         self._critical_scorer = scorer
         self._critical_llm_scorer = llm_scorer
         self._critical_feedback_evaluator = feedback_evaluator
-        
+
         # NOTE: World Model, SkillActivator, Learning Pipeline, Doc/Stored skills
         # are assembled in initialize_deferred()
-        
+
         graph_planner = GraphPlanner(self.llm, self.registry) if settings.has_llm_credentials else None
 
         # Bind perception/execution to the desktop semantic plugin
@@ -2201,12 +2201,14 @@ class Context:
                     tool_handlers=_TH,
                     tool_definitions=_TD,
                     settings=settings,
+                    tool_pipeline=_tool_reg_sub.tool_pipeline,
                 )
             self._subagent_manager = SubagentManager(
                 executor=sub_executor,
                 max_depth=settings.agent_subagent_max_depth,
                 max_concurrent=settings.agent_subagent_max_concurrent,
                 event_bus=self.event_bus,
+                conversation_store=self._conversation_store,
             )
             _tool_reg_sub.set_subagent_manager(self._subagent_manager)
             logger.info("SubagentManager wired with delegate_task tool")

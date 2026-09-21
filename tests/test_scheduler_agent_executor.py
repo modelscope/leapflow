@@ -416,3 +416,207 @@ class TestConfigSettings:
                 defaults[f.name] = f.default
         assert defaults["scheduler_agent_max_iterations"] == 25
         assert defaults["scheduler_agent_tool_blocklist"] == ""
+
+
+# ═════════════════════════════════════════════════════════════════════
+# SchedulerExecutionMode enum (unified mode contract)
+# ═════════════════════════════════════════════════════════════════════
+
+
+class TestSchedulerExecutionMode:
+    """The enum encodes the two modes the router dispatches between."""
+
+    def test_values_match_wire_strings(self) -> None:
+        from leapflow.scheduler.types import SchedulerExecutionMode
+
+        # These string values are the on-the-wire contract stored in a task's
+        # parameters and matched by the router; they must not drift.
+        assert SchedulerExecutionMode.SCRIPT.value == "script"
+        assert SchedulerExecutionMode.AGENT.value == "agent"
+
+    def test_from_value_defaults_to_script(self) -> None:
+        from leapflow.scheduler.types import SchedulerExecutionMode
+
+        assert SchedulerExecutionMode.from_value(None) is SchedulerExecutionMode.SCRIPT
+        assert SchedulerExecutionMode.from_value("") is SchedulerExecutionMode.SCRIPT
+        assert SchedulerExecutionMode.from_value("bogus") is SchedulerExecutionMode.SCRIPT
+
+    def test_from_value_recognizes_modes(self) -> None:
+        from leapflow.scheduler.types import SchedulerExecutionMode
+
+        assert SchedulerExecutionMode.from_value("agent") is SchedulerExecutionMode.AGENT
+        assert SchedulerExecutionMode.from_value("script") is SchedulerExecutionMode.SCRIPT
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Router coverage: every execution_mode value routes with no gaps
+# ═════════════════════════════════════════════════════════════════════
+
+
+class TestRouterCoverage:
+    """``_RoutingExecutor`` dispatches agent vs default for all mode values."""
+
+    def _pair(self) -> tuple[Any, Any]:
+        default_exec = MagicMock()
+        default_exec.execute = AsyncMock(return_value={"ok": True, "output": "default"})
+        agent_exec = MagicMock()
+        agent_exec.execute = AsyncMock(return_value={"ok": True, "output": "agent"})
+        return default_exec, agent_exec
+
+    @pytest.mark.asyncio
+    async def test_explicit_script_uses_default(self) -> None:
+        from leapflow.scheduler.coordinator import _RoutingExecutor
+
+        default_exec, agent_exec = self._pair()
+        router = _RoutingExecutor(default_exec, agent_factory=lambda: agent_exec)
+        await router.execute("skill", {"instruction": "x", "execution_mode": "script"})
+        default_exec.execute.assert_called_once()
+        agent_exec.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_mode_falls_through_to_default(self) -> None:
+        from leapflow.scheduler.coordinator import _RoutingExecutor
+
+        default_exec, agent_exec = self._pair()
+        router = _RoutingExecutor(default_exec, agent_factory=lambda: agent_exec)
+        # An unrecognized mode must not error — it runs as the default.
+        await router.execute("skill", {"instruction": "x", "execution_mode": "bogus"})
+        default_exec.execute.assert_called_once()
+        agent_exec.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_mode_uses_default(self) -> None:
+        from leapflow.scheduler.coordinator import _RoutingExecutor
+
+        default_exec, agent_exec = self._pair()
+        router = _RoutingExecutor(default_exec, agent_factory=lambda: agent_exec)
+        await router.execute("skill", {"instruction": "x"})
+        default_exec.execute.assert_called_once()
+        agent_exec.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_agent_executor_is_built_once_and_cached(self) -> None:
+        from leapflow.scheduler.coordinator import _RoutingExecutor
+
+        _, agent_exec = self._pair()
+        builds = {"n": 0}
+
+        def factory() -> Any:
+            builds["n"] += 1
+            return agent_exec
+
+        router = _RoutingExecutor(MagicMock(), agent_factory=factory)
+        params = {"instruction": "x", "execution_mode": "agent"}
+        await router.execute("skill", params)
+        await router.execute("skill", params)
+        # A task can fire many times; the agent executor is constructed once.
+        assert builds["n"] == 1
+        assert agent_exec.execute.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_mode_switch_on_single_router(self) -> None:
+        from leapflow.scheduler.coordinator import _RoutingExecutor
+
+        default_exec, agent_exec = self._pair()
+        router = _RoutingExecutor(default_exec, agent_factory=lambda: agent_exec)
+        # Same router services both modes back-to-back.
+        r_agent = await router.execute("skill", {"execution_mode": "agent"})
+        r_script = await router.execute("skill", {"execution_mode": "script"})
+        assert r_agent["output"] == "agent"
+        assert r_script["output"] == "default"
+        agent_exec.execute.assert_called_once()
+        default_exec.execute.assert_called_once()
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Scheduler ↔ SubagentManager collaboration boundary
+# ═════════════════════════════════════════════════════════════════════
+
+
+class TestSubagentBoundary:
+    """AgentSkillExecutor drives an isolated, depth-gated sub-agent."""
+
+    @pytest.mark.asyncio
+    async def test_delegates_through_manager_with_depth_one(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import leapflow.engine.subagent as subagent_mod
+
+        captured: dict[str, Any] = {}
+
+        class FakeResult:
+            status = "completed"
+            summary = "work done"
+            tool_calls = 2
+            error = None
+
+        class FakeManager:
+            def __init__(self, *, executor: Any, max_depth: int) -> None:
+                captured["max_depth"] = max_depth
+
+            async def delegate(self, config: Any) -> Any:
+                captured["depth"] = config.depth
+                captured["goal"] = config.goal
+                return FakeResult()
+
+        monkeypatch.setattr(subagent_mod, "SubagentManager", FakeManager)
+        monkeypatch.setattr(
+            subagent_mod, "DefaultSubagentExecutor", lambda **kw: object(),
+        )
+
+        executor = AgentSkillExecutor(
+            llm=FakeLLM(),
+            tool_handlers={},
+            tool_definitions=[],
+            settings=_make_settings(),
+        )
+        result = await executor.execute("report", {"instruction": "do the thing"})
+
+        assert result["ok"] is True
+        assert "work done" in result["output"]
+        assert "tool_calls=2" in result["output"]
+        # Boundary contract: the scheduler agent is a leaf — gated at depth 1,
+        # started at depth 0, carrying the task instruction as its goal.
+        assert captured["max_depth"] == 1
+        assert captured["depth"] == 0
+        assert captured["goal"] == "do the thing"
+
+    @pytest.mark.asyncio
+    async def test_failed_subagent_returns_failed_dict(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import leapflow.engine.subagent as subagent_mod
+
+        class FakeResult:
+            status = "failed"
+            summary = "partial"
+            tool_calls = 0
+            error = "budget exhausted"
+
+        class FakeManager:
+            def __init__(self, *, executor: Any, max_depth: int) -> None:
+                pass
+
+            async def delegate(self, config: Any) -> Any:
+                return FakeResult()
+
+        monkeypatch.setattr(subagent_mod, "SubagentManager", FakeManager)
+        monkeypatch.setattr(
+            subagent_mod, "DefaultSubagentExecutor", lambda **kw: object(),
+        )
+
+        executor = AgentSkillExecutor(
+            llm=FakeLLM(),
+            tool_handlers={},
+            tool_definitions=[],
+            settings=_make_settings(),
+        )
+        result = await executor.execute("report", {"instruction": "go"})
+        # A failed sub-agent surfaces as ok=False with the error — never a raise,
+        # so the LocalScheduler retry path can act on it uniformly.
+        assert result["ok"] is False
+        assert result["error"] == "budget exhausted"
+        # Context field provides debugging breadcrumb
+        assert "context" in result
+        assert "report" in result["context"]
+        assert "go" in result["context"]
