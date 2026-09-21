@@ -104,8 +104,9 @@ testpaths = ["tests"]
 markers = [
     "unit: hermetic — no real IO, no LLM. Default for tests/*.py",
     "component: real local IO (DuckDB, tmp profile) in-process; LLM via cassette replay",
+    "integration: real DB/storage, stub LLM — synonym for component",
     "e2e: real leapd subprocess driven over RPC; LLM via cassette replay",
-    "live: journey assertions against a real provider (nightly lane only)",
+    "live: real LLM provider, requires credentials (nightly/manual lane only)",
     "invariant: always-on guard — never skipped by impact selection",
     "slow: takes more than a few seconds",
 ]

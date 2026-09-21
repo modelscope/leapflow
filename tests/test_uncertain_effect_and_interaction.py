@@ -94,7 +94,6 @@ def test_uncertainty_fields_survive_tool_metadata_extraction() -> None:
     The metadata extractor is an allow-list, so a new field is dropped unless it
     is listed; that would silently undo the annotation.
     """
-    from leapflow.engine.engine import AgentEngine
     from leapflow.engine.tool_dispatch_engine import ToolDispatchEngine
 
     metadata = ToolDispatchEngine._tool_execution_metadata({
