@@ -2,7 +2,6 @@
 """Phase 2 quarantine recovery path tests."""
 from __future__ import annotations
 
-import pytest
 
 from leapflow.learning.plugin_trust import PluginTrustLedger, PluginTrustLevel
 

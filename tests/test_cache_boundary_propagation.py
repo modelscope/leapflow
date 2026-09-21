@@ -8,9 +8,8 @@ providers.  No real LLM tokens are consumed; no network or DuckDB.
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List
 
-import pytest
 
 from leapflow.engine.context.context_disclosure import (
     CacheBoundary,
@@ -377,7 +376,7 @@ class TestPrefixStabilityProxy:
                 controller.force_commit()
 
             if controller.committed:
-                enforcement = controller.enforce(
+                controller.enforce(
                     "full",
                     tuple(d["function"]["name"] for d in _TOOL_CATALOG),
                     _system_prompt_hash(base_system),

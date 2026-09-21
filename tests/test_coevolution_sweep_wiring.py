@@ -446,14 +446,14 @@ def test_sweep_expires_stale_proposals(tmp_path: Path):
     """A proposal with expires_at in the past is swept to EXPIRED."""
     queue = _proposal_queue(tmp_path / "expire", ttl_hours=0)
     # Create with an explicit past expires_at via low-level update
-    item = queue.enqueue(
+    queue.enqueue(
         requirements=(CapabilityRequirement.create("chat.reply", "world_model", requirement_id="req-exp"),),
     )
     # Manually set expires_at in the past by re-creating with occurred_at far back
     # Since ttl_hours=0 means expires_at=None, we need a different approach.
     # Use a queue with ttl_hours=1, but create with occurred_at far in the past.
     queue2 = _proposal_queue(tmp_path / "expire2", ttl_hours=1)
-    item2 = queue2.enqueue(
+    queue2.enqueue(
         requirements=(CapabilityRequirement.create("chat.stale", "world_model", requirement_id="req-stale"),),
     )
     # The item was created "now" with expires_at = now + 3600. Force expiry by
@@ -469,7 +469,6 @@ def test_sweep_expires_stale_proposals(tmp_path: Path):
     assert past_item.expires_at < time.time()  # Definitely expired
 
     orch = _orchestrator(queue3)
-    sink = _sink()
     try:
         outcome = asyncio.run(
             CoevolutionSweep(
@@ -505,7 +504,6 @@ def test_sweep_supersedes_outdated_proposal(tmp_path: Path):
     assert older.proposal_id != newer.proposal_id
 
     orch = _orchestrator(queue)
-    sink = _sink()
     try:
         outcome = asyncio.run(
             CoevolutionSweep(
@@ -532,7 +530,6 @@ def test_proposal_without_ttl_not_expired(tmp_path: Path):
     assert item.expires_at is None
 
     orch = _orchestrator(queue)
-    sink = _sink()
     try:
         outcome = asyncio.run(
             CoevolutionSweep(

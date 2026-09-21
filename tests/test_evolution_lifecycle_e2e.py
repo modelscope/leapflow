@@ -20,7 +20,7 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import pytest
 
@@ -447,7 +447,7 @@ async def test_full_evolution_lifecycle(
     )
 
     # ── Phase F — Proposal Sweep (Phase 1: TTL expiry) ────────────
-    from leapflow.evolution.sweep import CoevolutionSweep, SweepOutcome
+    from leapflow.evolution.sweep import CoevolutionSweep
 
     # Create a stale proposal with expires_at in the past
     stale_req = CapabilityRequirement.create(
@@ -472,12 +472,11 @@ async def test_full_evolution_lifecycle(
     )
     if stale_event is not None:
         event_store.append(stale_event)
-    stale_id = stale_item.proposal_id
+    _ = stale_item.proposal_id  # used only to assert creation succeeded
 
     # Manually set expires_at to the past by updating it with a past timestamp
     # Since TTL=0 means expires_at=None, we use the main store (TTL=72h)
     # and create a proposal with occurred_at far in the past
-    from leapflow.storage.capability_proposal_queue import CapabilityProposalItem
 
     # Use the main proposal_store (TTL=72h) and create an already-expired proposal
     expired_req = CapabilityRequirement.create(

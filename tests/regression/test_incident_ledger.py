@@ -229,8 +229,15 @@ def test_cross_session_fallback_is_named_for_what_it_does() -> None:
     another; ``most_recent_any_client`` cannot be mistaken for a per-caller lookup.
     """
     registry = SRC_ROOT / "daemon" / "session_registry.py"
-    if not registry.is_file():
-        pytest.skip("session registry has moved; update this ledger entry")
+    # A moved home is exactly the quiet disappearance this ledger guards against,
+    # so a relocation must fail loudly (forcing this path to be re-pointed at the
+    # module's new home) rather than skip. As of this writing the module still
+    # lives at daemon/session_registry.py and defines most_recent_any_client.
+    assert registry.is_file(), (
+        "session_registry.py is no longer at daemon/session_registry.py; the "
+        "cross-session fallback guard lost its home. Update this ledger entry to "
+        "the module's new path instead of letting the check skip."
+    )
     tree = ast.parse(registry.read_text(encoding="utf-8"))
     method_names = {
         node.name
@@ -255,8 +262,15 @@ def test_shared_console_does_not_enable_soft_wrap() -> None:
     ``soft_wrap=True`` on the shared console drops the tail of long answers.
     """
     console_path = SRC_ROOT / "cli" / "tui_app" / "console.py"
-    if not console_path.is_file():
-        pytest.skip("console module has moved; update this ledger entry")
+    # As with the session-registry guard above, a relocated console module must
+    # fail loudly rather than skip: a silent skip is the quiet disappearance the
+    # ledger exists to prevent. The module still lives at cli/tui_app/console.py
+    # and states soft_wrap=False explicitly.
+    assert console_path.is_file(), (
+        "console.py is no longer at cli/tui_app/console.py; the soft_wrap guard "
+        "lost its home. Update this ledger entry to the module's new path instead "
+        "of letting the check skip."
+    )
 
     settings = _keyword_values(console_path, "soft_wrap")
     enabled = [line for line, value in settings if value is True]
