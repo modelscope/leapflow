@@ -12,17 +12,17 @@ from __future__ import annotations
 
 import pytest
 
-from leapflow.engine.failure_envelope import (
+from leapflow.engine.recovery.failure_envelope import (
     FailureContext,
     FailureEnvelope,
     FailureSource,
     Recoverability,
 )
-from leapflow.engine.recovery_coordinator import RecoveryState, RecoveryStrategy
-from leapflow.engine.recovery_decision import (
+from leapflow.engine.recovery.recovery_coordinator import RecoveryState, RecoveryStrategy
+from leapflow.engine.recovery.recovery_decision import (
     RecoveryAction,
 )
-from leapflow.engine.recovery_strategies import (
+from leapflow.engine.recovery.strategies import (
     ContextCompressStrategy,
     CredentialRotateStrategy,
     JitteredRetryStrategy,
@@ -420,8 +420,8 @@ class TestStrategyRoutingContract:
     def test_failure_routes_to_expected_strategy(
         self, source, category, message, recoverability, expected_key,
     ) -> None:
-        from leapflow.engine.recovery_budget import RecoveryBudget
-        from leapflow.engine.recovery_coordinator import RecoveryCoordinator
+        from leapflow.engine.recovery.recovery_budget import RecoveryBudget
+        from leapflow.engine.recovery.recovery_coordinator import RecoveryCoordinator
 
         coord = RecoveryCoordinator(
             strategies=default_strategies(),

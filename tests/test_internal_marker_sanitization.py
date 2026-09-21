@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from leapflow.engine.context_disclosure import CacheBoundary
+from leapflow.engine.context.context_disclosure import CacheBoundary
 from leapflow.engine.prompt_cache import AnthropicCacheStrategy
 from leapflow.llm.openai_provider import OpenAIChat, _sanitize_messages
 

@@ -13,13 +13,18 @@ import pytest
 from conftest import StubLLM, make_settings
 from leapflow.engine.engine import (
     AgentEngine,
+)
+from leapflow.engine.tool_dispatch_engine import ToolDispatchEngine
+from leapflow.engine._tool_helpers import (
     _normalize_tool_name,
     _resolve_tool_name,
-    _tool_args_metadata,
     build_default_registry,
 )
+from leapflow.engine._message_helpers import (
+    _tool_args_metadata,
+)
 from leapflow.engine.intent_classifier import Intent
-from leapflow.engine.task_graph import (
+from leapflow.engine.task_planning.task_graph import (
     GraphValidationError,
     RetryPolicy,
     TaskGraph,
@@ -136,7 +141,8 @@ async def test_react_loop_tool_then_answer() -> None:
 @pytest.mark.asyncio
 async def test_concurrent_engine_turns_are_isolated() -> None:
     import json as _json
-    from leapflow.engine.engine import AgentEngine, build_default_registry
+    from leapflow.engine.engine import AgentEngine
+    from leapflow.engine import build_default_registry
     from leapflow.llm.base import LLMChatResponse, LLMProvider
     from leapflow.platform.mock import MockBridge
 
@@ -471,9 +477,9 @@ def test_child_frame_gets_isolated_session(tmp_path) -> None:
             engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, _FixedClassifier("complex"))
             engine._conversation_store = _FakeConvStore()
 
-            root_sid = engine._ensure_session_for_frame(engine._build_root_frame("hello"), "hello")
+            root_sid = engine._session_persistence._ensure_session_for_frame(engine._build_root_frame("hello"), "hello")
             child = engine._build_child_frame("sub goal", depth=1)
-            child_sid = engine._ensure_session_for_frame(child, "sub goal")
+            child_sid = engine._session_persistence._ensure_session_for_frame(child, "sub goal")
 
             assert child_sid is not None and child_sid.startswith("sub_")
             assert child_sid != root_sid                     # isolated from the root session
@@ -518,9 +524,9 @@ def test_periodic_recalibration_runs_every_interval(tmp_path) -> None:
         engine.set_calibration_store(store)
         baseline = engine._budget_config.scale_k
 
-        engine._maybe_periodic_recalibration()          # turn 1: counter 1 < 2 -> no change
+        engine._calibration_manager._maybe_periodic_recalibration()          # turn 1: counter 1 < 2 -> no change
         assert engine._budget_config.scale_k == baseline
-        engine._maybe_periodic_recalibration()          # turn 2: interval hit -> recalibrate
+        engine._calibration_manager._maybe_periodic_recalibration()          # turn 2: interval hit -> recalibrate
         assert engine._budget_config.scale_k < baseline
     finally:
         store.close()
@@ -554,7 +560,7 @@ def test_periodic_recalibration_off_by_default(tmp_path) -> None:
         engine.set_calibration_store(store)
         baseline = engine._budget_config.scale_k
         for _ in range(5):
-            engine._maybe_periodic_recalibration()
+            engine._calibration_manager._maybe_periodic_recalibration()
         assert engine._budget_config.scale_k == baseline    # interval 0 -> never fires
     finally:
         store.close()
@@ -596,7 +602,7 @@ def test_compression_writeback_persists_when_enabled() -> None:
         try:
             messages = _long_messages()
             before = len(messages)
-            engine._prepare_llm_messages(messages)
+            engine._prompt_assembler._prepare_llm_messages(messages)
             assert len(messages) < before        # write-back shrank the history
             assert messages[0]["role"] == "system"  # cacheable prefix preserved
         finally:
@@ -609,7 +615,7 @@ def test_compression_writeback_off_leaves_history_intact() -> None:
         try:
             messages = _long_messages()
             before = len(messages)
-            engine._prepare_llm_messages(messages)
+            engine._prompt_assembler._prepare_llm_messages(messages)
             assert len(messages) == before       # default off: history unchanged
         finally:
             lt.close()
@@ -683,7 +689,7 @@ def test_stagnation_guard_ignores_injected_context() -> None:
     """Guardrail fix: StagnationGuard counts only genuine tool results, not
     injected user context (ledger/live signals/memory), so a context-heavy long
     task with successful tools is not falsely flagged as stagnating."""
-    from leapflow.engine.tool_guardrails import StagnationGuard
+    from leapflow.engine.tools.tool_guardrails import StagnationGuard
 
     guard = StagnationGuard(window=5, min_success_rate=0.5)
     history: list = []
@@ -696,7 +702,7 @@ def test_stagnation_guard_ignores_injected_context() -> None:
 
 
 def test_stagnation_guard_flags_genuine_tool_failures() -> None:
-    from leapflow.engine.tool_guardrails import StagnationGuard
+    from leapflow.engine.tools.tool_guardrails import StagnationGuard
 
     guard = StagnationGuard(window=5, min_success_rate=0.5)
     history = [{"role": "tool", "content": '{"ok": false, "error": "boom"}'} for _ in range(6)]
@@ -707,7 +713,7 @@ def test_guardrail_halt_suppressed_while_progressing() -> None:
     """Guardrail is progress-aware: a halt/nudge is suppressed while the task is
     advancing (stall counter 0) and only escalates once the task is stalled."""
     from leapflow.engine.agent_loop import AgentLoopFrame
-    from leapflow.engine.tool_guardrails import GuardrailViolation
+    from leapflow.engine.tools.tool_guardrails import GuardrailViolation
 
     class _HaltGuard:
         def check(self, history):
@@ -725,9 +731,9 @@ def test_guardrail_halt_suppressed_while_progressing() -> None:
             msgs = [{"role": "user", "content": "x"}]
 
             frame.stalled_rounds = 0
-            assert engine._check_guardrail(msgs) is None      # progressing -> halt suppressed
+            assert engine._tool_dispatch._check_guardrail(msgs) is None      # progressing -> halt suppressed
             frame.stalled_rounds = 2
-            assert engine._check_guardrail(msgs) == "halt"     # stalled -> halt fires
+            assert engine._tool_dispatch._check_guardrail(msgs) == "halt"     # stalled -> halt fires
         finally:
             lt.close()
 
@@ -738,7 +744,7 @@ def test_repetition_guard_is_result_aware() -> None:
     (legitimate polling) is progress and must not be flagged. The no-progress
     halt is ``progress_independent`` so the engine honours it without consulting
     the coarse global stall marker."""
-    from leapflow.engine.tool_guardrails import RepetitionGuard
+    from leapflow.engine.tools.tool_guardrails import RepetitionGuard
 
     def _call(name: str, args: str, cid: int) -> dict:
         return {
@@ -773,7 +779,7 @@ def test_progress_independent_halt_fires_while_progressing() -> None:
     -- otherwise a genuine no-op loop spins until the iteration budget is spent
     and the user gets a canned step-limit notice instead of an answer."""
     from leapflow.engine.agent_loop import AgentLoopFrame
-    from leapflow.engine.tool_guardrails import GuardrailViolation
+    from leapflow.engine.tools.tool_guardrails import GuardrailViolation
 
     class _NoProgressHaltGuard:
         def check(self, history):
@@ -797,7 +803,7 @@ def test_progress_independent_halt_fires_while_progressing() -> None:
             frame.stalled_rounds = 0
             msgs = [{"role": "user", "content": "x"}]
             # Not stalled, yet the halt fires because it is progress-independent.
-            assert engine._check_guardrail(msgs) == "halt"
+            assert engine._tool_dispatch._check_guardrail(msgs) == "halt"
         finally:
             lt.close()
 
@@ -809,7 +815,7 @@ def test_turn_cap_guard_per_turn_semantics() -> None:
     turn 2 makes 3 calls. Turn 2 must NOT be halted because turn 1's
     8 calls are excluded by the per-turn baseline. A single turn that
     exceeds the cap MUST halt."""
-    from leapflow.engine.tool_guardrails import TurnCapGuard
+    from leapflow.engine.tools.tool_guardrails import TurnCapGuard
 
     def _assistant_with_n_calls(n: int, start_id: int = 0) -> list:
         """Build n assistant messages, each with one tool_call."""
@@ -885,9 +891,9 @@ def test_synthesize_forced_answer_returns_model_answer() -> None:
 
 
 def _with_coordinator(engine):
-    from leapflow.engine.recovery_budget import RecoveryBudget
-    from leapflow.engine.recovery_coordinator import RecoveryCoordinator
-    from leapflow.engine.recovery_strategies import default_strategies
+    from leapflow.engine.recovery.recovery_budget import RecoveryBudget
+    from leapflow.engine.recovery.recovery_coordinator import RecoveryCoordinator
+    from leapflow.engine.recovery.strategies import default_strategies
     engine._recovery_coordinator = RecoveryCoordinator(
         strategies=default_strategies(), budget=RecoveryBudget(total_recovery_actions=12),
     )
@@ -902,7 +908,7 @@ def test_recoverable_tool_failures_feed_back_never_break() -> None:
         try:
             _with_coordinator(engine)
             failed = [("shell_run", {"ok": False, "error": "boom", "retryable": True})] * 10
-            assert engine._evaluate_tool_failures(failed, turn_id=1) is None   # never halts
+            assert engine._tool_dispatch._evaluate_tool_failures(failed, turn_id=1) is None   # never halts
         finally:
             lt.close()
 
@@ -915,7 +921,7 @@ def test_recoverable_tool_failures_do_not_spend_recovery_budget() -> None:
         try:
             coord = _with_coordinator(engine)
             before = coord.budget.remaining()
-            engine._evaluate_tool_failures(
+            engine._tool_dispatch._evaluate_tool_failures(
                 [("shell_run", {"ok": False, "error": "x", "retryable": True})] * 8, turn_id=1,
             )
             assert coord.budget.remaining() == before   # zero-cost feedback
@@ -936,7 +942,7 @@ def test_non_recoverable_tool_failure_halts_via_coordinator() -> None:
                 "error": "permission denied",
                 "execution_policy": "external_side_effect",
             })]
-            reason = engine._evaluate_tool_failures(perm, turn_id=1)
+            reason = engine._tool_dispatch._evaluate_tool_failures(perm, turn_id=1)
             assert reason is not None and reason != ""
         finally:
             lt.close()
@@ -945,7 +951,7 @@ def test_non_recoverable_tool_failure_halts_via_coordinator() -> None:
 def test_turn_recovery_rearm_after_progress_content_only() -> None:
     """P1-A: progress re-arms content-level one-shots (so a long task can recover
     again) but keeps storm-prone infrastructure one-shots strict for the turn."""
-    from leapflow.engine.turn_recovery import TurnRecoveryState
+    from leapflow.engine.recovery.turn_recovery import TurnRecoveryState
 
     rec = TurnRecoveryState()
     assert rec.try_length_continuation() is True    # content one-shot fires
@@ -964,7 +970,7 @@ def test_turn_recovery_rearm_after_progress_content_only() -> None:
 def test_should_stop_after_tool_result_is_policy_driven() -> None:
     """P1-B: the side-effect batch-stop gate is driven by the declared
     execution_policy, not a hardcoded tool-name list."""
-    from leapflow.engine.engine import _should_stop_after_tool_result
+    from leapflow.engine._message_helpers import _should_stop_after_tool_result
 
     # Any mutating/side-effect policy failure stops the batch…
     assert _should_stop_after_tool_result("any_tool", {"ok": False, "execution_policy": "external_side_effect"}) is True
@@ -999,7 +1005,7 @@ async def test_exact_canonical_tool_names_execute_without_guessing() -> None:
             classifier = _FixedClassifier("complex")
             engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
 
-            result = await engine._execute_general_tool(
+            result = await engine._tool_dispatch._execute_general_tool(
                 {"name": "file_list", "arguments": {"path": "."}},
                 {"file_list": file_list_handler},
             )
@@ -1061,11 +1067,11 @@ async def test_tool_execution_ledger_skips_duplicate_external_tool() -> None:
             engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
             engine._current_session_id = "session-1"
             engine._session_turn_count = 1
-            engine._begin_turn_context("push once")
+            engine._prompt_assembler._begin_turn_context("push once")
             call = {"name": "shell_run", "arguments": {"command": "git push"}}
 
-            first = await engine._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="a")
-            second = await engine._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="b")
+            first = await engine._tool_dispatch._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="a")
+            second = await engine._tool_dispatch._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="b")
 
             assert len(calls) == 1
             assert first["ok"] is True
@@ -1103,15 +1109,15 @@ async def test_tool_execution_ledger_waits_for_inflight_duplicate_external_tool(
             engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
             engine._current_session_id = "session-1"
             engine._session_turn_count = 1
-            engine._begin_turn_context("push once")
+            engine._prompt_assembler._begin_turn_context("push once")
             call = {"name": "shell_run", "arguments": {"command": "git push"}}
 
             first_task = asyncio.create_task(
-                engine._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="a")
+                engine._tool_dispatch._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="a")
             )
             await started.wait()
             second_task = asyncio.create_task(
-                engine._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="b")
+                engine._tool_dispatch._execute_tool_with_ledger(call, {"shell_run": shell_handler}, tool_call_id="b")
             )
             await asyncio.sleep(0)
 
@@ -1153,11 +1159,11 @@ async def test_tool_execution_ledger_allows_repeated_read_only_tool() -> None:
             engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
             engine._current_session_id = "session-1"
             engine._session_turn_count = 1
-            engine._begin_turn_context("list twice")
+            engine._prompt_assembler._begin_turn_context("list twice")
             call = {"name": "file_list", "arguments": {"path": "."}}
 
-            first = await engine._execute_tool_with_ledger(call, {"file_list": file_list_handler}, tool_call_id="a")
-            second = await engine._execute_tool_with_ledger(call, {"file_list": file_list_handler}, tool_call_id="b")
+            first = await engine._tool_dispatch._execute_tool_with_ledger(call, {"file_list": file_list_handler}, tool_call_id="a")
+            second = await engine._tool_dispatch._execute_tool_with_ledger(call, {"file_list": file_list_handler}, tool_call_id="b")
 
             assert len(calls) == 2
             assert first["execution_policy"] == "read_only"
@@ -1169,7 +1175,7 @@ async def test_tool_execution_ledger_allows_repeated_read_only_tool() -> None:
 
 @pytest.mark.asyncio
 async def test_side_effect_failure_stops_remaining_native_tool_batch() -> None:
-    from leapflow.engine.execution_trace import ExecutionTrace
+    from leapflow.engine.tools.execution_trace import ExecutionTrace
     from leapflow.llm.base import ToolCallInfo
     from leapflow.platform.mock import MockBridge
 
@@ -1190,13 +1196,13 @@ async def test_side_effect_failure_stops_remaining_native_tool_batch() -> None:
             reg = build_default_registry(rpc, llm, wm, lt)
             classifier = _FixedClassifier("complex")
             engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
-            engine._execute_general_tool = AsyncMock(side_effect=execute_tool)  # type: ignore[method-assign]
+            engine._tool_dispatch._execute_general_tool = AsyncMock(side_effect=execute_tool)  # type: ignore[method-assign]
             engine._current_session_id = "session-1"
             engine._session_turn_count = 1
-            engine._begin_turn_context("run git commands")
+            engine._prompt_assembler._begin_turn_context("run git commands")
             messages: list[dict[str, object]] = []
 
-            results = await engine._execute_tools_concurrent(
+            results = await engine._tool_dispatch._execute_tools_concurrent(
                 [
                     ToolCallInfo(id="tc1", name="shell_run", arguments={"command": "cd missing"}),
                     ToolCallInfo(id="tc2", name="shell_run", arguments={"command": "git status"}),
@@ -1211,7 +1217,7 @@ async def test_side_effect_failure_stops_remaining_native_tool_batch() -> None:
             assert results[0]["result"]["ok"] is False
             assert results[1]["result"]["execution_skipped"] is True
             assert results[1]["result"]["counts_as_failure"] is False
-            assert AgentEngine._count_consecutive_tool_failures(messages) == 1
+            assert ToolDispatchEngine._count_consecutive_tool_failures(messages) == 1
             # Every emitted tool_call must get a matching tool-result message,
             # even the one skipped by the batch stop: otherwise the next request
             # carries an assistant tool_calls message with fewer responses than
@@ -1288,7 +1294,7 @@ async def test_unknown_tool_returns_structured_retry_feedback() -> None:
             classifier = _FixedClassifier("complex")
             engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
 
-            result = await engine._execute_general_tool(
+            result = await engine._tool_dispatch._execute_general_tool(
                 {"name": "missing_magic_tool", "arguments": {"foo": "bar"}},
                 {},
             )
@@ -1442,7 +1448,7 @@ async def test_app_connector_empty_final_uses_onboarding_recovery_state() -> Non
         from leapflow.tools.gateway_tool import set_gateway_approval_gate, set_gateway_server
 
         rpc = MockBridge()
-        llm = StubLLM([tool_reply, ""])
+        llm = StubLLM([tool_reply, "", ""])
         wm = WorkingMemoryProvider(max_tokens=1024)
         lt = SemanticMemoryProvider(source=settings.duckdb_path)
         imm = EpisodicMemoryProvider()
@@ -1462,7 +1468,7 @@ async def test_app_connector_empty_final_uses_onboarding_recovery_state() -> Non
             set_gateway_server(None)
             lt.close()
 
-    assert llm.call_count == 2
+    assert llm.call_count == 3  # tool_call + empty + empty-retry
     assert "App onboarding is paused" in final
     assert "cli_missing" in final
     assert "definitely-missing-cli-for-onboarding-test" in final
@@ -1697,12 +1703,12 @@ def test_task_contract_replaces_stale_contract_block() -> None:
             engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
 
             engine._session_turn_count = 1
-            engine._begin_turn_context("first request")
-            stale_contract = engine._task_contract_block()
+            engine._prompt_assembler._begin_turn_context("first request")
+            stale_contract = engine._prompt_assembler._task_contract_block()
             engine._session_turn_count = 2
-            engine._begin_turn_context("second request")
+            engine._prompt_assembler._begin_turn_context("second request")
 
-            prepared = engine._ensure_task_contract_message([
+            prepared = engine._prompt_assembler._ensure_task_contract_message([
                 {"role": "system", "content": f"base system\n\n{stale_contract}\n"},
                 {"role": "system", "content": stale_contract},
                 {"role": "user", "content": "second request"},
@@ -2007,7 +2013,7 @@ def test_task_graph_retry_policy() -> None:
 
 def test_platform_action_idempotency_key_deduplicates_identical_calls() -> None:
     """Unified idempotency keys replace the old platform_action fingerprint."""
-    from leapflow.engine.tool_execution import build_idempotency_key
+    from leapflow.engine.tools.tool_execution import build_idempotency_key
 
     args = {"platform": "feishu", "action": "im.send_message", "payload": {"chat_id": "oc_1", "text": "hi"}}
     key1 = build_idempotency_key(
@@ -2047,7 +2053,7 @@ def test_platform_action_idempotency_key_deduplicates_identical_calls() -> None:
 def test_last_tool_failures_recovery_message_from_unknown_action() -> None:
     """_last_tool_failures_recovery_message extracts context from unknown_platform_action results."""
     import json
-    from leapflow.engine.engine import _last_tool_failures_recovery_message
+    from leapflow.engine._message_helpers import _last_tool_failures_recovery_message
 
     failure_payload = {
         "ok": False,
@@ -2073,7 +2079,7 @@ def test_last_tool_failures_recovery_message_from_unknown_action() -> None:
 def test_last_tool_failures_recovery_message_missing_fields() -> None:
     """_last_tool_failures_recovery_message handles Missing required fields errors."""
     import json
-    from leapflow.engine.engine import _last_tool_failures_recovery_message
+    from leapflow.engine._message_helpers import _last_tool_failures_recovery_message
 
     failure_payload = {
         "ok": False,
@@ -2089,7 +2095,7 @@ def test_last_tool_failures_recovery_message_missing_fields() -> None:
 def test_duplicate_suppression_is_not_counted_as_consecutive_tool_failure() -> None:
     """Suppressed duplicate side effects are control signals, not failed executions."""
     import json
-    from leapflow.engine.engine import _last_tool_failures_recovery_message
+    from leapflow.engine._message_helpers import _last_tool_failures_recovery_message
 
     root_failure = {
         "ok": False,
@@ -2109,7 +2115,7 @@ def test_duplicate_suppression_is_not_counted_as_consecutive_tool_failure() -> N
         {"role": "tool", "content": json.dumps(duplicate_suppressed)},
     ]
 
-    assert AgentEngine._count_consecutive_tool_failures(messages) == 1
+    assert ToolDispatchEngine._count_consecutive_tool_failures(messages) == 1
     recovery = _last_tool_failures_recovery_message(messages)
     assert "git push rejected" in recovery
     assert "consecutive tool failures" not in recovery
@@ -2118,7 +2124,7 @@ def test_duplicate_suppression_is_not_counted_as_consecutive_tool_failure() -> N
 
 
     import json
-    from leapflow.engine.engine import _last_tool_failures_recovery_message
+    from leapflow.engine._message_helpers import _last_tool_failures_recovery_message
 
     messages = [
         {"role": "user", "content": "hello"},
@@ -2160,12 +2166,12 @@ async def test_permission_failure_hard_stops_text_tool_loop() -> None:
             reg = build_default_registry(rpc, llm, wm, lt)
             classifier = _FixedClassifier("complex")
             engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
-            engine._execute_general_tool = AsyncMock(return_value=failure_payload)  # type: ignore[method-assign]
+            engine._tool_dispatch._execute_general_tool = AsyncMock(return_value=failure_payload)  # type: ignore[method-assign]
 
             out = await engine.run("列出飞书群聊")
 
             assert llm.call_count == 1
-            engine._execute_general_tool.assert_awaited_once()  # type: ignore[attr-defined]
+            engine._tool_dispatch._execute_general_tool.assert_awaited_once()  # type: ignore[attr-defined]
             assert "Authorization failed" in out
             assert "im:chat:read" in out
             assert "Do NOT retry" in out
@@ -2239,12 +2245,12 @@ async def test_permission_failure_hard_stops_native_tool_loop() -> None:
             reg = build_default_registry(rpc, llm, wm, lt)
             classifier = _FixedClassifier("complex")
             engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, classifier)
-            engine._execute_general_tool = AsyncMock(return_value=failure_payload)  # type: ignore[method-assign]
+            engine._tool_dispatch._execute_general_tool = AsyncMock(return_value=failure_payload)  # type: ignore[method-assign]
 
             out = await engine.run("列出飞书群聊")
 
             assert llm.call_count == 1
-            engine._execute_general_tool.assert_awaited_once()  # type: ignore[attr-defined]
+            engine._tool_dispatch._execute_general_tool.assert_awaited_once()  # type: ignore[attr-defined]
             assert "Authorization failed" in out
             assert "im:chat:read" in out
             assert "SHOULD NOT BE CALLED" not in out
@@ -2254,7 +2260,7 @@ async def test_permission_failure_hard_stops_native_tool_loop() -> None:
 
 def test_permission_recovery_text_quotes_only_listed_scopes() -> None:
     """The deterministic renderer must never invent or expand scope names."""
-    from leapflow.engine.engine import _build_permission_recovery_text
+    from leapflow.engine._message_helpers import _build_permission_recovery_text
 
     text = _build_permission_recovery_text({
         "platform": "feishu",
@@ -2275,7 +2281,7 @@ def test_permission_recovery_text_quotes_only_listed_scopes() -> None:
 
 def test_permission_recovery_text_uses_one_of_only_when_declared() -> None:
     """"one of" phrasing only appears when scope_relation explicitly says so."""
-    from leapflow.engine.engine import _build_permission_recovery_text
+    from leapflow.engine._message_helpers import _build_permission_recovery_text
 
     text = _build_permission_recovery_text({
         "platform": "feishu",
@@ -2296,7 +2302,7 @@ def test_permission_override_message_replaces_free_text_after_unresolved_failure
     """An unresolved permission failure as the turn's last tool signal must
     override any free-text LLM answer, preventing scope hallucination."""
     import json
-    from leapflow.engine.engine import _permission_override_message
+    from leapflow.engine._message_helpers import _permission_override_message
 
     failure_payload = {
         "ok": False,
@@ -2324,7 +2330,7 @@ def test_permission_override_message_replaces_free_text_after_unresolved_failure
 def test_permission_override_message_empty_after_successful_followup() -> None:
     """No override once a later tool call in the same turn succeeded."""
     import json
-    from leapflow.engine.engine import _permission_override_message
+    from leapflow.engine._message_helpers import _permission_override_message
 
     messages = [
         {"role": "user", "content": "list my groups"},
@@ -2339,17 +2345,17 @@ def test_record_tool_call_categories_caches_capability_manifests(monkeypatch) ->
     """Capability manifests are cached instead of rebuilt on every tool-call round."""
     from types import SimpleNamespace
 
-    import leapflow.engine.engine as engine_module
+    import leapflow.engine.prompt_assembler as assembler_module
 
     calls = 0
-    real_build = engine_module.build_capability_manifests
+    real_build = assembler_module.build_capability_manifests
 
     def counting_build(tool_definitions):
         nonlocal calls
         calls += 1
         return real_build(tool_definitions)
 
-    monkeypatch.setattr(engine_module, "build_capability_manifests", counting_build)
+    monkeypatch.setattr(assembler_module, "build_capability_manifests", counting_build)
 
     with tempfile.TemporaryDirectory() as td:
         settings = make_settings(td)
@@ -2366,8 +2372,8 @@ def test_record_tool_call_categories_caches_capability_manifests(monkeypatch) ->
                 settings, rpc, llm, wm, lt, imm, reg, _FixedClassifier("chat"),
             )
 
-            engine._record_tool_call_categories([SimpleNamespace(name="shell_run")])
-            engine._record_tool_call_categories([SimpleNamespace(name="shell_run")])
+            engine._prompt_assembler._record_tool_call_categories([SimpleNamespace(name="shell_run")])
+            engine._prompt_assembler._record_tool_call_categories([SimpleNamespace(name="shell_run")])
 
             assert calls == 1
             assert engine._last_turn_tool_categories == frozenset({"shell"})
@@ -2464,10 +2470,10 @@ async def test_unified_catalog_merges_semantic_tools_when_plugin_active(monkeypa
             try:
                 catalog_names = {
                     item.get("function", {}).get("name")
-                    for item in engine._unified_tool_catalog()
+                    for item in engine._tool_dispatch._unified_tool_catalog()
                 }
                 assert {"observe_ui", "click"} <= catalog_names
-                handlers = engine._unified_tool_handlers()
+                handlers = engine._tool_dispatch._unified_tool_handlers()
                 assert "observe_ui" in handlers and "click" in handlers
                 static_names = {
                     item.get("function", {}).get("name") for item in TOOL_DEFINITIONS
@@ -2491,7 +2497,7 @@ async def test_unified_catalog_rebuilds_when_static_registry_grows(monkeypatch) 
         with tempfile.TemporaryDirectory() as td:
             engine, lt = _build_desktop_engine(td)
             try:
-                assert engine._unified_tool_catalog()  # prime the cache
+                assert engine._tool_dispatch._unified_tool_catalog()  # prime the cache
                 TOOL_DEFINITIONS.append(
                     {
                         "type": "function",
@@ -2505,7 +2511,7 @@ async def test_unified_catalog_rebuilds_when_static_registry_grows(monkeypatch) 
                 try:
                     names = {
                         item.get("function", {}).get("name")
-                        for item in engine._unified_tool_catalog()
+                        for item in engine._tool_dispatch._unified_tool_catalog()
                     }
                     assert "late_registered_probe" in names
                 finally:
@@ -2571,16 +2577,16 @@ async def test_semantic_execution_gate_and_perception_offline(monkeypatch) -> No
         with tempfile.TemporaryDirectory() as td:
             engine, lt = _build_desktop_engine(td)
             try:
-                handlers = engine._unified_tool_handlers()
+                handlers = engine._tool_dispatch._unified_tool_handlers()
 
-                observed = await engine._execute_general_tool(
+                observed = await engine._tool_dispatch._execute_general_tool(
                     {"name": "observe_ui", "arguments": {"app": "Safari"}}, handlers
                 )
                 assert observed.get("ok") is True
                 assert calls == [("observe_ui", {"app": "Safari"})]
 
                 _tool_reg.set_desktop_gate(None)
-                denied = await engine._execute_general_tool(
+                denied = await engine._tool_dispatch._execute_general_tool(
                     {"name": "click", "arguments": {"selector": "#go"}}, handlers
                 )
                 assert denied.get("ok") is False
@@ -2592,7 +2598,7 @@ async def test_semantic_execution_gate_and_perception_offline(monkeypatch) -> No
                         return types.SimpleNamespace(approved=True, denial_message="")
 
                 _tool_reg.set_desktop_gate(_Approve())
-                clicked = await engine._execute_general_tool(
+                clicked = await engine._tool_dispatch._execute_general_tool(
                     {"name": "click", "arguments": {"selector": "#go"}}, handlers
                 )
                 assert clicked.get("ok") is True
@@ -2607,9 +2613,9 @@ async def test_semantic_execution_gate_and_perception_offline(monkeypatch) -> No
     with tempfile.TemporaryDirectory() as td:
         engine, lt = _build_desktop_engine(td)
         try:
-            result = await engine._execute_general_tool(
+            result = await engine._tool_dispatch._execute_general_tool(
                 {"name": "click", "arguments": {"selector": "#go"}},
-                engine._unified_tool_handlers(),
+                engine._tool_dispatch._unified_tool_handlers(),
             )
             assert result.get("ok") is False
             assert "unavailable" in result["error"]
@@ -2632,7 +2638,7 @@ async def test_reconfigure_host_backend_drops_semantic_tools(monkeypatch) -> Non
             try:
                 assert any(
                     item.get("function", {}).get("name") == "click"
-                    for item in engine._unified_tool_catalog()
+                    for item in engine._tool_dispatch._unified_tool_catalog()
                 )
                 _deactivate_desktop_plugin()
                 engine.reconfigure_host_backend(
@@ -2640,10 +2646,10 @@ async def test_reconfigure_host_backend_drops_semantic_tools(monkeypatch) -> Non
                 )
                 names = {
                     item.get("function", {}).get("name")
-                    for item in engine._unified_tool_catalog()
+                    for item in engine._tool_dispatch._unified_tool_catalog()
                 }
                 assert "click" not in names
-                assert "observe_ui" not in engine._unified_tool_handlers()
+                assert "observe_ui" not in engine._tool_dispatch._unified_tool_handlers()
             finally:
                 lt.close()
     finally:
@@ -2673,10 +2679,10 @@ def test_disable_desktop_semantic_drops_engine_surfaces(monkeypatch) -> None:
                 # Plugin active: semantic tools disclosed and dispatchable.
                 catalog_names = {
                     item.get("function", {}).get("name")
-                    for item in engine._unified_tool_catalog()
+                    for item in engine._tool_dispatch._unified_tool_catalog()
                 }
                 assert {"click", "observe_ui"} <= catalog_names
-                assert "observe_ui" in engine._unified_tool_handlers()
+                assert "observe_ui" in engine._tool_dispatch._unified_tool_handlers()
                 old_plugin = get_registry().get_desktop_semantic_plugin()
                 assert old_plugin is not None
 
@@ -2693,11 +2699,11 @@ def test_disable_desktop_semantic_drops_engine_surfaces(monkeypatch) -> None:
                 assert get_registry().get_desktop_semantic_plugin() is None
                 post_disable_names = {
                     item.get("function", {}).get("name")
-                    for item in engine._unified_tool_catalog()
+                    for item in engine._tool_dispatch._unified_tool_catalog()
                 }
                 assert post_disable_names.isdisjoint(SEMANTIC_TOOL_NAMES)
-                assert set(engine._unified_tool_handlers()).isdisjoint(SEMANTIC_TOOL_NAMES)
-                assert engine._semantic_tool_schemas() == []
+                assert set(engine._tool_dispatch._unified_tool_handlers()).isdisjoint(SEMANTIC_TOOL_NAMES)
+                assert engine._tool_dispatch._semantic_tool_schemas() == []
 
                 # Reload: a fresh instance (version restarting at 0) becomes
                 # visible again. "screenshot" is only present in the real
@@ -2709,10 +2715,10 @@ def test_disable_desktop_semantic_drops_engine_surfaces(monkeypatch) -> None:
                 assert fresh.active  # last_bound_deps re-injected the ports
                 reloaded_names = {
                     item.get("function", {}).get("name")
-                    for item in engine._unified_tool_catalog()
+                    for item in engine._tool_dispatch._unified_tool_catalog()
                 }
                 assert {"click", "observe_ui", "screenshot"} <= reloaded_names
-                assert "observe_ui" in engine._unified_tool_handlers()
+                assert "observe_ui" in engine._tool_dispatch._unified_tool_handlers()
             finally:
                 # Leave the global plugin deactivated for subsequent tests.
                 _deactivate_desktop_plugin()
@@ -2729,7 +2735,7 @@ def test_expanded_disclosure_tier_positively_includes_desktop_schemas(monkeypatc
     the EXPANDED disclosure plan must carry the semantic schemas in its native
     tool_definitions, not just name the category in the catalog index.
     """
-    from leapflow.engine.context_disclosure import (
+    from leapflow.engine.context.context_disclosure import (
         DisclosureLevel,
         DisclosurePlanner,
         DisclosureRuntimeState,
@@ -2741,7 +2747,7 @@ def test_expanded_disclosure_tier_positively_includes_desktop_schemas(monkeypatc
             engine, lt = _build_desktop_engine(td)
             try:
                 plan = DisclosurePlanner().plan(
-                    engine._unified_tool_catalog(),
+                    engine._tool_dispatch._unified_tool_catalog(),
                     DisclosureRuntimeState(
                         native_tools_enabled=True,
                         last_turn_tool_categories=frozenset({"desktop"}),

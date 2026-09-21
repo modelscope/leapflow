@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Union, runtime_checkable
 
 if TYPE_CHECKING:
-    from leapflow.engine.tool_execution import ToolExecutionRecord
+    from leapflow.engine.tools.tool_execution import ToolExecutionRecord
     from leapflow.storage.connection import ConnectionHolder
 
 logger = logging.getLogger(__name__)
@@ -847,7 +847,7 @@ class DuckDBConversationStore:
         )
 
     def _row_to_tool_execution(self, row: tuple) -> "ToolExecutionRecord":
-        from leapflow.engine.tool_execution import ToolExecutionRecord
+        from leapflow.engine.tools.tool_execution import ToolExecutionRecord
 
         arguments: dict[str, Any] = {}
         result: Any = None

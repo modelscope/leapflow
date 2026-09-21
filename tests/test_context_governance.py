@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from leapflow.engine.context_compressor import (
+from leapflow.engine.context.context_compressor import (
     CompressorConfig,
     ContextCompressor,
     SummarizeStage,
@@ -13,7 +13,7 @@ from leapflow.engine.context_compressor import (
     adaptive_trim_chars,
     estimate_text_tokens,
 )
-from leapflow.engine.context_control import (
+from leapflow.engine.context.context_control import (
     ContextBudgetEstimator,
     ContextGovernanceController,
     ContextPostureConfig,
@@ -493,7 +493,7 @@ def test_compressor_reconfigure_updates_budget_and_threshold() -> None:
 
 
 def test_compressor_reconfigure_preserves_summarize_state() -> None:
-    from leapflow.engine.context_compressor import SummarizeStage
+    from leapflow.engine.context.context_compressor import SummarizeStage
 
     compressor = ContextCompressor(CompressorConfig(
         token_budget=128_000,
@@ -522,7 +522,7 @@ def test_compressor_reconfigure_preserves_summarize_state() -> None:
 
 
 def test_deterministic_summary_preserves_tool_args_and_results() -> None:
-    from leapflow.engine.context_compressor import SummarizeStage
+    from leapflow.engine.context.context_compressor import SummarizeStage
 
     middle = [
         {

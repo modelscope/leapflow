@@ -9,7 +9,7 @@ sequential; and the conservative default when no metadata is available.
 """
 from __future__ import annotations
 
-from leapflow.engine.tool_concurrency import DefaultConcurrencyPolicy, ToolCall
+from leapflow.engine.tools.tool_concurrency import DefaultConcurrencyPolicy, ToolCall
 from leapflow.tools.name_resolver import ToolSpec
 
 

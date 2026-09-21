@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import pytest
 
-from leapflow.engine.failure_envelope import Recoverability
-from leapflow.engine.recovery_strategies.credential_rotate import CredentialRotateStrategy
-from leapflow.engine.unified_classifier import UnifiedErrorClassifier
+from leapflow.engine.recovery.failure_envelope import Recoverability
+from leapflow.engine.recovery.strategies.credential_rotate import CredentialRotateStrategy
+from leapflow.engine.recovery.unified_classifier import UnifiedErrorClassifier
 from leapflow.llm import provider_chain as pc
 from leapflow.llm.base import LLMChatResponse, LLMProvider
 from leapflow.llm.credential_state import AllCredentialsExhausted, CredentialState

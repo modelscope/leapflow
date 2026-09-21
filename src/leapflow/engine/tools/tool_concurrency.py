@@ -24,7 +24,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
-from leapflow.engine.tool_execution import execution_policy_for
+from leapflow.engine.tools.tool_execution import execution_policy_for
 
 logger = logging.getLogger(__name__)
 

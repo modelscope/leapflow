@@ -15,29 +15,29 @@ from __future__ import annotations
 
 import pytest
 
-from leapflow.engine.engine import (
+from leapflow.engine._message_helpers import (
     _annotate_uncertain_effect,
     _interaction_metadata,
     _terminal_failure_text,
 )
-from leapflow.engine.failure_envelope import (
+from leapflow.engine.recovery.failure_envelope import (
     FailureContext,
     FailureEnvelope,
     FailureSource,
     Recoverability,
     SideEffectState,
 )
-from leapflow.engine.interaction_request import (
+from leapflow.engine.recovery.interaction_request import (
     InteractionRequest,
     InteractionType,
     Severity,
     SuggestedAction,
 )
-from leapflow.engine.recovery_budget import RecoveryBudget
-from leapflow.engine.recovery_coordinator import RecoveryCoordinator
-from leapflow.engine.recovery_decision import RecoveryAction, RecoveryDecision
-from leapflow.engine.recovery_strategies import default_strategies
-from leapflow.engine.tool_execution import effect_is_uncertain_on_failure
+from leapflow.engine.recovery.recovery_budget import RecoveryBudget
+from leapflow.engine.recovery.recovery_coordinator import RecoveryCoordinator
+from leapflow.engine.recovery.recovery_decision import RecoveryAction, RecoveryDecision
+from leapflow.engine.recovery.strategies import default_strategies
+from leapflow.engine.tools.tool_execution import effect_is_uncertain_on_failure
 
 # ── Uncertain-effect reporting ───────────────────────────────────────────
 
@@ -95,8 +95,9 @@ def test_uncertainty_fields_survive_tool_metadata_extraction() -> None:
     is listed; that would silently undo the annotation.
     """
     from leapflow.engine.engine import AgentEngine
+    from leapflow.engine.tool_dispatch_engine import ToolDispatchEngine
 
-    metadata = AgentEngine._tool_execution_metadata({
+    metadata = ToolDispatchEngine._tool_execution_metadata({
         "ok": False,
         "execution_policy": "external_side_effect",
         "side_effect_uncertain": True,
@@ -212,7 +213,7 @@ def test_gated_halt_reaches_the_user_with_actionable_text() -> None:
 
 def _engine_with_checkpoint_store():
     from leapflow.engine.engine import AgentEngine
-    from leapflow.engine.recovery_checkpoint import InMemoryCheckpointStore
+    from leapflow.engine.recovery.recovery_checkpoint import InMemoryCheckpointStore
 
     engine = AgentEngine.__new__(AgentEngine)
     engine._checkpoint_store = InMemoryCheckpointStore()
@@ -279,7 +280,7 @@ def test_duplicate_result_preserves_the_uncertainty_verdict() -> None:
     the flag is not carried over, the model loses exactly the signal that told
     it to verify before retrying.
     """
-    from leapflow.engine.tool_execution import ToolExecutionLedger, ToolExecutionRecord
+    from leapflow.engine.tools.tool_execution import ToolExecutionLedger, ToolExecutionRecord
 
     record = ToolExecutionRecord(
         execution_id="x1", session_id="s", turn_id="t", command_id="c",
@@ -300,7 +301,7 @@ def test_duplicate_result_preserves_the_uncertainty_verdict() -> None:
 
 def test_duplicate_result_stays_clean_for_certain_outcomes() -> None:
     """No false alarm: a completed original adds no uncertainty flag."""
-    from leapflow.engine.tool_execution import ToolExecutionLedger, ToolExecutionRecord
+    from leapflow.engine.tools.tool_execution import ToolExecutionLedger, ToolExecutionRecord
 
     record = ToolExecutionRecord(
         execution_id="x2", session_id="s", turn_id="t", command_id="c",

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from leapflow.engine.context_control import (
+from leapflow.engine.context.context_control import (
     _CALIBRATION_MAX_FACTOR,
     _CALIBRATION_MIN_FACTOR,
     ContextBudgetEstimator,
@@ -217,7 +217,8 @@ def test_calibration_failure_never_breaks_the_turn() -> None:
 def _real_engine(tmp_path):
     """Build an actual AgentEngine, so attribute wiring is exercised for real."""
     from conftest import StubLLM, make_settings
-    from leapflow.engine.engine import AgentEngine, build_default_registry
+    from leapflow.engine.engine import AgentEngine
+    from leapflow.engine import build_default_registry
     from leapflow.engine.intent_classifier import Intent
     from leapflow.memory import (
         EpisodicMemoryProvider,

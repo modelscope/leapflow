@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from leapflow.engine.failure_envelope import (
+from leapflow.engine.recovery.failure_envelope import (
     FailureContext,
     FailureEnvelope,
     FailureSource,
@@ -24,14 +24,14 @@ from leapflow.engine.failure_envelope import (
     RecoveryHint,
     SideEffectState,
 )
-from leapflow.engine.oneshot_guard import OneShotGuard
-from leapflow.engine.recovery_budget import RecoveryBudget
-from leapflow.engine.recovery_coordinator import (
+from leapflow.engine.recovery.oneshot_guard import OneShotGuard
+from leapflow.engine.recovery.recovery_budget import RecoveryBudget
+from leapflow.engine.recovery.recovery_coordinator import (
     RecoveryCoordinator,
     RecoveryState,
     RecoveryStrategy,
 )
-from leapflow.engine.recovery_decision import (
+from leapflow.engine.recovery.recovery_decision import (
     BackoffConfig,
     RecoveryAction,
     RecoveryDecision,

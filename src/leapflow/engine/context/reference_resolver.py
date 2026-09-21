@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from leapflow.engine.context_focus import ContextPlane, ReferenceResolution, SessionFocusState
+from leapflow.engine.context.context_focus import ContextPlane, ReferenceResolution, SessionFocusState
 
 
 @dataclass(frozen=True)

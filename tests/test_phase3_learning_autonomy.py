@@ -563,7 +563,7 @@ class TestMcpToolExecutionPolicy:
     """MCP tools without x_leapflow do not fall back to mutating_idempotent."""
 
     def test_mcp_tool_without_metadata_is_external(self) -> None:
-        from leapflow.engine.tool_execution import execution_policy_for
+        from leapflow.engine.tools.tool_execution import execution_policy_for
 
         @dataclass
         class FakeSpec:
@@ -578,7 +578,7 @@ class TestMcpToolExecutionPolicy:
         assert policy == "external_side_effect"
 
     def test_mcp_tool_with_explicit_read_only_stays_read_only(self) -> None:
-        from leapflow.engine.tool_execution import execution_policy_for
+        from leapflow.engine.tools.tool_execution import execution_policy_for
 
         @dataclass
         class FakeSpec:
@@ -593,7 +593,7 @@ class TestMcpToolExecutionPolicy:
         assert policy == "read_only"
 
     def test_any_tool_without_metadata_fails_safe_as_external(self) -> None:
-        from leapflow.engine.tool_execution import execution_policy_for
+        from leapflow.engine.tools.tool_execution import execution_policy_for
 
         @dataclass
         class FakeSpec:

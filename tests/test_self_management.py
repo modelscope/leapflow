@@ -67,14 +67,14 @@ def _reset_tool_registry_state() -> None:
     test that exercises them would otherwise leak a disabled plugin into every
     later test in the same process.
     """
-    import leapflow.engine.engine as engine_module
+    import leapflow.engine._tool_helpers as engine_tool_helpers
     import leapflow.plugins as plugins_module
     import leapflow.plugins.tool_plugins as tool_plugins_module
 
     plugins_module._registry = None
     plugins_module._scoped_registry = None
     tool_plugins_module._all_plugins = None
-    engine_module._registry_cache = None
+    engine_tool_helpers._registry_cache = None
 
 
 @pytest.fixture

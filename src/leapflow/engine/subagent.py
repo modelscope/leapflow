@@ -403,7 +403,7 @@ class DefaultSubagentExecutor:
         # difficulty signal, so a hard sub-task earns more iterations while a
         # simple one stays short (reuses the W1 budget + governance components).
         from leapflow.engine.budget import BudgetConfig, BudgetStatus, IterationBudget
-        from leapflow.engine.context_control import (
+        from leapflow.engine.context.context_control import (
             ContextGovernanceController,
             ToolEvidenceBuilder,
         )

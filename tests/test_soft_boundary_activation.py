@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest  # noqa: F401 – used by test discovery
 
-from leapflow.engine.context_disclosure import (
+from leapflow.engine.context.context_disclosure import (
     CacheBoundary,
     DisclosureLevel,
     DisclosurePlanner,
@@ -326,6 +326,7 @@ class TestCacheAwarePlanKwargs:
     ) -> MagicMock:
         """Build a MagicMock with the fields _cache_aware_plan_kwargs reads."""
         from leapflow.engine.engine import AgentEngine
+        from leapflow.engine.calibration import CalibrationManager
 
         engine = MagicMock(spec=AgentEngine)
         engine._prefix_commitment = MagicMock()
@@ -337,12 +338,12 @@ class TestCacheAwarePlanKwargs:
         engine._budget_config = MagicMock()
         engine._budget_config.max_iterations = max_iterations
 
-        # Full tool tokens
-        engine._full_tool_schema_tokens = MagicMock(return_value=full_tool_tokens)
-
-        # Bind the real method
-        engine._cache_aware_plan_kwargs = (
-            AgentEngine._cache_aware_plan_kwargs.__get__(engine, AgentEngine)
+        # Component holding the extracted calibration/commitment methods.
+        # _cache_aware_plan_kwargs / _full_tool_schema_tokens now live on
+        # CalibrationManager and read engine state through its back-reference.
+        engine._calibration_manager = CalibrationManager(engine)
+        engine._calibration_manager._full_tool_schema_tokens = MagicMock(
+            return_value=full_tool_tokens
         )
         return engine
 
@@ -353,7 +354,7 @@ class TestCacheAwarePlanKwargs:
         enforcement.frozen_tool_names = ("file_read", "text_search")
 
         engine = self._make_mock_engine(committed=True, enforcement=enforcement)
-        kwargs = engine._cache_aware_plan_kwargs()
+        kwargs = engine._calibration_manager._cache_aware_plan_kwargs()
 
         assert kwargs["commitment_status"] is CommitmentStatus.COMMITTED
         assert kwargs["committed_level"] is DisclosureLevel.FULL
@@ -369,7 +370,7 @@ class TestCacheAwarePlanKwargs:
         # Configure projected_savings to return positive
         engine._prefix_commitment.projected_savings = MagicMock(return_value=100.0)
 
-        kwargs = engine._cache_aware_plan_kwargs()
+        kwargs = engine._calibration_manager._cache_aware_plan_kwargs()
         assert kwargs.get("cache_benefit") is True
         assert kwargs.get("commitment_status") is CommitmentStatus.UNCOMMITTED
 
@@ -381,19 +382,19 @@ class TestCacheAwarePlanKwargs:
         )
         engine._prefix_commitment.projected_savings = MagicMock(return_value=-50.0)
 
-        kwargs = engine._cache_aware_plan_kwargs()
+        kwargs = engine._calibration_manager._cache_aware_plan_kwargs()
         assert kwargs == {}
 
     def test_no_snapshot_returns_empty(self) -> None:
         """No prior-round data → empty dict (first round)."""
         engine = self._make_mock_engine(committed=False, snapshot={})
-        kwargs = engine._cache_aware_plan_kwargs()
+        kwargs = engine._calibration_manager._cache_aware_plan_kwargs()
         assert kwargs == {}
 
     def test_committed_without_enforcement_returns_empty(self) -> None:
         """Committed but enforcement broken → empty dict (falls through)."""
         engine = self._make_mock_engine(committed=True, enforcement=None)
-        kwargs = engine._cache_aware_plan_kwargs()
+        kwargs = engine._calibration_manager._cache_aware_plan_kwargs()
         assert kwargs == {}
 
 

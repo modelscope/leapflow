@@ -15,8 +15,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, FrozenSet, List
 
-from leapflow.engine.error_classifier import ErrorCategory, ErrorClassifier
-from leapflow.engine.failure_envelope import (
+from leapflow.engine.recovery.error_classifier import ErrorCategory, ErrorClassifier
+from leapflow.engine.recovery.failure_envelope import (
     FailureContext,
     FailureEnvelope,
     FailureSource,

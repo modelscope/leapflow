@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Mapping
 
 import pytest
 
-from leapflow.engine.context_disclosure import (
+from leapflow.engine.context.context_disclosure import (
     CacheBoundary,
     DisclosureLevel,
     DisclosurePlanner,

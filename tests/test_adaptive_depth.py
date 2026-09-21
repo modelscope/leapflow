@@ -13,7 +13,7 @@ All tests are hermetic (no network, no LLM, no disk).
 from __future__ import annotations
 
 from leapflow.engine.budget import BudgetConfig, BudgetStatus, IterationBudget
-from leapflow.engine.context_control import (
+from leapflow.engine.context.context_control import (
     ContextGovernanceController,
     DifficultyConfig,
     ToolEvidenceBuilder,
@@ -469,7 +469,7 @@ def test_summarize_append_only_freezes_prior_segments() -> None:
     long-task findings are captured once at full fidelity (no summary-of-summary
     drift) and stay cacheable.
     """
-    from leapflow.engine.context_compressor import SummarizeStage
+    from leapflow.engine.context.context_compressor import SummarizeStage
 
     stage = SummarizeStage(threshold_messages=4, keep_recent=2, summarize_fn=None, append_only=True)
     msgs = [
@@ -495,7 +495,7 @@ def test_summarize_append_only_freezes_prior_segments() -> None:
 
 
 def test_summarize_legacy_mode_merges_segments() -> None:
-    from leapflow.engine.context_compressor import SummarizeStage
+    from leapflow.engine.context.context_compressor import SummarizeStage
 
     stage = SummarizeStage(threshold_messages=4, keep_recent=2, summarize_fn=None, append_only=False)
     msgs = [{"role": "system", "content": "sys"}] + _turns("m", 7)
@@ -741,7 +741,7 @@ def test_task_contract_render_is_deterministic_prefix_material() -> None:
     must be a pure function of stable fields (no volatile tokens) — keeping the
     prefix byte-stable across rounds/turns for prompt-cache reuse.
     """
-    from leapflow.engine.engine import TaskContract
+    from leapflow.engine._stream_helpers import TaskContract
 
     contract = TaskContract(
         task_id="t1", original_request="do X",
