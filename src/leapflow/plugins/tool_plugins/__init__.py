@@ -42,6 +42,9 @@ _BUILTIN_PLUGIN_MODULES = (
     "leapflow.plugins.tool_plugins.hub",
     "leapflow.plugins.tool_plugins.gateway",
     "leapflow.plugins.tool_plugins.self_management",
+    "leapflow.plugins.tool_plugins.self_awareness",
+    # Scheduler — tools activate only once the TaskCoordinator is bound.
+    "leapflow.plugins.tool_plugins.scheduler_tools",
     # Desktop semantics — tools activate only once perception is bound.
     "leapflow.plugins.tool_plugins.desktop_semantic",
     # Hardware Context Protocol — appended last, and contributes no tools until a
