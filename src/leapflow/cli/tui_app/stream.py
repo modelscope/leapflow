@@ -35,6 +35,10 @@ _MAX_THINKING_DISPLAY = 2000
 _TOOL_CONTEXT_TAG_LIMIT = 3
 _SYNTHETIC_THINKING_ROUND_RE = re.compile(r"round\s*\d+", re.IGNORECASE)
 _FENCED_BLOCK_RE = re.compile(r"```(?P<lang>[\w+-]*)\s*\n(?P<body>.*?)\n```", re.DOTALL)
+_PYTHON_TRACEBACK_ANGLE_RE = re.compile(
+    r'<(string|module|stdin|lambda|listcomp|dictcomp|setcomp|genexpr'
+    r'|frozen\b[^>]*|built-in\b[^>]*|ipython[^>]*|cell[^>]*)>'
+)
 _TOOL_AUDIT_LINE_RE = re.compile(
     r"^\s*(?:·|✓|✗|📁|📄|✍️?|🧠|🧭|💻|🌐|🧩|🔧|❌)\s+"
     r"[A-Za-z_][\w.-]*(?:\s|$).*",
@@ -123,13 +127,19 @@ def _ensure_copyable_markdown_links(text: str) -> str:
     return "\n".join(lines)
 
 
+def _escape_traceback_angles(text: str) -> str:
+    """Escape angle-bracketed Python identifiers so Markdown won't strip them."""
+    return _PYTHON_TRACEBACK_ANGLE_RE.sub(r'`<\1>`', text)
+
+
 def _sanitize_final_response(text: str) -> str:
     """Remove leaked tool protocol artifacts and keep critical links copyable."""
     without_fences = _strip_tool_protocol_fences(text)
     without_objects = _strip_tool_protocol_json_objects(without_fences)
     without_audit_lines = _TOOL_AUDIT_LINE_RE.sub("", without_objects)
     with_copyable_links = _ensure_copyable_markdown_links(without_audit_lines)
-    return _collapse_blank_lines(with_copyable_links)
+    with_safe_angles = _escape_traceback_angles(with_copyable_links)
+    return _collapse_blank_lines(with_safe_angles)
 
 
 def _normalize_thinking_text(text: str) -> str:

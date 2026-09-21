@@ -72,6 +72,7 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 - **Uncertain Effects Are Reported, Not Retried Blindly**: a failed call whose effect may already have landed (`external_side_effect`, `mutating_once`) must carry that verdict in its result so the next turn verifies before repeating it. An error is not proof that nothing happened. Idempotent mutations are exempt — re-applying them converges, so flagging them would only stall safe retries.
 - **Budget-Constrained Recovery**: Turn-level deadlines, per-category limits, and a global recovery budget prevent infinite retry loops. Every recovery action has an explicit cost; exhaustion triggers a clean halt or user escalation.
 - **Recovery Strategy as Protocol**: Recovery strategies implement a `RecoveryStrategy` Protocol (`can_apply` + `decide`), registered by priority, composable, and extensible without modifying the coordinator.
+- **Tool Output Must Survive Rendering Intact (MANDATORY)**: text produced by tool execution — especially error tracebacks, JSON payloads, and structured diagnostics — must reach the user without silent corruption. Angle-bracketed identifiers (`<string>`, `<module>`, `<stdin>`) in Python tracebacks, and any content that resembles HTML tags, must be escaped or code-fenced before passing through Markdown renderers. A silently stripped traceback is worse than no traceback — it misdirects investigation. The `_sanitize_final_response` pipeline owns this guarantee for the TUI path.
 
 ## Engine Module Architecture Rules
 
