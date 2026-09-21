@@ -769,6 +769,10 @@ class Settings:
     scheduler_tick_seconds: int = 60
     scheduler_grace_seconds: float = 120.0
     scheduler_default_tier: str = "auto"  # auto | local | cloud
+    scheduler_agent_max_iterations: int = 25
+    scheduler_agent_tool_blocklist: str = ""  # comma-separated tool names
+    scheduler_default_max_retries: int = 2
+    scheduler_default_retry_backoff_s: float = 60.0
 
     # ── Usage Pricing (config-driven cost accounting) ──
     # Mapping keyed by model family or exact model name, each entry providing
@@ -1429,6 +1433,10 @@ def _build_settings_from_env(
     scheduler_tick_seconds = int(os.getenv("LEAPFLOW_SCHEDULER_TICK_SECONDS", "60"))
     scheduler_grace_seconds = float(os.getenv("LEAPFLOW_SCHEDULER_GRACE_SECONDS", "120.0"))
     scheduler_default_tier = os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_TIER", "auto")
+    scheduler_agent_max_iterations = int(os.getenv("LEAPFLOW_SCHEDULER_AGENT_MAX_ITERATIONS", "25"))
+    scheduler_agent_tool_blocklist = os.getenv("LEAPFLOW_SCHEDULER_AGENT_TOOL_BLOCKLIST", "")
+    scheduler_default_max_retries = int(os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_MAX_RETRIES", "2"))
+    scheduler_default_retry_backoff_s = float(os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_RETRY_BACKOFF_S", "60.0"))
 
     # Dashboard
     dashboard_enabled = _bool("LEAPFLOW_DASHBOARD_ENABLED", "true")
@@ -1817,6 +1825,10 @@ def _build_settings_from_env(
         scheduler_tick_seconds=scheduler_tick_seconds,
         scheduler_grace_seconds=scheduler_grace_seconds,
         scheduler_default_tier=scheduler_default_tier,
+        scheduler_agent_max_iterations=scheduler_agent_max_iterations,
+        scheduler_agent_tool_blocklist=scheduler_agent_tool_blocklist,
+        scheduler_default_max_retries=scheduler_default_max_retries,
+        scheduler_default_retry_backoff_s=scheduler_default_retry_backoff_s,
         # Dashboard
         dashboard_enabled=dashboard_enabled,
         dashboard_bind=dashboard_bind,

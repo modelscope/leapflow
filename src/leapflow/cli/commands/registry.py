@@ -146,6 +146,9 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("schedule", "List active scheduled tasks", "Scheduler", aliases=("schedule list",), args_hint="[list|history|cancel] ...", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
     CommandDef("schedule history", "Show recent execution log entries", "Scheduler", args_hint="[task_id]", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
     CommandDef("schedule cancel", "Cancel/disable a scheduled task", "Scheduler", args_hint="<task_id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("schedule pause", "Pause a scheduled task (stops firing)", "Scheduler", args_hint="<task_id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("schedule resume", "Resume a paused scheduled task", "Scheduler", args_hint="<task_id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("schedule edit", "Edit a task's trigger expression", "Scheduler", args_hint="<task_id> <trigger_expr>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
 
     # File Checkpoint
     CommandDef("checkpoint", "List recent file checkpoints for this session", "File Checkpoint", aliases=("checkpoint list",), args_hint="[list]", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),

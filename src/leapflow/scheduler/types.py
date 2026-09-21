@@ -27,6 +27,7 @@ class TaskState(str, Enum):
     DONE = "done"
     FAILED = "failed"
     SUSPENDED = "suspended"
+    PAUSED = "paused"
 
 
 class ExecutionTier(str, Enum):
@@ -63,6 +64,9 @@ class ArmedTask:
     parameters: dict = field(default_factory=dict)
     cloud_worker_id: str = ""
     metadata: dict = field(default_factory=dict)
+    max_retries: int = 0
+    retry_count: int = 0
+    retry_backoff_s: float = 60.0
 
 
 @dataclass

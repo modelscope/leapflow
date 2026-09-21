@@ -192,6 +192,9 @@ class SlashCommandCompleter(Completer):
         ("list", "List active scheduled tasks"),
         ("history", "Show recent execution log entries"),
         ("cancel", "Cancel/disable a scheduled task"),
+        ("pause", "Pause a scheduled task (stops firing)"),
+        ("resume", "Resume a paused scheduled task"),
+        ("edit", "Edit a task's trigger expression"),
     )
 
     def _schedule_completions(self, text: str) -> "Iterable[Completion]":

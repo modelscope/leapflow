@@ -1,6 +1,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 """Long-horizon async task scheduler — local and cloud execution."""
 
+from leapflow.scheduler.agent_executor import AgentSkillExecutor
 from leapflow.scheduler.execution_log import (
     DuckDBExecutionLogStore,
     ExecutionLogRecord,
@@ -40,6 +41,8 @@ __all__ = [
     "ExecutionLogRecord",
     "ExecutionLogStore",
     "DuckDBExecutionLogStore",
+    # Executors
+    "AgentSkillExecutor",
     # Schedulers & dispatchers
     "LocalScheduler",
     "CloudDispatcher",
