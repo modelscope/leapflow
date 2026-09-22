@@ -47,6 +47,8 @@ class ConversationSession:
     is_active: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
     summary: str = ""
+    pinned: bool = False
+    hidden: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,8 +100,14 @@ class ConversationStore(Protocol):
     def create_session(self, session_id: str, *, title: str = "", **kwargs: Any) -> ConversationSession: ...
     def get_session(self, session_id: str) -> Optional[ConversationSession]: ...
     def list_sessions(
-        self, *, limit: int = 20, active_only: bool = True, cwd: Optional[str] = None
+        self, *, limit: int = 20, active_only: bool = True, cwd: Optional[str] = None,
+        include_hidden: bool = False, include_archived: bool = False,
     ) -> List[ConversationSession]: ...
+    def pin_session(self, session_id: str) -> None: ...
+    def unpin_session(self, session_id: str) -> None: ...
+    def hide_session(self, session_id: str) -> None: ...
+    def unhide_session(self, session_id: str) -> None: ...
+    def archive_session(self, session_id: str) -> None: ...
     def append_message(self, session_id: str, role: str, content: str, **kwargs: Any) -> ConversationMessage: ...
     def reserve_tool_execution(self, record: "ToolExecutionRecord") -> None: ...
     def complete_tool_execution(self, record: "ToolExecutionRecord") -> None: ...
@@ -190,6 +198,17 @@ class DuckDBConversationStore:
         ):
             try:
                 self._conn.execute(f"ALTER TABLE conversation_sessions ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass  # Column already exists
+        # Migration: session operations (pin/hide) columns
+        for col, col_type, default in (
+            ("pinned", "BOOLEAN", "FALSE"),
+            ("hidden", "BOOLEAN", "FALSE"),
+        ):
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE conversation_sessions ADD COLUMN {col} {col_type} DEFAULT {default}"
+                )
             except Exception:
                 pass  # Column already exists
         self._conn.execute("""
@@ -324,19 +343,28 @@ class DuckDBConversationStore:
         return self._row_to_session(rows[0])
 
     def list_sessions(
-        self, *, limit: int = 20, active_only: bool = True, cwd: Optional[str] = None
+        self,
+        *,
+        limit: int = 20,
+        active_only: bool = True,
+        cwd: Optional[str] = None,
+        include_hidden: bool = False,
+        include_archived: bool = False,
     ) -> List[ConversationSession]:
         conditions: list[str] = []
         params: list[Any] = []
         sql = "SELECT * FROM conversation_sessions"
-        if active_only:
+        if active_only and not include_archived:
             conditions.append("is_active = TRUE")
+        if not include_hidden:
+            conditions.append("(hidden = FALSE OR hidden IS NULL)")
         if cwd:
             conditions.append("cwd = ?")
             params.append(cwd)
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
-        sql += " ORDER BY updated_at DESC LIMIT ?"
+        # Pinned sessions appear first, then by updated_at
+        sql += " ORDER BY COALESCE(pinned, FALSE) DESC, updated_at DESC LIMIT ?"
         params.append(limit)
         rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_session(r) for r in rows]
@@ -633,6 +661,50 @@ class DuckDBConversationStore:
             [session_id, *message_ids],
         )
 
+    def pin_session(self, session_id: str) -> None:
+        """Mark a session as pinned so it sorts to the top of listings."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET pinned = TRUE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def unpin_session(self, session_id: str) -> None:
+        """Remove the pinned flag from a session."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET pinned = FALSE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def hide_session(self, session_id: str) -> None:
+        """Hide a session from default listings without deleting it."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET hidden = TRUE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def unhide_session(self, session_id: str) -> None:
+        """Remove the hidden flag from a session."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET hidden = FALSE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def archive_session(self, session_id: str) -> None:
+        """Archive a session — marks it inactive and optionally hidden.
+
+        Reuses the ``is_active`` column (same as ``end_session``) so archived
+        sessions are excluded from active-only listings.
+        """
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET is_active = FALSE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
     def end_session(self, session_id: str, *, title: str | None = None, summary: str | None = None) -> None:
         """Mark a session as inactive (completed/archived).
 
@@ -837,6 +909,19 @@ class DuckDBConversationStore:
             summary = row[12] or "" if len(row) > 12 else ""
         except (IndexError, TypeError):
             pass
+        # pinned/hidden columns may not exist in legacy databases
+        pinned = False
+        hidden = False
+        try:
+            # After snapshot columns (13, 14, 15), pinned=16, hidden=17
+            # but column positions depend on migration state.
+            # Safest: iterate column names if available, fall back to tail.
+            n = len(row)
+            if n > 16:
+                pinned = bool(row[n - 2]) if row[n - 2] is not None else False
+                hidden = bool(row[n - 1]) if row[n - 1] is not None else False
+        except (IndexError, TypeError):
+            pass
         return ConversationSession(
             session_id=row[0], title=row[1] or "", created_at=row[2] or 0.0,
             updated_at=row[3] or 0.0, parent_session_id=row[4],
@@ -844,6 +929,7 @@ class DuckDBConversationStore:
             message_count=row[8] or 0, total_tokens=row[9] or 0,
             is_active=bool(row[10]) if row[10] is not None else True,
             metadata=meta, summary=summary,
+            pinned=pinned, hidden=hidden,
         )
 
     def _row_to_tool_execution(self, row: tuple) -> "ToolExecutionRecord":

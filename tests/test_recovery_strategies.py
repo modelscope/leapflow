@@ -450,10 +450,11 @@ class TestStrategyRoutingContract:
     def test_only_idempotent_strategies_are_repeatable(self) -> None:
         """Repeatable strategies must be safe to re-apply within one turn.
 
-        Compression advances through phases and jittered retry backs off, so
-        both converge. Every other strategy mutates provider/credential/mode
+        Compression advances through phases, compression_timeout escalates
+        through cooldown tiers, and jittered retry backs off — all three
+        converge. Every other strategy mutates provider/credential/mode
         state and must fire at most once per turn.
         """
         strategies = default_strategies()
         repeatable = {s.key for s in strategies if s.repeatable}
-        assert repeatable == {"context_compress", "jittered_retry"}
+        assert repeatable == {"context_compress", "compression_timeout", "jittered_retry"}

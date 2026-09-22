@@ -2051,6 +2051,14 @@ async def command_execute(
     if name == "btw":
         from leapflow.cli.commands.btw_handler import build_btw_payload
         return await build_btw_payload(ctx, args)
+    if name == "session" or name.startswith("session "):
+        from leapflow.cli.commands.session_handler import build_session_payload
+        session_args = name[len("session"):].strip()
+        if session_args:
+            session_args = session_args + (" " + args if args else "")
+        else:
+            session_args = args
+        return build_session_payload(ctx, session_args)
     if name == "doctor":
         return await _execute_doctor(ctx, args)
     return {"ok": False, "message": f"Unknown command: /{name}"}

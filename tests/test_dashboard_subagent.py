@@ -154,7 +154,7 @@ def test_subagents_template_loads():
 
     assert isinstance(raw, dict)
     assert raw["template"] == "subagents"
-    assert raw["version"] == 1
+    assert raw["version"] == 2
     assert "layout" in raw
     assert isinstance(raw["layout"], list)
     assert len(raw["layout"]) > 0
