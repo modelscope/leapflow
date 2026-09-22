@@ -52,7 +52,7 @@ dev = [
     "pytest-xdist>=3.5",
     "pytest-cov>=5.0",
 ]
-hub = ["modelscope-hub>=0.1.0"]
+hub = ["modelscope-hub>=0.4.5"]
 # Native Anthropic Messages API provider. Optional: the core install uses the
 # OpenAI-compatible transport by default; this extra enables AnthropicChat for
 # endpoints that speak the Anthropic wire format (api.anthropic.com, DeepSeek
