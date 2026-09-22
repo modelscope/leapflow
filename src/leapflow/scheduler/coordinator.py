@@ -13,11 +13,18 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
+from leapflow.scheduler.execution_log import ExecutionLogStore
 from leapflow.scheduler.store import TaskStore
 from leapflow.scheduler.triggers import create_trigger
-from leapflow.scheduler.types import ArmedTask, ExecutionTier, TaskState, TaskStatus
+from leapflow.scheduler.types import (
+    ArmedTask,
+    ExecutionTier,
+    SchedulerExecutionMode,
+    TaskState,
+    TaskStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +111,45 @@ def parse_trigger_expression(expr: str) -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 
 
+class _RoutingExecutor:
+    """Thin dispatcher that routes to the agent executor or the default.
+
+    Satisfies the ``SkillExecutor`` Protocol.  The ``LocalScheduler`` holds one
+    executor; this wrapper lets it transparently delegate agent-mode tasks to
+    ``AgentSkillExecutor`` while keeping the existing call site unchanged.
+
+    Routing covers every ``execution_mode`` value with no gaps:
+    - ``"agent"`` (:attr:`SchedulerExecutionMode.AGENT`) → the lazily built
+      agent executor, but only when an ``agent_factory`` is wired.
+    - anything else — ``"script"``, ``None``, a missing key, or an unknown
+      string — falls through to the default (script) executor.
+
+    The agent executor is built once on first use and cached: scheduler ticks
+    are a cold path, but a task may fire many times and must not pay
+    construction cost or spawn a fresh executor on every fire.
+    """
+
+    def __init__(
+        self,
+        default: Any,
+        agent_factory: Optional[Callable[[], Any]] = None,
+    ) -> None:
+        self._default = default
+        self._agent_factory = agent_factory
+        self._agent: Optional[Any] = None
+
+    async def execute(self, skill_name: str, parameters: dict) -> dict:
+        if (
+            isinstance(parameters, dict)
+            and parameters.get("execution_mode") == SchedulerExecutionMode.AGENT.value
+            and self._agent_factory is not None
+        ):
+            if self._agent is None:
+                self._agent = self._agent_factory()
+            return await self._agent.execute(skill_name, parameters)
+        return await self._default.execute(skill_name, parameters)
+
+
 class TaskCoordinator:
     """Unified task orchestrator — routes armed tasks to local or cloud execution.
 
@@ -120,11 +166,28 @@ class TaskCoordinator:
         local_scheduler: Optional["LocalScheduler"] = None,
         cloud_dispatcher: Optional["CloudDispatcher"] = None,
         default_tier: str = "auto",
+        execution_log: Optional[ExecutionLogStore] = None,
+        agent_executor_factory: Optional[Callable[[], Any]] = None,
+        default_max_retries: int = 0,
+        default_retry_backoff_s: float = 60.0,
     ) -> None:
         self._store = store
         self._local = local_scheduler
         self._cloud = cloud_dispatcher
         self._default_tier = default_tier
+        self._execution_log = execution_log
+        self._agent_executor_factory = agent_executor_factory
+        self._default_max_retries = default_max_retries
+        self._default_retry_backoff_s = default_retry_backoff_s
+
+    def wrap_executor(self, default_executor: Any) -> "_RoutingExecutor":
+        """Wrap a default executor with agent-mode routing.
+
+        Returns a ``_RoutingExecutor`` that satisfies the ``SkillExecutor``
+        Protocol and transparently dispatches ``execution_mode=agent`` tasks
+        to an ``AgentSkillExecutor``.
+        """
+        return _RoutingExecutor(default_executor, self._agent_executor_factory)
 
     # ------------------------------------------------------------------
     # Public API
@@ -139,6 +202,8 @@ class TaskCoordinator:
         max_runs: int = -1,
         parameters: Optional[dict] = None,
         context_snapshot: Optional[dict] = None,
+        max_retries: Optional[int] = None,
+        retry_backoff_s: Optional[float] = None,
     ) -> ArmedTask:
         """Create and register an armed task.
 
@@ -171,7 +236,11 @@ class TaskCoordinator:
         trigger = create_trigger(trigger_type, trigger_config)
         trigger.advance(now)
 
-        # 5. Create ArmedTask
+        # 5. Resolve retry defaults from config if not specified per-task
+        effective_max_retries = max_retries if max_retries is not None else self._default_max_retries
+        effective_backoff = retry_backoff_s if retry_backoff_s is not None else self._default_retry_backoff_s
+
+        # 6. Create ArmedTask
         task = ArmedTask(
             skill_name=skill_name,
             trigger_type=trigger_type,
@@ -182,12 +251,14 @@ class TaskCoordinator:
             parameters=parameters or {},
             max_runs=max_runs,
             next_due_at=trigger.next_due_at,
+            max_retries=effective_max_retries,
+            retry_backoff_s=effective_backoff,
         )
 
-        # 6. Persist
+        # 7. Persist
         self._store.save(task)
 
-        # 7. Route to execution backend
+        # 8. Route to execution backend
         if tier == ExecutionTier.LOCAL.value:
             assert self._local is not None
             await self._local.register(task)
@@ -218,6 +289,71 @@ class TaskCoordinator:
 
         logger.info("Cancelled task %s", task_id[:8])
 
+    async def pause_task(self, task_id: str) -> None:
+        """Pause a task — stops it from firing without cancelling.
+
+        The task stays in the store with state PAUSED; ``get_due_tasks``
+        already filters on ``state = 'armed'``, so paused tasks are
+        naturally skipped.
+        """
+        task = self._store.load(task_id)
+        if task is None:
+            raise ValueError(f"Task not found: {task_id}")
+        self._store.update_state(task_id, TaskState.PAUSED.value)
+        logger.info("Paused task %s", task_id[:8])
+
+    async def resume_task(self, task_id: str) -> None:
+        """Resume a paused task — re-arm it and recalculate next_due."""
+        task = self._store.load(task_id)
+        if task is None:
+            raise ValueError(f"Task not found: {task_id}")
+        # Recalculate next_due from the trigger
+        now = time.time()
+        trigger = create_trigger(
+            task.trigger_type,
+            task.trigger_config if isinstance(task.trigger_config, dict) else {},
+        )
+        trigger.advance(now)
+        self._store.update_task(
+            task_id,
+            state=TaskState.ARMED.value,
+            next_due_at=trigger.next_due_at,
+        )
+        logger.info("Resumed task %s (next_due=%.0f)", task_id[:8], trigger.next_due_at)
+
+    async def update_task(
+        self,
+        task_id: str,
+        *,
+        trigger_expr: Optional[str] = None,
+        payload: Optional[dict] = None,
+    ) -> ArmedTask:
+        """Update a task's trigger expression and/or payload."""
+        task = self._store.load(task_id)
+        if task is None:
+            raise ValueError(f"Task not found: {task_id}")
+
+        fields: dict = {}
+        if payload is not None:
+            fields["parameters"] = payload
+
+        if trigger_expr is not None:
+            trigger_type, trigger_config = parse_trigger_expression(trigger_expr)
+            now = time.time()
+            trigger = create_trigger(trigger_type, trigger_config)
+            trigger.advance(now)
+            fields["trigger_type"] = trigger_type
+            fields["trigger_config"] = trigger_config
+            fields["next_due_at"] = trigger.next_due_at
+
+        if fields:
+            self._store.update_task(task_id, **fields)
+
+        updated = self._store.load(task_id)
+        assert updated is not None
+        logger.info("Updated task %s", task_id[:8])
+        return updated
+
     async def status(self, task_id: str) -> TaskStatus:
         """Unified status query."""
         task = self._store.load(task_id)
@@ -241,7 +377,7 @@ class TaskCoordinator:
         return self._store.load_all()
 
     async def logs(self, task_id: str, tail: int = 50) -> List[str]:
-        """Get logs (local: from last execution, cloud: from Studio logs)."""
+        """Get logs (local: from execution log store, cloud: from Studio logs)."""
         task = self._store.load(task_id)
         if task is None:
             raise ValueError(f"Task not found: {task_id}")
@@ -249,8 +385,39 @@ class TaskCoordinator:
         if task.execution_tier == ExecutionTier.CLOUD.value and self._cloud and task.cloud_worker_id:
             return await self._cloud.logs(task.cloud_worker_id, tail=tail)
 
-        # Local tasks: no log store yet, return placeholder
+        # Local tasks: pull from execution log store
+        if self._execution_log is not None:
+            try:
+                records = self._execution_log.get_history(task_id=task_id, limit=tail)
+                if records:
+                    lines: List[str] = []
+                    for r in records:
+                        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r.started_at))
+                        detail = r.result_summary or r.error or ""
+                        lines.append(f"[{ts}] {r.status}" + (f" — {detail}" if detail else ""))
+                    return lines
+            except Exception:
+                logger.debug("Failed to read execution log for %s", task_id[:8], exc_info=True)
+
         return [f"[local] Task {task_id[:8]}: state={task.state}, runs={task.run_count}"]
+
+    def get_execution_history(
+        self,
+        task_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List:
+        """Return recent execution log records (newest first).
+
+        Delegates to the injected :class:`ExecutionLogStore`.  Returns an
+        empty list when no store is available.
+        """
+        if self._execution_log is None:
+            return []
+        try:
+            return self._execution_log.get_history(task_id=task_id, limit=limit)
+        except Exception:
+            logger.debug("Failed to read execution history", exc_info=True)
+            return []
 
     # ------------------------------------------------------------------
     # Tier decision heuristic

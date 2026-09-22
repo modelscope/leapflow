@@ -410,7 +410,7 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
         render_plugin_generate_start,
     )
     from leapflow.utils.terminal_io import TerminalIOProvider
-    from leapflow.engine.session import SessionMode
+    from leapflow.engine.session.session import SessionMode
     from leapflow.plugins import get_registry
     _tool_registry = get_registry()
 
@@ -781,6 +781,11 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                     cmd_text.split()[1:] if len(cmd_text.split()) > 1 else []
                 )
                 await cmd_hub(ctx, hub_args)
+                return
+
+            if canonical == "btw":
+                from leapflow.cli.commands.btw_handler import handle_btw
+                await handle_btw(ctx, console, cmd_args)
                 return
 
             if canonical == "run":
@@ -1707,7 +1712,7 @@ async def _handle_teach(
     ctx: "Context", console, line: str, learning: bool
 ) -> bool:
     """Handle teach/learn commands. Returns True if handled."""
-    from leapflow.engine.session import SessionMode
+    from leapflow.engine.session.session import SessionMode
 
     if (
         line.startswith("teach start")
@@ -1833,7 +1838,7 @@ async def _handle_teach(
         return True
 
     if line == "teach resume":
-        from leapflow.engine.session import SessionMode as SM
+        from leapflow.engine.session.session import SessionMode as SM
 
         if ctx.session and ctx.session.mode == SM.LEARNING:
             ctx.session.resume_learning()

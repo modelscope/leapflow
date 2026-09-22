@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from leapflow.gateway.connectors.protocol import ActionFailure, ActionPreview, ActionResult, ActionSpec, BackendKind
-from leapflow.gateway.protocol import OutboundContent, SendResult, SendTarget
+from leapflow.gateway.protocol import OutboundContent, PlatformCapabilities, SendResult, SendTarget
 from leapflow.gateway.server import GatewayServer
 from leapflow.tools.gateway_tool import (
     build_app_connector_prompt_section,
@@ -196,6 +196,14 @@ class FakeSendAdapter:
     supports_async_delivery = True
     splits_long_messages = False
     max_message_length = 0
+
+    @property
+    def capabilities(self) -> PlatformCapabilities:
+        return PlatformCapabilities(
+            supports_async_delivery=self.supports_async_delivery,
+            splits_long_messages=self.splits_long_messages,
+            max_message_length=self.max_message_length,
+        )
 
     def __init__(self) -> None:
         self.sent: list[tuple[SendTarget, OutboundContent]] = []

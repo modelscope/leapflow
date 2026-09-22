@@ -118,7 +118,7 @@ class MarketplaceServer:
         # Write all data at once to ensure atomicity
         writer.write(header + body)
         await writer.drain()
-    
+
     async def _serve_manifests_and_close(self, writer: asyncio.StreamWriter) -> None:
         """Serve the combined manifest index and close connection."""
         manifests = []

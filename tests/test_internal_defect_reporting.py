@@ -20,14 +20,14 @@ from __future__ import annotations
 
 import json
 
-from leapflow.engine.error_classifier import ErrorClassifier
-from leapflow.engine.failure_envelope import FailureSource, Recoverability
-from leapflow.engine.recovery_audit import JsonlAuditSink, create_audit_entry
-from leapflow.engine.recovery_budget import RecoveryBudget
-from leapflow.engine.recovery_coordinator import RecoveryCoordinator
-from leapflow.engine.recovery_decision import RecoveryAction
-from leapflow.engine.recovery_strategies import default_strategies
-from leapflow.engine.unified_classifier import (
+from leapflow.engine.recovery.error_classifier import ErrorClassifier
+from leapflow.engine.recovery.failure_envelope import FailureSource, Recoverability
+from leapflow.engine.recovery.recovery_audit import JsonlAuditSink, create_audit_entry
+from leapflow.engine.recovery.recovery_budget import RecoveryBudget
+from leapflow.engine.recovery.recovery_coordinator import RecoveryCoordinator
+from leapflow.engine.recovery.recovery_decision import RecoveryAction
+from leapflow.engine.recovery.strategies import default_strategies
+from leapflow.engine.recovery.unified_classifier import (
     INTERNAL_DEFECT_CATEGORY,
     UnifiedErrorClassifier,
 )
@@ -120,7 +120,7 @@ def test_defect_halts_immediately_without_burning_strategies() -> None:
 
 def test_terminal_decision_carries_an_actionable_interaction() -> None:
     """A stopped turn must not surface internal jargon as its whole answer."""
-    from leapflow.engine.engine import _terminal_failure_text
+    from leapflow.engine._message_helpers import _terminal_failure_text
 
     coordinator = RecoveryCoordinator(strategies=default_strategies(), budget=_budget())
     coordinator.new_turn(turn_id=0)
@@ -135,7 +135,7 @@ def test_terminal_decision_carries_an_actionable_interaction() -> None:
 
 def test_no_strategy_terminal_also_explains_itself() -> None:
     """The exact message from the incident must never be the whole answer."""
-    from leapflow.engine.engine import _terminal_failure_text
+    from leapflow.engine._message_helpers import _terminal_failure_text
 
     coordinator = RecoveryCoordinator(strategies=[], budget=_budget())
     coordinator.new_turn(turn_id=0)
@@ -172,7 +172,8 @@ def test_recovery_audit_is_written_to_disk(tmp_path) -> None:
 def test_engine_points_the_audit_sink_at_the_profile_layout(tmp_path) -> None:
     """The sink must be constructed with a layout-owned path, not left in memory."""
     from conftest import StubLLM, make_settings
-    from leapflow.engine.engine import AgentEngine, build_default_registry
+    from leapflow.engine.engine import AgentEngine
+    from leapflow.engine import build_default_registry
     from leapflow.engine.intent_classifier import Intent
     from leapflow.memory import (
         EpisodicMemoryProvider,

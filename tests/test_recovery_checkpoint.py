@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from leapflow.engine.recovery_checkpoint import (
+from leapflow.engine.recovery.recovery_checkpoint import (
     CheckpointResumer,
     CheckpointState,
     CheckpointStore,

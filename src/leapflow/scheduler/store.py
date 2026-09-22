@@ -79,9 +79,27 @@ class TaskStore:
                 grace_seconds DOUBLE DEFAULT 120.0,
                 parameters TEXT DEFAULT '{}',
                 cloud_worker_id TEXT DEFAULT '',
-                metadata TEXT DEFAULT '{}'
+                metadata TEXT DEFAULT '{}',
+                max_retries INTEGER DEFAULT 0,
+                retry_count INTEGER DEFAULT 0,
+                retry_backoff_s DOUBLE DEFAULT 60.0
             )
         """)
+        self._migrate_retry_columns()
+
+    def _migrate_retry_columns(self) -> None:
+        """Idempotent migration: add retry columns to pre-existing tables."""
+        for col, dtype, default in (
+            ("max_retries", "INTEGER", "0"),
+            ("retry_count", "INTEGER", "0"),
+            ("retry_backoff_s", "DOUBLE", "60.0"),
+        ):
+            try:
+                self._con.execute(
+                    f"ALTER TABLE armed_tasks ADD COLUMN {col} {dtype} DEFAULT {default}"
+                )
+            except Exception:  # noqa: BLE001 — column already exists
+                pass
 
     # ------------------------------------------------------------------
     # CRUD
@@ -96,8 +114,9 @@ class TaskStore:
                 task_id, skill_name, trigger_type, trigger_config,
                 state, execution_tier, context_snapshot, confidence,
                 created_at, next_due_at, last_run_at, run_count,
-                max_runs, grace_seconds, parameters, cloud_worker_id, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                max_runs, grace_seconds, parameters, cloud_worker_id, metadata,
+                max_retries, retry_count, retry_backoff_s
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 task.task_id,
@@ -117,6 +136,9 @@ class TaskStore:
                 json.dumps(task.parameters) if isinstance(task.parameters, dict) else task.parameters,
                 task.cloud_worker_id,
                 json.dumps(task.metadata) if isinstance(task.metadata, dict) else task.metadata,
+                task.max_retries,
+                task.retry_count,
+                task.retry_backoff_s,
             ],
         )
 
@@ -191,6 +213,50 @@ class TaskStore:
         )
 
     # ------------------------------------------------------------------
+    # CRUD extensions (Phase 1B)
+    # ------------------------------------------------------------------
+
+    _MUTABLE_COLUMNS = frozenset({
+        "trigger_type", "trigger_config", "state", "next_due_at",
+        "parameters", "max_runs", "grace_seconds", "metadata",
+        "max_retries", "retry_count", "retry_backoff_s",
+    })
+
+    def update_task(self, task_id: str, **fields: Any) -> bool:
+        """Update mutable fields on an armed task.
+
+        Returns True if the task existed and was updated, False otherwise.
+        Raises ValueError for unknown field names.
+        """
+        unknown = set(fields) - self._MUTABLE_COLUMNS
+        if unknown:
+            raise ValueError(f"Cannot update field(s): {', '.join(sorted(unknown))}")
+        if not fields:
+            return False
+        set_clauses = []
+        values: list[Any] = []
+        for col, val in fields.items():
+            set_clauses.append(f"{col} = ?")
+            if col in ("trigger_config", "parameters", "metadata") and isinstance(val, dict):
+                values.append(json.dumps(val))
+            else:
+                values.append(val)
+        values.append(task_id)
+        execute_with_retry(
+            self._con,
+            f"UPDATE armed_tasks SET {', '.join(set_clauses)} WHERE task_id = ?",
+            values,
+        )
+        return self.load(task_id) is not None
+
+    def set_state(self, task_id: str, state: str) -> bool:
+        """Convenience wrapper: update only the state column.
+
+        Returns True if the task existed.
+        """
+        return self.update_task(task_id, state=state)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -214,6 +280,9 @@ class TaskStore:
             parameters=self._safe_json_loads(row[14]),
             cloud_worker_id=row[15],
             metadata=self._safe_json_loads(row[16]),
+            max_retries=row[17] if len(row) > 17 else 0,
+            retry_count=row[18] if len(row) > 18 else 0,
+            retry_backoff_s=row[19] if len(row) > 19 else 60.0,
         )
 
     @staticmethod

@@ -42,8 +42,15 @@ _BUILTIN_PLUGIN_MODULES = (
     "leapflow.plugins.tool_plugins.hub",
     "leapflow.plugins.tool_plugins.gateway",
     "leapflow.plugins.tool_plugins.self_management",
+    "leapflow.plugins.tool_plugins.self_awareness",
+    # Scheduler — tools activate only once the TaskCoordinator is bound.
+    "leapflow.plugins.tool_plugins.scheduler_tools",
     # Desktop semantics — tools activate only once perception is bound.
     "leapflow.plugins.tool_plugins.desktop_semantic",
+    # Tool search bridge — BM25-based tool discovery meta-tools (tool_search,
+    # tool_describe).  Read-only CORE tools; appended after desktop_semantic so
+    # existing tool-index ordering is preserved.
+    "leapflow.plugins.tool_plugins.bridge",
     # Hardware Context Protocol — appended last, and contributes no tools until a
     # hardware registry is bound. With hardware disabled the tool index is
     # byte-identical to a build without it, which is what keeps the journey

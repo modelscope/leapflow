@@ -284,8 +284,20 @@ class MonitorCoordinator:
     ) -> Callable[..., None]:
         """Apply noise policy once, then route accepted events to watch + stream."""
         stream_callback = self._make_signal_stream_subscriber(notification_bus)
+        _SUBAGENT_PREFIX = "subagent."
 
         def _on_event(event: Any) -> None:
+            # Bridge subagent lifecycle events directly to NotificationBus so the
+            # dashboard can stream them to browsers. Subagent events arrive as
+            # internal.unmapped (the prefix is not in PRE_NORMALIZED_EVENT_PREFIXES),
+            # so recover the original type from the payload.
+            payload = getattr(event, "payload", None) or {}
+            original_type = payload.get("_original_type", "")
+            if original_type.startswith(_SUBAGENT_PREFIX):
+                notification_bus.emit(Notification(
+                    event_type=original_type,
+                    payload=payload,
+                ))
             gate = self._signal_noise_gate
             if gate is not None and not gate.should_pass(event):
                 return

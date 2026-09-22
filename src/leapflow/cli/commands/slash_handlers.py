@@ -75,7 +75,7 @@ def render_tool_payload(console: "LeapConsole", payload: dict[str, Any]) -> None
 
 
 def build_usage_payload(ctx: "Context") -> dict[str, Any]:
-    """Build a serializable token usage summary."""
+    """Build a serializable token usage summary with cost and latency."""
     engine = ctx.engine
     if engine is None:
         return {"ok": False, "error": "No active engine — send a message first."}
@@ -91,20 +91,60 @@ def build_usage_payload(ctx: "Context") -> dict[str, Any]:
         caps = cap_registry.resolve(ctx.settings.llm_model)
         context_length = int(caps.context_length)
 
+    # Cost computation (graceful: missing pricing => cost unknown)
+    cost_payload: dict[str, Any] = {"dollar_cost": None, "session_dollar_cost": None}
+    try:
+        from leapflow.engine.cost_calculator import compute_cost, format_cost
+
+        pricing_config = ctx.settings.usage_pricing
+        if pricing_config:
+            result = compute_cost(
+                prompt_tokens=summary.prompt_tokens,
+                completion_tokens=summary.completion_tokens,
+                cached_tokens=summary.cached_tokens,
+                model=summary.model or ctx.settings.llm_model,
+                pricing_config=pricing_config,
+            )
+            cost_payload["dollar_cost"] = result.dollar_cost
+            cost_payload["dollar_cost_formatted"] = format_cost(result.dollar_cost)
+            cost_payload["pricing_source"] = result.pricing_source
+    except Exception:  # noqa: BLE001 — never let cost accounting break /usage
+        pass
+
+    # Latency aggregation (read-only snapshots from existing instrumentation)
+    latency_payload: dict[str, Any] = {}
+    try:
+        from leapflow.performance import LatencySummary, aggregate_latency_snapshots
+
+        snapshots: dict[str, LatencySummary] = {}
+
+        # Plugin registry snapshot latency
+        registry = getattr(engine, "_plugin_registry", None) or getattr(engine, "plugin_registry", None)
+        if registry is not None and hasattr(registry, "snapshot_latency"):
+            snapshots["plugin_snapshot"] = registry.snapshot_latency()
+
+        if snapshots:
+            latency_payload = aggregate_latency_snapshots(snapshots)
+    except Exception:  # noqa: BLE001
+        pass
+
     return {
         "ok": True,
         "model": ctx.settings.llm_model,
         "prompt_tokens": int(summary.prompt_tokens),
         "completion_tokens": int(summary.completion_tokens),
         "total_tokens": int(summary.total_tokens),
+        "cached_tokens": int(summary.cached_tokens),
         "turn_count": int(getattr(engine, "turn_count", 0)),
         "context_used": int(getattr(engine, "context_token_count", 0)),
         "context_length": context_length,
+        **cost_payload,
+        "latency": latency_payload,
     }
 
 
 def render_usage_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
-    """Render a serializable token usage summary."""
+    """Render a serializable token usage summary with cost and latency."""
     from leapflow.cli.tui_app.status import _compact_tokens
 
     if not payload.get("ok", True):
@@ -115,6 +155,7 @@ def render_usage_payload(console: "LeapConsole", payload: dict[str, Any]) -> Non
     prompt_tokens = int(payload.get("prompt_tokens") or 0)
     completion_tokens = int(payload.get("completion_tokens") or 0)
     total_tokens = int(payload.get("total_tokens") or 0)
+    cached_tokens = int(payload.get("cached_tokens") or 0)
     turn_count = int(payload.get("turn_count") or 0)
     context_used = int(payload.get("context_used") or 0)
     context_length = int(payload.get("context_length") or 0)
@@ -123,13 +164,40 @@ def render_usage_payload(console: "LeapConsole", payload: dict[str, Any]) -> Non
         f"  Input tokens:    {_compact_tokens(prompt_tokens):>8}  ({prompt_tokens:,})",
         f"  Output tokens:   {_compact_tokens(completion_tokens):>8}  ({completion_tokens:,})",
         f"  Total tokens:    {_compact_tokens(total_tokens):>8}  ({total_tokens:,})",
-        f"  Turns:           {turn_count}",
     ]
+    if cached_tokens > 0:
+        lines.append(
+            f"  Cached tokens:   {_compact_tokens(cached_tokens):>8}  ({cached_tokens:,})"
+        )
+    lines.append(f"  Turns:           {turn_count}")
     if context_length > 0:
         pct = int(context_used * 100 / context_length)
         lines.append(
             f"  Context:         {_compact_tokens(context_used)}/{_compact_tokens(context_length)} ({pct}%)"
         )
+
+    # Cost line (graceful: only shown when pricing is configured)
+    dollar_cost = payload.get("dollar_cost")
+    if dollar_cost is not None:
+        cost_str = payload.get("dollar_cost_formatted", f"${dollar_cost:.4f}")
+        lines.append(f"  Turn cost:       {cost_str}")
+    session_cost = payload.get("session_dollar_cost")
+    if session_cost is not None:
+        lines.append(f"  Session cost:    ${session_cost:.4f}")
+
+    # Latency summary (read-only aggregation)
+    latency = payload.get("latency") or {}
+    if latency:
+        lines.append("  Latency (ms):")
+        for label, snap in latency.items():
+            p50 = snap.get("p50_ms", 0)
+            p95 = snap.get("p95_ms", 0)
+            p99 = snap.get("p99_ms", 0)
+            count = snap.get("count", 0)
+            lines.append(
+                f"    {label:20s} p50={p50:>7.1f}  p95={p95:>7.1f}  p99={p99:>7.1f}  n={count}"
+            )
+
     for line in lines:
         console.system(line)
     console.print()
@@ -561,7 +629,7 @@ def handle_status(ctx: "Context", console: "LeapConsole", args: str) -> None:
         info.append("Session:   ", style="dim")
         info.append(f"{session_id}\n")
 
-    from leapflow.engine.session import SessionMode
+    from leapflow.engine.session.session import SessionMode
     mode = "idle"
     if ctx.session:
         if ctx.session.mode == SessionMode.LEARNING:
@@ -1886,6 +1954,32 @@ def build_orient_payload(ctx: "Context") -> dict[str, Any]:
     }
 
 
+async def _execute_doctor(ctx: "Context", args: str = "") -> dict[str, Any]:
+    """Run ``leap doctor`` checks and return a serializable payload."""
+    from leapflow.cli.doctor import (
+        build_doctor_checks,
+        build_doctor_payload,
+        run_doctor,
+    )
+
+    settings = ctx.settings
+    should_fix = "--fix" in args
+    section_filter: str | None = None
+    parts = args.strip().split()
+    for i, tok in enumerate(parts):
+        if tok == "--section" and i + 1 < len(parts):
+            section_filter = parts[i + 1]
+            break
+
+    checks = build_doctor_checks(settings)
+    aggregate, details = await run_doctor(
+        checks,
+        should_fix=should_fix,
+        section_filter=section_filter,
+    )
+    return build_doctor_payload(aggregate, details)
+
+
 async def command_execute(
     ctx: "Context", name: str, args: str = "", session_id: str = "",
 ) -> dict[str, Any]:
@@ -1931,6 +2025,20 @@ async def command_execute(
         return await _execute_scheduler_arm(ctx, args)
     if name == "task":
         return _execute_scheduler_task(ctx)
+    if name == "schedule" or name.startswith("schedule "):
+        sched_args = name[len("schedule"):].strip()
+        if sched_args:
+            sched_args = sched_args + (" " + args if args else "")
+        else:
+            sched_args = args
+        return build_schedule_payload(ctx, sched_args)
+    if name == "checkpoint" or name.startswith("checkpoint "):
+        ckpt_args = name[len("checkpoint"):].strip()
+        if ckpt_args:
+            ckpt_args = ckpt_args + (" " + args if args else "")
+        else:
+            ckpt_args = args
+        return build_checkpoint_payload(ctx, ckpt_args, session_id=session_id)
     if name == "board" or name.startswith("board "):
         return await _execute_dashboard(ctx, name, args, session_id=session_id)
     if _is_plugin_command(name):
@@ -1940,7 +2048,427 @@ async def command_execute(
         else:
             plugin_args = args
         return await build_plugin_payload(ctx, plugin_args)
+    if name == "btw":
+        from leapflow.cli.commands.btw_handler import build_btw_payload
+        return await build_btw_payload(ctx, args)
+    if name == "session" or name.startswith("session "):
+        from leapflow.cli.commands.session_handler import build_session_payload
+        session_args = name[len("session"):].strip()
+        if session_args:
+            session_args = session_args + (" " + args if args else "")
+        else:
+            session_args = args
+        return build_session_payload(ctx, session_args)
+    if name == "doctor":
+        return await _execute_doctor(ctx, args)
     return {"ok": False, "message": f"Unknown command: /{name}"}
+
+
+def build_checkpoint_payload(ctx: "Context", args: str = "", session_id: str = "") -> dict[str, Any]:
+    """Handle /checkpoint list and /checkpoint rollback commands."""
+    store = getattr(ctx, "_file_checkpoint_store", None)
+    if store is None:
+        return {
+            "ok": False,
+            "message": "File checkpoint is not enabled. Set checkpoint.file_rollback_enabled=true.",
+        }
+
+    parts = args.strip().split(None, 1)
+    verb = parts[0].lower() if parts else "list"
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if verb == "list" or not args.strip():
+        sid = session_id or getattr(getattr(ctx, "engine", None), "_current_session_id", "") or ""
+        checkpoints = store.list_turns(sid, limit=20)
+        if not checkpoints:
+            return {"ok": True, "message": "No file checkpoints found for this session."}
+        lines = ["Recent file checkpoints:"]
+        for cp in checkpoints:
+            import datetime
+            ts = datetime.datetime.fromtimestamp(cp.created_at).strftime("%Y-%m-%d %H:%M:%S")
+            paths = [s.path for s in cp.snapshots]
+            summary = ", ".join(paths[:3])
+            if len(paths) > 3:
+                summary += f" (+{len(paths) - 3} more)"
+            lines.append(f"  {cp.turn_id}  {ts}  [{len(cp.snapshots)} file(s)]: {summary}")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    if verb == "rollback":
+        turn_id = rest
+        if not turn_id:
+            return {"ok": False, "message": "Usage: /checkpoint rollback <turn_id>"}
+        result = store.rollback_turn(turn_id)
+        lines = [f"Rollback of turn {turn_id}:"]
+        if result.restored:
+            lines.append(f"  Restored: {', '.join(result.restored)}")
+        if result.skipped:
+            lines.append(f"  Skipped (unchanged): {', '.join(result.skipped)}")
+        if result.failed:
+            for path, reason in result.failed:
+                lines.append(f"  Failed: {path} — {reason}")
+        ok = len(result.failed) == 0
+        return {"ok": ok, "message": "\n".join(lines)}
+
+    return {"ok": False, "message": f"Unknown checkpoint subcommand: {verb}. Use list or rollback."}
+
+
+def build_schedule_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
+    """Handle /schedule list, /schedule history, and /schedule cancel commands."""
+    from leapflow.scheduler.coordinator import TaskCoordinator
+    from leapflow.scheduler.execution_log import DuckDBExecutionLogStore
+    from leapflow.scheduler.store import TaskStore
+
+    # Resolve coordinator from context — same wiring as /arm and /task
+    coordinator: TaskCoordinator | None = getattr(ctx, "coordinator", None)
+    task_store: TaskStore | None = None
+
+    if coordinator is not None:
+        task_store = coordinator._store  # noqa: SLF001
+    else:
+        # Fallback: build a read-only TaskStore from settings
+        try:
+            task_store = TaskStore(ctx.settings.duckdb_path)
+        except Exception:
+            pass
+
+    parts = args.strip().split(None, 1)
+    verb = parts[0].lower() if parts else "list"
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    # ── /schedule list (default) ─────────────────────────────────────
+    if verb == "list" or not args.strip():
+        if task_store is None:
+            return {"ok": True, "message": "No scheduler active."}
+        try:
+            tasks = task_store.load_all()
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to load tasks: {exc}"}
+        if not tasks:
+            return {"ok": True, "message": "No scheduled tasks."}
+        import time as _time
+        now = _time.time()
+        lines = ["Active scheduled tasks:"]
+        for t in tasks:
+            tid = t.task_id[:8]
+            trigger = t.trigger_type
+            if t.trigger_type == "interval":
+                sec = (t.trigger_config or {}).get("interval_seconds", 0)
+                if sec < 60:
+                    trigger = f"every {int(sec)}s"
+                elif sec < 3600:
+                    trigger = f"every {int(sec / 60)}m"
+                else:
+                    trigger = f"every {int(sec / 3600)}h"
+            elif t.trigger_type == "cron":
+                trigger = (t.trigger_config or {}).get("expression", "cron")
+            if t.next_due_at > 0:
+                delta = t.next_due_at - now
+                if delta <= 0:
+                    next_str = "now"
+                elif delta < 60:
+                    next_str = f"{int(delta)}s"
+                elif delta < 3600:
+                    next_str = f"{int(delta / 60)}m"
+                else:
+                    next_str = f"{int(delta / 3600)}h"
+            else:
+                next_str = "-"
+            enabled = t.state not in ("suspended", "done", "failed", "paused")
+            params = t.parameters if isinstance(t.parameters, dict) else {}
+            mode = params.get("execution_mode") or "script"
+            lines.append(
+                f"  {tid}  skill={t.skill_name}  mode={mode}  trigger={trigger}"
+                f"  next={next_str}  enabled={enabled}"
+            )
+        return {"ok": True, "message": "\n".join(lines)}
+
+    # ── /schedule history [task_id] ──────────────────────────────────
+    if verb == "history":
+        # Build an execution log store from the same DB
+        log_store = None
+        if coordinator is not None and coordinator._execution_log is not None:  # noqa: SLF001
+            log_store = coordinator._execution_log  # noqa: SLF001
+        else:
+            try:
+                log_store = DuckDBExecutionLogStore(ctx.settings.duckdb_path)
+            except Exception:
+                pass
+        if log_store is None:
+            return {"ok": False, "message": "Execution log is not available."}
+        task_id = rest or None
+        try:
+            records = log_store.get_history(task_id=task_id, limit=30)
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to read execution history: {exc}"}
+        if not records:
+            label = f" for task {task_id[:8]}" if task_id else ""
+            return {"ok": True, "message": f"No execution history{label}."}
+        import datetime
+        lines = ["Recent executions:"]
+        for r in records:
+            ts = datetime.datetime.fromtimestamp(r.started_at).strftime("%Y-%m-%d %H:%M:%S")
+            detail = r.result_summary or r.error or ""
+            detail_str = f"  {detail[:80]}" if detail else ""
+            lines.append(f"  {r.task_id[:8]}  [{ts}]  {r.status}{detail_str}")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    # ── /schedule status <task_id> ───────────────────────────────────
+    if verb == "status":
+        task_id = rest
+        if not task_id:
+            return {"ok": False, "message": "Usage: /schedule status <task_id>"}
+        if task_store is None:
+            return {"ok": False, "message": "No scheduler active."}
+        task = task_store.load(task_id)
+        if task is None:
+            return {"ok": False, "message": f"Task not found: {task_id}"}
+        import time as _time_st
+        params = task.parameters if isinstance(task.parameters, dict) else {}
+        mode = params.get("execution_mode") or "script"
+        now = _time_st.time()
+        if task.next_due_at > 0:
+            delta = task.next_due_at - now
+            next_str = "now" if delta <= 0 else (
+                f"{int(delta)}s" if delta < 60 else (
+                    f"{int(delta / 60)}m" if delta < 3600 else f"{int(delta / 3600)}h"
+                )
+            )
+        else:
+            next_str = "-"
+        runs = f"{task.run_count}" + (f"/{task.max_runs}" if task.max_runs > 0 else "")
+        lines = [
+            f"Task {task.task_id[:8]} status:",
+            f"  skill: {task.skill_name}",
+            f"  state: {task.state}",
+            f"  mode: {mode}",
+            f"  trigger: {task.trigger_type}",
+            f"  next due: {next_str}",
+            f"  runs: {runs}",
+            f"  retries: {task.retry_count}/{task.max_retries}",
+        ]
+        # Agent-mode sub-status: agent tasks run an isolated, bounded sub-agent
+        # (depth-gated at 1) on each fire; the per-fire outcome is reflected in
+        # the recent execution history below rather than a live sub-agent handle.
+        if mode == "agent":
+            lines.append("  sub-agent: isolated LLM tool loop (max_depth=1)")
+        # Recent execution history (agent or script) — the observable trace of
+        # what each fire actually did.
+        log_store = None
+        if coordinator is not None and coordinator._execution_log is not None:  # noqa: SLF001
+            log_store = coordinator._execution_log  # noqa: SLF001
+        else:
+            try:
+                log_store = DuckDBExecutionLogStore(ctx.settings.duckdb_path)
+            except Exception:
+                log_store = None
+        records = []
+        if log_store is not None:
+            try:
+                records = log_store.get_history(task_id=task.task_id, limit=5)
+            except Exception:
+                records = []
+        if records:
+            import datetime as _dt_st
+            lines.append("  recent runs:")
+            for r in records:
+                ts = _dt_st.datetime.fromtimestamp(r.started_at).strftime("%Y-%m-%d %H:%M:%S")
+                detail = (r.result_summary or r.error or "")[:80]
+                detail_str = f" — {detail}" if detail else ""
+                lines.append(f"    [{ts}] {r.status}{detail_str}")
+        else:
+            lines.append("  recent runs: none")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    # ── /schedule cancel <task_id> ───────────────────────────────────
+    if verb == "cancel":
+        task_id = rest
+        if not task_id:
+            return {"ok": False, "message": "Usage: /schedule cancel <task_id>"}
+        if task_store is None:
+            return {"ok": False, "message": "No scheduler active."}
+
+        # Prefer coordinator for unified cancellation (including cloud workers)
+        if coordinator is not None:
+            try:
+                import asyncio as _asyncio_cancel
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    pool.submit(
+                        _asyncio_cancel.run, coordinator.cancel(task_id),
+                    ).result(timeout=30)
+            except ValueError as exc:
+                return {"ok": False, "message": str(exc)}
+            except Exception as exc:
+                # Coordinator failed, fallback to direct state update
+                try:
+                    task_store.update_state(task_id, "suspended")
+                except Exception:
+                    return {"ok": False, "message": f"Failed to cancel: {exc}"}
+        else:
+            try:
+                task_store.update_state(task_id, "suspended")
+            except Exception as exc:
+                return {"ok": False, "message": f"Failed to cancel: {exc}"}
+
+        return {"ok": True, "message": f"Cancelled task {task_id[:8]}."}
+
+    # ── /schedule pause <task_id> ────────────────────────────────────
+    if verb == "pause":
+        task_id = rest
+        if not task_id:
+            return {"ok": False, "message": "Usage: /schedule pause <task_id>"}
+        if task_store is None:
+            return {"ok": False, "message": "No scheduler active."}
+        try:
+            task_store.update_state(task_id, "paused")
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to pause: {exc}"}
+        return {"ok": True, "message": f"Paused task {task_id[:8]}."}
+
+    # ── /schedule resume <task_id> ───────────────────────────────────
+    if verb == "resume":
+        task_id = rest
+        if not task_id:
+            return {"ok": False, "message": "Usage: /schedule resume <task_id>"}
+        if task_store is None:
+            return {"ok": False, "message": "No scheduler active."}
+        try:
+            _resume_task_sync(task_store, task_id)
+        except ValueError as exc:
+            return {"ok": False, "message": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to resume: {exc}"}
+        return {"ok": True, "message": f"Resumed task {task_id[:8]}."}
+
+    # ── /schedule edit <task_id> <trigger_expr> ──────────────────────
+    if verb == "edit":
+        edit_parts = rest.split(None, 1)
+        if len(edit_parts) < 2:
+            return {"ok": False, "message": "Usage: /schedule edit <task_id> <trigger_expr>"}
+        task_id, trigger_expr = edit_parts[0], edit_parts[1]
+        if task_store is None:
+            return {"ok": False, "message": "No scheduler active."}
+        try:
+            _edit_task_sync(task_store, task_id, trigger_expr)
+        except ValueError as exc:
+            return {"ok": False, "message": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to edit: {exc}"}
+        return {"ok": True, "message": f"Updated task {task_id[:8]} trigger to: {trigger_expr}"}
+
+    # ── /schedule run <task_id> ─────────────────────────────────────
+    if verb == "run":
+        task_id = rest
+        if not task_id:
+            return {"ok": False, "message": "Usage: /schedule run <task_id>"}
+        if task_store is None:
+            return {"ok": False, "message": "No scheduler active."}
+        task = task_store.load(task_id)
+        if task is None:
+            return {"ok": False, "message": f"Task not found: {task_id}"}
+        # Execute immediately via the coordinator's underlying local scheduler.
+        import asyncio as _asyncio_run
+        import json as _json_run
+        if coordinator is not None and coordinator._local is not None:  # noqa: SLF001
+            try:
+                local_sched = coordinator._local  # noqa: SLF001
+                params = (
+                    task.parameters
+                    if isinstance(task.parameters, dict)
+                    else _json_run.loads(task.parameters)
+                )
+                coro = local_sched._executor.execute(task.skill_name, params)  # noqa: SLF001
+                # Always use a worker thread so asyncio.run() gets its own loop,
+                # avoiding deprecated get_event_loop() and working regardless of
+                # whether the caller is already inside a running loop.
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    result = pool.submit(
+                        _asyncio_run.run, coro,
+                    ).result(timeout=120)
+                ok = result.get("ok", False)
+                output = str(result.get("output", ""))[:200] if ok else str(result.get("error", ""))[:200]
+                return {"ok": True, "message": f"Task {task_id[:8]} executed: ok={ok}\n{output}".strip()}
+            except Exception as exc:
+                return {"ok": False, "message": f"Manual execution failed: {exc}"}
+        return {"ok": False, "message": "No local scheduler available to execute the task."}
+
+    # ── /schedule doctor ─────────────────────────────────────────
+    if verb == "doctor":
+        if task_store is None:
+            return {"ok": True, "message": "No scheduler active."}
+        import time as _time_doc
+        try:
+            tasks = task_store.load_all()
+        except Exception as exc:
+            return {"ok": False, "message": f"Failed to load tasks: {exc}"}
+        now = _time_doc.time()
+        # Count by state
+        state_counts: dict[str, int] = {}
+        stale_tasks: list[str] = []
+        near_exhaustion: list[str] = []
+        for t in tasks:
+            state_counts[t.state] = state_counts.get(t.state, 0) + 1
+            # Stale: armed but next_due is in the past
+            if t.state == "armed" and t.next_due_at > 0 and t.next_due_at < now - 120:
+                stale_tasks.append(f"{t.task_id[:8]} (overdue {int(now - t.next_due_at)}s)")
+            # Near retry exhaustion
+            if t.max_retries > 0 and t.retry_count >= t.max_retries - 1 and t.state not in ("done", "suspended", "failed"):
+                near_exhaustion.append(f"{t.task_id[:8]} (retry {t.retry_count}/{t.max_retries})")
+
+        lines = ["Scheduler Diagnostics:"]
+        lines.append(f"  Total tasks: {len(tasks)}")
+        for state, count in sorted(state_counts.items()):
+            lines.append(f"  {state}: {count}")
+        if stale_tasks:
+            lines.append(f"  Stale (next_due in past): {', '.join(stale_tasks)}")
+        else:
+            lines.append("  Stale: none")
+        if near_exhaustion:
+            lines.append(f"  Near retry exhaustion: {', '.join(near_exhaustion)}")
+        else:
+            lines.append("  Near retry exhaustion: none")
+        return {"ok": True, "message": "\n".join(lines)}
+
+    return {"ok": False, "message": f"Unknown schedule subcommand: {verb}. Use list, status, history, cancel, pause, resume, edit, run, or doctor."}
+
+
+def _resume_task_sync(task_store: Any, task_id: str) -> None:
+    """Sync fallback: recalculate next_due and re-arm a paused task."""
+    from leapflow.scheduler.triggers import create_trigger as _create_trigger
+    import time as _t
+
+    task = task_store.load(task_id)
+    if task is None:
+        raise ValueError(f"Task not found: {task_id}")
+    trigger = _create_trigger(
+        task.trigger_type,
+        task.trigger_config if isinstance(task.trigger_config, dict) else {},
+    )
+    trigger.advance(_t.time())
+    task_store.update_task(
+        task_id,
+        state="armed",
+        next_due_at=trigger.next_due_at,
+    )
+
+
+def _edit_task_sync(task_store: Any, task_id: str, trigger_expr: str) -> None:
+    """Sync fallback: parse a new trigger expression and update the task."""
+    from leapflow.scheduler.coordinator import parse_trigger_expression
+    from leapflow.scheduler.triggers import create_trigger as _create_trigger
+    import time as _t
+
+    trigger_type, trigger_config = parse_trigger_expression(trigger_expr)
+    trigger = _create_trigger(trigger_type, trigger_config)
+    trigger.advance(_t.time())
+    task_store.update_task(
+        task_id,
+        trigger_type=trigger_type,
+        trigger_config=trigger_config,
+        next_due_at=trigger.next_due_at,
+    )
 
 
 async def _ensure_session_watch_refresh(
@@ -2595,7 +3123,7 @@ def build_status_payload(ctx: "Context") -> dict[str, Any]:
     platform_status = "connected" if (hasattr(ctx.rpc, "connected") and ctx.rpc.connected) else "mock"
     cwd = os.getcwd().replace(os.path.expanduser("~"), "~")
 
-    from leapflow.engine.session import SessionMode
+    from leapflow.engine.session.session import SessionMode
     mode = "idle"
     if ctx.session:
         if ctx.session.mode == SessionMode.LEARNING:
@@ -2706,7 +3234,7 @@ async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]
     Returns ``session_mode`` in the payload so the TUI client can track
     whether it should route subsequent inputs as annotations.
     """
-    from leapflow.engine.session import SessionMode
+    from leapflow.engine.session.session import SessionMode
 
     full_cmd = name + (" " + args if args else "")
     if full_cmd in ("teach start", "teach") or full_cmd.startswith("teach start "):
@@ -2883,6 +3411,83 @@ def _execute_skill(ctx: "Context", name: str, args: str) -> dict[str, Any]:
             return {"ok": True, "message": f"Skill '{skill_name}' deleted."}
         return {"ok": False, "message": f"Skill '{skill_name}' not found."}
 
+    # ── /skill curator subcommands ──
+    if name == "skill curator" or full_cmd == "skill curator":
+        curator = getattr(ctx, "skill_curator", None)
+        if curator is None:
+            return {"ok": False, "message": "Skill curator is not initialized."}
+        # Parse subcommand from args
+        sub_parts = args.strip().split(None, 1) if args.strip() else []
+        sub_cmd = sub_parts[0] if sub_parts else ""
+        sub_args = sub_parts[1] if len(sub_parts) > 1 else ""
+
+        if not sub_cmd:
+            # Show curation report
+            report = curator.get_curation_report()
+            lines = [
+                "Skill Curation Report",
+                f"  Total: {report.total}  Active: {report.active}  "
+                f"Stale: {report.stale}  Archived: {report.archived}  "
+                f"Pinned: {report.pinned}",
+            ]
+            return {"ok": True, "message": "\n".join(lines)}
+
+        if sub_cmd == "sweep":
+            report = curator.apply_automatic_transitions()
+            t_count = len(report.transitions)
+            lines = [
+                f"Sweep complete: {t_count} transition(s).",
+                f"  Active: {report.active}  Stale: {report.stale}  "
+                f"Archived: {report.archived}  Pinned: {report.pinned}",
+            ]
+            if report.transitions:
+                for t in report.transitions:
+                    lines.append(
+                        f"  {t.skill_name}: {t.from_state.value} → {t.to_state.value} ({t.reason})"
+                    )
+            return {"ok": True, "message": "\n".join(lines)}
+
+        if sub_cmd == "archive":
+            parts = sub_args.strip().split(None, 1)
+            skill_name = parts[0] if parts else ""
+            reason = parts[1] if len(parts) > 1 else ""
+            if not skill_name:
+                return {"ok": False, "message": "Usage: /skill curator archive <name> [reason]"}
+            try:
+                curator.archive(skill_name, reason)
+                return {"ok": True, "message": f"Skill '{skill_name}' archived."}
+            except KeyError as e:
+                return {"ok": False, "message": str(e)}
+
+        if sub_cmd == "reactivate":
+            skill_name = sub_args.strip()
+            if not skill_name:
+                return {"ok": False, "message": "Usage: /skill curator reactivate <name>"}
+            try:
+                curator.reactivate(skill_name)
+                return {"ok": True, "message": f"Skill '{skill_name}' reactivated."}
+            except KeyError as e:
+                return {"ok": False, "message": str(e)}
+
+        if sub_cmd == "pin":
+            skill_name = sub_args.strip()
+            if not skill_name:
+                return {"ok": False, "message": "Usage: /skill curator pin <name>"}
+            curator.pin(skill_name)
+            return {"ok": True, "message": f"Skill '{skill_name}' pinned."}
+
+        if sub_cmd == "unpin":
+            skill_name = sub_args.strip()
+            if not skill_name:
+                return {"ok": False, "message": "Usage: /skill curator unpin <name>"}
+            try:
+                curator.unpin(skill_name)
+                return {"ok": True, "message": f"Skill '{skill_name}' unpinned."}
+            except KeyError as e:
+                return {"ok": False, "message": str(e)}
+
+        return {"ok": False, "message": f"Unknown curator command: {sub_cmd}"}
+
     return {"ok": False, "message": f"Unknown skill command: /{full_cmd}"}
 
 
@@ -2976,6 +3581,9 @@ def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> N
     if view == "dashboard":
         _render_dashboard_view(console, payload)
         return
+    if view == "btw":
+        _render_btw_view(console, payload)
+        return
 
     msg = payload.get("message")
     if msg:
@@ -3000,6 +3608,15 @@ def _ago(ts: Any) -> str:
     if delta < 86400:
         return f"{delta // 3600}h ago"
     return f"{delta // 86400}d ago"
+
+
+def _render_btw_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    """Render a /btw side question answer in the TUI (daemon path)."""
+    answer = str(payload.get("answer") or "")
+    if answer:
+        console.markdown(answer)
+    else:
+        console.system("(no answer)")
 
 
 def _board_page_url() -> str:

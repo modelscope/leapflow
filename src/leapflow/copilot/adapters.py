@@ -121,24 +121,24 @@ class EpisodicSequenceAdapter:
 
     def seed_markov(self, predictor: "L1MarkovPredictor", lookback: int = 100) -> int:
         """Extract recent event sequences and feed them into the predictor.
-    
+
         Uses the predictor's public ``import_state()`` API to inject transitions
         without accessing private internals.
-    
+
         Returns the number of transitions seeded.
         """
         fragments = self._episodic.recent(limit=lookback)
         if len(fragments) < 2:
             return 0
-    
+
         # Build a pseudo action_ring from recent event types
         action_sequence = [f.event_type for f in fragments]
-    
+
         # Build transition counts via sliding window
         ngram_n = predictor.export_state().get("ngram_n", 3)
         transitions: dict[str, dict[str, int]] = {}
         totals: dict[str, int] = {}
-    
+
         for i in range(ngram_n, len(action_sequence)):
             key = "\u2192".join(action_sequence[i - ngram_n: i])
             action = action_sequence[i]
@@ -146,28 +146,28 @@ class EpisodicSequenceAdapter:
                 transitions.get(key, {}).get(action, 0) + 1
             )
             totals[key] = totals.get(key, 0) + 1
-    
+
         if not transitions:
             return 0
-    
+
         # Merge into the predictor via public API
         existing = predictor.export_state()
         existing_transitions = existing.get("transitions", {})
         existing_totals = existing.get("totals", {})
-    
+
         # Merge new transitions into existing (additive)
         for key, actions in transitions.items():
             bucket = existing_transitions.setdefault(key, {})
             for act, count in actions.items():
                 bucket[act] = bucket.get(act, 0) + count
             existing_totals[key] = existing_totals.get(key, 0) + totals[key]
-    
+
         predictor.import_state({
             "ngram_n": ngram_n,
             "transitions": existing_transitions,
             "totals": existing_totals,
         })
-    
+
         transitions_seeded = sum(totals.values())
         logger.info(
             "EpisodicSequenceAdapter seeded %d transitions from %d events",

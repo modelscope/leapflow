@@ -54,7 +54,7 @@ def _headless_prompt_toolkit_output(monkeypatch: pytest.MonkeyPatch) -> None:
 # ════════════════════════════════════════════════════════════════
 
 _TESTS_ROOT = Path(__file__).resolve().parent
-_EXPLICIT_LAYERS = frozenset({"unit", "component", "e2e", "live"})
+_EXPLICIT_LAYERS = frozenset({"unit", "component", "integration", "e2e", "live"})
 
 
 def pytest_collection_modifyitems(
@@ -64,8 +64,9 @@ def pytest_collection_modifyitems(
 
     Labelling by path keeps the 1400-case mock suite untouched while still making
     the layers selectable: ``tests/journeys/`` is the real end-to-end layer,
-    ``tests/regression/`` is the always-on incident ledger, and everything else
-    defaults to ``unit`` unless the file opts into ``component`` itself.
+    ``tests/regression/`` is the always-on incident ledger, ``tests/live/`` is the
+    real LLM provider layer, and everything else defaults to ``unit`` unless the
+    file opts into ``component`` itself.
     """
     for item in items:
         try:
@@ -74,6 +75,11 @@ def pytest_collection_modifyitems(
             continue
         top = relative.parts[0] if relative.parts else ""
         if top == "journeys":
+            item.add_marker(pytest.mark.e2e)
+            item.add_marker(pytest.mark.slow)
+            continue
+        if top == "live":
+            item.add_marker(pytest.mark.live)
             item.add_marker(pytest.mark.e2e)
             item.add_marker(pytest.mark.slow)
             continue

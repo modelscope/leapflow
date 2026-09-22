@@ -2,6 +2,7 @@
 """Approval orchestration: policy, grants, prompting, and audit."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,8 +15,11 @@ from leapflow.security.grants import (
     InMemoryApprovalGrantStore,
     grant_key,
 )
+from leapflow.security.guardian import DenialBreaker, GuardianConfig, GuardianDecisionAdapter
 from leapflow.security.policy import ApprovalPolicyEngine, PolicyVerdict
 from leapflow.security.risk import DefaultRiskClassifier, RiskAssessment, RiskClassifier, RiskLevel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -47,7 +51,14 @@ class ApprovalResult:
 
 
 class ApprovalOrchestrator:
-    """Coordinates risk assessment, grant lookup, human approval, and audit."""
+    """Coordinates risk assessment, grant lookup, human approval, and audit.
+
+    Optional Guardian integration: when a ``GuardianDecisionAdapter`` is
+    injected, the orchestrator consults the LLM for ASK-tier requests before
+    falling through to the human prompt.  The Guardian can auto-approve
+    (low LLM score), auto-deny (high LLM score), or defer to the human
+    ("review").  A ``DenialBreaker`` prevents infinite loops.
+    """
 
     def __init__(
         self,
@@ -57,12 +68,19 @@ class ApprovalOrchestrator:
         policy: ApprovalPolicyEngine | None = None,
         grants: ApprovalGrantStore | None = None,
         audit: ApprovalAuditLog | None = None,
+        guardian: GuardianDecisionAdapter | None = None,
+        guardian_config: GuardianConfig | None = None,
     ) -> None:
         self._gate = gate
         self._risk = risk_classifier or DefaultRiskClassifier()
         self._policy = policy or ApprovalPolicyEngine()
         self._grants = grants or InMemoryApprovalGrantStore()
         self._audit = audit or ApprovalAuditLog()
+        self._guardian = guardian
+        self._guardian_config = guardian_config or (guardian.config if guardian else GuardianConfig())
+        self._denial_breaker = DenialBreaker(
+            max_consecutive_denials=self._guardian_config.max_consecutive_denials,
+        )
 
     @property
     def audit(self) -> ApprovalAuditLog:
@@ -72,6 +90,14 @@ class ApprovalOrchestrator:
     def grants(self) -> ApprovalGrantStore:
         return self._grants
 
+    @property
+    def denial_breaker(self) -> DenialBreaker:
+        return self._denial_breaker
+
+    def reset_turn(self) -> None:
+        """Reset per-turn state (call between turns)."""
+        self._denial_breaker.reset()
+
     async def evaluate(self, action: ActionDescriptor) -> ApprovalResult:
         """Return an approval result, prompting only when policy requires it."""
         from leapflow.security.approval import ApprovalDecision, ApprovalRequest
@@ -79,15 +105,31 @@ class ApprovalOrchestrator:
         risk = self._risk.assess(action)
         policy = self._policy.evaluate(action, risk)
         if policy.verdict == PolicyVerdict.ALLOW:
+            self._denial_breaker.record_approval()
             return self._approved(action, risk, actor="policy", reason=policy.reason)
         if policy.verdict == PolicyVerdict.DENY:
+            self._denial_breaker.record_denial()
             return self._denied(action, risk, actor="policy", reason=policy.reason)
+
+        # DenialBreaker: fast-deny if too many consecutive denials
+        if self._denial_breaker.is_tripped():
+            return self._denied(
+                action, risk, actor="denial_breaker",
+                reason="consecutive denial limit reached",
+            )
 
         existing = self._existing_grant(action)
         if existing is not None:
             if existing.decision.startswith("deny"):
+                self._denial_breaker.record_denial()
                 return self._denied(action, risk, actor="grant", reason=existing.reason)
+            self._denial_breaker.record_approval()
             return self._approved(action, risk, actor="grant", scope=existing.scope, reason=existing.reason)
+
+        # Guardian LLM evaluation for ASK-tier requests
+        guardian_result = await self._try_guardian(action, risk)
+        if guardian_result is not None:
+            return guardian_result
 
         request = ApprovalRequest(
             category=action.kind,
@@ -115,6 +157,7 @@ class ApprovalOrchestrator:
             ApprovalDecision.ALLOW_SESSION,
             ApprovalDecision.ALLOW_ALWAYS,
         }:
+            self._denial_breaker.record_approval()
             scope = self._scope_from_decision(decision)
             if scope in {ApprovalScope.SESSION.value, ApprovalScope.PROFILE.value}:
                 self._grants.put(ApprovalGrant(
@@ -129,6 +172,7 @@ class ApprovalOrchestrator:
             return self._approved(action, risk, actor="user", scope=scope, reason=decision.value)
 
         if decision == ApprovalDecision.DENY_ALWAYS:
+            self._denial_breaker.record_denial()
             self._grants.put(ApprovalGrant(
                 key=grant_key(action, ApprovalScope.SESSION),
                 scope=ApprovalScope.SESSION.value,
@@ -145,6 +189,7 @@ class ApprovalOrchestrator:
                 reason=decision.value,
                 scope=ApprovalScope.SESSION.value,
             )
+        self._denial_breaker.record_denial()
         return self._denied(action, risk, actor="user", reason=decision.value)
 
     async def check(self, command: str) -> bool:
@@ -234,6 +279,51 @@ class ApprovalOrchestrator:
         if value in {"allow_always", "always"}:
             return ApprovalScope.PROFILE.value
         return ApprovalScope.ONCE.value
+
+    async def _try_guardian(
+        self,
+        action: ActionDescriptor,
+        risk: RiskAssessment,
+    ) -> ApprovalResult | None:
+        """Consult the Guardian LLM if configured and applicable.
+
+        Returns an ``ApprovalResult`` when the Guardian auto-resolves the
+        request (approve or deny).  Returns ``None`` when the request should
+        proceed to the human approval prompt.
+        """
+        mode = self._guardian_config.mode
+        if mode == "static_only" or self._guardian is None:
+            return None
+
+        try:
+            verdict = await self._guardian.evaluate(
+                tool_name=action.kind,
+                detail=action.detail,
+                risk_hint=risk.score,
+                session_id=action.session_id,
+                metadata={"action_id": action.action_id, "effect": action.effect},
+            )
+        except Exception as exc:
+            logger.warning("guardian evaluation failed: %s", exc)
+            if mode == "hybrid":
+                return None  # degrade to human prompt
+            # llm_assisted: failure is an error but we still degrade safely
+            return None
+
+        if verdict.recommendation == "approve":
+            self._denial_breaker.record_approval()
+            return self._approved(
+                action, risk, actor="guardian",
+                reason=f"guardian auto-approve (score={verdict.risk_score:.2f})",
+            )
+        if verdict.recommendation == "deny":
+            self._denial_breaker.record_denial()
+            return self._denied(
+                action, risk, actor="guardian",
+                reason=f"guardian auto-deny (score={verdict.risk_score:.2f})",
+            )
+        # "review" — fall through to human prompt
+        return None
 
     @staticmethod
     def _title(risk: RiskAssessment) -> str:

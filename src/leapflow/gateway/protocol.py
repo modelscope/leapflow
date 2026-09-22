@@ -105,6 +105,31 @@ class SendResult:
 
 
 # ═══════════════════════════════════════════════════════════════
+# Platform capabilities
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class PlatformCapabilities:
+    """Typed declaration of what a platform adapter natively supports.
+
+    Defaults are conservative (off / low limits) so adapters that do not
+    override still degrade gracefully via ``PlatformAdapterMixin``.
+    """
+
+    supports_streaming: bool = False
+    supports_rich_text: bool = False
+    supports_images: bool = False
+    supports_files: bool = False
+    supports_reactions: bool = False
+    supports_threads: bool = False
+    supports_group_chat: bool = False
+    supports_edit: bool = False
+    supports_async_delivery: bool = True
+    splits_long_messages: bool = False
+    max_message_length: int = 4000
+
+
+# ═══════════════════════════════════════════════════════════════
 # Platform adapter contract
 # ═══════════════════════════════════════════════════════════════
 
@@ -118,15 +143,21 @@ class PlatformAdapter(Protocol):
     Each adapter manages its own connection lifecycle.
     The gateway sets ``on_message`` before calling ``connect()``.
 
-    Capability flags are declared as class-level attributes.  Callers
-    read them via ``getattr()`` to determine platform-specific behaviour
-    without ``isinstance`` checks.
+    Platform-specific capability flags are exposed through the typed
+    ``capabilities`` property returning a ``PlatformCapabilities``
+    instance.  Legacy class-level flags (``supports_async_delivery``,
+    ``splits_long_messages``, ``max_message_length``) are still present
+    for structural compatibility but callers should prefer the typed
+    accessor.
     """
 
     @property
     def platform_id(self) -> str: ...
 
-    # ── Capability flags (class-level declarations) ──────────
+    # ── Capabilities ──────────────────────────────────────────
+    @property
+    def capabilities(self) -> PlatformCapabilities: ...
+
     supports_async_delivery: bool
     splits_long_messages: bool
     max_message_length: int

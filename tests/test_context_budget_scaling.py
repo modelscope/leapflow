@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from leapflow.engine.context_compressor import (
+from leapflow.engine.context.context_compressor import (
     _RESULT_CEILING_CHARS,
     _RESULT_FLOOR_CHARS,
     adaptive_tool_result_chars,

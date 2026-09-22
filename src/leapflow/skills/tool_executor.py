@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from leapflow.engine.budget import BudgetConfig, BudgetStatus, IterationBudget
-from leapflow.engine.context_compressor import CompressorConfig, ContextCompressor
+from leapflow.engine.context.context_compressor import CompressorConfig, ContextCompressor
 from leapflow.engine.message_healer import MessageHealer
 
 if TYPE_CHECKING:

@@ -18,7 +18,8 @@ from conftest import make_settings
 
 
 def _build_base_engine(td: str, llm):
-    from leapflow.engine.engine import AgentEngine, build_default_registry
+    from leapflow.engine.engine import AgentEngine
+    from leapflow.engine import build_default_registry
     from leapflow.memory import (
         EpisodicMemoryProvider,
         SemanticMemoryProvider,
@@ -67,7 +68,7 @@ class _EchoLLM:
 
 
 def test_build_session_engine_isolates_substrate() -> None:
-    from leapflow.engine.session_factory import build_session_engine
+    from leapflow.engine.session.session_factory import build_session_engine
     from leapflow.memory import WorkingMemoryProvider
 
     with tempfile.TemporaryDirectory() as td:
@@ -111,7 +112,7 @@ def test_build_session_engine_isolates_substrate() -> None:
 
 @pytest.mark.asyncio
 async def test_concurrent_session_engines_are_isolated() -> None:
-    from leapflow.engine.session_factory import build_session_engine
+    from leapflow.engine.session.session_factory import build_session_engine
     from leapflow.memory import WorkingMemoryProvider
 
     with tempfile.TemporaryDirectory() as td:
@@ -170,11 +171,11 @@ def test_ensure_session_creates_a_provided_session_id() -> None:
             base._settings = SimpleNamespace(session_persistence_enabled=True, llm_model="m")
             # Simulate the daemon binding the engine to a client-provided id.
             base._current_session_id = "client-owned-id"
-            assert base._ensure_session("hello there") == "client-owned-id"
+            assert base._session_persistence._ensure_session("hello there") == "client-owned-id"
             assert store.created == ["client-owned-id"]        # created for the provided id
             assert ("client-owned-id", "user") in store.messages
             # A second turn reuses the existing session (no duplicate create).
-            base._ensure_session("second message")
+            base._session_persistence._ensure_session("second message")
             assert store.created == ["client-owned-id"]
         finally:
             lt.close()
@@ -186,8 +187,8 @@ async def test_parallel_tools_are_bounded_by_max_parallel() -> None:
     agent.max_parallel_tools in flight at once."""
     from dataclasses import replace
 
-    from leapflow.engine.execution_trace import ExecutionTrace
-    from leapflow.engine.tool_concurrency import ToolCall
+    from leapflow.engine.tools.execution_trace import ExecutionTrace
+    from leapflow.engine.tools.tool_concurrency import ToolCall
 
     with tempfile.TemporaryDirectory() as td:
         base, lt = _build_base_engine(td, _EchoLLM())
@@ -204,9 +205,9 @@ async def test_parallel_tools_are_bounded_by_max_parallel() -> None:
                 in_flight -= 1
                 return {"ok": True}
 
-            base._execute_tool_with_ledger = _stub  # type: ignore[assignment]
+            base._tool_dispatch._execute_tool_with_ledger = _stub  # type: ignore[assignment]
             calls = [ToolCall(id=f"c{i}", name="file_read", arguments={"path": f"/x{i}.py"}) for i in range(5)]
-            await base._execute_tools_concurrent(calls, {}, trace=ExecutionTrace(), messages=[])
+            await base._tool_dispatch._execute_tools_concurrent(calls, {}, trace=ExecutionTrace(), messages=[])
             assert peak == 2  # 5 read-only calls, capped at 2 concurrent
         finally:
             lt.close()

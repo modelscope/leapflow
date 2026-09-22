@@ -225,6 +225,40 @@ def test_unknown_key_suggests_the_real_one(cfg_home, typo: str, expected: str) -
     assert expected in result["did_you_mean"]
 
 
+@pytest.mark.parametrize("handler_args", [
+    {"key": "llm.provider"},
+    {"key": "llm.provider", "value": "deepseek"},
+])
+def test_unknown_llm_provider_explains_the_endpoint_based_contract(cfg_home, handler_args) -> None:
+    """Provider selection must recover to the public model/endpoint keys."""
+    handler = (
+        config_tools.config_set_handler
+        if "value" in handler_args
+        else config_tools.config_get_handler
+    )
+
+    result = asyncio.run(handler(handler_args))
+
+    assert result["ok"] is False
+    assert result["retryable"] is True
+    assert "llm.model" in result["did_you_mean"]
+    connection = result["llm_connection"]
+    assert connection["keys"] == ["llm.model", "llm.base_url", "llm.api_key"]
+    assert "llm.provider is not a setting" in connection["provider_selection"]
+
+
+def test_config_tool_schema_discloses_the_llm_endpoint_contract() -> None:
+    """The model must learn the public keys before choosing an LLM endpoint."""
+    from leapflow.plugins.tool_plugins.config_tools import ConfigToolsPlugin
+
+    tools = {tool.name: tool for tool in ConfigToolsPlugin().tools}
+
+    for name in ("config_get", "config_set"):
+        description = tools[name].description
+        assert "llm.base_url" in description
+        assert "There is no 'llm.provider' key" in description
+
+
 def test_config_tools_ignore_the_workspace_boundary(cfg_home) -> None:
     """They take keys, so an unrelated workspace context must not affect them.
 

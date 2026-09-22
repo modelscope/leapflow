@@ -67,9 +67,9 @@ def _requirement():
 
 
 def _drive_engine_outcome(item, workspace):
-    from leapflow.engine.engine import AgentEngine
+    from leapflow.engine.learning_bridge import LearningBridge
 
-    AgentEngine._record_coevolution_outcome(item, workspace)
+    LearningBridge._record_coevolution_outcome(item, workspace)
 
 
 def _registry_for(tool_name, plugin_id):

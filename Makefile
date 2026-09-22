@@ -23,14 +23,17 @@ sync:  ## Sync dependencies (excludes the heavy leapspace extra)
 space-sync:  ## Sync all dependencies including the leapspace extra
 	uv sync --all-extras
 
-lint:  ## Lint source code
-	uv run ruff check src/ tests/ tools/
+# Identical scope + runner to the CI "Lint" step (.github/workflows/ci.yaml), so
+# `make lint` and CI can never disagree. leapspace is opt-in everywhere else and
+# CI never syncs it (--no-extra leapspace), so it stays out of the lint gate too.
+lint:  ## Lint source code (mirrors the CI Lint step exactly)
+	uv run ruff check src/leapflow/ tests/ tools/
 
 # ── Test layers ───────────────────────────────────────────────────────────────
 # The mock layer is broad and fast; the real layer is small, coarse, and never
 # skipped. Both run offline: the LLM boundary is served from committed cassettes.
 
-test: test-unit test-e2e  ## Default gate: mock layer + real journeys (offline)
+test: lint test-unit test-e2e  ## Default gate: lint + mock layer + real journeys (offline)
 
 test-unit:  ## Mock layer — hermetic units and components
 	uv run pytest tests/ -q -m "not e2e" -n $(JOBS)

@@ -1,14 +1,14 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from __future__ import annotations
 
-from leapflow.engine.context_focus import (
+from leapflow.engine.context.context_focus import (
     ContextPlane,
     FocusEntity,
     SessionFocusState,
     control_event_from_tool,
     focus_entity_from_tool,
 )
-from leapflow.engine.reference_resolver import ReferenceResolver
+from leapflow.engine.context.reference_resolver import ReferenceResolver
 
 
 def _minicpm_focus(turn_id: int = 1) -> FocusEntity:

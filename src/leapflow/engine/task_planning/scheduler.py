@@ -1,0 +1,435 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""DAG-based task scheduler with parallel execution, retry, and fault tolerance.
+
+Executes a TaskGraph by:
+1. Finding ready nodes (all dependencies completed)
+2. Executing them in parallel (bounded by max_concurrency)
+3. Handling failures via RetryPolicy (exponential backoff + fallback)
+4. Propagating results to downstream nodes via template resolution
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from typing import Any, Awaitable, Callable, Dict, Optional, Protocol, Set, runtime_checkable
+
+from .task_graph import TaskGraph, TaskNode, TaskStatus, RetryPolicy
+from leapflow.skills.registry import SkillRegistry
+
+logger = logging.getLogger(__name__)
+
+# Callback type for progress reporting
+NodeCallback = Callable[[TaskNode, TaskGraph], None]
+ActionDispatcher = Callable[[Dict[str, Any], str], Awaitable[Any]]
+
+
+@runtime_checkable
+class SubagentNodeExecutor(Protocol):
+    """Protocol for executing agent-mode DAG nodes via a subagent.
+
+    This re-uses the same contract as ``SubagentExecutor`` in
+    :mod:`leapflow.engine.subagent`, declared separately here so the
+    task-planning sub-package has no module-level cross-sub-package import
+    (per engine architecture rules).
+    """
+
+    async def execute_subagent(self, config: Any) -> Any:
+        ...
+
+
+class SchedulerError(Exception):
+    """Raised when the scheduler encounters an unrecoverable issue."""
+
+
+class DeadlockError(SchedulerError):
+    """Raised when no progress can be made (no ready nodes, graph incomplete)."""
+
+
+class TaskScheduler:
+    """Async DAG scheduler with bounded parallelism and fault tolerance.
+
+    Design principles:
+    - Single-responsibility: only orchestrates execution order and concurrency
+    - Open/closed: extensible dispatch via action_type routing
+    - Dependency inversion: delegates every operation through ActionDispatcher
+    """
+
+    def __init__(
+        self,
+        registry: SkillRegistry,
+        *,
+        max_concurrency: int = 3,
+        on_node_complete: Optional[NodeCallback] = None,
+        on_node_failed: Optional[NodeCallback] = None,
+        graph_planner: Optional[Any] = None,
+        action_dispatcher: Optional[ActionDispatcher] = None,
+        subagent_executor: Optional[SubagentNodeExecutor] = None,
+    ) -> None:
+        self._registry = registry
+        self._max_concurrency = max_concurrency
+        self._on_node_complete = on_node_complete
+        self._on_node_failed = on_node_failed
+        self._graph_planner = graph_planner
+        self._action_dispatcher = action_dispatcher
+        self._subagent_executor = subagent_executor
+        self._semaphore: Optional[asyncio.Semaphore] = None
+
+    def set_action_dispatcher(self, dispatcher: ActionDispatcher) -> None:
+        """Bind the runtime's single action execution entry point."""
+        self._action_dispatcher = dispatcher
+
+    def set_subagent_executor(self, executor: Optional[SubagentNodeExecutor]) -> None:
+        """Bind an optional subagent executor for agent-mode DAG nodes."""
+        self._subagent_executor = executor
+
+    # ═══ Public API ═══
+
+    async def execute_graph(self, graph: TaskGraph) -> TaskGraph:
+        """Execute the entire task graph, returning the updated graph.
+
+        Algorithm:
+        1. Validate graph structure
+        2. Initialize concurrency semaphore
+        3. Loop: find ready nodes → execute in parallel → update states
+        4. Continue until graph.is_complete or deadlock detected
+        5. Return graph with all results populated
+
+        Raises:
+            ValueError: If graph fails validation.
+            DeadlockError: If no progress is possible.
+        """
+        errors = graph.validate()
+        if errors:
+            raise ValueError(f"Invalid graph: {'; '.join(errors)}")
+
+        self._semaphore = asyncio.Semaphore(self._max_concurrency)
+
+        while not graph.is_complete:
+            ready = graph.ready_nodes()
+            if not ready:
+                self._handle_deadlock(graph)
+                break
+
+            tasks = [self._execute_with_semaphore(node, graph) for node in ready]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, BaseException):
+                    node = ready[i]
+                    logger.error(
+                        "scheduler.unhandled_exception node=%s error=%s",
+                        node.id, result, exc_info=result
+                    )
+                    # If the node hasn't been marked failed yet (exception outside _execute_node)
+                    if node.status == TaskStatus.RUNNING:
+                        graph.mark_failed(node.id, f"Unhandled: {result}")
+
+        return graph
+
+    async def execute_node_isolated(
+        self, node: TaskNode, graph: TaskGraph
+    ) -> TaskNode:
+        """Execute a single node (useful for testing or manual re-execution).
+
+        Returns the node with updated status/result.
+        """
+        await self._execute_node(node, graph)
+        return node
+
+    # ═══ Internal Execution ═══
+
+    async def _execute_with_semaphore(
+        self, node: TaskNode, graph: TaskGraph
+    ) -> None:
+        """Execute a single node with concurrency limiting."""
+        async with self._semaphore:  # type: ignore[union-attr]
+            await self._execute_node(node, graph)
+
+    async def _execute_node(self, node: TaskNode, graph: TaskGraph) -> None:
+        """Execute a single task node with retry and error handling.
+
+        Steps:
+        1. Evaluate condition (skip if false)
+        2. Resolve params (template references from upstream results)
+        3. Execute action (skill or bridge) with retry loop
+        4. Handle success/failure state transitions
+        """
+        # Condition check — skip node if condition evaluates to false
+        if node.condition:
+            if not self._evaluate_condition(node.condition, graph):
+                graph.mark_skipped(node.id, reason=f"Condition false: {node.condition}")
+                return
+
+        graph.mark_running(node.id)
+        resolved_params = graph.resolve_params(node)
+
+        total_iterations = max(1, node.repeat_count)
+        last_result: Any = None
+        policy = node.retry_policy or RetryPolicy(max_retries=0)
+        last_error: Optional[str] = None
+        success = False
+
+        for iteration in range(total_iterations):
+            last_error = None
+            success = False
+
+            for attempt in range(policy.max_retries + 1):
+                if attempt > 0:
+                    node.attempt_count += 1
+                try:
+                    last_result = await self._dispatch_action(node, resolved_params)
+                    success = True
+                    break
+                except Exception as e:
+                    last_error = str(e)
+                    logger.warning(
+                        "scheduler.node_attempt_failed node=%s attempt=%d error=%s",
+                        node.id, attempt + 1, last_error,
+                    )
+                    if attempt < policy.max_retries:
+                        if not policy.is_retryable(last_error):
+                            logger.info(
+                                "scheduler.non_retryable node=%s error=%s",
+                                node.id, last_error,
+                            )
+                            break
+                        delay = policy.delay_for_attempt(attempt)
+                        await asyncio.sleep(delay)
+
+            if not success:
+                break
+
+            node.result = last_result
+
+            if node.repeat_until and iteration < total_iterations - 1:
+                if self._evaluate_condition(node.repeat_until, graph):
+                    break
+
+        if success:
+            graph.mark_completed(node.id, last_result)
+            if self._on_node_complete:
+                self._on_node_complete(node, graph)
+            return
+
+        # All retries exhausted — try fallback
+        if policy.fallback_action:
+            try:
+                result = await self._dispatch_fallback(
+                    node, policy.fallback_action, resolved_params
+                )
+                graph.mark_completed(node.id, result)
+                if self._on_node_complete:
+                    self._on_node_complete(node, graph)
+                return
+            except Exception as e:
+                last_error = f"Fallback '{policy.fallback_action}' also failed: {e}"
+                logger.error("scheduler.fallback_failed node=%s error=%s", node.id, e)
+
+        # Final failure
+        graph.mark_failed(node.id, last_error or "Unknown error")
+        if self._on_node_failed:
+            self._on_node_failed(node, graph)
+
+        # Attempt LLM re-planning before cascading skip
+        if self._graph_planner is not None:
+            try:
+                graph = await self._graph_planner.replan_on_failure(graph, node)
+                if not graph.downstream_of(node.id):
+                    return
+            except Exception:
+                logger.debug("scheduler.replan_on_failure failed", exc_info=True)
+
+        # Skip downstream nodes that depend on this failed node
+        self._cascade_skip(node.id, graph)
+
+    # ═══ Action Dispatch ═══
+
+    async def _dispatch_action(
+        self, node: TaskNode, params: Dict[str, Any]
+    ) -> Any:
+        """Route every scheduled operation through the appropriate executor.
+
+        When ``node.execution_mode`` is ``"agent"`` and a
+        :class:`SubagentNodeExecutor` has been injected, the node is
+        delegated to a subagent via :class:`SubagentConfig`.  Otherwise the
+        default :class:`ActionDispatcher` path is used (unchanged).
+        """
+        if node.execution_mode == "agent":
+            return await self._dispatch_agent_node(node, params)
+        if node.action_type not in {"skill", "bridge"}:
+            raise ValueError(f"Unknown action_type: '{node.action_type}'")
+        return await self._dispatch(node.action_type, node.action, params, node.expected_effect)
+
+    async def _dispatch_agent_node(
+        self, node: TaskNode, params: Dict[str, Any]
+    ) -> Any:
+        """Dispatch a node through SubagentExecutor (agent execution mode).
+
+        Fails gracefully when no executor is configured: the node is marked
+        as failed with a clear diagnostic rather than silently falling back
+        to the default path (an agent-mode node is a deliberate intent).
+        """
+        if self._subagent_executor is None:
+            raise SchedulerError(
+                f"Node '{node.id}' requires execution_mode='agent' but no "
+                "SubagentExecutor is configured on TaskScheduler"
+            )
+        # Build SubagentConfig from the node (function-local import to avoid
+        # cross-sub-package module-level dependency per engine architecture).
+        from leapflow.engine.subagent import SubagentConfig
+
+        goal = params.get("instruction") or node.expected_effect or node.name
+        context = params.get("context", "")
+        config = SubagentConfig(
+            goal=goal,
+            context=context,
+            metadata={"source": "task_graph", "node_id": node.id},
+        )
+        result = await self._subagent_executor.execute_subagent(config)
+        # SubagentResult → extract summary as the node result
+        status = getattr(result, "status", "completed")
+        if status != "completed":
+            error = getattr(result, "error", None) or getattr(result, "summary", "agent execution failed")
+            raise RuntimeError(f"Agent-mode node '{node.id}' failed: {error}")
+        return getattr(result, "summary", str(result))
+
+    async def _dispatch(
+        self,
+        action_type: str,
+        action_name: str,
+        params: Dict[str, Any],
+        user_goal: str,
+    ) -> Any:
+        dispatcher = self._action_dispatcher
+        if dispatcher is None:
+            raise SchedulerError("TaskScheduler requires the runtime action dispatcher")
+        result = await dispatcher(
+            {"type": action_type, "name": action_name, "payload": params},
+            user_goal or "",
+        )
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise RuntimeError(str(result.get("error") or f"Action '{action_name}' failed"))
+        if isinstance(result, dict) and "result" in result:
+            return result["result"]
+        return result
+
+    async def _dispatch_fallback(
+        self, node: TaskNode, fallback_action: str, params: Dict[str, Any]
+    ) -> Any:
+        """Execute fallback action on final failure.
+
+        Resolves the fallback kind, then delegates through the same action boundary.
+        """
+        action_type = "skill" if self._registry.get(fallback_action) is not None else "bridge"
+        return await self._dispatch(
+            action_type,
+            fallback_action,
+            params,
+            node.expected_effect,
+        )
+
+    # ═══ Condition Evaluation ═══
+
+    _COND_REFERENCE = re.compile(r"\$\{([^}]+)\}")
+
+    def _evaluate_condition(self, condition: str, graph: TaskGraph) -> bool:
+        """Safely evaluate a condition expression against graph state.
+
+        Supports:
+        - "${node_id.status}" == "completed"
+        - "${node_id.output}" is not None
+        - Simple comparison expressions
+
+        Uses restricted evaluation with only graph-derived context.
+        """
+        resolved = condition
+        for match in self._COND_REFERENCE.finditer(condition):
+            ref = match.group(1)
+            value = self._resolve_condition_ref(ref, graph)
+            # Replace with repr for safe evaluation
+            resolved = resolved.replace(match.group(0), repr(value))
+
+        try:
+            # Restricted eval: only allow comparison operators
+            return bool(eval(resolved, {"__builtins__": {}}, {}))  # noqa: S307
+        except Exception:
+            logger.warning("scheduler.condition_eval_failed condition=%s", condition)
+            return True  # Default to executing on eval failure
+
+    @staticmethod
+    def _resolve_condition_ref(ref: str, graph: TaskGraph) -> Any:
+        """Resolve a single ${...} reference in a condition string."""
+        parts = ref.split(".")
+        if not parts:
+            return None
+
+        root = parts[0]
+        if root not in graph.nodes:
+            return None
+
+        node = graph.nodes[root]
+        if len(parts) < 2:
+            return node.result
+
+        accessor = parts[1]
+        if accessor == "status":
+            return node.status.value
+        elif accessor in ("output", "result"):
+            if len(parts) == 2:
+                return node.result
+            # Nested access
+            current = node.result
+            for key in parts[2:]:
+                if isinstance(current, dict):
+                    current = current.get(key)
+                elif hasattr(current, key):
+                    current = getattr(current, key)
+                else:
+                    return None
+            return current
+        return None
+
+    # ═══ Deadlock & Cascade ═══
+
+    def _handle_deadlock(self, graph: TaskGraph) -> None:
+        """Handle situation where no nodes are ready but graph is not complete.
+
+        This occurs when all remaining nodes have failed dependencies.
+        Log the state and mark unresolvable nodes as skipped.
+        """
+        unfinished = [
+            n for n in graph.nodes.values() if not n.is_terminal
+        ]
+        if not unfinished:
+            return
+
+        # Check if all unfinished nodes are blocked by failed nodes
+        failed_ids: Set[str] = {
+            n.id for n in graph.nodes.values() if n.status == TaskStatus.FAILED
+        }
+        for node in unfinished:
+            blocked_by_failure = any(
+                dep_id in failed_ids for dep_id in node.depends_on
+            )
+            if blocked_by_failure:
+                graph.mark_skipped(
+                    node.id,
+                    reason="Skipped: upstream dependency failed",
+                )
+            else:
+                # True deadlock — should not happen with valid DAG
+                logger.error(
+                    "scheduler.deadlock node=%s deps=%s", node.id, node.depends_on
+                )
+                graph.mark_failed(node.id, "Deadlock: no progress possible")
+
+    def _cascade_skip(self, failed_node_id: str, graph: TaskGraph) -> None:
+        """Skip all downstream nodes that transitively depend on the failed node."""
+        downstream = graph.downstream_of(failed_node_id)
+        for nid in downstream:
+            node = graph.nodes[nid]
+            if not node.is_terminal:
+                graph.mark_skipped(
+                    nid,
+                    reason=f"Skipped: upstream '{failed_node_id}' failed",
+                )

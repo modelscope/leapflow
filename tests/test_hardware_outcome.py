@@ -40,7 +40,7 @@ from leapflow.security.approval import ApprovalDecision, SessionAwareGate
 from leapflow.security.orchestrator import ApprovalOrchestrator
 from leapflow.security.policy import ApprovalPolicyEngine
 
-from tests.test_hardware_governance import ScriptedHuman, with_transport_config
+from tests._harness.hardware_stubs import ScriptedHuman, with_transport_config
 
 
 # ════════════════════════════════════════════════════════════════

@@ -52,7 +52,12 @@ dev = [
     "pytest-xdist>=3.5",
     "pytest-cov>=5.0",
 ]
-hub = ["modelscope-hub>=0.1.0"]
+hub = ["modelscope-hub>=0.4.5"]
+# Native Anthropic Messages API provider. Optional: the core install uses the
+# OpenAI-compatible transport by default; this extra enables AnthropicChat for
+# endpoints that speak the Anthropic wire format (api.anthropic.com, DeepSeek
+# /anthropic compat endpoint, etc.).
+anthropic = ["anthropic>=0.39"]
 # Better main-content extraction for web_fetch. Optional because the stdlib
 # extractor always ships: this upgrades quality, it does not enable the feature.
 web = ["trafilatura>=2.2"]
@@ -99,8 +104,9 @@ testpaths = ["tests"]
 markers = [
     "unit: hermetic — no real IO, no LLM. Default for tests/*.py",
     "component: real local IO (DuckDB, tmp profile) in-process; LLM via cassette replay",
+    "integration: real DB/storage, stub LLM — synonym for component",
     "e2e: real leapd subprocess driven over RPC; LLM via cassette replay",
-    "live: journey assertions against a real provider (nightly lane only)",
+    "live: real LLM provider, requires credentials (nightly/manual lane only)",
     "invariant: always-on guard — never skipped by impact selection",
     "slow: takes more than a few seconds",
 ]

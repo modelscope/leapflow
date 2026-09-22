@@ -8,8 +8,9 @@ import pytest
 
 from conftest import StubLLM, make_settings
 from leapflow.domain.evolution_event import EvolutionContext, EvolutionEvent
-from leapflow.engine.action_executor import ActionInvocation, RecordedActionExecutor
-from leapflow.engine.engine import AgentEngine, build_default_registry
+from leapflow.engine.tools.action_executor import ActionInvocation, RecordedActionExecutor
+from leapflow.engine.engine import AgentEngine
+from leapflow.engine import build_default_registry
 from leapflow.engine.intent_classifier import Intent
 from leapflow.evolution.action_recorder import ActionEvidenceUnavailable
 from leapflow.memory import EpisodicMemoryProvider, SemanticMemoryProvider, WorkingMemoryProvider
@@ -193,9 +194,9 @@ async def test_real_agent_engine_routes_tool_through_action_executor() -> None:
             )
             engine._current_session_id = "session-a"
             engine._session_turn_count = 1
-            engine._begin_turn_context("list files")
+            engine._prompt_assembler._begin_turn_context("list files")
 
-            result = await engine._execute_tool_with_ledger(
+            result = await engine._tool_dispatch._execute_tool_with_ledger(
                 {"name": "file_list", "arguments": {"path": "."}},
                 {"file_list": file_list_handler},
                 tool_call_id="tool-call-a",

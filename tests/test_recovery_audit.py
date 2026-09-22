@@ -8,20 +8,20 @@ from pathlib import Path
 
 import pytest
 
-from leapflow.engine.failure_envelope import (
+from leapflow.engine.recovery.failure_envelope import (
     FailureContext,
     FailureEnvelope,
     FailureSource,
     Recoverability,
     SideEffectState,
 )
-from leapflow.engine.recovery_audit import (
+from leapflow.engine.recovery.recovery_audit import (
     JsonlAuditSink,
     RecoveryAuditEntry,
     create_audit_entry,
 )
-from leapflow.engine.recovery_budget import RecoveryBudget
-from leapflow.engine.recovery_decision import (
+from leapflow.engine.recovery.recovery_budget import RecoveryBudget
+from leapflow.engine.recovery.recovery_decision import (
     RecoveryAction,
     RecoveryDecision,
 )

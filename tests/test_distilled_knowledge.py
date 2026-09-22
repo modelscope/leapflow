@@ -22,6 +22,7 @@ from leapflow.domain.adaptation_verdict import AdaptationVerdict
 from leapflow.domain.event_types import EvolutionEventType
 from leapflow.domain.evolution_event import EvolutionContext, EvolutionEvent
 from leapflow.engine.engine import AgentEngine
+from leapflow.engine.prompt_assembler import PromptAssembler
 from leapflow.storage.distilled_knowledge_store import (
     DistilledKnowledge,
     EvolutionDistilledKnowledgeStore,
@@ -67,6 +68,7 @@ def _reader(store: Any, *, fingerprint: str = "", limit: int = 12) -> AgentEngin
     engine._knowledge_store_unavailable = False
     engine._environment_fingerprint_id = fingerprint
     engine._settings = SimpleNamespace(distilled_knowledge_limit=limit)
+    engine._prompt_assembler = PromptAssembler(engine)
     return engine
 
 
@@ -177,7 +179,7 @@ def test_the_student_sees_distilled_knowledge_as_observations(tmp_path):
         _verdict("rebind", "chat.reply", "the control is now Dispatch", target="chat_v2"),
     )
 
-    block = _reader(store)._distilled_knowledge_context()
+    block = _reader(store)._prompt_assembler._distilled_knowledge_context()
 
     assert "What is known about this environment" in block
     assert "- chat.reply: the control is now Dispatch" in block
@@ -190,7 +192,7 @@ def test_a_rebind_target_tells_the_student_what_to_prefer(tmp_path):
         tmp_path,
         _verdict("rebind", "chat.reply", "the app is now v3", target="chat_reply_v3"),
     )
-    block = _reader(store)._distilled_knowledge_context()
+    block = _reader(store)._prompt_assembler._distilled_knowledge_context()
     assert "Prefer chat_reply_v3." in block
     _events_store.close()
 
@@ -201,7 +203,7 @@ def test_an_escalation_target_names_what_a_person_must_do(tmp_path):
         _verdict("escalate", "drive.upload", "the scope was revoked",
                  target="grant the drive.file scope"),
     )
-    block = _reader(store)._distilled_knowledge_context()
+    block = _reader(store)._prompt_assembler._distilled_knowledge_context()
     assert "This needs a person to: grant the drive.file scope." in block
     _events_store.close()
 
@@ -211,7 +213,7 @@ def test_a_verdict_without_a_target_adds_no_hint(tmp_path):
         tmp_path,
         _verdict("absorb", "chat.react", "it moved"),
     )
-    block = _reader(store)._distilled_knowledge_context()
+    block = _reader(store)._prompt_assembler._distilled_knowledge_context()
     assert "- chat.react: it moved" in block
     assert "Prefer" not in block and "needs a person" not in block
     _events_store.close()
@@ -224,7 +226,7 @@ def test_the_disclosed_set_is_bounded(tmp_path):
 
     lines = [
         line
-        for line in _reader(store, limit=3)._distilled_knowledge_context().splitlines()
+        for line in _reader(store, limit=3)._prompt_assembler._distilled_knowledge_context().splitlines()
         if line.startswith("- ")
     ]
     assert len(lines) == 3
@@ -233,14 +235,15 @@ def test_the_disclosed_set_is_bounded(tmp_path):
 
 def test_an_empty_or_absent_store_produces_no_block(tmp_path):
     _events_store, store = _knowledge(tmp_path)
-    assert _reader(store)._distilled_knowledge_context() == ""
+    assert _reader(store)._prompt_assembler._distilled_knowledge_context() == ""
 
     bare = AgentEngine.__new__(AgentEngine)
     bare._knowledge_store = None
     bare._knowledge_store_unavailable = True
     bare._environment_fingerprint_id = ""
     bare._settings = SimpleNamespace(distilled_knowledge_limit=12)
-    assert bare._distilled_knowledge_context() == "", "no store must degrade, not fail"
+    bare._prompt_assembler = PromptAssembler(bare)
+    assert bare._prompt_assembler._distilled_knowledge_context() == "", "no store must degrade, not fail"
     _events_store.close()
 
 
@@ -260,10 +263,11 @@ def test_the_reader_uses_the_injected_event_projection(tmp_path):
     )
 
     engine.set_distilled_knowledge_store(store)
+    engine._prompt_assembler = PromptAssembler(engine)
 
-    assert engine._resolve_knowledge_store() is store
-    assert "chat.reply" in engine._distilled_knowledge_context()
-    assert engine._rebind_preferences() == (("chat.reply", "chat_v2"),)
+    assert engine._prompt_assembler._resolve_knowledge_store() is store
+    assert "chat.reply" in engine._prompt_assembler._distilled_knowledge_context()
+    assert engine._prompt_assembler._rebind_preferences() == (("chat.reply", "chat_v2"),)
     _events_store.close()
 
 
@@ -290,6 +294,6 @@ def test_an_unknown_action_still_discloses_its_recommendation(tmp_path):
     store = EvolutionDistilledKnowledgeStore(events, profile_id="p")
     store.refresh()
 
-    block = _reader(store)._distilled_knowledge_context()
+    block = _reader(store)._prompt_assembler._distilled_knowledge_context()
     assert "do the thing" in block, "an unmapped action must not drop its target"
     events.close()

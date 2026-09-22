@@ -86,6 +86,10 @@ _MONITOR_EVENTS = frozenset({
     # publishes it after buffering the trace and from the event loop, never inline
     # with a registry/trust mutation.
     "evolution.presentation",
+    # Subagent lifecycle events for the Sub-Agent Monitor panel.
+    "subagent.started",
+    "subagent.completed",
+    "subagent.failed",
 })
 # Only these RPCs may be triggered by browser actions (least privilege).
 #

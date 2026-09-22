@@ -28,7 +28,7 @@ import duckdb
 logger = logging.getLogger(__name__)
 
 BASE_SCHEMA_VERSION = 1
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 10
 
 
 @dataclass(frozen=True)
@@ -505,12 +505,93 @@ def _apply_proposal_event_index(conn: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+def _apply_skill_curation_table(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the skill curation lifecycle management table."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS skill_curation (
+            skill_name TEXT PRIMARY KEY,
+            state TEXT NOT NULL DEFAULT 'active',
+            pinned BOOLEAN NOT NULL DEFAULT FALSE,
+            last_activity_at DOUBLE,
+            created_at DOUBLE NOT NULL,
+            archive_reason TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_skill_curation_state ON skill_curation(state)"
+    )
+
+
+def _apply_session_snapshot_columns(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add PCD cache-aware session snapshot columns to conv_sessions.
+
+    These columns persist the system prompt, tool schema, and disclosure level
+    at the time a session was last active, enabling prefix-cache-friendly
+    session resumption.
+    """
+    statements = (
+        "ALTER TABLE conv_sessions ADD COLUMN IF NOT EXISTS system_prompt_snapshot TEXT",
+        "ALTER TABLE conv_sessions ADD COLUMN IF NOT EXISTS tool_schema_snapshot TEXT",
+        "ALTER TABLE conv_sessions ADD COLUMN IF NOT EXISTS disclosure_level TEXT",
+    )
+    for statement in statements:
+        conn.execute(statement)
+
+
+def _apply_session_operations_columns(conn: duckdb.DuckDBPyConnection) -> None:
+    """Add pinned/hidden columns to conv_sessions for session management operations.
+
+    ``pinned`` promotes a session to the top of listings.
+    ``hidden`` excludes a session from default listings without deletion.
+    """
+    statements = (
+        "ALTER TABLE conv_sessions ADD COLUMN IF NOT EXISTS pinned BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE conv_sessions ADD COLUMN IF NOT EXISTS hidden BOOLEAN DEFAULT FALSE",
+    )
+    for statement in statements:
+        conn.execute(statement)
+
+
+def _apply_approval_decisions_table(conn: duckdb.DuckDBPyConnection) -> None:
+    """Create the Guardian LLM approval audit table.
+
+    Records every Guardian decision so the approval pipeline is fully
+    auditable even when the LLM auto-approves or auto-denies.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS approval_decisions (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL DEFAULT '',
+            timestamp DOUBLE NOT NULL,
+            tool_name TEXT NOT NULL DEFAULT '',
+            risk_score DOUBLE NOT NULL DEFAULT 0.0,
+            recommendation TEXT NOT NULL DEFAULT '',
+            decision TEXT NOT NULL DEFAULT '',
+            reasoning TEXT NOT NULL DEFAULT '',
+            latency_ms DOUBLE NOT NULL DEFAULT 0.0,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_approval_decisions_session "
+        "ON approval_decisions(session_id, timestamp)"
+    )
+
+
 MIGRATIONS: tuple[MigrationDef, ...] = (
     MigrationDef(2, "evolution event stream", _apply_evolution_tables),
     MigrationDef(3, "database-global evolution cursor", _apply_evolution_sequence),
     MigrationDef(4, "durable teacher job context", _apply_teacher_job_context),
     MigrationDef(5, "checkpointed evolution projections", _apply_evolution_projection),
     MigrationDef(6, "event-sourced proposal index", _apply_proposal_event_index),
+    MigrationDef(7, "PCD session snapshot columns", _apply_session_snapshot_columns),
+    MigrationDef(8, "skill curation lifecycle", _apply_skill_curation_table),
+    MigrationDef(9, "session operations (pin/hide)", _apply_session_operations_columns),
+    MigrationDef(10, "guardian approval decisions audit", _apply_approval_decisions_table),
 )
 
 

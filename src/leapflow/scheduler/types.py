@@ -27,6 +27,7 @@ class TaskState(str, Enum):
     DONE = "done"
     FAILED = "failed"
     SUSPENDED = "suspended"
+    PAUSED = "paused"
 
 
 class ExecutionTier(str, Enum):
@@ -35,6 +36,37 @@ class ExecutionTier(str, Enum):
     LOCAL = "local"
     CLOUD = "cloud"
     AUTO = "auto"
+
+
+class SchedulerExecutionMode(str, Enum):
+    """How a scheduled task runs its skill on each trigger.
+
+    Both modes are dispatched through the single :class:`SkillExecutor`
+    contract; the mode travels in a task's ``parameters['execution_mode']`` and
+    is routed transparently by the coordinator's routing executor. ``SCRIPT`` is
+    the default and runs the skill directly; ``AGENT`` runs an isolated,
+    bounded LLM tool loop (see ``AgentSkillExecutor``).
+
+    The two modes share the full ``execute(skill_name, parameters) -> dict``
+    interface and the same retry / error-handling path in ``LocalScheduler``;
+    the only difference is *which* executor the router selects.
+    """
+
+    SCRIPT = "script"
+    AGENT = "agent"
+
+    @classmethod
+    def from_value(cls, value: object) -> "SchedulerExecutionMode":
+        """Coerce an arbitrary value to a mode, defaulting to ``SCRIPT``.
+
+        Any value that is not a recognized mode (``None``, ``""``, or an
+        unknown string) maps to ``SCRIPT`` — the same fall-through the router
+        applies, so a task with a malformed mode still runs rather than error.
+        """
+        try:
+            return cls(str(value))
+        except ValueError:
+            return cls.SCRIPT
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +95,9 @@ class ArmedTask:
     parameters: dict = field(default_factory=dict)
     cloud_worker_id: str = ""
     metadata: dict = field(default_factory=dict)
+    max_retries: int = 0
+    retry_count: int = 0
+    retry_backoff_s: float = 60.0
 
 
 @dataclass
@@ -156,8 +191,24 @@ class ComputeBackend(Protocol):
 
 
 class SkillExecutor(Protocol):
-    """Protocol for executing a skill by name with parameters."""
+    """Unified execution-mode contract for the scheduler.
+
+    This is the single interface every scheduler execution mode implements:
+    the default script executor, the ``AgentSkillExecutor`` (agent mode), and
+    the ``_RoutingExecutor`` that dispatches between them all satisfy it via
+    structural subtyping. Because the contract is identical across modes, the
+    ``LocalScheduler`` tick, retry logic, and result handling never branch on
+    the mode — they call ``execute`` and interpret the returned dict.
+
+    Contract:
+    - ``skill_name``: the skill/instruction identifier being executed.
+    - ``parameters``: the task payload; ``execution_mode`` (see
+      :class:`SchedulerExecutionMode`) selects the mode when routing.
+    - returns a dict with ``ok`` (bool) and, on success, ``output``; on
+      failure, ``error`` (str). Implementations must never raise: a scheduler
+      tick must survive any skill failure.
+    """
 
     async def execute(self, skill_name: str, parameters: dict) -> dict:
-        """Execute a skill. Returns {"ok": bool, "output": ...}."""
+        """Execute a skill. Returns ``{"ok": bool, "output"|"error": ...}``."""
         ...

@@ -122,24 +122,26 @@ class _MarkerInterceptor:
 
 @pytest.mark.asyncio
 async def test_engine_executes_plugin_list_with_empty_native_arguments() -> None:
-    import leapflow.engine.engine as engine_module
+    import leapflow.engine._tool_helpers as engine_tool_helpers
     import leapflow.plugins as plugins_module
     import leapflow.plugins.tool_plugins as tool_plugins_module
     from leapflow.engine.engine import AgentEngine
+    from leapflow.engine.tool_dispatch_engine import ToolDispatchEngine
     from leapflow.plugins import get_registry
 
     plugins_module._registry = None
     plugins_module._scoped_registry = None
     tool_plugins_module._all_plugins = None
-    engine_module._registry_cache = None
+    engine_tool_helpers._registry_cache = None
     registry = get_registry()
     registry.assemble()
     engine = AgentEngine.__new__(AgentEngine)
     engine._tool_timeouts = {}
     engine._default_tool_timeout_s = 2.0
     engine._usage_tracker = _UsageTracker()
+    engine._tool_dispatch = ToolDispatchEngine(engine)
 
-    result = await engine._execute_general_tool(
+    result = await engine._tool_dispatch._execute_general_tool(
         {"name": "plugin_list", "arguments": {}}, registry.tool_handlers
     )
 
@@ -150,16 +152,17 @@ async def test_engine_executes_plugin_list_with_empty_native_arguments() -> None
 
 @pytest.mark.asyncio
 async def test_engine_executes_handlers_through_interceptor_pipeline() -> None:
-    import leapflow.engine.engine as engine_module
+    import leapflow.engine._tool_helpers as engine_tool_helpers
     import leapflow.plugins as plugins_module
     import leapflow.plugins.tool_plugins as tool_plugins_module
     from leapflow.engine.engine import AgentEngine
+    from leapflow.engine.tool_dispatch_engine import ToolDispatchEngine
     from leapflow.plugins import get_registry
 
     plugins_module._registry = None
     plugins_module._scoped_registry = None
     tool_plugins_module._all_plugins = None
-    engine_module._registry_cache = None
+    engine_tool_helpers._registry_cache = None
     registry = get_registry()
     registry.assemble()
     registry.tool_pipeline.register(_MarkerInterceptor())
@@ -167,8 +170,9 @@ async def test_engine_executes_handlers_through_interceptor_pipeline() -> None:
     engine._tool_timeouts = {}
     engine._default_tool_timeout_s = 2.0
     engine._usage_tracker = _UsageTracker()
+    engine._tool_dispatch = ToolDispatchEngine(engine)
     try:
-        result = await engine._execute_general_tool(
+        result = await engine._tool_dispatch._execute_general_tool(
             {"name": "plugin_status", "arguments": {"plugin_id": "self_management"}},
             registry.tool_handlers,
         )
