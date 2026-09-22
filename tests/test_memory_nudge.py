@@ -2,10 +2,9 @@
 """Tests for the periodic memory nudge policy and EventBus integration."""
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

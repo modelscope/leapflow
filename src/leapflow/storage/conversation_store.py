@@ -185,32 +185,23 @@ class DuckDBConversationStore:
                 summary VARCHAR DEFAULT ''
             )
         """)
-        # Migration: add summary column for existing databases
-        try:
-            self._conn.execute("ALTER TABLE conversation_sessions ADD COLUMN summary VARCHAR DEFAULT ''")
-        except Exception:
-            pass  # Column already exists
-        # Migration: PCD cache-aware session snapshot columns
-        for col, col_type in (
+        # Idempotent column migrations for pre-existing databases. DuckDB supports
+        # ADD COLUMN IF NOT EXISTS, a true no-op when the column is already present.
+        # A bare ALTER guarded only by try/except is unsafe: a failed DDL statement
+        # aborts the surrounding DuckDB transaction, so the next statement fails with
+        # "current transaction is aborted" on every restart against an already-migrated
+        # database — which silently broke session resume after a daemon restart.
+        for col, col_def in (
+            ("summary", "VARCHAR DEFAULT ''"),
             ("system_prompt_snapshot", "TEXT"),
             ("tool_schema_snapshot", "TEXT"),
             ("disclosure_level", "TEXT"),
+            ("pinned", "BOOLEAN DEFAULT FALSE"),
+            ("hidden", "BOOLEAN DEFAULT FALSE"),
         ):
-            try:
-                self._conn.execute(f"ALTER TABLE conversation_sessions ADD COLUMN {col} {col_type}")
-            except Exception:
-                pass  # Column already exists
-        # Migration: session operations (pin/hide) columns
-        for col, col_type, default in (
-            ("pinned", "BOOLEAN", "FALSE"),
-            ("hidden", "BOOLEAN", "FALSE"),
-        ):
-            try:
-                self._conn.execute(
-                    f"ALTER TABLE conversation_sessions ADD COLUMN {col} {col_type} DEFAULT {default}"
-                )
-            except Exception:
-                pass  # Column already exists
+            self._conn.execute(
+                f"ALTER TABLE conversation_sessions ADD COLUMN IF NOT EXISTS {col} {col_def}"
+            )
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_messages (
                 message_id VARCHAR PRIMARY KEY,
