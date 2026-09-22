@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import random
 
-import pytest
 
 from leapflow.engine.tools.tool_search import (
     ListingLevel,

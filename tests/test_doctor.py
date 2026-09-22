@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -357,8 +356,6 @@ async def test_vault_check_pass(tmp_path: Path) -> None:
 
 
 def test_cli_parses_doctor_command() -> None:
-    from leapflow.cli.cli import main
-
     # --help exits with 0 so we can't really run it, but we can test that
     # the command is recognized by checking known_commands set.
     # Verify 'doctor' is accepted as a subcommand by the parser.
@@ -373,7 +370,6 @@ def test_cli_parses_doctor_command() -> None:
 
 def test_cli_known_commands_includes_doctor() -> None:
     """Verify the pre-parse set in cli.py includes 'doctor'."""
-    import ast
     from pathlib import Path
 
     cli_path = Path(__file__).resolve().parent.parent / "src" / "leapflow" / "cli" / "cli.py"
