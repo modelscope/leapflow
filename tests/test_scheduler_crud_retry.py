@@ -12,7 +12,7 @@ import pytest
 from leapflow.scheduler.coordinator import TaskCoordinator
 from leapflow.scheduler.local_scheduler import LocalScheduler
 from leapflow.scheduler.store import TaskStore
-from leapflow.scheduler.types import ArmedTask, TaskState
+from leapflow.scheduler.types import ArmedTask, TaskSource, TaskState
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +191,31 @@ class TestRetryFields:
         assert loaded.max_retries == 3
         assert loaded.retry_count == 1
         assert loaded.retry_backoff_s == 30.0
+
+
+class TestTaskSource:
+    """Creation source is explicit and survives persistence."""
+
+    def test_armed_task_defaults_to_user(self) -> None:
+        task = ArmedTask(
+            skill_name="manual",
+            trigger_type="interval",
+            trigger_config={"interval_seconds": 60},
+        )
+        assert task.source == TaskSource.USER.value
+
+    def test_system_source_roundtrip(self, tmp_store: TaskStore) -> None:
+        task = ArmedTask(
+            task_id="system_task",
+            skill_name="health",
+            trigger_type="interval",
+            trigger_config={"interval_seconds": 60},
+            source=TaskSource.SYSTEM.value,
+        )
+        tmp_store.save(task)
+        loaded = tmp_store.load(task.task_id)
+        assert loaded is not None
+        assert loaded.source == TaskSource.SYSTEM.value
 
 
 class TestRetryLogic:
@@ -438,6 +463,20 @@ class TestArmRetryDefaults:
         task = await coordinator.arm("my_skill", "5m")
         assert task.max_retries == 5
         assert task.retry_backoff_s == 30.0
+        assert task.source == TaskSource.USER.value
+
+    @pytest.mark.asyncio
+    async def test_arm_rejects_unknown_source(self, tmp_store: TaskStore) -> None:
+        local_sched = AsyncMock()
+        local_sched.register = AsyncMock()
+        coordinator = TaskCoordinator(
+            store=tmp_store,
+            local_scheduler=local_sched,
+            default_tier="local",
+        )
+
+        with pytest.raises(ValueError, match="Invalid task source"):
+            await coordinator.arm("my_skill", "5m", source="operator")
 
     @pytest.mark.asyncio
     async def test_arm_per_task_overrides_config(self, tmp_store: TaskStore):
@@ -464,7 +503,7 @@ class TestArmRetryDefaults:
 
 
 class TestStoreMigration:
-    """Idempotent column migration for retry fields."""
+    """Idempotent column migration for scheduler fields."""
 
     def test_migration_is_idempotent(self, tmp_path: Path):
         """Creating TaskStore twice doesn't fail (columns already exist)."""
@@ -489,6 +528,31 @@ class TestStoreMigration:
         loaded = tmp_store.load("migration_test")
         assert loaded.max_retries == 7
         assert loaded.retry_backoff_s == 120.0
+
+    def test_source_migration_backfills_legacy_watches(self, tmp_path: Path) -> None:
+        """Legacy monitor watches become system tasks; other rows remain user tasks."""
+        db = tmp_path / "source_migration.duckdb"
+        store = TaskStore(db)
+        store.save(ArmedTask(
+            task_id="legacy_watch",
+            skill_name="hardware",
+            trigger_type="interval",
+            trigger_config={"interval_seconds": 60},
+            metadata={"kind": "watch"},
+        ))
+        store.save(ArmedTask(
+            task_id="legacy_user",
+            skill_name="report",
+            trigger_type="interval",
+            trigger_config={"interval_seconds": 60},
+        ))
+        store._con.execute("ALTER TABLE armed_tasks DROP COLUMN source")  # noqa: SLF001
+        store.close()
+
+        migrated = TaskStore(db)
+        assert migrated.load("legacy_watch").source == TaskSource.SYSTEM.value
+        assert migrated.load("legacy_user").source == TaskSource.USER.value
+        migrated.close()
 
 
 # ---------------------------------------------------------------------------

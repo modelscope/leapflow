@@ -25,6 +25,7 @@ from leapflow.monitor.types import ProducerContext
 from leapflow.scheduler.coordinator import parse_trigger_expression
 from leapflow.scheduler.triggers import create_trigger
 from leapflow.scheduler.triggers.event import EventTrigger
+from leapflow.scheduler.types import TaskSource
 from leapflow.storage.connection import LocalConnectionHolder
 
 
@@ -140,6 +141,9 @@ async def test_manager_arm_list_and_state_transitions(tmp_path: Path) -> None:
     assert view.state == "armed"
     assert view.client_coupled is False
     assert view.to_dict()["client_coupled"] is False
+    stored = manager._task_store.load(view.watch_id)  # noqa: SLF001
+    assert stored is not None
+    assert stored.source == TaskSource.SYSTEM.value
 
     assert [v.watch_id for v in manager.list_watches()] == [view.watch_id]
     assert manager.has_active_watches() is True

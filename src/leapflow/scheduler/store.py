@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, List, Optional, Union
 
-from leapflow.scheduler.types import ArmedTask
+from leapflow.scheduler.types import ArmedTask, TaskSource
 from leapflow.storage.connection import ConnectionHolder, LocalConnectionHolder
 from leapflow.storage.write_buffer import execute_with_retry
 
@@ -82,10 +82,12 @@ class TaskStore:
                 metadata TEXT DEFAULT '{}',
                 max_retries INTEGER DEFAULT 0,
                 retry_count INTEGER DEFAULT 0,
-                retry_backoff_s DOUBLE DEFAULT 60.0
+                retry_backoff_s DOUBLE DEFAULT 60.0,
+                source TEXT DEFAULT 'user'
             )
         """)
         self._migrate_retry_columns()
+        self._migrate_source_column()
 
     def _migrate_retry_columns(self) -> None:
         """Idempotent migration: add retry columns to pre-existing tables."""
@@ -101,6 +103,36 @@ class TaskStore:
             except Exception:  # noqa: BLE001 — column already exists
                 pass
 
+    def _migrate_source_column(self) -> None:
+        """Add task source and backfill legacy monitor watches as system tasks.
+
+        Before the source field existed, monitor watches were the only
+        system-created scheduler rows and were already durably tagged with
+        ``metadata.kind=watch``. Other legacy rows came from the user-facing
+        scheduler tool and therefore retain the column default of ``user``.
+        """
+        columns = {
+            str(row[1])
+            for row in self._con.execute("PRAGMA table_info('armed_tasks')").fetchall()
+        }
+        if "source" in columns:
+            return
+
+        self._con.execute(
+            "ALTER TABLE armed_tasks ADD COLUMN source TEXT DEFAULT 'user'"
+        )
+        rows = self._con.execute(
+            "SELECT task_id, metadata FROM armed_tasks",
+        ).fetchall()
+        for task_id, raw_metadata in rows:
+            if self._safe_json_loads(raw_metadata).get("kind") != "watch":
+                continue
+            execute_with_retry(
+                self._con,
+                "UPDATE armed_tasks SET source = ? WHERE task_id = ?",
+                [TaskSource.SYSTEM.value, task_id],
+            )
+
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
@@ -115,8 +147,8 @@ class TaskStore:
                 state, execution_tier, context_snapshot, confidence,
                 created_at, next_due_at, last_run_at, run_count,
                 max_runs, grace_seconds, parameters, cloud_worker_id, metadata,
-                max_retries, retry_count, retry_backoff_s
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                max_retries, retry_count, retry_backoff_s, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 task.task_id,
@@ -139,6 +171,7 @@ class TaskStore:
                 task.max_retries,
                 task.retry_count,
                 task.retry_backoff_s,
+                task.source,
             ],
         )
 
@@ -283,6 +316,7 @@ class TaskStore:
             max_retries=row[17] if len(row) > 17 else 0,
             retry_count=row[18] if len(row) > 18 else 0,
             retry_backoff_s=row[19] if len(row) > 19 else 60.0,
+            source=row[20] if len(row) > 20 else TaskSource.USER.value,
         )
 
     @staticmethod

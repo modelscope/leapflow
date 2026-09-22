@@ -141,10 +141,8 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("plugin enable", "Re-enable a disabled plugin (daemon mode, approval required)", "Skills & Tools", args_hint="<id>", requires_host=True, effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
     CommandDef("plugin generate", "Generate and install a plugin from a natural-language description", "Skills & Tools", args_hint="[--preview|--dry-run|--id <id>] <description>", requires_host=True, effect=CommandEffect.SESSION, execution=CommandExecution.LONG_RUNNING),
 
-    # Scheduler
-    CommandDef("arm", "Schedule a skill for timed execution", "Scheduler", args_hint="<skill> <cron>"),
-    CommandDef("task", "List scheduled tasks", "Scheduler"),
-    CommandDef("schedule", "List active scheduled tasks", "Scheduler", aliases=("schedule list",), args_hint="[list|status|history|cancel] ...", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
+    # Scheduler — a single namespace; the bare command lists scheduled tasks.
+    CommandDef("schedule", "List scheduled tasks", "Scheduler", aliases=("schedule list",), args_hint="[list|status|history|cancel] ...", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
     CommandDef("schedule status", "Show detailed status for one task", "Scheduler", args_hint="<task_id>", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
     CommandDef("schedule history", "Show recent execution log entries", "Scheduler", args_hint="[task_id]", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
     CommandDef("schedule cancel", "Cancel/disable a scheduled task", "Scheduler", args_hint="<task_id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
