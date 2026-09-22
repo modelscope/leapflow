@@ -12,10 +12,8 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, AsyncIterator, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any, AsyncIterator, Dict, List
 
 import pytest
 

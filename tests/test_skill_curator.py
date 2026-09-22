@@ -10,9 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from leapflow.skills.curator import (
-    CurationReport,
     CurationState,
-    CurationTransition,
     SkillCurationEntry,
     SkillCurator,
 )
