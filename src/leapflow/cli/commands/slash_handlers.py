@@ -2021,10 +2021,6 @@ async def command_execute(
         return await _execute_hub(ctx, name, args)
     if name == "run":
         return {"ok": True, "stream": True, "prompt": args}
-    if name == "arm":
-        return await _execute_scheduler_arm(ctx, args)
-    if name == "task":
-        return _execute_scheduler_task(ctx)
     if name == "schedule" or name.startswith("schedule "):
         sched_args = name[len("schedule"):].strip()
         if sched_args:
@@ -2112,13 +2108,117 @@ def build_checkpoint_payload(ctx: "Context", args: str = "", session_id: str = "
     return {"ok": False, "message": f"Unknown checkpoint subcommand: {verb}. Use list or rollback."}
 
 
+# Lifecycle states in which a task is still firing (or about to). Everything
+# else -- paused, suspended, done, failed -- is inert and must not advertise a
+# countdown, which is why an inert task renders its next run as an em dash
+# rather than a misleading "now".
+_SCHEDULE_ACTIVE_STATES: frozenset[str] = frozenset(
+    {"armed", "watching", "due", "confirming", "executing"}
+)
+
+
+def _humanize_interval(seconds: float) -> str:
+    """Render an interval in seconds as a compact 'every Nx' phrase."""
+    sec = int(seconds)
+    if sec < 60:
+        return f"every {sec}s"
+    if sec < 3600:
+        return f"every {sec // 60}m"
+    if sec < 86400:
+        return f"every {sec // 3600}h"
+    return f"every {sec // 86400}d"
+
+
+def _humanize_trigger(task: Any) -> str:
+    """Human-readable trigger description for the schedule list.
+
+    Event triggers read 'on event' (with the pattern when known) rather than a
+    bare 'event', so the list explains *why* such a task has no next-run time.
+    """
+    cfg = task.trigger_config if isinstance(task.trigger_config, dict) else {}
+    if task.trigger_type == "interval":
+        return _humanize_interval(cfg.get("interval_seconds", 0))
+    if task.trigger_type == "cron":
+        return f"cron {cfg.get('expression', '?')}"
+    if task.trigger_type == "event":
+        pattern = cfg.get("event_pattern") or cfg.get("event") or ""
+        return f"on event: {pattern}" if pattern else "on event"
+    if task.trigger_type == "condition":
+        expr = str(cfg.get("expression", "?"))
+        return f"when {expr[:24]}"
+    return str(task.trigger_type)
+
+
+def _humanize_next_run(task: Any, now: float, active: bool) -> str:
+    """Relative next-run string; inert tasks and event waits render as an em dash.
+
+    An inert (paused/suspended/done/failed) task has no meaningful countdown,
+    and an event task fires on a signal rather than a clock, so both return the
+    em dash instead of a time that would imply an imminent clock-driven run.
+    """
+    if not active or task.next_due_at <= 0:
+        return "—"
+    delta = task.next_due_at - now
+    if delta <= 0:
+        return "now"
+    if delta < 60:
+        return f"{int(delta)}s"
+    if delta < 3600:
+        return f"in {int(delta / 60)}m"
+    if delta < 86400:
+        return f"in {int(delta / 3600)}h"
+    return f"in {int(delta / 86400)}d"
+
+
+def _schedule_task_entry(task: Any, now: float) -> dict[str, Any]:
+    """Build one structured schedule-list row from an ArmedTask."""
+    params = task.parameters if isinstance(task.parameters, dict) else {}
+    mode = params.get("execution_mode") or "script"
+    active = task.state in _SCHEDULE_ACTIVE_STATES
+    runs = str(task.run_count) + (f"/{task.max_runs}" if task.max_runs > 0 else "")
+    return {
+        "task_id": task.task_id,
+        "short_id": task.task_id[:8],
+        "skill": task.skill_name,
+        "source": task.source,
+        "trigger": _humanize_trigger(task),
+        "next_run": _humanize_next_run(task, now, active),
+        "next_due_at": task.next_due_at,
+        "state": task.state,
+        "active": active,
+        "mode": mode,
+        "runs": runs,
+    }
+
+
+def _schedule_list_text(entries: list[dict[str, Any]], summary: dict[str, Any]) -> str:
+    """Plain-text fallback of the schedule list for non-Rich consumers/logs.
+
+    The TUI renders the structured ``view`` as a table; this text form keeps
+    skill names, state, and timing available wherever only ``message`` is read.
+    """
+    inactive = summary.get("inactive") or {}
+    census = [f"{summary['active']} active"] + [
+        f"{count} {state}" for state, count in sorted(inactive.items())
+    ]
+    lines = [f"Scheduled tasks ({summary['total']}) — {' · '.join(census)}"]
+    for e in entries:
+        mode_suffix = "  [agent]" if e["mode"] == "agent" else ""
+        lines.append(
+            f"  {e['short_id']}  {e['skill']}  source={e['source']}  {e['trigger']}"
+            f"  next={e['next_run']}  {e['state']}{mode_suffix}"
+        )
+    return "\n".join(lines)
+
+
 def build_schedule_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
     """Handle /schedule list, /schedule history, and /schedule cancel commands."""
     from leapflow.scheduler.coordinator import TaskCoordinator
     from leapflow.scheduler.execution_log import DuckDBExecutionLogStore
     from leapflow.scheduler.store import TaskStore
 
-    # Resolve coordinator from context — same wiring as /arm and /task
+    # Resolve coordinator from context; fall back to a read-only store so the
+    # daemon (where no coordinator is wired) can still list tasks from DuckDB.
     coordinator: TaskCoordinator | None = getattr(ctx, "coordinator", None)
     task_store: TaskStore | None = None
 
@@ -2138,49 +2238,38 @@ def build_schedule_payload(ctx: "Context", args: str = "") -> dict[str, Any]:
     # ── /schedule list (default) ─────────────────────────────────────
     if verb == "list" or not args.strip():
         if task_store is None:
-            return {"ok": True, "message": "No scheduler active."}
+            return {"ok": True, "view": "schedule", "tasks": [], "message": "No scheduler active."}
         try:
             tasks = task_store.load_all()
         except Exception as exc:
             return {"ok": False, "message": f"Failed to load tasks: {exc}"}
         if not tasks:
-            return {"ok": True, "message": "No scheduled tasks."}
+            return {"ok": True, "view": "schedule", "tasks": [], "message": "No scheduled tasks."}
         import time as _time
         now = _time.time()
-        lines = ["Active scheduled tasks:"]
-        for t in tasks:
-            tid = t.task_id[:8]
-            trigger = t.trigger_type
-            if t.trigger_type == "interval":
-                sec = (t.trigger_config or {}).get("interval_seconds", 0)
-                if sec < 60:
-                    trigger = f"every {int(sec)}s"
-                elif sec < 3600:
-                    trigger = f"every {int(sec / 60)}m"
-                else:
-                    trigger = f"every {int(sec / 3600)}h"
-            elif t.trigger_type == "cron":
-                trigger = (t.trigger_config or {}).get("expression", "cron")
-            if t.next_due_at > 0:
-                delta = t.next_due_at - now
-                if delta <= 0:
-                    next_str = "now"
-                elif delta < 60:
-                    next_str = f"{int(delta)}s"
-                elif delta < 3600:
-                    next_str = f"{int(delta / 60)}m"
-                else:
-                    next_str = f"{int(delta / 3600)}h"
-            else:
-                next_str = "-"
-            enabled = t.state not in ("suspended", "done", "failed", "paused")
-            params = t.parameters if isinstance(t.parameters, dict) else {}
-            mode = params.get("execution_mode") or "script"
-            lines.append(
-                f"  {tid}  skill={t.skill_name}  mode={mode}  trigger={trigger}"
-                f"  next={next_str}  enabled={enabled}"
-            )
-        return {"ok": True, "message": "\n".join(lines)}
+        entries = [_schedule_task_entry(t, now) for t in tasks]
+        # Active tasks first, then soonest next run; inert tasks (no due time)
+        # sort last so the top of the list is always what fires next.
+        entries.sort(key=lambda e: (
+            not e["active"],
+            e["next_due_at"] if e["next_due_at"] > 0 else float("inf"),
+        ))
+        inactive_counts: dict[str, int] = {}
+        for e in entries:
+            if not e["active"]:
+                inactive_counts[e["state"]] = inactive_counts.get(e["state"], 0) + 1
+        summary = {
+            "total": len(entries),
+            "active": sum(1 for e in entries if e["active"]),
+            "inactive": inactive_counts,
+        }
+        return {
+            "ok": True,
+            "view": "schedule",
+            "tasks": entries,
+            "summary": summary,
+            "message": _schedule_list_text(entries, summary),
+        }
 
     # ── /schedule history [task_id] ──────────────────────────────────
     if verb == "history":
@@ -3512,35 +3601,6 @@ async def _execute_hub(ctx: "Context", name: str, args: str) -> dict[str, Any]:
     return {"ok": False, "message": f"Hub command '{command}' is not yet implemented in this runtime."}
 
 
-def _execute_scheduler_task(ctx: "Context") -> dict[str, Any]:
-    """Execute /task command."""
-    scheduler = getattr(ctx, "scheduler", None)
-    if scheduler is None:
-        return {"ok": True, "view": "task", "tasks": [], "message": "No scheduler active."}
-    tasks = scheduler.list_tasks() if hasattr(scheduler, "list_tasks") else []
-    entries = [
-        {"name": t.name, "schedule": t.schedule, "next_run": str(getattr(t, "next_run", ""))}
-        for t in tasks
-    ]
-    return {"ok": True, "view": "task", "tasks": entries}
-
-
-async def _execute_scheduler_arm(ctx: "Context", args: str) -> dict[str, Any]:
-    """Execute /arm command."""
-    scheduler = getattr(ctx, "scheduler", None)
-    if scheduler is None:
-        return {"ok": False, "message": "Scheduler not active in this session."}
-    tokens = args.strip().split(None, 1)
-    if len(tokens) < 2:
-        return {"ok": False, "message": "Usage: /arm <skill> <cron>"}
-    skill_name, cron_expr = tokens
-    try:
-        task_id = await scheduler.arm(skill_name, cron_expr)
-        return {"ok": True, "message": f"Armed: {skill_name} → {cron_expr} (id={task_id})"}
-    except Exception as e:
-        return {"ok": False, "message": str(e)}
-
-
 def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> None:
     """Render a generic command_execute result payload in the TUI."""
     view = str(payload.get("view") or "")
@@ -3575,8 +3635,8 @@ def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> N
     if view == "skill_show":
         _render_skill_show_view(console, payload)
         return
-    if view == "task":
-        _render_task_view(console, payload)
+    if view == "schedule":
+        _render_schedule_view(console, payload)
         return
     if view == "dashboard":
         _render_dashboard_view(console, payload)
@@ -3972,20 +4032,84 @@ def _render_skill_show_view(console: "LeapConsole", payload: dict[str, Any]) -> 
     console.print(Panel(info, title=str(payload.get("name") or "Skill"), border_style="cyan"))
 
 
-def _render_task_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+# Glyph + Rich style per lifecycle state. The glyph carries the status at a
+# glance (green ● = firing, yellow ⏸ = paused, red ✗ = failed), so the list is
+# scannable without reading the label; an unknown state falls back to a neutral
+# dot rather than crashing on a state added later in the scheduler.
+_SCHEDULE_STATE_STYLE: dict[str, tuple[str, str]] = {
+    "armed": ("●", "green"),
+    "watching": ("◔", "green"),
+    "due": ("◆", "yellow"),
+    "confirming": ("◆", "yellow"),
+    "executing": ("▸", "cyan"),
+    "paused": ("⏸", "yellow"),
+    "suspended": ("⊘", "bright_black"),
+    "done": ("✓", "bright_black"),
+    "failed": ("✗", "red"),
+}
+
+
+def _render_schedule_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
+    """Render /schedule list as an aligned, status-coloured table.
+
+    Replaces the previous space-joined ``key=value`` line list, which never
+    aligned into columns and flattened a nine-state lifecycle into one
+    enabled=True/False boolean. Columns are chosen so the short id (the handle
+    every other /schedule subcommand takes) is never cropped. Source identifies
+    whether the system or a user created each task. The Mode column appears only
+    when at least one task runs in agent mode -- otherwise it is a constant
+    ``script`` that adds noise without information.
+    """
     tasks = payload.get("tasks") or []
-    msg = payload.get("message")
-    if msg:
-        console.system(str(msg))
-        return
     if not tasks:
-        console.system("No scheduled tasks.")
+        msg = payload.get("message")
+        console.system(str(msg) if msg else "No scheduled tasks.")
         return
+
     from rich.table import Table
-    table = Table(show_header=True, header_style="bold", border_style="dim")
-    table.add_column("Name", style="cyan")
-    table.add_column("Schedule")
-    table.add_column("Next Run")
+    from rich.text import Text
+
+    show_mode = any(t.get("mode") == "agent" for t in tasks)
+    summary = payload.get("summary") or {}
+    inactive = summary.get("inactive") or {}
+    census = [f"{summary.get('active', 0)} active"] + [
+        f"{count} {state}" for state, count in sorted(inactive.items())
+    ]
+
+    table = Table(
+        title=f"Scheduled tasks ({summary.get('total', len(tasks))})",
+        title_style="bold",
+        title_justify="left",
+        caption=" · ".join(census),
+        caption_style="dim",
+        caption_justify="left",
+        header_style="bold",
+        border_style="dim",
+    )
+    table.add_column("ID", style="cyan", no_wrap=True)
+    # "Task" rather than "Skill": the row is a scheduled task and this column
+    # names what it runs; "Skill" was read as the LeapFlow skill catalog.
+    table.add_column("Task", overflow="fold")
+    table.add_column("Source", no_wrap=True)
+    table.add_column("Trigger")
+    table.add_column("Next run", justify="right")
+    table.add_column("Status")
+    if show_mode:
+        table.add_column("Mode")
+
     for t in tasks:
-        table.add_row(str(t.get("name") or ""), str(t.get("schedule") or ""), str(t.get("next_run") or ""))
+        state = str(t.get("state") or "")
+        glyph, style = _SCHEDULE_STATE_STYLE.get(state, ("•", "white"))
+        row: list[Any] = [
+            str(t.get("short_id") or ""),
+            str(t.get("skill") or ""),
+            str(t.get("source") or "user").title(),
+            str(t.get("trigger") or ""),
+            str(t.get("next_run") or ""),
+            Text(f"{glyph} {state}", style=style),
+        ]
+        if show_mode:
+            row.append("agent" if t.get("mode") == "agent" else "script")
+        table.add_row(*row)
+
     console.print(table)

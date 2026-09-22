@@ -22,6 +22,7 @@ from leapflow.scheduler.types import (
     ArmedTask,
     ExecutionTier,
     SchedulerExecutionMode,
+    TaskSource,
     TaskState,
     TaskStatus,
 )
@@ -204,6 +205,7 @@ class TaskCoordinator:
         context_snapshot: Optional[dict] = None,
         max_retries: Optional[int] = None,
         retry_backoff_s: Optional[float] = None,
+        source: str = TaskSource.USER.value,
     ) -> ArmedTask:
         """Create and register an armed task.
 
@@ -213,8 +215,13 @@ class TaskCoordinator:
         4. Persist to store
         5. Route to local_scheduler.register() or cloud_dispatcher.deploy()
         """
-        # 1. Parse trigger
+        # 1. Parse trigger and validate the creation source at the boundary.
         trigger_type, trigger_config = parse_trigger_expression(trigger_expr)
+        try:
+            task_source = TaskSource(source).value
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in TaskSource)
+            raise ValueError(f"Invalid task source '{source}'; expected one of: {allowed}") from exc
 
         # 2. Decide tier
         tier = execution_tier if execution_tier != "auto" else self._default_tier
@@ -253,6 +260,7 @@ class TaskCoordinator:
             next_due_at=trigger.next_due_at,
             max_retries=effective_max_retries,
             retry_backoff_s=effective_backoff,
+            source=task_source,
         )
 
         # 7. Persist

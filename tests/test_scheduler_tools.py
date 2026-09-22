@@ -18,7 +18,7 @@ import pytest
 from leapflow.plugins.protocol import ToolMetadata, ToolPlugin
 from leapflow.plugins.tool_plugins.scheduler_tools import SchedulerToolsPlugin
 from leapflow.scheduler.local_scheduler import LocalScheduler
-from leapflow.scheduler.types import ArmedTask
+from leapflow.scheduler.types import ArmedTask, TaskSource
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +178,11 @@ class TestUnboundRefusal:
 
 class TestBoundHandlers:
     @pytest.mark.asyncio
-    async def test_create_success(self, bound_plugin: SchedulerToolsPlugin) -> None:
+    async def test_create_success(
+        self,
+        bound_plugin: SchedulerToolsPlugin,
+        mock_coordinator: AsyncMock,
+    ) -> None:
         result = await bound_plugin._handle_create(
             trigger_expression="30m",
             instruction="daily_report",
@@ -186,6 +190,7 @@ class TestBoundHandlers:
         assert result["ok"] is True
         assert "task_id" in result
         assert result["state"] == "armed"
+        assert mock_coordinator.arm.call_args.kwargs["source"] == TaskSource.USER.value
 
     @pytest.mark.asyncio
     async def test_create_missing_fields(self, bound_plugin: SchedulerToolsPlugin) -> None:
@@ -217,6 +222,7 @@ class TestBoundHandlers:
         assert result["ok"] is True
         assert result["count"] == 1
         assert result["tasks"][0]["skill_name"] == "report"
+        assert result["tasks"][0]["source"] == TaskSource.USER.value
 
     @pytest.mark.asyncio
     async def test_status_success(self, bound_plugin: SchedulerToolsPlugin) -> None:
@@ -577,9 +583,9 @@ class TestExecutionModeExposure:
 
 
 class TestScheduleListStatusFormat:
-    """Slash command output shows mode column and per-task status detail."""
+    """Slash command output reports per-task mode and status detail."""
 
-    def test_list_shows_execution_mode_column(self) -> None:
+    def test_list_reports_execution_mode_per_task(self) -> None:
         from leapflow.cli.commands.slash_handlers import build_schedule_payload
 
         ctx = MagicMock()
@@ -589,6 +595,7 @@ class TestScheduleListStatusFormat:
                 skill_name="a", trigger_type="interval",
                 trigger_config={"interval_seconds": 60}, task_id="aaaa1111",
                 state="armed", parameters={"execution_mode": "agent"},
+                source=TaskSource.SYSTEM.value,
             ),
             ArmedTask(
                 skill_name="b", trigger_type="interval",
@@ -601,8 +608,90 @@ class TestScheduleListStatusFormat:
         ctx.coordinator = coordinator
         result = build_schedule_payload(ctx, "list")
         assert result["ok"] is True
-        assert "mode=agent" in result["message"]
-        assert "mode=script" in result["message"]
+        # Structured view drives the table; mode is per-task, not a constant
+        # "mode=script" repeated on every row.
+        assert result["view"] == "schedule"
+        modes = {t["skill"]: t["mode"] for t in result["tasks"]}
+        assert modes == {"a": "agent", "b": "script"}
+        sources = {t["skill"]: t["source"] for t in result["tasks"]}
+        assert sources == {"a": "system", "b": "user"}
+        assert result["summary"]["total"] == 2
+        assert result["summary"]["active"] == 2
+
+    def test_schedule_table_renders_source_column(self) -> None:
+        from rich.console import Console
+
+        from leapflow.cli.commands.slash_handlers import _render_schedule_view
+
+        console = Console(record=True, width=120)
+        _render_schedule_view(console, {
+            "tasks": [
+                {
+                    "short_id": "aaaa1111", "skill": "health",
+                    "source": "system", "trigger": "every 5m",
+                    "next_run": "in 3m", "state": "armed", "mode": "script",
+                },
+                {
+                    "short_id": "bbbb2222", "skill": "report",
+                    "source": "user", "trigger": "cron 0 9 * * *",
+                    "next_run": "in 2h", "state": "armed", "mode": "script",
+                },
+            ],
+            "summary": {"total": 2, "active": 2, "inactive": {}},
+        })
+        rendered = console.export_text()
+        assert "Source" in rendered
+        assert "System" in rendered
+        assert "User" in rendered
+
+    def test_list_inert_task_has_no_countdown(self) -> None:
+        """A paused task must not advertise a next-run time (regression).
+
+        The old key=value list showed ``next=now enabled=False`` for a paused,
+        overdue task -- a disabled task claiming it fires immediately. An inert
+        task now renders its next run as an em dash.
+        """
+        from leapflow.cli.commands.slash_handlers import build_schedule_payload
+
+        ctx = MagicMock()
+        task_store = MagicMock()
+        task_store.load_all.return_value = [
+            ArmedTask(
+                skill_name="paused_one", trigger_type="interval",
+                trigger_config={"interval_seconds": 60}, task_id="cccc3333",
+                state="paused", next_due_at=time.time() - 5,
+            ),
+        ]
+        coordinator = MagicMock()
+        coordinator._store = task_store
+        ctx.coordinator = coordinator
+        result = build_schedule_payload(ctx, "list")
+        assert result["ok"] is True
+        entry = result["tasks"][0]
+        assert entry["active"] is False
+        assert entry["next_run"] == "\u2014"
+        assert result["summary"]["active"] == 0
+        assert result["summary"]["inactive"] == {"paused": 1}
+
+    def test_list_event_trigger_has_no_countdown(self) -> None:
+        from leapflow.cli.commands.slash_handlers import build_schedule_payload
+
+        ctx = MagicMock()
+        task_store = MagicMock()
+        task_store.load_all.return_value = [
+            ArmedTask(
+                skill_name="on_signal", trigger_type="event",
+                trigger_config={"event_pattern": "ci.passed"}, task_id="dddd4444",
+                state="armed", next_due_at=0.0,
+            ),
+        ]
+        coordinator = MagicMock()
+        coordinator._store = task_store
+        ctx.coordinator = coordinator
+        result = build_schedule_payload(ctx, "list")
+        entry = result["tasks"][0]
+        assert entry["trigger"] == "on event: ci.passed"
+        assert entry["next_run"] == "\u2014"
 
     def test_status_missing_task_id(self) -> None:
         from leapflow.cli.commands.slash_handlers import build_schedule_payload

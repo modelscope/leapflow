@@ -38,6 +38,13 @@ class ExecutionTier(str, Enum):
     AUTO = "auto"
 
 
+class TaskSource(str, Enum):
+    """Who created a scheduled task."""
+
+    SYSTEM = "system"
+    USER = "user"
+
+
 class SchedulerExecutionMode(str, Enum):
     """How a scheduled task runs its skill on each trigger.
 
@@ -98,6 +105,7 @@ class ArmedTask:
     max_retries: int = 0
     retry_count: int = 0
     retry_backoff_s: float = 60.0
+    source: str = TaskSource.USER.value
 
 
 @dataclass
