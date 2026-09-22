@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 from leapflow.plugins.protocol import ToolMetadata
+from leapflow.scheduler.types import TaskSource
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +296,7 @@ class SchedulerToolsPlugin:
                 trigger_expr=trigger_expr,
                 parameters=parameters,
                 max_retries=max_retries,
+                source=TaskSource.USER.value,
             )
         except (ValueError, RuntimeError) as exc:
             return {"ok": False, "error": "arm_failed", "message": str(exc)}
@@ -322,6 +324,7 @@ class SchedulerToolsPlugin:
                 {
                     "task_id": t.task_id,
                     "skill_name": t.skill_name,
+                    "source": t.source,
                     "state": t.state,
                     "execution_mode": _task_execution_mode(t),
                     "trigger_type": t.trigger_type,

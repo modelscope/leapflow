@@ -36,7 +36,7 @@ from leapflow.scheduler.coordinator import TaskCoordinator
 from leapflow.scheduler.local_scheduler import LocalScheduler
 from leapflow.scheduler.store import TaskStore
 from leapflow.scheduler.triggers.event import EventTrigger
-from leapflow.scheduler.types import ArmedTask, TaskState
+from leapflow.scheduler.types import ArmedTask, TaskSource, TaskState
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +237,7 @@ class MonitorManager:
             execution_tier="local",
             max_runs=spec.max_runs,
             parameters=spec.to_task_parameters(),
+            source=TaskSource.SYSTEM.value,
         )
         # Backfill watch_id into parameters and stamp watch metadata so ticks
         # and listings can identify the row without re-deriving it.

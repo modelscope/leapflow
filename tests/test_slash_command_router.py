@@ -53,8 +53,8 @@ def test_command_router_all_commands_supported_in_daemon() -> None:
         "/skill show demo",
         "/hub search test",
         "/gateway",
-        "/arm test_skill 0 * * * *",
-        "/task",
+        "/schedule",
+        "/schedule list",
     ):
         inv = daemon_router.parse(cmd_text)
         assert inv is not None, f"parse failed for {cmd_text}"

@@ -10,6 +10,7 @@ from leapflow.scheduler.execution_log import (
 from leapflow.scheduler.types import (
     ArmedTask,
     TaskState,
+    TaskSource,
     ExecutionTier,
     TaskStatus,
     Trigger,
@@ -29,6 +30,7 @@ __all__ = [
     # Types & enums
     "ArmedTask",
     "TaskState",
+    "TaskSource",
     "ExecutionTier",
     "TaskStatus",
     "Trigger",
