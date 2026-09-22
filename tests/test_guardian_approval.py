@@ -3,17 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import time
-from dataclasses import dataclass
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
-from leapflow.security.actions import ActionDescriptor, ActionEffect, ActionKind
+from leapflow.security.actions import ActionDescriptor
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest
-from leapflow.security.grants import ApprovalAuditLog, InMemoryApprovalGrantStore
 from leapflow.security.guardian import (
     DenialBreaker,
     GuardianConfig,
@@ -21,9 +16,7 @@ from leapflow.security.guardian import (
     GuardianVerdict,
     NullGuardianAuditSink,
 )
-from leapflow.security.orchestrator import ApprovalOrchestrator, ApprovalResult
-from leapflow.security.policy import ApprovalPolicyEngine
-from leapflow.security.risk import DefaultRiskClassifier, RiskAssessment, RiskLevel
+from leapflow.security.orchestrator import ApprovalOrchestrator
 
 
 # ---------------------------------------------------------------------------

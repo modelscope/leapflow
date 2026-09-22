@@ -262,8 +262,16 @@ class TurnUsageTracker:
     ) -> None:
         """Record a single tool execution."""
         self._tool_records.append(_ToolCallRecord(name, success, duration_ms))
-        if self._plugin_stats_sink is not None:
-            self._plugin_stats_sink.record(name, success, duration_ms)
+        sink = self._plugin_stats_sink
+        if sink is None:
+            return
+        # Telemetry must never fail a turn: a malformed or misbehaving stats sink
+        # (e.g. one injected by a plugin, or leaked across tests) is contained and
+        # logged rather than propagated into the agent loop.
+        try:
+            sink.record(name, success, duration_ms)
+        except Exception:  # noqa: BLE001 - stats recording is telemetry, never a gate
+            logger.debug("plugin stats sink.record failed", exc_info=True)
 
     def mark_compression(self) -> None:
         self._compression_applied = True
