@@ -1,15 +1,23 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""ReAct-style tool-use executor for SKILL.md skills.
+"""**DEPRECATED** — Legacy ReAct-style tool-use executor for SKILL.md skills.
+
+.. deprecated:: 0.3.0
+    ``ToolUseSkillExecutor`` and ``ExecutionToolset`` are legacy components
+    that predate the Hermes-inspired unified agent loop. New code should use
+    ``SkillActivator`` / ``SkillInjector`` / ``SkillDispatcher`` and the
+    unified tool dispatch engine (``engine.tool_dispatch_engine``) instead.
+
+    Domain types (``ToolCall``, ``ToolDefinition``, ``StepOutput``,
+    ``ExecutionPort``) have been relocated to ``leapflow.skills.tool_types``.
+    Parsing utilities (``parse_tool_call``, ``detect_repetition``) have been
+    relocated to ``leapflow.skills.tool_call_parser``.
+
+    Imports from this module are forwarded for backward compatibility but will
+    be removed in a future release.
 
 Gives the LLM access to real system tools (file ops, shell, UI) via
 ExecutionPort. Each SKILL.md instruction is executed as a bounded
 observe → reason → act loop.
-
-Architecture:
-    ToolDefinition  → describes available tools for LLM prompt
-    ToolCall        → parsed from LLM JSON output
-    ExecutionToolset → dispatches ToolCalls to ExecutionPort (SRP: only routing)
-    ToolUseSkillExecutor → orchestrates the ReAct loop per instruction
 
 ``ExecutionToolset`` is the desktop execution tool container used exclusively
 by the bounded ReAct skill executor (SKILL.md instructions and the chat
@@ -24,12 +32,27 @@ import json
 import logging
 import re
 import shlex
+import warnings
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from leapflow.engine.budget import BudgetConfig, BudgetStatus, IterationBudget
 from leapflow.engine.context.context_compressor import CompressorConfig, ContextCompressor
 from leapflow.engine.message_healer import MessageHealer
+
+# Re-export domain types from their canonical home for backward compatibility.
+from leapflow.skills.tool_types import (  # noqa: F401 — re-export
+    ExecutionPort,
+    StepOutput,
+    ToolCall,
+    ToolDefinition,
+)
+
+# Re-export parsing utilities from their canonical home.
+from leapflow.skills.tool_call_parser import (  # noqa: F401 — re-export
+    detect_repetition as _detect_repetition_impl,
+    parse_tool_call as _parse_tool_call_impl,
+)
 
 if TYPE_CHECKING:
     from leapflow.engine.confirmation import IOProvider
@@ -38,6 +61,21 @@ if TYPE_CHECKING:
     from leapflow.storage.bundle_writer import BundleContext
 
 logger = logging.getLogger(__name__)
+
+# Module-level deprecation notice: emitted once when the module is first imported.
+warnings.warn(
+    "leapflow.skills.tool_executor is deprecated. "
+    "Use leapflow.skills.tool_types for domain types, "
+    "leapflow.skills.tool_call_parser for parsing utilities, "
+    "and the unified engine loop for execution.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
+# Backward-compat aliases for private parser functions previously in this module.
+_detect_repetition = _detect_repetition_impl
+_parse_tool_call = _parse_tool_call_impl
+
 
 _DRIFT_THRESHOLD = 2
 _MUTATING_SHELL_PREFIXES = (
@@ -50,12 +88,6 @@ _MUTATING_SHELL_PREFIXES = (
     "sed", "awk", "tee",
 )
 _SHELL_CHAIN_SPLIT = re.compile(r"\s*(?:&&|\|\||;)\s*")
-_TOOL_CALL_PATTERN = re.compile(
-    r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL
-)
-_INLINE_JSON_PATTERN = re.compile(
-    r'\{\s*"name"\s*:', re.DOTALL
-)
 
 
 def _is_shell_mutating(command: str) -> bool:
@@ -72,65 +104,14 @@ def _is_shell_mutating(command: str) -> bool:
     return False
 
 
-@dataclass(frozen=True)
-class ToolDefinition:
-    """Schema for one available tool — injected into the LLM system prompt.
-
-    Traits:
-        mutates_state: Tool changes observable state → clears dedup cache.
-        counts_as_progress: Tool represents forward progress toward the goal
-            → triggers completion HINT. Defaults to mutates_state.
-            Set False for timing/polling tools (wait, wait_until_stable).
-    """
-
-    name: str
-    description: str
-    parameters: Dict[str, str]
-    mutates_state: bool = False
-    counts_as_progress: bool | None = None
-
-    @property
-    def is_progress(self) -> bool:
-        if self.counts_as_progress is not None:
-            return self.counts_as_progress
-        return self.mutates_state
-
-
-@dataclass(frozen=True)
-class ToolCall:
-    """Parsed tool invocation from LLM output."""
-
-    name: str
-    params: Dict[str, Any]
-
-
-@dataclass
-class StepOutput:
-    """Result of executing one instruction step."""
-
-    ok: bool
-    result: str = ""
-    error: str = ""
-    tool_calls_made: int = 0
-    goal_complete: bool = False
-
-
-@runtime_checkable
-class ExecutionPort(Protocol):
-    """Minimal execution interface (matches vsi.ports.ExecutionPort)."""
-
-    async def perform_file_op(self, op: str, params: Dict[str, Any]) -> Dict[str, Any]: ...
-    async def exec_shell(self, command: str) -> Dict[str, Any]: ...
-    async def launch_app(
-        self, app_id: str, urls: Optional[List[str]] = None
-    ) -> Dict[str, Any]: ...
-    async def perform_ui_action(
-        self, node_id: str, action: str, params: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]: ...
+# Domain types are now defined in leapflow.skills.tool_types and re-exported
+# at the top of this module. The class definitions below have been removed;
+# ToolDefinition, ToolCall, StepOutput, ExecutionPort are available via the
+# re-export imports above.
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ExecutionToolset — desktop execution dispatch layer
+# ExecutionToolset — desktop execution dispatch layer (DEPRECATED)
 # ═══════════════════════════════════════════════════════════════════════
 
 
@@ -155,6 +136,11 @@ class _ToolHandler:
 class ExecutionToolset:
     """Maps desktop tool names to ExecutionPort methods via a handler registry.
 
+    .. deprecated:: 0.3.0
+        This class is part of the legacy ReAct skill executor. New code should
+        use the unified tool dispatch engine (``engine.tool_dispatch_engine``)
+        and the ``ToolPluginRegistry`` handler system instead.
+
     Serves the bounded ReAct skill executor: registers ExecutionPort-derived
     defaults (file ops, shell, launch_app, ui_action, done) plus optional
     semantic UI tools (via ``build_execution_toolset``). The unified agent
@@ -170,6 +156,12 @@ class ExecutionToolset:
         policy: Optional["PolicyEngine"] = None,
         io: Optional["IOProvider"] = None,
     ) -> None:
+        warnings.warn(
+            "ExecutionToolset is deprecated. Use the unified tool dispatch "
+            "engine and ToolPluginRegistry handlers instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._execution = execution
         self.policy = policy
         self.io = io
@@ -496,7 +488,14 @@ Skill context:
 
 
 class ToolUseSkillExecutor:
-    """Executes SKILL.md instructions via bounded ReAct loop with real tools."""
+    """Executes SKILL.md instructions via bounded ReAct loop with real tools.
+
+    .. deprecated:: 0.3.0
+        This executor is a legacy component that predates the Hermes-inspired
+        unified agent loop. New code should use ``SkillActivator`` /
+        ``SkillInjector`` / ``SkillDispatcher`` and the unified tool dispatch
+        engine instead.
+    """
 
     def __init__(
         self,
@@ -512,6 +511,12 @@ class ToolUseSkillExecutor:
         compressor_config: Optional[CompressorConfig] = None,
         step_timeout_s: float = 30.0,
     ) -> None:
+        warnings.warn(
+            "ToolUseSkillExecutor is deprecated. Use the unified agent loop "
+            "(SkillActivator / SkillDispatcher) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._llm = llm
         self._vlm = vlm
         self._toolset = toolset
@@ -964,111 +969,6 @@ class ToolUseSkillExecutor:
         return "\n".join(parts)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Tool call parsing
-# ═══════════════════════════════════════════════════════════════════════
-
-
-def _detect_repetition(content: str, threshold: int = 10) -> bool:
-    """Detect if LLM output is stuck in a repetitive pattern."""
-    if len(content) < 100:
-        return False
-    # Check for repeated closing tags (common failure mode)
-    repeated_patterns = ["</invoke>", "</tool_call>", "```\n```"]
-    for pattern in repeated_patterns:
-        if content.count(pattern) >= threshold:
-            return True
-    # Check last 200 chars for character-level repetition
-    tail = content[-200:]
-    if len(set(tail.split())) <= 3 and len(tail) > 50:
-        return True
-    return False
-
-
-def _parse_tool_call(content: str) -> Optional[ToolCall]:
-    """Extract a tool call JSON from LLM response text.
-
-    Supports:
-    - ```json {"name": ..., "arguments": {...}} ``` (primary)
-    - Inline {"name": ...} patterns
-    - <tool_call>{"name": ..., "arguments": {...}}</tool_call> patterns
-    - Legacy {"tool": ..., "params": {...}} format
-    """
-    # 1. Standard markdown code block
-    match = _TOOL_CALL_PATTERN.search(content)
-    if match:
-        result = _try_parse_json(match.group(1))
-        if result:
-            return result
-
-    # 2. <tool_call> XML-style wrapper
-    tc_match = re.search(r'<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|</invoke>)', content, re.DOTALL)
-    if tc_match:
-        result = _try_parse_json(tc_match.group(1))
-        if result:
-            return result
-
-    # 3. Inline JSON with "name" or "tool" key
-    idx = -1
-    for pattern_str in ['"name"', '"tool"']:
-        search = content.find('{')
-        while search != -1:
-            # Check if this { starts a valid tool call JSON
-            if pattern_str in content[search:search + 50]:
-                idx = search
-                break
-            search = content.find('{', search + 1)
-        if idx != -1:
-            break
-
-    if idx == -1:
-        match2 = _INLINE_JSON_PATTERN.search(content)
-        if match2:
-            idx = match2.start()
-
-    if idx != -1:
-        depth = 0
-        end = idx
-        for i in range(idx, min(len(content), idx + 2000)):  # limit scan to 2000 chars
-            if content[i] == '{':
-                depth += 1
-            elif content[i] == '}':
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        if depth == 0:
-            return _try_parse_json(content[idx:end])
-
-    return None
-
-
-def _try_parse_json(text: str) -> Optional[ToolCall]:
-    """Parse a JSON string into a ToolCall (OpenAI function calling format)."""
-    try:
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            return None
-
-        # Primary: OpenAI function calling format {"name": ..., "arguments": {...}}
-        if "name" in data:
-            name = data["name"]
-            params = data.get("arguments", data.get("params", data.get("parameters", {})))
-            if isinstance(params, str):
-                # Sometimes arguments is a JSON string
-                try:
-                    params = json.loads(params)
-                except (json.JSONDecodeError, TypeError):
-                    params = {"raw": params}
-            return ToolCall(name=str(name), params=params if isinstance(params, dict) else {})
-
-        # Fallback: legacy {"tool": ..., "params": {...}} format
-        if "tool" in data:
-            return ToolCall(
-                name=data["tool"],
-                params=data.get("params", data.get("arguments", data.get("parameters", {}))),
-            )
-
-    except (json.JSONDecodeError, KeyError, TypeError):
-        pass
-    return None
+# Parser functions have been relocated to leapflow.skills.tool_call_parser.
+# The module-level backward-compat aliases (_detect_repetition, _parse_tool_call)
+# are defined near the top of this file via the re-export imports.

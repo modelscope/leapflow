@@ -10,6 +10,8 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
+from leapflow.skills.index import _BUILTIN_SKILLS_DIR
+
 logger = logging.getLogger(__name__)
 
 # Injection markers (LLM recognizes these as skill context)
@@ -86,19 +88,31 @@ class SkillInjector:
     def find_skill_dir(self, name: str) -> Optional[Path]:
         """Resolve skill name -> directory path.
 
+        Searches user-profile skills_dir first (so user overrides win),
+        then the package-bundled builtin_skills directory.
         Attempts direct match first, then normalized (hyphen-based) lookup.
         """
-        if not self._skills_dir.exists():
+        # Search order: user dir first, then builtin
+        for base_dir in (self._skills_dir, _BUILTIN_SKILLS_DIR):
+            result = self._find_in_dir(base_dir, name)
+            if result is not None:
+                return result
+        return None
+
+    @staticmethod
+    def _find_in_dir(base_dir: Path, name: str) -> Optional[Path]:
+        """Search a single directory for a skill by name."""
+        if not base_dir.exists():
             return None
 
         # Direct match
-        direct = self._skills_dir / name
+        direct = base_dir / name
         if direct.is_dir() and (direct / "SKILL.md").exists():
             return direct
 
         # Normalized: replace spaces/underscores with hyphens
         normalized = name.lower().replace(" ", "-").replace("_", "-")
-        for d in self._skills_dir.iterdir():
+        for d in base_dir.iterdir():
             if not d.is_dir():
                 continue
             if d.name.lower().replace("_", "-") == normalized:

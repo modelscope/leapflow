@@ -2,6 +2,8 @@
 """Skills package — runtime skill registry, activation, and execution."""
 
 from leapflow.skills.curator import (
+    ConsolidationAction,
+    ConsolidationSuggestion,
     CurationReport,
     CurationState,
     CurationTransition,
@@ -10,6 +12,7 @@ from leapflow.skills.curator import (
 )
 from leapflow.skills.index import SkillEntry, SkillIndex
 from leapflow.skills.injector import SkillInjector
+from leapflow.skills.mcp_bridge import McpSkillBridge, McpSkillEntry
 from leapflow.skills.registry import (
     Skill,
     SkillMetadata,
@@ -19,9 +22,13 @@ from leapflow.skills.registry import (
 )
 
 __all__ = [
+    "ConsolidationAction",
+    "ConsolidationSuggestion",
     "CurationReport",
     "CurationState",
     "CurationTransition",
+    "McpSkillBridge",
+    "McpSkillEntry",
     "Skill",
     "SkillCurationEntry",
     "SkillCurator",

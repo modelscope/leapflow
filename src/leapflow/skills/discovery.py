@@ -1,9 +1,11 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 """Skill discovery tools — exposed to LLM for progressive disclosure.
 
-Provides two tool handlers registered into the unified tool system:
-- skills_list: Layer 1 — compact metadata listing with optional keyword filter
-- skill_view: Layer 2 — full SKILL.md content for a specific skill
+Provides four tool handlers registered into the unified tool system:
+- skills_list:      Layer 1 — compact metadata listing with optional keyword filter
+- skill_view:       Layer 2 — full SKILL.md content for a specific skill
+- skill_list_files: Layer 3a — list support files in a skill directory
+- skill_file_read:  Layer 3b — read individual support file from a skill directory
 
 Module-level configuration pattern: call configure() at startup to inject
 SkillIndex and SkillInjector instances without coupling to DI framework.
@@ -11,7 +13,9 @@ SkillIndex and SkillInjector instances without coupling to DI framework.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+import os
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +149,111 @@ async def skill_view(params: Dict[str, Any]) -> Dict[str, Any]:
         "name": name,
         "content": content_out,
         "path": str(skill_dir),
+    }
+    if truncated:
+        result["truncated"] = True
+        result["total_chars"] = len(content)
+
+    return result
+
+
+def _validate_relative_path(file_path: str) -> Optional[str]:
+    """Validate that *file_path* is relative and does not escape the skill dir.
+
+    Returns an error message string if invalid, or ``None`` if safe.
+    """
+    if not file_path:
+        return "file_path is required"
+    # Reject absolute paths (Unix and Windows)
+    if file_path.startswith("/") or file_path.startswith("\\"):
+        return "Absolute paths are not allowed"
+    # Reject any component that walks upward
+    parts = PurePosixPath(file_path).parts
+    if ".." in parts:
+        return "Path traversal ('..') is not allowed"
+    return None
+
+
+async def skill_list_files(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Layer 3a: List support files available in a skill directory.
+
+    Params:
+        name (str, required): Skill name to look up.
+
+    Returns dict with ok, name, files[] fields.
+    """
+    if _skill_injector is None:
+        return {"ok": False, "error": "Skill injector not initialized"}
+
+    name = str(params.get("name", "")).strip()
+    if not name:
+        return {"ok": False, "error": "Skill name required"}
+
+    skill_dir = _skill_injector.find_skill_dir(name)
+    if skill_dir is None:
+        return {"ok": False, "error": f"Skill '{name}' not found"}
+
+    files: List[str] = []
+    skill_path = Path(skill_dir)
+    for root, _dirs, filenames in os.walk(skill_path):
+        root_path = Path(root)
+        for fn in sorted(filenames):
+            rel = (root_path / fn).relative_to(skill_path)
+            files.append(str(rel))
+
+    return {"ok": True, "name": name, "files": sorted(files), "path": str(skill_dir)}
+
+
+async def skill_file_read(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Layer 3b: Read an individual support file from a skill directory.
+
+    Params:
+        name (str, required): Skill name to look up.
+        file_path (str, required): Relative path within the skill directory.
+
+    Returns dict with ok, name, file_path, content, path fields.
+    """
+    if _skill_injector is None:
+        return {"ok": False, "error": "Skill injector not initialized"}
+
+    name = str(params.get("name", "")).strip()
+    if not name:
+        return {"ok": False, "error": "Skill name required"}
+
+    file_path = str(params.get("file_path", "")).strip()
+    path_err = _validate_relative_path(file_path)
+    if path_err:
+        return {"ok": False, "error": path_err}
+
+    skill_dir = _skill_injector.find_skill_dir(name)
+    if skill_dir is None:
+        return {"ok": False, "error": f"Skill '{name}' not found"}
+
+    skill_root = Path(skill_dir).resolve()
+    target = (skill_root / file_path).resolve()
+    try:
+        target.relative_to(skill_root)
+    except ValueError:
+        return {"ok": False, "error": "Path escapes skill directory"}
+
+    if not target.is_file():
+        return {"ok": False, "error": f"File '{file_path}' not found in skill '{name}'"}
+
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"ok": False, "error": f"Failed to read file: {exc}"}
+
+    max_chars = _skill_view_max_chars
+    truncated = len(content) > max_chars
+    content_out = content[:max_chars]
+
+    result: Dict[str, Any] = {
+        "ok": True,
+        "name": name,
+        "file_path": file_path,
+        "content": content_out,
+        "path": str(target),
     }
     if truncated:
         result["truncated"] = True

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Protocol, runtime_checkable
 
-from leapflow.skills.tool_executor import ToolCall
+from leapflow.skills.tool_types import ToolCall
 
 
 class Verdict(Enum):
