@@ -345,12 +345,12 @@ _DOMAIN_TYPES = [
     ("leapflow.gateway.connectors.protocol", "ActionSpec"),
     ("leapflow.gateway.connectors.protocol", "ActionResult"),
     ("leapflow.gateway.connectors.protocol", "ActionFailure"),
-    ("leapflow.engine.failure_envelope", "FailureEnvelope"),
-    ("leapflow.engine.failure_envelope", "FailureContext"),
-    ("leapflow.engine.failure_envelope", "RecoveryHint"),
-    ("leapflow.engine.recovery_decision", "RecoveryDecision"),
-    ("leapflow.engine.recovery_decision", "BackoffConfig"),
-    ("leapflow.engine.recovery_decision", "RetrySemantics"),
+    ("leapflow.engine.recovery.failure_envelope", "FailureEnvelope"),
+    ("leapflow.engine.recovery.failure_envelope", "FailureContext"),
+    ("leapflow.engine.recovery.failure_envelope", "RecoveryHint"),
+    ("leapflow.engine.recovery.recovery_decision", "RecoveryDecision"),
+    ("leapflow.engine.recovery.recovery_decision", "BackoffConfig"),
+    ("leapflow.engine.recovery.recovery_decision", "RetrySemantics"),
     ("leapflow.monitor.types", "Finding"),
     ("leapflow.monitor.types", "WatchSpec"),
 ]
@@ -373,7 +373,7 @@ def test_domain_types_are_frozen(module_name: str, type_name: str) -> None:
 
 def test_frozen_domain_type_rejects_mutation_at_runtime() -> None:
     """The frozen flag must actually block writes (not just be declared)."""
-    from leapflow.engine.failure_envelope import FailureEnvelope, FailureSource, Recoverability
+    from leapflow.engine.recovery.failure_envelope import FailureEnvelope, FailureSource, Recoverability
 
     envelope = FailureEnvelope.create(
         source=FailureSource.TOOL,
@@ -393,7 +393,7 @@ def test_frozen_domain_type_rejects_mutation_at_runtime() -> None:
 _EXTENSION_POINTS = [
     ("leapflow.gateway.connectors.protocol", "ExecutionBackend"),
     ("leapflow.gateway.connectors.protocol", "BackendEventSource"),
-    ("leapflow.engine.recovery_coordinator", "RecoveryStrategy"),
+    ("leapflow.engine.recovery.recovery_coordinator", "RecoveryStrategy"),
     ("leapflow.monitor.types", "MonitorProducer"),
     ("leapflow.dashboard.service", "DashboardDataProvider"),
     ("leapflow.plugins.selection_policy", "SelectionPolicy"),
@@ -433,9 +433,9 @@ _STANDALONE_MODULES = [
     "leapflow.gateway.trigger_policy",
     "leapflow.gateway.session_router",
     "leapflow.gateway.validators",
-    "leapflow.engine.recovery_coordinator",
-    "leapflow.engine.recovery_strategies",
-    "leapflow.engine.failure_envelope",
+    "leapflow.engine.recovery.recovery_coordinator",
+    "leapflow.engine.recovery.strategies",
+    "leapflow.engine.recovery.failure_envelope",
     "leapflow.monitor.types",
     "leapflow.monitor.session_producer",
     "leapflow.dashboard.service",
@@ -503,7 +503,7 @@ def test_engine_self_attributes_all_exist() -> None:
     read = set(re.findall(attribute, source))
     assigned = set(re.findall(attribute + r"\s*(?::[^=\n]+)?=", source))
     # Attributes may also be set from outside (session_factory clones engines).
-    for module in ("leapflow.engine.session_factory", "leapflow.engine.agent_loop"):
+    for module in ("leapflow.engine.session.session_factory", "leapflow.engine.agent_loop"):
         mod = importlib.import_module(module)
         assigned |= set(
             re.findall(r"engine\.(_?[a-z][a-z0-9_]*)\s*=", Path(mod.__file__).read_text(encoding="utf-8"))

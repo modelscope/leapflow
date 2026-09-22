@@ -64,10 +64,21 @@ class SkillIndex:
         platform: Optional[str] = None,
         available_tools: Optional[Set[str]] = None,
         disabled: Optional[Set[str]] = None,
+        archived: Optional[Set[str]] = None,
+        include_archived: bool = False,
     ) -> List[SkillEntry]:
-        """Get filtered skill entries (L1 -> L2 -> L3)."""
+        """Get filtered skill entries (L1 -> L2 -> L3).
+
+        Args:
+            archived: Set of archived skill names (from SkillCurator).
+                      Excluded from results unless *include_archived* is True.
+            include_archived: If True, archived skills are included in results.
+        """
         entries = self._load_entries()
-        return self._apply_filters(entries, platform, available_tools, disabled)
+        return self._apply_filters(
+            entries, platform, available_tools, disabled,
+            archived=archived, include_archived=include_archived,
+        )
 
     def get_entry(self, name: str) -> Optional[SkillEntry]:
         """Get single entry by exact name."""
@@ -218,7 +229,8 @@ class SkillIndex:
                 raw["platforms"] = tuple(raw.get("platforms", ()))
                 entries.append(SkillEntry(**raw))
             return entries
-        except Exception:
+        except Exception as exc:
+            logger.debug("skill_index.snapshot_load_failed path=%s error=%s", self._snapshot_path, exc)
             return None
 
     def _save_snapshot(self, entries: List[SkillEntry]) -> None:
@@ -236,11 +248,17 @@ class SkillIndex:
         platform: Optional[str],
         available_tools: Optional[Set[str]],
         disabled: Optional[Set[str]],
+        *,
+        archived: Optional[Set[str]] = None,
+        include_archived: bool = False,
     ) -> List[SkillEntry]:
-        """Conditional filtering (Hermes-style)."""
+        """Conditional filtering (Hermes-style) with curation awareness."""
         result: List[SkillEntry] = []
         for entry in entries:
             if disabled and entry.name in disabled:
+                continue
+            # Curation: exclude archived skills unless explicitly requested
+            if not include_archived and archived and entry.name in archived:
                 continue
             if platform and entry.platforms and platform not in entry.platforms:
                 continue

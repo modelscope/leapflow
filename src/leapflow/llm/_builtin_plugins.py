@@ -59,6 +59,8 @@ class OpenAICompatiblePlugin:
             "supports_vision": True,
             "supports_thinking": True,
             "credential_rotation": True,
+            "cache_type": "auto_prefix",
+            "cache_usage_fields": ["prompt_cache_hit_tokens", "cached_tokens"],
         }
 
     def create_provider(self, config: Dict[str, Any]) -> LLMProvider:

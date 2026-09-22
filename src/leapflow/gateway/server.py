@@ -788,7 +788,7 @@ class GatewayServer:
             chat_id=source.chat_id,
             thread_id=source.thread_id,
         )
-        max_len = getattr(adapter, "max_message_length", 0) or 8000
+        max_len = adapter.capabilities.max_message_length or 8000
         chunks = _chunk_text(text, max_len)
         if not chunks:
             return SendResult(ok=True)

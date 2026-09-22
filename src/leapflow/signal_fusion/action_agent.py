@@ -82,7 +82,7 @@ class ActionFusionAgent:
                     timestamp=0.0,
                     confidence=va.confidence,
                     source_signals=["visual"],
-                    fusion_mode=FusionMode.VISUAL_ONLY,
+                    fusion_mode=FusionMode.VISUAL_PRIMARY,
                     visual_evidence=va.evidence,
                     frame_ref=va.frame_ref_a,
                 ))
@@ -98,7 +98,7 @@ class ActionFusionAgent:
                 app_bundle=ev.source,
                 confidence=self._event_only_confidence,
                 source_signals=["event"],
-                fusion_mode=FusionMode.EVENT_ONLY,
+                fusion_mode=FusionMode.EVENT_PRIMARY,
             ))
 
         atoms.sort(key=lambda a: a.timestamp)
@@ -122,7 +122,7 @@ class ActionFusionAgent:
                 continue
             if not _action_types_compatible(va.action, ev.event_type):
                 continue
-            dist = abs(ev.timestamp)
+            dist = abs(ev.timestamp - getattr(va, "timestamp", 0.0))
             if dist < best_dist and dist <= self._tolerance:
                 best_dist = dist
                 best_idx = i

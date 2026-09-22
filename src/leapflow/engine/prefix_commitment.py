@@ -18,9 +18,13 @@ Design contract (aligns with the design doc 7.2):
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, FrozenSet
+
+logger = logging.getLogger(__name__)
 
 
 class CommitmentStatus(str, Enum):
@@ -51,7 +55,12 @@ class PrefixCommitmentConfig:
     """Thresholds for the commitment decision (7.2.2)."""
 
     commit_difficulty_threshold: float = 0.60
-    min_prefix_tokens: int = 1024
+    # Lowered from 1024 to 768 (P0-OPT-2) to allow earlier COMMITTED entry
+    # in sessions whose stable prefix is large enough for amortization but
+    # below the previous threshold.  The other gates (difficulty, posture,
+    # remaining_rounds, projected_savings > 0) still prevent premature
+    # commitment on short or trivial tasks.
+    min_prefix_tokens: int = 768
     min_remaining_rounds: int = 3
     margin: float = 0.15
     # Expansion / long-horizon postures that make committing worthwhile. Note
@@ -84,11 +93,47 @@ class PrefixCommitmentState:
         }
 
 
+@dataclass(frozen=True)
+class CommitmentEnforcement:
+    """Frozen snapshot of the disclosure state at the moment of cache commitment.
+
+    Captures the exact disclosure level, tool set, and system-prompt identity
+    so that subsequent turns can reproduce a byte-identical prefix.  The
+    ``frozen_level`` field stores a :class:`DisclosureLevel` *value* (which is
+    a plain ``str`` because ``DisclosureLevel`` is ``str, Enum``).  Keeping the
+    type as ``str`` avoids a circular import between this module and
+    ``context_disclosure``.
+    """
+
+    frozen_level: str
+    """DisclosureLevel value (e.g. 'core', 'expanded', 'full')."""
+
+    frozen_tool_names: tuple[str, ...]
+    """Sorted tuple of tool names that were active at commitment time."""
+
+    frozen_system_prompt_hash: str
+    """SHA-256 hex digest of the system prompt at commitment time."""
+
+    committed_at_turn: int
+    """Turn index at which the enforcement was established."""
+
+
+def _system_prompt_hash(system_prompt: str) -> str:
+    """Compute a stable SHA-256 hex digest for a system prompt string."""
+    return hashlib.sha256(system_prompt.encode("utf-8", errors="replace")).hexdigest()
+
+
 class PrefixCommitmentController:
     """Per-task controller: decides (once) whether to commit the prefix.
 
     Stateless w.r.t. the decision math (``should_commit`` is pure); holds only
     the monotonic commitment state, reset per task via :meth:`reset`.
+
+    **Enforcement lifecycle**:  After commitment, :meth:`enforce` freezes a
+    snapshot of the current disclosure state.  :meth:`break_commitment` clears
+    the enforcement without reverting ``CommitmentStatus`` (the commitment
+    decision itself is still monotonic; only the *enforcement* is revocable so
+    the planner can fall back to normal PCD when the prefix drifts).
     """
 
     def __init__(
@@ -100,6 +145,9 @@ class PrefixCommitmentController:
         self._config = config or PrefixCommitmentConfig()
         self._price = price_model or CachePriceModel()
         self._state = PrefixCommitmentState()
+        self._enforcement: CommitmentEnforcement | None = None
+
+    # ── read-only accessors ───────────────────────────────────────────
 
     @property
     def state(self) -> PrefixCommitmentState:
@@ -109,9 +157,17 @@ class PrefixCommitmentController:
     def committed(self) -> bool:
         return self._state.committed
 
+    @property
+    def enforcement(self) -> CommitmentEnforcement | None:
+        """Return the active enforcement snapshot, or ``None`` if not enforced."""
+        return self._enforcement
+
+    # ── lifecycle ─────────────────────────────────────────────────────
+
     def reset(self) -> None:
         """Clear commitment state at the start of a new task/turn."""
         self._state = PrefixCommitmentState()
+        self._enforcement = None
 
     def projected_savings(
         self,
@@ -193,3 +249,91 @@ class PrefixCommitmentController:
                 reason=f"difficulty={difficulty:.2f} posture={posture} R={remaining_rounds}",
             )
         return self._state
+
+    # ── enforcement ───────────────────────────────────────────────────
+
+    def enforce(
+        self,
+        current_level: str,
+        current_tool_names: tuple[str, ...],
+        system_prompt_hash: str,
+        turn_index: int,
+    ) -> CommitmentEnforcement | None:
+        """Freeze the current disclosure snapshot once committed.
+
+        On the first call after commitment, captures a
+        :class:`CommitmentEnforcement` snapshot.  Subsequent calls while
+        enforcement is active return the existing snapshot unchanged.
+
+        Parameters are plain values (``str``, ``tuple``) rather than rich
+        domain types to avoid a circular import with ``context_disclosure``.
+
+        Returns:
+            The active enforcement snapshot, or ``None`` if not yet committed.
+        """
+        if not self._state.committed:
+            return None
+        if self._enforcement is not None:
+            return self._enforcement
+        self._enforcement = CommitmentEnforcement(
+            frozen_level=str(current_level),
+            frozen_tool_names=tuple(sorted(current_tool_names)),
+            frozen_system_prompt_hash=system_prompt_hash,
+            committed_at_turn=turn_index,
+        )
+        logger.debug(
+            "PrefixCommitment: enforced level=%s tools=%d turn=%d",
+            current_level, len(current_tool_names), turn_index,
+        )
+        return self._enforcement
+
+    def should_break_commitment(
+        self,
+        *,
+        posture_changed: bool = False,
+        tool_error: bool = False,
+        slash_command: bool = False,
+        transform_retry: bool = False,
+    ) -> bool:
+        """Return whether enforcement should be broken.
+
+        Any structural disruption (posture shift, tool error, slash command,
+        recovery-driven transform retry) means the stable prefix assumption
+        no longer holds and the planner should fall back to normal PCD.
+        """
+        return posture_changed or tool_error or slash_command or transform_retry
+
+    def break_commitment(self) -> None:
+        """Clear enforcement without reverting the commitment decision.
+
+        The ``CommitmentStatus`` remains COMMITTED (the decision is monotonic
+        per the 7.2.6 contract), but the enforcement snapshot is discarded so
+        :meth:`DisclosurePlanner.plan` will run normal PCD logic instead of
+        freezing the disclosure level.  A new :meth:`enforce` call can
+        re-establish enforcement if the prefix stabilizes again.
+        """
+        if self._enforcement is not None:
+            logger.debug(
+                "PrefixCommitment: enforcement broken (was level=%s turn=%d)",
+                self._enforcement.frozen_level,
+                self._enforcement.committed_at_turn,
+            )
+        self._enforcement = None
+
+    def force_commit(self) -> None:
+        """Force the controller into the committed state.
+
+        Intended for session restoration / resume paths where the prior
+        session was already committed.  The caller must follow up with
+        :meth:`enforce` to re-establish the enforcement snapshot.
+        """
+        if self._state.committed:
+            return
+        self._state = PrefixCommitmentState(
+            status=CommitmentStatus.COMMITTED,
+            committed_at_round=-1,
+            prefix_token_estimate=0,
+            projected_savings=0.0,
+            reason="force_commit (session restore)",
+        )
+        logger.debug("PrefixCommitment: force-committed for session restore")

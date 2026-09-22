@@ -465,7 +465,7 @@ def test_skill_library_crud(skill_library) -> None:
 
 
 def test_tool_execution_store_roundtrip_and_unique_key(tmp_path: Path) -> None:
-    from leapflow.engine.tool_execution import ToolExecutionRecord
+    from leapflow.engine.tools.tool_execution import ToolExecutionRecord
     from leapflow.storage.conversation_store import DuckDBConversationStore
 
     store = DuckDBConversationStore(tmp_path / "conversation.duckdb")

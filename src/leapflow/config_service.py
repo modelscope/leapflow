@@ -104,7 +104,7 @@ _BOOTSTRAP_ONLY_SETTINGS = frozenset({
     "perceptual_field_config",
 })
 
-_SECRET_SETTINGS = frozenset({"llm_api_key", "vlm_api_key", "llm_aux_api_key"})
+_SECRET_SETTINGS = frozenset({"llm_api_key", "vlm_api_key", "llm_aux_api_key", "compression_api_key"})
 
 _FIELD_DESCRIPTIONS = {
     "mcp.approval_mode": (
@@ -258,6 +258,11 @@ _FIELD_DESCRIPTIONS = {
     "visual.track_enabled": "Enable screenshot-based visual perception for the active profile.",
     "recording.mode": "Default recording pipeline used during teaching and observation.",
     "scheduler.tick_seconds": "Scheduler polling interval in seconds.",
+    "scheduler.agent_max_iterations": "Iteration budget cap for agent-mode scheduled tasks (bounded tool loop).",
+    "scheduler.agent_tool_blocklist": "Comma-separated tool names blocked during agent-mode scheduled execution (e.g. schedule_reentry to prevent recursive scheduling).",
+    "scheduler.default_max_retries": "Default retry attempts for failed scheduled tasks. Applied when arm() does not specify per-task retries. 0 disables retry.",
+    "scheduler.default_retry_backoff_s": "Base backoff interval in seconds for exponential retry delay (backoff_s * 2^attempt). Applied when arm() does not specify per-task backoff.",
+    "scheduler.delivery_enabled": "Enable post-execution result delivery to a gateway platform (opt-in, default off).",
     "dashboard.enabled": "Enable the local monitoring web dashboard.",
     "dashboard.bind": "Address the dashboard web server binds to (keep loopback).",
     "dashboard.port": "TCP port for the local dashboard web server.",
@@ -275,10 +280,17 @@ _FIELD_DESCRIPTIONS = {
     "recovery.total_actions": "Maximum total recovery actions (retries/transforms/failovers) within one agent turn before recovery halts.",
     "recovery.max_retry_per_category": "Maximum recovery retries per error category within one agent turn.",
     "guardrail.enabled": "Enable tool-loop guardrails (repetition / stagnation / single-tool domination). Progress-aware: halts and finalize nudges are suppressed while the task is still making progress, so long productive tasks are not cut short.",
+    "approval.advisory_risk_enabled": (
+        "Surface the auxiliary LLM risk score as an advisory line in human approval "
+        "prompts. The score is informational only — it cannot auto-approve, auto-deny, "
+        "or lower the deterministic risk level. Disabling skips the auxiliary call "
+        "entirely. Hot-reloadable."
+    ),
     "guardrail.max_repeats": "Consecutive identical tool calls (same name + arguments) that trigger a loop halt — only when the task is also stalled.",
     "guardrail.max_consecutive_same": "Consecutive uses of the same tool that trigger a diversify nudge (suppressed while progressing, so batch/sequential work is not penalized).",
     "guardrail.stagnation_window": "Window of recent genuine tool results over which the low-success-rate stagnation warning is computed.",
     "guardrail.min_success_rate": "Minimum tool success rate within the stagnation window before a stagnation warning is emitted.",
+    "guardrail.max_calls_per_turn": "Hard ceiling on total tool invocations in a single agent turn; exceeding it halts unconditionally regardless of progress.",
     "tools.ripgrep_autoinstall": "Best-effort seamless ripgrep auto-install for code_search when missing (macOS/Homebrew, no sudo, background, non-fatal). code_search always works via the pure-Python fallback regardless; disabling this just skips the accelerator install and shows a manual hint.",
     "tools.test_command": "Explicit command for the test_run tool (empty => auto-detect pytest/npm/go/cargo from project markers).",
     "tools.lint_command": "Explicit command for the lint_check tool (empty => auto-detect ruff/eslint/go vet/clippy from project markers).",
@@ -321,6 +333,14 @@ _FIELD_DESCRIPTIONS = {
     "web.extractor": "HTML reader for web_fetch. auto prefers trafilatura when the `web` extra is installed (`pip install 'leapflow[web]'`) and falls back to the built-in stdlib reader; stdlib pins the dependency-free reader.",
     "web.private_targets": "How web_fetch treats URLs resolving to loopback, private, link-local, or cloud-metadata addresses. approval asks the user each session (default), deny refuses without prompting (for unattended deployments), allow permits them silently and is only appropriate on a trusted network.",
     "web.cache_ttl_s": "Seconds a fetched body is reused from the session cache (0 disables caching). Entries are session-scoped and never synced.",
+    "usage.pricing": (
+        "Per-model token pricing for cost accounting. A YAML/JSON mapping keyed by model "
+        "family or exact model name; each value has input_per_mtok, output_per_mtok, and "
+        "cached_input_ratio (ratio applied to cached prompt tokens). When absent for the "
+        "active model, cost is reported as unknown. Example: "
+        "{\"deepseek\": {\"input_per_mtok\": 0.27, \"output_per_mtok\": 1.10, "
+        "\"cached_input_ratio\": 0.1}}"
+    ),
     "signal.noise_gate_enabled": "Enable monitor/LeapBoard suppression of low-value signal noise before it wakes watches or enters the live stream.",
     "signal.noise_same_source_cooldown_s": "Suppress repeated fs.change events from the same source path within this many seconds (0 disables burst suppression).",
     "signal.noise_allow_fs_outside_workspace": "Allow fs.change events outside the active workspace into monitor/LeapBoard signal flow (default false to avoid system and unrelated-project churn).",
@@ -343,6 +363,20 @@ _FIELD_DESCRIPTIONS = {
         "once self-evolution has generated a competing tool -- which is why the learning "
         "policies that once shipped here were removed after measurement, and why a "
         "third-party policy can register through the entry point group when that changes."
+    ),
+    "compression.provider": "Dedicated LLM provider for context compression (empty = reuse primary).",
+    "compression.model": "Model for context compression (empty = reuse primary model).",
+    "compression.api_key": "API key for the compression provider, stored in the local secret vault.",
+    "compression.base_url": "Base URL for the compression provider (empty = reuse primary URL).",
+    "compression.protect_first_n": "Number of initial user/assistant exchanges after the system prompt shielded from the first summarization pass.",
+    "compression.keep_recent_n": "Minimum recent messages preserved by the SummarizeStage and DropStage compressors.",
+    "checkpoint.file_rollback_enabled": "Enable file checkpoint snapshots before mutation tools run, with rollback support via /checkpoint.",
+    "checkpoint.max_inline_bytes": "File size threshold in bytes; files larger than this are copied to temp storage instead of stored inline.",
+    "checkpoint.ttl_hours": "Hours to retain file checkpoint snapshots before automatic cleanup.",
+    "session.resume_cache_policy": (
+        "Session resume strategy for PCD cache-aware resumption. 'cache_priority' "
+        "restores the persisted tool schema to maximise prefix-cache hits; "
+        "'tool_freshness' re-discovers tools at resume time."
     ),
     "evolution.enabled": (
         "Whether the agent may propose acquiring a NEW capability for itself. Off by "
@@ -390,6 +424,9 @@ _SECTION_CATEGORIES = {
     "gateway": "Gateway",
     "privacy": "Safety",
     "approval": "Safety",
+    "compression": "LLM Provider",
+    "usage": "Usage",
+    "session": "Storage",
     "cache": "Storage",
     "runtime": "Runtime",
     "mock": "Runtime",
@@ -402,6 +439,7 @@ _SECTION_CATEGORIES = {
     "tool": "Execution Loop",
     "context": "Execution Loop",
     "agent": "Execution Loop",
+    "guardrail": "Execution Loop",
     "stream": "Interactive UX",
     "verbose": "Interactive UX",
     "signal": "Signal Fusion",
@@ -430,6 +468,8 @@ _VALUE_HINTS = {
     "web.transport": "auto|httpx|curl",
     "web.extractor": "auto|stdlib",
     "web.private_targets": "approval|deny|allow",
+    "session.resume_cache_policy": "cache_priority|tool_freshness",
+    "usage.pricing": "YAML/JSON mapping: {model: {input_per_mtok, output_per_mtok, cached_input_ratio}}",
     # Callable rather than a literal: the valid ids come from the live policy
     # registry, which a third-party package can add to through an entry point. A
     # hardcoded enumeration here would silently omit every such policy and would
@@ -452,7 +492,7 @@ def _registered_selection_policies() -> str:
         return "a registered selection policy id"
     return ids or "a registered selection policy id"
 
-_PARTIAL_RELOAD_SECTIONS = frozenset({"runtime", "mock", "gateway", "hub", "scheduler", "observer", "cua", "use", "dashboard"})
+_PARTIAL_RELOAD_SECTIONS = frozenset({"runtime", "mock", "gateway", "hub", "scheduler", "observer", "cua", "use", "usage", "dashboard"})
 _RESTART_REQUIRED_SECTIONS = frozenset({"daemon", "plugins", "hardware", "mcp"})
 
 _PROFILE_FILE_BY_SECTION = {
@@ -461,6 +501,9 @@ _PROFILE_FILE_BY_SECTION = {
     "gateway": "gateway.yaml",
     "privacy": "privacy.yaml",
     "approval": "approval.yaml",
+    "compression": "llm.yaml",
+    "usage": "llm.yaml",
+    "checkpoint": "runtime.yaml",
     "cache": "cache.yaml",
 }
 
@@ -807,6 +850,15 @@ def _restart_warnings(spec: ConfigFieldSpec) -> tuple[str, ...]:
 
 
 def _category_for_spec(spec: ConfigFieldSpec) -> str:
+    # Compression protect/keep settings are behavioural context controls,
+    # not LLM-provider knobs, so they belong under Execution Loop.
+    if spec.key in (
+        "compression.protect_first_n",
+        "compression.keep_recent_n",
+    ):
+        return "Execution Loop"
+    if spec.key.startswith("checkpoint."):
+        return "Execution Loop"
     if spec.key.startswith("runtime."):
         return "Runtime"
     return _SECTION_CATEGORIES.get(spec.section, _title_words(spec.section))

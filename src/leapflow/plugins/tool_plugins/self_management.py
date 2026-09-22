@@ -2169,6 +2169,7 @@ class SelfManagementPlugin:
             response = {
                 "ok": False,
                 "error": f"DSH bundle rollback failed: {exc}",
+                "failure_code": "dsh_rollback_unsupported",
                 "rolled_back": restoration_error == "",
             }
             if restoration_error:

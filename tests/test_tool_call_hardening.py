@@ -12,7 +12,7 @@ import asyncio
 import json
 import os
 
-from leapflow.engine.engine import (
+from leapflow.engine._message_helpers import (
     _head_tail_truncate,
     _truncate_result_for_budget,
     _validate_tool_arguments,
@@ -118,7 +118,7 @@ def test_truncate_over_budget_dict_never_returns_malformed_json() -> None:
 
 
 def test_compaction_preserves_invalid_argument_repair_hints() -> None:
-    from leapflow.engine.context_control import ToolEvidenceBuilder
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
     builder = ToolEvidenceBuilder()
     invalid = {
         "ok": False,
@@ -136,7 +136,7 @@ def test_compaction_preserves_invalid_argument_repair_hints() -> None:
 
 
 def test_compaction_preserves_anchor_not_unique_match_count() -> None:
-    from leapflow.engine.context_control import ToolEvidenceBuilder
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
     builder = ToolEvidenceBuilder()
     result = {"ok": False, "error": "not unique", "error_type": "anchor_not_unique", "match_count": 3}
     compact = builder.build("edit_file", {}, result)
@@ -148,7 +148,7 @@ def test_compaction_preserves_anchor_not_unique_match_count() -> None:
 def test_compact_error_preserves_shell_output() -> None:
     """A failed shell result must keep stderr (the traceback) + returncode so the
     agent can diagnose the cause instead of seeing a bare 'unknown error'."""
-    from leapflow.engine.context_control import ToolEvidenceBuilder
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
     builder = ToolEvidenceBuilder()
     failed = {
         "ok": False,
@@ -164,7 +164,7 @@ def test_compact_error_preserves_shell_output() -> None:
 
 
 def test_compact_error_preserves_stderr_without_error_field() -> None:
-    from leapflow.engine.context_control import ToolEvidenceBuilder
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
     builder = ToolEvidenceBuilder()
     result = {"ok": False, "returncode": 2, "stdout": "", "stderr": "boom: the real error"}
     compact = builder.build("shell_run", {}, result)

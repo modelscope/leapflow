@@ -20,12 +20,12 @@ from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional
 
 if TYPE_CHECKING:  # imported lazily; never required at runtime for the value object
     from leapflow.engine.budget import IterationBudget
-    from leapflow.engine.context_compressor import ContextCompressor
-    from leapflow.engine.context_control import ContextGovernanceController
+    from leapflow.engine.context.context_compressor import ContextCompressor
+    from leapflow.engine.context.context_control import ContextGovernanceController
     from leapflow.engine.prefix_commitment import PrefixCommitmentController
-    from leapflow.engine.recovery_coordinator import RecoveryCoordinator
+    from leapflow.engine.recovery.recovery_coordinator import RecoveryCoordinator
     from leapflow.engine.research_ledger import ResearchLedger
-    from leapflow.engine.turn_recovery import TurnRecoveryState
+    from leapflow.engine.recovery.turn_recovery import TurnRecoveryState
     from leapflow.engine.turn_usage import TurnUsageTracker
 
 

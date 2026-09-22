@@ -20,7 +20,7 @@ from leapflow.domain.trajectory import (
     Trajectory,
     TrajectoryStep,
 )
-from leapflow.engine.session import (
+from leapflow.engine.session.session import (
     LearnResult,
     SessionController,
     SessionMode,

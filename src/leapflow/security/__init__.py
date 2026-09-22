@@ -10,6 +10,12 @@ from leapflow.security.approval import (
     SessionAwareGate,
 )
 from leapflow.security.grants import ApprovalAuditLog, ApprovalGrant, ApprovalScope
+from leapflow.security.guardian import (
+    DenialBreaker,
+    GuardianConfig,
+    GuardianDecisionAdapter,
+    GuardianVerdict,
+)
 from leapflow.security.orchestrator import ApprovalOrchestrator, ApprovalResult
 from leapflow.security.policy import ApprovalPolicyEngine, PolicyDecision, PolicyVerdict
 from leapflow.security.risk import (
@@ -36,7 +42,11 @@ __all__ = [
     "ApprovalScope",
     "CompositeRiskClassifier",
     "DefaultRiskClassifier",
+    "DenialBreaker",
     "DenyAllGate",
+    "GuardianConfig",
+    "GuardianDecisionAdapter",
+    "GuardianVerdict",
     "PolicyDecision",
     "PolicyVerdict",
     "RiskAssessment",

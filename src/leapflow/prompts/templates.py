@@ -140,8 +140,6 @@ run in parallel.
 6. **Professional closure**: End with a concise conclusion or next step when helpful; avoid rambling after the useful answer is complete.
 
 When finished with all tool calls, respond normally without a JSON block, tool-call transcript, or process log.
-
-{memory_context}
 """
 
 

@@ -19,6 +19,7 @@ from leapflow.storage.evolution_event_store import (
 )
 from leapflow.storage.plugin_outcome_store import EvolutionPluginOutcomeStore
 from leapflow.storage.session_store import LearningSessionStore
+from leapflow.storage.skill_curation_store import DuckDBSkillCurationStore
 from leapflow.storage.skill_docs import SkillDocStore
 from leapflow.storage.skill_library import SkillLibraryStore
 from leapflow.storage.trajectory_store import TrajectoryStore
@@ -29,6 +30,7 @@ __all__ = [
     "DatabaseLockedError",
     "DuckDBConversationStore",
     "DuckDBEvolutionEventStore",
+    "DuckDBSkillCurationStore",
     "EvolutionCapabilityProposalStore",
     "EvolutionDistilledKnowledgeStore",
     "EvolutionPluginOutcomeStore",

@@ -65,7 +65,7 @@ class SessionCoordinator:
         """
         if self._session_registry is None:
             from leapflow.daemon.session_registry import SessionRegistry
-            from leapflow.engine.session_factory import build_session_engine
+            from leapflow.engine.session.session_factory import build_session_engine
             from leapflow.memory import WorkingMemoryProvider
 
             base_wm = getattr(base_engine, "_wm", None)

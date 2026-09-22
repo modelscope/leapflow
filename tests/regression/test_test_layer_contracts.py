@@ -59,6 +59,14 @@ _HAND_WRITTEN_BODY_ALLOWLIST = frozenset(
         # recorded traffic still carries them. Naming a field is the opposite of
         # hand-writing a body — it is what makes a missing field fail.
         "regression/test_provider_shape_drift.py",
+        # Marker sanitization tests mock the SDK boundary to verify that internal
+        # markers are stripped before the call reaches OpenAI; the response shape
+        # is incidental to the test purpose.
+        "test_internal_marker_sanitization.py",
+        # Gateway adapter tests verify the API server returns OpenAI-compatible
+        # response format; the marker is the protocol shape under test, not a
+        # hand-written LLM body.
+        "test_gateway_adapters.py",
     }
 )
 
@@ -66,7 +74,6 @@ _HAND_WRITTEN_BODY_ALLOWLIST = frozenset(
 _HAND_WRITTEN_BODY_DEBT = frozenset(
     {
         "test_adaptive_depth.py",
-        "test_gateway_adapters.py",
     }
 )
 
@@ -76,8 +83,8 @@ _HAND_WRITTEN_BODY_DEBT = frozenset(
 # external boundary. Mocking these proves the test's own arrangement, not the
 # behavior under test.
 _INTERNAL_PATCH_TARGETS = (
-    "leapflow.engine.recovery_coordinator.RecoveryCoordinator.evaluate",
-    "leapflow.engine.unified_classifier",
+    "leapflow.engine.recovery.recovery_coordinator.RecoveryCoordinator.evaluate",
+    "leapflow.engine.recovery.unified_classifier",
     "leapflow.daemon.session_registry.SessionRegistry.acquire",
     "leapflow.config_service.ConfigService.set",
 )

@@ -263,6 +263,7 @@ class LeapApp:
         self._active_fragment_marker: Optional[str] = None
         self._active_command: Optional[TuiCommand] = None
         self._pending_input = _CommandQueue()
+        self._side_tasks: set[asyncio.Task[Any]] = set()
         self._approval_modal: Optional[ApprovalModal] = None
 
         if history_path is None:
@@ -332,6 +333,9 @@ class LeapApp:
             raise ValueError("Cannot submit an empty TUI command")
         if self._dispatch_control_text(normalized):
             return TuiCommand.create(command_id=0, text=normalized).mark_done()
+        # Side commands (e.g. /btw) bypass the serial queue when a task is active
+        if self._active_command is not None and self._is_side_command(normalized):
+            return self._dispatch_side_command(normalized)
         key = command_key(normalized)
         command = TuiCommand.create(command_id=self._next_command_id, text=normalized)
         self._next_command_id += 1
@@ -481,6 +485,55 @@ class LeapApp:
     def _is_duplicate_command_key(self, key: str) -> bool:
         active = self._active_command
         return bool((active is not None and active.command_key == key) or self._pending_input.contains_key(key))
+
+    # ── Side-command concurrent bypass ────────────────────────────
+
+    # Commands that are safe to run concurrently with the main task.
+    # Extensible: add command names here as new concurrent-safe commands appear.
+    _SIDE_COMMAND_NAMES: frozenset[str] = frozenset({"btw"})
+
+    def _is_side_command(self, text: str) -> bool:
+        """Return True when *text* is a concurrent-safe side command.
+
+        Uses the command registry to resolve the input, then checks against
+        the known set of side commands that can run without blocking the
+        serial queue.
+        """
+        from leapflow.cli.commands.registry import resolve_command
+
+        bare = text.lstrip("/").strip()
+        if not bare:
+            return False
+        cmd = resolve_command(bare)
+        return cmd is not None and cmd.name in self._SIDE_COMMAND_NAMES
+
+    def _dispatch_side_command(self, text: str) -> TuiCommand:
+        """Create a concurrent asyncio.Task for a side command.
+
+        The task runs independently of the serial ``_process_loop``:
+        it does not touch ``_active_command`` or queue state.  The task
+        reference is held in ``_side_tasks`` to prevent GC.
+        """
+        command = TuiCommand.create(command_id=self._next_command_id, text=text)
+        self._next_command_id += 1
+        on_input = self._on_input
+
+        async def _run_side() -> None:
+            try:
+                if on_input is not None:
+                    result = on_input(text)
+                    if asyncio.iscoroutine(result):
+                        await result
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self._console.error(f"Side question failed: {exc}")
+
+        task = asyncio.create_task(_run_side(), name=f"side-{command.id}")
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
+        self._invalidate()
+        return command.mark_done()
 
     def _dispatch_control_text(self, text: str) -> bool:
         handler = self._on_control

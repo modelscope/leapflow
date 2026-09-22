@@ -231,7 +231,7 @@ def test_registry_still_bumps_when_the_sink_is_broken():
 
 def test_trust_transition_is_emitted_where_the_flush_already_detects_it():
     """Only the current level is persisted; the move itself lives nowhere else."""
-    from leapflow.engine.session_factory import _PersistingTrustLedger
+    from leapflow.engine.session.session_factory import _PersistingTrustLedger
 
     collector = _Collector()
     evolution_tap.install_sink(collector)
@@ -251,7 +251,7 @@ def test_trust_transition_is_emitted_where_the_flush_already_detects_it():
 
 def test_a_hard_failure_is_traced_as_frozen_even_at_an_unchanged_level():
     """DRAFT alone cannot say whether a plugin is new or disqualified."""
-    from leapflow.engine.session_factory import _PersistingTrustLedger
+    from leapflow.engine.session.session_factory import _PersistingTrustLedger
 
     collector = _Collector()
     evolution_tap.install_sink(collector)

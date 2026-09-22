@@ -110,6 +110,7 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("skill show", "Show skill details", "Skills & Tools", args_hint="<name>"),
     CommandDef("skill disable", "Disable a skill", "Skills & Tools", args_hint="<name>"),
     CommandDef("skill delete", "Delete a skill", "Skills & Tools", args_hint="<name>"),
+    CommandDef("skill curator", "Show curation report or manage skill lifecycle", "Skills & Tools", args_hint="[sweep|archive|reactivate|pin|unpin] ..."),
     CommandDef("tool", "List available tools", "Skills & Tools"),
     CommandDef("run", "Execute a skill by trigger", "Skills & Tools", args_hint="<trigger>", requires_llm=True, execution=CommandExecution.STREAMING),
 
@@ -143,6 +144,19 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     # Scheduler
     CommandDef("arm", "Schedule a skill for timed execution", "Scheduler", args_hint="<skill> <cron>"),
     CommandDef("task", "List scheduled tasks", "Scheduler"),
+    CommandDef("schedule", "List active scheduled tasks", "Scheduler", aliases=("schedule list",), args_hint="[list|status|history|cancel] ...", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
+    CommandDef("schedule status", "Show detailed status for one task", "Scheduler", args_hint="<task_id>", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
+    CommandDef("schedule history", "Show recent execution log entries", "Scheduler", args_hint="[task_id]", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
+    CommandDef("schedule cancel", "Cancel/disable a scheduled task", "Scheduler", args_hint="<task_id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("schedule pause", "Pause a scheduled task (stops firing)", "Scheduler", args_hint="<task_id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("schedule resume", "Resume a paused scheduled task", "Scheduler", args_hint="<task_id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("schedule edit", "Edit a task's trigger expression", "Scheduler", args_hint="<task_id> <trigger_expr>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("schedule run", "Immediately execute a scheduled task (fire once)", "Scheduler", args_hint="<task_id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+    CommandDef("schedule doctor", "Show scheduler diagnostics and health summary", "Scheduler", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
+
+    # File Checkpoint
+    CommandDef("checkpoint", "List recent file checkpoints for this session", "File Checkpoint", aliases=("checkpoint list",), args_hint="[list]", effect=CommandEffect.READ_ONLY, execution=CommandExecution.INSTANT),
+    CommandDef("checkpoint rollback", "Rollback files to a checkpoint snapshot", "File Checkpoint", args_hint="<turn_id>", effect=CommandEffect.DESTRUCTIVE, execution=CommandExecution.SHORT_OPERATION),
 
     # Board & Monitors (LeapBoard) — one analysis target (current session),
     # rendered through a selectable template lens.
@@ -161,6 +175,30 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("board device", "Open one device's page (id or unique prefix)", "Board", args_hint="<id>", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
     CommandDef("board preview", "Approve and open a live device preview", "Board", args_hint="<id> [channel]", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
     CommandDef("board rescan", "Re-run device discovery to pick up a hot-plug", "Board", effect=CommandEffect.SESSION, execution=CommandExecution.SHORT_OPERATION),
+
+    # Diagnostics
+    CommandDef("doctor", "Run system health diagnostics", "Diagnostics", args_hint="[--fix] [--section <name>]", effect=CommandEffect.READ_ONLY, execution=CommandExecution.SHORT_OPERATION),
+
+    # Session Management
+    CommandDef("session", "List or manage conversation sessions", "Session Management", aliases=("session list",), args_hint="[list|archive|pin|unpin|hide|unhide] ...", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("session archive", "Archive a session", "Session Management", args_hint="<session_id>", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("session pin", "Pin a session to the top", "Session Management", args_hint="<session_id>", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("session unpin", "Unpin a session", "Session Management", args_hint="<session_id>", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("session hide", "Hide a session from default listings", "Session Management", args_hint="<session_id>", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("session unhide", "Unhide a previously hidden session", "Session Management", args_hint="<session_id>", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+
+    # Interaction
+    CommandDef(
+        "btw",
+        "Ask a quick side question without affecting the main conversation",
+        "Interaction",
+        aliases=("aside",),
+        args_hint="<question>",
+        client_local=False,
+        requires_llm=True,
+        effect=CommandEffect.READ_ONLY,
+        execution=CommandExecution.STREAMING,
+    ),
 )
 
 # ── Derived structures ───────────────────────────────────────────────

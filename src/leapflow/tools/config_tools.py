@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 # A listing of every writable field is long; keep the default bounded and let the
 # model narrow by category (categories come back in the payload either way).
 _DEFAULT_LIST_LIMIT = 60
+_LLM_CONNECTION_KEYS = ("llm.model", "llm.base_url", "llm.api_key")
 
 # Set by the CLI/daemon so a write can hot-reload the live session, the same way
 # ``/config set`` does. Without it a write lands on disk while the in-process
@@ -163,14 +164,7 @@ async def config_get_handler(args: Dict[str, Any]) -> Dict[str, Any]:
         service = _service()
         view = service.describe(key)
     except ValueError as exc:
-        # Unknown key is recoverable in the same turn: hand back near matches so
-        # the model can correct itself instead of falling back to file probing.
-        return {
-            "ok": False,
-            "error": str(exc),
-            "retryable": True,
-            "did_you_mean": _suggest(key),
-        }
+        return _unknown_key_payload(key, exc)
     except Exception as exc:  # noqa: BLE001
         logger.debug("config_get failed for %s", key, exc_info=True)
         return {"ok": False, "error": f"Could not read config key {key!r}: {exc}", "retryable": False}
@@ -242,12 +236,7 @@ async def config_set_handler(args: Dict[str, Any]) -> Dict[str, Any]:
         service = _service()
         before = service.describe(key)
     except ValueError as exc:
-        return {
-            "ok": False,
-            "error": str(exc),
-            "retryable": True,
-            "did_you_mean": _suggest(key),
-        }
+        return _unknown_key_payload(key, exc)
     except Exception as exc:  # noqa: BLE001
         logger.debug("config_set failed to describe %s", key, exc_info=True)
         return {"ok": False, "error": f"Could not read config key {key!r}: {exc}", "retryable": False}
@@ -309,6 +298,28 @@ async def config_set_handler(args: Dict[str, Any]) -> Dict[str, Any]:
         # Reload so an immediate config_get reflects the new value; otherwise the
         # model sees the stale singleton and concludes the write failed.
         payload["session_reloaded"] = _reload_after_write()
+    return payload
+
+
+def _unknown_key_payload(key: str, error: ValueError) -> Dict[str, Any]:
+    """Return an actionable, catalog-backed response for an unknown config key."""
+    payload: Dict[str, Any] = {
+        "ok": False,
+        "error": str(error),
+        "retryable": True,
+        "did_you_mean": _suggest(key),
+    }
+    if str(key).strip().lower().startswith("llm."):
+        payload["llm_connection"] = {
+            "keys": list(_LLM_CONNECTION_KEYS),
+            "provider_selection": (
+                "Provider behavior is inferred from llm.base_url; llm.provider is not a setting."
+            ),
+            "next_step": (
+                "Read or set llm.model and llm.base_url, then set llm.api_key when the "
+                "endpoint requires different credentials."
+            ),
+        }
     return payload
 
 

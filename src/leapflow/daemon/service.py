@@ -1549,6 +1549,22 @@ class RuntimeLeapService:
         stream = self._monitor_coordinator.get_signal_stream()
         return {"ok": True, "metrics": snapshot.to_dict(), "signal_stream": stream}
 
+    # ── Delegate: subagent state ─────────────────────────────────────
+
+    async def subagent_state(self) -> dict[str, Any]:
+        """Return the SubagentManager's active state snapshot for the dashboard."""
+        ctx = self._ctx
+        if ctx is None:
+            return {}
+        manager = getattr(ctx, "_subagent_manager", None)
+        if manager is None or not hasattr(manager, "get_active_state"):
+            return {}
+        try:
+            return manager.get_active_state()
+        except Exception:  # noqa: BLE001 - dashboard read must not fail the daemon
+            logger.debug("daemon: subagent state read failed", exc_info=True)
+            return {}
+
     # ── Delegate: memory / signal ────────────────────────────────────
 
     async def signal_record(self, signal_data: dict[str, Any]) -> dict[str, Any]:

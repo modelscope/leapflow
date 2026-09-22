@@ -17,8 +17,8 @@ from leapflow.llm.base import LLMProvider
 from leapflow.llm.message_builder import build_system_message, build_user_message_text
 
 if TYPE_CHECKING:
-    from leapflow.engine.graph_planner import GraphPlanner
-    from leapflow.engine.task_graph import TaskGraph
+    from leapflow.engine.task_planning.graph_planner import GraphPlanner
+    from leapflow.engine.task_planning.task_graph import TaskGraph
 
 logger = logging.getLogger(__name__)
 

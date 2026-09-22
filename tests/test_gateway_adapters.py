@@ -13,7 +13,7 @@ from leapflow.gateway.adapters.telegram import TelegramAdapter
 from leapflow.gateway.adapters.webhook import WebhookAdapter
 from leapflow.gateway.connectors.protocol import ActionResult, BackendStatus
 from leapflow.gateway.manifest import ManifestLoader
-from leapflow.gateway.protocol import InboundMessage, OutboundContent, SendTarget
+from leapflow.gateway.protocol import InboundMessage, OutboundContent, PlatformCapabilities, SendTarget
 from leapflow.gateway.server import GatewayServer
 
 
@@ -233,3 +233,97 @@ async def test_dingtalk_adapter_connect_send_and_event_normalization() -> None:
     assert data["ok"] is True
     assert result.message_id == "task-1"
     assert fake_http.requests[1]["json_body"]["robotCode"] == "robot"
+
+
+# ═══════════════════════════════════════════════════════════════
+# PlatformCapabilities tests
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestPlatformCapabilities:
+    """Verify typed PlatformCapabilities resolve correctly per adapter."""
+
+    def test_capabilities_is_frozen_dataclass(self) -> None:
+        caps = PlatformCapabilities()
+        assert caps.max_message_length == 4000
+        with pytest.raises(AttributeError):
+            caps.max_message_length = 9999  # type: ignore[misc]
+
+    def test_feishu_capabilities(self) -> None:
+        backend = FakeExecutionBackend()
+        adapter = FeishuAdapter(profile="test", backend=backend)
+        caps = adapter.capabilities
+        assert isinstance(caps, PlatformCapabilities)
+        assert caps.max_message_length == 8000
+        assert caps.supports_async_delivery is True
+        assert caps.splits_long_messages is False
+        # Feishu adapter does not override rich-media mixin methods
+        assert caps.supports_edit is False
+        assert caps.supports_images is False
+
+    def test_feishu_custom_max_message_length(self) -> None:
+        backend = FakeExecutionBackend()
+        adapter = FeishuAdapter(profile="test", backend=backend, max_message_length=2000)
+        assert adapter.capabilities.max_message_length == 2000
+
+    def test_telegram_capabilities(self) -> None:
+        fake_http = FakeJsonHttpClient({})
+        adapter = TelegramAdapter(bot_token="tok", auto_poll=False, http_client=fake_http)
+        caps = adapter.capabilities
+        assert caps.max_message_length == 4096
+        assert caps.supports_async_delivery is True
+
+    def test_dingtalk_capabilities(self) -> None:
+        fake_http = FakeJsonHttpClient({})
+        adapter = DingTalkAdapter(
+            app_key="k", app_secret="s", port=0, http_client=fake_http,
+        )
+        caps = adapter.capabilities
+        assert caps.max_message_length == 5000
+        assert caps.supports_async_delivery is True
+
+    def test_webhook_capabilities(self) -> None:
+        adapter = WebhookAdapter(port=0)
+        caps = adapter.capabilities
+        assert caps.max_message_length == 0
+        assert caps.supports_async_delivery is False
+
+    def test_api_server_capabilities(self) -> None:
+        adapter = APIServerAdapter(api_key="0123456789abcdef", port=0)
+        caps = adapter.capabilities
+        assert caps.max_message_length == 0
+        assert caps.supports_async_delivery is False
+
+    def test_mixin_edit_degrades_gracefully(self) -> None:
+        """Adapter with supports_edit=False still returns mixin not-supported result."""
+        adapter = WebhookAdapter(port=0)
+        assert adapter.capabilities.supports_edit is False
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                adapter.edit_message(
+                    SendTarget(platform="webhook", chat_id="c"),
+                    "mid",
+                    OutboundContent(text="edited"),
+                )
+            )
+        finally:
+            loop.close()
+        assert result.ok is False
+        assert "not supported" in result.error
+
+    def test_conservative_defaults(self) -> None:
+        """PlatformCapabilities defaults are conservative."""
+        caps = PlatformCapabilities()
+        assert caps.supports_streaming is False
+        assert caps.supports_rich_text is False
+        assert caps.supports_images is False
+        assert caps.supports_files is False
+        assert caps.supports_reactions is False
+        assert caps.supports_threads is False
+        assert caps.supports_group_chat is False
+        assert caps.supports_edit is False
+        assert caps.supports_async_delivery is True
+        assert caps.splits_long_messages is False
+        assert caps.max_message_length == 4000

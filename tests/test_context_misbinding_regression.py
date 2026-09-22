@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from conftest import StubLLM, make_settings
 
-from leapflow.engine.context_focus import ContextPlane, FocusEntity
-from leapflow.engine.engine import AgentEngine, build_default_registry
+from leapflow.engine.context.context_focus import ContextPlane, FocusEntity
+from leapflow.engine.engine import AgentEngine
+from leapflow.engine import build_default_registry
 from leapflow.engine.intent_classifier import Intent
 from leapflow.llm.message_builder import build_system_message, build_user_message_text
 from leapflow.memory.providers.episodic import EpisodicMemoryProvider
@@ -69,17 +70,20 @@ async def test_prompt_assembly_keeps_paper_focus_across_model_config_events(tmp_
             turn_id=2,
         )
 
-        assembly = await engine._assemble_unified_prompt(
+        assembly = await engine._prompt_assembler._assemble_unified_prompt(
             "上面的 paper 需要更深层次解读",
             tool_definitions=TOOL_DEFINITIONS,
             enable_thinking=False,
         )
 
-        assert "## Semantic Focus Plane" in assembly.system
-        assert "Current task focus" in assembly.system
-        assert "MiniCPM-O 4.5 Technical Report" in assembly.system
-        assert "llm.model -> qwen3.8-max" in assembly.system
-        assert "Resolved user reference" in assembly.system
+        # Focus context is assembled into volatile_context (separated from
+        # the byte-stable system prompt to preserve prefix-cache hits).
+        ctx = assembly.volatile_context
+        assert "## Semantic Focus Plane" in ctx
+        assert "Current task focus" in ctx
+        assert "MiniCPM-O 4.5 Technical Report" in ctx
+        assert "llm.model -> qwen3.8-max" in ctx
+        assert "Resolved user reference" in ctx
         assert engine._last_disclosure_metadata["reference_resolution"]["target_name"] == "MiniCPM-O 4.5 Technical Report"
     finally:
         lt.close()
@@ -136,18 +140,24 @@ async def test_focus_block_survives_provider_message_preparation(tmp_path) -> No
             last_task_turn=1,
             last_mentioned_turn=1,
         ))
-        assembly = await engine._assemble_unified_prompt(
+        assembly = await engine._prompt_assembler._assemble_unified_prompt(
             "上面的 paper 需要更深层次解读",
             tool_definitions=TOOL_DEFINITIONS,
             enable_thinking=False,
         )
         messages = [
             build_system_message(assembly.system),
+        ]
+        # volatile_context carries semantic focus; the engine injects it as a
+        # separate system message between the stable system prompt and history.
+        if assembly.volatile_context:
+            messages.append(build_system_message(assembly.volatile_context))
+        messages += [
             build_user_message_text("older unrelated history " * 200),
             build_user_message_text("上面的 paper 需要更深层次解读"),
         ]
 
-        prepared = engine._prepare_llm_messages(messages, tools=None)
+        prepared = engine._prompt_assembler._prepare_llm_messages(messages, tools=None)
         joined = "\n".join(str(msg.get("content") or "") for msg in prepared)
 
         assert "## Semantic Focus Plane" in joined
@@ -180,7 +190,7 @@ async def test_prompt_assembly_resolves_to_task_entity_even_with_control_events(
             turn_id=2,
         )
 
-        await engine._assemble_unified_prompt(
+        await engine._prompt_assembler._assemble_unified_prompt(
             "刚才设置的默认模型是什么？",
             tool_definitions=TOOL_DEFINITIONS,
             enable_thinking=False,

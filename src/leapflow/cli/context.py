@@ -18,15 +18,16 @@ from leapflow.platform.event_bus import EventBus
 from leapflow.platform.mock import MockBridge
 from leapflow.config import Settings, _build_settings_from_env
 from leapflow.config_loader import config_signature, load_config_bundle
-from leapflow.engine.context_compressor import adaptive_tool_result_chars
-from leapflow.engine.engine import AgentEngine, build_default_registry
-from leapflow.engine.graph_planner import GraphPlanner
+from leapflow.engine.context.context_compressor import adaptive_tool_result_chars
+from leapflow.engine.engine import AgentEngine
+from leapflow.engine._tool_helpers import build_default_registry
+from leapflow.engine.task_planning.graph_planner import GraphPlanner
 from leapflow.engine.intent_classifier import (
     FallbackClassifier,
     IntentClassifier,
     LLMIntentClassifier,
 )
-from leapflow.engine.session import SessionController
+from leapflow.engine.session.session import SessionController
 from leapflow.recording.attention import build_attention_filters
 from leapflow.analysis.pipeline import ImitationPipeline
 from leapflow.storage.session_store import LearningSessionStore
@@ -97,6 +98,103 @@ if TYPE_CHECKING:
     from leapflow.platform.observers import RecordingProfile
     from leapflow.security.approval import ApprovalDecision, ApprovalRequest
     from leapflow.storage.skill_library import StoredSkill
+
+
+def _select_cache_strategy(
+    base_url: str,
+    *,
+    provider_id: str | None = None,
+) -> Any:
+    """Select prompt cache strategy based on the active provider's capabilities.
+
+    Resolution order:
+    1. Explicit *provider_id* (structured, preferred when available).
+    2. URL-inferred plugin id (best-effort fallback — see ``_resolve_cache_type``).
+
+    Mapping from ``cache_type`` capability to strategy:
+
+    - ``explicit_breakpoint`` → ``AnthropicCacheStrategy()``
+    - ``auto_prefix``         → ``PrefixCacheOptimizer()``
+    - ``none``                → ``NoCacheStrategy()``
+    - (unknown / absent)      → ``PrefixCacheOptimizer()``  (safe default)
+    """
+    from leapflow.engine.prompt_cache import (
+        AnthropicCacheStrategy,
+        NoCacheStrategy,
+        PrefixCacheOptimizer,
+    )
+
+    cache_type = _resolve_cache_type(base_url, provider_id=provider_id)
+
+    if cache_type == "explicit_breakpoint":
+        return AnthropicCacheStrategy()
+    elif cache_type == "none":
+        return NoCacheStrategy()
+    # auto_prefix or any unrecognised value — safe default.
+    return PrefixCacheOptimizer()
+
+
+def _resolve_cache_type(
+    base_url: str,
+    *,
+    provider_id: str | None = None,
+) -> str:
+    """Determine the ``cache_type`` capability for the active provider.
+
+    Resolution strategy (Config-Driven first, URL fallback second):
+
+    1. **Explicit provider_id** — when the caller already knows the provider
+       identity (e.g. from a future ``settings.llm_provider`` field), look
+       up the plugin directly.  This is the authoritative path.
+    2. **URL best-effort fallback** — when no explicit id is available,
+       infer a probable plugin id from the ``base_url``:
+
+       - Host contains ``anthropic.com``          → ``"anthropic"``
+       - Path contains an ``/anthropic`` segment   → ``"anthropic"``
+         (covers ``/anthropic``, ``/anthropic/v1/messages``, etc.)
+       - Everything else                           → ``"openai"``
+
+       *This is a heuristic, not a contract.*  It exists because LeapFlow's
+       provider instantiation is currently URL-implicit (``_configure_llm_clients``
+       always creates ``OpenAIChat``).  When a structured ``llm_provider``
+       setting is added, the caller should pass it as *provider_id* and
+       the URL fallback becomes a no-op.
+
+    Falls back to ``"auto_prefix"`` if the resolved plugin is not
+    registered or does not declare ``cache_type``.
+    """
+    from urllib.parse import urlparse
+
+    from leapflow.llm.provider_registry import get_default_registry
+
+    registry = get_default_registry()
+
+    # ── 1. Explicit provider_id (authoritative) ──────────────────────────
+    if provider_id:
+        plugin = registry.get_plugin(provider_id)
+        if plugin is not None:
+            return str(plugin.capabilities.get("cache_type", "auto_prefix"))
+        # Explicit id given but plugin not registered → safe default.
+        return "auto_prefix"
+
+    # ── 2. URL best-effort fallback ──────────────────────────────────────
+    # NOTE: This is an approximate heuristic, not a hard contract.
+    # It mirrors how _configure_llm_clients selects provider behaviour
+    # from the URL today.  Prefer passing provider_id when available.
+    parsed = urlparse((base_url or "").strip())
+    host = (parsed.hostname or "").lower()
+    # Split path into non-empty segments for segment-level matching.
+    path_segments = [s for s in (parsed.path or "").lower().split("/") if s]
+
+    if "anthropic.com" in host or "anthropic" in path_segments:
+        plugin_id = "anthropic"
+    else:
+        plugin_id = "openai"
+
+    plugin = registry.get_plugin(plugin_id)
+    if plugin is not None:
+        return str(plugin.capabilities.get("cache_type", "auto_prefix"))
+    return "auto_prefix"
 
 
 class _TUIApprovalGate:
@@ -1189,6 +1287,79 @@ class Context:
                 execution=execution_adapter,
             )
 
+    def _register_file_checkpoint_interceptor(self, settings: Settings) -> None:
+        """Register the file checkpoint interceptor on the tool pipeline.
+
+        Creates a DuckDB-backed checkpoint store and registers the interceptor
+        (priority 40) so it runs after approval and before audit.
+        """
+        from leapflow.engine.file_checkpoint import FileCheckpointInterceptor
+        from leapflow.plugins import get_registry
+        from leapflow.storage.file_checkpoint_store import DuckDBFileCheckpointStore
+
+        profile_layout = settings.profile_layout
+        db_path = profile_layout.checkpoint_db_path
+
+        # Use CacheLayout for temp copies of large files (session-scoped, sensitive)
+        cache_layout = profile_layout.cache
+        temp_dir = cache_layout.category_dir(
+            scope="profile", category="file_checkpoints",
+        )
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        checkpoint_store = DuckDBFileCheckpointStore(db_path)
+        self._file_checkpoint_store = checkpoint_store
+
+        # Opportunistic startup cleanup: purge expired checkpoints on the cold
+        # path.  Guarded so a cleanup failure never blocks startup.
+        if settings.checkpoint_ttl_hours > 0:
+            try:
+                purged = checkpoint_store.cleanup(
+                    max_age_hours=float(settings.checkpoint_ttl_hours),
+                )
+                if purged:
+                    logger.debug(
+                        "file_checkpoint: startup cleanup purged %d expired rows", purged,
+                    )
+            except Exception:
+                logger.debug("file_checkpoint: startup cleanup failed", exc_info=True)
+
+        def _get_turn_id() -> str:
+            engine = self.engine
+            if engine is not None:
+                return getattr(engine, "_current_turn_id", "") or ""
+            return ""
+
+        def _get_session_id() -> str:
+            engine = self.engine
+            if engine is not None:
+                return getattr(engine, "_current_session_id", "") or ""
+            return ""
+
+        def _parameters_schema_lookup(tool_name: str) -> dict:
+            """Look up parameters_schema from ToolPluginRegistry metadata."""
+            registry = get_registry()
+            for meta in registry.all_metadata:
+                if meta.name == tool_name:
+                    return meta.parameters_schema
+            return {}
+
+        interceptor = FileCheckpointInterceptor(
+            store=checkpoint_store,
+            max_inline_bytes=settings.checkpoint_max_inline_bytes,
+            temp_dir=temp_dir,
+            get_turn_id=_get_turn_id,
+            get_session_id=_get_session_id,
+            parameters_schema_lookup=_parameters_schema_lookup,
+        )
+
+        pipeline = get_registry().tool_pipeline
+        pipeline.register(interceptor)
+        logger.info(
+            "File checkpoint interceptor registered (priority=%d, max_inline=%d)",
+            interceptor.priority, settings.checkpoint_max_inline_bytes,
+        )
+
     def _bind_hardware_experience(self) -> None:
         """Give the hardware registry the experience store once it exists.
 
@@ -1418,7 +1589,7 @@ class Context:
 
         await self.memory.initialize_all()
         if self._action_recorder is None:
-            from leapflow.engine.action_executor import RecordedActionExecutor
+            from leapflow.engine.tools.action_executor import RecordedActionExecutor
             from leapflow.evolution.action_recorder import ActionRecorder
             from leapflow.evolution.artifact_store import ContentAddressedArtifactStore
             from leapflow.evolution.outbox import EvolutionEventOutbox
@@ -1620,15 +1791,15 @@ class Context:
         )
 
         self.registry = build_default_registry(self.rpc, self.llm, self.wm, self.lt)
-        
+
         # Store scorers for deferred phase
         self._critical_scorer = scorer
         self._critical_llm_scorer = llm_scorer
         self._critical_feedback_evaluator = feedback_evaluator
-        
+
         # NOTE: World Model, SkillActivator, Learning Pipeline, Doc/Stored skills
         # are assembled in initialize_deferred()
-        
+
         graph_planner = GraphPlanner(self.llm, self.registry) if settings.has_llm_credentials else None
 
         # Bind perception/execution to the desktop semantic plugin
@@ -1876,7 +2047,7 @@ class Context:
 
         # ── Build CompressorConfig with LLM callbacks ──
 
-        from leapflow.engine.context_compressor import CompressorConfig
+        from leapflow.engine.context.context_compressor import CompressorConfig
 
         async def _summarize_via_llm(prompt: str) -> str:
             from leapflow.llm.message_builder import build_user_message_text
@@ -1894,6 +2065,8 @@ class Context:
             keep_tail=settings.compress_keep_tail,
             max_output_chars=settings.max_tool_output_chars,
             summarize_fn=_summarize_via_llm if settings.has_llm_credentials else None,
+            protect_first_n=settings.compression_protect_first_n,
+            summarize_keep_recent=settings.compression_keep_recent_n,
         )
 
         # ── Initialize DuckDBConversationStore ──
@@ -1964,7 +2137,7 @@ class Context:
         self.engine.set_distilled_knowledge_store(self._evolution_knowledge_store)
 
         # ── Wire CompressorConfig with archive_fn into engine ──
-        from leapflow.engine.context_compressor import ContextCompressor
+        from leapflow.engine.context.context_compressor import ContextCompressor
 
         async def _archive_to_semantic(messages: List[Dict[str, Any]]) -> None:
             """Archive evicted messages to SemanticMemoryProvider."""
@@ -1981,13 +2154,21 @@ class Context:
         compressor_config.archive_fn = _archive_to_semantic
         self.engine._compressor = ContextCompressor(compressor_config)
 
-        # ── Enable PrefixCacheOptimizer ──
-        from leapflow.engine.prompt_cache import PrefixCacheOptimizer
-        self.engine.set_cache_strategy(PrefixCacheOptimizer())
+        # ── Enable capability-driven cache strategy (P0-OPT-1) ──
+        self.engine.set_cache_strategy(
+            _select_cache_strategy(settings.llm_base_url)
+        )
 
         # ── Wire ConversationStore into engine for session persistence ──
         if self._conversation_store:
             self.engine.set_conversation_store(self._conversation_store)
+
+        # ── File Checkpoint Interceptor (P1-2) ──
+        if settings.checkpoint_file_rollback_enabled:
+            try:
+                self._register_file_checkpoint_interceptor(settings)
+            except Exception:
+                logger.debug("File checkpoint interceptor registration skipped", exc_info=True)
 
         # ── Wire ResearchLedgerStore into engine (S1 durable Orient) ──
         if self._research_ledger_store:
@@ -2020,11 +2201,14 @@ class Context:
                     tool_handlers=_TH,
                     tool_definitions=_TD,
                     settings=settings,
+                    tool_pipeline=_tool_reg_sub.tool_pipeline,
                 )
             self._subagent_manager = SubagentManager(
                 executor=sub_executor,
                 max_depth=settings.agent_subagent_max_depth,
                 max_concurrent=settings.agent_subagent_max_concurrent,
+                event_bus=self.event_bus,
+                conversation_store=self._conversation_store,
             )
             _tool_reg_sub.set_subagent_manager(self._subagent_manager)
             logger.info("SubagentManager wired with delegate_task tool")
@@ -2038,12 +2222,13 @@ class Context:
         # ── Wire tool loop guardrails (progress-aware; thresholds from config) ──
         try:
             if getattr(settings, "guardrail_enabled", True):
-                from leapflow.engine.tool_guardrails import CompositeGuardrail
+                from leapflow.engine.tools.tool_guardrails import CompositeGuardrail
                 self.engine._guardrail = CompositeGuardrail(
                     max_repeats=settings.guardrail_max_repeats,
                     stagnation_window=settings.guardrail_stagnation_window,
                     min_success_rate=settings.guardrail_min_success_rate,
                     max_consecutive_same=settings.guardrail_max_consecutive_same,
+                    max_calls_per_turn=settings.guardrail_max_calls_per_turn,
                 )
                 logger.debug("Tool loop guardrails enabled")
             else:
@@ -2089,23 +2274,75 @@ class Context:
             try:
                 aux = self.auxiliary
 
+                def _advisory_label(score: float) -> str:
+                    """Map a [0,1] advisory score to a human-readable label."""
+                    if score >= 0.8:
+                        return "CRITICAL"
+                    if score >= 0.6:
+                        return "HIGH"
+                    if score >= 0.4:
+                        return "MODERATE"
+                    if score >= 0.2:
+                        return "LOW"
+                    return "SAFE"
+
                 class _SmartApprovalGate:
-                    """LLM-assisted shell approval adapter that preserves policy authority."""
+                    """LLM-assisted approval adapter that surfaces advisory risk.
+
+                    Intercepts the orchestrator's human-prompt gate so the
+                    ApprovalRequest is enriched with an advisory risk score
+                    right before it is rendered.  The advisory is purely
+                    informational — it MUST NOT change the decision path,
+                    lower the deterministic RiskLevel, or auto-approve/deny.
+                    """
 
                     def __init__(self, delegate: Any) -> None:
                         self._delegate = delegate
+                        # Replace the orchestrator's inner gate with self so
+                        # request_approval() flows through advisory enrichment.
+                        self._inner_gate = delegate._gate
+                        delegate._gate = self
+
+                    # -- ApprovalGate protocol (called by the orchestrator) --
+
+                    async def request_approval(self, request: Any) -> Any:
+                        """Enrich *request* with advisory then forward to the real gate."""
+                        enriched = await self._attach_advisory(request)
+                        return await self._inner_gate.request_approval(enriched)
+
+                    # -- Public wrappers for shell / evaluate callers --
 
                     async def evaluate(self, action: Any) -> Any:
                         return await self._delegate.evaluate(action)
 
                     async def check(self, command: str) -> bool:
-                        try:
-                            risk = await aux.classify_risk(command)
-                        except Exception:
-                            risk = 0.5
-                        if risk < 0.3:
-                            logger.debug("smart_approval: low auxiliary risk hint (risk=%.2f)", risk)
                         return await self._delegate.check(command)
+
+                    # -- Advisory enrichment (cold-path, best-effort) --
+
+                    async def _attach_advisory(self, request: Any) -> Any:
+                        from leapflow.config import get_settings
+
+                        if not getattr(get_settings(), "approval_advisory_risk_enabled", False):
+                            return request
+                        try:
+                            command_text = request.detail or ""
+                            score = await aux.classify_risk(command_text)
+                            label = _advisory_label(score)
+                            from dataclasses import replace as _replace
+
+                            new_display = {
+                                **request.display,
+                                "advisory": f"AI risk assessment: {label} ({score:.2f})",
+                            }
+                            new_metadata = {
+                                **request.metadata,
+                                "advisory_risk": {"score": score, "label": label},
+                            }
+                            return _replace(request, display=new_display, metadata=new_metadata)
+                        except Exception:
+                            logger.debug("advisory risk enrichment failed", exc_info=True)
+                            return request
 
                 from leapflow.tools.shell_tools import set_approval_gate
                 set_approval_gate(_SmartApprovalGate(self._approval_orchestrator))

@@ -15,7 +15,7 @@ from leapflow.plugins.protocol import ToolMetadata
 def _active_workspace_root() -> str:
     """Return the current turn's workspace root from the tool execution context.
 
-    Memory tools run inside Engine._execute_tool_scoped, which installs the
+    Memory tools run inside ToolDispatchEngine._execute_tool_scoped, which installs the
     per-turn ToolExecutionContext. Reading it here scopes memory reads and tags
     writes to the active workspace (concurrency-safe via ContextVar).
     """

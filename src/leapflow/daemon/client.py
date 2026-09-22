@@ -583,6 +583,10 @@ class DaemonClient:
         """Fetch signal flow metrics from daemon."""
         return dict(await self.request("monitor.signal_metrics") or {})
 
+    async def subagent_state(self) -> dict[str, Any]:
+        """Fetch subagent delegation state from daemon."""
+        return dict(await self.request("subagent.state") or {})
+
     async def shutdown(self) -> None:
         """Request graceful daemon shutdown."""
         await self.request("daemon.shutdown")

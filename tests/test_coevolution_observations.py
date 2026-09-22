@@ -135,9 +135,9 @@ class _Resolution:
 
 def _drive_engine_record(resolution):
     """Call the production static method itself."""
-    from leapflow.engine.engine import AgentEngine
+    from leapflow.engine.learning_bridge import LearningBridge
 
-    AgentEngine._record_coevolution_resolution(resolution)
+    LearningBridge._record_coevolution_resolution(resolution)
 
 
 def test_engine_records_scorer_names_not_prose():

@@ -64,6 +64,12 @@ class LLMProviderPlugin(Protocol):
         - 'supports_thinking': bool
         - 'max_context_length': int
         - 'credential_rotation': bool
+        - 'cache_type': str — prompt cache mechanism used by the provider.
+              'auto_prefix'          — automatic prefix caching (OpenAI, DeepSeek).
+              'explicit_breakpoint'  — explicit cache_control breakpoints (Anthropic).
+              'none'                 — no prompt caching support.
+        - 'cache_usage_fields': List[str] — names of usage-dict keys that
+              report cache hit / creation token counts for this provider.
         """
         ...
 
@@ -262,10 +268,27 @@ class LLMProviderRegistry:
 
         Currently registers:
         - OpenAICompatiblePlugin (covers OpenAI, Azure, DeepSeek, Dashscope, etc.)
+        - AnthropicPlugin (native Anthropic Messages API; skipped when the
+          ``anthropic`` SDK is not installed)
         """
         from leapflow.llm._builtin_plugins import OpenAICompatiblePlugin
 
         self.register(OpenAICompatiblePlugin())
+
+        # Anthropic: optional — gracefully degrade when SDK is absent.
+        try:
+            from leapflow.llm._anthropic_plugin import AnthropicPlugin
+
+            self.register(AnthropicPlugin())
+        except ImportError:
+            logger.debug(
+                "llm_registry: anthropic SDK not installed, "
+                "AnthropicPlugin skipped (install with 'pip install anthropic')"
+            )
+        except Exception as exc:
+            logger.warning(
+                "llm_registry: failed to load AnthropicPlugin: %s", exc,
+            )
 
     def bootstrap(self) -> None:
         """Full initialization: register built-ins, then discover external plugins.

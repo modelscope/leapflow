@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Union, runtime_checkable
 
 if TYPE_CHECKING:
-    from leapflow.engine.tool_execution import ToolExecutionRecord
+    from leapflow.engine.tools.tool_execution import ToolExecutionRecord
     from leapflow.storage.connection import ConnectionHolder
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,8 @@ class ConversationSession:
     is_active: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
     summary: str = ""
+    pinned: bool = False
+    hidden: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,19 @@ class ConversationSearchResult:
     created_at: float
 
 
+@dataclass(frozen=True)
+class SessionSnapshot:
+    """Immutable snapshot of PCD-relevant session state for cache-aware resumption.
+
+    Persisted alongside the session so that a resumed session can restore the
+    exact system prompt, tool schema, and disclosure level that produced the
+    last prefix-cache-friendly prompt assembly.
+    """
+    system_prompt: Optional[str] = None
+    tool_schema: Optional[str] = None
+    disclosure_level: Optional[str] = None
+
+
 @runtime_checkable
 class ConversationStore(Protocol):
     """Protocol for conversation persistence (DIP)."""
@@ -85,8 +100,14 @@ class ConversationStore(Protocol):
     def create_session(self, session_id: str, *, title: str = "", **kwargs: Any) -> ConversationSession: ...
     def get_session(self, session_id: str) -> Optional[ConversationSession]: ...
     def list_sessions(
-        self, *, limit: int = 20, active_only: bool = True, cwd: Optional[str] = None
+        self, *, limit: int = 20, active_only: bool = True, cwd: Optional[str] = None,
+        include_hidden: bool = False, include_archived: bool = False,
     ) -> List[ConversationSession]: ...
+    def pin_session(self, session_id: str) -> None: ...
+    def unpin_session(self, session_id: str) -> None: ...
+    def hide_session(self, session_id: str) -> None: ...
+    def unhide_session(self, session_id: str) -> None: ...
+    def archive_session(self, session_id: str) -> None: ...
     def append_message(self, session_id: str, role: str, content: str, **kwargs: Any) -> ConversationMessage: ...
     def reserve_tool_execution(self, record: "ToolExecutionRecord") -> None: ...
     def complete_tool_execution(self, record: "ToolExecutionRecord") -> None: ...
@@ -102,6 +123,14 @@ class ConversationStore(Protocol):
         role_filter: Optional[str] = None,
         cwd: Optional[str] = None,
     ) -> List[ConversationSearchResult]: ...
+    def update_session_snapshot(
+        self,
+        session_id: str,
+        system_prompt: Optional[str],
+        tool_schema: Optional[str],
+        disclosure_level: Optional[str],
+    ) -> None: ...
+    def get_session_snapshot(self, session_id: str) -> Optional[SessionSnapshot]: ...
     def close(self) -> None: ...
 
 
@@ -156,11 +185,23 @@ class DuckDBConversationStore:
                 summary VARCHAR DEFAULT ''
             )
         """)
-        # Migration: add summary column for existing databases
-        try:
-            self._conn.execute("ALTER TABLE conversation_sessions ADD COLUMN summary VARCHAR DEFAULT ''")
-        except Exception:
-            pass  # Column already exists
+        # Idempotent column migrations for pre-existing databases. DuckDB supports
+        # ADD COLUMN IF NOT EXISTS, a true no-op when the column is already present.
+        # A bare ALTER guarded only by try/except is unsafe: a failed DDL statement
+        # aborts the surrounding DuckDB transaction, so the next statement fails with
+        # "current transaction is aborted" on every restart against an already-migrated
+        # database — which silently broke session resume after a daemon restart.
+        for col, col_def in (
+            ("summary", "VARCHAR DEFAULT ''"),
+            ("system_prompt_snapshot", "TEXT"),
+            ("tool_schema_snapshot", "TEXT"),
+            ("disclosure_level", "TEXT"),
+            ("pinned", "BOOLEAN DEFAULT FALSE"),
+            ("hidden", "BOOLEAN DEFAULT FALSE"),
+        ):
+            self._conn.execute(
+                f"ALTER TABLE conversation_sessions ADD COLUMN IF NOT EXISTS {col} {col_def}"
+            )
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_messages (
                 message_id VARCHAR PRIMARY KEY,
@@ -293,19 +334,28 @@ class DuckDBConversationStore:
         return self._row_to_session(rows[0])
 
     def list_sessions(
-        self, *, limit: int = 20, active_only: bool = True, cwd: Optional[str] = None
+        self,
+        *,
+        limit: int = 20,
+        active_only: bool = True,
+        cwd: Optional[str] = None,
+        include_hidden: bool = False,
+        include_archived: bool = False,
     ) -> List[ConversationSession]:
         conditions: list[str] = []
         params: list[Any] = []
         sql = "SELECT * FROM conversation_sessions"
-        if active_only:
+        if active_only and not include_archived:
             conditions.append("is_active = TRUE")
+        if not include_hidden:
+            conditions.append("(hidden = FALSE OR hidden IS NULL)")
         if cwd:
             conditions.append("cwd = ?")
             params.append(cwd)
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
-        sql += " ORDER BY updated_at DESC LIMIT ?"
+        # Pinned sessions appear first, then by updated_at
+        sql += " ORDER BY COALESCE(pinned, FALSE) DESC, updated_at DESC LIMIT ?"
         params.append(limit)
         rows = self._conn.execute(sql, params).fetchall()
         return [self._row_to_session(r) for r in rows]
@@ -602,6 +652,50 @@ class DuckDBConversationStore:
             [session_id, *message_ids],
         )
 
+    def pin_session(self, session_id: str) -> None:
+        """Mark a session as pinned so it sorts to the top of listings."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET pinned = TRUE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def unpin_session(self, session_id: str) -> None:
+        """Remove the pinned flag from a session."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET pinned = FALSE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def hide_session(self, session_id: str) -> None:
+        """Hide a session from default listings without deleting it."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET hidden = TRUE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def unhide_session(self, session_id: str) -> None:
+        """Remove the hidden flag from a session."""
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET hidden = FALSE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
+    def archive_session(self, session_id: str) -> None:
+        """Archive a session — marks it inactive and optionally hidden.
+
+        Reuses the ``is_active`` column (same as ``end_session``) so archived
+        sessions are excluded from active-only listings.
+        """
+        now = time.time()
+        self._execute_write(
+            "UPDATE conversation_sessions SET is_active = FALSE, updated_at = ? WHERE session_id = ?",
+            [now, session_id],
+        )
+
     def end_session(self, session_id: str, *, title: str | None = None, summary: str | None = None) -> None:
         """Mark a session as inactive (completed/archived).
 
@@ -737,6 +831,64 @@ class DuckDBConversationStore:
             except Exception:
                 pass
 
+    def update_session_snapshot(
+        self,
+        session_id: str,
+        system_prompt: Optional[str],
+        tool_schema: Optional[str],
+        disclosure_level: Optional[str],
+    ) -> None:
+        """Persist the PCD session snapshot for cache-aware resumption.
+
+        Updates the system prompt, tool schema JSON, and disclosure level
+        columns on the ``conversation_sessions`` row identified by
+        *session_id*. Callers are responsible for serialising the tool
+        schema to a JSON string before passing it here.
+        """
+        now = time.time()
+        self._execute_write(
+            """
+            UPDATE conversation_sessions SET
+                system_prompt_snapshot = ?,
+                tool_schema_snapshot = ?,
+                disclosure_level = ?,
+                updated_at = ?
+            WHERE session_id = ?
+            """,
+            [system_prompt, tool_schema, disclosure_level, now, session_id],
+        )
+
+    def get_session_snapshot(self, session_id: str) -> Optional[SessionSnapshot]:
+        """Read the persisted PCD session snapshot.
+
+        Returns ``None`` when the session does not exist or when all three
+        snapshot columns are NULL (legacy sessions that predate the PCD
+        cache-aware migration).
+        """
+        try:
+            row = self._conn.execute(
+                """
+                SELECT system_prompt_snapshot, tool_schema_snapshot, disclosure_level
+                FROM conversation_sessions
+                WHERE session_id = ?
+                """,
+                [session_id],
+            ).fetchone()
+        except Exception:
+            # Column may not exist in a database that has not been migrated yet.
+            logger.debug("conversation_store: snapshot read failed", exc_info=True)
+            return None
+        if row is None:
+            return None
+        # All NULL means no snapshot was ever persisted.
+        if row[0] is None and row[1] is None and row[2] is None:
+            return None
+        return SessionSnapshot(
+            system_prompt=row[0],
+            tool_schema=row[1],
+            disclosure_level=row[2],
+        )
+
     def _row_to_session(self, row: tuple) -> ConversationSession:
         meta = {}
         try:
@@ -748,6 +900,19 @@ class DuckDBConversationStore:
             summary = row[12] or "" if len(row) > 12 else ""
         except (IndexError, TypeError):
             pass
+        # pinned/hidden columns may not exist in legacy databases
+        pinned = False
+        hidden = False
+        try:
+            # After snapshot columns (13, 14, 15), pinned=16, hidden=17
+            # but column positions depend on migration state.
+            # Safest: iterate column names if available, fall back to tail.
+            n = len(row)
+            if n > 16:
+                pinned = bool(row[n - 2]) if row[n - 2] is not None else False
+                hidden = bool(row[n - 1]) if row[n - 1] is not None else False
+        except (IndexError, TypeError):
+            pass
         return ConversationSession(
             session_id=row[0], title=row[1] or "", created_at=row[2] or 0.0,
             updated_at=row[3] or 0.0, parent_session_id=row[4],
@@ -755,10 +920,11 @@ class DuckDBConversationStore:
             message_count=row[8] or 0, total_tokens=row[9] or 0,
             is_active=bool(row[10]) if row[10] is not None else True,
             metadata=meta, summary=summary,
+            pinned=pinned, hidden=hidden,
         )
 
     def _row_to_tool_execution(self, row: tuple) -> "ToolExecutionRecord":
-        from leapflow.engine.tool_execution import ToolExecutionRecord
+        from leapflow.engine.tools.tool_execution import ToolExecutionRecord
 
         arguments: dict[str, Any] = {}
         result: Any = None

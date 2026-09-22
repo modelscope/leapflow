@@ -629,13 +629,36 @@ class Settings:
     # is not cut short. Thresholds are configurable; the guard can be disabled.
     guardrail_enabled: bool = True
     approval_bypass: bool = False            # Skip all approval prompts for non-hardline actions
+    approval_advisory_risk_enabled: bool = True  # Surface auxiliary LLM risk score in approval prompts
     guardrail_max_repeats: int = 3
     guardrail_max_consecutive_same: int = 8
     guardrail_stagnation_window: int = 10
     guardrail_min_success_rate: float = 0.2
+    guardrail_max_calls_per_turn: int = 50
 
     # ── Session Persistence ──
     session_persistence_enabled: bool = True
+    # Session resume cache strategy: cache_priority keeps the persisted tool
+    # schema so the LLM prefix cache hits; tool_freshness re-discovers tools.
+    session_resume_cache_policy: str = "cache_priority"
+
+    # ── Compression Provider (PCD Cache-Aware) ──
+    # Dedicated provider for context compression. Empty strings fall back to
+    # the primary LLM provider/model/key/url respectively.
+    compression_provider: str = ""
+    compression_model: str = ""
+    compression_api_key: str = ""  # supports secret:// refs like llm_api_key
+    compression_base_url: str = ""
+    # Head/tail protection for the SummarizeStage compressor.  Module-level
+    # _DEFAULT_PROTECT_FIRST_N / _DEFAULT_SUMMARIZE_KEEP_RECENT serve as
+    # fallback defaults only; runtime values are read from these settings.
+    compression_protect_first_n: int = 3
+    compression_keep_recent_n: int = 6
+
+    # ── File Checkpoint Rollback ──
+    checkpoint_file_rollback_enabled: bool = True
+    checkpoint_max_inline_bytes: int = 262144  # 256 KiB threshold for inline vs temp copy
+    checkpoint_ttl_hours: int = 24
 
     # ── Multi-Provider LLM ──
     llm_fallback_providers: str = ""  # JSON array of fallback provider configs
@@ -746,6 +769,18 @@ class Settings:
     scheduler_tick_seconds: int = 60
     scheduler_grace_seconds: float = 120.0
     scheduler_default_tier: str = "auto"  # auto | local | cloud
+    scheduler_agent_max_iterations: int = 25
+    scheduler_agent_tool_blocklist: str = ""  # comma-separated tool names
+    scheduler_default_max_retries: int = 2
+    scheduler_default_retry_backoff_s: float = 60.0
+    scheduler_delivery_enabled: bool = False  # opt-in: deliver results to gateway
+
+    # ── Usage Pricing (config-driven cost accounting) ──
+    # Mapping keyed by model family or exact model name, each entry providing
+    # {input_per_mtok: float, output_per_mtok: float, cached_input_ratio: float}.
+    # Loaded from the layered config (user/profile/workspace).  When absent for
+    # the active model, cost is reported as unknown (graceful degradation).
+    usage_pricing: Dict[str, Any] = field(default_factory=dict)
 
     # ── Dashboard (monitoring web view) ──
     dashboard_enabled: bool = True
@@ -1276,9 +1311,24 @@ def _build_settings_from_env(
     guardrail_max_consecutive_same = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_CONSECUTIVE_SAME", "8"))
     guardrail_stagnation_window = int(os.getenv("LEAPFLOW_GUARDRAIL_STAGNATION_WINDOW", "10"))
     guardrail_min_success_rate = float(os.getenv("LEAPFLOW_GUARDRAIL_MIN_SUCCESS_RATE", "0.2"))
+    guardrail_max_calls_per_turn = int(os.getenv("LEAPFLOW_GUARDRAIL_MAX_CALLS_PER_TURN", "50"))
 
     # Session Persistence
     session_persistence_enabled = _bool("LEAPFLOW_SESSION_PERSISTENCE_ENABLED", "true")
+    session_resume_cache_policy = os.getenv("LEAPFLOW_SESSION_RESUME_CACHE_POLICY", "cache_priority").strip()
+
+    # Compression Provider (PCD Cache-Aware)
+    compression_provider = os.getenv("LEAPFLOW_COMPRESSION_PROVIDER", "").strip()
+    compression_model = os.getenv("LEAPFLOW_COMPRESSION_MODEL", "").strip()
+    compression_api_key = os.getenv("LEAPFLOW_COMPRESSION_API_KEY", "").strip()
+    compression_base_url = os.getenv("LEAPFLOW_COMPRESSION_BASE_URL", "").strip()
+    compression_protect_first_n = int(os.getenv("LEAPFLOW_COMPRESSION_PROTECT_FIRST_N", "3"))
+    compression_keep_recent_n = int(os.getenv("LEAPFLOW_COMPRESSION_KEEP_RECENT_N", "6"))
+
+    # File Checkpoint Rollback
+    checkpoint_file_rollback_enabled = _bool("LEAPFLOW_CHECKPOINT_FILE_ROLLBACK_ENABLED", "true")
+    checkpoint_max_inline_bytes = int(os.getenv("LEAPFLOW_CHECKPOINT_MAX_INLINE_BYTES", "262144"))
+    checkpoint_ttl_hours = int(os.getenv("LEAPFLOW_CHECKPOINT_TTL_HOURS", "24"))
 
     # Multi-Provider LLM
     llm_fallback_providers = os.getenv("LEAPFLOW_LLM_FALLBACK_PROVIDERS", "").strip()
@@ -1384,6 +1434,11 @@ def _build_settings_from_env(
     scheduler_tick_seconds = int(os.getenv("LEAPFLOW_SCHEDULER_TICK_SECONDS", "60"))
     scheduler_grace_seconds = float(os.getenv("LEAPFLOW_SCHEDULER_GRACE_SECONDS", "120.0"))
     scheduler_default_tier = os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_TIER", "auto")
+    scheduler_agent_max_iterations = int(os.getenv("LEAPFLOW_SCHEDULER_AGENT_MAX_ITERATIONS", "25"))
+    scheduler_agent_tool_blocklist = os.getenv("LEAPFLOW_SCHEDULER_AGENT_TOOL_BLOCKLIST", "")
+    scheduler_default_max_retries = int(os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_MAX_RETRIES", "2"))
+    scheduler_default_retry_backoff_s = float(os.getenv("LEAPFLOW_SCHEDULER_DEFAULT_RETRY_BACKOFF_S", "60.0"))
+    scheduler_delivery_enabled = _bool("LEAPFLOW_SCHEDULER_DELIVERY_ENABLED", "false")
 
     # Dashboard
     dashboard_enabled = _bool("LEAPFLOW_DASHBOARD_ENABLED", "true")
@@ -1391,6 +1446,16 @@ def _build_settings_from_env(
     dashboard_port = int(os.getenv("LEAPFLOW_DASHBOARD_PORT", "8765"))
     dashboard_auto_open = _bool("LEAPFLOW_DASHBOARD_AUTO_OPEN", "true")
     dashboard_token_ref = os.getenv("LEAPFLOW_DASHBOARD_TOKEN_REF", "").strip()
+
+    # Usage Pricing (config-driven cost accounting)
+    usage_pricing: Dict[str, Any] = {}
+    _raw_pricing = os.getenv("LEAPFLOW_USAGE_PRICING", "")
+    if _raw_pricing:
+        import json as _json_pricing
+        try:
+            usage_pricing = {str(k): v for k, v in _json_pricing.loads(_raw_pricing).items()}
+        except Exception:
+            logger.warning("Invalid LEAPFLOW_USAGE_PRICING: %s", _raw_pricing)
 
     # Session analysis dashboard
     monitor_session_batch_turns = int(os.getenv("LEAPFLOW_MONITOR_SESSION_BATCH_TURNS", "6"))
@@ -1689,8 +1754,21 @@ def _build_settings_from_env(
         guardrail_max_consecutive_same=guardrail_max_consecutive_same,
         guardrail_stagnation_window=guardrail_stagnation_window,
         guardrail_min_success_rate=guardrail_min_success_rate,
+        guardrail_max_calls_per_turn=guardrail_max_calls_per_turn,
         # Session Persistence
         session_persistence_enabled=session_persistence_enabled,
+        session_resume_cache_policy=session_resume_cache_policy,
+        # Compression Provider (PCD Cache-Aware)
+        compression_provider=compression_provider,
+        compression_model=compression_model,
+        compression_api_key=compression_api_key,
+        compression_base_url=compression_base_url,
+        compression_protect_first_n=compression_protect_first_n,
+        compression_keep_recent_n=compression_keep_recent_n,
+        # File Checkpoint Rollback
+        checkpoint_file_rollback_enabled=checkpoint_file_rollback_enabled,
+        checkpoint_max_inline_bytes=checkpoint_max_inline_bytes,
+        checkpoint_ttl_hours=checkpoint_ttl_hours,
         # Multi-Provider LLM
         llm_fallback_providers=llm_fallback_providers,
         llm_aux_model=llm_aux_model,
@@ -1749,12 +1827,19 @@ def _build_settings_from_env(
         scheduler_tick_seconds=scheduler_tick_seconds,
         scheduler_grace_seconds=scheduler_grace_seconds,
         scheduler_default_tier=scheduler_default_tier,
+        scheduler_agent_max_iterations=scheduler_agent_max_iterations,
+        scheduler_agent_tool_blocklist=scheduler_agent_tool_blocklist,
+        scheduler_default_max_retries=scheduler_default_max_retries,
+        scheduler_default_retry_backoff_s=scheduler_default_retry_backoff_s,
+        scheduler_delivery_enabled=scheduler_delivery_enabled,
         # Dashboard
         dashboard_enabled=dashboard_enabled,
         dashboard_bind=dashboard_bind,
         dashboard_port=dashboard_port,
         dashboard_auto_open=dashboard_auto_open,
         dashboard_token_ref=dashboard_token_ref,
+        # Usage Pricing
+        usage_pricing=usage_pricing,
         monitor_session_batch_turns=monitor_session_batch_turns,
         monitor_session_batch_tokens=monitor_session_batch_tokens,
         monitor_session_use_model_salience=monitor_session_use_model_salience,
@@ -1809,6 +1894,19 @@ def validate_settings(settings: Settings) -> list[str]:
         warnings.append(
             "llm_aux_model is set but no API key available (neither aux nor primary). "
             "Auxiliary LLM calls will fail."
+        )
+
+    if settings.session_resume_cache_policy not in ("cache_priority", "tool_freshness"):
+        warnings.append(
+            f"session_resume_cache_policy='{settings.session_resume_cache_policy}' is not "
+            "a recognised value; expected 'cache_priority' or 'tool_freshness'. "
+            "Defaulting to cache_priority behaviour."
+        )
+
+    if settings.compression_model and not settings.compression_api_key and not settings.llm_api_key:
+        warnings.append(
+            "compression_model is set but no API key available (neither compression nor primary). "
+            "Compression LLM calls will fail."
         )
 
     if settings.llm_fallback_providers:

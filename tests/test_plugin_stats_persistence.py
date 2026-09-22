@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from leapflow.engine.session_factory import (
+from leapflow.engine.session.session_factory import (
     _PersistingTrustLedger,
     _default_stats_db_path,
     _load_or_new_trust_ledger,
@@ -188,7 +188,7 @@ class TestSinkWiringPersistence:
     @pytest.fixture
     def reset_singletons(self, tmp_path: Path):
         """Isolate the process-global advisor + store around each test."""
-        import leapflow.engine.session_factory as sf
+        import leapflow.engine.session.session_factory as sf
         from leapflow.learning import plugin_advisor as pa
 
         saved_advisor = pa._default_advisor
@@ -316,7 +316,7 @@ class TestUsageSinkWiring:
 
     @pytest.fixture
     def reset_singletons(self, tmp_path: Path):
-        import leapflow.engine.session_factory as sf
+        import leapflow.engine.session.session_factory as sf
         from leapflow.learning import plugin_advisor as pa
 
         saved_advisor = pa._default_advisor

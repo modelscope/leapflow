@@ -148,7 +148,7 @@ class VideoAnalyzer:
         return all_actions
 
     # ── L1: Macro ──
-    
+
     async def _analyze_macro(
         self,
         seg: AnalysisSegment,
