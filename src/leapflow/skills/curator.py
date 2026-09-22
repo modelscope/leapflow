@@ -12,12 +12,41 @@ architecture.
 from __future__ import annotations
 
 import enum
+import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from leapflow.llm.base import LLMProvider
 
 logger = logging.getLogger(__name__)
+
+
+# ── Consolidation types ──
+
+
+class ConsolidationAction(str, enum.Enum):
+    """Possible actions when two skills overlap significantly."""
+
+    MERGE = "merge"                  # Combine into a single skill
+    KEEP_SEPARATE = "keep_separate"  # Intentional overlap, keep both
+    DEPRECATE_ONE = "deprecate_one"  # One skill supersedes the other
+
+
+@dataclass(frozen=True)
+class ConsolidationSuggestion:
+    """LLM-generated suggestion for consolidating overlapping skills."""
+
+    skill_a: str
+    skill_b: str
+    action: ConsolidationAction
+    reason: str
+    confidence: float
+    merged_name: str = ""
+    merged_description: str = ""
 
 
 # ── Curation state machine ──
@@ -104,16 +133,22 @@ class SkillCurator:
         store: SkillCurationStore,
         *,
         event_bus: Optional[Any] = None,
+        llm_provider: Optional[LLMProvider] = None,
         stale_after_days: int = _DEFAULT_STALE_DAYS,
         archive_after_days: int = _DEFAULT_ARCHIVE_DAYS,
     ) -> None:
         self._store = store
         self._event_bus = event_bus
+        self._llm_provider: Optional[LLMProvider] = llm_provider
         self._stale_after_days = stale_after_days
         self._archive_after_days = archive_after_days
         self._last_sweep_time: float = 0.0
         # In-memory cache for fast lookups (lazily populated)
         self._cache: Optional[Dict[str, SkillCurationEntry]] = None
+
+    def set_llm(self, provider: LLMProvider) -> None:
+        """Inject or replace the LLM provider (back-reference pattern)."""
+        self._llm_provider = provider
 
     # ── Cache management ──
 
@@ -319,6 +354,178 @@ class SkillCurator:
         """Generate a current-state curation report."""
         return self._build_report([])
 
+    # ── LLM-powered consolidation ──
+
+    async def consolidate(
+        self,
+        skill_entries: List[Any],
+        *,
+        llm_provider: Optional[LLMProvider] = None,
+    ) -> List[ConsolidationSuggestion]:
+        """Detect overlapping skills and suggest merges via LLM.
+
+        Collects active skills from *skill_entries* (SkillEntry instances),
+        groups them by category, and asks the LLM to identify significant
+        overlaps.  Returns a list of :class:`ConsolidationSuggestion`
+        instances for user review — no automatic mutations are performed.
+
+        Args:
+            skill_entries: Active SkillEntry instances from SkillIndex.
+            llm_provider: Override the instance-level LLM provider for
+                          this single call.
+
+        Returns:
+            Suggestions list (empty when no LLM is available or no
+            overlaps are detected).
+        """
+        provider = llm_provider or self._llm_provider
+        if provider is None:
+            logger.warning(
+                "curator.consolidate: no LLM provider available; "
+                "returning empty suggestions"
+            )
+            return []
+
+        # Group skills by category for efficient comparison
+        by_category: Dict[str, List[Any]] = {}
+        for entry in skill_entries:
+            cat = getattr(entry, "category", "") or "uncategorized"
+            by_category.setdefault(cat, []).append(entry)
+
+        suggestions: List[ConsolidationSuggestion] = []
+
+        for category, group in by_category.items():
+            if len(group) < 2:
+                continue
+            prompt = self._build_consolidation_prompt(category, group)
+            try:
+                response = await provider.achat(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a skill-catalog analyst. "
+                                "Respond ONLY with the JSON array described "
+                                "in the user message. No markdown fences, "
+                                "no commentary."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    stream=False,
+                )
+                parsed = self._parse_consolidation_response(response.content)
+                suggestions.extend(parsed)
+            except Exception as exc:
+                logger.warning(
+                    "curator.consolidate: LLM call failed for "
+                    "category=%s error=%s",
+                    category, exc,
+                )
+
+        logger.info(
+            "curator.consolidate: %d suggestion(s) across %d categories",
+            len(suggestions), len(by_category),
+        )
+        return suggestions
+
+    @staticmethod
+    def _build_consolidation_prompt(
+        category: str, entries: List[Any],
+    ) -> str:
+        """Format skill entries into a structured LLM prompt."""
+        skill_lines: List[str] = []
+        for entry in entries:
+            name = getattr(entry, "name", "unknown")
+            desc = getattr(entry, "description", "")[:200]
+            tags = ", ".join(getattr(entry, "tags", ()) or ())
+            triggers = ", ".join(getattr(entry, "triggers", ()) or ())
+            parts = [f"  name: {name}", f"  description: {desc}"]
+            if tags:
+                parts.append(f"  tags: {tags}")
+            if triggers:
+                parts.append(f"  triggers: {triggers}")
+            skill_lines.append("\n".join(parts))
+
+        skills_block = "\n---\n".join(skill_lines)
+
+        return (
+            f"Category: {category}\n"
+            f"Skills ({len(entries)}):\n"
+            f"{skills_block}\n\n"
+            "Analyze these skills for significant overlap. "
+            "For each overlapping pair, produce a JSON object with:\n"
+            '  "skill_a": <name>,\n'
+            '  "skill_b": <name>,\n'
+            '  "action": "merge" | "keep_separate" | "deprecate_one",\n'
+            '  "reason": <concise explanation>,\n'
+            '  "confidence": <0.0-1.0>,\n'
+            '  "merged_name": <suggested name if merge>,\n'
+            '  "merged_description": <suggested description if merge>\n\n'
+            "Return a JSON array of these objects. "
+            "If no overlaps exist, return [].\n"
+            "Do NOT wrap in markdown code fences."
+        )
+
+    @staticmethod
+    def _parse_consolidation_response(
+        raw: str,
+    ) -> List[ConsolidationSuggestion]:
+        """Defensively parse LLM JSON into ConsolidationSuggestion list."""
+        # Strip markdown code fences if present
+        text = raw.strip()
+        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+        if fence_match:
+            text = fence_match.group(1).strip()
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "curator.consolidate: malformed JSON from LLM: %s", exc
+            )
+            return []
+
+        if not isinstance(data, list):
+            logger.warning(
+                "curator.consolidate: expected JSON array, got %s",
+                type(data).__name__,
+            )
+            return []
+
+        action_map = {a.value: a for a in ConsolidationAction}
+        suggestions: List[ConsolidationSuggestion] = []
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                action_str = str(item.get("action", "")).lower()
+                action = action_map.get(action_str)
+                if action is None:
+                    logger.debug(
+                        "curator.consolidate: unknown action '%s', skipping",
+                        action_str,
+                    )
+                    continue
+                suggestion = ConsolidationSuggestion(
+                    skill_a=str(item.get("skill_a", "")),
+                    skill_b=str(item.get("skill_b", "")),
+                    action=action,
+                    reason=str(item.get("reason", "")),
+                    confidence=float(item.get("confidence", 0.5)),
+                    merged_name=str(item.get("merged_name", "")),
+                    merged_description=str(item.get("merged_description", "")),
+                )
+                suggestions.append(suggestion)
+            except (ValueError, TypeError) as exc:
+                logger.debug(
+                    "curator.consolidate: skipping malformed entry: %s", exc
+                )
+                continue
+
+        return suggestions
+
     # ── Internal helpers ──
 
     def _build_report(self, transitions: list[CurationTransition]) -> CurationReport:
@@ -363,6 +570,8 @@ class SkillCurator:
 
 
 __all__ = [
+    "ConsolidationAction",
+    "ConsolidationSuggestion",
     "CurationState",
     "CurationReport",
     "CurationTransition",

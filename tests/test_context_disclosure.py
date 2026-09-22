@@ -248,7 +248,7 @@ def test_config_tools_are_core_and_writes_are_not() -> None:
 
 def _desktop_definitions() -> list[dict]:
     from leapflow.skills.semantic_schema import semantic_tool_to_openai
-    from leapflow.skills.tool_executor import ToolDefinition
+    from leapflow.skills.tool_types import ToolDefinition
 
     defs = []
     for name in ("observe_ui", "click", "list_apps"):

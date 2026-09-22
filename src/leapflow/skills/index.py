@@ -16,6 +16,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Package-bundled builtin SKILL.md skills — always scanned in addition to
+# the user-profile skills_dir so they ship with the installed package.
+_BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin_skills"
+
 
 @dataclass(frozen=True)
 class SkillEntry:
@@ -132,12 +136,41 @@ class SkillIndex:
         return entries
 
     def _scan_skills_dir(self) -> List[SkillEntry]:
-        """L3: Full directory scan, parse all SKILL.md files."""
-        entries: List[SkillEntry] = []
-        if not self._skills_dir.exists():
-            return entries
+        """L3: Full directory scan, parse all SKILL.md files.
 
-        for skill_dir in sorted(self._skills_dir.iterdir()):
+        Scans both the package-bundled builtin_skills directory and the
+        user-profile skills_dir.  Builtin entries are scanned first;
+        user entries with the same name silently win (last-write-wins
+        in the name→entry mapping) so users can override builtins.
+        """
+        seen_names: Dict[str, SkillEntry] = {}
+
+        # 1) Package-bundled builtin skills
+        for entry in self._scan_single_dir(_BUILTIN_SKILLS_DIR):
+            seen_names[entry.name] = entry
+
+        # 2) User-profile skills — may override builtins
+        for entry in self._scan_single_dir(self._skills_dir):
+            seen_names[entry.name] = entry
+
+        # 3) MCP-bridged skills (auto-generated under _mcp_skills/)
+        mcp_skills_dir = self._skills_dir / "_mcp_skills"
+        for entry in self._scan_single_dir(mcp_skills_dir):
+            seen_names[entry.name] = entry
+
+        entries = list(seen_names.values())
+        logger.info(
+            "skill_index.scanned count=%d user_dir=%s builtin_dir=%s",
+            len(entries), self._skills_dir, _BUILTIN_SKILLS_DIR,
+        )
+        return entries
+
+    def _scan_single_dir(self, directory: Path) -> List[SkillEntry]:
+        """Scan one directory for SKILL.md subdirectories."""
+        entries: List[SkillEntry] = []
+        if not directory.exists():
+            return entries
+        for skill_dir in sorted(directory.iterdir()):
             if not skill_dir.is_dir():
                 continue
             skill_md = skill_dir / "SKILL.md"
@@ -146,10 +179,6 @@ class SkillIndex:
             entry = self._parse_skill_md(skill_md, skill_dir)
             if entry is not None:
                 entries.append(entry)
-
-        logger.info(
-            "skill_index.scanned count=%d dir=%s", len(entries), self._skills_dir
-        )
         return entries
 
     def _parse_skill_md(self, path: Path, skill_dir: Path) -> Optional[SkillEntry]:

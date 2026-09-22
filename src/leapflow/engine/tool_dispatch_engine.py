@@ -368,11 +368,11 @@ class ToolDispatchEngine:
     def _parse_tool_call_from_content(content: str) -> Optional[Dict[str, Any]]:
         """Extract tool call from LLM response content.
 
-        Reuses the robust parser from tool_executor.
+        Reuses the robust parser from tool_call_parser.
         """
-        from leapflow.skills.tool_executor import _parse_tool_call
+        from leapflow.skills.tool_call_parser import parse_tool_call
 
-        call = _parse_tool_call(content)
+        call = parse_tool_call(content)
         if call:
             return {"name": call.name, "arguments": call.params}
         return None
