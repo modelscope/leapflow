@@ -9,17 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     # hub.sync imports HubClient, so this stays annotation-only to avoid a cycle.
     from leapflow.hub.sync import SyncPlan
+    from leapflow.hub.federated import FederatedHubRouter, FederatedSearchResult
 
 from leapflow.hub.protocol import (
     HubBackend,
     PushResult,
     SkillBundle,
     SkillManifest,
+    SkillSourceTag,
     SkillSummary,
     UserInfo,
     VersionConflictError,
@@ -116,6 +119,7 @@ class HubClient:
         ]
         self._backend: Optional[HubBackend] = None
         self._backend_cache: Dict[str, HubBackend] = {}
+        self._federated: Optional[FederatedHubRouter] = None
 
     @property
     def hub_type(self) -> str:
@@ -263,17 +267,37 @@ class HubClient:
         """Pull a skill bundle from the remote hub.
 
         Supports identifier routing: github://owner/repo, hf://owner/repo, etc.
+        Pulled bundles are automatically tagged for Progressive Trust:
+        source_tag is set to HUB and tier is clamped to DRAFT (1).
 
         Args:
             repo_id: Repository identifier (may include protocol prefix).
             version: Specific version (None = latest).
 
         Returns:
-            Complete SkillBundle.
+            Complete SkillBundle with trust metadata applied.
         """
         backend_name, normalized = self._route_identifier(repo_id)
         backend = self._get_backend_for(backend_name)
-        return await backend.pull_skill(normalized, version)
+        bundle = await backend.pull_skill(normalized, version)
+        return self._apply_hub_trust(bundle, backend_name)
+
+    @staticmethod
+    def _apply_hub_trust(bundle: SkillBundle, backend_name: str) -> SkillBundle:
+        """Ensure a pulled bundle carries Hub Progressive Trust metadata.
+
+        Sets source_tag to 'hub' and clamps tier to DRAFT (1) so the skill
+        enters the trust pipeline at the lowest level.
+        """
+        manifest = bundle.manifest
+        new_tier = min(manifest.tier, 1)  # DRAFT is the ceiling for hub pulls
+        updated_manifest = replace(
+            manifest,
+            source_tag=SkillSourceTag.HUB.value,
+            tier=new_tier,
+            hub_type=backend_name,
+        )
+        return replace(bundle, manifest=updated_manifest)
 
     async def search(
         self,
@@ -376,6 +400,50 @@ class HubClient:
 
         return ClientSyncPlan(to_push=to_push, to_pull=to_pull, conflicts=conflicts)
 
+    # ─── Federated Search ─────────────────────────────────────────────────
+
+    def _get_or_create_federated(self) -> FederatedHubRouter:
+        """Lazily build a FederatedHubRouter populated with all registered backends."""
+        if self._federated is not None:
+            return self._federated
+
+        from leapflow.hub.federated import FederatedHubRouter
+
+        router = FederatedHubRouter()
+        for hub_type in self._search_sources:
+            try:
+                backend = self._get_backend_for(hub_type)
+                router.add_backend(hub_type, backend)
+            except ValueError:
+                logger.warning(
+                    "Federated search: backend '%s' not available — skipped",
+                    hub_type,
+                )
+        self._federated = router
+        return router
+
+    async def federated_search(
+        self,
+        query: str,
+        owner: str | None = None,
+    ) -> FederatedSearchResult:
+        """Search across ALL registered backends via FederatedHubRouter.
+
+        Creates or reuses a FederatedHubRouter populated with every backend
+        listed in ``search_sources``.  Results are deduplicated and sorted.
+
+        Args:
+            query: Free-text search query.
+            owner: Optional owner/org filter.
+
+        Returns:
+            FederatedSearchResult with merged, deduplicated summaries.
+        """
+        router = self._get_or_create_federated()
+        return await router.search(query, owner=owner)
+
+    # ─── Authentication ───────────────────────────────────────────────────
+
     async def login(self) -> UserInfo:
         """Authenticate with the hub backend.
 
@@ -415,7 +483,7 @@ def _register_defaults() -> None:
 
     HubClient.register("modelscope", _modelscope_factory)
 
-    # HuggingFace backend — placeholder
+    # HuggingFace backend — available if huggingface-hub installed
     def _huggingface_factory() -> HubBackend:
         from leapflow.hub.backends.huggingface import HuggingFaceBackend
 

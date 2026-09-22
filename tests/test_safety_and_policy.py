@@ -17,7 +17,7 @@ from leapflow.skills.action_policy import (
     default_rules,
 )
 from leapflow.skills.sandbox import SandboxedNamespace
-from leapflow.skills.tool_executor import ToolCall
+from leapflow.skills.tool_types import ToolCall
 
 
 # ═══════════════════════════════════════════════════════════════════
