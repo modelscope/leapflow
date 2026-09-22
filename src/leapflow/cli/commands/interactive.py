@@ -806,24 +806,6 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                 _print_execution_result(result)
                 return
 
-            if canonical == "arm":
-                from leapflow.cli.commands.scheduler import cmd_arm
-
-                await cmd_arm(
-                    ctx,
-                    cmd_text.split()[1:] if len(cmd_text.split()) > 1 else [],
-                )
-                return
-
-            if canonical == "task":
-                from leapflow.cli.commands.scheduler import cmd_tasks
-
-                await cmd_tasks(
-                    ctx,
-                    cmd_text.split()[1:] if len(cmd_text.split()) > 1 else [],
-                )
-                return
-
             # Registered engine command with no in-process fast path (e.g.
             # /board): route through the shared command_execute contract so a
             # recognized slash command never leaks into the LLM chat stream.
