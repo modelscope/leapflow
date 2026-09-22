@@ -22,6 +22,7 @@ from leapflow.engine.context.context_focus import ContextPlane
 from leapflow.engine.tools.execution_trace import ExecutionMode, ExecutionTrace
 from leapflow.engine.turn_usage import build_adaptive_learning_signal
 from leapflow.engine._tool_helpers import _default_tool_registry
+from leapflow.memory.nudge import MemoryNudgePolicy, MemoryNudgeTriggered
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from leapflow.engine.engine import AgentEngine
@@ -40,6 +41,8 @@ class LearningBridge:
 
     def __init__(self, engine: "AgentEngine") -> None:
         self._engine = engine
+        self._nudge_policy = MemoryNudgePolicy()
+        self._last_turn_end: float = time.monotonic()
 
     def _emit_chat_event(self, sub_action: str, payload: Dict[str, Any]) -> None:
         """Emit a chat interaction event for trajectory recording during LEARNING.
@@ -126,13 +129,65 @@ class LearningBridge:
             return {"context_plane": ContextPlane.TOOL_EVIDENCE.value}
         return {}
 
+    async def _maybe_nudge(self, messages: List[Dict[str, Any]]) -> None:
+        """Check the nudge policy and emit a *MemoryNudgeTriggered* event if due.
+
+        Called from ``_post_turn_review`` so it piggybacks on the existing
+        post-turn background task without adding a new scheduling path.
+        The nudge is advisory: listeners decide whether to act.
+        """
+        try:
+            turn_count = getattr(self._engine, "_turn_count", 0) or 0
+            idle_seconds = time.monotonic() - self._last_turn_end
+
+            if not self._nudge_policy.should_nudge(turn_count, idle_seconds):
+                return
+
+            if self._engine._event_bus is None:
+                return
+
+            topics = self._nudge_policy.extract_topics(messages)
+            session_id = str(
+                getattr(self._engine, "_current_session_id", "") or ""
+            )
+            event = MemoryNudgeTriggered(
+                session_id=session_id,
+                turn_count=turn_count,
+                suggested_topics=tuple(topics),
+            )
+
+            await self._engine._event_bus.handle_event(
+                "memory.nudge_triggered",
+                {
+                    "session_id": event.session_id,
+                    "turn_count": event.turn_count,
+                    "suggested_topics": list(event.suggested_topics),
+                },
+            )
+
+            self._nudge_policy.record_nudge(turn_count)
+            logger.debug(
+                "memory nudge fired: turn=%d topics=%s",
+                turn_count,
+                topics,
+            )
+        except Exception:
+            logger.debug("memory nudge check failed", exc_info=True)
+
     async def _post_turn_review(self, messages: List[Dict[str, Any]], final_content: str) -> None:
         """Background post-turn review: detect memorable patterns and persist episodes.
 
         Scans the turn's tool calls for interesting patterns (successes, failures)
         and records them as skill episodes for evolution learning. Delegates
         persistence, world-model bridging, and event emission to focused helpers.
+        Also checks the memory nudge policy for periodic review triggers.
         """
+        # Update idle-timer anchor *before* the review so the next nudge
+        # measures idle time from the end of this turn.
+        self._last_turn_end = time.monotonic()
+
+        # Periodic memory nudge check.
+        await self._maybe_nudge(messages)
         try:
             tool_actions: List[Dict[str, Any]] = []
             for msg in messages:
@@ -186,7 +241,7 @@ class LearningBridge:
             )
             self._emit_episode_event(episode, reward)
         except Exception:
-            logger.debug("post_turn_review failed", exc_info=True)
+            logger.debug("post_turn_review failed (episode)", exc_info=True)
 
     def _persist_episode(self, episode: Any) -> None:
         """Incremental persistence: write episode to DuckDB immediately."""

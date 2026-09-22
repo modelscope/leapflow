@@ -10,8 +10,10 @@ domain), never a hardcoded domain->file map.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import time
+from collections import Counter
 from typing import Any, Protocol, runtime_checkable
 
 from leapflow.dashboard.intent import DashboardIntent
@@ -833,7 +835,12 @@ class DashboardViewBuilder:
         return spec
 
     async def _build_subagents(self, template: str, provider: DashboardDataProvider) -> dict[str, Any]:
-        """Build subagent monitor view from live SubagentManager state."""
+        """Build subagent monitor view from live SubagentManager state.
+
+        Enriches raw SubagentManager state with derived statistics, distributions,
+        time-series trends, and alert flags suitable for an academically-styled
+        dashboard with drill-down analytics.
+        """
         state = await provider.subagent_state()
         active = state.get("active") or []
         recent = state.get("recent") or []
@@ -879,9 +886,47 @@ class DashboardViewBuilder:
         finished = stats.get("completed", 0) + stats.get("failed", 0)
         total_duration = round(stats.get("avg_duration", 0) * finished, 1)
 
+        # ── NEW: Performance statistics ──────────────────────────────────────
+        duration_percentiles = _compute_duration_percentiles(recent)
+        duration_distribution = _compute_duration_distribution(recent)
+        tool_calls_distribution = _compute_tool_calls_distribution(recent)
+
+        # ── NEW: Trends ──────────────────────────────────────────────────────
+        delegation_trend = _compute_delegation_trend(recent)
+        hourly_distribution = _compute_hourly_distribution(recent)
+
+        # ── NEW: Alerts ──────────────────────────────────────────────────────
+        alerts = _compute_alerts(recent, stats, config)
+
+        # ── NEW: Unique goals ────────────────────────────────────────────────
+        unique_goals = len({r.get("goal", "") for r in recent if r.get("goal")})
+
+        # ── NEW: Delegation graph badges for EntityGraph ─────────────────────
+        delegation_badges = _compute_delegation_badges(all_entries)
+
+        # ── NEW: Average delegation chain metrics ────────────────────────────
+        depths = [entry.get("depth", 0) for entry in all_entries if isinstance(entry.get("depth"), (int, float))]
+        max_observed_depth = max(depths) if depths else 0
+        avg_depth = round(sum(depths) / len(depths), 2) if depths else 0.0
+        deepest_entries = [e for e in all_entries if e.get("depth") == max_observed_depth] if depths else []
+        deepest_goal_summary = deepest_entries[0].get("goal", "")[:80] if deepest_entries else "—"
+
+        # ── NEW: Efficiency metrics ──────────────────────────────────────────
+        tool_counts = [r.get("tool_calls", 0) for r in recent]
+        avg_tools_per_task = round(sum(tool_counts) / len(tool_counts), 1) if tool_counts else 0.0
+        durations = sorted(_safe_float(r.get("duration_s", 0)) for r in recent)
+        median_duration = round(durations[len(durations) // 2], 2) if durations else 0.0
+        failure_rate_pct = round(
+            (stats.get("failed", 0) / finished * 100) if finished > 0 else 0.0, 1
+        )
+
+        # ── NEW: Config table rows ───────────────────────────────────────────
+        config_table = _build_config_table(config)
+
         data: dict[str, Any] = {
             "title": "Sub-Agent Monitor",
             "subagent": {
+                # Existing keys — kept intact
                 "active": active or None,
                 "active_count": len(active),
                 "recent": recent or None,
@@ -893,6 +938,23 @@ class DashboardViewBuilder:
                 "outcome_distribution": outcome_dist,
                 "total_tool_calls": total_tool_calls,
                 "total_duration": total_duration,
+                # New derived keys
+                "duration_percentiles": duration_percentiles,
+                "duration_distribution": duration_distribution,
+                "tool_calls_distribution": tool_calls_distribution,
+                "delegation_trend": delegation_trend,
+                "hourly_distribution": hourly_distribution,
+                "alerts": alerts,
+                "unique_goals": unique_goals,
+                "delegation_badges": delegation_badges,
+                "max_observed_depth": max_observed_depth,
+                "avg_depth": avg_depth,
+                "deepest_goal_summary": deepest_goal_summary,
+                "avg_tools_per_task": avg_tools_per_task,
+                "median_duration": median_duration,
+                "failure_rate_pct": failure_rate_pct,
+                "config_table": config_table,
+                "sample_count": len(recent),
             },
         }
         if not state or stats.get("total_delegated", 0) == 0:
@@ -946,6 +1008,181 @@ class DashboardViewBuilder:
             "finding_severity_distribution": _distribution(findings, "severity") if findings else None,
         }
         return self._render(template, data)
+
+
+# ── Subagent derived-data helpers ────────────────────────────────────────────
+
+
+def _compute_duration_percentiles(recent: list[dict[str, Any]]) -> dict[str, float] | None:
+    """Return p50/p75/p90/p95 percentiles from sorted duration_s values."""
+    durations = sorted(_safe_float(r.get("duration_s", 0)) for r in recent if r.get("duration_s") is not None)
+    if not durations:
+        return None
+    n = len(durations)
+
+    def _pct(p: float) -> float:
+        idx = min(int(p / 100.0 * n), n - 1)
+        return round(durations[idx], 2)
+
+    return {"p50": _pct(50), "p75": _pct(75), "p90": _pct(90), "p95": _pct(95)}
+
+
+def _compute_duration_distribution(recent: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """Bucket durations into human-readable bands for a BarChart."""
+    if not recent:
+        return None
+    buckets = {"<1s": 0, "1-5s": 0, "5-30s": 0, "30-60s": 0, ">60s": 0}
+    for r in recent:
+        d = _safe_float(r.get("duration_s", 0))
+        if d < 1:
+            buckets["<1s"] += 1
+        elif d < 5:
+            buckets["1-5s"] += 1
+        elif d < 30:
+            buckets["5-30s"] += 1
+        elif d < 60:
+            buckets["30-60s"] += 1
+        else:
+            buckets[">60s"] += 1
+    return [{"label": k, "value": v} for k, v in buckets.items()]
+
+
+def _compute_tool_calls_distribution(recent: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """Bucket tool call counts for a BarChart."""
+    if not recent:
+        return None
+    buckets = {"0": 0, "1-3": 0, "4-10": 0, ">10": 0}
+    for r in recent:
+        tc = _safe_int(r.get("tool_calls", 0))
+        if tc == 0:
+            buckets["0"] += 1
+        elif tc <= 3:
+            buckets["1-3"] += 1
+        elif tc <= 10:
+            buckets["4-10"] += 1
+        else:
+            buckets[">10"] += 1
+    return [{"label": k, "value": v} for k, v in buckets.items()]
+
+
+def _compute_delegation_trend(recent: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """Aggregate delegations by time window for an AreaChart.
+
+    Groups recent entries into 10-minute buckets (or hourly if span > 6h),
+    returning ``[{ts, value}]`` sorted ascending.
+    """
+    timestamped = [
+        (r, _safe_float(r.get("timestamp", 0)))
+        for r in recent
+        if _safe_float(r.get("timestamp", 0)) > 0
+    ]
+    if not timestamped:
+        return None
+    timestamps = [ts for _, ts in timestamped]
+    span = max(timestamps) - min(timestamps)
+    bucket_s = 3600 if span > 6 * 3600 else 600  # 1h or 10min buckets
+    counts: dict[float, int] = Counter()
+    for _, ts in timestamped:
+        bucket_start = (ts // bucket_s) * bucket_s
+        counts[bucket_start] += 1
+    return [{"ts": k, "value": v} for k, v in sorted(counts.items())]
+
+
+def _compute_hourly_distribution(recent: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """Count delegations by hour-of-day (0-23) for pattern analysis."""
+    timestamps = [
+        _safe_float(r.get("timestamp", 0))
+        for r in recent
+        if _safe_float(r.get("timestamp", 0)) > 0
+    ]
+    if not timestamps:
+        return None
+    hour_counts: dict[int, int] = Counter()
+    for ts in timestamps:
+        try:
+            hour = datetime.datetime.fromtimestamp(ts).hour
+        except (OSError, ValueError, OverflowError):
+            continue
+        hour_counts[hour] += 1
+    return [
+        {"label": f"{h:02d}:00", "value": hour_counts.get(h, 0)}
+        for h in range(24)
+    ] or None
+
+
+def _compute_alerts(
+    recent: list[dict[str, Any]],
+    stats: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Derive alert flags from live state. Returns None when all is healthy."""
+    success_rate = _safe_float(stats.get("success_rate", 1.0))
+    high_failure_rate = success_rate < 0.7 and stats.get("total_delegated", 0) > 0
+    has_timeouts = any(_safe_float(r.get("duration_s", 0)) > 120 for r in recent)
+    max_depth_cfg = _safe_int(config.get("max_depth", 0))
+    depth_saturation = any(
+        _safe_int(r.get("depth", 0)) >= max_depth_cfg
+        for r in recent
+    ) if max_depth_cfg > 0 else False
+
+    if not (high_failure_rate or has_timeouts or depth_saturation):
+        return None
+
+    messages = []
+    if high_failure_rate:
+        messages.append(f"High failure rate: {round((1.0 - success_rate) * 100, 1)}% of delegations failed.")
+    if has_timeouts:
+        messages.append("Timeout detected: at least one delegation exceeded 120s.")
+    if depth_saturation:
+        messages.append(f"Depth saturation: delegations reached max depth ({max_depth_cfg}).")
+
+    return {
+        "high_failure_rate": high_failure_rate,
+        "has_timeouts": has_timeouts,
+        "depth_saturation": depth_saturation,
+        "message": " ".join(messages),
+    }
+
+
+def _compute_delegation_badges(entries: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """Build a flat badge list for the EntityGraph renderer.
+
+    Each badge represents a unique parent→subagent pair with its status.
+    """
+    if not entries:
+        return None
+    badges: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        sid = str(entry.get("subagent_id") or "")
+        if sid in seen:
+            continue
+        seen.add(sid)
+        badges.append({
+            "name": f"{_short_id(entry.get('parent_session_id'))} → {_short_id(sid)}",
+            "status": str(entry.get("status", "running")),
+        })
+    return badges or None
+
+
+def _build_config_table(config: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Flatten config into ``{setting, value, description}`` rows for a Table."""
+    if not config:
+        return None
+    descriptions = {
+        "max_depth": "Maximum recursion depth for nested delegations.",
+        "max_concurrent": "Maximum number of subagents running in parallel.",
+        "summary_max_chars": "Character budget for summaries flowing back to the parent.",
+        "iteration_limit": "Maximum iterations per subagent execution.",
+    }
+    rows = []
+    for key, value in config.items():
+        rows.append({
+            "setting": key.replace("_", " ").title(),
+            "value": str(value),
+            "description": descriptions.get(key, ""),
+        })
+    return rows or None
 
 
 __all__ = [

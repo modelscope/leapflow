@@ -179,6 +179,14 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     # Diagnostics
     CommandDef("doctor", "Run system health diagnostics", "Diagnostics", args_hint="[--fix] [--section <name>]", effect=CommandEffect.READ_ONLY, execution=CommandExecution.SHORT_OPERATION),
 
+    # Session Management
+    CommandDef("session", "List or manage conversation sessions", "Session Management", aliases=("session list",), args_hint="[list|archive|pin|unpin|hide|unhide] ...", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("session archive", "Archive a session", "Session Management", args_hint="<session_id>", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("session pin", "Pin a session to the top", "Session Management", args_hint="<session_id>", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("session unpin", "Unpin a session", "Session Management", args_hint="<session_id>", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("session hide", "Hide a session from default listings", "Session Management", args_hint="<session_id>", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+    CommandDef("session unhide", "Unhide a previously hidden session", "Session Management", args_hint="<session_id>", effect=CommandEffect.SESSION, execution=CommandExecution.INSTANT),
+
     # Interaction
     CommandDef(
         "btw",

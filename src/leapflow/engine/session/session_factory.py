@@ -377,6 +377,25 @@ def build_session_engine(
     prefix-cache hit. Best-effort: any failure degrades to a normal resume.
     """
     engine = copy.copy(base_engine)  # shallow copy: own __dict__, shared attr refs
+    # Rebind delegate components to THIS engine. A shallow copy shares the base
+    # engine's delegates by reference, and each delegate holds a back-reference
+    # (``self._engine``) that would still point at the base engine — so a
+    # per-session engine would silently read the BASE engine's state (settings,
+    # task contract, workspace_root, ...) through its delegates. That defeats
+    # per-session isolation: the most visible symptom is workspace-relative tool
+    # paths resolving against the daemon's default root instead of the session's
+    # workspace, so ``file_read`` in a second workspace reports "File not found".
+    # Re-bind each delegate onto a copy pointing at this engine, preserving any
+    # state injected via ``set_*`` while fixing the back-reference.
+    for _attr in (
+        "_session_persistence", "_calibration_manager", "_learning_bridge",
+        "_skill_dispatcher", "_prompt_assembler", "_tool_dispatch",
+    ):
+        _delegate = getattr(engine, _attr, None)
+        if _delegate is not None and hasattr(_delegate, "_engine"):
+            _rebound = copy.copy(_delegate)
+            _rebound._engine = engine
+            setattr(engine, _attr, _rebound)
     engine._settings = _settings_for_workspace(
         getattr(base_engine, "_settings", None),
         workspace_root,

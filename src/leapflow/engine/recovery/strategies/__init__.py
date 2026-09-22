@@ -7,6 +7,7 @@ credential rotation, etc.).
 """
 from __future__ import annotations
 
+from leapflow.engine.recovery.strategies.compression_timeout import CompressionTimeoutStrategy
 from leapflow.engine.recovery.strategies.context_compress import ContextCompressStrategy
 from leapflow.engine.recovery.strategies.credential_rotate import CredentialRotateStrategy
 from leapflow.engine.recovery.strategies.jittered_retry import JitteredRetryStrategy
@@ -17,6 +18,7 @@ from leapflow.engine.recovery.strategies.thinking_disable import ThinkingDisable
 from leapflow.engine.recovery.strategies.tool_schema_expand import ToolSchemaExpandStrategy
 
 __all__ = [
+    "CompressionTimeoutStrategy",
     "ContextCompressStrategy",
     "CredentialRotateStrategy",
     "JitteredRetryStrategy",
@@ -38,6 +40,7 @@ def default_strategies(credential_availability=None) -> list:
     """
     return [
         ContextCompressStrategy(),
+        CompressionTimeoutStrategy(),
         MultimodalStripStrategy(),
         ProviderFailoverStrategy(),
         CredentialRotateStrategy(credential_availability=credential_availability),
