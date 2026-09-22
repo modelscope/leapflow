@@ -173,7 +173,7 @@ class CompressorConfig:
     archive_fn: Optional[ArchiveFn] = field(default=None, repr=False)
     token_count_fn: Optional[TokenCountFn] = field(default=None, repr=False)
 
-    # Legacy field aliases (backward compat with engine.py / tool_executor.py)
+    # Legacy field aliases (backward compat with engine.py / tool_executor.py [deprecated])
     threshold: int = 16
     keep_tail: int = 4
     max_output_chars: int = 2000

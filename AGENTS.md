@@ -125,6 +125,51 @@ The plugin subsystem is not a feature area — it is how the product is composed
 - **`self_describe` is the canonical tool for agent self-cognition**: all facets read live runtime state (registry, daemon, engine, build_info) through `bind_runtime` injected services, never from documentation or static config. A new runtime observable (e.g., a new daemon metric, a new engine state) that the agent should be aware of must be wired into the appropriate `self_describe` facet in the same change — an observable that exists only in daemon status but not in any tool is invisible to the agent.
 - **The plugin contract is published, so it changes with the code**: `docs/plugins/third_party_plugin_development.md` (interfaces, deployment, security model) and `docs/plugins/plugin_lifecycle_management.md` (lifecycle, governance matrix, enforcement status) are third-party-facing specifications whose tables state what the code does *today*. A change to a Protocol, a lifecycle transition, an approval rule, a config key, or an injectable dependency name updates them in the same change — and never promotes a roadmap entry to ENFORCED ahead of the wiring.
 
+## Extension Ladder
+
+LeapFlow exposes four levels of extension, ordered from lowest barrier to deepest integration. Pick the lowest level that satisfies the requirement — it will ship faster, carry less maintenance cost, and stay compatible across upgrades.
+
+### Level 1: Skill (`SKILL.md`) — Lowest Barrier
+
+- Pure Markdown file with YAML frontmatter; no code changes required.
+- Add a `SKILL.md` to the skills directory and the agent discovers it at startup.
+- Declares tool dependencies, trigger phrases, category, and platform constraints.
+- The LLM reads the skill document and autonomously calls existing tools to execute the workflow.
+- Compatible with Hermes skill format (`metadata.hermes` namespace).
+- **Best for:** custom workflows, domain knowledge, operational playbooks, guided procedures.
+
+### Level 2: MCP Server — Low Barrier
+
+- External process communicating via Model Context Protocol (JSON-RPC over stdio/SSE).
+- Brings external service capabilities into the agent as discoverable tools.
+- Language-agnostic — any runtime that speaks MCP can serve tools.
+- **Best for:** external API integrations, third-party service connectors, language-specific tooling.
+
+### Level 3: Plugin (Python Module) — Medium Barrier
+
+- Python module implementing the `ToolPlugin` Protocol (`runtime_checkable`).
+- Full access to LeapFlow's runtime: EventBus, memory, storage, settings via `bind_runtime`.
+- Subject to Progressive Trust lifecycle: DRAFT → CANDIDATE → VERIFIED → PRODUCTION.
+- Sandbox isolation via subprocess JSON-RPC until trust is earned.
+- **Best for:** deep framework integration, new LLM providers, custom storage backends, platform adapters.
+
+### Level 4: Core Tool — High Barrier
+
+- Direct modification to LeapFlow's core tool system (`leapflow/tools/`).
+- Requires understanding of internal architecture, review process, and compliance with all rules in this document.
+- **Best for:** fundamental capabilities that all plugins and skills may depend on.
+
+### Summary
+
+| Level | Mechanism | Barrier | Use Case | Example |
+|-------|-----------|---------|----------|---------|
+| 1 | Skill (`SKILL.md`) | Lowest | Workflows, playbooks, domain knowledge | Deployment checklist, code-review guide |
+| 2 | MCP Server | Low | External services, cross-language tools | GitHub API connector, database explorer |
+| 3 | Plugin (Python) | Medium | Runtime integration, providers, adapters | LLM provider, gateway adapter |
+| 4 | Core Tool | High | Foundational agent capabilities | File I/O, code search |
+
+> **Community contributions should start at Level 1 (Skill).** It requires no code changes, has the fastest feedback loop, and can be shared as a single Markdown file. Escalate to a higher level only when the skill layer cannot express the needed capability.
+
 ## Path Tree, Configuration, and Secrets Rules
 
 - **Path tree is a product contract**: every LeapFlow-managed path must be declared by `PathLayout`, `ProfileLayout`, `CacheLayout`, or a child layout object. Runtime code must consume layout APIs, never assemble managed paths with ad-hoc string joins.
