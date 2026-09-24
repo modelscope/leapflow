@@ -7,6 +7,7 @@ indexed by frontmatter metadata, and filtered by runtime conditions.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import time
@@ -19,6 +20,10 @@ logger = logging.getLogger(__name__)
 # Package-bundled builtin SKILL.md skills — always scanned in addition to
 # the user-profile skills_dir so they ship with the installed package.
 _BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin_skills"
+
+# Bumped when the snapshot layout or signing scheme changes; a mismatch forces
+# a fresh L3 rescan so an old on-disk snapshot can never mask new skills.
+_SNAPSHOT_SCHEMA = 2
 
 
 @dataclass(frozen=True)
@@ -244,30 +249,78 @@ class SkillIndex:
                 return line[2:].strip()
         return None
 
+    def _compute_source_signature(self) -> str:
+        """Fingerprint the scanned skill sources so a stale snapshot is detected.
+
+        Covers add / remove / edit of any SKILL.md across the package builtin_skills
+        dir, the user skills_dir, and the MCP-bridged dir — the exact sources
+        ``_scan_skills_dir`` reads — using only ``stat()`` (no file reads), so it
+        stays cheap on the L2 hot path. Without it, an ``.skills_index.json``
+        written while a source dir was empty (e.g. before builtin skills shipped,
+        or before a package upgrade) is trusted forever and silently hides every
+        skill added since.
+        """
+        parts: List[str] = []
+        for label, directory in (
+            ("builtin", _BUILTIN_SKILLS_DIR),
+            ("user", self._skills_dir),
+            ("mcp", self._skills_dir / "_mcp_skills"),
+        ):
+            if not directory.exists():
+                continue
+            for skill_dir in sorted(directory.iterdir()):
+                skill_md = skill_dir / "SKILL.md"
+                try:
+                    st = skill_md.stat()
+                except OSError:
+                    continue
+                parts.append(f"{label}/{skill_dir.name}:{st.st_mtime_ns}:{st.st_size}")
+        digest = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+        return f"{_SNAPSHOT_SCHEMA}:{digest}"
+
     def _load_from_snapshot(self) -> Optional[List[SkillEntry]]:
-        """L2: Load from disk snapshot."""
+        """L2: Load from disk snapshot, rejecting a legacy or stale one.
+
+        Returning ``None`` forces an L3 rescan that rewrites a fresh, signed
+        snapshot, so this path is self-healing across package upgrades and after
+        skills are added, edited, or removed.
+        """
         if not self._snapshot_path.exists():
             return None
         try:
             data = json.loads(self._snapshot_path.read_text(encoding="utf-8"))
-            # Convert list[str] back to tuple for frozen dataclass
+        except Exception as exc:
+            logger.debug("skill_index.snapshot_load_failed path=%s error=%s", self._snapshot_path, exc)
+            return None
+        # Legacy bare-list snapshots carry no signature — treat as stale and rescan.
+        if not isinstance(data, dict) or data.get("schema") != _SNAPSHOT_SCHEMA:
+            logger.info("skill_index.snapshot_legacy_or_schema_drift; rescanning path=%s", self._snapshot_path)
+            return None
+        if data.get("signature") != self._compute_source_signature():
+            logger.info("skill_index.snapshot_stale (skill sources changed); rescanning path=%s", self._snapshot_path)
+            return None
+        try:
             entries: List[SkillEntry] = []
-            for raw in data:
+            for raw in data.get("entries", []):
                 raw["tags"] = tuple(raw.get("tags", ()))
                 raw["requires_tools"] = tuple(raw.get("requires_tools", ()))
                 raw["platforms"] = tuple(raw.get("platforms", ()))
                 entries.append(SkillEntry(**raw))
             return entries
         except Exception as exc:
-            logger.debug("skill_index.snapshot_load_failed path=%s error=%s", self._snapshot_path, exc)
+            logger.debug("skill_index.snapshot_parse_failed path=%s error=%s", self._snapshot_path, exc)
             return None
 
     def _save_snapshot(self, entries: List[SkillEntry]) -> None:
-        """Save snapshot for L2 cache."""
+        """Save a signed snapshot for the L2 cache."""
         try:
             self._skills_dir.mkdir(parents=True, exist_ok=True)
-            data = [dataclasses.asdict(e) for e in entries]
-            self._snapshot_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            payload = {
+                "schema": _SNAPSHOT_SCHEMA,
+                "signature": self._compute_source_signature(),
+                "entries": [dataclasses.asdict(e) for e in entries],
+            }
+            self._snapshot_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass  # Non-critical — next scan will rebuild
 

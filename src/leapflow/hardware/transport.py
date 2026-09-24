@@ -332,7 +332,87 @@ class FrameTransport(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class BatchReading:
+    """Atomic vector read of multiple channels at one physical instant.
+
+    A single bus transaction that samples every requested channel at one
+    coordinated instant, rather than N sequential ``read()`` calls whose
+    timestamps drift by the inter-read latency.  The contract is that all
+    ``readings`` share the same physical sampling moment, so the pair
+    (``observed_at``, ``monotonic_at``) is per-batch, not per-reading.
+
+    Returned by ``BatchTransport.read_batch``.  Each ``Reading`` inside
+    carries the per-channel quantity, unit and quality; the batch adds
+    only the device scope and the shared timebase.
+    """
+
+    device_id: str
+    readings: tuple[Reading, ...]
+    observed_at: float = field(default_factory=time.time)
+    monotonic_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass(frozen=True)
+class BatchWriteOutcome:
+    """Result of an atomic vector write to multiple channels.
+
+    Mirrors ``WriteOutcome`` for the batch case.  ``ok`` is True only when
+    every individual outcome succeeded.  ``side_effect_state`` is the
+    worst-case across all outcomes: if any channel reports ``UNKNOWN``,
+    the batch reports ``UNKNOWN``; if any reports ``PARTIAL``, the batch
+    reports ``PARTIAL``.  A caller must never assume that a partially
+    successful batch can be meaningfully retried as a whole.
+    """
+
+    ok: bool
+    outcomes: tuple[WriteOutcome, ...]
+    side_effect_state: str = SIDE_EFFECT_UNKNOWN
+
+
+@runtime_checkable
+class BatchTransport(Protocol):
+    """Optional side-protocol for vectorized read/write.
+
+    Discovered via ``isinstance(transport, BatchTransport)``, exactly like
+    ``FrameTransport``.  A transport that does not satisfy this Protocol
+    falls back to sequential single-channel ``read``/``write`` calls
+    automatically -- the registry and the streaming engine both check
+    before attempting batch operations.
+
+    The motivation is physical: a six-joint robot arm reads all joint
+    positions in one bus transaction (``sync_read`` on Dynamixel/Feetech,
+    ``read_input_registers`` on Modbus, one ``get_observation()`` in
+    LeapRobot).  Expressing that as six sequential ``read()`` calls pays
+    six lock acquisitions and produces timestamps that drift by the
+    inter-read latency, which at 100 Hz is the period itself.
+
+    ``read_batch`` must return readings whose ``observed_at`` /
+    ``monotonic_at`` reflect the *physical* sampling instant, not the
+    moment each value was unpacked.  ``write_batch`` must be atomic at
+    the bus level: either all channels receive their commanded values in
+    one transaction, or the outcome reports which ones landed.
+    """
+
+    async def read_batch(self, channel_ids: tuple[str, ...]) -> BatchReading:
+        """Read multiple channels in one atomic bus transaction."""
+        ...
+
+    async def write_batch(
+        self, commands: tuple[tuple[str, Any], ...]
+    ) -> BatchWriteOutcome:
+        """Write multiple channels in one atomic bus transaction.
+
+        ``commands`` is a tuple of ``(channel_id, value)`` pairs.  Order
+        is preserved but the transport may reorder for bus efficiency.
+        """
+        ...
+
+
 __all__ = [
+    "BatchReading",
+    "BatchTransport",
+    "BatchWriteOutcome",
     "SIDE_EFFECT_COMMITTED",
     "SIDE_EFFECT_NONE",
     "SIDE_EFFECT_PARTIAL",

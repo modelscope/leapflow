@@ -3317,11 +3317,141 @@ async def _distill_background(session) -> None:
         _log.warning("background_distill failed", exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Physical teach helpers (teleop / kinesthetic)
+# ---------------------------------------------------------------------------
+
+def _parse_teach_start_args(raw_args: str) -> dict[str, Any]:
+    """Parse ``--mode``, ``--leader``, ``--follower``, ``--device`` from teach start args.
+
+    Unrecognized tokens (i.e. those not prefixed with ``--``) are treated as
+    the goal string, preserving backward compatibility with the existing
+    ``/teach start <goal>`` form.
+    """
+    result: dict[str, Any] = {"mode": "gui", "goal": ""}
+    goal_parts: list[str] = []
+    tokens = raw_args.split()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if "=" in token and token.startswith("--"):
+            key, _, val = token.partition("=")
+            result[key.lstrip("-")] = val
+        elif token.startswith("--") and i + 1 < len(tokens):
+            result[token.lstrip("-")] = tokens[i + 1]
+            i += 1
+        else:
+            goal_parts.append(token)
+        i += 1
+    if goal_parts:
+        result["goal"] = " ".join(goal_parts)
+    return result
+
+
+async def _start_physical_teach(
+    ctx: "Context", mode: str, parsed: dict[str, Any]
+) -> dict[str, Any]:
+    """Start a physical teach session (teleop or kinesthetic)."""
+    from leapflow.robot.teleop import (
+        KinestheticRecorder,
+        LeaderFollowerBridge,
+        get_physical_session,
+        register_physical_session,
+    )
+
+    session_key = _physical_session_key(ctx)
+    if get_physical_session(session_key) is not None:
+        return {
+            "ok": False,
+            "message": "A physical teach session is already active. Use '/teach stop' first.",
+            "session_mode": "learning",
+        }
+
+    registry = getattr(ctx, "hardware_registry", None)
+    if registry is None:
+        return {"ok": False, "message": "Hardware subsystem is not available."}
+
+    goal = parsed.get("goal", "")
+
+    if mode == "teleop":
+        leader = parsed.get("leader", "")
+        follower = parsed.get("follower", "")
+        if not leader or not follower:
+            return {
+                "ok": False,
+                "message": "Teleop mode requires --leader=<device> --follower=<device>.",
+            }
+        bridge = LeaderFollowerBridge(
+            registry,
+            leader_device_id=leader,
+            follower_device_id=follower,
+            goal=goal,
+        )
+    else:  # kinesthetic
+        device = parsed.get("device", "")
+        if not device:
+            return {
+                "ok": False,
+                "message": "Kinesthetic mode requires --device=<device>.",
+            }
+        bridge = KinestheticRecorder(registry, device_id=device, goal=goal)
+
+    await bridge.start()
+    register_physical_session(session_key, bridge)
+
+    label = "Teleop" if mode == "teleop" else "Kinesthetic"
+    msg = f"{label} teach started — session {bridge.session_id}"
+    if goal:
+        msg += f"\nGoal: {goal}"
+    msg += "\nSay '/teach stop' to stop and save the trajectory."
+    return {"ok": True, "message": msg, "session_mode": "learning"}
+
+
+async def _stop_physical_teach(ctx: "Context") -> dict[str, Any] | None:
+    """Stop an active physical teach session if one exists.  Returns None otherwise."""
+    from leapflow.robot.teleop import get_physical_session, remove_physical_session
+
+    session_key = _physical_session_key(ctx)
+    bridge = get_physical_session(session_key)
+    if bridge is None:
+        return None
+
+    trajectory = await bridge.stop()
+    remove_physical_session(session_key)
+
+    msg = (
+        f"Physical recording stopped — {trajectory.sample_count} samples, "
+        f"{trajectory.duration_s:.1f}s"
+    )
+    return {
+        "ok": True,
+        "message": msg,
+        "sample_count": trajectory.sample_count,
+        "duration": trajectory.duration_s,
+        "trajectory_id": trajectory.trajectory_id,
+        "session_mode": "idle",
+    }
+
+
+def _physical_session_key(ctx: "Context") -> str:
+    """Derive a stable key for tracking physical sessions on *ctx*."""
+    session = getattr(ctx, "session", None)
+    if session is not None:
+        sid = getattr(session, "session_id", "")
+        if sid:
+            return f"physical:{sid}"
+    return "physical:default"
+
+
 async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]:
     """Execute teach commands.
 
     Returns ``session_mode`` in the payload so the TUI client can track
     whether it should route subsequent inputs as annotations.
+
+    Physical modes (``--mode=teleop`` / ``--mode=kinesthetic``) start a
+    hardware bridge instead of the desktop GUI recorder.  The existing
+    GUI path (``--mode=gui`` or no ``--mode``) is completely unchanged.
     """
     from leapflow.engine.session.session import SessionMode
 
@@ -3331,7 +3461,16 @@ async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]
             return {"ok": False, "message": "No active session.", "session_mode": "idle"}
         if ctx.session.mode == SessionMode.LEARNING:
             return {"ok": False, "message": "Already in teaching mode. Say '/teach stop' to end.", "session_mode": "learning"}
-        goal = args if name == "teach start" else ""
+
+        # Parse --mode and physical-mode arguments from the raw args.
+        parsed = _parse_teach_start_args(args if name == "teach start" else "")
+        mode = parsed.get("mode", "gui")
+
+        if mode in ("teleop", "kinesthetic"):
+            return await _start_physical_teach(ctx, mode, parsed)
+
+        # Default GUI path — unchanged.
+        goal = parsed.get("goal", "")
         try:
             session = await ctx.session.enter_learning(goal=goal)
             msg = f"Teaching started — session {session.session_id}"
@@ -3343,6 +3482,11 @@ async def _execute_teach(ctx: "Context", name: str, args: str) -> dict[str, Any]
             return {"ok": False, "message": str(e)}
 
     if name == "teach stop":
+        # Check for an active physical session first.
+        physical_result = await _stop_physical_teach(ctx)
+        if physical_result is not None:
+            return physical_result
+
         if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
             return {"ok": False, "message": "Not in teaching mode.", "session_mode": "idle"}
         try:

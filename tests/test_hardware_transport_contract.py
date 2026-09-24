@@ -230,6 +230,15 @@ _EXTERNAL_ONLY_TRANSPORTS = frozenset(
         # tests/test_hardware_media.py: read-only refusal with a provable NONE verdict,
         # frame metadata without bytes, and the FrameTransport capability check.
         "media",
+        # Depends on torch/leapflow.robot -- optional heavy ML packages that are not installed
+        # in the standard test environment.
+        "robot_arm",
+        # Depends on torch and gRPC for VLA model serving; exercised in dedicated
+        # integration tests when the runtime is available.
+        "vla_inference",
+        # Depends on rclpy (ROS2 Python client library), which is an optional
+        # heavy dependency not installed in the standard test environment.
+        "ros2",
     }
 )
 

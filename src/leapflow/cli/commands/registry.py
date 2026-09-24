@@ -96,7 +96,7 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("orient", "Show the agent's unified orientation (layered) and pending re-entries", "Chat", effect=CommandEffect.READ_ONLY),
 
     # Teaching
-    CommandDef("teach start", "Start teaching mode", "Teaching", aliases=("teach",), args_hint="[goal]"),
+    CommandDef("teach start", "Start teaching mode", "Teaching", aliases=("teach",), args_hint="[goal] [--mode=gui|teleop|kinesthetic] [--leader=<dev> --follower=<dev>] [--device=<dev>]"),
     CommandDef("teach stop", "Stop and distill skill", "Teaching"),
     CommandDef("teach status", "Show distillation progress", "Teaching"),
     CommandDef("teach pause", "Pause recording", "Teaching"),

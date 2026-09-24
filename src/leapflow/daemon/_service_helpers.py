@@ -96,6 +96,33 @@ def engine_context_metadata(engine: Any | None, settings: Any) -> dict[str, Any]
     return metadata
 
 
+def engine_runtime_extras(engine: Any | None) -> dict[str, Any]:
+    """Return session turn count and cache hit rate for status introspection.
+
+    These live on the engine, not the budget snapshot, and are needed by the
+    self-awareness runtime facet. Kept separate from ``engine_context_metadata``
+    so they ride only on the (rare) status call, never on every stream chunk.
+    The cache hit rate is normalised from the tracker's 0..1 fraction to a
+    human-facing percentage.
+    """
+    extras: dict[str, Any] = {}
+    if engine is None:
+        return extras
+    turn_count = getattr(engine, "_session_turn_count", None)
+    if isinstance(turn_count, int) and turn_count >= 0:
+        extras["session_turn_count"] = turn_count
+    tracker = getattr(engine, "_usage_tracker", None)
+    summary_fn = getattr(tracker, "summary", None) if tracker is not None else None
+    if callable(summary_fn):
+        try:
+            rate = getattr(summary_fn(), "cache_hit_rate", None)
+        except Exception:  # noqa: BLE001 - telemetry must never fail status
+            rate = None
+        if isinstance(rate, (int, float)) and rate >= 0:
+            extras["cache_hit_rate"] = round(float(rate) * 100, 1)
+    return extras
+
+
 def host_backend_status(ctx: Any | None) -> dict[str, Any]:
     """Inspect daemon host-backend state for status reporting."""
     if ctx is None:

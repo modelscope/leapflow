@@ -60,6 +60,19 @@ from leapflow.hardware.transport import (
     TransportStatus,
     WriteOutcome,
 )
+from leapflow.hardware.evidence import (
+    EvidenceStore,
+)
+from leapflow.hardware.verification import (
+    EvidenceBundle,
+    GraspVerifier,
+    OperationVerdict,
+    OperationVerifier,
+    PositionVerifier,
+    VerdictStatus,
+    VerificationMode,
+    collect_evidence,
+)
 
 __all__ = [
     "HC_VERSION",
@@ -74,8 +87,11 @@ __all__ = [
     "ContextSource",
     "Direction",
     "Envelope",
+    "EvidenceBundle",
+    "EvidenceStore",
     "FrameReading",
     "FrameTransport",
+    "GraspVerifier",
     "HardwareContext",
     "HardwareEffect",
     "HardwareRegistry",
@@ -83,6 +99,9 @@ __all__ = [
     "HardwareTransport",
     "Interlock",
     "LoadReport",
+    "OperationVerdict",
+    "OperationVerifier",
+    "PositionVerifier",
     "PrivacyTier",
     "Quality",
     "Reading",
@@ -91,5 +110,8 @@ __all__ = [
     "TransportRef",
     "TransportStatus",
     "UnverifiedContextPolicy",
+    "VerdictStatus",
+    "VerificationMode",
     "WriteOutcome",
+    "collect_evidence",
 ]
