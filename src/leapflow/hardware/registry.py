@@ -724,6 +724,25 @@ class HardwareRegistry:
         channel = context.channel(channel_id) if context is not None else None
         return bool(channel is not None and channel.is_writable)
 
+    async def read(self, device_id: str, channel_id: str) -> Any:
+        """Read a single channel value. Convenience wrapper around transport.read()."""
+        async with self.device_io(device_id):
+            transport = await self.transport(device_id)
+            return await transport.read(channel_id)
+
+    async def read_frame(self, device_id: str, channel_id: str, **kwargs: Any) -> Any:
+        """Read a frame from a camera channel. Requires FrameTransport."""
+        async with self.device_io(device_id):
+            transport = await self.transport(device_id)
+            from leapflow.hardware.transport import FrameTransport
+
+            if not isinstance(transport, FrameTransport):
+                raise TransportError(
+                    f"Transport for {device_id!r} does not support frame capture",
+                    failure_code="frame_transport_missing",
+                )
+            return await transport.read_frame(channel_id, **kwargs)
+
     async def transport(self, device_id: str) -> HardwareTransport:
         """Return the open transport for *device_id*, opening it on first use.
 
@@ -776,14 +795,25 @@ class HardwareRegistry:
         if not self._settings.stream_enabled:
             return ()
         if self._stream_sources is None:
-            from leapflow.hardware.stream import build_stream_sources
+            from leapflow.hardware.stream import build_batch_coordinators, build_stream_sources
 
-            self._stream_sources = build_stream_sources(
+            batch_coordinators = build_batch_coordinators(
                 self,
                 ring_capacity=self._settings.stream_ring_capacity,
                 event_sink=self.record_event,
                 reading_store=self.reading_store,
             )
+            batch_device_ids = frozenset(
+                c._context.device_id for c in batch_coordinators
+            )
+            individual_sources = build_stream_sources(
+                self,
+                ring_capacity=self._settings.stream_ring_capacity,
+                event_sink=self.record_event,
+                reading_store=self.reading_store,
+                batch_device_ids=batch_device_ids,
+            )
+            self._stream_sources = (*batch_coordinators, *individual_sources)
         return self._stream_sources
 
     @property
@@ -1118,6 +1148,45 @@ class HardwareRegistry:
             lock = asyncio.Lock()
             self._io_locks[key] = lock
         return lock
+
+    def device_io_batch(self, device_id: str) -> Any:
+        """Acquire the device I/O lock for a batch operation.
+
+        Identical to ``device_io`` but named explicitly so batch vs single
+        operations are distinguishable in logs and metrics.  The lock is the
+        same per-device asyncio.Lock -- batch does not bypass it, it simply
+        acquires it once for multiple channels instead of once per channel.
+        """
+        key = str(device_id)
+        lock = self._io_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._io_locks[key] = lock
+        return lock
+
+    async def read_batch(self, device_id: str, channel_ids: tuple[str, ...]) -> Any:
+        """Read multiple channels in one atomic operation if the transport supports it.
+
+        Falls back to sequential reads if ``BatchTransport`` is not satisfied.
+        Returns a ``BatchReading`` or a synthesized equivalent from sequential reads.
+        """
+        from leapflow.hardware.transport import BatchReading, BatchTransport, Reading
+
+        transport = await self.transport(device_id)
+        if isinstance(transport, BatchTransport):
+            async with self.device_io_batch(device_id):
+                return await transport.read_batch(channel_ids)
+        else:
+            # Fallback: sequential reads under one lock acquisition.
+            async with self.device_io(device_id):
+                readings: list[Reading] = []
+                for ch_id in channel_ids:
+                    reading = await transport.read(ch_id)
+                    readings.append(reading)
+                return BatchReading(
+                    device_id=device_id,
+                    readings=tuple(readings),
+                )
 
     # ── Rate-limit baseline ──
 

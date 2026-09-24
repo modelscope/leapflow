@@ -224,6 +224,10 @@ def test_hardware_transports_are_not_named_after_one_device() -> None:
         "mcp.py",
         "host.py",
         "media.py",
+        "robot_arm.py",
+        "robot_channels.py",
+        "ros2.py",
+        "vla_inference.py",
     }
     present = {p.name for p in (HARDWARE_DIR / "transports").glob("*.py")}
     unexpected = present - allowed

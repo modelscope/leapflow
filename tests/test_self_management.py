@@ -170,22 +170,18 @@ class TestPluginListIntrospection:
         assert result["plugin_count"] == len(result["plugins"])
 
     @pytest.mark.asyncio
-    async def test_plugin_list_includes_live_capability_report(
+    async def test_plugin_list_is_management_only_no_capability_report(
         self, self_mgmt_plugin: Any
     ) -> None:
-        """plugin_list is the live evidence source for self-capability answers."""
+        """plugin_list is a plugin-management view; self-capability evidence now
+        lives on self_describe, so the redundant capability_report is gone."""
         result = await self_mgmt_plugin._plugin_list_handler()
 
         assert result["ok"] is True
-        report = result["capability_report"]
-        assert report["source"] == "live_runtime_registry"
-        assert report["registry"]["tool_count"] >= len(report["plugins_supported"]["evidence_tools"])
-        assert report["plugins_supported"]["supported"] is True
-        assert "plugin_list" in report["plugins_supported"]["evidence_tools"]
-        assert report["plugins_supported"]["hot_reload"] is True
-        assert report["plugins_supported"]["versioning"] is True
-        assert "approval_gate_bound" in report["runtime_dependencies"]
-        assert report["answering_guidance"]
+        assert "capability_report" not in result
+        # The management view still lists the live registry.
+        assert result["plugin_count"] == len(result["plugins"])
+        assert any(p["plugin_id"] == "self_management" for p in result["plugins"])
 
 
 class TestPluginStatusIntrospection:

@@ -625,6 +625,275 @@ class HardwareStreamSource:
         }
 
 
+class BatchStreamCoordinator:
+    """Coordinates batch sampling for all streaming channels of one device.
+
+    When the transport satisfies ``BatchTransport``, one coordinator replaces
+    N individual ``HardwareStreamSource`` tasks with a single sampling loop
+    that calls ``read_batch`` once per period.  The readings are then
+    distributed to the per-channel rings and detectors, preserving the
+    per-channel event model while eliminating per-read lock contention.
+
+    Falls back to individual sources when the transport does not support
+    batch -- the coordinator is an optimisation, not a requirement.
+    """
+
+    def __init__(
+        self,
+        registry: Any,
+        context: HardwareContext,
+        channels: tuple[Channel, ...],
+        *,
+        ring_capacity: int = DEFAULT_RING_CAPACITY,
+        event_sink: EventSink | None = None,
+        reading_store: Any = None,
+        alert_policy: Any = None,
+    ) -> None:
+        self._registry = registry
+        self._context = context
+        self._channels = channels
+        self._channel_ids = tuple(ch.channel_id for ch in channels)
+        self._rings: dict[str, ReadingRing] = {
+            ch.channel_id: ReadingRing(ring_capacity) for ch in channels
+        }
+        self._detectors: dict[str, HardwareEventDetector] = {
+            ch.channel_id: HardwareEventDetector(context, ch) for ch in channels
+        }
+        self._event_sink = event_sink
+        self._store = reading_store
+        self._alert_policy = alert_policy
+        self._task: asyncio.Task[None] | None = None
+        self._stopping = asyncio.Event()
+        self._last_emitted: dict[str, float] = {}
+        self._paced_out = 0
+        self._samples = 0
+        self._skipped_slots = 0
+        self._started_monotonic: float | None = None
+
+    @property
+    def source_id(self) -> str:
+        return f"hw.batch:{self._context.device_id}"
+
+    async def start(self, emit: Any) -> None:
+        """Begin batch sampling. Returns promptly; the loop runs as an internal task."""
+        if self._task is not None:
+            return
+        self._stopping.clear()
+        self._task = asyncio.create_task(self._run(emit), name=self.source_id)
+
+    async def stop(self) -> None:
+        """Stop batch sampling. Idempotent."""
+        self._stopping.set()
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+            logger.warning("Batch stream %s stop raised: %s", self.source_id, exc)
+
+    async def _run(self, emit: Any) -> None:
+        """Core batch sampling loop.
+
+        Uses deadline-based scheduling identical to HardwareStreamSource._run(),
+        but calls read_batch() once to get all channels simultaneously.
+        The batch readings are then split and fed to per-channel rings,
+        detectors, persistence and event dispatch.
+
+        The sampling rate is the maximum declared rate across all channels.
+        """
+        max_rate = max((ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0)
+        interval = 1.0 / max_rate if max_rate > 0 else 1.0
+        consecutive_failures = 0
+        self._started_monotonic = time.monotonic()
+        next_at = self._started_monotonic
+        while not self._stopping.is_set():
+            try:
+                batch = await self._registry.read_batch(
+                    self._context.device_id, self._channel_ids
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one device must not stop the rest
+                consecutive_failures += 1
+                if consecutive_failures == 1:
+                    logger.warning(
+                        "Batch stream %s read failed: %s", self.source_id, exc, exc_info=True
+                    )
+                # Check staleness on all channels during failures.
+                for detector in self._detectors.values():
+                    self._dispatch(detector.check_stale(), emit)
+                await self._sleep(min(interval * (2 ** consecutive_failures), 30.0))
+                next_at = time.monotonic()
+                continue
+
+            consecutive_failures = 0
+            self._samples += 1
+
+            # Distribute batch readings to per-channel rings and detectors.
+            for reading in batch.readings:
+                ch_id = reading.channel_id
+                ring = self._rings.get(ch_id)
+                if ring is None:
+                    continue
+                lost = ring.record(reading)
+                await self._persist(reading, lost=lost)
+                detector = self._detectors.get(ch_id)
+                if detector is not None:
+                    self._dispatch(detector.observe(reading, lost=lost), emit)
+
+            next_at += interval
+            delay = next_at - time.monotonic()
+            if delay < 0:
+                missed = int(-delay // interval) + 1
+                self._skipped_slots += missed
+                next_at += missed * interval
+                delay = max(0.0, next_at - time.monotonic())
+            await self._sleep(delay)
+
+    async def _persist(self, reading: Reading, *, lost: int) -> None:
+        """Buffer one sample for persistence, mirroring HardwareStreamSource._persist."""
+        store = self._store
+        if store is None:
+            return
+        try:
+            store.record(reading, dropped=lost)
+            if not store.due_for_flush():
+                return
+            batches = store.drain()
+            if batches:
+                await asyncio.to_thread(store.write_batches, batches)
+        except Exception as exc:  # noqa: BLE001 - persistence must not stop sampling
+            logger.warning(
+                "Hardware reading persistence failed for %s: %s",
+                self.source_id,
+                exc,
+                exc_info=True,
+            )
+
+    async def _sleep(self, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(self._stopping.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return
+
+    def _dispatch(self, events: Iterable[HardwareEvent], emit: Any) -> None:
+        """Hand events to the sink, signal pipeline, and alert policy, paced per kind."""
+        for event in events:
+            if not self._admit(event):
+                continue
+            if self._event_sink is not None:
+                try:
+                    self._event_sink(event)
+                except Exception as exc:  # noqa: BLE001 - a sink must not stop sampling
+                    logger.warning("Hardware event sink raised: %s", exc, exc_info=True)
+            if emit is not None:
+                try:
+                    emit(event)
+                except Exception as exc:  # noqa: BLE001 - as above
+                    logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
+            if self._alert_policy is not None:
+                try:
+                    self._alert_policy.evaluate(event)
+                    if event.kind == EventKind.SETTLED:
+                        self._alert_policy.reset_channel(
+                            event.device_id, event.channel_id
+                        )
+                except Exception as exc:  # noqa: BLE001 - policy must not stop sampling
+                    logger.warning("Hardware alert policy raised: %s", exc, exc_info=True)
+
+    def _admit(self, event: HardwareEvent) -> bool:
+        """Return whether this event clears the per-kind-per-channel rate floor."""
+        now = time.monotonic()
+        key = f"{event.kind}:{event.device_id}.{event.channel_id}"
+        previous = self._last_emitted.get(key)
+        if previous is not None and now - previous < MIN_EVENT_INTERVAL_S:
+            self._paced_out += 1
+            return False
+        self._last_emitted[key] = now
+        return True
+
+    def ring(self, channel_id: str) -> ReadingRing | None:
+        """Return the per-channel ring, or None for an unknown channel."""
+        return self._rings.get(channel_id)
+
+    @property
+    def health(self) -> dict[str, Any]:
+        """Return batch sampling health metrics."""
+        max_rate = max((ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0)
+        started = self._started_monotonic
+        elapsed = (time.monotonic() - started) if started is not None else 0.0
+        observed = (self._samples / elapsed) if elapsed > 0 else 0.0
+        total_dropped = sum(r.dropped for r in self._rings.values())
+        return {
+            "source_id": self.source_id,
+            "device_id": self._context.device_id,
+            "channels": len(self._channels),
+            "declared_hz": float(max_rate),
+            "observed_hz": observed,
+            "rate_ratio": (observed / max_rate) if max_rate > 0 else 0.0,
+            "samples": self._samples,
+            "skipped_slots": self._skipped_slots,
+            "dropped": total_dropped,
+            "events_paced_out": self._paced_out,
+        }
+
+
+def build_batch_coordinators(
+    registry: Any,
+    *,
+    ring_capacity: int = DEFAULT_RING_CAPACITY,
+    event_sink: EventSink | None = None,
+    reading_store: Any = None,
+    alert_policy: Any = None,
+) -> tuple[BatchStreamCoordinator, ...]:
+    """Return one coordinator per device whose transport supports BatchTransport.
+
+    Devices whose transport does not satisfy ``BatchTransport`` are skipped;
+    their channels are handled by individual ``HardwareStreamSource`` instances
+    from ``build_stream_sources``.
+    """
+    from leapflow.hardware.transport import BatchTransport
+
+    coordinators: list[BatchStreamCoordinator] = []
+    for context in registry.contexts():
+        channels = tuple(
+            ch for ch in context.streaming_channels
+            if ch.is_readable and not ch.is_media
+        )
+        if not channels:
+            continue
+        # Check whether the transport declaration supports batch.
+        # We inspect the transport kind; the actual isinstance check against the
+        # live transport is deferred to read_batch at runtime, but the coordinator
+        # is only created for devices whose transport advertises BatchTransport.
+        transport_kind = context.transport.kind
+        try:
+            from leapflow.hardware.transports import build_transport
+
+            proto = build_transport(transport_kind, context.transport.config)
+            if not isinstance(proto, BatchTransport):
+                continue
+        except Exception:  # noqa: BLE001 - skip devices we cannot probe
+            continue
+        coordinators.append(
+            BatchStreamCoordinator(
+                registry,
+                context,
+                channels,
+                ring_capacity=ring_capacity,
+                event_sink=event_sink,
+                reading_store=reading_store,
+                alert_policy=alert_policy,
+            )
+        )
+    return tuple(coordinators)
+
+
 def build_stream_sources(
     registry: Any,
     *,
@@ -632,6 +901,7 @@ def build_stream_sources(
     event_sink: EventSink | None = None,
     reading_store: Any = None,
     alert_policy: Any = None,
+    batch_device_ids: frozenset[str] = frozenset(),
 ) -> tuple[HardwareStreamSource, ...]:
     """Return one source per streaming channel across all admitted devices.
 
@@ -643,9 +913,15 @@ def build_stream_sources(
     because this is the loop that would otherwise push a few hundred kilobytes per
     sample into the raw NDJSON segment and try to average frames into a downsample
     window. Previews are pulled on demand by whoever is watching, never sampled.
+
+    Channels belonging to devices in *batch_device_ids* are skipped: they are
+    handled by a ``BatchStreamCoordinator`` instead, and building individual
+    sources for them would double-sample the device.
     """
     sources: list[HardwareStreamSource] = []
     for context in registry.contexts():
+        if context.device_id in batch_device_ids:
+            continue
         for channel in context.streaming_channels:
             if not channel.is_readable or channel.is_media:
                 continue
@@ -688,6 +964,7 @@ def _bounds(envelope: Any) -> str:
 
 
 __all__ = [
+    "BatchStreamCoordinator",
     "DEFAULT_RING_CAPACITY",
     "MIN_EVENT_INTERVAL_S",
     "EventKind",
@@ -695,5 +972,6 @@ __all__ = [
     "HardwareEventDetector",
     "HardwareStreamSource",
     "ReadingRing",
+    "build_batch_coordinators",
     "build_stream_sources",
 ]

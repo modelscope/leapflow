@@ -1704,11 +1704,33 @@ async def _handle_teach(
         if ctx.session and ctx.session.mode == SessionMode.LEARNING:
             console.warning("Already in teaching mode. Say '/teach stop' to end.")
             return True
-        goal = ""
+
+        # Parse --mode for physical demonstration modes.
+        raw_args = ""
         if line.startswith("teach start "):
-            goal = line[len("teach start "):]
+            raw_args = line[len("teach start "):]
         elif line.startswith("教学开始 "):
-            goal = line[len("教学开始 "):]
+            raw_args = line[len("教学开始 "):]
+
+        from leapflow.cli.commands.slash_handlers import _parse_teach_start_args
+
+        parsed = _parse_teach_start_args(raw_args)
+        mode = parsed.get("mode", "gui")
+
+        if mode in ("teleop", "kinesthetic"):
+            from leapflow.cli.commands.slash_handlers import (
+                _start_physical_teach,
+            )
+
+            result = await _start_physical_teach(ctx, mode, parsed)
+            if result.get("ok"):
+                console.success(result["message"])
+            else:
+                console.error(result.get("message", "Failed to start physical teach."))
+            return True
+
+        # Default GUI path — unchanged.
+        goal = parsed.get("goal", "")
         try:
             session = await ctx.session.enter_learning(goal=goal)
             console.success(f"Teaching started — session {session.session_id}")
@@ -1723,6 +1745,14 @@ async def _handle_teach(
         return True
 
     if line == "teach stop":
+        # Check for an active physical session first.
+        from leapflow.cli.commands.slash_handlers import _stop_physical_teach
+
+        physical_result = await _stop_physical_teach(ctx)
+        if physical_result is not None:
+            console.success(physical_result["message"])
+            return True
+
         if not ctx.session or ctx.session.mode != SessionMode.LEARNING:
             if learning:
                 ctx.imitation.end_control_input()

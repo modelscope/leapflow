@@ -58,7 +58,9 @@ class YamlContextProvider:
             if payload is None:
                 continue
             context = HardwareContext.from_mapping(payload)
-            contexts.append(self._apply_verification(context))
+            context = self._apply_verification(context)
+            context = _apply_control_bindings(context)
+            contexts.append(context)
         return tuple(contexts)
 
     def _apply_verification(self, context: HardwareContext) -> HardwareContext:
@@ -118,6 +120,62 @@ def _load_verified(path: Any) -> dict[str, str]:
 def build_provider(config: Mapping[str, Any] | None = None) -> YamlContextProvider:
     """Factory registered in the provider table."""
     return YamlContextProvider(config)
+
+
+def _apply_control_bindings(context: HardwareContext) -> HardwareContext:
+    """Resolve control_bindings into a TransportRef when the YAML declares them.
+
+    Rules:
+    - If no ``control_bindings`` section, return *context* unchanged.
+    - If the YAML already declares an explicit ``transport.kind``, the bindings
+      are kept as supplementary metadata but do **not** override the transport.
+    - Otherwise the resolver picks the best available binding and sets it as
+      the context's transport.
+    """
+    if not context.control_bindings:
+        return context
+
+    # Explicit transport already declared — nothing to override.
+    if context.transport.kind:
+        logger.debug(
+            "control_bindings: device %s already has transport.kind=%r; "
+            "bindings kept as metadata only",
+            context.device_id,
+            context.transport.kind,
+        )
+        return context
+
+    # Function-local import to avoid a module-level circular dependency.
+    from leapflow.hardware.control_binding_resolver import ControlBindingResolver
+
+    resolver = ControlBindingResolver()
+    bindings = resolver.parse(context.control_bindings)
+    if not bindings:
+        return context
+
+    resolved = resolver.resolve(bindings)
+    if resolved is None:
+        return context
+
+    if not resolved.available:
+        logger.info(
+            "control_bindings: best binding %s for device %s resolved to "
+            "unavailable transport (%s); transport left empty",
+            resolved.binding.binding_type,
+            context.device_id,
+            resolved.reason,
+        )
+        return context
+
+    from dataclasses import replace
+
+    logger.debug(
+        "control_bindings: device %s transport set to %s from %s binding",
+        context.device_id,
+        resolved.transport_ref.kind,
+        resolved.binding.binding_type,
+    )
+    return replace(context, transport=resolved.transport_ref)
 
 
 __all__ = ["YamlContextProvider", "build_provider"]

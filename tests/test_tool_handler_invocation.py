@@ -146,7 +146,7 @@ async def test_engine_executes_plugin_list_with_empty_native_arguments() -> None
     )
 
     assert result["ok"] is True
-    assert result["capability_report"]["registry"]["tool_count"] >= 1
+    assert result["plugin_count"] >= 1
     assert any(plugin["plugin_id"] == "self_management" for plugin in result["plugins"])
 
 

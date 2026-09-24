@@ -249,171 +249,10 @@ class SelfManagementPlugin:
                 "gateway_adapters": gateway_adapters,
                 "llm_providers": llm_providers,
                 "total_count": len(plugins_info) + len(gateway_adapters) + len(llm_providers),
-                "capability_report": self._build_capability_report(
-                    reg,
-                    scoped,
-                    plugins_info,
-                    gateway_adapters,
-                    llm_providers,
-                ),
             }
         except (RuntimeError, AttributeError) as exc:
             logger.warning("plugin_list failed: %s", exc, exc_info=True)
             return {"ok": False, "error": f"plugin_list failed: {exc}"}
-
-    def _build_capability_report(
-        self,
-        reg: Any,
-        scoped: Any,
-        plugins_info: list[dict[str, Any]],
-        gateway_adapters: list[dict[str, Any]],
-        llm_providers: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Build a live, evidence-backed capability report for self-questions."""
-        tool_categories: dict[str, dict[str, Any]] = {}
-        self_management_tools: list[str] = []
-        mutation_tools: list[str] = []
-        approval_required_tools: list[str] = []
-        read_only_tools: list[str] = []
-
-        for tool in reg.all_metadata:
-            metadata = dict(tool.x_leapflow or {})
-            category = str(metadata.get("category") or "general")
-            bucket = tool_categories.setdefault(
-                category,
-                {
-                    "tool_count": 0,
-                    "tools": [],
-                    "approval_required_count": 0,
-                    "mutating_count": 0,
-                },
-            )
-            bucket["tool_count"] += 1
-            bucket["tools"].append(tool.name)
-            if bool(tool.mutates_state):
-                mutation_tools.append(tool.name)
-                bucket["mutating_count"] += 1
-            else:
-                read_only_tools.append(tool.name)
-            if metadata.get("requires_approval") is True:
-                approval_required_tools.append(tool.name)
-                bucket["approval_required_count"] += 1
-            if tool.name.startswith("plugin_") or tool.name == "assess_compatibility":
-                self_management_tools.append(tool.name)
-
-        for bucket in tool_categories.values():
-            bucket["tools"] = sorted(bucket["tools"])
-
-        profile_layout = self._profile_layout_or_none()
-        install_dir = self._safe_install_dir()
-        dependency_state = {
-            "approval_gate_bound": self._plugin_approval_gate is not None,
-            "llm_provider_bound": self._llm_provider is not None,
-            "plugin_generation_enabled": self._plugin_generation_enabled,
-            "plugin_install_dir": install_dir,
-            "marketplace_configured": self._marketplace_client is not None,
-            "trusted_marketplace_pubkeys": len(self._trusted_pubkeys),
-            "proposal_store_available": self._capability_lifecycle_store is not None,
-            "version_store_available": (
-                self._plugin_version_store is not None or profile_layout is not None
-            ),
-            "capability_plan_store_available": (
-                self._capability_plan_store is not None or profile_layout is not None
-            ),
-        }
-        limitations = self._capability_limitations(dependency_state)
-
-        return {
-            "source": "live_runtime_registry",
-            "registry": {
-                "version": reg.version,
-                "plugin_count": len(plugins_info),
-                "tool_count": len(reg.tool_handlers),
-                "fiber_count": len(scoped.fibers),
-                "categories": sorted(tool_categories),
-                "capability_conflicts": [
-                    {
-                        "tool_name": c.tool_name,
-                        "kept_plugin": c.kept_plugin,
-                        "rejected_plugin": c.rejected_plugin,
-                    }
-                    for c in getattr(reg, "conflicts", [])
-                ],
-            },
-            "plugins_supported": {
-                "supported": "self_management" in reg.plugins,
-                "evidence_tools": sorted(self_management_tools),
-                "profile_installs": bool(install_dir),
-                "hot_reload": "plugin_reload" in self_management_tools,
-                "versioning": "plugin_versions" in self_management_tools
-                and "plugin_rollback" in self_management_tools,
-                "compatibility_assessment": "assess_compatibility" in self_management_tools,
-            },
-            "self_evolution": {
-                "proposal_flow": "plugin_propose" in self_management_tools,
-                "generation_tool": "plugin_generate" in self_management_tools,
-                "generation_ready": self._plugin_generation_enabled
-                and self._llm_provider is not None,
-                "install_tool": "plugin_install" in self_management_tools,
-                "rollback_tool": "plugin_rollback" in self_management_tools,
-                "behavior_test_gate": True,
-            },
-            "runtime_dependencies": dependency_state,
-            "tool_categories": dict(sorted(tool_categories.items())),
-            "read_only_tool_count": len(read_only_tools),
-            "mutation_tool_count": len(mutation_tools),
-            "approval_required_tools": sorted(approval_required_tools),
-            "gateway_adapter_count": len(gateway_adapters),
-            "llm_provider_count": len(llm_providers),
-            "limitations": limitations,
-            "answering_guidance": [
-                "Use this live report as the evidence source for questions about LeapFlow capabilities.",
-                (
-                    "State configuration-dependent capabilities as available only when "
-                    "their dependency flags are ready."
-                ),
-                "If this report is unavailable, say that live capability verification failed instead of guessing.",
-            ],
-        }
-
-    def _profile_layout_or_none(self) -> Any:
-        try:
-            from leapflow.config import get_settings
-
-            return getattr(get_settings(), "profile_layout", None)
-        except (RuntimeError, AttributeError, ImportError):
-            return None
-
-    def _safe_install_dir(self) -> str:
-        try:
-            return str(self._resolve_install_dir())
-        except (RuntimeError, AttributeError, ImportError):
-            return ""
-
-    @staticmethod
-    def _capability_limitations(dependency_state: dict[str, Any]) -> list[str]:
-        limitations: list[str] = []
-        if not dependency_state["approval_gate_bound"]:
-            limitations.append("Mutation tools fail closed until plugin_approval_gate is bound.")
-        if not dependency_state["llm_provider_bound"]:
-            limitations.append("plugin_generate cannot run until an LLM provider is bound.")
-        if not dependency_state["plugin_generation_enabled"]:
-            limitations.append("plugin_generate is disabled by configuration.")
-        if not dependency_state["marketplace_configured"]:
-            limitations.append("Marketplace installs require a configured marketplace client.")
-        if not dependency_state["proposal_store_available"]:
-            limitations.append(
-                "Plugin proposals require the daemon-injected evolution lifecycle store."
-            )
-        if not dependency_state["version_store_available"]:
-            limitations.append(
-                "Plugin versioning requires a profile layout or injected version store."
-            )
-        if not dependency_state["capability_plan_store_available"]:
-            limitations.append(
-                "Adaptive capability plan history requires a profile layout or injected plan store."
-            )
-        return limitations
 
     async def _plugin_status_handler(self, plugin_id: str, **kwargs: Any) -> Dict[str, Any]:
         """Detailed information about a specific plugin."""
@@ -2556,9 +2395,10 @@ class SelfManagementPlugin:
             ToolMetadata(
                 name="plugin_list",
                 description=(
-                    "List the live plugin registry and cross-subsystem capability evidence. "
-                    "Use this before answering questions about whether LeapFlow supports plugins, "
-                    "self-evolution, plugin installation, hot reload, versioning, or other runtime capabilities."
+                    "List the live plugin registry across Tool/Gateway/LLM subsystems for plugin "
+                    "management: which plugins are loaded, their category and fiber lifecycle state. "
+                    "For questions about LeapFlow's own capabilities or whether it supports X, use "
+                    "self_describe instead."
                 ),
                 parameters_schema={
                     "type": "object",
@@ -2571,7 +2411,7 @@ class SelfManagementPlugin:
                     "risk_level": "read_only",
                     "schema_cost": "low",
                     "requires_approval": False,
-                    "summary": "list live plugins and self capability evidence",
+                    "summary": "list live plugins across Tool/Gateway/LLM subsystems",
                 },
                 provides_capabilities=("plugin.list",),
             ),

@@ -391,6 +391,410 @@ class HardwareTools:
             "status": status.to_dict(),
         }
 
+    # ── Batch write ──
+
+    async def batch_actuate(self, params: dict) -> dict:
+        """Write multiple ACTUATE channels in one atomic bus transaction.
+
+        Parameters:
+        - device_id (str, required): Target device identifier
+        - commands (list[dict], required): List of {channel_id: str, value: number}
+        - dry_run (bool, optional): Preview mode, default false
+        - verify (bool, optional): Run post-write verification, default false
+
+        This tool is the primary interface for policy-driven control: a VLA
+        model produces a full joint-space action vector, and this tool writes
+        all joints atomically rather than one at a time.
+
+        Uses BatchTransport.write_batch() when available, falling back to
+        sequential writes otherwise.  Each channel in the command list must
+        be an ACTUATE-effect channel on the target device.
+
+        Approval: follows the same approval chain as hw_actuate -- each
+        channel's trust level and reversibility are checked.  The batch
+        is approved as a unit: if any channel requires approval, the
+        entire batch requires approval.
+        """
+        from leapflow.hardware.transport import BatchTransport, BatchWriteOutcome
+
+        device_id = str(params.get("device_id") or "")
+        commands = params.get("commands") or []
+        dry_run = bool(params.get("dry_run"))
+        verify = bool(params.get("verify"))
+
+        context = self._registry.context(device_id)
+        if context is None:
+            return self._unknown_device(device_id)
+
+        if self._requires_describe(device_id):
+            return self._refusal(
+                device_id,
+                "",
+                "describe_required",
+                f"Call hw_describe(device_id={device_id!r}) before commanding it. Writing to "
+                "channels whose envelope you have not read risks out-of-range commands; the "
+                "describe result carries the allowed range, rate, and reversibility.",
+            )
+
+        if not commands:
+            return self._refusal(
+                device_id, "", "empty_commands", "No commands provided in the batch."
+            )
+
+        # ── Validate every channel ──
+        resolved: list[tuple[Channel, Any]] = []  # (channel, value)
+        for idx, cmd in enumerate(commands):
+            channel_id = str(cmd.get("channel_id") or "")
+            value = cmd.get("value")
+            channel = context.channel(channel_id)
+            if channel is None:
+                known = ", ".join(c.channel_id for c in context.channels) or "(none)"
+                return self._refusal(
+                    device_id,
+                    channel_id,
+                    "unknown_channel",
+                    f"Command [{idx}]: device {device_id!r} has no channel "
+                    f"{channel_id!r}. Declared: {known}.",
+                )
+            if not channel.is_writable:
+                return self._refusal(
+                    device_id,
+                    channel_id,
+                    "channel_not_writable",
+                    f"Command [{idx}]: channel {channel_id!r} on {device_id!r} is read-only "
+                    "in the admitted declaration.",
+                )
+            if channel.effect != HardwareEffect.ACTUATE.value:
+                return self._refusal(
+                    device_id,
+                    channel_id,
+                    "effect_class_mismatch",
+                    f"Command [{idx}]: channel {channel_id!r} declares effect "
+                    f"{channel.effect!r}; hw_batch_actuate requires effect=actuate.",
+                )
+
+            envelope = channel.envelope
+            in_envelope = envelope.contains(value)
+            if not in_envelope:
+                return self._refusal(
+                    device_id,
+                    channel_id,
+                    "value_out_of_envelope",
+                    f"Command [{idx}]: value {value!r} lies outside the declared "
+                    f"envelope for {device_id}.{channel_id}. Call hw_describe to "
+                    "read the allowed range.",
+                )
+
+            wait_s = self._rate_wait_s(device_id, channel, value)
+            if wait_s > 0.0:
+                return {
+                    "ok": False,
+                    "device_id": device_id,
+                    "channel_id": channel_id,
+                    "error": (
+                        f"Command [{idx}]: commanding {device_id}.{channel_id} to {value} now "
+                        f"would exceed its declared maximum rate of "
+                        f"{envelope.max_rate:g} {channel.unit or 'units'}/s. Wait about "
+                        f"{wait_s:.2f}s and issue the same command again, or command a "
+                        "smaller step."
+                    ),
+                    "failure_code": "rate_limited",
+                    "retry_after_s": round(wait_s, 3),
+                    "side_effect_state": SIDE_EFFECT_NONE,
+                }
+            resolved.append((channel, value))
+
+        # ── Reachability (once for the device) ──
+        unreachable = await self._unreachable(device_id, resolved[0][0])
+        if unreachable is not None:
+            return unreachable
+
+        # ── Interlocks (union of all channels) ──
+        all_interlocks_failed: list[str] = []
+        for channel, _value in resolved:
+            failed = await self._failed_interlocks(context, channel)
+            for name in failed:
+                if name not in all_interlocks_failed:
+                    all_interlocks_failed.append(name)
+
+        # ── Build batch approval descriptor ──
+        # Use the first channel for the primary descriptor; metadata carries
+        # the full command list so the approval UI can render all of them.
+        any_irreversible = any(
+            not ch.envelope.reversible for ch, _ in resolved
+        )
+        channel_summaries = [
+            {
+                "channel_id": ch.channel_id,
+                "quantity": ch.quantity,
+                "value": v,
+                "unit": ch.unit,
+                "envelope_band": self._grant_band(ch.envelope, v),
+                "reversible": ch.envelope.reversible,
+            }
+            for ch, v in resolved
+        ]
+        descriptor = ActionDescriptor.device(
+            kind=ActionKind.DEVICE_ACTUATE.value,
+            device_id=device_id,
+            channel_id=resolved[0][0].channel_id,
+            quantity="batch",
+            value=f"{len(resolved)} channels",
+            unit="",
+            envelope_band="batch",
+            location=context.location,
+            reversible=not any_irreversible,
+            metadata={
+                "batch": True,
+                "commands": channel_summaries,
+                "interlocks_satisfied": not all_interlocks_failed,
+                "interlocks_failed": list(all_interlocks_failed),
+                "session_id": self._session_id,
+            },
+        )
+
+        if dry_run:
+            ok = not all_interlocks_failed
+            return {
+                "ok": ok,
+                "device_id": device_id,
+                "preview": True,
+                "side_effect_state": SIDE_EFFECT_NONE,
+                "plan": {
+                    "summary": descriptor.summary,
+                    "detail": descriptor.detail,
+                    "resource": descriptor.resource,
+                    "batch_size": len(resolved),
+                    "commands": channel_summaries,
+                    "any_irreversible": any_irreversible,
+                    "requires_approval": True,
+                    "interlocks_satisfied": not all_interlocks_failed,
+                    "interlocks_failed": list(all_interlocks_failed),
+                },
+                **({
+                    "failure_code": "interlocks_unsatisfied",
+                    "error": (
+                        f"Interlocks {all_interlocks_failed} are not satisfied; "
+                        "the real command would be refused."
+                    ),
+                } if all_interlocks_failed else {
+                    "next_step": (
+                        "Dry run only: nothing was commanded. Re-issue the same call "
+                        "without dry_run to execute it, which will require approval."
+                    ),
+                }),
+            }
+
+        if all_interlocks_failed:
+            # Use the first channel for the readiness failure, listing all failed interlocks.
+            return self._not_ready(context, resolved[0][0], tuple(all_interlocks_failed))
+
+        allowed, denial = await self._evaluate(descriptor)
+        if not allowed:
+            return self._refusal(device_id, "", "approval_denied", denial)
+
+        # ── Execute ──
+        try:
+            async with self._registry.device_io(device_id):
+                transport = await self._registry.transport(device_id)
+                if isinstance(transport, BatchTransport):
+                    command_tuples = tuple(
+                        (ch.channel_id, v) for ch, v in resolved
+                    )
+                    batch_outcome = await transport.write_batch(command_tuples)
+                else:
+                    logger.warning(
+                        "Transport for %s does not support BatchTransport; "
+                        "falling back to sequential writes (non-atomic)",
+                        device_id,
+                    )
+                    outcomes: list[WriteOutcome] = []
+                    for ch, v in resolved:
+                        outcome = await transport.write(ch.channel_id, v)
+                        outcomes.append(outcome)
+                    # Build a synthetic BatchWriteOutcome from sequential results.
+                    all_ok = all(o.ok for o in outcomes)
+                    worst_effect = self._worst_side_effect(
+                        [o.side_effect_state for o in outcomes]
+                    )
+                    batch_outcome = BatchWriteOutcome(
+                        ok=all_ok,
+                        outcomes=tuple(outcomes),
+                        side_effect_state=worst_effect,
+                    )
+        except TransportError as exc:
+            if self._trust_gate is not None:
+                for ch, _ in resolved:
+                    self._trust_gate.record_failure(device_id, ch.channel_id)
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "error": str(exc),
+                "failure_code": exc.failure_code,
+                "side_effect_state": SIDE_EFFECT_NONE,
+            }
+        except Exception as exc:  # noqa: BLE001 - see _write for rationale
+            logger.error(
+                "Hardware transport raised a non-contract exception on batch write "
+                "to %s: %s",
+                device_id,
+                exc,
+                exc_info=True,
+            )
+            if self._trust_gate is not None:
+                for ch, _ in resolved:
+                    self._trust_gate.record_failure(device_id, ch.channel_id, hard=True)
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "error": (
+                    f"The device driver failed unexpectedly ({type(exc).__name__}). "
+                    "Whether the commands reached the device is unknown; verify each "
+                    "channel before attempting anything similar."
+                ),
+                "failure_code": "driver_contract_violation",
+                "side_effect_state": SIDE_EFFECT_UNKNOWN,
+                "effect_uncertain": True,
+            }
+
+        # ── Post-write bookkeeping per channel ──
+        per_channel_results: list[dict] = []
+        for i, (channel, value) in enumerate(resolved):
+            outcome = batch_outcome.outcomes[i] if i < len(batch_outcome.outcomes) else None
+            ch_ok = outcome.ok if outcome else False
+
+            self._audit.record(
+                action="batch_write",
+                device=device_id,
+                channel=channel.channel_id,
+                value=value,
+                outcome="ok" if ch_ok else (outcome.failure_code if outcome else "error"),
+                identity=self._session_id,
+            )
+
+            if self._trust_gate is not None:
+                if ch_ok:
+                    self._trust_gate.record_success(device_id, channel.channel_id)
+                else:
+                    self._trust_gate.record_failure(device_id, channel.channel_id)
+
+            if ch_ok:
+                numeric = as_numeric(value)
+                if numeric is not None:
+                    self._registry.record_command(device_id, channel.channel_id, numeric)
+                if outcome:
+                    self._learn_from_write(device_id, channel, value, "", outcome)
+            else:
+                recorder = self._registry.outcome_recorder
+                if recorder is not None:
+                    recorder.drop_pending(device_id, channel.channel_id)
+
+            ch_result: dict = {
+                "channel_id": channel.channel_id,
+                "ok": ch_ok,
+            }
+            if outcome:
+                ch_result["side_effect_state"] = outcome.side_effect_state
+                if outcome.readback is not None:
+                    ch_result["readback"] = outcome.readback.to_dict()
+                if not ch_ok and outcome.error:
+                    ch_result["error"] = outcome.error
+            per_channel_results.append(ch_result)
+
+        # ── Optional verification ──
+        if verify and batch_outcome.ok:
+            verification_results = await self._batch_verify(device_id, resolved)
+            if verification_results:
+                for i, vr in enumerate(verification_results):
+                    if i < len(per_channel_results) and vr is not None:
+                        per_channel_results[i]["verification"] = vr
+
+        payload: dict = {
+            "ok": batch_outcome.ok,
+            "device_id": device_id,
+            "side_effect_state": batch_outcome.side_effect_state,
+            "batch_size": len(resolved),
+            "channels": per_channel_results,
+        }
+        if not batch_outcome.ok:
+            failed_channels = [
+                r["channel_id"] for r in per_channel_results if not r.get("ok")
+            ]
+            payload["failed_channels"] = failed_channels
+            if any(not ch.envelope.reversible for ch, _ in resolved):
+                payload["effect_uncertain"] = True
+                payload["next_step"] = (
+                    "Some commands in the batch failed but may have reached the device. "
+                    "Read back each channel before attempting a retry; the batch contains "
+                    "irreversible channels."
+                )
+        return payload
+
+    async def _batch_verify(
+        self,
+        device_id: str,
+        resolved: list[tuple[Channel, Any]],
+    ) -> list[dict | None]:
+        """Run post-write verification for each channel in a batch.
+
+        Returns a list parallel to *resolved*, with verification result dicts
+        or None when verification is not applicable or not available.
+        Uses tolerance-based comparison for floating-point values to avoid
+        false negatives on robot joint positions.
+        """
+        from leapflow.hardware.context import as_numeric
+
+        results: list[dict | None] = []
+        for channel, value in resolved:
+            try:
+                transport = await self._registry.transport(device_id)
+                reading = await transport.read(channel.channel_id)
+                commanded_num = as_numeric(value)
+                readback_num = as_numeric(reading.value)
+                if commanded_num is not None and readback_num is not None:
+                    deviation = abs(readback_num - commanded_num)
+                    # Use envelope tolerance or default 1e-3.
+                    tol = getattr(channel.envelope, "tolerance", 0.0) or 1e-3
+                    match = deviation <= tol
+                else:
+                    deviation = None
+                    match = reading.value == value
+                results.append({
+                    "channel_id": channel.channel_id,
+                    "commanded": value,
+                    "readback": reading.value,
+                    "match": match,
+                    "deviation": deviation,
+                })
+            except Exception as exc:  # noqa: BLE001 - verification must not fail the batch
+                logger.warning(
+                    "Post-write verification failed for %s.%s: %s",
+                    device_id,
+                    channel.channel_id,
+                    exc,
+                    exc_info=True,
+                )
+                results.append(None)
+        return results
+
+    @staticmethod
+    def _worst_side_effect(states: list[str]) -> str:
+        """Return the worst-case side-effect state across a list of outcomes.
+
+        Precedence: UNKNOWN > PARTIAL > COMMITTED > NONE.
+        """
+        _PRECEDENCE = {
+            SIDE_EFFECT_NONE: 0,
+            SIDE_EFFECT_COMMITTED: 1,
+            SIDE_EFFECT_PARTIAL: 2,
+            SIDE_EFFECT_UNKNOWN: 3,
+        }
+        worst = SIDE_EFFECT_NONE
+        for s in states:
+            if _PRECEDENCE.get(s, 3) > _PRECEDENCE.get(worst, 0):
+                worst = s
+        return worst
+
     # ── Write path ──
 
     async def _write(self, tool_name: str, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -1194,7 +1598,7 @@ def _tool_for_effect(effect: str) -> str:
 
 
 def build_hardware_tools(tools: HardwareTools) -> list[ToolMetadata]:
-    """Return the eight tool definitions bound to *tools*."""
+    """Return the nine tool definitions bound to *tools*."""
     return [
         ToolMetadata(
             name="hw_list",
@@ -1311,6 +1715,52 @@ def build_hardware_tools(tools: HardwareTools) -> list[ToolMetadata]:
                 "schema_cost": "low",
             },
             provides_capabilities=("hw.estop",),
+        ),
+        ToolMetadata(
+            name="hw_batch_actuate",
+            description=(
+                "Write multiple actuator channels in one atomic transaction. "
+                "Used for coordinated multi-joint control where all positions "
+                "must be commanded simultaneously (e.g. robot arm joint-space control)."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "device_id": {
+                        "type": "string",
+                        "description": "Target device identifier",
+                    },
+                    "commands": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "channel_id": {"type": "string"},
+                                "value": {"type": "number"},
+                            },
+                            "required": ["channel_id", "value"],
+                        },
+                        "description": "List of channel commands to write atomically",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Preview mode: validate without executing",
+                    },
+                    "verify": {
+                        "type": "boolean",
+                        "description": "Run post-write verification",
+                    },
+                },
+                "required": ["device_id", "commands"],
+            },
+            handler=tools.batch_actuate,
+            x_leapflow={
+                "category": "hardware",
+                "risk_level": "high",
+                "mutates_state": True,
+                "execution_policy": "serial",
+                "provides_capabilities": ["hardware_batch_control"],
+            },
         ),
     ]
 
