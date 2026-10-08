@@ -1,33 +1,40 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Unified self-awareness plugin — faceted agent self-cognition surface.
+"""Unified self-awareness plugin — the agent's single self-cognition surface.
 
-Aggregates registry, daemon, engine, and build_info into two read-only tools:
+This is the one place the agent answers questions about *itself* — its identity,
+capabilities, runtime state, evolution readiness, or platform connections — from
+live runtime evidence rather than from source code, documentation, or memory.
+
+Two read-only tools:
 
 * ``self_describe(facet=...)`` — structured introspection by facet
 * ``runtime_snapshot()`` — lightweight ~150-token flat dict for quick orientation
 
-All data sources are injected via ``bind_runtime``; missing dependencies degrade
-gracefully per facet rather than raising.
+Data sources are resolved by *pull*, not by push-DI, so the surface cannot go
+silently dark when a bootstrap wiring step is forgotten:
+
+* capabilities  → the process-global tool/scoped registries (``get_registry`` /
+  ``get_scoped_registry``) — the very evidence source ``plugin_list`` uses.
+* identity      → this process's captured ``BuildInfo`` + live ``Settings``.
+* runtime / evolution / platform → the *session-scoped* daemon ``status`` snapshot,
+  obtained through an injected ``runtime_status_provider`` keyed by the active
+  turn's ``session_id``. This honours the "session engine is the only reporting
+  source" rule: the provider resolves the caller's own session, never a template
+  engine (whose figures read zero). Absent that provider (in-process CLI), these
+  facets degrade gracefully instead of reporting stale zeros.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
-import weakref
 from collections import Counter
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from leapflow.plugins.protocol import ToolMetadata
 
-if TYPE_CHECKING:
-    pass
-
 logger = logging.getLogger(__name__)
-
-# ── Cache configuration ──────────────────────────────────────────────────────
-
-_DAEMON_CACHE_TTL_S = 30.0
 
 # ── Facet enum values ────────────────────────────────────────────────────────
 
@@ -65,31 +72,54 @@ def _format_context(used: int, total: int) -> str:
     return f"{_human(used)}/{_human(total)} ({pct}%)"
 
 
+def _settings_or_none() -> Any:
+    """Return live Settings, or None during early bootstrap."""
+    try:
+        from leapflow.config import get_settings
+
+        return get_settings()
+    except (ImportError, AttributeError, RuntimeError):
+        return None
+
+
+def _cache_hit_rate_str(value: Any) -> str:
+    """Render a numeric cache hit rate as a percentage string, else 'unknown'."""
+    if isinstance(value, (int, float)) and value >= 0:
+        return f"{float(value):.1f}%"
+    return "unknown"
+
+
 # ── Plugin class ─────────────────────────────────────────────────────────────
 
 
 class SelfAwarenessPlugin:
     """Unified self-cognition surface for the agent.
 
-    Facade plugin that reads live runtime state from four injected sources
-    (registry, daemon_client, engine, build_info) and exposes it through
-    two read-only tools. Registry version gating and daemon TTL caching keep
-    data current without hot-path cost.
+    Facade plugin that resolves live runtime state by pull (global registries,
+    captured build info, live settings) plus an injected session-scoped status
+    provider, and exposes it through two read-only tools. Registry version
+    gating keeps the capabilities report current without hot-path cost.
     """
 
     def __init__(self) -> None:
-        # Injected dependencies — all optional, degrade per-facet
-        self._daemon_client: Any = None
-        self._registry: Any = None
-        self._engine_ref: weakref.ref | None = None
-        self._build_info: Any = None
+        # Injected: a callable ``(session_id: str) -> dict | Awaitable[dict]``
+        # returning the session-scoped daemon status snapshot. Optional — the
+        # runtime/evolution/platform facets degrade when it is unbound.
+        self._status_provider: Any = None
 
-        # ── Caches ──
+        # Captured once per process, mirroring how the daemon captures its own
+        # build fingerprint at startup, so identity works without any wiring.
+        try:
+            from leapflow.utils.build_info import capture_build_info
+
+            self._build_info: Any = capture_build_info()
+        except Exception:  # noqa: BLE001 - identity must never fail to load
+            logger.debug("self_awareness: build info capture failed", exc_info=True)
+            self._build_info = None
+
+        # ── capabilities cache (rebuilt on registry version change) ──
         self._registry_version: int = -1
         self._capabilities_cache: dict[str, Any] = {}
-
-        self._daemon_cache: dict[str, Any] = {}
-        self._daemon_cache_ts: float = 0.0
 
     # ── Protocol properties ──────────────────────────────────────────────
 
@@ -107,9 +137,13 @@ class SelfAwarenessPlugin:
             ToolMetadata(
                 name="self_describe",
                 description=(
-                    "Introspect LeapFlow's own identity, capabilities, runtime state, "
-                    "evolution metrics, or platform connections. Use facet='all' only "
-                    "when a comprehensive self-check is explicitly requested."
+                    "Answer questions about LeapFlow ITSELF from live runtime evidence — its "
+                    "identity/version/model, what tools and plugins it has, whether it supports "
+                    "plugins/self-evolution/hot-reload, its runtime state, or whether it has any "
+                    "form of self-awareness. Prefer this over reading LeapFlow's own source code. "
+                    "Pick facet=capabilities for 'what can you do / do you support X', "
+                    "identity for version/model, runtime for context/posture, or all for a full "
+                    "self-check when explicitly requested."
                 ),
                 parameters_schema={
                     "type": "object",
@@ -119,9 +153,9 @@ class SelfAwarenessPlugin:
                             "enum": list(_FACETS),
                             "description": (
                                 "Which aspect to inspect: identity (version/model/uptime), "
-                                "capabilities (tools/plugins/trust), runtime (context/posture/"
-                                "disclosure), evolution (performance/proposals), platform "
-                                "(gateway/hardware/env), or all."
+                                "capabilities (tools/plugins/trust/evolution readiness), runtime "
+                                "(context/posture/disclosure), evolution (performance/proposals), "
+                                "platform (gateway/hardware/env), or all."
                             ),
                         },
                     },
@@ -132,6 +166,7 @@ class SelfAwarenessPlugin:
                     "risk_level": "read_only",
                     "schema_cost": "low",
                     "requires_approval": False,
+                    "summary": "introspect LeapFlow's own identity/capabilities/runtime state",
                 },
                 provides_capabilities=("system.self_describe",),
             ),
@@ -149,6 +184,7 @@ class SelfAwarenessPlugin:
                     "risk_level": "read_only",
                     "schema_cost": "low",
                     "requires_approval": False,
+                    "summary": "flat snapshot of live runtime state",
                 },
                 provides_capabilities=("system.runtime_snapshot",),
             ),
@@ -156,106 +192,66 @@ class SelfAwarenessPlugin:
 
     @property
     def dependencies(self) -> list[str]:
-        return ["daemon_client"]
+        return ["runtime_status_provider"]
 
     def bind_runtime(self, **deps: Any) -> None:
         """Receive runtime-injected dependencies.
 
-        Accepts: daemon_client, registry, engine (stored as weak ref), build_info.
+        Accepts ``runtime_status_provider`` — a ``(session_id) -> dict`` callable
+        (sync or async) resolving the session-scoped daemon status snapshot.
         """
-        if "daemon_client" in deps:
-            self._daemon_client = deps["daemon_client"]
-        if "registry" in deps:
-            self._registry = deps["registry"]
-        if "engine" in deps:
-            engine = deps["engine"]
-            if engine is not None:
-                try:
-                    self._engine_ref = weakref.ref(engine)
-                except TypeError:
-                    # Some stub objects cannot be weak-referenced
-                    self._engine_ref = lambda: engine  # type: ignore[assignment]
-            else:
-                self._engine_ref = None
-        if "build_info" in deps:
-            self._build_info = deps["build_info"]
+        if "runtime_status_provider" in deps:
+            self._status_provider = deps["runtime_status_provider"]
 
     # ── Tool handlers ────────────────────────────────────────────────────
 
-    def _handle_self_describe(self, facet: str = "identity", **_: Any) -> dict[str, Any]:
+    async def _handle_self_describe(self, facet: str = "identity", **_: Any) -> dict[str, Any]:
         """Dispatch to facet builders, merging all when facet='all'."""
         if facet not in _FACETS:
             return {"error": f"Unknown facet: {facet!r}. Valid: {', '.join(_FACETS)}"}
+
+        status = await self._resolve_status()
 
         if facet == "all":
             result: dict[str, Any] = {}
             for f in _FACETS:
                 if f == "all":
                     continue
-                result[f] = self._build_facet(f)
+                result[f] = self._build_facet(f, status)
             return result
 
-        return self._build_facet(facet)
+        return self._build_facet(facet, status)
 
-    def _handle_runtime_snapshot(self, **_: Any) -> dict[str, Any]:
+    async def _handle_runtime_snapshot(self, **_: Any) -> dict[str, Any]:
         """Return a lightweight flat dict for quick agent orientation."""
-        engine = self._resolve_engine()
-        daemon = self._get_daemon_cache()
+        status = await self._resolve_status()
+        snapshot = status.get("context_budget_snapshot") if isinstance(status, dict) else None
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
 
-        model = ""
-        context_str = "unknown"
-        posture = "unknown"
-        disclosure = "unknown"
-        turn = 0
-        cache_hit_rate = "unknown"
+        used = int(snapshot.get("total_tokens", status.get("context_used", 0)) or 0)
+        total = int(snapshot.get("context_length", status.get("llm_context_length", 0)) or 0)
+        context_str = _format_context(used, total) if total > 0 else "unknown"
+        posture = str(snapshot.get("context_posture", status.get("context_posture", "")) or "unknown")
+        disclosure = str(snapshot.get("disclosure_level", "") or "unknown")
+        turn = int(status.get("session_turn_count", 0) or 0)
+        cache_hit_rate = _cache_hit_rate_str(status.get("cache_hit_rate"))
 
-        if engine is not None:
-            snapshot = getattr(engine, "context_budget_snapshot", None)
-            if callable(snapshot):
-                snapshot = snapshot()
-            if isinstance(snapshot, dict):
-                used = int(snapshot.get("total_tokens", 0) or 0)
-                total = int(snapshot.get("context_length", 0) or 0)
-                context_str = _format_context(used, total)
-                posture = str(snapshot.get("context_posture", "baseline") or "baseline")
-                disclosure = str(snapshot.get("disclosure_level", "unknown") or "unknown")
-            turn = int(getattr(engine, "_session_turn_count", 0) or 0)
-            # Cache hit rate from usage tracker
-            tracker = getattr(engine, "_usage_tracker", None)
-            if tracker is not None:
-                summary = getattr(tracker, "summary", None)
-                if callable(summary):
-                    s = summary()
-                    rate = getattr(s, "cache_hit_rate", None)
-                    if rate is not None and rate >= 0:
-                        cache_hit_rate = f"{rate:.1f}%"
+        model = str(status.get("model", "") or "")
+        if not model:
+            settings = _settings_or_none()
+            model = str(getattr(settings, "llm_model", "") or "unknown") if settings else "unknown"
 
-        if daemon:
-            model = str(daemon.get("model", "") or "")
-            if not model:
-                model = "unknown"
-        elif engine is not None:
-            settings = getattr(engine, "_settings", None)
-            model = str(getattr(settings, "llm_model", "") or "") if settings else "unknown"
-
-        uptime = "unknown"
-        if daemon:
-            uptime_s = daemon.get("uptime_s")
-            if isinstance(uptime_s, (int, float)) and uptime_s >= 0:
-                uptime = _format_uptime(uptime_s)
-        elif self._build_info is not None:
-            started = getattr(self._build_info, "started_at", 0.0) or 0.0
-            if started > 0:
-                uptime = _format_uptime(time.time() - started)
+        uptime = self._uptime(status)
 
         tools_available = 0
-        if self._registry is not None:
+        reg = self._registry_or_none()
+        if reg is not None:
             try:
-                tools_available = len(self._registry.tool_handlers)
-            except Exception:
-                pass
+                tools_available = len(reg.tool_handlers)
+            except Exception:  # noqa: BLE001 - snapshot is best-effort
+                tools_available = 0
 
-        pending = int(daemon.get("pending_approvals", 0) or 0) if daemon else 0
+        pending = int(status.get("pending_approvals", 0) or 0)
 
         return {
             "model": model,
@@ -271,7 +267,7 @@ class SelfAwarenessPlugin:
 
     # ── Facet builders ───────────────────────────────────────────────────
 
-    def _build_facet(self, facet: str) -> dict[str, Any]:
+    def _build_facet(self, facet: str, status: dict[str, Any]) -> dict[str, Any]:
         builder = {
             "identity": self._facet_identity,
             "capabilities": self._facet_capabilities,
@@ -282,238 +278,229 @@ class SelfAwarenessPlugin:
         if builder is None:
             return {"error": f"No builder for facet: {facet!r}"}
         try:
-            return builder()
-        except Exception as exc:
+            return builder(status)
+        except Exception as exc:  # noqa: BLE001 - a facet fault degrades, never raises
             logger.debug("self_describe facet %s failed: %s", facet, exc, exc_info=True)
             return {"available": False, "reason": f"Facet {facet!r} raised: {exc}"}
 
-    def _facet_identity(self) -> dict[str, Any]:
+    def _facet_identity(self, status: dict[str, Any]) -> dict[str, Any]:
         """Version, build, model, provider, context limit, uptime."""
         result: dict[str, Any] = {"available": True}
 
-        if self._build_info is not None:
-            result["version"] = getattr(self._build_info, "version", "unknown")
-            result["commit"] = getattr(self._build_info, "commit", None) or "unknown"
-            dirty = getattr(self._build_info, "dirty_digest", None)
-            result["dirty"] = dirty is not None and dirty != ""
-        else:
-            result["version"] = "unknown"
-            result["commit"] = "unknown"
-            result["dirty"] = None
+        # Prefer the daemon's authoritative build fingerprint; fall back to the
+        # fingerprint this process captured at import time.
+        build = status.get("build") if isinstance(status.get("build"), dict) else {}
+        bi = self._build_info
+        result["version"] = (
+            build.get("version") or (getattr(bi, "version", None) if bi else None) or "unknown"
+        )
+        commit = build.get("commit") or (getattr(bi, "commit", None) if bi else None)
+        result["commit"] = commit or "unknown"
+        dirty = build.get("dirty_digest")
+        if dirty is None and bi is not None:
+            dirty = getattr(bi, "dirty_digest", None)
+        result["dirty"] = bool(dirty)
 
-        daemon = self._get_daemon_cache()
-        if daemon:
-            result["model"] = daemon.get("model", "unknown")
-            result["context_limit"] = daemon.get("llm_context_length", 0)
-            uptime_s = daemon.get("uptime_s", 0)
-            result["uptime"] = _format_uptime(uptime_s) if isinstance(uptime_s, (int, float)) else "unknown"
-            result["pid"] = daemon.get("pid")
+        if status:
+            result["model"] = status.get("model") or "unknown"
+            result["context_limit"] = status.get("llm_context_length", 0)
+            result["pid"] = status.get("pid") or build.get("pid")
         else:
-            engine = self._resolve_engine()
-            if engine is not None:
-                settings = getattr(engine, "_settings", None)
-                result["model"] = str(getattr(settings, "llm_model", "unknown") or "unknown") if settings else "unknown"
-                result["context_limit"] = int(getattr(settings, "llm_context_length", 0) or 0) if settings else 0
-            else:
-                result["model"] = "unknown"
-                result["context_limit"] = 0
-            if self._build_info is not None:
-                started = getattr(self._build_info, "started_at", 0.0) or 0.0
-                result["uptime"] = _format_uptime(time.time() - started) if started > 0 else "unknown"
-            else:
-                result["uptime"] = "unknown"
+            settings = _settings_or_none()
+            result["model"] = (
+                str(getattr(settings, "llm_model", "") or "unknown") if settings else "unknown"
+            )
+            result["context_limit"] = (
+                int(getattr(settings, "llm_context_length", 0) or 0) if settings else 0
+            )
+            result["pid"] = getattr(bi, "pid", None) if bi else None
 
+        result["uptime"] = self._uptime(status)
         return result
 
-    def _facet_capabilities(self) -> dict[str, Any]:
-        """Tool count by category, plugin count, trust summary, evolution readiness."""
-        if self._registry is None:
-            return {"available": False, "reason": "registry not bound"}
+    def _facet_capabilities(self, _status: dict[str, Any]) -> dict[str, Any]:
+        """Tool/plugin inventory, trust summary, evolution readiness — from the
+        live registry, the same evidence source ``plugin_list`` uses."""
+        reg = self._registry_or_none()
+        if reg is None:
+            return {"available": False, "reason": "tool registry unavailable"}
 
-        # Registry version gate: rebuild only on mismatch
-        current_version = self._registry.version
+        # Registry version gate: rebuild only on mismatch.
+        current_version = reg.version
         if current_version != self._registry_version:
-            self._capabilities_cache = self._build_capabilities_report()
+            self._capabilities_cache = self._build_capabilities_report(reg)
             self._registry_version = current_version
 
-        return {**self._capabilities_cache, "available": True}
+        # Skills are enumerated live (they carry their own index cache) rather
+        # than folded into the version-gated report, so a skill added without a
+        # tool-registry change still shows up.
+        return {**self._capabilities_cache, "skills": self._skill_inventory(), "available": True}
 
-    def _build_capabilities_report(self) -> dict[str, Any]:
-        """Construct capability report from live registry state."""
-        reg = self._registry
+    def _build_capabilities_report(self, reg: Any) -> dict[str, Any]:
+        """Construct the capability report from live registry state."""
         all_meta = reg.all_metadata
         plugins = reg.plugins
 
-        # Tools by category
         category_counts: Counter[str] = Counter()
+        mutating = 0
+        approval_required = 0
         for meta in all_meta:
-            cat = meta.x_leapflow.get("category", "uncategorized") if meta.x_leapflow else "uncategorized"
+            meta_x = meta.x_leapflow or {}
+            cat = str(meta_x.get("category", "uncategorized") or "uncategorized")
             category_counts[cat] += 1
+            if bool(getattr(meta, "mutates_state", False)):
+                mutating += 1
+            if meta_x.get("requires_approval") is True:
+                approval_required += 1
 
-        # Trust summary from plugin metadata (if available via scoped registry)
+        # Trust summary from the scoped registry's fibers, when available.
         trust_summary: dict[str, int] = {}
         try:
             from leapflow.plugins.scoped_registry import get_fiber_registry
 
             fiber_reg = get_fiber_registry()
             if fiber_reg is not None:
-                for pid, fiber in fiber_reg.fibers.items():
+                for _pid, fiber in fiber_reg.fibers.items():
                     level = str(getattr(fiber, "trust_level", "UNKNOWN"))
                     trust_summary[level] = trust_summary.get(level, 0) + 1
         except (ImportError, AttributeError, RuntimeError):
             pass
 
-        # Evolution readiness
+        # Evolution readiness from live settings.
         evolution_ready = False
         try:
             from leapflow.config import get_settings
-            settings = get_settings()
-            evolution_ready = bool(getattr(settings, "evolution_enabled", False))
+
+            evolution_ready = bool(getattr(get_settings(), "evolution_enabled", False))
         except (ImportError, AttributeError, RuntimeError):
             pass
 
         return {
             "tool_count": len(all_meta),
             "tools_by_category": dict(category_counts.most_common()),
+            "mutating_tool_count": mutating,
+            "approval_required_tool_count": approval_required,
             "plugin_count": len(plugins),
             "plugin_ids": sorted(plugins.keys()),
+            "supports_plugins": "self_management" in plugins,
             "trust_summary": trust_summary if trust_summary else {"note": "fiber registry unavailable"},
             "evolution_ready": evolution_ready,
             "conflicts": len(reg.conflicts),
         }
 
-    def _facet_runtime(self) -> dict[str, Any]:
+    def _facet_runtime(self, status: dict[str, Any]) -> dict[str, Any]:
         """Context budget, disclosure level, posture, session turns, cache hit rate."""
-        engine = self._resolve_engine()
-        if engine is None:
-            return {"available": False, "reason": "engine not bound"}
+        if not status:
+            return {"available": False, "reason": "runtime status unavailable (no daemon bound)"}
 
         result: dict[str, Any] = {"available": True}
+        snapshot = status.get("context_budget_snapshot")
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
 
-        # Context budget
-        snapshot = getattr(engine, "context_budget_snapshot", None)
-        if callable(snapshot):
-            snapshot = snapshot()
-        if isinstance(snapshot, dict):
-            used = int(snapshot.get("total_tokens", 0) or 0)
-            total = int(snapshot.get("context_length", 0) or 0)
-            result["context_used"] = used
-            result["context_total"] = total
-            result["context_percentage"] = round(used / total * 100, 1) if total > 0 else 0
-            result["context_formatted"] = _format_context(used, total)
-            result["posture"] = str(snapshot.get("context_posture", "baseline") or "baseline")
-            result["disclosure_level"] = str(snapshot.get("disclosure_level", "unknown") or "unknown")
-        else:
-            result["context_used"] = 0
-            result["context_total"] = 0
-            result["context_formatted"] = "unknown"
-            result["posture"] = "unknown"
-            result["disclosure_level"] = "unknown"
-
-        result["session_turn_count"] = int(getattr(engine, "_session_turn_count", 0) or 0)
-
-        # Cache hit rate
-        tracker = getattr(engine, "_usage_tracker", None)
-        if tracker is not None:
-            summary_fn = getattr(tracker, "summary", None)
-            if callable(summary_fn):
-                s = summary_fn()
-                rate = getattr(s, "cache_hit_rate", None)
-                result["cache_hit_rate"] = f"{rate:.1f}%" if rate is not None and rate >= 0 else "unknown"
-            else:
-                result["cache_hit_rate"] = "unknown"
-        else:
-            result["cache_hit_rate"] = "unknown"
-
+        used = int(snapshot.get("total_tokens", status.get("context_used", 0)) or 0)
+        total = int(snapshot.get("context_length", status.get("llm_context_length", 0)) or 0)
+        result["context_used"] = used
+        result["context_total"] = total
+        result["context_percentage"] = round(used / total * 100, 1) if total > 0 else 0
+        result["context_formatted"] = _format_context(used, total)
+        result["posture"] = str(
+            snapshot.get("context_posture", status.get("context_posture", "baseline")) or "baseline"
+        )
+        result["disclosure_level"] = str(snapshot.get("disclosure_level", "") or "unknown")
+        result["session_turn_count"] = int(status.get("session_turn_count", 0) or 0)
+        result["cache_hit_rate"] = _cache_hit_rate_str(status.get("cache_hit_rate"))
         return result
 
-    def _facet_evolution(self) -> dict[str, Any]:
+    def _facet_evolution(self, status: dict[str, Any]) -> dict[str, Any]:
         """Evolution performance metrics and active proposals count."""
-        daemon = self._get_daemon_cache()
-        if not daemon:
-            if self._daemon_client is None:
-                return {"available": False, "reason": "daemon_client not bound"}
-            return {"available": False, "reason": "daemon status unavailable"}
+        if not status:
+            return {"available": False, "reason": "evolution status unavailable (no daemon bound)"}
+        return {
+            "available": True,
+            "performance": status.get("evolution_performance", {}),
+            "pending_approvals": int(status.get("pending_approvals", 0) or 0),
+        }
 
-        result: dict[str, Any] = {"available": True}
-        result["performance"] = daemon.get("evolution_performance", {})
-
-        # Active proposals from watch summary or pending approvals
-        result["pending_approvals"] = int(daemon.get("pending_approvals", 0) or 0)
-
-        return result
-
-    def _facet_platform(self) -> dict[str, Any]:
+    def _facet_platform(self, status: dict[str, Any]) -> dict[str, Any]:
         """Gateway connections, hardware backend, environment sources, active clients."""
-        daemon = self._get_daemon_cache()
-        if not daemon:
-            if self._daemon_client is None:
-                return {"available": False, "reason": "daemon_client not bound"}
-            return {"available": False, "reason": "daemon status unavailable"}
-
-        result: dict[str, Any] = {"available": True}
-        result["active_clients"] = daemon.get("active_clients", 0)
-        result["connected_clients"] = daemon.get("connected_clients", 0)
-        result["host_backend"] = daemon.get("host_backend", {})
-        result["environment_sources"] = daemon.get("environment_sources", {})
-
-        return result
+        if not status:
+            return {"available": False, "reason": "platform status unavailable (no daemon bound)"}
+        return {
+            "available": True,
+            "active_clients": status.get("active_clients", 0),
+            "connected_clients": status.get("connected_clients", 0),
+            "host_backend": status.get("host_backend", {}),
+            "environment_sources": status.get("environment_sources", {}),
+        }
 
     # ── Internal helpers ─────────────────────────────────────────────────
 
-    def _resolve_engine(self) -> Any:
-        """Resolve engine from weak ref, returning None if unavailable."""
-        if self._engine_ref is None:
+    def _uptime(self, status: dict[str, Any]) -> str:
+        """Resolve uptime from the daemon status, else the captured build info."""
+        uptime_s = status.get("uptime_s") if status else None
+        if isinstance(uptime_s, (int, float)) and uptime_s >= 0:
+            return _format_uptime(uptime_s)
+        if self._build_info is not None:
+            started = getattr(self._build_info, "started_at", 0.0) or 0.0
+            if started > 0:
+                return _format_uptime(time.time() - started)
+        return "unknown"
+
+    def _registry_or_none(self) -> Any:
+        """Return the process-global tool registry, or None if unavailable."""
+        try:
+            from leapflow.plugins import get_registry
+
+            return get_registry()
+        except (ImportError, AttributeError, RuntimeError):
+            logger.debug("self_awareness: tool registry unavailable", exc_info=True)
             return None
-        engine = self._engine_ref()
-        return engine
 
-    def _get_daemon_cache(self) -> dict[str, Any]:
-        """Return cached daemon status, refreshing when TTL expires.
+    def _skill_inventory(self) -> dict[str, Any]:
+        """Live skills summary from the skill discovery subsystem (pull).
 
-        Uses synchronous access only — the daemon_client.status() is async,
-        so we store the last-fetched result and expose a sync refresh method
-        that callers in an async context can await.
+        Skills are a distinct capability surface from tools/plugins, so the
+        canonical self-cognition facet reports them too — otherwise the agent
+        must reach for skills_list separately and self_describe under-reports
+        what LeapFlow can do.
         """
-        now = time.monotonic()
-        if self._daemon_cache and (now - self._daemon_cache_ts) < _DAEMON_CACHE_TTL_S:
-            return self._daemon_cache
-        return self._refresh_daemon_cache_sync()
+        try:
+            from leapflow.skills.discovery import skill_inventory_summary
 
-    def _refresh_daemon_cache_sync(self) -> dict[str, Any]:
-        """Try to refresh daemon cache synchronously via an existing event loop."""
-        if self._daemon_client is None:
+            return skill_inventory_summary()
+        except Exception:  # noqa: BLE001 - skills are optional; degrade, never raise
+            logger.debug("self_awareness: skill inventory unavailable", exc_info=True)
+            return {"available": False, "reason": "skill discovery unavailable"}
+
+    async def _resolve_status(self) -> dict[str, Any]:
+        """Fetch the session-scoped status snapshot via the injected provider.
+
+        The active turn's ``session_id`` is read from the per-turn tool execution
+        context so the daemon resolves the caller's own session engine — never a
+        shared/most-recent one. Returns an empty dict when no provider is bound
+        (in-process CLI) or on any failure; facets degrade accordingly.
+        """
+        if self._status_provider is None:
             return {}
+
+        session_id = ""
         try:
-            import asyncio
+            from leapflow.tools.execution_context import current_tool_context
 
-            asyncio.get_running_loop()  # Verify we are in an async context
-            # We are inside an async context (tool handler runs within the agent loop).
-            # Schedule the coroutine and use a shim to get the result.
-            future = asyncio.ensure_future(self._daemon_client.status())
-            # Cannot await here in a sync handler; return stale cache and
-            # schedule background refresh.
-            future.add_done_callback(self._on_daemon_status_fetched)
-            return self._daemon_cache
-        except RuntimeError:
-            # No running event loop — likely in tests or sync CLI
-            pass
-        return self._daemon_cache
+            ctx = current_tool_context()
+            if ctx is not None:
+                session_id = str(getattr(ctx, "session_id", "") or "")
+        except Exception:  # noqa: BLE001 - context lookup must never break the tool
+            session_id = ""
 
-    def _on_daemon_status_fetched(self, future: Any) -> None:
-        """Callback when async daemon status completes."""
         try:
-            result = future.result()
-            if isinstance(result, dict):
-                self._daemon_cache = result
-                self._daemon_cache_ts = time.monotonic()
-        except Exception:
-            logger.debug("self_awareness: daemon status refresh failed", exc_info=True)
-
-    def inject_daemon_cache(self, status: dict[str, Any]) -> None:
-        """Inject daemon status directly (used by tests and daemon service)."""
-        self._daemon_cache = status
-        self._daemon_cache_ts = time.monotonic()
+            result = self._status_provider(session_id)
+            if inspect.isawaitable(result):
+                result = await result
+            return result if isinstance(result, dict) else {}
+        except Exception:  # noqa: BLE001 - a status fault degrades, never raises
+            logger.debug("self_awareness: status provider failed", exc_info=True)
+            return {}
 
 
 # Module-level instance for plugin discovery

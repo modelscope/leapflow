@@ -54,6 +54,7 @@ _PROVIDERS: dict[str, str] = {
     "yaml": "leapflow.hardware.providers.yaml_provider:build_provider",
     "host": "leapflow.hardware.providers.host_provider:build_provider",
     "media": "leapflow.hardware.providers.media_provider:build_provider",
+    "robot_arm": "leapflow.hardware.providers.robot_arm:build_provider",
 }
 
 _EP_GROUP = "leapflow.hardware.providers"
@@ -64,8 +65,8 @@ def _discover_entry_points() -> None:
     """Merge entry-point declared providers into ``_PROVIDERS``, once.
 
     Idempotent, and built-ins win: an installed package must not be able to
-    hijack ``yaml``, ``host`` or ``media`` and change where every profile's device
-    knowledge comes from.
+    hijack ``yaml``, ``host``, ``media`` or ``robot_arm`` and change where every
+    profile's device knowledge comes from.
     """
     global _ep_scanned  # noqa: PLW0603
     if _ep_scanned:

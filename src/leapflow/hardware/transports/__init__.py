@@ -34,6 +34,9 @@ _BUILTIN_TRANSPORTS: dict[str, str] = {
     "mcp": "leapflow.hardware.transports.mcp:build_transport",
     "host": "leapflow.hardware.transports.host:build_transport",
     "media": "leapflow.hardware.transports.media:build_transport",
+    "robot_arm": "leapflow.hardware.transports.robot_arm:build_transport",
+    "ros2": "leapflow.hardware.transports.ros2:build_transport",
+    "vla_inference": "leapflow.hardware.transports.vla_inference:build_transport",
 }
 _TRANSPORTS: dict[str, str] = dict(_BUILTIN_TRANSPORTS)
 

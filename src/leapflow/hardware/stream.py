@@ -31,7 +31,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Iterable, Iterator
 
-from leapflow.hardware.context import Channel, HardwareContext, Quality, as_numeric
+from leapflow.hardware.context import Channel, DegradationPolicy, HardwareContext, Quality, as_numeric
 from leapflow.hardware.transport import Reading
 
 logger = logging.getLogger(__name__)
@@ -403,6 +403,7 @@ class HardwareStreamSource:
         event_sink: EventSink | None = None,
         reading_store: Any = None,
         alert_policy: Any = None,
+        degradation_policy: DegradationPolicy | None = None,
     ) -> None:
         self._registry = registry
         self._context = context
@@ -412,6 +413,7 @@ class HardwareStreamSource:
         self._event_sink = event_sink
         self._store = reading_store
         self._alert_policy = alert_policy
+        self._degradation_policy = degradation_policy
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._last_emitted: dict[str, float] = {}
@@ -419,6 +421,10 @@ class HardwareStreamSource:
         self._samples = 0
         self._skipped_slots = 0
         self._started_monotonic: float | None = None
+        self._comm_loss_start: float | None = None
+        self._degradation_triggered: bool = False
+        self._sensor_loss_streak: int = 0
+        self._sensor_loss_triggered: bool = False
 
     @property
     def source_id(self) -> str:
@@ -481,6 +487,10 @@ class HardwareStreamSource:
                     logger.warning(
                         "Hardware stream %s read failed: %s", self.source_id, exc, exc_info=True
                     )
+                    # Mark the start of a communication loss window.
+                    self._comm_loss_start = time.monotonic()
+                # DegradationPolicy: comm_loss enforcement.
+                await self._maybe_trigger_comm_loss()
                 self._dispatch(self._detector.check_stale(), emit)
                 await self._sleep(min(interval * (2**consecutive_failures), 30.0))
                 # Backoff deliberately abandons the old cadence; resuming the prior
@@ -488,10 +498,16 @@ class HardwareStreamSource:
                 next_at = time.monotonic()
                 continue
 
+            # Recovery: clear comm-loss state.
+            if consecutive_failures > 0 or self._comm_loss_start is not None:
+                self._comm_loss_start = None
+                self._degradation_triggered = False
             consecutive_failures = 0
             self._samples += 1
             lost = self.ring.record(reading)
             await self._persist(reading, lost=lost)
+            # Sensor quality tracking for degradation policy.
+            await self._track_sensor_quality(reading)
             self._dispatch(self._detector.observe(reading, lost=lost), emit)
 
             next_at += interval
@@ -506,6 +522,114 @@ class HardwareStreamSource:
                 next_at += missed * interval
                 delay = max(0.0, next_at - time.monotonic())
             await self._sleep(delay)
+
+    async def _maybe_trigger_comm_loss(self) -> None:
+        """Evaluate DegradationPolicy.comm_loss_policy during a failure streak.
+
+        Triggers at most once per contiguous loss streak; the flag is cleared on
+        the next successful read.  No-op when no policy is declared or when the
+        loss window has not yet exceeded ``max_comm_loss_s``.
+        """
+        policy = self._degradation_policy
+        if policy is None or self._degradation_triggered:
+            return
+        if self._comm_loss_start is None:
+            return
+        elapsed = time.monotonic() - self._comm_loss_start
+        if elapsed <= policy.max_comm_loss_s:
+            return
+        self._degradation_triggered = True
+        await self._execute_degradation(policy.comm_loss_policy, reason="comm_loss")
+
+    async def _track_sensor_quality(self, reading: Reading) -> None:
+        """Evaluate DegradationPolicy.sensor_loss_policy on quality streaks.
+
+        Non-OK readings (STALE/SATURATED/SUSPECT) accumulate a streak; a run of
+        three triggers the declared ``sensor_loss_policy`` once.  An OK reading
+        resets both the streak and the triggered flag so a future loss can fire.
+        """
+        policy = self._degradation_policy
+        if reading.quality == Quality.OK.value:
+            self._sensor_loss_streak = 0
+            self._sensor_loss_triggered = False
+            return
+        self._sensor_loss_streak += 1
+        if policy is None or self._sensor_loss_triggered:
+            return
+        # Three consecutive degraded samples mirrors the detector's own threshold
+        # for QUALITY_DEGRADED: a lone suspect sample is noise, a run of them is
+        # a fault worth acting on.
+        if self._sensor_loss_streak < 3:
+            return
+        self._sensor_loss_triggered = True
+        await self._execute_degradation(policy.sensor_loss_policy, reason="sensor_loss")
+
+    async def _execute_degradation(self, action: str, *, reason: str) -> None:
+        """Carry out the declared degradation action against the transport.
+
+        ``halt``          -> stop every writable channel immediately via the
+                             transport's lock-free halt path.
+        ``hold_position`` -> stop issuing new commands; the device retains its
+                             last commanded position.  The runtime signal is a
+                             log line; command gating is enforced by callers
+                             reading :attr:`degradation_triggered`.
+        ``safe_return``   -> currently logged and treated as ``hold_position``
+                             until a per-device home position is declared.
+        """
+        device_id = self._context.device_id
+        try:
+            if action == "halt":
+                transport = await self._registry.transport(device_id)
+                # halt() is lock-free by design: an emergency stop must preempt
+                # any device_io lock the sampling loop is holding.
+                await transport.halt()
+                logger.warning(
+                    "DegradationPolicy halted device %s (%s)",
+                    device_id,
+                    reason,
+                )
+            elif action == "hold_position":
+                logger.warning(
+                    "DegradationPolicy holding position on device %s (%s)",
+                    device_id,
+                    reason,
+                )
+            elif action == "safe_return":
+                logger.warning(
+                    "DegradationPolicy safe_return requested on device %s (%s); "
+                    "no home position declared, holding position",
+                    device_id,
+                    reason,
+                )
+            elif action == "continue_blind":
+                logger.warning(
+                    "DegradationPolicy continue_blind on device %s (%s)",
+                    device_id,
+                    reason,
+                )
+            else:
+                logger.warning(
+                    "DegradationPolicy unknown action %r on device %s (%s)",
+                    action,
+                    device_id,
+                    reason,
+                )
+        except Exception as exc:  # noqa: BLE001 - degradation must not stop sampling
+            logger.warning(
+                "DegradationPolicy execution failed for %s: %s",
+                device_id,
+                exc,
+                exc_info=True,
+            )
+
+    @property
+    def degradation_triggered(self) -> bool:
+        """Return True while a declared degradation action is in effect.
+
+        Callers that gate commands (e.g. ``hold_position``) can read this to
+        decide whether to issue new writes without blocking the sampling loop.
+        """
+        return self._degradation_triggered or self._sensor_loss_triggered
 
     async def _persist(self, reading: Reading, *, lost: int) -> None:
         """Buffer one sample and, when a window closes, write it off the sampling path.
@@ -625,6 +749,370 @@ class HardwareStreamSource:
         }
 
 
+class BatchStreamCoordinator:
+    """Coordinates batch sampling for all streaming channels of one device.
+
+    When the transport satisfies ``BatchTransport``, one coordinator replaces
+    N individual ``HardwareStreamSource`` tasks with a single sampling loop
+    that calls ``read_batch`` once per period.  The readings are then
+    distributed to the per-channel rings and detectors, preserving the
+    per-channel event model while eliminating per-read lock contention.
+
+    Falls back to individual sources when the transport does not support
+    batch -- the coordinator is an optimisation, not a requirement.
+    """
+
+    def __init__(
+        self,
+        registry: Any,
+        context: HardwareContext,
+        channels: tuple[Channel, ...],
+        *,
+        ring_capacity: int = DEFAULT_RING_CAPACITY,
+        event_sink: EventSink | None = None,
+        reading_store: Any = None,
+        alert_policy: Any = None,
+        degradation_policy: DegradationPolicy | None = None,
+    ) -> None:
+        self._registry = registry
+        self._context = context
+        self._channels = channels
+        self._channel_ids = tuple(ch.channel_id for ch in channels)
+        self._rings: dict[str, ReadingRing] = {
+            ch.channel_id: ReadingRing(ring_capacity) for ch in channels
+        }
+        self._detectors: dict[str, HardwareEventDetector] = {
+            ch.channel_id: HardwareEventDetector(context, ch) for ch in channels
+        }
+        self._event_sink = event_sink
+        self._store = reading_store
+        self._alert_policy = alert_policy
+        self._degradation_policy = degradation_policy
+        self._task: asyncio.Task[None] | None = None
+        self._stopping = asyncio.Event()
+        self._last_emitted: dict[str, float] = {}
+        self._paced_out = 0
+        self._samples = 0
+        self._skipped_slots = 0
+        self._started_monotonic: float | None = None
+        self._comm_loss_start: float | None = None
+        self._degradation_triggered: bool = False
+        self._sensor_loss_streak: int = 0
+        self._sensor_loss_triggered: bool = False
+
+    @property
+    def source_id(self) -> str:
+        return f"hw.batch:{self._context.device_id}"
+
+    async def start(self, emit: Any) -> None:
+        """Begin batch sampling. Returns promptly; the loop runs as an internal task."""
+        if self._task is not None:
+            return
+        self._stopping.clear()
+        self._task = asyncio.create_task(self._run(emit), name=self.source_id)
+
+    async def stop(self) -> None:
+        """Stop batch sampling. Idempotent."""
+        self._stopping.set()
+        task = self._task
+        self._task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+            logger.warning("Batch stream %s stop raised: %s", self.source_id, exc)
+
+    async def _run(self, emit: Any) -> None:
+        """Core batch sampling loop.
+
+        Uses deadline-based scheduling identical to HardwareStreamSource._run(),
+        but calls read_batch() once to get all channels simultaneously.
+        The batch readings are then split and fed to per-channel rings,
+        detectors, persistence and event dispatch.
+
+        The sampling rate is the maximum declared rate across all channels.
+        """
+        max_rate = max((ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0)
+        interval = 1.0 / max_rate if max_rate > 0 else 1.0
+        consecutive_failures = 0
+        self._started_monotonic = time.monotonic()
+        next_at = self._started_monotonic
+        while not self._stopping.is_set():
+            try:
+                batch = await self._registry.read_batch(
+                    self._context.device_id, self._channel_ids
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one device must not stop the rest
+                consecutive_failures += 1
+                if consecutive_failures == 1:
+                    logger.warning(
+                        "Batch stream %s read failed: %s", self.source_id, exc, exc_info=True
+                    )
+                    self._comm_loss_start = time.monotonic()
+                # DegradationPolicy: comm_loss enforcement.
+                await self._maybe_trigger_comm_loss()
+                # Check staleness on all channels during failures.
+                for detector in self._detectors.values():
+                    self._dispatch(detector.check_stale(), emit)
+                await self._sleep(min(interval * (2 ** consecutive_failures), 30.0))
+                next_at = time.monotonic()
+                continue
+
+            # Recovery: clear comm-loss state.
+            if consecutive_failures > 0 or self._comm_loss_start is not None:
+                self._comm_loss_start = None
+                self._degradation_triggered = False
+            consecutive_failures = 0
+            self._samples += 1
+
+            # Distribute batch readings to per-channel rings and detectors.
+            for reading in batch.readings:
+                ch_id = reading.channel_id
+                ring = self._rings.get(ch_id)
+                if ring is None:
+                    continue
+                lost = ring.record(reading)
+                await self._persist(reading, lost=lost)
+                # Sensor quality tracking for degradation policy.
+                await self._track_sensor_quality(reading)
+                detector = self._detectors.get(ch_id)
+                if detector is not None:
+                    self._dispatch(detector.observe(reading, lost=lost), emit)
+
+            next_at += interval
+            delay = next_at - time.monotonic()
+            if delay < 0:
+                missed = int(-delay // interval) + 1
+                self._skipped_slots += missed
+                next_at += missed * interval
+                delay = max(0.0, next_at - time.monotonic())
+            await self._sleep(delay)
+
+    async def _maybe_trigger_comm_loss(self) -> None:
+        """Evaluate DegradationPolicy.comm_loss_policy during a failure streak."""
+        policy = self._degradation_policy
+        if policy is None or self._degradation_triggered:
+            return
+        if self._comm_loss_start is None:
+            return
+        elapsed = time.monotonic() - self._comm_loss_start
+        if elapsed <= policy.max_comm_loss_s:
+            return
+        self._degradation_triggered = True
+        await self._execute_degradation(policy.comm_loss_policy, reason="comm_loss")
+
+    async def _track_sensor_quality(self, reading: Reading) -> None:
+        """Evaluate DegradationPolicy.sensor_loss_policy on quality streaks."""
+        policy = self._degradation_policy
+        if reading.quality == Quality.OK.value:
+            self._sensor_loss_streak = 0
+            self._sensor_loss_triggered = False
+            return
+        self._sensor_loss_streak += 1
+        if policy is None or self._sensor_loss_triggered:
+            return
+        if self._sensor_loss_streak < 3:
+            return
+        self._sensor_loss_triggered = True
+        await self._execute_degradation(policy.sensor_loss_policy, reason="sensor_loss")
+
+    async def _execute_degradation(self, action: str, *, reason: str) -> None:
+        """Carry out the declared degradation action, mirroring HardwareStreamSource."""
+        device_id = self._context.device_id
+        try:
+            if action == "halt":
+                transport = await self._registry.transport(device_id)
+                await transport.halt()
+                logger.warning(
+                    "DegradationPolicy halted device %s (%s)",
+                    device_id,
+                    reason,
+                )
+            elif action == "hold_position":
+                logger.warning(
+                    "DegradationPolicy holding position on device %s (%s)",
+                    device_id,
+                    reason,
+                )
+            elif action == "safe_return":
+                logger.warning(
+                    "DegradationPolicy safe_return requested on device %s (%s); "
+                    "no home position declared, holding position",
+                    device_id,
+                    reason,
+                )
+            elif action == "continue_blind":
+                logger.warning(
+                    "DegradationPolicy continue_blind on device %s (%s)",
+                    device_id,
+                    reason,
+                )
+            else:
+                logger.warning(
+                    "DegradationPolicy unknown action %r on device %s (%s)",
+                    action,
+                    device_id,
+                    reason,
+                )
+        except Exception as exc:  # noqa: BLE001 - degradation must not stop sampling
+            logger.warning(
+                "DegradationPolicy execution failed for %s: %s",
+                device_id,
+                exc,
+                exc_info=True,
+            )
+
+    @property
+    def degradation_triggered(self) -> bool:
+        """Return True while a declared degradation action is in effect."""
+        return self._degradation_triggered or self._sensor_loss_triggered
+
+    async def _persist(self, reading: Reading, *, lost: int) -> None:
+        """Buffer one sample for persistence, mirroring HardwareStreamSource._persist."""
+        store = self._store
+        if store is None:
+            return
+        try:
+            store.record(reading, dropped=lost)
+            if not store.due_for_flush():
+                return
+            batches = store.drain()
+            if batches:
+                await asyncio.to_thread(store.write_batches, batches)
+        except Exception as exc:  # noqa: BLE001 - persistence must not stop sampling
+            logger.warning(
+                "Hardware reading persistence failed for %s: %s",
+                self.source_id,
+                exc,
+                exc_info=True,
+            )
+
+    async def _sleep(self, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(self._stopping.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return
+
+    def _dispatch(self, events: Iterable[HardwareEvent], emit: Any) -> None:
+        """Hand events to the sink, signal pipeline, and alert policy, paced per kind."""
+        for event in events:
+            if not self._admit(event):
+                continue
+            if self._event_sink is not None:
+                try:
+                    self._event_sink(event)
+                except Exception as exc:  # noqa: BLE001 - a sink must not stop sampling
+                    logger.warning("Hardware event sink raised: %s", exc, exc_info=True)
+            if emit is not None:
+                try:
+                    emit(event)
+                except Exception as exc:  # noqa: BLE001 - as above
+                    logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
+            if self._alert_policy is not None:
+                try:
+                    self._alert_policy.evaluate(event)
+                    if event.kind == EventKind.SETTLED:
+                        self._alert_policy.reset_channel(
+                            event.device_id, event.channel_id
+                        )
+                except Exception as exc:  # noqa: BLE001 - policy must not stop sampling
+                    logger.warning("Hardware alert policy raised: %s", exc, exc_info=True)
+
+    def _admit(self, event: HardwareEvent) -> bool:
+        """Return whether this event clears the per-kind-per-channel rate floor."""
+        now = time.monotonic()
+        key = f"{event.kind}:{event.device_id}.{event.channel_id}"
+        previous = self._last_emitted.get(key)
+        if previous is not None and now - previous < MIN_EVENT_INTERVAL_S:
+            self._paced_out += 1
+            return False
+        self._last_emitted[key] = now
+        return True
+
+    def ring(self, channel_id: str) -> ReadingRing | None:
+        """Return the per-channel ring, or None for an unknown channel."""
+        return self._rings.get(channel_id)
+
+    @property
+    def health(self) -> dict[str, Any]:
+        """Return batch sampling health metrics."""
+        max_rate = max((ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0)
+        started = self._started_monotonic
+        elapsed = (time.monotonic() - started) if started is not None else 0.0
+        observed = (self._samples / elapsed) if elapsed > 0 else 0.0
+        total_dropped = sum(r.dropped for r in self._rings.values())
+        return {
+            "source_id": self.source_id,
+            "device_id": self._context.device_id,
+            "channels": len(self._channels),
+            "declared_hz": float(max_rate),
+            "observed_hz": observed,
+            "rate_ratio": (observed / max_rate) if max_rate > 0 else 0.0,
+            "samples": self._samples,
+            "skipped_slots": self._skipped_slots,
+            "dropped": total_dropped,
+            "events_paced_out": self._paced_out,
+        }
+
+
+def build_batch_coordinators(
+    registry: Any,
+    *,
+    ring_capacity: int = DEFAULT_RING_CAPACITY,
+    event_sink: EventSink | None = None,
+    reading_store: Any = None,
+    alert_policy: Any = None,
+) -> tuple[BatchStreamCoordinator, ...]:
+    """Return one coordinator per device whose transport supports BatchTransport.
+
+    Devices whose transport does not satisfy ``BatchTransport`` are skipped;
+    their channels are handled by individual ``HardwareStreamSource`` instances
+    from ``build_stream_sources``.
+    """
+    from leapflow.hardware.transport import BatchTransport
+
+    coordinators: list[BatchStreamCoordinator] = []
+    for context in registry.contexts():
+        channels = tuple(
+            ch for ch in context.streaming_channels
+            if ch.is_readable and not ch.is_media
+        )
+        if not channels:
+            continue
+        # Check whether the transport declaration supports batch.
+        # We inspect the transport kind; the actual isinstance check against the
+        # live transport is deferred to read_batch at runtime, but the coordinator
+        # is only created for devices whose transport advertises BatchTransport.
+        transport_kind = context.transport.kind
+        try:
+            from leapflow.hardware.transports import build_transport
+
+            proto = build_transport(transport_kind, context.transport.config)
+            if not isinstance(proto, BatchTransport):
+                continue
+        except Exception:  # noqa: BLE001 - skip devices we cannot probe
+            continue
+        coordinators.append(
+            BatchStreamCoordinator(
+                registry,
+                context,
+                channels,
+                ring_capacity=ring_capacity,
+                event_sink=event_sink,
+                reading_store=reading_store,
+                alert_policy=alert_policy,
+                degradation_policy=context.degradation,
+            )
+        )
+    return tuple(coordinators)
+
+
 def build_stream_sources(
     registry: Any,
     *,
@@ -632,6 +1120,7 @@ def build_stream_sources(
     event_sink: EventSink | None = None,
     reading_store: Any = None,
     alert_policy: Any = None,
+    batch_device_ids: frozenset[str] = frozenset(),
 ) -> tuple[HardwareStreamSource, ...]:
     """Return one source per streaming channel across all admitted devices.
 
@@ -643,9 +1132,15 @@ def build_stream_sources(
     because this is the loop that would otherwise push a few hundred kilobytes per
     sample into the raw NDJSON segment and try to average frames into a downsample
     window. Previews are pulled on demand by whoever is watching, never sampled.
+
+    Channels belonging to devices in *batch_device_ids* are skipped: they are
+    handled by a ``BatchStreamCoordinator`` instead, and building individual
+    sources for them would double-sample the device.
     """
     sources: list[HardwareStreamSource] = []
     for context in registry.contexts():
+        if context.device_id in batch_device_ids:
+            continue
         for channel in context.streaming_channels:
             if not channel.is_readable or channel.is_media:
                 continue
@@ -658,6 +1153,7 @@ def build_stream_sources(
                     event_sink=event_sink,
                     reading_store=reading_store,
                     alert_policy=alert_policy,
+                    degradation_policy=context.degradation,
                 )
             )
     return tuple(sources)
@@ -688,6 +1184,7 @@ def _bounds(envelope: Any) -> str:
 
 
 __all__ = [
+    "BatchStreamCoordinator",
     "DEFAULT_RING_CAPACITY",
     "MIN_EVENT_INTERVAL_S",
     "EventKind",
@@ -695,5 +1192,6 @@ __all__ = [
     "HardwareEventDetector",
     "HardwareStreamSource",
     "ReadingRing",
+    "build_batch_coordinators",
     "build_stream_sources",
 ]

@@ -23,6 +23,7 @@ from leapflow.daemon._service_helpers import (
     ProducerServices as _ProducerServices,
     checkpoint_open_connection,
     engine_context_metadata,
+    engine_runtime_extras,
     host_backend_status,
     install_learn_notifications,
     memory_entry_to_dict,
@@ -478,6 +479,17 @@ class RuntimeLeapService:
         self._approval_coordinator.install_gate(ctx, self)
         install_learn_notifications(ctx, self.notification_bus)
         self._ctx = ctx
+        # Wire the session-scoped status snapshot into the self-awareness surface
+        # so self_describe/runtime_snapshot answer from live evidence rather than
+        # source code. bind_runtime reaches only plugins declaring
+        # 'runtime_status_provider' (self_awareness); status(session_id) resolves
+        # the caller's own session engine, so concurrent clients never cross-report.
+        try:
+            from leapflow.plugins import get_registry as _get_tool_registry
+
+            _get_tool_registry().bind_runtime(runtime_status_provider=self.status)
+        except Exception:  # noqa: BLE001 - introspection wiring must never block boot
+            logger.debug("self_awareness status provider wiring failed", exc_info=True)
         await self._start_environment_sources(ctx)
         if self._auto_start_deferred:
             self.start_deferred_init()
@@ -507,34 +519,70 @@ class RuntimeLeapService:
                     self._observation = None
 
     async def _start_environment_sources(self, ctx: Any) -> None:
-        """Start explicitly enabled experiment sources inside the daemon lifecycle."""
-        settings = getattr(ctx, "settings", self._settings)
-        if str(getattr(settings, "environment_mode", "production")) != "experiment":
-            return
-        if not bool(getattr(settings, "environment_leapspace_enabled", False)):
-            return
-        state_root = str(getattr(settings, "environment_leapspace_state_root", "") or "")
-        session_id = str(getattr(settings, "environment_leapspace_session_id", "") or "")
-        if not state_root or not session_id:
-            logger.warning(
-                "LeapSpace environment source requires both state_root and session_id"
-            )
-            return
-        from leapflow.layout import workspace_id_for_path
-        from leapflow.perception.environment_source import EnvironmentSourceManager
-        from leapflow.perception.leapspace_source import LeapSpaceEnvironmentSource
+        """Start environment sources inside the daemon lifecycle.
 
+        Two independent sources are considered:
+        - LeapSpaceEnvironmentSource: experiment-only, requires explicit config.
+        - PhysicalEnvironmentSource: available whenever hardware is admitted,
+          regardless of environment_mode.  Observes device topology, health,
+          and affordance changes through HCP.
+        """
+        from leapflow.perception.environment_source import EnvironmentSourceManager
+
+        settings = getattr(ctx, "settings", self._settings)
         manager = EnvironmentSourceManager(ctx.record_environment_observation)
-        manager.register(
-            LeapSpaceEnvironmentSource(
-                state_root,
-                workspace_id=workspace_id_for_path(self._workspace_root()),
-                session_id=session_id,
-                poll_interval_s=float(
-                    getattr(settings, "environment_leapspace_poll_interval_s", 0.5)
-                ),
-            )
-        )
+        registered_any = False
+
+        # ── LeapSpace source (experiment-only) ──
+        if (
+            str(getattr(settings, "environment_mode", "production")) == "experiment"
+            and bool(getattr(settings, "environment_leapspace_enabled", False))
+        ):
+            state_root = str(getattr(settings, "environment_leapspace_state_root", "") or "")
+            session_id = str(getattr(settings, "environment_leapspace_session_id", "") or "")
+            if state_root and session_id:
+                try:
+                    from leapflow.layout import workspace_id_for_path
+                    from leapflow.perception.leapspace_source import LeapSpaceEnvironmentSource
+
+                    manager.register(
+                        LeapSpaceEnvironmentSource(
+                            state_root,
+                            workspace_id=workspace_id_for_path(self._workspace_root()),
+                            session_id=session_id,
+                            poll_interval_s=float(
+                                getattr(settings, "environment_leapspace_poll_interval_s", 0.5)
+                            ),
+                        )
+                    )
+                    registered_any = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not register LeapSpaceEnvironmentSource: %s", exc, exc_info=True)
+            else:
+                logger.warning(
+                    "LeapSpace environment source requires both state_root and session_id"
+                )
+
+        # ── Physical hardware source (available whenever hardware is admitted) ──
+        hardware_registry = getattr(ctx, "_hardware_registry", None)
+        if hardware_registry is not None:
+            try:
+                from leapflow.hardware.environment_source import PhysicalEnvironmentSource
+
+                physical_source = PhysicalEnvironmentSource(
+                    hardware_registry,
+                    evidence_store=None,
+                    capability_index=None,
+                )
+                manager.register(physical_source)
+                registered_any = True
+                logger.info("Registered PhysicalEnvironmentSource for hardware observation")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not register PhysicalEnvironmentSource: %s", exc, exc_info=True)
+
+        if not registered_any:
+            return
+
         await manager.start()
         self._environment_source_manager = manager
 
@@ -1732,6 +1780,9 @@ class RuntimeLeapService:
                 else 0,
             },
             "evolution_performance": self._evolution_performance_status(ctx),
+            # Session turn count + cache hit rate for the self-awareness runtime
+            # facet (empty when no session engine is resolved for this caller).
+            **engine_runtime_extras(engine),
             # Whether *this* daemon process still matches the source tree on
             # disk (None when outside a git checkout, e.g. a packaged install).
             "build": {**self._build_info.to_dict(), "stale": build_stale},

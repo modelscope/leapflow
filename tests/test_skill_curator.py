@@ -14,7 +14,7 @@ from leapflow.skills.curator import (
     SkillCurationEntry,
     SkillCurator,
 )
-from leapflow.skills.index import SkillEntry, SkillIndex
+from leapflow.skills.index import SkillEntry, SkillIndex, _BUILTIN_SKILLS_DIR
 
 
 # ── In-memory store (implements SkillCurationStore protocol) ──
@@ -373,6 +373,44 @@ class TestSkillIndexIntegration:
         )
         names = [e.name for e in result]
         assert "archived-skill" in names
+
+    def test_fresh_scan_discovers_all_builtin_skills(self, tmp_path) -> None:
+        """A fresh skills_dir must surface every bundled builtin SKILL.md."""
+        builtin = sorted(p.parent.name for p in _BUILTIN_SKILLS_DIR.glob("*/SKILL.md"))
+        assert len(builtin) >= 1, "expected bundled builtin skills to exist"
+        index = SkillIndex(tmp_path)
+        names = {e.name for e in index.get_entries()}
+        assert set(builtin).issubset(names)
+
+    def test_legacy_empty_snapshot_is_rejected_and_self_heals(self, tmp_path) -> None:
+        """Regression: a pre-existing bare-list '[]' snapshot must NOT mask the
+        bundled builtin skills — the exact defect that reported only 3 skills."""
+        import json
+
+        (tmp_path / ".skills_index.json").write_text("[]", encoding="utf-8")
+        index = SkillIndex(tmp_path)
+        names = {e.name for e in index.get_entries()}
+        assert "web_research" in names and "code_review" in names
+        # The snapshot is rewritten in the new signed format.
+        rewritten = json.loads((tmp_path / ".skills_index.json").read_text())
+        assert isinstance(rewritten, dict)
+        assert rewritten.get("schema") == 2 and rewritten.get("signature")
+        assert len(rewritten.get("entries", [])) == len(names)
+
+    def test_signed_snapshot_is_reused_then_busted_by_new_skill(self, tmp_path) -> None:
+        """A matching signature reuses L2; adding a skill changes the signature."""
+        base = {e.name for e in SkillIndex(tmp_path).get_entries()}
+        # Second instance reuses the signed snapshot (same source signature).
+        assert {e.name for e in SkillIndex(tmp_path).get_entries()} == base
+        # Add a user skill → signature drift → rescan picks it up.
+        skill = tmp_path / "custom_skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "---\nname: custom_skill\ndescription: d\n---\n", encoding="utf-8"
+        )
+        after = {e.name for e in SkillIndex(tmp_path).get_entries()}
+        assert "custom_skill" in after
+        assert base.issubset(after)
 
 
 # ── DuckDB persistence tests ──

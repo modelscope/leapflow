@@ -70,6 +70,19 @@ web = ["trafilatura>=2.2"]
 # default `--all-extras` syncs deliberately exclude it (`--no-extra leapspace`,
 # see Makefile/CI/setup.sh); `make space-sync` opts back in.
 leapspace = ["pyqt6>=6.7", "cua-sandbox", "pydantic>=2"]
+robot = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "safetensors>=0.4",
+    "huggingface-hub>=0.20",
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "pyserial>=3.5",
+    "Pillow>=10.0",
+]
+robot-ros2 = [
+    "rclpy>=3.0; python_version>='3.11'",
+]
 
 [project.scripts]
 leap = "leapflow.__main__:main"
