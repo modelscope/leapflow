@@ -1402,7 +1402,12 @@ def test_plugin_exposes_no_tools_until_a_registry_is_bound() -> None:
 
 
 def test_plugin_exposes_exactly_twelve_tools_when_bound() -> None:
-    """Tool count is fixed regardless of how many devices exist."""
+    """Tool count is fixed regardless of how many devices exist.
+
+    The base twelve hardware tools are always present.  Additional tools
+    (hw_context_snapshot, hw_health) appear when their backing components
+    (LHPGateway, HardwareHealthMonitor) initialize successfully.
+    """
     from leapflow.hardware.plugin import HardwareContextPlugin
 
     registry = HardwareRegistry(
@@ -1417,12 +1422,14 @@ def test_plugin_exposes_exactly_twelve_tools_when_bound() -> None:
         "hw_actuate",
         "hw_batch_actuate",
         "hw_configure",
+        "hw_context_snapshot",
         "hw_control_start",
         "hw_control_status",
         "hw_control_stop",
         "hw_describe",
         "hw_dispense",
         "hw_estop",
+        "hw_health",
         "hw_list",
         "hw_read",
         "hw_status",

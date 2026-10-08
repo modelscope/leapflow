@@ -68,6 +68,7 @@ class PhysicalSkillPlugin:
         self._trust_gate: Any = None
         self._scope: Any = None
         self._session_id: str = ""
+        self._event_bus: Any = None
         self._tools: list[ToolMetadata] | None = None
         # Strategy cache: policy_path -> InferenceStrategy instance.
         # The plugin keeps its own reference so scope teardown can close only
@@ -87,6 +88,11 @@ class PhysicalSkillPlugin:
         # chunked-action queue rather than a fresh strategy per turn.
         self._active_episode: dict[str, Any] | None = None
         self._teardown_registered: bool = False
+
+        # Per-device ControlHierarchy instances, created on demand when the
+        # inference registry and registry are both available.  Keyed by
+        # device_id so each device gets its own three-layer control stack.
+        self._hierarchies: dict[str, Any] = {}
 
     @property
     def plugin_id(self) -> str:
@@ -121,11 +127,14 @@ class PhysicalSkillPlugin:
         if "effect_scope" in deps:
             self._scope = deps.get("effect_scope")
             self._teardown_registered = False
+        if "event_bus" in deps:
+            self._event_bus = deps.get("event_bus")
 
         if registry_changed:
             self._tools = None
             self._policies.clear()
             self._active_episode = None
+            self._hierarchies.clear()
             self._teardown_registered = False
 
         if self._registry is None:
@@ -440,8 +449,28 @@ class PhysicalSkillPlugin:
         if self._registry is None:
             raise RuntimeError("hardware registry is not bound")
 
-        # Multi-step chunk: attempt RT control loop execution first.
+        # Attempt ControlHierarchy path for multi-step chunks when available.
+        # This provides three-layer control (System-2/1.5/1) orchestration
+        # instead of the simpler RT control loop path.
         action_sequence = self._extract_action_sequence(action)
+        if len(action_sequence) > 1:
+            hierarchy = self._get_or_create_hierarchy(device_id)
+            if hierarchy is not None:
+                try:
+                    result = await self._execute_chunk_via_hierarchy(
+                        device_id, action_sequence, hierarchy,
+                    )
+                    if result is not None:
+                        return result
+                except Exception:  # noqa: BLE001 - fallback to RT/batch
+                    logger.debug(
+                        "Hierarchy execution failed for %s; "
+                        "falling back to RT/batch path",
+                        device_id,
+                        exc_info=True,
+                    )
+
+        # Multi-step chunk: attempt RT control loop execution first.
         if (
             len(action_sequence) > 1
             and hasattr(self._registry, "create_control_bus")
@@ -826,11 +855,106 @@ class PhysicalSkillPlugin:
             )
 
     async def _cleanup(self) -> None:
-        """Release cached policies and reset episode state."""
+        """Release cached policies, hierarchies, and reset episode state."""
         await self._close_remote_policies()
+        await self._shutdown_hierarchies()
         self._policies.clear()
         self._active_episode = None
         logger.debug("Physical skill plugin: cleaned up policy cache and episode state")
+
+    # -- ControlHierarchy integration ------------------------------------
+
+    def _get_or_create_hierarchy(self, device_id: str) -> Any:
+        """Return a ControlHierarchy for the device, creating one on demand.
+
+        Returns None when the inference registry or hardware registry is not
+        available — the caller falls back to the simpler RT/batch path.
+        The hierarchy is cached per device_id so subsequent calls reuse the
+        same instance and its layer state.
+        """
+        cached = self._hierarchies.get(device_id)
+        if cached is not None:
+            return cached
+
+        if self._registry is None:
+            return None
+
+        try:
+            from leapflow.hardware.control_hierarchy import ControlHierarchy
+
+            hierarchy = ControlHierarchy(
+                device_id=device_id,
+                registry=self._registry,
+                inference_registry=self._strategy_registry,
+                control_bus=None,  # created on demand by hierarchy
+                event_bus=self._event_bus,
+            )
+            self._hierarchies[device_id] = hierarchy
+            logger.info(
+                "Created ControlHierarchy for device %s", device_id,
+            )
+            return hierarchy
+        except Exception:  # noqa: BLE001 — hierarchy is optional
+            logger.debug(
+                "Failed to create ControlHierarchy for %s",
+                device_id, exc_info=True,
+            )
+            return None
+
+    async def _execute_chunk_via_hierarchy(
+        self,
+        device_id: str,
+        action_sequence: list[Any],
+        hierarchy: Any,
+    ) -> dict[str, Any] | None:
+        """Execute an action chunk through the ControlHierarchy.
+
+        Converts the action sequence into SubtaskGoals via TaskDecomposer
+        and delegates to ``hierarchy.execute_task()`` for three-layer
+        control orchestration.  Returns None to signal fallback.
+        """
+        from leapflow.hardware.control_hierarchy import TaskDecomposer
+
+        chunks: list[dict[str, float]] = []
+        for step in action_sequence:
+            if isinstance(step, dict):
+                chunks.append({k: float(v) for k, v in step.items()})
+            elif hasattr(step, "tolist"):
+                vals = step.tolist()
+                chunks.append({str(i): float(v) for i, v in enumerate(vals)})
+            elif isinstance(step, (list, tuple)):
+                chunks.append({str(i): float(v) for i, v in enumerate(step)})
+            else:
+                return None  # cannot interpret; fall back
+
+        if not chunks:
+            return None
+
+        decomposer = TaskDecomposer()
+        goals = decomposer.from_action_chunks(chunks)
+        if not goals:
+            return None
+
+        result = await hierarchy.execute_task(goals)
+        return {
+            "ok": result.get("failed", 1) == 0,
+            "side_effect_state": "committed",
+            "channels_written": len(chunks),
+            "execution_mode": "control_hierarchy",
+            "hierarchy_result": result,
+        }
+
+    async def _shutdown_hierarchies(self) -> None:
+        """Shut down all cached ControlHierarchy instances."""
+        for device_id, hierarchy in list(self._hierarchies.items()):
+            try:
+                await hierarchy.shutdown()
+            except Exception:  # noqa: BLE001 — teardown must not propagate
+                logger.debug(
+                    "Failed to shut down hierarchy for %s",
+                    device_id, exc_info=True,
+                )
+        self._hierarchies.clear()
 
     async def _close_remote_policies(self) -> None:
         """Close every remote strategy this plugin has referenced.
