@@ -46,6 +46,59 @@ def configure(index: Any, injector: Any, *, registry: Any = None, skill_view_max
 # ------------------------------------------------------------------
 
 
+def _collect_skills(
+    query: str = "", category_filter: str = "", source_filter: str = ""
+) -> List[Dict[str, Any]]:
+    """Enumerate skills from the SkillIndex plus the builtin registry, filtered.
+
+    Shared by ``skills_list`` (the async LLM tool) and ``skill_inventory_summary``
+    (sync self-introspection) so both report the exact same inventory.
+    """
+    skills: List[Dict[str, Any]] = []
+
+    if _skill_index is not None:
+        entries = _skill_index.get_entries()
+        if query:
+            ql = query.lower()
+            entries = [e for e in entries if ql in e.name.lower() or ql in e.description.lower()]
+        if category_filter:
+            cl = category_filter.lower()
+            entries = [e for e in entries if e.category.lower() == cl]
+        if source_filter:
+            sl = source_filter.lower()
+            entries = [e for e in entries if e.source.lower() == sl]
+        skills.extend(
+            {
+                "name": e.name,
+                "description": e.description,
+                "tags": list(e.tags),
+                "category": e.category,
+                "source": e.source,
+            }
+            for e in entries
+        )
+
+    # Builtin Python-class skills from the registry (always available)
+    if _skill_registry and hasattr(_skill_registry, "list_all"):
+        for s in _skill_registry.list_all():
+            reg_entry = {
+                "name": s.name,
+                "description": getattr(s, "description", s.name),
+                "tags": [],
+                "category": "builtin",
+                "source": "builtin",
+            }
+            if query and query.lower() not in reg_entry["name"].lower() and query.lower() not in reg_entry["description"].lower():
+                continue
+            if source_filter and source_filter.lower() != "builtin":
+                continue
+            if category_filter and category_filter.lower() != "builtin":
+                continue
+            skills.append(reg_entry)
+
+    return skills
+
+
 async def skills_list(params: Dict[str, Any]) -> Dict[str, Any]:
     """Layer 1: List available skills with compact metadata.
 
@@ -59,60 +112,36 @@ async def skills_list(params: Dict[str, Any]) -> Dict[str, Any]:
     if _skill_index is None:
         return {"ok": False, "error": "Skill index not initialized"}
 
-    query = str(params.get("query", "")).strip()
-    category_filter = str(params.get("category", "")).strip()
-    source_filter = str(params.get("source", "")).strip()
-    entries = _skill_index.get_entries()
-
-    # Optional keyword filter (case-insensitive substring match)
-    if query:
-        query_lower = query.lower()
-        entries = [
-            e for e in entries
-            if query_lower in e.name.lower() or query_lower in e.description.lower()
-        ]
-
-    # Category filter
-    if category_filter:
-        cat_lower = category_filter.lower()
-        entries = [e for e in entries if e.category.lower() == cat_lower]
-
-    # Source filter
-    if source_filter:
-        src_lower = source_filter.lower()
-        entries = [e for e in entries if e.source.lower() == src_lower]
-
-    skills = [
-        {
-            "name": e.name,
-            "description": e.description,
-            "tags": list(e.tags),
-            "category": e.category,
-            "source": e.source,
-        }
-        for e in entries
-    ]
-
-    # Include builtin skills from registry (always available)
-    if _skill_registry and hasattr(_skill_registry, 'list_all'):
-        for s in _skill_registry.list_all():
-            reg_entry = {
-                "name": s.name,
-                "description": getattr(s, 'description', s.name),
-                "tags": [],
-                "category": "builtin",
-                "source": "builtin",
-            }
-            # Apply filters
-            if query and query.lower() not in reg_entry["name"].lower() and query.lower() not in reg_entry["description"].lower():
-                continue
-            if source_filter and source_filter.lower() != "builtin":
-                continue
-            if category_filter and category_filter.lower() != "builtin":
-                continue
-            skills.append(reg_entry)
-
+    skills = _collect_skills(
+        str(params.get("query", "")).strip(),
+        str(params.get("category", "")).strip(),
+        str(params.get("source", "")).strip(),
+    )
     return {"ok": True, "count": len(skills), "skills": skills}
+
+
+def skill_inventory_summary() -> Dict[str, Any]:
+    """Compact, synchronous skills summary for self-introspection.
+
+    Returns ``{available, count, by_source, by_category, names}``. Degrades to
+    ``available=False`` when neither a skill index nor a builtin registry is
+    wired, so the self_describe capabilities facet can report skills as a
+    limitation rather than raising.
+    """
+    if _skill_index is None and _skill_registry is None:
+        return {"available": False, "reason": "skill discovery not initialized"}
+    from collections import Counter
+
+    skills = _collect_skills()
+    by_source = Counter(s["source"] for s in skills)
+    by_category = Counter(s["category"] for s in skills if s.get("category"))
+    return {
+        "available": True,
+        "count": len(skills),
+        "by_source": dict(by_source),
+        "by_category": dict(by_category),
+        "names": sorted(s["name"] for s in skills),
+    }
 
 
 async def skill_view(params: Dict[str, Any]) -> Dict[str, Any]:

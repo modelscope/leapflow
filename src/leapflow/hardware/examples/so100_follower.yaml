@@ -1,0 +1,161 @@
+# SO-100 Follower Arm — 6-DOF desktop manipulator with top camera and gripper.
+#
+# This is an hc.v1 declaration that exercises every new section:
+# kinematics, capabilities, safety, trust_config, degradation.
+
+hc_version: "hc.v1"
+device_id: "robot.so100_arm"
+display_name: "SO-100 Follower Arm"
+device_class: "robot_arm"
+vendor: "Feetech"
+model: "SO-100"
+location: "workbench_1"
+halt_supported: true
+
+kinematics:
+  chain_type: "serial"
+  dof: 6
+  joint_limits:
+    - [-3.14, 3.14]   # shoulder_pan
+    - [-1.57, 1.57]   # shoulder_lift
+    - [-3.14, 3.14]   # elbow
+    - [-3.14, 3.14]   # wrist_1
+    - [-3.14, 3.14]   # wrist_2
+    - [-3.14, 3.14]   # wrist_3
+  workspace_bounds: [-0.5, 0.5, -0.5, 0.5, 0.0, 0.6]
+
+capabilities:
+  affordances: ["grasp", "place", "push", "pour"]
+  payload_kg: 0.5
+  reach_m: 0.28
+  tool_slots: 1
+
+safety:
+  max_velocity_rad_s: 3.14
+  max_force_n: 10.0
+  emergency_decel_s: 0.1
+
+trust_config:
+  initial_level: "UNTRUSTED"
+  promotion_thresholds: [3, 8, 20]
+  demotion_threshold: 3
+
+degradation:
+  sensor_loss_policy: "halt"
+  comm_loss_policy: "hold_position"
+  max_comm_loss_s: 0.5
+
+transport:
+  kind: "robot_arm"
+  config:
+    robot_type: "so100_follower"
+    robot_config:
+      serial_port: "/dev/ttyUSB0"
+      cameras:
+        top: {index: 0, width: 640, height: 480, fps: 30}
+
+channels:
+  - channel_id: "joint.shoulder_pan.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "rad"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 50.0
+    description: "Shoulder pan joint position"
+    envelope:
+      declared: true
+      min_value: -3.14
+      max_value: 3.14
+      max_rate: 6.28
+      settling_time_s: 0.1
+      reversible: true
+
+  - channel_id: "joint.shoulder_lift.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "rad"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 50.0
+    description: "Shoulder lift joint position"
+    envelope:
+      declared: true
+      min_value: -1.57
+      max_value: 1.57
+      max_rate: 6.28
+      settling_time_s: 0.1
+      reversible: true
+
+  - channel_id: "joint.elbow.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "rad"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 50.0
+    description: "Elbow joint position"
+    envelope:
+      declared: true
+      min_value: -3.14
+      max_value: 3.14
+      max_rate: 6.28
+      settling_time_s: 0.1
+      reversible: true
+
+  - channel_id: "joint.wrist_1.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "rad"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 50.0
+    description: "Wrist 1 joint position"
+    envelope:
+      declared: true
+      min_value: -3.14
+      max_value: 3.14
+      max_rate: 6.28
+      settling_time_s: 0.1
+      reversible: true
+
+  - channel_id: "joint.wrist_2.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "rad"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 50.0
+    description: "Wrist 2 joint position"
+    envelope:
+      declared: true
+      min_value: -3.14
+      max_value: 3.14
+      max_rate: 6.28
+      settling_time_s: 0.1
+      reversible: true
+
+  - channel_id: "joint.wrist_3.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "rad"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 50.0
+    description: "Wrist 3 joint position"
+    envelope:
+      declared: true
+      min_value: -3.14
+      max_value: 3.14
+      max_rate: 6.28
+      settling_time_s: 0.1
+      reversible: true
+
+  - channel_id: "camera.top"
+    direction: "read"
+    quantity: "image"
+    representation: "frame"
+    effect: "read"
+    sample_rate_hz: 30.0
+    description: "Top-view RGB camera for workspace observation"
+    privacy_tier: "environment"

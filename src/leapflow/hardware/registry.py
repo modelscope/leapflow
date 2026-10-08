@@ -24,7 +24,9 @@ from typing import Any, Deque, Mapping, Sequence
 
 from leapflow.hardware.context import (
     SUPPORTED_HC_VERSIONS,
+    Channel,
     HardwareContext,
+    as_numeric,
 )
 from leapflow.hardware.providers import (
     HardwareContextProvider,
@@ -323,6 +325,7 @@ class HardwareRegistry:
         # with a schedule, and hw_status only ever shows a recent tail.
         self._recent_events: Deque[Any] = deque(maxlen=200)
         self._event_emitter: Any = None
+        self._control_buses: dict[str, Any] = {}
 
     # ── Loading ──
 
@@ -724,6 +727,43 @@ class HardwareRegistry:
         channel = context.channel(channel_id) if context is not None else None
         return bool(channel is not None and channel.is_writable)
 
+    async def read(self, device_id: str, channel_id: str) -> Any:
+        """Read a single channel value. Convenience wrapper around transport.read()."""
+        async with self.device_io(device_id):
+            transport = await self.transport(device_id)
+            return await transport.read(channel_id)
+
+    async def read_frame(self, device_id: str, channel_id: str, **kwargs: Any) -> Any:
+        """Read a frame from a camera channel. Requires FrameTransport."""
+        async with self.device_io(device_id):
+            transport = await self.transport(device_id)
+            from leapflow.hardware.transport import FrameTransport
+
+            if not isinstance(transport, FrameTransport):
+                raise TransportError(
+                    f"Transport for {device_id!r} does not support frame capture",
+                    failure_code="frame_transport_missing",
+                )
+            return await transport.read_frame(channel_id, **kwargs)
+
+    def get_open_transport(self, device_id: str) -> HardwareTransport:
+        """Return an already-opened transport for the device.
+
+        Unlike ``transport()`` which may open on first call (async + Lock),
+        this method only returns transports that are already open.  Raises
+        ``TransportError`` if the device has no open transport.
+
+        Safe to call from any thread — no asyncio primitives involved.
+        """
+        existing = self._transports.get(device_id)
+        if existing is None:
+            raise TransportError(
+                f"No open transport for device {device_id!r}. "
+                "Call transport() from the main event loop first.",
+                failure_code="transport_not_open",
+            )
+        return existing
+
     async def transport(self, device_id: str) -> HardwareTransport:
         """Return the open transport for *device_id*, opening it on first use.
 
@@ -776,14 +816,25 @@ class HardwareRegistry:
         if not self._settings.stream_enabled:
             return ()
         if self._stream_sources is None:
-            from leapflow.hardware.stream import build_stream_sources
+            from leapflow.hardware.stream import build_batch_coordinators, build_stream_sources
 
-            self._stream_sources = build_stream_sources(
+            batch_coordinators = build_batch_coordinators(
                 self,
                 ring_capacity=self._settings.stream_ring_capacity,
                 event_sink=self.record_event,
                 reading_store=self.reading_store,
             )
+            batch_device_ids = frozenset(
+                c._context.device_id for c in batch_coordinators
+            )
+            individual_sources = build_stream_sources(
+                self,
+                ring_capacity=self._settings.stream_ring_capacity,
+                event_sink=self.record_event,
+                reading_store=self.reading_store,
+                batch_device_ids=batch_device_ids,
+            )
+            self._stream_sources = (*batch_coordinators, *individual_sources)
         return self._stream_sources
 
     @property
@@ -1090,6 +1141,23 @@ class HardwareRegistry:
 
     # ── Describe-before-write bookkeeping ──
 
+    def is_device_degraded(self, device_id: str) -> bool:
+        """Return True if any stream source for this device has triggered degradation.
+
+        Checked by the write path so a device whose sampling loop has detected
+        communication loss or sustained sensor failure cannot be commanded until
+        the condition clears.  The flag is set by ``HardwareStreamSource`` /
+        ``BatchStreamCoordinator`` and cleared automatically on recovery.
+        """
+        for source in self._stream_sources or ():
+            if getattr(source, "degradation_triggered", False):
+                # Match the source to the device.  Individual sources store
+                # the context on ``_context``; batch coordinators do the same.
+                ctx = getattr(source, "_context", None)
+                if ctx is not None and getattr(ctx, "device_id", None) == device_id:
+                    return True
+        return False
+
     def mark_described(self, session_id: str, device_id: str) -> None:
         self._described.add((str(session_id), str(device_id)))
 
@@ -1119,6 +1187,123 @@ class HardwareRegistry:
             self._io_locks[key] = lock
         return lock
 
+    def device_io_batch(self, device_id: str) -> Any:
+        """Acquire the device I/O lock for a batch operation.
+
+        Identical to ``device_io`` but named explicitly so batch vs single
+        operations are distinguishable in logs and metrics.  The lock is the
+        same per-device asyncio.Lock -- batch does not bypass it, it simply
+        acquires it once for multiple channels instead of once per channel.
+        """
+        key = str(device_id)
+        lock = self._io_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._io_locks[key] = lock
+        return lock
+
+    async def read_batch(self, device_id: str, channel_ids: tuple[str, ...]) -> Any:
+        """Read multiple channels in one atomic operation if the transport supports it.
+
+        Falls back to sequential reads if ``BatchTransport`` is not satisfied.
+        Returns a ``BatchReading`` or a synthesized equivalent from sequential reads.
+        """
+        from leapflow.hardware.transport import BatchReading, BatchTransport, Reading
+
+        transport = await self.transport(device_id)
+        if isinstance(transport, BatchTransport):
+            async with self.device_io_batch(device_id):
+                return await transport.read_batch(channel_ids)
+        else:
+            # Fallback: sequential reads under one lock acquisition.
+            async with self.device_io(device_id):
+                readings: list[Reading] = []
+                for ch_id in channel_ids:
+                    reading = await transport.read(ch_id)
+                    readings.append(reading)
+                return BatchReading(
+                    device_id=device_id,
+                    readings=tuple(readings),
+                )
+
+    # ── Safety policy enforcement ──
+
+    def check_safety_policy(
+        self,
+        context: HardwareContext,
+        channel: Channel,
+        value: Any,
+        *,
+        rate: float | None = None,
+    ) -> tuple[bool, str]:
+        """Check whether a write violates the device's declared SafetyPolicy.
+
+        Returns ``(allowed, reason)``.  When not allowed, *reason* explains
+        which constraint was violated.
+
+        Checks performed:
+
+        1. **max_velocity_rad_s** -- if the channel quantity is angular velocity
+           (or velocity) and the absolute commanded value exceeds the limit.
+        2. **max_force_n** -- if the channel quantity is force (or torque) and
+           the absolute commanded value exceeds the limit.
+        3. **collision_zones** -- reserved for future kinematics integration;
+           skipped today because evaluating Cartesian zones requires a forward
+           kinematics solver that is not yet available.
+        4. **require_safety_interlock** -- when set, every interlock on the
+           context must be satisfied.  The per-channel interlock check already
+           covers per-envelope interlocks; this flag adds a device-level
+           blanket requirement.  Actual evaluation is deferred to the existing
+           ``_failed_interlocks`` path in the tools layer, so here we only
+           verify the flag is honoured.
+
+        When ``SafetyPolicy`` is ``None`` (hc.v0 device) the check passes --
+        backward compatible by design.
+        """
+        safety = context.safety
+        if safety is None:
+            return True, ""
+
+        # 1. Global velocity limit
+        if (
+            safety.max_velocity_rad_s > 0
+            and channel.quantity in ("angular_velocity", "velocity")
+        ):
+            num = as_numeric(value)
+            if num is not None and abs(num) > safety.max_velocity_rad_s:
+                return (
+                    False,
+                    f"velocity {abs(num):.3f} rad/s exceeds device limit "
+                    f"{safety.max_velocity_rad_s:.3f} rad/s",
+                )
+
+        # 2. Global force limit
+        if safety.max_force_n > 0 and channel.quantity in ("force", "torque"):
+            num = as_numeric(value)
+            if num is not None and abs(num) > safety.max_force_n:
+                return (
+                    False,
+                    f"force {abs(num):.3f} N exceeds device limit "
+                    f"{safety.max_force_n:.3f} N",
+                )
+
+        # 3. Collision zones -- requires forward kinematics (not yet available).
+        #    Placeholder for future integration.
+
+        # 4. Device-level interlock blanket -- the flag is checked, but the
+        #    actual interlock evaluation lives in the tools layer where the
+        #    transport is available for reading channel values.  When the flag
+        #    is set and the context has no interlocks at all, the device is
+        #    misconfigured: refuse rather than silently pass.
+        if safety.require_safety_interlock and not context.interlocks:
+            return (
+                False,
+                "require_safety_interlock is set but the device declares no "
+                "interlocks; add interlock declarations or disable the flag",
+            )
+
+        return True, ""
+
     # ── Rate-limit baseline ──
 
     def record_command(self, device_id: str, channel_id: str, value: float) -> None:
@@ -1138,6 +1323,78 @@ class HardwareRegistry:
     def last_command(self, device_id: str, channel_id: str) -> tuple[float, float] | None:
         """Return ``(value, monotonic_timestamp)`` of the last accepted command."""
         return self._last_command.get((str(device_id), str(channel_id)))
+
+    # ── Control loop management ──
+
+    def create_control_bus(
+        self, device_id: str, config: Any = None
+    ) -> Any:
+        """Create a :class:`HighFrequencyControlBus` for a device.
+
+        Caches per device — one bus per device at a time.  Returns the
+        existing bus if already created and still alive.
+        """
+        from leapflow.hardware.control_bus import ControlBusConfig, HighFrequencyControlBus
+
+        existing = self._control_buses.get(device_id)
+        if existing is not None:
+            return existing
+
+        bus_config = config if isinstance(config, ControlBusConfig) else ControlBusConfig()
+        bus = HighFrequencyControlBus(
+            self, config=bus_config, safety_checker=self.check_safety_policy,
+        )
+        self._control_buses[device_id] = bus
+        return bus
+
+    def start_control_loop(
+        self,
+        device_id: str,
+        policy: Any,
+        *,
+        config: Any = None,
+    ) -> None:
+        """Start a real-time control loop on a device.
+
+        Creates the bus if needed, then starts it with the given policy.
+        Raises ``RuntimeError`` if the device already has a running loop.
+        """
+        bus = self.create_control_bus(device_id, config)
+        if bus.is_running:
+            raise RuntimeError(
+                f"device {device_id!r} already has a running control loop; "
+                "stop it before starting another"
+            )
+        bus.start(device_id, policy)
+        logger.info("Control loop started on %s", device_id)
+
+    def stop_control_loop(self, device_id: str) -> dict[str, Any]:
+        """Stop the control loop on a device.  Returns final stats.
+
+        Returns ``{"status": "no_loop"}`` if no loop was running.
+        """
+        bus = self._control_buses.get(device_id)
+        if bus is None or not bus.is_running:
+            return {"status": "no_loop", "device_id": device_id}
+        bus.stop()
+        stats = bus.stats.to_dict()
+        return {
+            "status": "stopped",
+            "device_id": device_id,
+            "stats": stats,
+        }
+
+    def control_loop_status(self, device_id: str) -> dict[str, Any] | None:
+        """Return control loop status, or None if no loop exists."""
+        bus = self._control_buses.get(device_id)
+        if bus is None:
+            return None
+        stats = bus.stats.to_dict()
+        return {
+            "running": bus.is_running,
+            "device_id": device_id,
+            "stats": stats,
+        }
 
     # ── Teardown ──
 
@@ -1179,6 +1436,17 @@ class HardwareRegistry:
         down on shutdown rather than at interpreter exit.
         """
         await self.stop_streams()
+        # Stop any running control loops before closing transports.
+        for device_id, bus in list(self._control_buses.items()):
+            try:
+                if bus.is_running:
+                    bus.stop()
+            except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+                logger.warning(
+                    "Control bus stop failed for %r during close_all: %s",
+                    device_id, exc, exc_info=True,
+                )
+        self._control_buses.clear()
         if self._preview_broker is not None:
             await self._preview_broker.close()
         store = self._reading_store

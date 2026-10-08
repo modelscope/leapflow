@@ -1,0 +1,59 @@
+# Intel RealSense D435 — stereo depth camera (pure sensor, no actuators).
+#
+# Demonstrates an hc.v1 declaration for a device that only reads: no
+# kinematics, no safety policy, no trust overrides.  The capabilities
+# section declares what the sensor can observe, not what it can do.
+
+hc_version: "hc.v1"
+device_id: "sensor.realsense_d435"
+display_name: "RealSense D435 Depth Camera"
+device_class: "camera"
+vendor: "Intel"
+model: "D435"
+location: "workbench_1"
+halt_supported: false
+
+capabilities:
+  affordances: ["observe_depth", "observe_rgb"]
+  notes: "Passive sensor — no actuation capability"
+
+degradation:
+  sensor_loss_policy: "halt"
+  comm_loss_policy: "halt"
+  max_comm_loss_s: 2.0
+
+transport:
+  kind: "realsense"
+  config:
+    serial_number: "0"
+    depth_resolution: [640, 480]
+    color_resolution: [640, 480]
+    fps: 30
+
+channels:
+  - channel_id: "camera.color"
+    direction: "read"
+    quantity: "image"
+    representation: "frame"
+    effect: "read"
+    sample_rate_hz: 30.0
+    description: "RGB color stream"
+    privacy_tier: "environment"
+
+  - channel_id: "camera.depth"
+    direction: "read"
+    quantity: "depth_image"
+    representation: "frame"
+    effect: "read"
+    sample_rate_hz: 30.0
+    description: "Aligned depth stream (16-bit millimeters)"
+    privacy_tier: "environment"
+
+  - channel_id: "camera.infrared"
+    direction: "read"
+    quantity: "image"
+    representation: "frame"
+    effect: "read"
+    sample_rate_hz: 30.0
+    description: "Left infrared stream for stereo"
+    privacy_tier: "environment"

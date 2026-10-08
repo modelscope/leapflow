@@ -60,6 +60,64 @@ from leapflow.hardware.transport import (
     TransportStatus,
     WriteOutcome,
 )
+from leapflow.hardware.evidence import (
+    EvidenceStore,
+)
+from leapflow.hardware.verification import (
+    EvidenceBundle,
+    GraspVerifier,
+    OperationVerdict,
+    OperationVerifier,
+    PositionVerifier,
+    VerdictStatus,
+    VerificationMode,
+    collect_evidence,
+)
+from leapflow.hardware.control_bus import (
+    ControlBusConfig,
+    ControlBusStats,
+    ControlCommand,
+    ControlPolicy,
+    ControlState,
+    HighFrequencyControlBus,
+)
+from leapflow.hardware.realtime import (
+    ControlTelemetryEvent,
+    ImpedanceController,
+    PIDJointController,
+    PolicyChain,
+    RealtimeControlLoop,
+    TrajectoryTracker,
+)
+from leapflow.hardware.fleet import (
+    FleetError,
+    FleetManager,
+    FleetNode,
+    FleetSessionRouter,
+    FleetTopology,
+    build_fleet_tools,
+)
+from leapflow.hardware.control_hierarchy import (
+    ControlHierarchy,
+    ControlLayer,
+    EscalationEvent,
+    LayerState,
+    SubtaskGoal,
+    TaskDecomposer,
+)
+from leapflow.hardware.lhp_gateway import (
+    DeviceSnapshot,
+    HardwareContextDelta,
+    HardwareContextSnapshot,
+    LHPGateway,
+    LLMPlanSegment,
+    PCDLevel,
+    PlanStep,
+)
+from leapflow.hardware.health_monitor import (
+    DeviceHealthRecord,
+    HardwareHealthMonitor,
+)
 
 __all__ = [
     "HC_VERSION",
@@ -72,17 +130,30 @@ __all__ = [
     "Channel",
     "ContextProvenance",
     "ContextSource",
+    # control_bus.py
+    "ControlBusConfig",
+    "ControlBusStats",
+    "ControlCommand",
+    "ControlPolicy",
+    "ControlState",
     "Direction",
     "Envelope",
+    "EvidenceBundle",
+    "EvidenceStore",
     "FrameReading",
     "FrameTransport",
+    "GraspVerifier",
     "HardwareContext",
     "HardwareEffect",
     "HardwareRegistry",
     "HardwareSettings",
     "HardwareTransport",
+    "HighFrequencyControlBus",
     "Interlock",
     "LoadReport",
+    "OperationVerdict",
+    "OperationVerifier",
+    "PositionVerifier",
     "PrivacyTier",
     "Quality",
     "Reading",
@@ -91,5 +162,40 @@ __all__ = [
     "TransportRef",
     "TransportStatus",
     "UnverifiedContextPolicy",
+    "VerdictStatus",
+    "VerificationMode",
     "WriteOutcome",
+    "collect_evidence",
+    # realtime.py
+    "ControlTelemetryEvent",
+    "ImpedanceController",
+    "PIDJointController",
+    "PolicyChain",
+    "RealtimeControlLoop",
+    "TrajectoryTracker",
+    # control_hierarchy.py
+    "ControlHierarchy",
+    "ControlLayer",
+    "EscalationEvent",
+    "LayerState",
+    "SubtaskGoal",
+    "TaskDecomposer",
+    # lhp_gateway.py
+    "DeviceSnapshot",
+    "HardwareContextDelta",
+    "HardwareContextSnapshot",
+    "LHPGateway",
+    "LLMPlanSegment",
+    "PCDLevel",
+    "PlanStep",
+    # fleet.py
+    "FleetError",
+    "FleetManager",
+    "FleetNode",
+    "FleetSessionRouter",
+    "FleetTopology",
+    "build_fleet_tools",
+    # health_monitor.py
+    "DeviceHealthRecord",
+    "HardwareHealthMonitor",
 ]

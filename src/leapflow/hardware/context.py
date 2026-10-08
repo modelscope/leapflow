@@ -27,7 +27,7 @@ guessing: declarations are durable user assets, and silently rewriting one is
 worse than rejecting it with a reason.
 """
 
-SUPPORTED_HC_VERSIONS: frozenset[str] = frozenset({HC_VERSION})
+SUPPORTED_HC_VERSIONS: frozenset[str] = frozenset({HC_VERSION, "hc.v1"})
 
 _DEFAULT_HYSTERESIS_SPAN_FRACTION = 0.01
 """Settle band used when a channel declares no quantization, as a share of span."""
@@ -620,6 +620,214 @@ class TransportRef:
 
 
 @dataclass(frozen=True)
+class KinematicsDeclaration:
+    """Robot kinematics declaration for motion planning and safety.
+
+    Describes the physical structure of a robot manipulator: degrees of
+    freedom, joint limits, and workspace bounds.  This information is
+    consumed by safety checks (workspace violation detection) and by
+    the LLM context assembler (task feasibility assessment).
+    """
+
+    chain_type: str = ""  # "serial", "parallel", "mobile", "humanoid"
+    dof: int = 0
+    joint_limits: tuple[tuple[float, float], ...] = ()  # per-joint (min, max) in rad
+    workspace_bounds: tuple[float, ...] = ()  # (x_min, x_max, y_min, y_max, z_min, z_max) in meters
+    base_frame: str = ""  # reference frame name
+    tool_frame: str = ""  # end-effector frame name
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chain_type": self.chain_type,
+            "dof": self.dof,
+            "joint_limits": [list(pair) for pair in self.joint_limits],
+            "workspace_bounds": list(self.workspace_bounds),
+            "base_frame": self.base_frame,
+            "tool_frame": self.tool_frame,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "KinematicsDeclaration":
+        data = data or {}
+        raw_limits = data.get("joint_limits") or ()
+        joint_limits = tuple(
+            (float(pair[0]), float(pair[1]))
+            for pair in raw_limits
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2
+        )
+        raw_bounds = data.get("workspace_bounds") or ()
+        workspace_bounds = tuple(float(v) for v in raw_bounds)
+        return cls(
+            chain_type=str(data.get("chain_type") or ""),
+            dof=int(data.get("dof") or 0),
+            joint_limits=joint_limits,
+            workspace_bounds=workspace_bounds,
+            base_frame=str(data.get("base_frame") or ""),
+            tool_frame=str(data.get("tool_frame") or ""),
+            notes=str(data.get("notes") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class CapabilityDeclaration:
+    """Declared capabilities and affordances of a device.
+
+    Affordances are verbs that describe what the device can do in the
+    physical world: 'grasp', 'push', 'pour', 'inspect'.  They are the
+    bridge between LLM task decomposition and hardware capability
+    resolution.
+    """
+
+    affordances: tuple[str, ...] = ()  # ("grasp", "push", "place", ...)
+    tool_slots: int = 0  # number of tool change positions
+    payload_kg: float = 0.0  # maximum payload in kilograms
+    reach_m: float = 0.0  # maximum reach in meters
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "affordances": list(self.affordances),
+            "tool_slots": self.tool_slots,
+            "payload_kg": self.payload_kg,
+            "reach_m": self.reach_m,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "CapabilityDeclaration":
+        data = data or {}
+        raw_affordances = data.get("affordances") or ()
+        return cls(
+            affordances=tuple(str(a) for a in raw_affordances),
+            tool_slots=int(data.get("tool_slots") or 0),
+            payload_kg=_as_float(data.get("payload_kg"), default=0.0) or 0.0,
+            reach_m=_as_float(data.get("reach_m"), default=0.0) or 0.0,
+            notes=str(data.get("notes") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class SafetyPolicy:
+    """Declared safety constraints for a device.
+
+    These constraints are enforced at runtime by the registry before
+    any write command reaches the transport.  They complement the
+    per-channel Envelope (which constrains individual values) with
+    device-level spatial and force limits.
+    """
+
+    max_velocity_rad_s: float = 0.0  # global joint velocity limit
+    max_force_n: float = 0.0  # global force limit
+    collision_zones: tuple[tuple[float, ...], ...] = ()  # axis-aligned boxes (x_min,x_max,y_min,y_max,z_min,z_max)
+    emergency_decel_s: float = 0.0  # time to reach zero velocity on e-stop
+    require_safety_interlock: bool = False
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_velocity_rad_s": self.max_velocity_rad_s,
+            "max_force_n": self.max_force_n,
+            "collision_zones": [list(zone) for zone in self.collision_zones],
+            "emergency_decel_s": self.emergency_decel_s,
+            "require_safety_interlock": self.require_safety_interlock,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "SafetyPolicy":
+        data = data or {}
+        raw_zones = data.get("collision_zones") or ()
+        collision_zones = tuple(
+            tuple(float(v) for v in zone)
+            for zone in raw_zones
+            if isinstance(zone, (list, tuple))
+        )
+        return cls(
+            max_velocity_rad_s=_as_float(data.get("max_velocity_rad_s"), default=0.0) or 0.0,
+            max_force_n=_as_float(data.get("max_force_n"), default=0.0) or 0.0,
+            collision_zones=collision_zones,
+            emergency_decel_s=_as_float(data.get("emergency_decel_s"), default=0.0) or 0.0,
+            require_safety_interlock=bool(data.get("require_safety_interlock", False)),
+            notes=str(data.get("notes") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class TrustConfig:
+    """Per-device trust progression configuration.
+
+    Overrides the global HardwareTrustGate defaults for this specific
+    device.  A high-risk industrial arm may require more successes to
+    promote, while a simple sensor may start at a higher level.
+    """
+
+    initial_level: str = ""  # "UNTRUSTED", "CANDIDATE", "VERIFIED", "PRODUCTION"
+    promotion_thresholds: tuple[int, ...] = ()  # successes needed per level
+    demotion_threshold: int = 0  # consecutive failures to demote
+    approval_override: str = ""  # "always", "never", "" (use default)
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "initial_level": self.initial_level,
+            "promotion_thresholds": list(self.promotion_thresholds),
+            "demotion_threshold": self.demotion_threshold,
+            "approval_override": self.approval_override,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "TrustConfig":
+        data = data or {}
+        raw_thresholds = data.get("promotion_thresholds") or ()
+        return cls(
+            initial_level=str(data.get("initial_level") or ""),
+            promotion_thresholds=tuple(int(t) for t in raw_thresholds),
+            demotion_threshold=int(data.get("demotion_threshold") or 0),
+            approval_override=str(data.get("approval_override") or ""),
+            notes=str(data.get("notes") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class DegradationPolicy:
+    """Declared behavior when components degrade or fail.
+
+    Tells the runtime what to do when a sensor stops reporting, when
+    communication is lost, or when the device cannot maintain its
+    declared performance.
+    """
+
+    sensor_loss_policy: str = "halt"  # "halt", "continue_blind", "switch_sensor"
+    comm_loss_policy: str = "halt"  # "halt", "hold_position", "safe_return"
+    fallback_mode: str = ""  # device-specific fallback configuration
+    max_comm_loss_s: float = 1.0  # max seconds of communication loss before policy triggers
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sensor_loss_policy": self.sensor_loss_policy,
+            "comm_loss_policy": self.comm_loss_policy,
+            "fallback_mode": self.fallback_mode,
+            "max_comm_loss_s": self.max_comm_loss_s,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any] | None) -> "DegradationPolicy":
+        data = data or {}
+        return cls(
+            sensor_loss_policy=str(data.get("sensor_loss_policy") or "halt"),
+            comm_loss_policy=str(data.get("comm_loss_policy") or "halt"),
+            fallback_mode=str(data.get("fallback_mode") or ""),
+            max_comm_loss_s=_as_float(data.get("max_comm_loss_s"), default=1.0) or 1.0,
+            notes=str(data.get("notes") or ""),
+        )
+
+
+@dataclass(frozen=True)
 class HardwareContext:
     """Everything an agent must know about one device. The SSOT of the protocol.
 
@@ -648,6 +856,20 @@ class HardwareContext:
     permitted, every new peripheral needs a core edit and an unrecognised one gets
     a wrong default. It exists so the board can group a fleet into compute,
     camera, storage and sensor sections instead of one flat list.
+    """
+
+    # hc.v1 extensions — optional, None for hc.v0 declarations
+    kinematics: KinematicsDeclaration | None = None
+    capabilities: CapabilityDeclaration | None = None
+    safety: SafetyPolicy | None = None
+    trust_config: TrustConfig | None = None
+    degradation: DegradationPolicy | None = None
+    control_bindings: Mapping[str, Any] | None = None
+    """Raw control_bindings section from the YAML declaration.
+
+    Parsed by :class:`~leapflow.hardware.control_binding_resolver.ControlBindingResolver`
+    into executable transport configurations.  Stored as-is so the resolver
+    can operate after ``from_mapping`` without a second YAML parse pass.
     """
 
     def channel(self, channel_id: str) -> Channel | None:
@@ -695,6 +917,12 @@ class HardwareContext:
             notes=self.notes,
             provenance=self.provenance,
             device_class=self.device_class,
+            kinematics=self.kinematics,
+            capabilities=self.capabilities,
+            safety=self.safety,
+            trust_config=self.trust_config,
+            degradation=self.degradation,
+            control_bindings=self.control_bindings,
         )
 
     def read_only(self) -> "HardwareContext":
@@ -702,7 +930,7 @@ class HardwareContext:
         return self.with_channels(tuple(c.without_write() for c in self.channels))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "hc_version": self.hc_version,
             "device_id": self.device_id,
             "display_name": self.display_name,
@@ -717,6 +945,20 @@ class HardwareContext:
             "channels": [c.to_dict() for c in self.channels],
             "interlocks": [i.to_dict() for i in self.interlocks],
         }
+        # hc.v1 extensions — omit when absent for backward-compatible output
+        if self.kinematics is not None:
+            result["kinematics"] = self.kinematics.to_dict()
+        if self.capabilities is not None:
+            result["capabilities"] = self.capabilities.to_dict()
+        if self.safety is not None:
+            result["safety"] = self.safety.to_dict()
+        if self.trust_config is not None:
+            result["trust_config"] = self.trust_config.to_dict()
+        if self.degradation is not None:
+            result["degradation"] = self.degradation.to_dict()
+        if self.control_bindings is not None:
+            result["control_bindings"] = dict(self.control_bindings)
+        return result
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "HardwareContext":
@@ -736,6 +978,41 @@ class HardwareContext:
             for item in data.get("interlocks") or ()
             if isinstance(item, Mapping)
         )
+        # hc.v1 extensions — parse when present, leave None otherwise
+        raw_kin = data.get("kinematics")
+        kinematics = (
+            KinematicsDeclaration.from_mapping(raw_kin)
+            if isinstance(raw_kin, Mapping)
+            else None
+        )
+        raw_cap = data.get("capabilities")
+        capabilities = (
+            CapabilityDeclaration.from_mapping(raw_cap)
+            if isinstance(raw_cap, Mapping)
+            else None
+        )
+        raw_safety = data.get("safety")
+        safety = (
+            SafetyPolicy.from_mapping(raw_safety)
+            if isinstance(raw_safety, Mapping)
+            else None
+        )
+        raw_trust = data.get("trust_config")
+        trust_config = (
+            TrustConfig.from_mapping(raw_trust)
+            if isinstance(raw_trust, Mapping)
+            else None
+        )
+        raw_degrad = data.get("degradation")
+        degradation = (
+            DegradationPolicy.from_mapping(raw_degrad)
+            if isinstance(raw_degrad, Mapping)
+            else None
+        )
+        raw_bindings = data.get("control_bindings")
+        control_bindings = (
+            dict(raw_bindings) if isinstance(raw_bindings, Mapping) else None
+        )
         return cls(
             device_id=str(data.get("device_id") or ""),
             hc_version=str(data.get("hc_version") or ""),
@@ -750,6 +1027,12 @@ class HardwareContext:
             notes=str(data.get("notes") or ""),
             provenance=ContextProvenance.from_mapping(data.get("provenance")),
             device_class=str(data.get("device_class") or ""),
+            kinematics=kinematics,
+            capabilities=capabilities,
+            safety=safety,
+            trust_config=trust_config,
+            degradation=degradation,
+            control_bindings=control_bindings,
         )
 
 
@@ -808,17 +1091,22 @@ def _declared_span(envelope: "Envelope") -> float:
 __all__ = [
     "HC_VERSION",
     "SUPPORTED_HC_VERSIONS",
+    "CapabilityDeclaration",
     "Channel",
     "ContextProvenance",
     "ContextSource",
+    "DegradationPolicy",
     "Direction",
     "Envelope",
     "HardwareContext",
     "HardwareEffect",
     "Interlock",
+    "KinematicsDeclaration",
     "PrivacyTier",
     "Quality",
     "Representation",
+    "SafetyPolicy",
     "TransportRef",
+    "TrustConfig",
     "as_numeric",
 ]

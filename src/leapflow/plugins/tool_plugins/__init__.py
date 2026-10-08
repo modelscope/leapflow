@@ -51,11 +51,12 @@ _BUILTIN_PLUGIN_MODULES = (
     # tool_describe).  Read-only CORE tools; appended after desktop_semantic so
     # existing tool-index ordering is preserved.
     "leapflow.plugins.tool_plugins.bridge",
-    # Hardware Context Protocol — appended last, and contributes no tools until a
-    # hardware registry is bound. With hardware disabled the tool index is
-    # byte-identical to a build without it, which is what keeps the journey
-    # cassette fingerprints valid.
+    # Hardware plugins contribute no tools until a hardware registry is bound.
+    # Physical skills precede capability routing so policy-backed affordances can
+    # resolve the skill plugin when runtime dependencies are assembled.
     "leapflow.hardware.plugin",
+    "leapflow.plugins.tool_plugins.physical_skill",
+    "leapflow.hardware.capability_router",
 )
 
 
