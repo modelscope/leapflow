@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class HardwareContextPlugin:
-    """Exposes admitted hardware devices through the eight generic tools."""
+    """Exposes admitted hardware devices through the twelve generic tools."""
 
     def __init__(self) -> None:
         self._registry: Any = None
@@ -96,7 +96,28 @@ class HardwareContextPlugin:
         if self._registry is None:
             return
 
+        self._register_trust_configs()
         self._register_teardown()
+
+    def _register_trust_configs(self) -> None:
+        """Register per-device TrustConfig with the trust gate after admission.
+
+        Idempotent: ``register_device`` is a no-op for an already-known device.
+        Errors are swallowed per device so one bad config does not prevent the
+        rest from being registered.
+        """
+        gate = self._hardware_trust_gate
+        if gate is None or not hasattr(gate, "register_device"):
+            return
+        for ctx in self._registry.contexts():
+            try:
+                gate.register_device(ctx.device_id, ctx.trust_config)
+            except Exception as exc:  # noqa: BLE001 - registration must not block startup
+                logger.warning(
+                    "Could not register trust config for %s: %s",
+                    ctx.device_id,
+                    exc,
+                )
 
     def _register_teardown(self) -> None:
         """Close device connections when the owning scope unwinds.

@@ -68,6 +68,74 @@ class TeleopBridge(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# _TeleopPolicy — ControlPolicy adapter for leader-follower mode
+# ---------------------------------------------------------------------------
+
+class _TeleopPolicy:
+    """Reads the leader device's joints and maps them to follower commands.
+
+    Implements the :class:`ControlPolicy` Protocol so it can be passed
+    directly to :class:`HighFrequencyControlBus` for sub-20ms control.
+    The registry is used inside ``compute()`` via a thread-local event loop
+    because the bus control thread is not an asyncio context.
+    """
+
+    def __init__(
+        self,
+        registry: Any,
+        leader_device_id: str,
+        joint_map: Mapping[str, str],
+    ) -> None:
+        self._registry = registry
+        self._leader_device_id = leader_device_id
+        self._joint_map = dict(joint_map)
+        self._loop: Any = None  # thread-local event loop, created lazily
+
+    @property
+    def policy_id(self) -> str:
+        return f"teleop:{self._leader_device_id}"
+
+    def compute(self, state: Any) -> Any:
+        """Read leader joints and map to follower commands."""
+        from leapflow.hardware.control_bus import ControlCommand
+
+        if self._loop is None:
+            import asyncio
+            self._loop = asyncio.new_event_loop()
+
+        registry = self._registry
+        leader_ctx = registry.context(self._leader_device_id)
+        if leader_ctx is None:
+            return ControlCommand(joint_commands={})
+
+        leader_channels = tuple(
+            ch.channel_id for ch in leader_ctx.channels if ch.is_readable
+        )
+        if not leader_channels:
+            return ControlCommand(joint_commands={})
+
+        try:
+            batch = self._loop.run_until_complete(
+                registry.read_batch(self._leader_device_id, leader_channels)
+            )
+        except Exception:  # noqa: BLE001 - policy must not raise
+            return ControlCommand(joint_commands={})
+
+        commands: dict[str, float] = {}
+        for reading in batch.readings:
+            follower_ch = self._joint_map.get(
+                reading.channel_id, reading.channel_id,
+            )
+            commands[follower_ch] = float(reading.value)
+
+        return ControlCommand(joint_commands=commands)
+
+    def reset(self) -> None:
+        """No state to reset."""
+        pass
+
+
+# ---------------------------------------------------------------------------
 # LeaderFollowerBridge
 # ---------------------------------------------------------------------------
 
@@ -123,6 +191,9 @@ class LeaderFollowerBridge:
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._sequence = 0
+        # RT control bus state (activated when control_rate_hz > 50).
+        self._use_rt = False
+        self._rt_bus: Any = None
 
     @property
     def session_id(self) -> str:
@@ -130,11 +201,19 @@ class LeaderFollowerBridge:
 
     @property
     def is_active(self) -> bool:
+        if self._use_rt and self._rt_bus is not None:
+            return self._rt_bus.is_running
         return self._task is not None and not self._task.done()
 
     async def start(self) -> None:
-        """Begin the leader→follower mirror loop."""
-        if self._task is not None:
+        """Begin the leader→follower mirror loop.
+
+        When ``control_rate_hz > 50`` and the registry supports
+        :meth:`create_control_bus`, the loop is offloaded to a
+        :class:`HighFrequencyControlBus` running in a dedicated OS thread
+        for deterministic timing.  Otherwise falls back to an asyncio task.
+        """
+        if self._task is not None or self._use_rt:
             return
         self._stopping.clear()
         self._trajectory = PhysicalTrajectory(
@@ -144,6 +223,46 @@ class LeaderFollowerBridge:
             started_at=time.time(),
             metadata=self._trajectory.metadata,
         )
+
+        # High-frequency path: use RT control bus.
+        if (
+            self._control_rate_hz > 50
+            and hasattr(self._registry, "create_control_bus")
+        ):
+            try:
+                from leapflow.hardware.control_bus import ControlBusConfig
+
+                bus_config = ControlBusConfig(
+                    frequency_hz=self._control_rate_hz,
+                )
+                bus = self._registry.create_control_bus(
+                    self._follower_device_id, bus_config,
+                )
+                policy = _TeleopPolicy(
+                    self._registry,
+                    self._leader_device_id,
+                    self._joint_map,
+                )
+                bus.start(self._follower_device_id, policy)
+                self._use_rt = True
+                self._rt_bus = bus
+                logger.info(
+                    "Teleop session %s using RT control bus at %.0f Hz",
+                    self._session_id,
+                    self._control_rate_hz,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to start RT teleop for %s: %s; "
+                    "falling back to asyncio loop",
+                    self._follower_device_id,
+                    exc,
+                    exc_info=True,
+                )
+                self._use_rt = False
+                self._rt_bus = None
+
         self._task = asyncio.create_task(
             self._run(), name=f"teleop:{self._session_id}"
         )
@@ -151,6 +270,19 @@ class LeaderFollowerBridge:
     async def stop(self) -> PhysicalTrajectory:
         """Stop the mirror loop and return the finalized trajectory."""
         self._stopping.set()
+
+        # RT mode: stop the control bus.
+        if self._use_rt and self._rt_bus is not None:
+            try:
+                self._rt_bus.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "RT teleop bus stop raised: %s", exc, exc_info=True,
+                )
+            self._use_rt = False
+            self._rt_bus = None
+            return self._trajectory.finalized()
+
         task = self._task
         self._task = None
         if task is not None:
@@ -226,11 +358,20 @@ class LeaderFollowerBridge:
 
         # 3. Write to follower through approval-gated path.
         if commands and self._hardware_tools is not None:
-            await self._hardware_tools.batch_actuate(
-                self._follower_device_id, tuple(commands)
-            )
+            await self._hardware_tools.batch_actuate({
+                "device_id": self._follower_device_id,
+                "commands": [
+                    {"channel_id": cid, "value": val}
+                    for cid, val in commands
+                ],
+            })
         elif commands:
             # Direct write fallback when no hardware_tools provided (testing).
+            logger.warning(
+                "LeaderFollowerBridge: hardware_tools is None; falling back to direct "
+                "transport writes. This bypasses SafetyPolicy and approval gates. "
+                "Only acceptable in testing."
+            )
             from leapflow.hardware.transport import BatchTransport
 
             transport = await registry.transport(self._follower_device_id)
@@ -464,6 +605,7 @@ __all__ = [
     "KinestheticRecorder",
     "LeaderFollowerBridge",
     "TeleopBridge",
+    "_TeleopPolicy",
     "get_physical_session",
     "register_physical_session",
     "remove_physical_session",

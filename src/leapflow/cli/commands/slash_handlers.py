@@ -3381,11 +3381,36 @@ async def _start_physical_teach(
                 "ok": False,
                 "message": "Teleop mode requires --leader=<device> --follower=<device>.",
             }
+
+        # Build HardwareTools so the bridge writes through the governed path
+        # (SafetyPolicy, envelope, approval, trust) rather than direct transport.
+        hardware_tools = None
+        try:
+            from leapflow.hardware.tools import HardwareTools
+
+            hardware_tools = HardwareTools(
+                registry,
+                gate=getattr(ctx, "hardware_approval_gate", None)
+                or getattr(ctx, "_hardware_approval_gate", None),
+                session_id=getattr(ctx, "session_id", "") or "",
+                hardware_trust_gate=getattr(ctx, "hardware_trust_gate", None)
+                or getattr(ctx, "_hardware_trust_gate", None),
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade to direct writes
+            import logging as _log
+
+            _log.getLogger(__name__).warning(
+                "Could not build HardwareTools for teleop; writes will bypass "
+                "SafetyPolicy and approval gates: %s",
+                exc,
+            )
+
         bridge = LeaderFollowerBridge(
             registry,
             leader_device_id=leader,
             follower_device_id=follower,
             goal=goal,
+            hardware_tools=hardware_tools,
         )
     else:  # kinesthetic
         device = parsed.get("device", "")
@@ -3419,16 +3444,45 @@ async def _stop_physical_teach(ctx: "Context") -> dict[str, Any] | None:
     trajectory = await bridge.stop()
     remove_physical_session(session_key)
 
+    # Optional episode export: when a robot.episode_export_dir is configured,
+    # persist the trajectory as a training episode so offline learning
+    # pipelines can consume it.
+    export_info: dict[str, Any] | None = None
+    try:
+        settings = getattr(ctx, "settings", None)
+        export_dir = (
+            getattr(settings, "get", lambda *a: None)("robot.episode_export_dir")
+            if settings is not None
+            else None
+        )
+        if export_dir:
+            from leapflow.robot.episode_export import EpisodeExporter
+
+            exporter = EpisodeExporter(export_dir)
+            goal = getattr(trajectory, "goal", "") or ""
+            export_info = await exporter.export_trajectory(trajectory, task=goal)
+    except Exception as exc:  # noqa: BLE001 - export failure must not block teach stop
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Episode export failed (non-fatal): %s", exc, exc_info=True,
+        )
+
     msg = (
         f"Physical recording stopped — {trajectory.sample_count} samples, "
         f"{trajectory.duration_s:.1f}s"
     )
+    if export_info:
+        msg += f"\nEpisode exported: {export_info.get('format', '?')} "
+        msg += f"({export_info.get('step_count', 0)} steps)"
+
     return {
         "ok": True,
         "message": msg,
         "sample_count": trajectory.sample_count,
         "duration": trajectory.duration_s,
         "trajectory_id": trajectory.trajectory_id,
+        "export": export_info,
         "session_mode": "idle",
     }
 

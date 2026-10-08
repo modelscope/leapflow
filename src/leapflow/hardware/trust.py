@@ -48,7 +48,6 @@ _PRODUCTION_AT = 20
 _DEMOTE_AFTER = 2
 """Consecutive failures to demote one level."""
 
-
 class HardwareTrustLevel(IntEnum):
     """Trust gradient for a (device, channel) pair."""
 
@@ -56,6 +55,26 @@ class HardwareTrustLevel(IntEnum):
     CANDIDATE = 1
     VERIFIED = 2
     PRODUCTION = 3
+
+
+_LEVEL_NAMES: Dict[str, int] = {
+    "UNTRUSTED": 0,
+    "CANDIDATE": 1,
+    "VERIFIED": 2,
+    "PRODUCTION": 3,
+}
+
+
+@dataclass(frozen=True)
+class _DeviceThresholds:
+    """Resolved thresholds for one device, considering its TrustConfig."""
+
+    initial_level: HardwareTrustLevel
+    candidate_at: int
+    verified_at: int
+    production_at: int
+    demote_after: int
+    approval_override: str  # "always", "never", or ""
 
 
 @dataclass(frozen=True)
@@ -80,6 +99,10 @@ class HardwareTrustGate:
     ``allow_permanent`` is True only for reversible channels at VERIFIED+,
     matching the platform rule that ``allow_permanent=True`` is reserved for
     actions whose effect can be undone.
+
+    Per-device ``TrustConfig`` (from hc.v1 declarations) can override the
+    global defaults.  Call ``register_device`` before the first success/failure
+    for that device, or the global defaults apply.
     """
 
     def __init__(
@@ -100,6 +123,80 @@ class HardwareTrustGate:
         self._consecutive_fail: Dict[Tuple[str, str], int] = {}
         self._levels: Dict[Tuple[str, str], HardwareTrustLevel] = {}
         self._frozen: set[Tuple[str, str]] = set()
+        self._device_thresholds: Dict[str, _DeviceThresholds] = {}
+
+    # ── Device registration ──
+
+    def register_device(
+        self,
+        device_id: str,
+        trust_config: Any = None,
+    ) -> None:
+        """Register per-device trust thresholds from a ``TrustConfig``.
+
+        Must be called before the first success/failure for the device.
+        When *trust_config* is ``None`` the global defaults are used.
+        Idempotent: a second call for the same device is a no-op.
+        """
+        if device_id in self._device_thresholds:
+            return
+        thresholds = self._resolve_thresholds(trust_config)
+        self._device_thresholds[device_id] = thresholds
+
+    def _resolve_thresholds(self, trust_config: Any) -> _DeviceThresholds:
+        """Return effective thresholds, considering *trust_config*."""
+        if trust_config is None:
+            return _DeviceThresholds(
+                initial_level=HardwareTrustLevel.UNTRUSTED,
+                candidate_at=self._candidate_at,
+                verified_at=self._verified_at,
+                production_at=self._production_at,
+                demote_after=self._demote_after,
+                approval_override="",
+            )
+        # Resolve initial level from the config string.
+        raw_level = getattr(trust_config, "initial_level", "") or ""
+        level_int = _LEVEL_NAMES.get(raw_level.upper(), 0)
+        initial = HardwareTrustLevel(level_int)
+
+        # Resolve promotion thresholds.  The tuple carries at most 3 values:
+        # (candidate_at, verified_at, production_at).
+        promo = getattr(trust_config, "promotion_thresholds", ()) or ()
+        candidate_at = max(1, int(promo[0])) if len(promo) > 0 else self._candidate_at
+        verified_at = max(1, int(promo[1])) if len(promo) > 1 else self._verified_at
+        production_at = max(1, int(promo[2])) if len(promo) > 2 else self._production_at
+
+        raw_demote = getattr(trust_config, "demotion_threshold", 0) or 0
+        demote_after = max(1, int(raw_demote)) if raw_demote else self._demote_after
+
+        approval_override = str(getattr(trust_config, "approval_override", "") or "")
+
+        return _DeviceThresholds(
+            initial_level=initial,
+            candidate_at=candidate_at,
+            verified_at=verified_at,
+            production_at=production_at,
+            demote_after=demote_after,
+            approval_override=approval_override,
+        )
+
+    def _thresholds_for(self, device_id: str) -> _DeviceThresholds:
+        """Return thresholds for *device_id*, using global defaults as fallback."""
+        th = self._device_thresholds.get(device_id)
+        if th is not None:
+            return th
+        return _DeviceThresholds(
+            initial_level=HardwareTrustLevel.UNTRUSTED,
+            candidate_at=self._candidate_at,
+            verified_at=self._verified_at,
+            production_at=self._production_at,
+            demote_after=self._demote_after,
+            approval_override="",
+        )
+
+    def _initial_level_for(self, device_id: str) -> HardwareTrustLevel:
+        """Return the configured initial level for *device_id*."""
+        return self._thresholds_for(device_id).initial_level
 
     # ── Query ──
 
@@ -108,7 +205,7 @@ class HardwareTrustGate:
         key = (device_id, channel_id)
         if key in self._frozen:
             return HardwareTrustLevel.UNTRUSTED
-        return self._levels.get(key, HardwareTrustLevel.UNTRUSTED)
+        return self._levels.get(key, self._initial_level_for(device_id))
 
     def may_skip_approval(
         self,
@@ -122,7 +219,16 @@ class HardwareTrustGate:
         Only reversible channels at VERIFIED or above qualify.  Irreversible
         channels *always* require approval — the cost of being wrong once
         cannot be recovered.
+
+        Per-device ``approval_override`` takes precedence:
+        - ``"always"`` forces approval regardless of trust level.
+        - ``"never"`` skips approval for reversible channels regardless of level.
         """
+        th = self._thresholds_for(device_id)
+        if th.approval_override == "always":
+            return False
+        if th.approval_override == "never" and reversible:
+            return True
         if not reversible:
             return False
         return self.level(device_id, channel_id) >= HardwareTrustLevel.VERIFIED
@@ -150,6 +256,11 @@ class HardwareTrustGate:
         key = (device_id, channel_id)
         if key in self._frozen:
             return
+        # Ensure the initial level is seeded on the first mutation.
+        if key not in self._levels:
+            init = self._initial_level_for(device_id)
+            if init != HardwareTrustLevel.UNTRUSTED:
+                self._levels[key] = init
         self._consecutive_ok[key] = self._consecutive_ok.get(key, 0) + 1
         self._consecutive_fail[key] = 0
         self._maybe_promote(key)
@@ -177,9 +288,15 @@ class HardwareTrustGate:
             return
         if key in self._frozen:
             return
+        # Ensure the initial level is seeded on the first mutation.
+        if key not in self._levels:
+            init = self._initial_level_for(device_id)
+            if init != HardwareTrustLevel.UNTRUSTED:
+                self._levels[key] = init
         self._consecutive_fail[key] = self._consecutive_fail.get(key, 0) + 1
         self._consecutive_ok[key] = 0
-        if self._consecutive_fail[key] >= self._demote_after:
+        th = self._thresholds_for(device_id)
+        if self._consecutive_fail[key] >= th.demote_after:
             self._demote(key)
         self._sync_plugin_trust(key, success=False)
 
@@ -209,17 +326,20 @@ class HardwareTrustGate:
     # ── Internal ──
 
     def _maybe_promote(self, key: Tuple[str, str]) -> None:
+        device_id = key[0]
+        th = self._thresholds_for(device_id)
         streak = self._consecutive_ok.get(key, 0)
-        current = self._levels.get(key, HardwareTrustLevel.UNTRUSTED)
-        if current < HardwareTrustLevel.PRODUCTION and streak >= self._production_at:
+        current = self._levels.get(key, self._initial_level_for(device_id))
+        if current < HardwareTrustLevel.PRODUCTION and streak >= th.production_at:
             self._levels[key] = HardwareTrustLevel.PRODUCTION
-        elif current < HardwareTrustLevel.VERIFIED and streak >= self._verified_at:
+        elif current < HardwareTrustLevel.VERIFIED and streak >= th.verified_at:
             self._levels[key] = HardwareTrustLevel.VERIFIED
-        elif current < HardwareTrustLevel.CANDIDATE and streak >= self._candidate_at:
+        elif current < HardwareTrustLevel.CANDIDATE and streak >= th.candidate_at:
             self._levels[key] = HardwareTrustLevel.CANDIDATE
 
     def _demote(self, key: Tuple[str, str]) -> None:
-        current = self._levels.get(key, HardwareTrustLevel.UNTRUSTED)
+        device_id = key[0]
+        current = self._levels.get(key, self._initial_level_for(device_id))
         if current > HardwareTrustLevel.UNTRUSTED:
             self._levels[key] = HardwareTrustLevel(current - 1)
         self._consecutive_fail[key] = 0
@@ -255,4 +375,5 @@ __all__ = [
     "HardwareTrustGate",
     "HardwareTrustLevel",
     "TrustRecord",
+    "_DeviceThresholds",
 ]

@@ -73,6 +73,47 @@ from leapflow.hardware.verification import (
     VerificationMode,
     collect_evidence,
 )
+from leapflow.hardware.control_bus import (
+    ControlBusConfig,
+    ControlBusStats,
+    ControlCommand,
+    ControlPolicy,
+    ControlState,
+    HighFrequencyControlBus,
+)
+from leapflow.hardware.realtime import (
+    ControlTelemetryEvent,
+    ImpedanceController,
+    PIDJointController,
+    PolicyChain,
+    RealtimeControlLoop,
+    TrajectoryTracker,
+)
+from leapflow.hardware.fleet import (
+    FleetError,
+    FleetManager,
+    FleetNode,
+    FleetSessionRouter,
+    FleetTopology,
+    build_fleet_tools,
+)
+from leapflow.hardware.control_hierarchy import (
+    ControlHierarchy,
+    ControlLayer,
+    EscalationEvent,
+    LayerState,
+    SubtaskGoal,
+    TaskDecomposer,
+)
+from leapflow.hardware.lhp_gateway import (
+    DeviceSnapshot,
+    HardwareContextDelta,
+    HardwareContextSnapshot,
+    LHPGateway,
+    LLMPlanSegment,
+    PCDLevel,
+    PlanStep,
+)
 
 __all__ = [
     "HC_VERSION",
@@ -85,6 +126,12 @@ __all__ = [
     "Channel",
     "ContextProvenance",
     "ContextSource",
+    # control_bus.py
+    "ControlBusConfig",
+    "ControlBusStats",
+    "ControlCommand",
+    "ControlPolicy",
+    "ControlState",
     "Direction",
     "Envelope",
     "EvidenceBundle",
@@ -97,6 +144,7 @@ __all__ = [
     "HardwareRegistry",
     "HardwareSettings",
     "HardwareTransport",
+    "HighFrequencyControlBus",
     "Interlock",
     "LoadReport",
     "OperationVerdict",
@@ -114,4 +162,33 @@ __all__ = [
     "VerificationMode",
     "WriteOutcome",
     "collect_evidence",
+    # realtime.py
+    "ControlTelemetryEvent",
+    "ImpedanceController",
+    "PIDJointController",
+    "PolicyChain",
+    "RealtimeControlLoop",
+    "TrajectoryTracker",
+    # control_hierarchy.py
+    "ControlHierarchy",
+    "ControlLayer",
+    "EscalationEvent",
+    "LayerState",
+    "SubtaskGoal",
+    "TaskDecomposer",
+    # lhp_gateway.py
+    "DeviceSnapshot",
+    "HardwareContextDelta",
+    "HardwareContextSnapshot",
+    "LHPGateway",
+    "LLMPlanSegment",
+    "PCDLevel",
+    "PlanStep",
+    # fleet.py
+    "FleetError",
+    "FleetManager",
+    "FleetNode",
+    "FleetSessionRouter",
+    "FleetTopology",
+    "build_fleet_tools",
 ]

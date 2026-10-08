@@ -429,9 +429,36 @@ class PhysicalSkillPlugin:
         *,
         verify: bool = False,
     ) -> dict[str, Any]:
-        """Write action vector to robot and optionally verify."""
+        """Write action vector to robot and optionally verify.
+
+        When the action contains multiple steps (chunked inference) and a
+        hardware registry with RT control support is available, the chunk
+        is dispatched through a :class:`RealtimeControlLoop` for smooth,
+        high-frequency execution.  Falls back to sequential batch writes
+        when the RT path is unavailable or fails.
+        """
         if self._registry is None:
             raise RuntimeError("hardware registry is not bound")
+
+        # Multi-step chunk: attempt RT control loop execution first.
+        action_sequence = self._extract_action_sequence(action)
+        if (
+            len(action_sequence) > 1
+            and hasattr(self._registry, "create_control_bus")
+        ):
+            try:
+                result = await self._execute_chunk_via_rt(
+                    device_id, action_sequence,
+                )
+                if result is not None:
+                    return result
+            except Exception:  # noqa: BLE001 - fallback to batch path
+                logger.debug(
+                    "RT control loop execution failed for %s; "
+                    "falling back to sequential batch writes",
+                    device_id,
+                    exc_info=True,
+                )
 
         device = await self._resolve_device(device_id)
         transport = getattr(device, "transport", None)
@@ -462,16 +489,19 @@ class PhysicalSkillPlugin:
                 "channels_written": len(commands),
             }
         else:
-            # Fallback: sequential writes.
+            # Fallback: sequential writes through the transport directly.
+            # Uses device_io lock for serialisation, matching the governed path.
             written = 0
             last_error = ""
             for cid, val in commands:
                 try:
-                    w = await self._registry.write(device_id, cid, val)
+                    async with self._registry.device_io(device_id):
+                        t = await self._registry.transport(device_id)
+                        w = await t.write(cid, val)
                     if w.ok:
                         written += 1
                     else:
-                        last_error = w.error
+                        last_error = getattr(w, "error", "") or getattr(w, "failure_code", "unknown")
                 except Exception as exc:
                     last_error = str(exc)
             result = {
@@ -489,6 +519,98 @@ class PhysicalSkillPlugin:
                 result["verification"] = verification
 
         return result
+
+    @staticmethod
+    def _extract_action_sequence(action: Any) -> list[Any]:
+        """Extract a sequence of action steps from a policy output.
+
+        A chunked VLA policy may return a list/tuple of action vectors or a
+        2-D array (steps x joints).  A single-step action is returned as a
+        one-element list so the caller can branch on ``len``.
+        """
+        if isinstance(action, (list, tuple)) and action:
+            # Already a sequence of steps (list of dicts or list of arrays).
+            first = action[0]
+            if isinstance(first, (dict, list, tuple)):
+                return list(action)
+            # Could be a flat 1-D vector: treat as single step.
+            return [action]
+        if hasattr(action, "ndim") and action.ndim == 2:
+            # 2-D numpy/torch tensor: each row is one step.
+            return [action[i] for i in range(action.shape[0])]
+        return [action]
+
+    async def _execute_chunk_via_rt(
+        self,
+        device_id: str,
+        action_sequence: list[Any],
+    ) -> dict[str, Any] | None:
+        """Execute an action chunk through a RealtimeControlLoop.
+
+        Builds a trajectory from the action sequence and runs it through
+        PID tracking on the control bus.  Returns a result dict on success,
+        or None to signal the caller should fall back to the batch path.
+        """
+        import asyncio as _asyncio
+
+        from leapflow.hardware.control_bus import ControlBusConfig
+        from leapflow.hardware.realtime import RealtimeControlLoop
+
+        bus = self._registry.create_control_bus(device_id)
+        loop = RealtimeControlLoop(bus)
+
+        # Build waypoints from the action sequence.  Each step is spaced
+        # at ``dt`` seconds, derived from the bus config frequency.
+        config: ControlBusConfig = bus._config
+        dt = 1.0 / config.frequency_hz
+        waypoints: list[tuple[float, dict[str, float]]] = []
+        for idx, step in enumerate(action_sequence):
+            t = idx * dt
+            if isinstance(step, dict):
+                positions = {k: float(v) for k, v in step.items()}
+            elif hasattr(step, "tolist"):
+                vals = step.tolist()
+                positions = {str(i): float(v) for i, v in enumerate(vals)}
+            elif isinstance(step, (list, tuple)):
+                positions = {str(i): float(v) for i, v in enumerate(step)}
+            else:
+                return None  # cannot interpret; fall back
+            waypoints.append((t, positions))
+
+        if not waypoints:
+            return None
+
+        session_id = await loop.start_trajectory(
+            device_id,
+            tuple(waypoints),
+            controller="pid",
+            loop_mode="hold_final",
+        )
+
+        # Wait for trajectory completion with a generous timeout.
+        timeout = len(action_sequence) * dt * 3.0 + 2.0
+        deadline = _asyncio.get_event_loop().time() + timeout
+        while True:
+            status = await loop.status()
+            if status.get("is_complete") or status.get("status") != "running":
+                break
+            if _asyncio.get_event_loop().time() > deadline:
+                logger.warning(
+                    "RT chunk execution timed out after %.1fs on %s",
+                    timeout, device_id,
+                )
+                break
+            await _asyncio.sleep(0.05)
+
+        result = await loop.stop()
+        return {
+            "ok": True,
+            "side_effect_state": "committed",
+            "channels_written": len(waypoints),
+            "execution_mode": "rt_control_loop",
+            "session_id": session_id,
+            "stats": result.get("stats", {}),
+        }
 
     async def _approve_write(
         self,

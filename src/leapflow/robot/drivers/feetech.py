@@ -618,6 +618,55 @@ class FeetechMotorsBus(SerialMotorsBus):
             self.write("Acceleration", motor, acceleration)
 
 
+# ---------------------------------------------------------------------------
+# make_robot() integration
+# ---------------------------------------------------------------------------
+
+
+def _make_feetech_robot(*, robot_type: str = "", **kwargs: Any) -> FeetechMotorsBus:
+    """Factory callable for :func:`~leapflow.robot.base.make_robot` integration.
+
+    Expected keyword arguments:
+
+    - ``serial_port`` (str, required): device path, e.g. ``/dev/ttyACM0``
+    - ``motors`` (dict[str, dict], required): mapping of motor name to
+      ``{"id": int, "model": str}``
+    - ``calibration`` (dict, optional): pre-loaded calibration data
+    - ``protocol_version`` (int, optional): default ``0``
+    """
+    port = str(kwargs.get("serial_port", ""))
+    if not port:
+        raise ValueError("serial_port is required for Feetech motor bus")
+    raw_motors = kwargs.get("motors", {})
+    if not isinstance(raw_motors, dict) or not raw_motors:
+        raise ValueError("motors dict is required (e.g. {'shoulder': {'id': 1, 'model': 'sts3215'}})")
+    motors: dict[str, Motor] = {}
+    for name, spec in raw_motors.items():
+        if isinstance(spec, Motor):
+            motors[name] = spec
+        elif isinstance(spec, dict):
+            motors[name] = Motor(id=int(spec["id"]), model=str(spec["model"]))
+        else:
+            raise ValueError(f"Invalid motor spec for {name!r}: {spec!r}")
+    calibration = kwargs.get("calibration")
+    protocol = int(kwargs.get("protocol_version", DEFAULT_PROTOCOL_VERSION))
+    return FeetechMotorsBus(
+        port=port, motors=motors, calibration=calibration, protocol_version=protocol,
+    )
+
+
+# Discoverable by make_robot() auto-discovery: maps known robot_type names
+# that use Feetech servos to the factory callable.
+ROBOT_TYPES: dict[str, Any] = {
+    "feetech": _make_feetech_robot,
+    "so100": _make_feetech_robot,
+    "so100_follower": _make_feetech_robot,
+    "so100_leader": _make_feetech_robot,
+    "koch_v1.1": _make_feetech_robot,
+    "moss_v1": _make_feetech_robot,
+}
+
+
 __all__ = [
     "FeetechMotorsBus",
     "OperatingMode",

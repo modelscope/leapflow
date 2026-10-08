@@ -534,6 +534,9 @@ class CapabilityRouterPlugin:
 
     Tool generation is lazy: tools are generated on first access to
     ``self.tools`` and regenerated when the registry changes.
+
+    Also exposes ``hw_orchestrate``, which delegates coordinated
+    multi-device operations to :class:`MultiDeviceOrchestrator`.
     """
 
     plugin_id = "capability_router"
@@ -545,6 +548,7 @@ class CapabilityRouterPlugin:
         self._gate: Any = None
         self._skill_plugin: Any = None
         self._tools: list[ToolMetadata] | None = None
+        self._orchestrator: Any = None
 
     def bind_runtime(self, **deps: Any) -> None:
         """Receive the registry, the approval gate, and an optional skill plugin.
@@ -569,10 +573,145 @@ class CapabilityRouterPlugin:
             changed = True
         if changed:
             self._tools = None
+            self._orchestrator = None
+
+    # -- Orchestrator tool handler ------------------------------------------
+
+    def _get_orchestrator(self) -> Any:
+        """Lazily construct a :class:`MultiDeviceOrchestrator`."""
+        if self._orchestrator is None and self._registry is not None:
+            from leapflow.robot.orchestrator import MultiDeviceOrchestrator
+            from leapflow.hardware.tools import HardwareTools
+
+            hw_tools = HardwareTools(self._registry, gate=self._gate)
+            index = CapabilityIndex(self._registry)
+            self._orchestrator = MultiDeviceOrchestrator(
+                self._registry,
+                hardware_tools=hw_tools,
+                capability_index=index,
+            )
+        return self._orchestrator
+
+    async def _hw_orchestrate_handler(self, params: dict) -> dict:
+        """Execute coordinated operations across multiple devices."""
+        from leapflow.robot.orchestrator import (
+            DeviceOperation,
+            OrchestrationStep,
+        )
+
+        orchestrator = self._get_orchestrator()
+        if orchestrator is None:
+            return {"ok": False, "error": "Hardware subsystem not available."}
+
+        mode = str(params.get("mode", "sequential"))
+        raw_ops = params.get("operations") or []
+        if not raw_ops:
+            return {"ok": False, "error": "No operations provided."}
+
+        operations: list[DeviceOperation] = []
+        for idx, raw_op in enumerate(raw_ops):
+            device_id = str(raw_op.get("device_id", ""))
+            if not device_id:
+                return {
+                    "ok": False,
+                    "error": f"Operation [{idx}]: device_id is required.",
+                }
+            raw_cmds = raw_op.get("commands") or []
+            commands = tuple(
+                (str(c.get("channel_id", "")), c.get("value"))
+                for c in raw_cmds
+            )
+            operations.append(DeviceOperation(
+                device_id=device_id,
+                commands=commands,
+                verify=bool(raw_op.get("verify", False)),
+            ))
+
+        step = OrchestrationStep(
+            mode=mode,
+            operations=tuple(operations),
+            barrier_timeout_s=float(params.get("barrier_timeout_s", 10.0)),
+            label=str(params.get("label", "")),
+        )
+        result = await orchestrator.execute_step(step)
+        return {
+            "ok": result.ok,
+            "halted": result.halted,
+            "halt_reason": result.halt_reason,
+            "elapsed_s": round(result.elapsed_s, 3),
+            "step_results": list(result.step_results),
+        }
+
+    def _orchestrate_tool(self) -> ToolMetadata:
+        """Build the ``hw_orchestrate`` ToolMetadata."""
+        return ToolMetadata(
+            name="hw_orchestrate",
+            description=(
+                "Execute coordinated operations across multiple hardware devices.  "
+                "Supports sequential (one-at-a-time), parallel (concurrent), and "
+                "barrier (synchronised) execution modes.  Any failure in a parallel "
+                "group triggers halt_all on every participating device for safety."
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["sequential", "parallel", "barrier"],
+                        "description": "Execution coordination mode.",
+                    },
+                    "operations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "device_id": {"type": "string"},
+                                "commands": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "channel_id": {"type": "string"},
+                                            "value": {"type": "number"},
+                                        },
+                                        "required": ["channel_id", "value"],
+                                    },
+                                },
+                                "verify": {"type": "boolean"},
+                            },
+                            "required": ["device_id", "commands"],
+                        },
+                        "description": "List of per-device operations to coordinate.",
+                    },
+                    "barrier_timeout_s": {
+                        "type": "number",
+                        "description": "Timeout for barrier mode (default 10s).",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Optional human-readable label for the step.",
+                    },
+                },
+                "required": ["mode", "operations"],
+            },
+            handler=self._hw_orchestrate_handler,
+            x_leapflow={
+                "category": "hardware",
+                "risk_level": "high",
+                "requires_approval": True,
+                "effect_scope": "external",
+                "idempotency_scope": "session",
+                "mutates_state": True,
+                "schema_cost": "medium",
+            },
+            mutates_state=True,
+            execution_policy="serial",
+            provides_capabilities=("hw.orchestrate",),
+        )
 
     @property
     def tools(self) -> list[ToolMetadata]:
-        """Return generated affordance tools, empty if no device has capabilities."""
+        """Return generated affordance tools plus hw_orchestrate."""
         if self._registry is None:
             return []
         if self._tools is None:
@@ -585,6 +724,9 @@ class CapabilityRouterPlugin:
             )
             generator = CapabilityToolGenerator(index, executor)
             self._tools = generator.generate()
+            # Always include the multi-device orchestration tool when
+            # the hardware subsystem is active.
+            self._tools.append(self._orchestrate_tool())
         return list(self._tools)
 
 
