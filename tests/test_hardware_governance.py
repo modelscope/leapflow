@@ -1401,7 +1401,7 @@ def test_plugin_exposes_no_tools_until_a_registry_is_bound() -> None:
     assert plugin.plugin_id == "hardware_context"
 
 
-def test_plugin_exposes_exactly_nine_tools_when_bound() -> None:
+def test_plugin_exposes_exactly_twelve_tools_when_bound() -> None:
     """Tool count is fixed regardless of how many devices exist."""
     from leapflow.hardware.plugin import HardwareContextPlugin
 
@@ -1417,6 +1417,9 @@ def test_plugin_exposes_exactly_nine_tools_when_bound() -> None:
         "hw_actuate",
         "hw_batch_actuate",
         "hw_configure",
+        "hw_control_start",
+        "hw_control_status",
+        "hw_control_stop",
         "hw_describe",
         "hw_dispense",
         "hw_estop",

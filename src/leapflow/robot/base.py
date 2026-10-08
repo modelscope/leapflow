@@ -140,22 +140,97 @@ class RobotConfig:
     """Vendor-specific or user-supplied configuration key-values."""
 
 
+# ---------------------------------------------------------------------------
+# Robot type registry
+# ---------------------------------------------------------------------------
+
+_ROBOT_TYPE_REGISTRY: dict[str, Any] = {}
+"""Global mapping of robot type name to a callable that returns a Robot.
+
+Factory callables receive ``(**kwargs) -> Robot``.  Registration happens
+either explicitly via :func:`register_robot_type` or through lazy
+discovery from ``leapflow.robot.drivers``.
+"""
+
+_DISCOVERY_DONE: bool = False
+
+
+def register_robot_type(name: str, factory: Any) -> None:
+    """Register a factory callable for a robot type name.
+
+    The factory must accept keyword arguments and return an object
+    satisfying the :class:`Robot` Protocol.
+    """
+    _ROBOT_TYPE_REGISTRY[name] = factory
+
+
+def _discover_drivers() -> None:
+    """One-shot import of known driver packages to populate the registry.
+
+    Each driver module can call :func:`register_robot_type` at import time
+    or expose a ``ROBOT_TYPES`` dict mapping type names to factory callables.
+    Discovery is best-effort: an import failure skips the driver quietly
+    because hardware dependencies are optional.
+    """
+    global _DISCOVERY_DONE
+    if _DISCOVERY_DONE:
+        return
+    _DISCOVERY_DONE = True
+
+    _driver_modules = (
+        "leapflow.robot.drivers.feetech",
+    )
+    import importlib
+    import logging
+
+    _logger = logging.getLogger(__name__)
+    for mod_path in _driver_modules:
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            _logger.debug("Robot driver %s not importable (optional dependency).", mod_path)
+            continue
+        # Convention: a driver may expose ROBOT_TYPES = {"name": callable}.
+        types_map = getattr(mod, "ROBOT_TYPES", None)
+        if isinstance(types_map, dict):
+            for type_name, factory_fn in types_map.items():
+                _ROBOT_TYPE_REGISTRY.setdefault(type_name, factory_fn)
+
+
 def make_robot(robot_type: str, **kwargs: Any) -> Any:
     """Construct a robot instance by type name.
 
     This is the LeapRobot factory entry point that replaces the upstream
     ``make_robot`` from the open-source robot SDK.
 
-    .. note::
+    Lookup order:
 
-       The concrete registry is not yet implemented — callers should
-       configure ``robot_factory`` directly in the transport config.
-       This stub exists so that internal imports resolve within the
-       ``leapflow.robot`` namespace.
+    1. Explicit registrations via :func:`register_robot_type`.
+    2. Lazy discovery from ``leapflow.robot.drivers.*`` sub-packages.
+    3. A ``robot_factory`` key in *kwargs* (escape hatch for custom robots).
+
+    Raises ``NotImplementedError`` only when no factory can be resolved.
     """
+    # 1. Direct registry hit.
+    factory = _ROBOT_TYPE_REGISTRY.get(robot_type)
+    if factory is not None:
+        return factory(**kwargs)
+
+    # 2. Run driver auto-discovery and retry.
+    _discover_drivers()
+    factory = _ROBOT_TYPE_REGISTRY.get(robot_type)
+    if factory is not None:
+        return factory(**kwargs)
+
+    # 3. Escape hatch: caller-supplied factory callable.
+    custom_factory = kwargs.pop("robot_factory", None)
+    if callable(custom_factory):
+        return custom_factory(**kwargs)
+
     raise NotImplementedError(
-        f"make_robot('{robot_type}') is not yet wired to a robot "
-        "registry; configure robot_factory directly in transport config"
+        f"make_robot('{robot_type}'): no registered factory for this type.  "
+        "Register one with register_robot_type(), declare ROBOT_TYPES in a "
+        "driver module, or pass robot_factory in the transport config."
     )
 
 
@@ -163,4 +238,5 @@ __all__ = [
     "Robot",
     "RobotConfig",
     "make_robot",
+    "register_robot_type",
 ]
