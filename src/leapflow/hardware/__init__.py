@@ -114,6 +114,10 @@ from leapflow.hardware.lhp_gateway import (
     PCDLevel,
     PlanStep,
 )
+from leapflow.hardware.health_monitor import (
+    DeviceHealthRecord,
+    HardwareHealthMonitor,
+)
 
 __all__ = [
     "HC_VERSION",
@@ -191,4 +195,7 @@ __all__ = [
     "FleetSessionRouter",
     "FleetTopology",
     "build_fleet_tools",
+    # health_monitor.py
+    "DeviceHealthRecord",
+    "HardwareHealthMonitor",
 ]
