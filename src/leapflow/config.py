@@ -668,6 +668,12 @@ class Settings:
     llm_context_length: int = DEFAULT_LLM_CONTEXT_LENGTH  # Primary provider's runtime context budget
     llm_credential_cooldown_s: float = 60.0  # Per-key rate-limit cooldown
 
+    # ── Benchmark Qualification ──
+    benchmark_commands: str = "{}"  # JSON benchmark id -> explicit command template
+    benchmark_data_roots: str = "{}"  # JSON benchmark id -> licensed local data root
+    benchmark_license_acceptances: str = "{}"  # JSON license id -> operator acknowledgement
+    benchmark_hardware_profiles: str = "{}"  # JSON device id -> approved Tier4 profile
+
     # ── Stream & Tool Robustness ──
     stale_stream_timeout_s: float = 180.0  # Idle timeout for streaming responses
     default_tool_timeout_s: float = 120.0  # Default per-tool execution timeout
@@ -1338,6 +1344,12 @@ def _build_settings_from_env(
     llm_context_length = int(os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", str(DEFAULT_LLM_CONTEXT_LENGTH)))
     llm_credential_cooldown_s = float(os.getenv("LEAPFLOW_LLM_CREDENTIAL_COOLDOWN_S", "60.0"))
 
+    # Benchmark Qualification
+    benchmark_commands = os.getenv("LEAPFLOW_BENCHMARK_COMMANDS", "{}").strip() or "{}"
+    benchmark_data_roots = os.getenv("LEAPFLOW_BENCHMARK_DATA_ROOTS", "{}").strip() or "{}"
+    benchmark_license_acceptances = os.getenv("LEAPFLOW_BENCHMARK_LICENSE_ACCEPTANCES", "{}").strip() or "{}"
+    benchmark_hardware_profiles = os.getenv("LEAPFLOW_BENCHMARK_HARDWARE_PROFILES", "{}").strip() or "{}"
+
     # Stream & Tool Robustness
     stale_stream_timeout_s = float(os.getenv("LEAPFLOW_STALE_STREAM_TIMEOUT_S", "180.0"))
     default_tool_timeout_s = float(os.getenv("LEAPFLOW_DEFAULT_TOOL_TIMEOUT_S", "120.0"))
@@ -1776,6 +1788,11 @@ def _build_settings_from_env(
         llm_aux_base_url=llm_aux_base_url,
         llm_context_length=llm_context_length,
         llm_credential_cooldown_s=llm_credential_cooldown_s,
+        # Benchmark Qualification
+        benchmark_commands=benchmark_commands,
+        benchmark_data_roots=benchmark_data_roots,
+        benchmark_license_acceptances=benchmark_license_acceptances,
+        benchmark_hardware_profiles=benchmark_hardware_profiles,
         # Stream & Tool Robustness
         stale_stream_timeout_s=stale_stream_timeout_s,
         default_tool_timeout_s=default_tool_timeout_s,

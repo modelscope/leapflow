@@ -1,0 +1,24 @@
+id: hardware_so100
+version: "1.0.0"
+source: "leapflow://tier4/so100"
+adapter: hardware_preflight
+tier: 4
+tags: [hardware, tier4, manipulator, so100]
+required: false
+dependencies: []
+timeouts:
+  availability: 10.0
+  trial: 120.0
+seeds: [42]
+metrics: []
+gates: {}
+note: "Requires an operator-approved benchmark.hardware_profiles.so100 entry with a non-motion preflight_command. Real motion remains separately approval-gated."
+scenarios:
+  - scenario_id: so100_preflight
+    name: "SO-100 connection, e-stop, calibration, and fallback preflight"
+    tags: [hardware, tier4, so100]
+    timeout_seconds: 120.0
+    required: true
+    parameters:
+      device_id: so100
+      topology: single_usb

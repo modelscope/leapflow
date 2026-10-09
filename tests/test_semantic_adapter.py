@@ -43,6 +43,15 @@ async def test_observe_ui_requires_window_target() -> None:
 
 
 @pytest.mark.asyncio
+async def test_screenshot_requires_a_known_window_target() -> None:
+    adapter = _adapter()
+    result = await adapter.screenshot({})
+    assert result["ok"] is False
+    assert result["failure_code"] == "window_target_required"
+    assert result["retryable"] is False
+
+
+@pytest.mark.asyncio
 async def test_observe_ui_indexes_elements() -> None:
     adapter = _adapter()
     observed = await adapter.observe_ui({"pid": 100, "window_id": 1})

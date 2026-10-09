@@ -1,0 +1,38 @@
+id: native_yaml_onboarding
+version: "1.0.0"
+source: "leapflow://native"
+adapter: native_yaml_onboarding
+tier: 1
+tags:
+  - native
+  - onboarding
+  - yaml
+required: false
+dependencies:
+  - python:yaml
+timeouts:
+  availability: 5.0
+  trial: 60.0
+seeds:
+  - 42
+metrics:
+  - onboarding_success_rate
+  - loaded_context_count
+gates:
+  onboarding_success_rate: 1.0
+scenarios:
+  - scenario_id: yaml_context_load
+    name: "Load example YAML HardwareContext declarations"
+    tags: [native, onboarding, tier1]
+    timeout_seconds: 30.0
+    required: true
+  - scenario_id: control_binding_resolution
+    name: "Resolve YAML-derived control binding"
+    tags: [native, onboarding, tier1]
+    timeout_seconds: 30.0
+    required: true
+  - scenario_id: capability_tool_generation
+    name: "Generate tools from declared affordances"
+    tags: [native, onboarding, tier1]
+    timeout_seconds: 30.0
+    required: true

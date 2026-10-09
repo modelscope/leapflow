@@ -32,6 +32,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from leapflow.hardware.degradation import DegradationCoordinator
+
 logger = logging.getLogger(__name__)
 
 
@@ -283,33 +285,13 @@ class HardwareHealthMonitor:
 
         record.degradation_reason = reason
 
-        if policy_action == "halt":
-            await self._execute_halt(device_id, reason=reason)
-            record.degradation_policy_active = "halt"
-        elif policy_action == "hold_position":
-            await self._execute_hold_position(device_id)
-            record.degradation_policy_active = "hold_position"
-        elif policy_action == "safe_return":
-            await self._execute_safe_return(device_id)
-            record.degradation_policy_active = "safe_return"
-        elif policy_action == "switch_sensor":
-            await self._execute_switch_sensor(device_id, "")
-            record.degradation_policy_active = "switch_sensor"
-        elif policy_action == "continue_blind":
-            logger.warning(
-                "HealthMonitor: device %s degraded (%s) — continuing blind per policy",
-                device_id,
-                reason,
-            )
-            record.degradation_policy_active = "continue_blind"
-        else:
-            logger.warning(
-                "HealthMonitor: unknown degradation action %r for device %s; halting",
-                policy_action,
-                device_id,
-            )
-            await self._execute_halt(device_id, reason=f"unknown policy: {policy_action}")
-            record.degradation_policy_active = "halt"
+        outcome = await DegradationCoordinator(self._registry, context).execute(
+            policy_action,
+            reason=reason,
+        )
+        record.degradation_policy_active = outcome.action
+        if outcome.error:
+            record.degradation_reason = f"{reason}: {outcome.error}"
 
     async def _execute_halt(self, device_id: str, reason: str) -> None:
         """Halt a device immediately via the registry transport."""

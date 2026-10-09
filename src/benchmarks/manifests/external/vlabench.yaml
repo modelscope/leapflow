@@ -1,0 +1,65 @@
+id: vlabench
+version: "1.0.0"
+source: "https://vlabench.github.io/"
+paper: "https://arxiv.org/abs/2412.18194"
+repo: "https://github.com/OpenMOSS/VLABench"
+license: "UNKNOWN"
+setup_guidance: "Use the official VLABench evaluation tracks and standard evaluation episodes. Configure benchmark.commands.vlabench with the official evaluation script, benchmark.data_roots.vlabench with the official evaluation dataset, and emit the official success_rate JSON summary for the selected track."
+official:
+  implementation: "OpenMOSS/VLABench"
+  evaluator: "scripts/evaluate_policy.py or official multi-GPU evaluation script"
+  protocol: "Official evaluation_tracks with fixed episodes"
+  dataset: "Official VLABench standard evaluation episodes"
+  result_contract: "Final JSON line with success_rate for the selected official track."
+adapter: vlabench
+tier: 2
+tags:
+  - vla
+  - manipulation
+  - visual-grounding
+  - simulation
+required: false
+dependencies:
+  - config:benchmark.commands.vlabench
+  - config:benchmark.data_roots.vlabench
+timeouts:
+  availability: 10.0
+  trial: 600.0
+seeds:
+  - 42
+metrics:
+  - success_rate
+gates: {}
+scenarios:
+  - scenario_id: track_1_in_distribution
+    name: "VLABench Track 1: in-distribution"
+    description: "Official fixed-episode in-distribution policy evaluation track."
+    tags: [vla, official, in-distribution]
+    timeout_seconds: 3600.0
+    required: true
+    parameters:
+      official_metrics: [success_rate]
+  - scenario_id: track_2_cross_category
+    name: "VLABench Track 2: cross-category"
+    description: "Official fixed-episode cross-category generalization track."
+    tags: [vla, official, generalization]
+    timeout_seconds: 3600.0
+    required: true
+    parameters:
+      official_metrics: [success_rate]
+  - scenario_id: track_4_semantic_instruction
+    name: "VLABench Track 4: semantic instruction"
+    description: "Official fixed-episode semantic-instruction generalization track."
+    tags: [vla, official, language]
+    timeout_seconds: 3600.0
+    required: false
+    parameters:
+      official_metrics: [success_rate]
+  - scenario_id: track_6_unseen_texture
+    name: "VLABench Track 6: unseen texture"
+    description: "Official fixed-episode visual-robustness track."
+    tags: [vla, official, visual-robustness]
+    timeout_seconds: 3600.0
+    required: false
+    parameters:
+      official_metrics: [success_rate]

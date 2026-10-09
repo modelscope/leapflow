@@ -25,6 +25,7 @@ import asyncio
 import hashlib
 import logging
 import shlex
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 from leapflow.domain.events import UIElement, UISnapshot
@@ -42,6 +43,35 @@ def _window_target(params: Dict[str, Any]) -> Optional[Tuple[int, int]]:
         return int(pid), int(window_id)
     except (TypeError, ValueError):
         return None
+
+
+def _window_target_required_result() -> Dict[str, Any]:
+    """Describe the CUA screenshot precondition without invoking perception."""
+    return {
+        "ok": False,
+        "error": (
+            "screenshot requires pid and window_id from list_windows (or a prior "
+            "observe_ui); cua-driver has no full-display capture capability."
+        ),
+        "failure_class": "invalid_request",
+        "failure_code": "window_target_required",
+        "retryable": False,
+        "dependency_blocked": ["window_target"],
+        "suggestion": "Call list_windows and pass one window's pid and window_id.",
+    }
+
+
+def _window_discovery_invalid_result(result: Any) -> Dict[str, Any]:
+    """Reject malformed discovery before a caller can treat it as a target list."""
+    return {
+        "ok": False,
+        "error": "list_windows requires {'windows': [mapping, ...]} from the platform driver",
+        "failure_class": "driver_contract",
+        "failure_code": "window_discovery_invalid_result",
+        "retryable": False,
+        "result_type": type(result).__name__,
+        "suggestion": "Recover list_windows before attempting a screenshot.",
+    }
 
 
 def _launch_window_target(launch_result: Dict[str, Any]) -> Optional[Tuple[int, int]]:
@@ -180,11 +210,16 @@ class SemanticAdapter:
         return result
 
     async def list_windows(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """List top-level windows — the source of pid/window_id targets."""
+        """List validated top-level windows — the source of pid/window_id targets."""
         result = await self._perception.list_windows()
-        if isinstance(result, dict):
-            return {"ok": True, **result}
-        return {"ok": True, "windows": result}
+        if isinstance(result, dict) and result.get("ok") is False:
+            return result
+        if not isinstance(result, Mapping):
+            return _window_discovery_invalid_result(result)
+        windows = result.get("windows")
+        if not isinstance(windows, list) or not all(isinstance(item, Mapping) for item in windows):
+            return _window_discovery_invalid_result(result)
+        return {**dict(result), "ok": True, "windows": [dict(item) for item in windows]}
 
     async def get_clipboard(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Read current clipboard text."""
@@ -458,18 +493,23 @@ class SemanticAdapter:
         }
 
     async def screenshot(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Capture a screenshot for visual state verification.
-
-        With a pid/window_id target (explicit or remembered) captures that
-        window; otherwise captures the full desktop.
-        """
+        """Capture a screenshot for visual verification of one known window."""
         target = _window_target(params) or self._current_target()
         if target is None:
-            result = await self._perception.capture_screenshot()
-        else:
-            result = await self._perception.capture_screenshot(
-                pid=target[0], window_id=target[1]
-            )
+            return _window_target_required_result()
+        result = await self._perception.capture_screenshot(
+            pid=target[0], window_id=target[1]
+        )
+        if not isinstance(result, dict):
+            return {
+                "ok": False,
+                "error": "screenshot driver returned an invalid result",
+                "failure_class": "driver_contract",
+                "failure_code": "screenshot_invalid_result",
+                "retryable": False,
+            }
+        if result.get("ok") is False:
+            return result
         return {"ok": True, "captured": True, **result}
 
     async def wait_until_stable(self, params: Dict[str, Any]) -> Dict[str, Any]:

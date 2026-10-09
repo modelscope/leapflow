@@ -159,6 +159,37 @@ async def test_capture_screenshot_returns_path() -> None:
     assert result["path"].endswith(".png")
 
 
+@pytest.mark.asyncio
+async def test_targetless_capture_fails_before_creating_output_or_calling_rpc() -> None:
+    class CountingRpc:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def call(self, method: str, params: dict | None = None):
+            self.calls.append((method, params or {}))
+            raise AssertionError("targetless capture must not issue an RPC")
+
+    rpc = CountingRpc()
+    perception = DarwinPerceptionAdapter(rpc, _manifest())
+    result = await perception.capture_screenshot()
+    assert result["ok"] is False
+    assert result["failure_code"] == "window_target_required"
+    assert "path" not in result and rpc.calls == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_window_discovery_shape_is_not_repackaged_as_windows() -> None:
+    class InvalidDiscoveryRpc:
+        async def call(self, method: str, params: dict | None = None):
+            assert method == "ax.list"
+            return {"windows": "driver error text"}
+
+    perception = DarwinPerceptionAdapter(InvalidDiscoveryRpc(), _manifest())
+    result = await perception.list_windows()
+    assert result["ok"] is False
+    assert result["failure_code"] == "window_discovery_invalid_result"
+
+
 # ── R7: exec_shell runs locally ──────────────────────────────────────────────
 
 @pytest.mark.asyncio

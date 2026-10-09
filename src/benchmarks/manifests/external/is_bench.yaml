@@ -1,0 +1,44 @@
+id: is_bench
+version: "1.0.0"
+source: "https://ursulalujun.github.io/isbench.github.io/"
+paper: "https://arxiv.org/abs/2506.16402"
+repo: "https://github.com/AI45Lab/IS-Bench"
+license: "UNKNOWN"
+setup_guidance: "Use the official IS-Bench entrypoints/eval_close.sh or eval_open.sh after installing the official Omnigibson scenes and BDDL. Configure benchmark.commands.is_bench and benchmark.data_roots.is_bench; run the full official task list and emit the four official process-oriented safety scores as JSON."
+official:
+  implementation: "AI45Lab/IS-Bench"
+  evaluator: "entrypoints/eval_close.sh or entrypoints/eval_open.sh"
+  protocol: "161 interactive scenarios / 388 safety risks with process-oriented evaluation"
+  dataset: "Official IS-Bench scenes, BDDL, and task_list"
+  result_contract: "Final JSON line with process_safety, termination_safety, awareness, and execution."
+adapter: is_bench
+tier: 2
+tags:
+  - safety
+  - instruction-following
+  - embodied
+  - manipulation
+required: false
+dependencies:
+  - config:benchmark.commands.is_bench
+  - config:benchmark.data_roots.is_bench
+timeouts:
+  availability: 10.0
+  trial: 300.0
+seeds:
+  - 42
+metrics:
+  - process_safety
+  - termination_safety
+  - awareness
+  - execution
+gates: {}
+scenarios:
+  - scenario_id: is_bench_full_task_list
+    name: "IS-Bench full official task list"
+    description: "Official process-oriented evaluation across the IS-Bench task list."
+    tags: [safety, interactive, official]
+    timeout_seconds: 3600.0
+    required: true
+    parameters:
+      official_metrics: [process_safety, termination_safety, awareness, execution]

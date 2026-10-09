@@ -107,6 +107,20 @@ _BOOTSTRAP_ONLY_SETTINGS = frozenset({
 _SECRET_SETTINGS = frozenset({"llm_api_key", "vlm_api_key", "llm_aux_api_key", "compression_api_key"})
 
 _FIELD_DESCRIPTIONS = {
+    "benchmark.commands": (
+        "JSON object mapping external benchmark ids to explicitly approved command templates. "
+        "The harness never downloads, installs, or invents commands."
+    ),
+    "benchmark.data_roots": (
+        "JSON object mapping benchmark ids to licensed local dataset roots used by external adapters."
+    ),
+    "benchmark.license_acceptances": (
+        "JSON object recording operator-accepted benchmark license identifiers."
+    ),
+    "benchmark.hardware_profiles": (
+        "JSON object mapping Tier4 device ids to operator-approved non-motion preflight profiles. "
+        "Real hardware execution still requires --confirm-hardware and normal approval gates."
+    ),
     "mcp.approval_mode": (
         "Approval policy for tools from external MCP servers, which run third-party code "
         "with this agent's privileges. mutating_only assesses every tool that does not "

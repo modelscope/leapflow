@@ -1,0 +1,24 @@
+id: hardware_unitree_g1
+version: "1.0.0"
+source: "leapflow://tier4/unitree-g1"
+adapter: hardware_preflight
+tier: 4
+tags: [hardware, tier4, humanoid, unitree-g1]
+required: false
+dependencies: []
+timeouts:
+  availability: 10.0
+  trial: 120.0
+seeds: [42]
+metrics: []
+gates: {}
+note: "Requires an operator-approved benchmark.hardware_profiles.unitree_g1 entry with a non-motion preflight_command. Real motion remains separately approval-gated."
+scenarios:
+  - scenario_id: unitree_g1_preflight
+    name: "Unitree G1 connection, e-stop, calibration, and topology preflight"
+    tags: [hardware, tier4, unitree-g1]
+    timeout_seconds: 120.0
+    required: true
+    parameters:
+      device_id: unitree_g1
+      topology: dual_host_mcp

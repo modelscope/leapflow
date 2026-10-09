@@ -296,7 +296,26 @@ def _tool_result_detail(metadata: dict[str, Any] | None) -> str:
         return ""
     if metadata.get("ok") is False:
         exit_code = metadata.get("exit_code")
-        prefix = f"exit={exit_code} " if exit_code is not None else ""
+        state: list[str] = []
+        failure_code = _metadata_text(metadata, "failure_code")
+        if failure_code:
+            state.append(f"code={failure_code}")
+        if "retryable" in metadata:
+            state.append("retry=yes" if bool(metadata["retryable"]) else "retry=no")
+        repeat_count = metadata.get("failure_repeat_count")
+        if isinstance(repeat_count, int) and repeat_count > 0:
+            state.append(f"repeat={repeat_count}")
+        blocked = metadata.get("dependency_blocked")
+        if isinstance(blocked, (list, tuple)) and blocked:
+            state.append("blocked=" + ",".join(str(item) for item in blocked[:3]))
+        retry_after = metadata.get("retry_after_s")
+        if isinstance(retry_after, (int, float)) and retry_after > 0:
+            state.append(f"cooldown={retry_after:.1f}s")
+        prefix = " ".join(state)
+        if exit_code is not None:
+            prefix = f"{prefix} exit={exit_code}".strip()
+        if prefix:
+            prefix += " "
         # error_preview first: the tool already clipped it to the informative end
         # of the output, while stderr_preview starts at the top of the dump.
         detail = (
@@ -304,9 +323,22 @@ def _tool_result_detail(metadata: dict[str, Any] | None) -> str:
             or _metadata_text(metadata, "stderr_preview")
             or _metadata_text(metadata, "result_preview")
         )
-        if not (detail or prefix):
+        suggestion = _metadata_text(metadata, "suggestion") or _metadata_text(metadata, "next_step")
+        next_detail = f"Next: {_truncate_detail(suggestion, limit=96)}" if suggestion else ""
+        if not (detail or prefix or next_detail):
             return "failed"
-        return _truncate_detail(prefix + detail, limit=_TOOL_OUTPUT_LIMIT, keep_tail=True)
+        if prefix:
+            # Stable state and the next action must not disappear behind a long
+            # traceback; trim only the free-form diagnostic portion.
+            detail_limit = max(0, _TOOL_OUTPUT_LIMIT - len(prefix) - len(next_detail) - 1)
+            detail_part = (
+                _truncate_detail(detail, limit=max(1, detail_limit), keep_tail=True)
+                if detail and detail_limit > 0 else ""
+            )
+            return prefix + " ".join(part for part in (detail_part, next_detail) if part)
+        if next_detail:
+            detail = f"{detail} {next_detail}".strip()
+        return _truncate_detail(detail, limit=_TOOL_OUTPUT_LIMIT, keep_tail=True)
     detail = (
         _metadata_text(metadata, "stdout_preview")
         or _metadata_text(metadata, "content_preview")

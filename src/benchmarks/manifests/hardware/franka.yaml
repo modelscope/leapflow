@@ -1,0 +1,24 @@
+id: hardware_franka
+version: "1.0.0"
+source: "leapflow://tier4/franka"
+adapter: hardware_preflight
+tier: 4
+tags: [hardware, tier4, manipulator, franka]
+required: false
+dependencies: []
+timeouts:
+  availability: 10.0
+  trial: 120.0
+seeds: [42]
+metrics: []
+gates: {}
+note: "Requires an operator-approved benchmark.hardware_profiles.franka entry with a non-motion preflight_command. Real motion remains separately approval-gated."
+scenarios:
+  - scenario_id: franka_preflight
+    name: "Franka connection, e-stop, home pose, and sensor fallback preflight"
+    tags: [hardware, tier4, franka]
+    timeout_seconds: 120.0
+    required: true
+    parameters:
+      device_id: franka
+      topology: dual_host_mcp

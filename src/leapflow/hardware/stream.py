@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Deque, Iterable, Iterator
 
 from leapflow.hardware.context import Channel, DegradationPolicy, HardwareContext, Quality, as_numeric
+from leapflow.hardware.degradation import DegradationCoordinator
 from leapflow.hardware.transport import Reading
 
 logger = logging.getLogger(__name__)
@@ -414,6 +415,7 @@ class HardwareStreamSource:
         self._store = reading_store
         self._alert_policy = alert_policy
         self._degradation_policy = degradation_policy
+        self._degradation_coordinator = DegradationCoordinator(registry, context)
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._last_emitted: dict[str, float] = {}
@@ -425,6 +427,7 @@ class HardwareStreamSource:
         self._degradation_triggered: bool = False
         self._sensor_loss_streak: int = 0
         self._sensor_loss_triggered: bool = False
+        self._last_degradation_outcome: Any = None
 
     @property
     def source_id(self) -> str:
@@ -498,10 +501,13 @@ class HardwareStreamSource:
                 next_at = time.monotonic()
                 continue
 
-            # Recovery: clear comm-loss state.
+            # Recovery: clear comm-loss state only after a healthy read.
             if consecutive_failures > 0 or self._comm_loss_start is not None:
                 self._comm_loss_start = None
                 self._degradation_triggered = False
+                self._registry.clear_degradation(
+                    self._context.device_id, recovery="healthy_stream_read"
+                )
             consecutive_failures = 0
             self._samples += 1
             lost = self.ring.record(reading)
@@ -551,6 +557,10 @@ class HardwareStreamSource:
         policy = self._degradation_policy
         if reading.quality == Quality.OK.value:
             self._sensor_loss_streak = 0
+            if self._sensor_loss_triggered:
+                self._registry.clear_degradation(
+                    self._context.device_id, recovery="healthy_sensor_read"
+                )
             self._sensor_loss_triggered = False
             return
         self._sensor_loss_streak += 1
@@ -565,62 +575,34 @@ class HardwareStreamSource:
         await self._execute_degradation(policy.sensor_loss_policy, reason="sensor_loss")
 
     async def _execute_degradation(self, action: str, *, reason: str) -> None:
-        """Carry out the declared degradation action against the transport.
+        """Delegate every transition to the shared fail-closed coordinator."""
+        outcome = await self._degradation_coordinator.execute(
+            action,
+            reason=reason,
+            failed_channel_id=self._channel.channel_id,
+            sensor_switcher=self._switch_sensor,
+        )
+        self._last_degradation_outcome = outcome
+        if outcome.completed and outcome.action == "switch_sensor":
+            self._degradation_triggered = False
+            self._sensor_loss_triggered = False
 
-        ``halt``          -> stop every writable channel immediately via the
-                             transport's lock-free halt path.
-        ``hold_position`` -> stop issuing new commands; the device retains its
-                             last commanded position.  The runtime signal is a
-                             log line; command gating is enforced by callers
-                             reading :attr:`degradation_triggered`.
-        ``safe_return``   -> currently logged and treated as ``hold_position``
-                             until a per-device home position is declared.
-        """
-        device_id = self._context.device_id
+    async def _switch_sensor(self, target_channel_id: str) -> bool:
+        """Verify and atomically switch this source to a declared fallback."""
+        target = self._context.channel(target_channel_id)
+        if target is None or not target.is_readable:
+            return False
         try:
-            if action == "halt":
-                transport = await self._registry.transport(device_id)
-                # halt() is lock-free by design: an emergency stop must preempt
-                # any device_io lock the sampling loop is holding.
-                await transport.halt()
-                logger.warning(
-                    "DegradationPolicy halted device %s (%s)",
-                    device_id,
-                    reason,
-                )
-            elif action == "hold_position":
-                logger.warning(
-                    "DegradationPolicy holding position on device %s (%s)",
-                    device_id,
-                    reason,
-                )
-            elif action == "safe_return":
-                logger.warning(
-                    "DegradationPolicy safe_return requested on device %s (%s); "
-                    "no home position declared, holding position",
-                    device_id,
-                    reason,
-                )
-            elif action == "continue_blind":
-                logger.warning(
-                    "DegradationPolicy continue_blind on device %s (%s)",
-                    device_id,
-                    reason,
-                )
-            else:
-                logger.warning(
-                    "DegradationPolicy unknown action %r on device %s (%s)",
-                    action,
-                    device_id,
-                    reason,
-                )
-        except Exception as exc:  # noqa: BLE001 - degradation must not stop sampling
-            logger.warning(
-                "DegradationPolicy execution failed for %s: %s",
-                device_id,
-                exc,
-                exc_info=True,
-            )
+            async with self._registry.device_io(self._context.device_id):
+                transport = await self._registry.transport(self._context.device_id)
+                reading = await transport.read(target_channel_id)
+        except Exception:  # noqa: BLE001 - coordinator records the fail-closed outcome
+            return False
+        if reading.quality != Quality.OK.value:
+            return False
+        self._channel = target
+        self._detector = HardwareEventDetector(self._context, target)
+        return True
 
     @property
     def degradation_triggered(self) -> bool:
@@ -630,6 +612,11 @@ class HardwareStreamSource:
         decide whether to issue new writes without blocking the sampling loop.
         """
         return self._degradation_triggered or self._sensor_loss_triggered
+
+    @property
+    def last_degradation_outcome(self) -> Any | None:
+        """Return the most recent governed degradation transition."""
+        return self._last_degradation_outcome
 
     async def _persist(self, reading: Reading, *, lost: int) -> None:
         """Buffer one sample and, when a window closes, write it off the sampling path.
@@ -788,6 +775,7 @@ class BatchStreamCoordinator:
         self._store = reading_store
         self._alert_policy = alert_policy
         self._degradation_policy = degradation_policy
+        self._degradation_coordinator = DegradationCoordinator(registry, context)
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._last_emitted: dict[str, float] = {}
@@ -799,6 +787,7 @@ class BatchStreamCoordinator:
         self._degradation_triggered: bool = False
         self._sensor_loss_streak: int = 0
         self._sensor_loss_triggered: bool = False
+        self._last_degradation_outcome: Any = None
 
     @property
     def source_id(self) -> str:
@@ -868,6 +857,9 @@ class BatchStreamCoordinator:
             if consecutive_failures > 0 or self._comm_loss_start is not None:
                 self._comm_loss_start = None
                 self._degradation_triggered = False
+                self._registry.clear_degradation(
+                    self._context.device_id, recovery="healthy_batch_read"
+                )
             consecutive_failures = 0
             self._samples += 1
 
@@ -912,6 +904,10 @@ class BatchStreamCoordinator:
         policy = self._degradation_policy
         if reading.quality == Quality.OK.value:
             self._sensor_loss_streak = 0
+            if self._sensor_loss_triggered:
+                self._registry.clear_degradation(
+                    self._context.device_id, recovery="healthy_batch_sensor_read"
+                )
             self._sensor_loss_triggered = False
             return
         self._sensor_loss_streak += 1
@@ -923,55 +919,54 @@ class BatchStreamCoordinator:
         await self._execute_degradation(policy.sensor_loss_policy, reason="sensor_loss")
 
     async def _execute_degradation(self, action: str, *, reason: str) -> None:
-        """Carry out the declared degradation action, mirroring HardwareStreamSource."""
-        device_id = self._context.device_id
+        """Delegate batch-source transitions to the shared coordinator."""
+        failed_channel_id = self._channel_ids[0] if self._channel_ids else ""
+        outcome = await self._degradation_coordinator.execute(
+            action,
+            reason=reason,
+            failed_channel_id=failed_channel_id,
+            sensor_switcher=self._switch_sensor,
+        )
+        self._last_degradation_outcome = outcome
+        if outcome.completed and outcome.action == "switch_sensor":
+            self._degradation_triggered = False
+            self._sensor_loss_triggered = False
+
+    async def _switch_sensor(self, target_channel_id: str) -> bool:
+        """Replace one failed batch input only after healthy fallback readback."""
+        target = self._context.channel(target_channel_id)
+        if target is None or not target.is_readable:
+            return False
         try:
-            if action == "halt":
-                transport = await self._registry.transport(device_id)
-                await transport.halt()
-                logger.warning(
-                    "DegradationPolicy halted device %s (%s)",
-                    device_id,
-                    reason,
-                )
-            elif action == "hold_position":
-                logger.warning(
-                    "DegradationPolicy holding position on device %s (%s)",
-                    device_id,
-                    reason,
-                )
-            elif action == "safe_return":
-                logger.warning(
-                    "DegradationPolicy safe_return requested on device %s (%s); "
-                    "no home position declared, holding position",
-                    device_id,
-                    reason,
-                )
-            elif action == "continue_blind":
-                logger.warning(
-                    "DegradationPolicy continue_blind on device %s (%s)",
-                    device_id,
-                    reason,
-                )
-            else:
-                logger.warning(
-                    "DegradationPolicy unknown action %r on device %s (%s)",
-                    action,
-                    device_id,
-                    reason,
-                )
-        except Exception as exc:  # noqa: BLE001 - degradation must not stop sampling
-            logger.warning(
-                "DegradationPolicy execution failed for %s: %s",
-                device_id,
-                exc,
-                exc_info=True,
-            )
+            async with self._registry.device_io(self._context.device_id):
+                transport = await self._registry.transport(self._context.device_id)
+                reading = await transport.read(target_channel_id)
+        except Exception:  # noqa: BLE001 - coordinator performs the fail-closed fallback
+            return False
+        if reading.quality != Quality.OK.value:
+            return False
+        failed = next(
+            (channel_id for channel_id in self._channel_ids if channel_id != target_channel_id),
+            "",
+        )
+        updated = tuple(
+            target if channel.channel_id == failed else channel for channel in self._channels
+        )
+        self._channels = updated
+        self._channel_ids = tuple(dict.fromkeys(channel.channel_id for channel in updated))
+        self._rings.setdefault(target_channel_id, ReadingRing(DEFAULT_RING_CAPACITY))
+        self._detectors[target_channel_id] = HardwareEventDetector(self._context, target)
+        return True
 
     @property
     def degradation_triggered(self) -> bool:
         """Return True while a declared degradation action is in effect."""
         return self._degradation_triggered or self._sensor_loss_triggered
+
+    @property
+    def last_degradation_outcome(self) -> Any | None:
+        """Return the most recent governed degradation transition."""
+        return self._last_degradation_outcome
 
     async def _persist(self, reading: Reading, *, lost: int) -> None:
         """Buffer one sample for persistence, mirroring HardwareStreamSource._persist."""
