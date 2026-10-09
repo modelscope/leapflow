@@ -3284,10 +3284,28 @@ def build_gateway_payload(ctx: "Context") -> dict[str, Any]:
 
 
 async def _execute_host(ctx: "Context", args: str) -> dict[str, Any]:
-    """Execute /host command."""
-    action = args.strip().lower() if args.strip() else "status"
-    if action not in {"status", "start", "stop", "restart"}:
-        return {"ok": False, "message": "Usage: /host [status|start|stop|restart]"}
+    """Execute a declared /host action and preserve backend failure state."""
+    from leapflow.cli.commands.registry import (
+        command_action_usage,
+        resolve_command,
+        resolve_command_action,
+    )
+
+    command = resolve_command("host")
+    if command is None:
+        logger.error("Host command is missing from the command registry")
+        return {"ok": False, "message": "Host control is unavailable."}
+    action_def = resolve_command_action(command, args)
+    if action_def is None:
+        return {
+            "ok": False,
+            "message": (
+                f"{command_action_usage(command)}\n"
+                "Use Tab after `/host ` to choose an action."
+            ),
+        }
+
+    action = action_def.name
     if action == "status":
         result = await ctx.host_backend_status()
     elif action == "start":
@@ -3296,7 +3314,16 @@ async def _execute_host(ctx: "Context", args: str) -> dict[str, Any]:
         result = await ctx.host_backend_stop()
     else:
         result = await ctx.host_backend_restart()
-    return {"ok": True, "view": "host", "action": action, "result": result}
+
+    succeeded = bool(result.get("ok", True))
+    message = "" if succeeded else str(result.get("last_error") or "Host control failed.")
+    return {
+        "ok": succeeded,
+        "view": "host",
+        "action": action,
+        "result": result,
+        "message": message,
+    }
 
 
 async def _distill_background(session) -> None:
@@ -3805,6 +3832,9 @@ def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> N
     if view.startswith("plugin_"):
         render_plugin_payload(console, payload)
         return
+    if view == "host":
+        _render_host_view(console, payload)
+        return
     if not payload.get("ok"):
         console.warning(str(payload.get("message") or payload.get("error") or "Command failed."))
         return
@@ -3823,9 +3853,6 @@ def render_command_payload(console: "LeapConsole", payload: dict[str, Any]) -> N
         return
     if view == "gateway":
         _render_gateway_view(console, payload)
-        return
-    if view == "host":
-        _render_host_view(console, payload)
         return
     if view == "skill_list":
         _render_skill_list_view(console, payload)
@@ -4181,16 +4208,84 @@ def _render_gateway_view(console: "LeapConsole", payload: dict[str, Any]) -> Non
 
 
 def _render_host_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
-    result = payload.get("result") or {}
-    action = payload.get("action") or "status"
+    """Render host state, recovery evidence, and all available actions."""
+    from rich.panel import Panel
+    from rich.text import Text
+
+    from leapflow.cli.commands.registry import command_action_entries, resolve_command
+
+    result = dict(payload.get("result") or {})
+    action = str(payload.get("action") or "status")
+    succeeded = bool(payload.get("ok", True))
     if action != "status":
-        console.success(f"Host {action} completed.")
-    lines = []
-    for key in ("status", "backend", "pid", "session_id"):
-        if key in result:
-            lines.append(f"  {key}: {result[key]}")
-    if lines:
-        console.system("\n".join(lines))
+        if succeeded:
+            console.success(f"Host {action} completed.")
+        else:
+            console.warning(f"Host {action} failed.")
+
+    info = Text()
+    started = bool(result.get("started")) and str(result.get("backend") or "") != "mock"
+    info.append("Desktop control: ", style="dim")
+    info.append(
+        "online\n" if started else "offline\n",
+        style="bold green" if started else "bold yellow",
+    )
+    info.append(
+        "CuaDriver provides screenshots, UI automation, and app or clipboard actions.\n\n",
+        style="dim",
+    )
+
+    backend = str(result.get("backend") or "unknown")
+    info.append("Backend:         ", style="dim")
+    info.append(f"{backend}\n")
+    if result.get("cua_status"):
+        info.append("Driver health:   ", style="dim")
+        info.append(f"{result['cua_status']}\n")
+    if result.get("tools_count") is not None:
+        info.append("Driver tools:    ", style="dim")
+        info.append(f"{result['tools_count']}\n")
+    if result.get("restart_count") is not None:
+        info.append("Driver restarts: ", style="dim")
+        info.append(f"{result['restart_count']}\n")
+
+    operation_health = result.get("operation_health") or {}
+    degraded = []
+    if isinstance(operation_health, dict):
+        for operation, health in sorted(operation_health.items()):
+            if not isinstance(health, dict) or health.get("state") == "healthy":
+                continue
+            failure_code = str(health.get("last_failure_code") or "unknown failure")
+            degraded.append(f"{operation}: {health.get('state')} ({failure_code})")
+    if degraded:
+        info.append("Degraded operations:\n", style="bold yellow")
+        for item in degraded:
+            info.append(f"  • {item}\n", style="yellow")
+    if result.get("last_error"):
+        info.append("Driver error: ", style="bold red")
+        info.append(f"{result['last_error']}\n", style="red")
+    elif not succeeded and payload.get("message"):
+        info.append("Driver error: ", style="bold red")
+        info.append(f"{payload['message']}\n", style="red")
+
+    command = resolve_command("host")
+    if command is not None:
+        info.append("\nActions:\n", style="bold cyan")
+        for name, description in command_action_entries(command):
+            info.append(f"  /host {name:<7}", style="cyan")
+            info.append(f"{description}\n", style="dim")
+    info.append("\nSetup or diagnose in a terminal: ", style="dim")
+    info.append("leap host doctor", style="cyan")
+    info.append(" · ", style="dim")
+    info.append("leap host install", style="cyan")
+
+    console.print(
+        Panel(
+            info,
+            title="[bold cyan]Host Control[/]",
+            border_style="bright_black",
+            padding=(0, 2),
+        )
+    )
 
 
 def _render_skill_list_view(console: "LeapConsole", payload: dict[str, Any]) -> None:
