@@ -393,15 +393,38 @@ _STILL_ACTIVE = 259
 _ERROR_ACCESS_DENIED = 5
 
 
+def _process_is_zombie(pid: int) -> bool:
+    """Return whether a non-child POSIX process is a zombie.
+
+    ``waitpid`` can only reap a child of this CLI process. A daemon whose parent
+    died first remains a zombie under another parent, and ``kill(pid, 0)`` still
+    reports it as alive forever. ``ps`` is the portable macOS/Linux way to read
+    that process state; a failure is conservative and leaves normal liveness
+    probing unchanged.
+    """
+    if sys.platform == "win32":
+        return False
+    try:
+        probe = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0 and probe.stdout.lstrip().startswith("Z")
+
+
 def _process_alive(pid: int) -> bool:
     """Return True if the process with the given PID is still running.
 
     A daemon spawned by the current process lingers as an unreaped zombie after
     it exits (including after ``SIGKILL``); ``os.kill(pid, 0)`` still succeeds
     for zombies, which would make a successful stop look like a failure. Reap
-    our own exited children first so a terminated daemon is correctly reported
-    as gone. For processes that are not our children, reaping is a no-op and we
-    fall back to the ``os.kill`` liveness probe.
+    our own exited children first, then detect non-child zombies before falling
+    back to the ``os.kill`` liveness probe.
 
     Windows has no zombie/reap machinery, and its ``os.kill(pid, 0)`` probe
     succeeds for an exited process while any handle to it remains open, so it
@@ -414,6 +437,8 @@ def _process_alive(pid: int) -> bool:
                 return False  # our child has exited and was just reaped
         except (ChildProcessError, OSError):
             pass  # not our child, or already reaped by subprocess/init
+        if _process_is_zombie(pid):
+            return False
         try:
             os.kill(pid, 0)
         except ProcessLookupError:

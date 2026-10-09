@@ -1110,6 +1110,8 @@ class RuntimeLeapService:
         llm = ctx.llm
         vlm = getattr(ctx, "vlm", None)
         classifier = getattr(ctx, "intent_classifier", None)
+        from leapflow.memory.providers.working import resolve_working_memory_max_tokens
+
         for sid in registry.session_ids():
             session_ctx = registry.get(sid)
             if session_ctx is None:
@@ -1125,6 +1127,13 @@ class RuntimeLeapService:
                     vlm=vlm,
                     classifier=classifier,
                 )
+                memory = getattr(engine, "_wm", None)
+                reconfigure_memory = getattr(memory, "reconfigure_max_tokens", None)
+                if callable(reconfigure_memory):
+                    reconfigure_memory(resolve_working_memory_max_tokens(
+                        int(getattr(settings, "memory_working_max_tokens", 0) or 0),
+                        int(getattr(engine, "active_context_length", 0) or settings.llm_context_length),
+                    ))
             except Exception:
                 logger.debug(
                     "Failed to propagate config to session %s", sid, exc_info=True,
