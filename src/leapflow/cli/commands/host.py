@@ -187,11 +187,17 @@ async def _cmd_status() -> int:
         _ok(f"leapd healthy (PID {getattr(leapd_info, 'pid', None)})")
         host = runtime.get("host_backend") if isinstance(runtime, dict) else None
         if isinstance(host, dict):
-            _info(
-                "Backend: "
-                f"{host.get('backend')} started={host.get('started')} "
-                f"pid={host.get('pid')} ({host.get('pid_source')})"
+            backend_status = (
+                f"Backend: {host.get('backend')} started={host.get('started')}"
             )
+            pid = host.get("pid")
+            if pid is None:
+                backend_status += " process=MCP-managed"
+            else:
+                backend_status += f" pid={pid}"
+            _info(backend_status)
+            if host.get("cua_status"):
+                _info(f"Driver health: {host['cua_status']}")
             if host.get("command"):
                 args = " ".join(str(arg) for arg in host.get("args") or [])
                 _info(f"Command: {str(host.get('command'))} {args}".strip())

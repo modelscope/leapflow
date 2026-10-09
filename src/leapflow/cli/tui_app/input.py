@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Sequence
 
 from prompt_toolkit.completion import Completer, Completion, ThreadedCompleter
 
+from leapflow.cli.commands.registry import command_action_entries, resolve_command
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -141,6 +143,9 @@ class SlashCommandCompleter(Completer):
         if text.startswith("/schedule "):
             yield from self._schedule_completions(text)
             return
+        if text.startswith("/host "):
+            yield from self._command_action_completions("host", text, "/host ")
+            return
 
         query = text.lstrip("/").lower()
         for command, description in self._commands:
@@ -216,6 +221,23 @@ class SlashCommandCompleter(Completer):
                 verb, start_position=start, display=verb,
                 display_meta=_truncate_meta(description),
             )
+
+    def _command_action_completions(
+        self,
+        command_name: str,
+        text: str,
+        prefix_text: str,
+    ) -> "Iterable[Completion]":
+        """Offer declared single-token actions for one slash command."""
+        command = resolve_command(command_name)
+        if command is None:
+            return
+        tail = text[len(prefix_text):]
+        parts = tail.split()
+        if len(parts) > 1 or (parts and tail.endswith(" ")):
+            return
+        prefix = parts[0] if parts else ""
+        yield from _complete_pairs(command_action_entries(command), prefix, -len(prefix))
 
     def _config_completions(self, text: str) -> "Iterable[Completion]":
         tail = text[len("/config "):]
