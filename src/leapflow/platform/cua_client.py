@@ -456,8 +456,15 @@ def _extract_result(mcp_result: Any) -> Dict[str, Any]:
     """Flatten an MCP CallToolResult into a plain dict."""
     data: Any = None
     images: List[str] = []
-    is_error = bool(getattr(mcp_result, "isError", False))
-    structured: Optional[Dict] = getattr(mcp_result, "structuredContent", None) or None
+    # MCP 2.x exposes Python attributes in snake_case while MCP 1.x used the
+    # JSON wire names. Read both so a dependency upgrade cannot silently drop
+    # structured tool payloads (notably list_windows) into their text summary.
+    is_error = getattr(mcp_result, "is_error", None)
+    if is_error is None:
+        is_error = getattr(mcp_result, "isError", False)
+    structured = getattr(mcp_result, "structured_content", None)
+    if structured is None:
+        structured = getattr(mcp_result, "structuredContent", None)
     text_parts: List[str] = []
 
     for part in getattr(mcp_result, "content", []) or []:
@@ -479,8 +486,8 @@ def _extract_result(mcp_result: Any) -> Dict[str, Any]:
     return {
         "data": data,
         "images": images,
-        "structuredContent": structured,
-        "isError": is_error,
+        "structuredContent": structured if isinstance(structured, dict) else None,
+        "isError": bool(is_error),
     }
 
 
@@ -1061,6 +1068,27 @@ class CuaDriverClient(HostRpc):
 
         return self._unwrap_result(result)
 
+    async def _call_tool_on_bridge(
+        self, name: str, args: Dict[str, Any], timeout: float
+    ) -> Dict[str, Any]:
+        """Run an MCP call on the loop that owns its stdio session.
+
+        ``ClientSession`` and its anyio streams are bound to ``_AsyncBridge``'s
+        loop. Awaiting ``call_tool`` from the agent loop races that ownership and
+        can leave the write side blocked until the caller's timeout expires.
+        """
+        bridge_loop = self._bridge.loop
+        if bridge_loop is None or not bridge_loop.is_running():
+            raise RuntimeError("cua-driver bridge not running")
+        future = asyncio.run_coroutine_threadsafe(
+            self._session.call_tool(name, args), bridge_loop
+        )
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
+        except asyncio.TimeoutError:
+            future.cancel()
+            raise
+
     async def _call_cua_tool(
         self,
         name: str,
@@ -1073,10 +1101,7 @@ class CuaDriverClient(HostRpc):
         if self._session._session is None:
             raise RpcError("not_connected", "cua-driver session not active", {})
         try:
-            return await asyncio.wait_for(
-                self._session.call_tool(name, args),
-                timeout=timeout,
-            )
+            return await self._call_tool_on_bridge(name, args, timeout)
         except asyncio.TimeoutError:
             raise RpcError("timeout", f"cua-driver {name} timed out after {timeout}s", {})
         except Exception as e:
@@ -1097,10 +1122,7 @@ class CuaDriverClient(HostRpc):
             with self._session._lock:
                 self._session._restart()
             try:
-                return await asyncio.wait_for(
-                    self._session.call_tool(name, args),
-                    timeout=timeout,
-                )
+                return await self._call_tool_on_bridge(name, args, timeout)
             except Exception as retry_exc:
                 raise RpcError(
                     "cua_reconnect_failed",
