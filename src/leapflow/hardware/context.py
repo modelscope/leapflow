@@ -635,6 +635,7 @@ class KinematicsDeclaration:
     workspace_bounds: tuple[float, ...] = ()  # (x_min, x_max, y_min, y_max, z_min, z_max) in meters
     base_frame: str = ""  # reference frame name
     tool_frame: str = ""  # end-effector frame name
+    home_joint_targets: Mapping[str, float] = field(default_factory=dict)
     notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -645,6 +646,7 @@ class KinematicsDeclaration:
             "workspace_bounds": list(self.workspace_bounds),
             "base_frame": self.base_frame,
             "tool_frame": self.tool_frame,
+            "home_joint_targets": dict(self.home_joint_targets),
             "notes": self.notes,
         }
 
@@ -666,6 +668,10 @@ class KinematicsDeclaration:
             workspace_bounds=workspace_bounds,
             base_frame=str(data.get("base_frame") or ""),
             tool_frame=str(data.get("tool_frame") or ""),
+            home_joint_targets={
+                str(channel_id): float(target)
+                for channel_id, target in (data.get("home_joint_targets") or {}).items()
+            } if isinstance(data.get("home_joint_targets"), Mapping) else {},
             notes=str(data.get("notes") or ""),
         )
 
@@ -802,16 +808,18 @@ class DegradationPolicy:
 
     sensor_loss_policy: str = "halt"  # "halt", "continue_blind", "switch_sensor"
     comm_loss_policy: str = "halt"  # "halt", "hold_position", "safe_return"
-    fallback_mode: str = ""  # device-specific fallback configuration
+    sensor_fallbacks: Mapping[str, str] = field(default_factory=dict)
     max_comm_loss_s: float = 1.0  # max seconds of communication loss before policy triggers
+    safe_return_timeout_s: float = 5.0  # bounded duration for a verified home trajectory
     notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "sensor_loss_policy": self.sensor_loss_policy,
             "comm_loss_policy": self.comm_loss_policy,
-            "fallback_mode": self.fallback_mode,
+            "sensor_fallbacks": dict(self.sensor_fallbacks),
             "max_comm_loss_s": self.max_comm_loss_s,
+            "safe_return_timeout_s": self.safe_return_timeout_s,
             "notes": self.notes,
         }
 
@@ -821,8 +829,12 @@ class DegradationPolicy:
         return cls(
             sensor_loss_policy=str(data.get("sensor_loss_policy") or "halt"),
             comm_loss_policy=str(data.get("comm_loss_policy") or "halt"),
-            fallback_mode=str(data.get("fallback_mode") or ""),
+            sensor_fallbacks={
+                str(source): str(target)
+                for source, target in (data.get("sensor_fallbacks") or {}).items()
+            } if isinstance(data.get("sensor_fallbacks"), Mapping) else {},
             max_comm_loss_s=_as_float(data.get("max_comm_loss_s"), default=1.0) or 1.0,
+            safe_return_timeout_s=_as_float(data.get("safe_return_timeout_s"), default=5.0) or 5.0,
             notes=str(data.get("notes") or ""),
         )
 

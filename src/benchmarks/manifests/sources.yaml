@@ -1,0 +1,461 @@
+schema_version: "1.0"
+evidence_date: "2026-10-08"
+policy:
+  external_benchmarks_auto_download: false
+  external_benchmarks_auto_install: false
+  license_revalidation: "Required by leapflow doctor before first execution"
+  unknown_fields: "Must remain unknown; never infer or guess"
+
+sources:
+  - id: embodyguard
+    name: "EmbodyGuard"
+    full_name: "EMBODYGUARD (PDDL-grounded benchmark introduced by Subtle Risks, Critical Failures)"
+    paper_title: "Subtle Risks, Critical Failures: A Framework for Diagnosing Physical Safety of LLMs for Embodied Decision Making"
+    status: core
+    paper: "https://aclanthology.org/2025.emnlp-main.1305/"
+    homepage: "https://embodied-llms-safety.github.io/"
+    repository: "https://github.com/Yonsei-MIR/EAI-safety"
+    venue: "EMNLP Main Conference"
+    year: 2025
+    citation_signal:
+      source: "ACL Anthology / Semantic Scholar"
+      count: null
+      note: "Record verified; dynamic count intentionally not frozen"
+    license:
+      code: unknown
+      data: unknown
+      note: "No explicit repository license verified"
+    manifest_license: "UNKNOWN"
+    run_cost: low
+    evidence_date: "2026-10-08"
+
+  - id: asimov
+    name: "ASIMOV"
+    full_name: "Generating Robot Constitutions & Benchmarks for Semantic Safety"
+    status: core
+    paper: "https://arxiv.org/abs/2503.08663"
+    proceedings: "https://proceedings.mlr.press/v305/sermanet25a.html"
+    homepage: "https://asimov-benchmark.github.io/"
+    repository: "https://github.com/asimov-benchmark/code"
+    venue: "CoRL"
+    year: 2025
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 52
+      approximate: true
+    license:
+      paper: "CC BY 4.0"
+      code: unknown
+      data: unknown
+    manifest_license: "UNKNOWN"
+    run_cost: medium
+    evidence_date: "2026-10-08"
+
+  - id: asimov_v2
+    name: "ASIMOV Benchmark v2"
+    full_name: "Can AI Perceive Physical Danger and Intervene?"
+    status: core_extension
+    paper: "https://arxiv.org/abs/2509.21651"
+    homepage: "https://asimov-benchmark.github.io/v2/"
+    repository: null
+    venue: "arXiv"
+    year: 2025
+    citation_signal:
+      source: "arXiv search result"
+      count: null
+    license:
+      code: unknown
+      data: unknown
+    run_cost: medium
+    uncertainty: "Paper identity and final publication venue require doctor revalidation"
+    evidence_date: "2026-10-08"
+
+  - id: is_bench
+    name: "IS-Bench"
+    full_name: "IS-Bench: Evaluating Interactive Safety of VLM-Driven Embodied Agents"
+    status: core
+    paper: "https://arxiv.org/abs/2506.16402"
+    homepage: "https://ursulalujun.github.io/isbench.github.io/"
+    repository: "https://github.com/AI45Lab/IS-Bench"
+    venue: "AAAI"
+    year: 2026
+    citation_signal:
+      source: "Semantic Scholar / AAAI search result"
+      count: 63
+      approximate: true
+    license:
+      code: unknown
+      data: unknown
+    manifest_license: "UNKNOWN"
+    run_cost: medium
+    evidence_date: "2026-10-08"
+
+  - id: kinder
+    name: "KinDER"
+    full_name: "KinDER: A Physical Reasoning Benchmark for Robot Learning and Planning"
+    status: core
+    paper: "https://arxiv.org/abs/2604.25788"
+    homepage: "https://prpl-group.com/kinder-site/"
+    repository: "https://github.com/Princeton-Robot-Planning-and-Learning/kindergarden"
+    venue: "Robotics: Science and Systems"
+    year: 2026
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 5
+      approximate: true
+    license:
+      paper: "arXiv perpetual non-exclusive license"
+      code: unknown
+      data: unknown
+    manifest_license: "UNKNOWN"
+    run_cost: low_to_medium
+    evidence_date: "2026-10-08"
+
+  - id: vlabench
+    name: "VLABench"
+    full_name: "VLABench: A Large-Scale Benchmark for Language-Conditioned Robotics Manipulation with Long-Horizon Reasoning Tasks"
+    status: core
+    paper: "https://arxiv.org/abs/2412.18194"
+    homepage: "https://vlabench.github.io/"
+    repository: "https://github.com/OpenMOSS/VLABench"
+    venue: "arXiv; formal venue not verified"
+    year: 2024
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 227
+      approximate: true
+    license:
+      code: unknown
+      data: unknown
+    manifest_license: "UNKNOWN"
+    run_cost: medium_to_high
+    evidence_date: "2026-10-08"
+
+  - id: calvin
+    name: "CALVIN"
+    full_name: "CALVIN: A Benchmark for Language-Conditioned Policy Learning for Long-Horizon Robot Manipulation Tasks"
+    status: core
+    paper: "https://arxiv.org/abs/2112.03227"
+    homepage: "http://calvin.cs.uni-freiburg.de/"
+    repository: "https://github.com/mees/calvin"
+    venue: "IEEE Robotics and Automation Letters"
+    year: 2022
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 995
+      approximate: true
+    license:
+      code: "MIT"
+      data: "Verify project terms"
+    manifest_license: "MIT"
+    run_cost: low
+    replaces: alfred
+    evidence_date: "2026-10-08"
+
+  - id: robojailbench
+    name: "RoboJailBench"
+    full_name: "RoboJailBench: Benchmarking Adversarial Attacks and Defenses in Embodied Robotic Agents"
+    status: core
+    paper: "https://arxiv.org/abs/2605.19328"
+    homepage: "https://purseclab.github.io/benchmark-for-robotics-security/"
+    repository: "https://github.com/purseclab/benchmark-for-robotics-security"
+    venue: "arXiv; formal venue not verified"
+    year: 2026
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 3
+      approximate: true
+    license:
+      code: unknown
+      data: unknown
+    manifest_license: "UNKNOWN"
+    run_cost: medium
+    evidence_date: "2026-10-08"
+
+  - id: attackvla
+    name: "AttackVLA"
+    full_name: "AttackVLA: Benchmarking Adversarial and Backdoor Attacks on Vision-Language-Action Models"
+    status: core
+    paper: "https://arxiv.org/abs/2511.12149"
+    homepage: "https://github.com/lijayuTnT/AttackVLA"
+    repository: "https://github.com/lijayuTnT/AttackVLA"
+    venue: "arXiv; formal venue not verified"
+    year: 2025
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 22
+      approximate: true
+    license:
+      code: unknown
+      data: unknown
+    manifest_license: "UNKNOWN"
+    run_cost: medium_to_high
+    evidence_date: "2026-10-08"
+
+  - id: safety_gymnasium
+    name: "Safety-Gymnasium"
+    full_name: "Safety-Gymnasium: A Unified Safe Reinforcement Learning Benchmark"
+    status: core
+    paper: "https://arxiv.org/abs/2310.12567"
+    homepage: "https://www.safety-gymnasium.com/"
+    repository: "https://github.com/PKU-Alignment/safety-gymnasium"
+    venue: "NeurIPS Datasets and Benchmarks Track"
+    year: 2023
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 296
+      approximate: true
+    license:
+      code: "Apache-2.0"
+      data: "Verify per-environment assets"
+    manifest_license: "Apache-2.0"
+    run_cost: low
+    replaces: safe_control_gym
+    evidence_date: "2026-10-08"
+
+  - id: maniskill
+    name: "ManiSkill3"
+    full_name: "ManiSkill3: GPU Parallelized Robotics Simulation and Rendering for Generalizable Embodied AI"
+    status: core
+    paper: "https://arxiv.org/abs/2410.00425"
+    homepage: "https://maniskill.readthedocs.io/"
+    repository: "https://github.com/mani-skill/ManiSkill"
+    venue: "arXiv; formal venue not verified"
+    year: 2024
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 287
+      approximate: true
+    license:
+      code: "Apache-2.0"
+      assets: "CC BY-NC 4.0 and per-asset terms"
+    manifest_license: "Apache-2.0 (code); assets CC BY-NC 4.0 and per-asset terms"
+    run_cost: medium_to_high
+    evidence_date: "2026-10-08"
+
+  - id: isaac_lab
+    name: "Isaac Lab"
+    full_name: "Isaac Lab: A GPU-Accelerated Simulation Framework for Multi-Modal Robot Learning"
+    status: core
+    paper: "https://arxiv.org/abs/2511.04831"
+    homepage: "https://isaac-sim.github.io/IsaacLab/"
+    repository: "https://github.com/isaac-sim/IsaacLab"
+    venue: "arXiv; formal venue not verified"
+    year: 2025
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 336
+      approximate: true
+    license:
+      code: "BSD-3-Clause; some components Apache-2.0"
+      assets: "Verify NVIDIA and per-asset terms"
+    manifest_license: "BSD-3-Clause (core); some components Apache-2.0; assets require NVIDIA/per-asset terms revalidation"
+    run_cost: high
+    evidence_date: "2026-10-08"
+
+  - id: leaprobot_native
+    name: "LeapRobot Native Suite"
+    full_name: "LeapRobot Native Benchmark Suite"
+    status: core
+    paper: null
+    homepage: null
+    repository: "internal://leapflow"
+    venue: "Internal"
+    year: 2026
+    citation_signal:
+      source: "Not applicable"
+      count: null
+    license:
+      code: "Same as LeapFlow repository"
+      data: "Internal evidence policy"
+    run_cost: low
+    evidence_date: "2026-10-08"
+
+  - id: roboharm
+    name: "RoboHarm"
+    full_name: "RoboHarm: Five Fixed-Scene Robot Refusal Tasks"
+    status: tier4
+    paper: null
+    homepage: null
+    repository: "https://github.com/robocurve/roboharm"
+    venue: "Software release; no paper verified"
+    year: 2026
+    citation_signal:
+      source: "GitHub software citation"
+      count: null
+    license:
+      code_and_content: "CC BY-NC 4.0"
+    run_cost: very_high
+    evidence_date: "2026-10-08"
+
+  - id: pac_bench
+    name: "PAC Bench"
+    full_name: unknown
+    status: optional_unresolved
+    paper: null
+    homepage: null
+    repository: null
+    venue: unknown
+    year: null
+    citation_signal:
+      source: "No authoritative match found"
+      count: null
+    license:
+      code: unknown
+      data: unknown
+    run_cost: unknown
+    uncertainty: "Name is ambiguous; no authoritative embodied-robotics benchmark match verified"
+    evidence_date: "2026-10-08"
+
+  - id: spoc
+    name: "SPOC"
+    full_name: "SPOC: Imitating Shortest Paths in Simulation Enables Effective Navigation and Manipulation in the Real World"
+    status: optional
+    paper: "https://arxiv.org/abs/2312.02976"
+    homepage: "https://spoc-robot.github.io/"
+    repository: "https://github.com/allenai/spoc-robot-training"
+    venue: "CVPR"
+    year: 2024
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 83
+      approximate: true
+    license:
+      code: unknown
+      data: unknown
+    run_cost: medium
+    evidence_date: "2026-10-08"
+
+  - id: embodiedbench
+    name: "EmbodiedBench"
+    full_name: "EmbodiedBench: Comprehensive Benchmarking Multi-modal Large Language Models for Vision-Driven Embodied Agents"
+    status: optional
+    paper: "https://proceedings.mlr.press/v267/yang25f.html"
+    homepage: "https://embodiedbench.github.io/"
+    repository: "https://github.com/EmbodiedBench/EmbodiedBench"
+    venue: "ICML Oral"
+    year: 2025
+    citation_signal:
+      source: "PMLR / Semantic Scholar search result"
+      count: 275
+      approximate: true
+    license:
+      code: unknown
+      data: unknown
+    run_cost: medium_to_high
+    evidence_date: "2026-10-08"
+
+  - id: libero
+    name: "LIBERO"
+    full_name: "LIBERO: Benchmarking Knowledge Transfer for Lifelong Robot Learning"
+    status: optional
+    paper: "https://papers.neurips.cc/paper_files/paper/2023/file/8c3c666820ea055a77726d66fc7d447f-Paper-Datasets_and_Benchmarks.pdf"
+    homepage: "https://libero-project.github.io/main.html"
+    repository: "https://github.com/Lifelong-Robot-Learning/LIBERO"
+    venue: "NeurIPS Datasets and Benchmarks Track"
+    year: 2023
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 2090
+      approximate: true
+    license:
+      code: unknown
+      data: unknown
+    run_cost: medium
+    evidence_date: "2026-10-08"
+
+  - id: behavior_1k
+    name: "BEHAVIOR-1K"
+    full_name: "BEHAVIOR-1K: A Human-Centered, Embodied AI Benchmark with 1,000 Everyday Activities and Realistic Simulation"
+    status: optional
+    paper: "https://arxiv.org/abs/2403.09227"
+    homepage: "https://behavior.stanford.edu/"
+    repository: "https://github.com/StanfordVL/BEHAVIOR-1K"
+    venue: "Formal venue not verified"
+    year: 2024
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 662
+      approximate: true
+    license:
+      code: unknown
+      assets: unknown
+    run_cost: high
+    evidence_date: "2026-10-08"
+
+  - id: agentharm
+    name: "AgentHarm"
+    full_name: "AgentHarm: A Benchmark for Measuring Harmfulness of LLM Agents"
+    status: optional
+    paper: "https://arxiv.org/abs/2410.09024"
+    homepage: "https://ukgovernmentbeis.github.io/inspect_evals/evals/safeguards/agentharm/"
+    repository: "https://github.com/UKGovernmentBEIS/inspect_evals"
+    venue: "ICLR"
+    year: 2025
+    citation_signal:
+      source: "Semantic Scholar / OpenReview search result"
+      count: 576
+      approximate: true
+    license:
+      code: "MIT with additional harmful-use restriction"
+      data: "Verify additional clause"
+    run_cost: low
+    evidence_date: "2026-10-08"
+
+  - id: alfred
+    name: "ALFRED"
+    full_name: "ALFRED: A Benchmark for Interpreting Grounded Instructions for Everyday Tasks"
+    status: replaced
+    paper: "https://arxiv.org/abs/1912.01734"
+    homepage: "https://askforalfred.com/"
+    repository: "https://github.com/askforalfred/alfred"
+    venue: "CVPR"
+    year: 2020
+    citation_signal:
+      source: "arXiv / Semantic Scholar"
+      count: null
+    license:
+      code: unknown
+      data: unknown
+    run_cost: medium
+    replaced_by: calvin
+    evidence_date: "2026-10-08"
+
+  - id: safe_control_gym
+    name: "safe-control-gym"
+    full_name: "safe-control-gym: A Unified Benchmark Suite for Safe Learning-Based Control and Reinforcement Learning in Robotics"
+    status: replaced
+    paper: "https://arxiv.org/abs/2109.06325"
+    homepage: null
+    repository: "https://github.com/learnsyslab/safe-control-gym"
+    venue: "arXiv / IEEE Control Systems Letters attribution requires revalidation"
+    year: 2021
+    citation_signal:
+      source: "Semantic Scholar search result"
+      count: 137
+      approximate: true
+    license:
+      code: "MIT"
+      data: "Not separately verified"
+    run_cost: low
+    replaced_by: safety_gymnasium
+    evidence_date: "2026-10-08"
+
+  - id: safelab
+    name: "SafeLab"
+    full_name: "SafeLab: An Interactive High-Fidelity Benchmark for Embodied Safety in Scientific Robotics"
+    status: deferred
+    paper: "https://openreview.net/forum?id=ojwpa0wXo9"
+    homepage: "https://icml.cc/virtual/2026/poster/61584"
+    repository: null
+    venue: "ICML"
+    year: 2026
+    citation_signal:
+      source: "ICML virtual poster"
+      count: null
+    license:
+      code: unknown
+      data: unknown
+    run_cost: unknown
+    deferred_reason: "Await public code and explicit license"
+    evidence_date: "2026-10-08"

@@ -1,0 +1,66 @@
+id: maniskill
+version: "3.0.0"
+source: "https://maniskill.readthedocs.io/"
+paper: "https://arxiv.org/abs/2410.00425"
+repo: "https://github.com/mani-skill/ManiSkill"
+license: "Apache-2.0 (code); assets CC BY-NC 4.0 and per-asset terms"
+setup_guidance: "Run the official ManiSkill version-pinned evaluation for the selected environment IDs and policy. Configure benchmark.commands.maniskill to emit a final JSON summary of the official episode success and return metrics."
+official:
+  implementation: "mani-skill/ManiSkill"
+  protocol: "Official Gymnasium environment evaluation with task success from the environment info"
+  dataset: "Official ManiSkill task assets for the pinned release"
+  result_contract: "Final JSON line with success_rate and mean_episode_return."
+adapter: maniskill
+tier: 2
+tags:
+  - manipulation
+  - simulation
+  - gpu-accelerated
+  - sapien
+  - generalizable
+required: false
+dependencies:
+  - config:benchmark.commands.maniskill
+timeouts:
+  availability: 15.0
+  trial: 900.0
+seeds:
+  - 42
+  - 123
+metrics:
+  - success_rate
+  - mean_episode_return
+gates: {}
+scenarios:
+  - scenario_id: PickCube-v1
+    name: "Pick Cube"
+    description: "Pick up a cube from the table"
+    tags: [manipulation, rigid-body]
+    timeout_seconds: 120.0
+    required: true
+    parameters:
+      official_metrics: [success_rate, mean_episode_return]
+  - scenario_id: StackCube-v1
+    name: "Stack Cube"
+    description: "Stack one cube on top of another"
+    tags: [manipulation, rigid-body]
+    timeout_seconds: 180.0
+    required: true
+    parameters:
+      official_metrics: [success_rate, mean_episode_return]
+  - scenario_id: PegInsertionSide-v1
+    name: "Peg Insertion Side"
+    description: "Insert a peg from the side into a hole"
+    tags: [manipulation, precision]
+    timeout_seconds: 180.0
+    required: false
+    parameters:
+      official_metrics: [success_rate, mean_episode_return]
+  - scenario_id: TurnFaucet-v1
+    name: "Turn Faucet"
+    description: "Turn an articulated faucet handle"
+    tags: [manipulation, articulated]
+    timeout_seconds: 120.0
+    required: false
+    parameters:
+      official_metrics: [success_rate, mean_episode_return]

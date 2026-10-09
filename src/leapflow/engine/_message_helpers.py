@@ -251,7 +251,10 @@ def _tool_result_metadata(
         exit_code = exit_code_from(result)
         if exit_code is not None:
             metadata["exit_code"] = exit_code
-        for key in ("path", "lines", "truncated", "bytes_written"):
+        for key in (
+            "path", "lines", "truncated", "bytes_written", "command_digest",
+            "stdout_sha256", "stderr_sha256",
+        ):
             if key in result:
                 metadata[key] = result[key]
         for key in (
@@ -278,6 +281,11 @@ def _tool_result_metadata(
             # needs verification, not a blind retry.
             "side_effect_uncertain",
             "retry_guidance",
+            "failure_fingerprint",
+            "failure_repeat_count",
+            "original_failure_code",
+            "completion_evidence",
+            "task_completion_ready",
         ):
             if key in result:
                 metadata[key] = result[key]
@@ -286,6 +294,9 @@ def _tool_result_metadata(
             "failure_class",
             "failure_code",
             "recoverability",
+            "dependency_blocked",
+            "retry_after_s",
+            "cua_status",
             "blocks_approval",
             "platform",
             "action",
@@ -300,7 +311,7 @@ def _tool_result_metadata(
         ):
             if key in result:
                 metadata[key] = result[key]
-        for key in ("suggestions", "available_tools"):
+        for key in ("suggestions", "available_tools", "suggestion", "next_step"):
             value = result.get(key)
             if value:
                 metadata[key] = value

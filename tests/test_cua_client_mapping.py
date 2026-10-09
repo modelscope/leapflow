@@ -299,3 +299,70 @@ def test_app_list_timeout_gets_dedicated_budget() -> None:
     assert client._resolve_timeout(Methods.AX_LIST) == 8.0
     # Exact entries win over prefixes; unknown prefixes fall back to default.
     assert client._resolve_timeout("custom.method") == client._call_timeout
+
+
+@pytest.mark.asyncio
+async def test_ax_list_timeout_probes_once_then_opens_window_target_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = CuaDriverClient(window_target_cooldown_s=60.0)
+    calls: list[str] = []
+    restarts: list[bool] = []
+
+    async def fake_call(
+        name: str, args: dict, timeout: float, *, allow_reconnect: bool = True
+    ) -> dict:
+        del args, timeout, allow_reconnect
+        calls.append(name)
+        if name == "list_windows":
+            raise RpcError("timeout", "list_windows stalled", {})
+        assert name == "get_screen_size"
+        return {"data": {"width": 100, "height": 100}, "images": [], "structuredContent": None, "isError": False}
+
+    monkeypatch.setattr(client, "_call_cua_tool", fake_call)
+    monkeypatch.setattr(client._session, "_restart", lambda: restarts.append(True))
+
+    failed = await client.call(Methods.AX_LIST)
+    assert failed["failure_code"] == "cua_driver_unavailable"
+    assert failed["dependency_blocked"] == ["window_target"]
+    assert calls == ["list_windows", "get_screen_size", "list_windows"]
+    assert restarts == [True]
+
+    blocked = await client.call(Methods.SCREEN_CAPTURE_FRAME, {"pid": 1, "window_id": 2})
+    assert blocked["failure_code"] == "cua_driver_unavailable"
+    assert calls == ["list_windows", "get_screen_size", "list_windows"]
+    assert client.status_snapshot()["operation_health"]["window_target"]["state"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_ax_list_recovery_requires_successful_probe_and_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = CuaDriverClient()
+    calls: list[str] = []
+    restarts: list[bool] = []
+
+    async def fake_call(
+        name: str, args: dict, timeout: float, *, allow_reconnect: bool = True
+    ) -> dict:
+        del args, timeout, allow_reconnect
+        calls.append(name)
+        if name == "list_windows" and calls.count("list_windows") == 1:
+            raise RpcError("timeout", "list_windows stalled", {})
+        if name == "get_screen_size":
+            return {"data": {"width": 100, "height": 100}, "images": [], "structuredContent": None, "isError": False}
+        return {
+            "data": {"windows": []},
+            "images": [],
+            "structuredContent": None,
+            "isError": False,
+        }
+
+    monkeypatch.setattr(client, "_call_cua_tool", fake_call)
+    monkeypatch.setattr(client._session, "_restart", lambda: restarts.append(True))
+
+    result = await client.call(Methods.AX_LIST)
+    assert result == {"ok": True, "windows": [], "cua_status": "healthy"}
+    assert calls == ["list_windows", "get_screen_size", "list_windows"]
+    assert restarts == [True]
+    assert client.status_snapshot()["cua_status"] == "healthy"

@@ -80,6 +80,21 @@ class _ConstantPolicy:
         pass
 
 
+def test_control_bus_refuses_commands_when_device_is_degraded() -> None:
+    registry = MagicMock()
+    registry.is_device_degraded.return_value = True
+    bus = HighFrequencyControlBus(registry)
+    bus._device_id = "arm"
+
+    safe = bus._check_safety(
+        _make_state({"joint_0": 0.0}),
+        ControlCommand(joint_commands={"joint_0": 0.1}),
+    )
+
+    assert safe is False
+    registry.context.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # PIDJointController
 # ---------------------------------------------------------------------------

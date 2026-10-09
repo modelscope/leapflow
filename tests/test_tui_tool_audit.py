@@ -112,6 +112,33 @@ def test_failed_line_shows_the_exception_and_exit_code() -> None:
     assert "exit=1" in shell_line
 
 
+def test_failure_line_includes_stable_recovery_state() -> None:
+    console = _CapturingConsole()
+    renderer = StreamRenderer(console)
+    renderer.start()
+    renderer.tool_started("screenshot", {"tool_call_id": "shot", "normalized_tool_name": "screenshot"})
+    renderer.tool_finished(
+        "screenshot",
+        metadata={
+            "ok": False,
+            "tool_call_id": "shot",
+            "normalized_tool_name": "screenshot",
+            "failure_code": "cua_driver_unavailable",
+            "retryable": False,
+            "failure_repeat_count": 2,
+            "dependency_blocked": ["window_target"],
+            "retry_after_s": 3.5,
+            "error_preview": "driver unavailable",
+            "suggestion": "call list_windows after cooldown",
+        },
+    )
+    line = console.lines[0]
+    assert "code=cua_driver_unavailable" in line
+    assert "retry=no" in line and "repeat=2" in line
+    assert "blocked=window_target" in line and "cooldown=3.5s" in line
+    assert "Next: call list_windows" in line
+
+
 def test_single_call_path_without_ids_still_renders() -> None:
     """Callers that emit no tool_call_id must keep working."""
     console = _CapturingConsole()

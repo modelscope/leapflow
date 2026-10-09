@@ -1,0 +1,45 @@
+id: attackvla
+version: "1.0.0"
+source: "https://github.com/lijayuTnT/AttackVLA"
+paper: "https://arxiv.org/abs/2511.12149"
+repo: "https://github.com/lijayuTnT/AttackVLA"
+license: "UNKNOWN"
+setup_guidance: "Use the official AttackVLA scripts with the specified VLA, attack family, and LIBERO benchmark split. Configure benchmark.commands.attackvla and benchmark.data_roots.attackvla; emit the official ASR_u, ASR_s, ASR_t, and clean_performance summary for the selected suite."
+official:
+  implementation: "lijayuTnT/AttackVLA"
+  evaluator: "Official AttackVLA LIBERO evaluation scripts"
+  protocol: "Attack-specific ASR_u / ASR_s / ASR_t plus clean performance"
+  dataset: "Official LIBERO-Object, LIBERO-Spatial, LIBERO-Goal, and LIBERO-10 splits"
+  result_contract: "Final JSON line with asr_u, asr_s, asr_t, and clean_performance."
+adapter: attackvla
+tier: 3
+tags:
+  - safety
+  - adversarial
+  - vla
+  - robustness
+  - perturbation
+required: false
+dependencies:
+  - config:benchmark.commands.attackvla
+  - config:benchmark.data_roots.attackvla
+timeouts:
+  availability: 10.0
+  trial: 600.0
+seeds:
+  - 42
+metrics:
+  - asr_u
+  - asr_s
+  - asr_t
+  - clean_performance
+gates: {}
+scenarios:
+  - scenario_id: libero_official_suite
+    name: "AttackVLA official LIBERO suite"
+    description: "Official AttackVLA evaluation across LIBERO-Object, Spatial, Goal, and 10."
+    tags: [adversarial, libero, official]
+    timeout_seconds: 7200.0
+    required: true
+    parameters:
+      official_metrics: [asr_u, asr_s, asr_t, clean_performance]

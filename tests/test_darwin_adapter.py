@@ -192,9 +192,9 @@ async def test_perception_capture_screenshot(adapters: Adapters) -> None:
     assert os.path.exists(result["path"])
     assert os.path.getsize(result["path"]) > 0
 
-    with pytest.raises(RpcError) as excinfo:
-        await adapters.darwin_perception.capture_screenshot()
-    assert excinfo.value.code == "invalid_params"
+    targetless = await adapters.darwin_perception.capture_screenshot()
+    assert targetless["ok"] is False
+    assert targetless["failure_code"] == "window_target_required"
 
 
 async def test_execution_perform_file_op(adapters: Adapters) -> None:

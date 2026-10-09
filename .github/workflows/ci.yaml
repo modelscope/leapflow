@@ -57,7 +57,7 @@ jobs:
         run: uv sync --all-extras --no-extra leapspace
 
       - name: Lint
-        run: uv run ruff check src/leapflow/ tests/ tools/
+        run: uv run ruff check src/leapflow/ src/benchmarks/ tests/benchmarks/ tests/ tools/
 
       - name: Verify derived fixtures match the cassette store
         run: uv run python tools/sync_fixtures.py --check
@@ -67,6 +67,17 @@ jobs:
 
       - name: Mock layer (full)
         run: uv run pytest tests/ -q -m "not e2e" --tb=short -n auto
+
+      - name: Benchmark contract suite
+        run: |
+          source .venv/bin/activate
+          PYTHONPATH=src python -m pytest tests/benchmarks -q
+
+      - name: Native benchmark smoke profiles
+        run: |
+          source .venv/bin/activate
+          PYTHONPATH=src python -m benchmarks run --profile tier0 --json
+          PYTHONPATH=src python -m benchmarks run --profile tier1 --json
 
   # ── L2: main lane ──────────────────────────────────────────────────────
   # Everything, unscoped, across the supported matrix.
@@ -100,7 +111,7 @@ jobs:
         run: uv sync --all-extras --no-extra leapspace
 
       - name: Lint
-        run: uv run ruff check src/leapflow/ tests/ tools/
+        run: uv run ruff check src/leapflow/ src/benchmarks/ tests/benchmarks/ tests/ tools/
 
       - name: Verify derived fixtures match the stored exchanges
         run: uv run python tools/sync_fixtures.py --check

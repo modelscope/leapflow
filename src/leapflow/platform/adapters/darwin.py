@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import uuid
 from collections import deque
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -18,6 +19,40 @@ from leapflow.domain.platform import Capability, PlatformManifest
 from leapflow.platform.protocol import HostRpc, Methods
 
 logger = logging.getLogger(__name__)
+
+
+def _window_target_required_result() -> Dict[str, Any]:
+    """Describe the CUA window-target precondition without issuing an RPC."""
+    return {
+        "ok": False,
+        "error": (
+            "screen.capture_frame requires pid and window_id; cua-driver has no "
+            "full-display capture capability. Call list_windows first or provide "
+            "a known window target."
+        ),
+        "failure_class": "invalid_request",
+        "failure_code": "window_target_required",
+        "retryable": False,
+        "dependency_blocked": ["window_target"],
+        "suggestion": "Call list_windows and pass one window's pid and window_id.",
+    }
+
+
+def _window_discovery_invalid_result(result: Any) -> Dict[str, Any]:
+    """Reject non-window discovery payloads before they become screenshot targets."""
+    return {
+        "ok": False,
+        "error": (
+            "ax.list returned an invalid window discovery result; expected "
+            "{'windows': [mapping, ...]}. Recover window discovery before "
+            "attempting a window screenshot."
+        ),
+        "failure_class": "driver_contract",
+        "failure_code": "window_discovery_invalid_result",
+        "retryable": False,
+        "result_type": type(result).__name__,
+        "suggestion": "Recover ax.list before attempting a window-scoped operation.",
+    }
 
 
 class DarwinPerceptionAdapter:
@@ -47,9 +82,16 @@ class DarwinPerceptionAdapter:
         return _snapshot_from_payload(payload, pid=pid, window_id=window_id)
 
     async def list_windows(self) -> Dict[str, Any]:
-        """List top-level windows; the source of pid/window_id targets."""
+        """List validated top-level windows; the source of screenshot targets."""
         result = await self._rpc.call(Methods.AX_LIST, {})
-        return result if isinstance(result, dict) else {"windows": result}
+        if isinstance(result, dict) and result.get("ok") is False:
+            return result
+        if not isinstance(result, Mapping):
+            return _window_discovery_invalid_result(result)
+        windows = result.get("windows")
+        if not isinstance(windows, list) or not all(isinstance(item, Mapping) for item in windows):
+            return _window_discovery_invalid_result(result)
+        return {**dict(result), "ok": True, "windows": [dict(item) for item in windows]}
 
     async def get_clipboard(self) -> Dict[str, Any]:
         result = await self._rpc.call(Methods.CLIPBOARD_GET, {})
@@ -60,17 +102,22 @@ class DarwinPerceptionAdapter:
     async def capture_screenshot(
         self, pid: Optional[int] = None, window_id: Optional[int] = None
     ) -> Dict[str, Any]:
+        if pid is None or window_id is None:
+            return _window_target_required_result()
         # Route the image to disk: base64 payloads must never enter context.
         out_file = str(
             Path(tempfile.gettempdir()) / f"leapflow_screenshot_{uuid.uuid4().hex[:8]}.png"
         )
-        params: Dict[str, Any] = {"screenshot_out_file": out_file}
-        if pid is not None and window_id is not None:
-            params["pid"] = pid
-            params["window_id"] = window_id
+        params: Dict[str, Any] = {
+            "pid": pid,
+            "window_id": window_id,
+            "screenshot_out_file": out_file,
+        }
         result = await self._rpc.call(Methods.SCREEN_CAPTURE_FRAME, params)
         if not isinstance(result, dict):
             return {"ok": True, "path": out_file}
+        if result.get("ok") is False:
+            return result
         result.setdefault("path", result.get("screenshot_file_path") or out_file)
         return result
 
@@ -247,11 +294,11 @@ class DarwinExecutionAdapter:
     async def capture_screenshot(
         self, pid: Optional[int] = None, window_id: Optional[int] = None
     ) -> Dict[str, Any]:
-        params: Dict[str, Any] = {}
-        if pid is not None and window_id is not None:
-            params["pid"] = pid
-            params["window_id"] = window_id
-        return await self._rpc.call(Methods.SCREEN_CAPTURE_FRAME, params)
+        if pid is None or window_id is None:
+            return _window_target_required_result()
+        return await self._rpc.call(
+            Methods.SCREEN_CAPTURE_FRAME, {"pid": pid, "window_id": window_id}
+        )
 
     async def undo(self, steps: int = 1) -> List[Dict[str, Any]]:
         """Undo the last N file operations from the stack."""

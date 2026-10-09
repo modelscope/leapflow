@@ -1,0 +1,24 @@
+id: hardware_unitree_go2
+version: "1.0.0"
+source: "leapflow://tier4/unitree-go2"
+adapter: hardware_preflight
+tier: 4
+tags: [hardware, tier4, locomotion, unitree-go2]
+required: false
+dependencies: []
+timeouts:
+  availability: 10.0
+  trial: 120.0
+seeds: [42]
+metrics: []
+gates: {}
+note: "Requires an operator-approved benchmark.hardware_profiles.unitree_go2 entry with a non-motion preflight_command. Real motion remains separately approval-gated."
+scenarios:
+  - scenario_id: unitree_go2_preflight
+    name: "Unitree Go2 connection, e-stop, health, and network-loss preflight"
+    tags: [hardware, tier4, unitree-go2]
+    timeout_seconds: 120.0
+    required: true
+    parameters:
+      device_id: unitree_go2
+      topology: edge_standalone

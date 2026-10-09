@@ -364,9 +364,9 @@ def build_semantic_tool_entries(adapter: Any) -> List[SemanticToolEntry]:
         SemanticToolEntry(
             name="screenshot",
             description=(
-                "Capture a screenshot for visual verification. With pid + window_id captures that "
-                "window (works across all displays); defaults to the last observed window, or the "
-                "full desktop when no window has been observed."
+                "Capture a screenshot for visual verification of one window. Provide pid + window_id "
+                "from list_windows, or rely on the last observed window; cua-driver has no "
+                "full-desktop capture capability."
             ),
             parameters={
                 "pid": "int (optional) — window's process ID from list_windows",

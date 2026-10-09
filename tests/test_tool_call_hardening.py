@@ -180,12 +180,50 @@ def test_shell_run_populates_error_on_failure() -> None:
     result = asyncio.run(shell_run({"command": f"echo BOOM_ERR 1>&2 {joiner} exit 2"}))
     assert result["ok"] is False and result["returncode"] == 2
     assert "BOOM_ERR" in result["error"] and "BOOM_ERR" in result["stderr"]
+    assert result["failure_code"] == "shell_nonzero_exit"
+    assert result["retryable"] is False
+
+
+def test_shell_run_classifies_io_exit_251_without_overgeneralizing() -> None:
+    from leapflow.tools.shell_tools import _classify_nonzero_shell_exit
+
+    assert _classify_nonzero_shell_exit(251, "Error opening input files: Input/output error") == (
+        "environment_unavailable",
+        "shell_io_failure",
+    )
+    assert _classify_nonzero_shell_exit(251, "application-defined failure") == (
+        "shell_command_failed",
+        "shell_nonzero_exit",
+    )
+
+
+def test_shell_run_missing_command_has_stable_failure_contract() -> None:
+    from leapflow.tools.shell_tools import shell_run
+
+    result = asyncio.run(shell_run({}))
+    assert result["ok"] is False
+    assert result["failure_code"] == "shell_command_required"
+    assert result["failure_class"] == "invalid_request"
+    assert result["retryable"] is False and result["returncode"] is None
 
 
 def test_shell_run_success_has_no_error_field() -> None:
     from leapflow.tools.shell_tools import shell_run
     result = asyncio.run(shell_run({"command": "echo ok"}))
     assert result["ok"] is True and "error" not in result and "ok" in result["stdout"]
+
+
+def test_shell_run_emits_safe_audit_digests() -> None:
+    from leapflow.tools.shell_tools import shell_run
+
+    command = "echo audit-output"
+    result = asyncio.run(shell_run({"command": command}))
+    assert result["ok"] is True
+    assert len(result["command_digest"]) == 64
+    assert len(result["stdout_sha256"]) == 64
+    assert len(result["stderr_sha256"]) == 64
+    assert result["audit_returncode"] == 0
+    assert result["command_digest"] != command
 
 
 def test_workspace_context_resolves_relative_paths_and_blocks_cross_workspace(tmp_path) -> None:

@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -51,6 +52,34 @@ _MANIFEST_TIMEOUT_S = float(os.environ.get("LEAPFLOW_CUA_MANIFEST_TIMEOUT", "6.0
 # driver keeps enumerating and every later call queues behind it — so the
 # timeout must outlast the worst cold enumeration.
 _APP_LIST_TIMEOUT_S = float(os.environ.get("LEAPFLOW_CUA_APP_LIST_TIMEOUT", "120.0"))
+_WINDOW_TARGET_COOLDOWN_S = max(
+    1.0, float(os.environ.get("LEAPFLOW_CUA_WINDOW_TARGET_COOLDOWN", "15.0"))
+)
+
+
+@dataclass
+class DriverOperationHealth:
+    """Short-lived health state for one logical CUA operation.
+
+    Kept on the client instance (not a module singleton) so one degraded desktop
+    session cannot suppress another session's independent driver.
+    """
+
+    failure_count: int = 0
+    last_failure_code: str = ""
+    last_failure_message: str = ""
+    next_probe_at: float = 0.0
+    state: str = "healthy"
+
+    def snapshot(self, *, now: float) -> Dict[str, Any]:
+        return {
+            "state": self.state,
+            "failure_count": self.failure_count,
+            "last_failure_code": self.last_failure_code,
+            "last_failure_message": self.last_failure_message,
+            "next_probe_at": self.next_probe_at or None,
+            "retry_after_s": round(max(0.0, self.next_probe_at - now), 3),
+        }
 
 
 # ── Telemetry policy ─────────────────────────────────────────────────────────
@@ -711,6 +740,7 @@ class CuaDriverClient(HostRpc):
         call_timeout: float = _CALL_TIMEOUT_S,
         keepalive_interval: float = _KEEPALIVE_INTERVAL_S,
         timeout_overrides: Optional[Dict[str, float]] = None,
+        window_target_cooldown_s: float = _WINDOW_TARGET_COOLDOWN_S,
     ) -> None:
         self._bridge = _AsyncBridge()
         self._session = _McpSession(self._bridge)
@@ -720,6 +750,8 @@ class CuaDriverClient(HostRpc):
         self._closed = False
         self._last_start_time: Optional[float] = None
         self._last_error = ""
+        self._operation_health: Dict[str, DriverOperationHealth] = {}
+        self._window_target_cooldown_s = max(1.0, float(window_target_cooldown_s))
         # Per-method-prefix timeout overrides. Exact method names win over
         # prefixes: app.list enumerates installed + running apps on Windows
         # (can exceed a minute when cold), far beyond any fast-path budget.
@@ -798,7 +830,156 @@ class CuaDriverClient(HostRpc):
             "last_start_time": self._last_start_time,
             "last_error": self._last_error or self._session.last_error,
             "restart_count": self._session.restart_count,
+            "cua_status": self._operation_health_for("window_target").state,
+            "operation_health": {
+                operation: health.snapshot(now=time.monotonic())
+                for operation, health in self._operation_health.items()
+            },
         }
+
+    def _operation_health_for(self, operation: str) -> DriverOperationHealth:
+        """Return the client-local health record for one logical operation."""
+        return self._operation_health.setdefault(operation, DriverOperationHealth())
+
+    def _mark_operation_healthy(self, operation: str) -> None:
+        health = self._operation_health_for(operation)
+        health.failure_count = 0
+        health.last_failure_code = ""
+        health.last_failure_message = ""
+        health.next_probe_at = 0.0
+        health.state = "healthy"
+
+    def _mark_operation_failed(
+        self,
+        operation: str,
+        *,
+        failure_code: str,
+        message: str,
+        unavailable: bool = False,
+    ) -> None:
+        health = self._operation_health_for(operation)
+        health.failure_count += 1
+        health.last_failure_code = failure_code
+        health.last_failure_message = message[:500]
+        if unavailable:
+            health.state = "unavailable"
+            health.next_probe_at = time.monotonic() + self._window_target_cooldown_s
+        elif health.state != "unavailable":
+            health.state = "healthy"
+
+    def _window_target_is_circuit_open(self) -> bool:
+        return self._operation_health_for("window_target").state == "unavailable"
+
+    def _with_window_target_status(self, result: Any) -> Any:
+        """Attach the current target dependency status to CUA dictionary results."""
+        if not isinstance(result, dict):
+            return result
+        return {**result, "cua_status": self._operation_health_for("window_target").state}
+
+    def _window_target_unavailable_result(self) -> Dict[str, Any]:
+        """Return a stable, actionable failure without touching the driver."""
+        health = self._operation_health_for("window_target")
+        now = time.monotonic()
+        retry_after_s = round(max(0.0, health.next_probe_at - now), 3)
+        return {
+            "ok": False,
+            "error": (
+                "cua-driver window discovery is unavailable; window-scoped operations "
+                "are blocked until a successful ax.list recovery probe."
+            ),
+            "failure_class": "environment_unavailable",
+            "failure_code": "cua_driver_unavailable",
+            "retryable": False,
+            "dependency_blocked": ["window_target"],
+            "cua_status": health.state,
+            "retry_after_s": retry_after_s,
+            "next_step": "Wait for the cooldown, then call list_windows to run the recovery probe.",
+        }
+
+    async def _recover_window_discovery(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        timeout: float,
+        *,
+        failure_code: str,
+        failure_message: str,
+    ) -> Any:
+        """Perform the one allowed reconnect/probe/retry for ``ax.list``.
+
+        A timed-out list call may leave a serial MCP session occupied. Restarting
+        and probing ``get_screen_size`` proves a fresh driver is responsive before
+        exactly one list retry; a failed recovery opens the target dependency
+        circuit instead of sending later screenshots into the same dead path.
+        """
+        discovery = self._operation_health_for(Methods.AX_LIST)
+        target = self._operation_health_for("window_target")
+        discovery.state = target.state = "probing"
+        try:
+            with self._session._lock:
+                self._session._restart()
+            await self._call_cua_tool(
+                "get_screen_size", {}, self._resolve_timeout(Methods.PING), allow_reconnect=False
+            )
+            recovered = await self._call_cua_tool(
+                tool_name, tool_args, timeout, allow_reconnect=False
+            )
+        except Exception as exc:  # recovery is deliberately bounded to this one attempt
+            code = exc.code if isinstance(exc, RpcError) else failure_code
+            message = str(exc) or failure_message
+            self._mark_operation_failed(
+                Methods.AX_LIST,
+                failure_code=code,
+                message=message,
+                unavailable=True,
+            )
+            self._mark_operation_failed(
+                "window_target",
+                failure_code=code,
+                message=message,
+                unavailable=True,
+            )
+            self._last_error = message
+            return self._window_target_unavailable_result()
+        self._mark_operation_healthy(Methods.AX_LIST)
+        self._mark_operation_healthy("window_target")
+        return self._with_window_target_status(self._unwrap_result(recovered))
+
+    async def _call_window_discovery(
+        self, tool_name: str, tool_args: Dict[str, Any], timeout: float
+    ) -> Any:
+        """Run ``ax.list`` with a bounded recovery and target dependency circuit."""
+        target = self._operation_health_for("window_target")
+        if target.state == "unavailable":
+            if time.monotonic() < target.next_probe_at:
+                return self._window_target_unavailable_result()
+            return await self._recover_window_discovery(
+                tool_name,
+                tool_args,
+                timeout,
+                failure_code=target.last_failure_code or "cua_driver_unavailable",
+                failure_message=target.last_failure_message,
+            )
+        try:
+            result = await self._call_cua_tool(tool_name, tool_args, timeout)
+        except RpcError as exc:
+            self._mark_operation_failed(
+                Methods.AX_LIST,
+                failure_code=exc.code,
+                message=exc.message,
+            )
+            if exc.code != "timeout":
+                raise
+            return await self._recover_window_discovery(
+                tool_name,
+                tool_args,
+                timeout,
+                failure_code=exc.code,
+                failure_message=exc.message,
+            )
+        self._mark_operation_healthy(Methods.AX_LIST)
+        self._mark_operation_healthy("window_target")
+        return self._with_window_target_status(self._unwrap_result(result))
 
     def _start_keepalive(self) -> None:
         """Start periodic heartbeat on the bridge loop."""
@@ -846,23 +1027,47 @@ class CuaDriverClient(HostRpc):
         if handler is not None:
             return handler(params)
 
+        # Once window discovery is unavailable, never let target-dependent calls
+        # spend another RPC on the known-bad dependency. Only ax.list is allowed
+        # to leave the circuit open through its controlled recovery probe.
+        if method in {Methods.AX_TREE, Methods.SCREEN_CAPTURE_FRAME} and self._window_target_is_circuit_open():
+            return self._window_target_unavailable_result()
+
         # cua-driver tool dispatch (may raise _LocalResult for synthesized responses)
         try:
             tool_name, tool_args = self._map_to_cua_tool(method, params)
         except _LocalResult as lr:
             return lr.data
 
-        result = await self._call_cua_tool(tool_name, tool_args, timeout)
+        if method == Methods.AX_LIST:
+            return await self._call_window_discovery(tool_name, tool_args, timeout)
+
+        try:
+            result = await self._call_cua_tool(tool_name, tool_args, timeout)
+        except RpcError as exc:
+            self._mark_operation_failed(method, failure_code=exc.code, message=exc.message)
+            raise
+        self._mark_operation_healthy(method)
 
         # Verify-Then-Escalate: check if response recommends escalation
         if self._should_escalate(result):
             escalated_args = self._apply_escalation(tool_args, result)
-            result = await self._call_cua_tool(tool_name, escalated_args, timeout)
+            try:
+                result = await self._call_cua_tool(tool_name, escalated_args, timeout)
+            except RpcError as exc:
+                self._mark_operation_failed(method, failure_code=exc.code, message=exc.message)
+                raise
+            self._mark_operation_healthy(method)
 
         return self._unwrap_result(result)
 
     async def _call_cua_tool(
-        self, name: str, args: Dict[str, Any], timeout: float
+        self,
+        name: str,
+        args: Dict[str, Any],
+        timeout: float,
+        *,
+        allow_reconnect: bool = True,
     ) -> Dict[str, Any]:
         """Call a cua-driver MCP tool with reconnect-once semantics."""
         if self._session._session is None:
@@ -881,6 +1086,12 @@ class CuaDriverClient(HostRpc):
                     f"cua-driver {name} failed: {e}",
                     {"tool": name, "original": str(e)},
                 )
+            if not allow_reconnect:
+                raise RpcError(
+                    "cua_session_unavailable",
+                    f"cua-driver {name} lost its session during recovery: {e}",
+                    {"tool": name},
+                ) from e
             # Reconnect once
             logger.warning("cua-driver session dropped during %s; reconnecting", name)
             with self._session._lock:

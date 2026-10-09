@@ -741,6 +741,58 @@ def test_repetition_guard_is_result_aware() -> None:
     assert guard.check(polling).violated is False
 
 
+def test_failure_fingerprint_and_guard_ignore_volatile_screenshot_details() -> None:
+    import json
+
+    from leapflow.engine.tools.tool_guardrails import FailureFingerprint, RepetitionGuard
+
+    first = FailureFingerprint.from_result(
+        "screenshot",
+        {"screenshot_out_file": "/tmp/leapflow_screenshot_aaaaaaaa.png", "timestamp": 1700000000},
+        {
+            "ok": False,
+            "failure_code": "cua_driver_unavailable",
+            "returncode": 251,
+            "error": "Traceback: File /tmp/leapflow_screenshot_aaaaaaaa.png, line 41 at 1700000000",
+        },
+    )
+    second = FailureFingerprint.from_result(
+        "screenshot",
+        {"screenshot_out_file": "/tmp/leapflow_screenshot_bbbbbbbb.png", "timestamp": 1700000001},
+        {
+            "ok": False,
+            "failure_code": "cua_driver_unavailable",
+            "returncode": 251,
+            "error": "Traceback: File /tmp/leapflow_screenshot_bbbbbbbb.png, line 99 at 1700000001",
+        },
+    )
+    assert first.digest == second.digest
+
+    history: list[dict] = []
+    for index, fingerprint in enumerate((first, second, first)):
+        history.append({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": index,
+                "function": {
+                    "name": "screenshot",
+                    "arguments": '{"screenshot_out_file":"/tmp/leapflow_screenshot_%08x.png"}' % index,
+                },
+            }],
+        })
+        history.append({
+            "role": "tool",
+            "tool_call_id": index,
+            "content": json.dumps({
+                "ok": False,
+                "failure_code": fingerprint.failure_code,
+                "returncode": fingerprint.returncode,
+                "error": "driver unavailable at line %d" % (index + 1),
+            }),
+        })
+    assert RepetitionGuard(max_repeats=3).check(history).violated is True
+
+
 def test_progress_independent_halt_fires_while_progressing() -> None:
     """A ``progress_independent`` halt (the same tool returning the same result)
     must stop the loop even when the global stall marker still reads as advancing

@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shlex
 import time
 import uuid
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Literal, Mapping, cast
 
 ExecutionPolicy = Literal["read_only", "mutating_idempotent", "mutating_once", "external_side_effect"]
@@ -169,6 +171,187 @@ class ToolExecutionRecord:
             result=result,
             completed_at=time.time(),
         )
+
+
+@dataclass(frozen=True)
+class TaskCompletionEvidence:
+    """Immutable, per-step proof that a requested artifact or effect completed."""
+
+    step_id: str
+    artifact_uri: str
+    artifact_hash: str
+    effect_confirmed: bool
+    opened_paths: tuple[str, ...]
+    source: str
+    observed_at: float
+
+    def to_metadata(self) -> dict[str, Any]:
+        """Return the safe structured form carried in tool/stream metadata."""
+        return {
+            "step_id": self.step_id,
+            "artifact_uri": self.artifact_uri,
+            "artifact_hash": self.artifact_hash,
+            "effect_confirmed": self.effect_confirmed,
+            "opened_paths": list(self.opened_paths),
+            "source": self.source,
+            "observed_at": self.observed_at,
+        }
+
+
+def _canonical_artifact_path(value: Any) -> str:
+    """Normalize a local artifact path without treating URLs as filesystem paths."""
+    text = str(value or "").strip()
+    if not text or "://" in text and not text.startswith("file://"):
+        return ""
+    if text.startswith("file://"):
+        text = text[7:]
+    try:
+        return str(Path(text).expanduser().resolve())
+    except (OSError, ValueError):
+        return ""
+
+
+def _artifact_digest(path: str) -> str:
+    """Hash an existing artifact so equal content is idempotent within a step."""
+    if not path:
+        return ""
+    try:
+        candidate = Path(path)
+        if not candidate.is_file():
+            return ""
+        digest = hashlib.sha256()
+        with candidate.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65_536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def _result_artifact_paths(result: Mapping[str, Any]) -> tuple[str, ...]:
+    """Extract local artifact paths from the common result contract fields."""
+    candidates: list[Any] = [
+        result.get("artifact_uri"),
+        result.get("path"),
+        result.get("file_path"),
+        result.get("screenshot_file_path"),
+    ]
+    artifacts = result.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if isinstance(artifact, Mapping):
+                candidates.append(artifact.get("uri") or artifact.get("path"))
+            else:
+                candidates.append(artifact)
+    paths = [_canonical_artifact_path(candidate) for candidate in candidates]
+    return tuple(dict.fromkeys(path for path in paths if path))
+
+
+def _opened_paths(tool_name: str, arguments: Mapping[str, Any], result: Mapping[str, Any]) -> tuple[str, ...]:
+    """Extract explicit or shell-requested local file opens from a successful call."""
+    candidates: list[Any] = []
+    for key in ("opened_path", "opened_file", "path_opened"):
+        candidates.append(result.get(key))
+    raw_paths = result.get("opened_paths")
+    if isinstance(raw_paths, (list, tuple)):
+        candidates.extend(raw_paths)
+    if bool(result.get("opened")):
+        candidates.extend((result.get("path"), result.get("file_path")))
+    lowered_name = str(tool_name or "").lower()
+    if lowered_name.startswith("open"):
+        candidates.extend((arguments.get("path"), arguments.get("file_path")))
+    if lowered_name == "shell_run":
+        command = str(arguments.get("command") or "")
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = []
+        if len(tokens) >= 2 and tokens[0].lower() in {"open", "xdg-open", "start"}:
+            candidates.append(tokens[-1])
+    paths = [_canonical_artifact_path(candidate) for candidate in candidates]
+    return tuple(dict.fromkeys(path for path in paths if path))
+
+
+class TaskCompletionTracker:
+    """Per-frame evidence ledger that turns completed screenshot work into a finalization signal."""
+
+    def __init__(self) -> None:
+        self._evidence: dict[tuple[str, str, str], TaskCompletionEvidence] = {}
+
+    @property
+    def evidence(self) -> tuple[TaskCompletionEvidence, ...]:
+        return tuple(self._evidence.values())
+
+    def record(
+        self,
+        *,
+        step_id: str,
+        tool_name: str,
+        arguments: Mapping[str, Any] | None,
+        result: Mapping[str, Any],
+    ) -> tuple[TaskCompletionEvidence, ...]:
+        """Record success evidence and return only records newly added this call."""
+        if result.get("ok") is not True or result.get("duplicate_suppressed"):
+            return ()
+        args = arguments or {}
+        source = "screenshot" if (
+            tool_name == "screenshot"
+            or bool(result.get("captured"))
+            or bool(result.get("screenshot_file_path"))
+        ) else "tool_result"
+        effect_confirmed = bool(result.get("effect_confirmed", result.get("completed", True)))
+        opened = _opened_paths(tool_name, args, result)
+        added: list[TaskCompletionEvidence] = []
+        for artifact_path in _result_artifact_paths(result):
+            artifact_hash = _artifact_digest(artifact_path)
+            # Screenshot completion needs a real file, not only the driver saying
+            # where it intended to write one.
+            if source == "screenshot" and not artifact_hash:
+                continue
+            identity = artifact_hash or artifact_path
+            key = (step_id, source, identity)
+            if key in self._evidence:
+                continue
+            evidence = TaskCompletionEvidence(
+                step_id=step_id,
+                artifact_uri=artifact_path,
+                artifact_hash=artifact_hash,
+                effect_confirmed=effect_confirmed,
+                opened_paths=opened,
+                source=source,
+                observed_at=time.time(),
+            )
+            self._evidence[key] = evidence
+            added.append(evidence)
+        if opened:
+            key = (step_id, "open_request", "|".join(opened))
+            if key not in self._evidence:
+                evidence = TaskCompletionEvidence(
+                    step_id=step_id,
+                    artifact_uri="",
+                    artifact_hash="",
+                    effect_confirmed=effect_confirmed,
+                    opened_paths=opened,
+                    source="open_request",
+                    observed_at=time.time(),
+                )
+                self._evidence[key] = evidence
+                added.append(evidence)
+        return tuple(added)
+
+    def ready_for_final_response(self) -> bool:
+        """Return true once two real screenshots have each been requested open."""
+        screenshots: dict[str, TaskCompletionEvidence] = {}
+        opened: set[str] = set()
+        for evidence in self._evidence.values():
+            opened.update(evidence.opened_paths)
+            if evidence.source == "screenshot" and evidence.effect_confirmed and evidence.artifact_uri:
+                identity = evidence.artifact_hash or evidence.artifact_uri
+                screenshots[identity] = evidence
+        if len(screenshots) < 2:
+            return False
+        screenshot_paths = {evidence.artifact_uri for evidence in screenshots.values()}
+        return screenshot_paths.issubset(opened)
 
 
 class ToolExecutionLedger:
