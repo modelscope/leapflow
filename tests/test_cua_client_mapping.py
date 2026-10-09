@@ -302,6 +302,24 @@ def test_app_list_timeout_gets_dedicated_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_call_cua_tool_uses_session_owner_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = CuaDriverClient()
+    client._session._session = object()
+    calls: list[tuple[str, dict, float]] = []
+
+    async def fake_on_bridge(name: str, args: dict, timeout: float) -> dict:
+        calls.append((name, args, timeout))
+        return {"data": {"windows": []}, "images": [], "structuredContent": None, "isError": False}
+
+    monkeypatch.setattr(client, "_call_tool_on_bridge", fake_on_bridge)
+    result = await client._call_cua_tool("list_windows", {}, 8.0)
+    assert result["data"] == {"windows": []}
+    assert calls == [("list_windows", {}, 8.0)]
+
+
+@pytest.mark.asyncio
 async def test_ax_list_timeout_probes_once_then_opens_window_target_circuit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

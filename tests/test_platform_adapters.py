@@ -24,7 +24,7 @@ from leapflow.platform.adapters.darwin import (
     DarwinPerceptionAdapter,
     _snapshot_from_payload,
 )
-from leapflow.platform.cua_client import CuaDriverClient, _local_clipboard_get
+from leapflow.platform.cua_client import CuaDriverClient, _extract_result, _local_clipboard_get
 from leapflow.platform.mock import MockBridge
 from leapflow.platform.protocol import RpcError
 
@@ -136,6 +136,31 @@ def test_unwrap_preserves_existing_ok() -> None:
         "isError": False,
     })
     assert result["ok"] is False and result["error"] == "denied"
+
+
+def test_extract_result_reads_mcp2_snake_case_structured_content() -> None:
+    """MCP 2.x Python models use snake_case even though wire JSON is camelCase."""
+    from mcp.types import CallToolResult, TextContent
+
+    raw = CallToolResult(
+        content=[TextContent(type="text", text="Found 1 window(s).")],
+        structured_content={"windows": [{"pid": 1, "window_id": 2}]},
+        is_error=False,
+    )
+    result = _extract_result(raw)
+    assert result["isError"] is False
+    assert result["structuredContent"] == {"windows": [{"pid": 1, "window_id": 2}]}
+
+
+def test_extract_result_preserves_mcp1_camel_case_compatibility() -> None:
+    class LegacyResult:
+        isError = True
+        structuredContent = {"error": "legacy"}
+        content: list[object] = []
+
+    result = _extract_result(LegacyResult())
+    assert result["isError"] is True
+    assert result["structuredContent"] == {"error": "legacy"}
 
 
 # ── R2: local clipboard contract shape ───────────────────────────────────────
