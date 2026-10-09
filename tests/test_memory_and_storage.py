@@ -20,6 +20,7 @@ from leapflow.domain.trajectory import (
 from leapflow.memory import (
     EpisodicMemoryProvider, SemanticMemoryProvider, WorkingMemoryProvider,
 )
+from leapflow.memory.providers.working import resolve_working_memory_max_tokens
 from leapflow.memory.manager import MemoryManager
 from leapflow.memory.protocol import MemoryEntry, MemoryKind, SignalDomain
 from leapflow.platform.event_bus import EventBus
@@ -105,6 +106,54 @@ def test_working_memory_overflow() -> None:
     msgs = wm.as_chat_messages()
     assert len(msgs) < 50
     assert msgs[-1]["content"].startswith("message-49")
+    assert wm.evicted_messages > 0
+
+
+def test_working_memory_auto_budget_scales_with_context_window() -> None:
+    assert resolve_working_memory_max_tokens(0, 32_000) == 16_384
+    assert resolve_working_memory_max_tokens(0, 1_000_000) == 125_000
+    assert resolve_working_memory_max_tokens(0, 2_000_000) == 131_072
+    assert resolve_working_memory_max_tokens(12_000, 1_000_000) == 12_000
+
+
+def test_working_memory_snapshot_exposes_retention_and_eviction() -> None:
+    wm = WorkingMemoryProvider(max_tokens=64)
+    wm.remember_chat({"role": "user", "content": "x" * 400})
+    snapshot = wm.snapshot()
+    assert snapshot["max_tokens"] == 64
+    assert snapshot["token_count"] <= 64
+    assert snapshot["evicted_messages"] >= 1
+
+
+def test_session_resume_restores_persisted_tool_evidence() -> None:
+    from types import SimpleNamespace
+
+    from leapflow.engine.session_persistence import SessionPersistence
+
+    class Store:
+        def get_messages(self, session_id: str, limit: int = 500):
+            assert session_id == "session-1" and limit == 500
+            return [
+                SimpleNamespace(role="user", content="Research the topic", tool_name=""),
+                SimpleNamespace(
+                    role="tool",
+                    content='{"ok": true, "kind": "web_fetch_evidence", "text": "source finding"}',
+                    tool_name="web_fetch",
+                ),
+                SimpleNamespace(role="assistant", content="Initial findings", tool_name=""),
+            ]
+
+    wm = WorkingMemoryProvider(max_tokens=2_048)
+    engine = SimpleNamespace(
+        _conversation_store=Store(),
+        _current_session_id="",
+        _wm=wm,
+        _settings=SimpleNamespace(session_resume_cache_policy="cache_priority"),
+    )
+    assert SessionPersistence(engine).load_session("session-1") is True
+    restored = "\n".join(str(message["content"]) for message in wm.as_chat_messages())
+    assert "[Tool Evidence — persisted" in restored
+    assert "web_fetch" in restored and "source finding" in restored
 
 
 def test_working_memory_pattern_counting() -> None:

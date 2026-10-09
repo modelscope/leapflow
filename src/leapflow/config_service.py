@@ -268,7 +268,10 @@ _FIELD_DESCRIPTIONS = {
     "vlm.api_key": "VLM API key stored in the local secret vault.",
     "runtime.mock_host": "Use the in-process mock host when native OS control is unavailable.",
     "runtime.log_level": "Logging verbosity for CLI, TUI, and runtime diagnostics.",
-    "memory.working_max_tokens": "Token budget for working memory injected into active reasoning.",
+    "memory.working_max_tokens": (
+        "Working-memory token budget injected into active reasoning; 0 automatically "
+        "scales with the model context window, while a positive value is a hard cap."
+    ),
     "visual.track_enabled": "Enable screenshot-based visual perception for the active profile.",
     "recording.mode": "Default recording pipeline used during teaching and observation.",
     "scheduler.tick_seconds": "Scheduler polling interval in seconds.",
@@ -903,7 +906,7 @@ def _examples_for_key(key: str) -> tuple[str, ...]:
         "llm.context_length": ("leap config set llm.context_length 1000000",),
         "runtime.mock_host": ("leap config set runtime.mock_host true",),
         "runtime.log_level": ("leap config set runtime.log_level DEBUG",),
-        "memory.working_max_tokens": ("leap config set memory.working_max_tokens 12000",),
+        "memory.working_max_tokens": ("leap config set memory.working_max_tokens 0",),
         "visual.track_enabled": ("leap config set visual.track_enabled true",),
     }
     return examples.get(key, ())

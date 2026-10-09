@@ -85,7 +85,9 @@ class Settings:
     log_level: str
 
     # ── Memory Providers ──
-    memory_working_max_tokens: int = 8192
+    # ``0`` selects an adaptive fraction of the active model context window;
+    # positive values are an explicit operator cap.
+    memory_working_max_tokens: int = 0
     memory_episodic_ttl_s: float = 300.0        # 5 minutes
     memory_episodic_max_entries: int = 200
     memory_evolution_max_episodes: int = 1000
@@ -919,8 +921,9 @@ def _build_settings_from_env(
     # belong to the daemon file log (daemon.log_level, default INFO).
     log_level = os.getenv("LEAPFLOW_LOG_LEVEL", "WARNING").strip()
 
-    # Memory Providers
-    memory_working_max_tokens = int(os.getenv("LEAPFLOW_MEMORY_WORKING_MAX_TOKENS", "8192"))
+    # Memory Providers. Zero is the safe default: derive capacity from the
+    # active context window instead of retaining the legacy fixed 8K ring.
+    memory_working_max_tokens = int(os.getenv("LEAPFLOW_MEMORY_WORKING_MAX_TOKENS", "0"))
     memory_episodic_ttl_s = float(os.getenv("LEAPFLOW_MEMORY_EPISODIC_TTL_S", "300.0"))
     memory_episodic_max_entries = int(os.getenv("LEAPFLOW_MEMORY_EPISODIC_MAX_ENTRIES", "200"))
     memory_evolution_max_episodes = int(os.getenv("LEAPFLOW_MEMORY_EVOLUTION_MAX_EPISODES", "1000"))

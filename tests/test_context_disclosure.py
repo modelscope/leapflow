@@ -36,6 +36,7 @@ def test_disclosure_planner_core_is_never_empty_and_excludes_heavy_categories() 
     assert plan.catalog_definitions == tuple(TOOL_DEFINITIONS)
     assert plan.native_tools is True
     assert plan.context_planes == ("task_semantic", "control_plane")
+    assert plan.max_prior_turns == 4
 
     # Always-on low-risk, cheap-schema tools.
     for expected in ("file_list", "file_read", "text_search", "memory_search", "capability_expand"):
@@ -77,6 +78,16 @@ def test_disclosure_planner_expands_via_last_turn_tool_category_continuity() -> 
         assert expected in names
     # Gateway tools were not part of the continuity signal, so they stay closed.
     assert "gateway_send" not in names
+    assert plan.max_prior_turns == 12
+
+
+def test_full_disclosure_keeps_enough_tool_evidence_for_follow_up_turns() -> None:
+    plan = DisclosurePlanner().plan(
+        TOOL_DEFINITIONS,
+        DisclosureRuntimeState(context_posture="research", native_tools_enabled=True),
+    )
+    assert plan.level == DisclosureLevel.FULL
+    assert plan.max_prior_turns == 24
 
 
 def test_disclosure_planner_expands_tools_from_capability_plan() -> None:

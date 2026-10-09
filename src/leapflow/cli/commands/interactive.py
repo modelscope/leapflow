@@ -1087,7 +1087,12 @@ async def cmd_interactive_daemon(
             runtime_context_state = str(metadata["context_posture"])
         elif isinstance(metadata.get("context_budget_snapshot"), dict):
             snapshot = metadata["context_budget_snapshot"]
-            runtime_context_state = str(snapshot.get("context_posture") or runtime_context_state)
+            if snapshot.get("working_memory_trimmed"):
+                # A smaller prompt can be legitimate, but this label makes the
+                # retention boundary explicit instead of implying compression.
+                runtime_context_state = "memory-trimmed"
+            else:
+                runtime_context_state = str(snapshot.get("context_posture") or runtime_context_state)
         host = metadata.get("host_backend")
         if isinstance(host, dict):
             runtime_host_online = _host_started(host)

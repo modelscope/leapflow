@@ -87,6 +87,136 @@ async def test_react_loop_tool_then_answer() -> None:
             lt.close()
 
 
+@pytest.mark.asyncio
+async def test_native_tool_evidence_survives_into_follow_up_turn() -> None:
+    """A later question must see compact findings, not only a tool-name marker."""
+    from leapflow.llm.base import LLMChatResponse, LLMProvider, ToolCallInfo
+    from leapflow.platform.mock import MockBridge
+
+    class CaptureNativeLLM(LLMProvider):
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, object]]] = []
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, **kwargs):
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                return LLMChatResponse(
+                    content="",
+                    tool_calls=[ToolCallInfo(id="clock-1", name="time_get", arguments={})],
+                )
+            if len(self.calls) == 2:
+                return LLMChatResponse(content="The time was collected.")
+            return LLMChatResponse(content="Follow-up answered from retained evidence.")
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            if False:
+                yield ""
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        settings = settings.__class__(**{
+            **settings.__dict__,
+            "native_tool_calling_enabled": True,
+            "llm_context_length": 1_000_000,
+        })
+        rpc = MockBridge()
+        llm = CaptureNativeLLM()
+        wm = WorkingMemoryProvider(max_tokens=125_000)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, _FixedClassifier("complex"))
+            assert await engine.run("Collect the current time.") == "The time was collected."
+            assert await engine.run("What did you collect previously?") == "Follow-up answered from retained evidence."
+            follow_up_prompt = "\n".join(
+                str(message.get("content", "")) for message in llm.calls[2]
+            )
+            assert "[Tool Evidence" in follow_up_prompt
+            assert "time_get" in follow_up_prompt
+            assert engine.context_budget_snapshot["working_memory"]["max_tokens"] == 125_000
+            assert engine.context_budget_snapshot["working_memory_trimmed"] is False
+            assert wm.evicted_messages == 0
+        finally:
+            lt.close()
+
+
+@pytest.mark.asyncio
+async def test_dense_tool_batch_retains_bounded_evidence_for_follow_up() -> None:
+    """Large research payloads stay useful across turns without re-inflating context."""
+    from leapflow.llm.base import LLMChatResponse, LLMProvider, ToolCallInfo
+    from leapflow.platform.mock import MockBridge
+
+    class DenseResearchLLM(LLMProvider):
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, object]]] = []
+
+        async def achat(self, messages, *, stream=True, enable_thinking=False, **kwargs):
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                return LLMChatResponse(
+                    content="",
+                    tool_calls=[
+                        ToolCallInfo(
+                            id=f"fetch-{index}",
+                            name="web_fetch",
+                            arguments={"url": f"https://example.test/{index}"},
+                        )
+                        for index in range(8)
+                    ],
+                )
+            if len(self.calls) == 2:
+                return LLMChatResponse(content="Research collected.")
+            return LLMChatResponse(content="Follow-up synthesized.")
+
+        async def achat_stream(self, messages, *, enable_thinking=False, **kwargs):
+            if False:
+                yield ""
+
+    async def _large_fetch(tool_call, _handlers):
+        url = str(tool_call["arguments"]["url"])
+        return {
+            "ok": True,
+            "url": url,
+            "final_url": url,
+            "status": 200,
+            "text": f"FINDING-{url.rsplit('/', 1)[-1]} " + ("x" * 40_000),
+        }
+
+    with tempfile.TemporaryDirectory() as td:
+        settings = make_settings(td)
+        settings = settings.__class__(**{
+            **settings.__dict__,
+            "native_tool_calling_enabled": True,
+            "llm_context_length": 1_000_000,
+        })
+        rpc = MockBridge()
+        llm = DenseResearchLLM()
+        wm = WorkingMemoryProvider(max_tokens=125_000)
+        lt = SemanticMemoryProvider(source=settings.duckdb_path)
+        imm = EpisodicMemoryProvider()
+        try:
+            reg = build_default_registry(rpc, llm, wm, lt)
+            engine = AgentEngine(settings, rpc, llm, wm, lt, imm, reg, _FixedClassifier("complex"))
+            engine._tool_dispatch._execute_general_tool = AsyncMock(side_effect=_large_fetch)  # type: ignore[method-assign]
+            assert await engine.run("Research eight sources.") == "Research collected."
+            assert await engine.run("Synthesize the retained research.") == "Follow-up synthesized."
+            evidence = next(
+                str(message["content"])
+                for message in wm.as_chat_messages()
+                if str(message.get("content", "")).startswith("[Tool Evidence")
+            )
+            assert "FINDING-0" in evidence and "FINDING-7" in evidence
+            assert len(evidence) <= 48_000
+            follow_up_prompt = "\n".join(
+                str(message.get("content", "")) for message in llm.calls[2]
+            )
+            assert "FINDING-0" in follow_up_prompt and "FINDING-7" in follow_up_prompt
+            assert wm.evicted_messages == 0
+        finally:
+            lt.close()
+
+
 # Current status (verified during the P0 test-cleanup pass): this test remains a
 # genuine XFAIL, not a stale marker. Running it without the decorator still fails
 # on cross-contamination, because a single shared AgentEngine keeps per-turn

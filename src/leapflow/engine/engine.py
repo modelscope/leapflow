@@ -2006,6 +2006,9 @@ class AgentEngine:
                             f"[Called: {', '.join(tc.name for tc in native_calls)}]"
                         )
                     )
+                    memory_evidence = self._tool_dispatch.working_memory_evidence(results)
+                    if memory_evidence:
+                        self._wm.remember_chat(build_assistant_message(memory_evidence))
 
                     if status == BudgetStatus.SOFT_LIMIT and not self._should_extend_budget(frame):
                         messages.append(
@@ -2275,6 +2278,11 @@ class AgentEngine:
                     tool_name, tool_arguments, result
                 ),
             )
+            memory_evidence = self._tool_dispatch.working_memory_evidence([
+                {"name": tool_name, "evidence": result_payload}
+            ])
+            if memory_evidence:
+                self._wm.remember_chat(build_assistant_message(memory_evidence))
 
             if self._tool_dispatch.task_completion_ready():
                 messages.append(build_user_message_text(

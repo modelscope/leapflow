@@ -44,6 +44,7 @@ from leapflow.memory import (
     SemanticMemoryProvider, EvolutionMemoryProvider, NarrativeProvider,
     MemoryFragment,
 )
+from leapflow.memory.providers.working import resolve_working_memory_max_tokens
 from leapflow.skills.activator import SkillActivator
 from leapflow.skills.evolution import EMAConfidencePolicy
 from leapflow.skills.index import SkillIndex
@@ -498,8 +499,14 @@ class Context:
         self._capability_proposal_queue: Optional[Any] = None
         self._plugin_outcome_store: Optional[Any] = None
 
-        # Memory subsystem — provider-based architecture (dual-layer)
-        working = WorkingMemoryProvider(max_tokens=settings.memory_working_max_tokens)
+        # Memory subsystem — provider-based architecture (dual-layer). The
+        # default budget scales with the real model window; an explicit positive
+        # setting remains a hard operator cap.
+        working = WorkingMemoryProvider(
+            max_tokens=resolve_working_memory_max_tokens(
+                settings.memory_working_max_tokens, settings.llm_context_length
+            )
+        )
         semantic = SemanticMemoryProvider(source=self._db_holder)
         episodic = EpisodicMemoryProvider(
             ttl=settings.memory_episodic_ttl_s,
@@ -825,6 +832,13 @@ class Context:
             return
 
         context_length = self._effective_llm_context_length(settings)
+        working_memory_budget = resolve_working_memory_max_tokens(
+            int(getattr(settings, "memory_working_max_tokens", 0) or 0), context_length
+        )
+        working_memory = getattr(self, "wm", None) or getattr(self.engine, "_wm", None)
+        reconfigure_memory = getattr(working_memory, "reconfigure_max_tokens", None)
+        if callable(reconfigure_memory):
+            reconfigure_memory(working_memory_budget)
         dynamic_result_budget = adaptive_tool_result_chars(
             settings.max_tool_result_chars, context_length,
         )
