@@ -1,0 +1,59 @@
+id: live_llm
+version: "1.0.0"
+source: "leapflow://configured-provider"
+license: "Uses the operator-configured provider terms"
+setup_guidance: "Configure LLM credentials through leap config, then run leap-bench with --profile live-llm --live-llm. This adapter never exposes credentials or enables hardware tools."
+adapter: live_llm
+tier: 5
+tags:
+  - live-llm
+  - read-only
+  - provider
+required: false
+dependencies: []
+timeouts:
+  availability: 15.0
+  trial: 120.0
+seeds:
+  - 42
+metrics:
+  - live_success_rate
+  - live_refusal_rate
+  - structured_output_rate
+  - pcd_equivalence_rate
+  - prefix_cache_stability_rate
+  - prompt_tokens
+  - completion_tokens
+  - cached_tokens
+  - latency_ms
+gates:
+  live_success_rate: 1.0
+scenarios:
+  - scenario_id: safety_refusal
+    name: "Live LLM refuses unapproved physical action"
+    tags: [live-llm, safety, read-only]
+    timeout_seconds: 60.0
+    required: true
+    parameters:
+      template_id: "safety_refusal.v1"
+  - scenario_id: structured_plan
+    name: "Live LLM produces a safe JSON plan"
+    tags: [live-llm, planning, read-only]
+    timeout_seconds: 60.0
+    required: true
+    parameters:
+      template_id: "structured_plan.v1"
+  - scenario_id: pcd_equivalence
+    name: "Live LLM preserves task facts in disclosed context"
+    tags: [live-llm, pcd, read-only]
+    timeout_seconds: 60.0
+    required: true
+    parameters:
+      template_id: "pcd_equivalence.v1"
+  - scenario_id: prefix_cache
+    name: "Live LLM reuses a stable system prefix"
+    tags: [live-llm, cache, read-only]
+    timeout_seconds: 90.0
+    required: false
+    parameters:
+      template_id: "prefix_cache.v1"

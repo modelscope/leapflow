@@ -290,12 +290,20 @@ def _print_auth_setup_hint(console: Any, settings: Any) -> bool:
 
 
 def _host_action(args: str) -> str:
-    action = (args or "status").strip().lower()
-    if action in {"on", "up", "enable"}:
-        return "start"
-    if action in {"off", "down", "disable"}:
-        return "stop"
-    return action
+    """Resolve a /host action through the registry's shared declaration."""
+    from leapflow.cli.commands.registry import resolve_command, resolve_command_action
+
+    command = resolve_command("host")
+    action = resolve_command_action(command, args) if command is not None else None
+    return action.name if action is not None else ""
+
+
+def _host_action_usage() -> str:
+    """Return the canonical /host usage text from the command registry."""
+    from leapflow.cli.commands.registry import command_action_usage, resolve_command
+
+    command = resolve_command("host")
+    return command_action_usage(command) if command is not None else "Usage: /host"
 
 
 def _format_queue_elapsed(seconds: float) -> str:
@@ -719,9 +727,24 @@ async def cmd_interactive(ctx: "Context", *, resume_id: Optional[str] = None) ->
                     console.system("Restarting CuaDriver OS control…")
                     result = await ctx.host_backend_restart()
                 else:
-                    console.warning("Usage: /host [status|start|stop|restart]")
+                    console.warning(_host_action_usage())
+                    console.system("Use Tab after `/host ` to choose an action.")
                     return
-                _print_host_status(console, result)
+                succeeded = bool(result.get("ok", True))
+                render_command_payload(
+                    console,
+                    {
+                        "ok": succeeded,
+                        "view": "host",
+                        "action": action,
+                        "result": result,
+                        "message": (
+                            ""
+                            if succeeded
+                            else str(result.get("last_error") or "Host control failed.")
+                        ),
+                    },
+                )
                 _update_status()
                 return
 
@@ -1087,7 +1110,12 @@ async def cmd_interactive_daemon(
             runtime_context_state = str(metadata["context_posture"])
         elif isinstance(metadata.get("context_budget_snapshot"), dict):
             snapshot = metadata["context_budget_snapshot"]
-            runtime_context_state = str(snapshot.get("context_posture") or runtime_context_state)
+            if snapshot.get("working_memory_trimmed"):
+                # A smaller prompt can be legitimate, but this label makes the
+                # retention boundary explicit instead of implying compression.
+                runtime_context_state = "memory-trimmed"
+            else:
+                runtime_context_state = str(snapshot.get("context_posture") or runtime_context_state)
         host = metadata.get("host_backend")
         if isinstance(host, dict):
             runtime_host_online = _host_started(host)

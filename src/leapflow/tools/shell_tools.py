@@ -11,6 +11,7 @@ Safety layers:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -42,6 +43,95 @@ _DEFAULT_TIMEOUT = 30.0
 # hard-coded 120 s; injectable at startup via set_max_shell_timeout so
 # long-running builds and tests are no longer unconditionally killed.
 _max_shell_timeout_s: float = 300.0
+
+# ``251`` alone is not meaningful across all commands. The I/O markers make the
+# classification specific to the observed infrastructure failure instead of
+# turning every command that happens to reuse that exit code into a terminal
+# environment incident.
+_SHELL_IO_ERROR_MARKERS: FrozenSet[str] = frozenset({
+    "input/output error",
+    "i/o error",
+    "errno 5",
+})
+_SHELL_SYNTAX_ERROR_MARKERS: FrozenSet[str] = frozenset({
+    "syntax error",
+    "unexpected token",
+    "unterminated",
+    "unmatched ",
+})
+_SHELL_COMMAND_NOT_FOUND_MARKERS: FrozenSet[str] = frozenset({
+    "command not found",
+    "not recognized as an internal or external command",
+    "no such file or directory",
+})
+
+
+def _shell_failure_result(
+    *,
+    error: str,
+    failure_class: str,
+    failure_code: str,
+    retryable: bool,
+    returncode: int | None = None,
+    stdout: str = "",
+    stderr: str = "",
+    cwd: str | None = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build the stable failure contract for every ``shell_run`` exit path."""
+    result: Dict[str, Any] = {
+        "ok": False,
+        "error": error,
+        "failure_class": failure_class,
+        "failure_code": failure_code,
+        "retryable": retryable,
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "cwd": cwd,
+    }
+    if extra:
+        result.update(extra)
+    return result
+
+
+def _annotate_shell_refusal(
+    refusal: Dict[str, Any], *, failure_class: str, failure_code: str
+) -> Dict[str, Any]:
+    """Preserve a gate's diagnostic fields while applying shell failure semantics."""
+    return {
+        **refusal,
+        "ok": False,
+        "failure_class": failure_class,
+        "failure_code": failure_code,
+        "retryable": False,
+        "returncode": refusal.get("returncode"),
+    }
+
+
+def _classify_nonzero_shell_exit(returncode: int | None, detail: str) -> tuple[str, str]:
+    """Classify a completed non-zero process without relying on its raw message."""
+    normalized = detail.lower()
+    if returncode == 251 and any(marker in normalized for marker in _SHELL_IO_ERROR_MARKERS):
+        return "environment_unavailable", "shell_io_failure"
+    if any(marker in normalized for marker in _SHELL_SYNTAX_ERROR_MARKERS):
+        return "invalid_command", "shell_syntax_error"
+    if returncode == 127 or any(marker in normalized for marker in _SHELL_COMMAND_NOT_FOUND_MARKERS):
+        return "invalid_command", "shell_command_not_found"
+    return "shell_command_failed", "shell_nonzero_exit"
+
+
+def _shell_audit_metadata(
+    command: str, *, stdout: str = "", stderr: str = "", returncode: int | None = None
+) -> Dict[str, Any]:
+    """Return safe shell audit fields without persisting command or output text."""
+    digest = lambda value: hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+    return {
+        "command_digest": digest(command),
+        "stdout_sha256": digest(stdout),
+        "stderr_sha256": digest(stderr),
+        "audit_returncode": returncode,
+    }
 
 
 def set_max_shell_timeout(seconds: float) -> None:
@@ -240,14 +330,32 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
     cwd = str(cwd_path) if cwd_path is not None else None
     timeout = min(float(params.get("timeout", _DEFAULT_TIMEOUT)), _max_shell_timeout_s)
 
-    if not command:
-        return {"ok": False, "error": "Missing required parameter: command"}
+    if not isinstance(command, str) or not command.strip():
+        return _shell_failure_result(
+            error="Missing required parameter: command",
+            failure_class="invalid_request",
+            failure_code="shell_command_required",
+            retryable=False,
+            cwd=cwd,
+        )
 
     if _is_hardline_blocked(command):
-        return {"ok": False, "error": "Command blocked by safety policy (destructive pattern detected)"}
+        return _shell_failure_result(
+            error="Command blocked by safety policy (destructive pattern detected)",
+            failure_class="safety_policy",
+            failure_code="shell_command_blocked",
+            retryable=False,
+            cwd=cwd,
+        )
 
     if _is_cwd_blocked(cwd):
-        return {"ok": False, "error": f"Working directory blocked by safety policy: {cwd}"}
+        return _shell_failure_result(
+            error=f"Working directory blocked by safety policy: {cwd}",
+            failure_class="safety_policy",
+            failure_code="shell_cwd_blocked",
+            retryable=False,
+            cwd=cwd,
+        )
 
     if cwd_path is not None:
         scope_error = await require_workspace_access(
@@ -258,7 +366,11 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
             metadata={"command": command},
         )
         if scope_error:
-            return scope_error
+            return _annotate_shell_refusal(
+                scope_error,
+                failure_class="scope_denied",
+                failure_code="workspace_access_denied",
+            )
 
     escape_target = _command_workspace_escape_path(str(command), cwd=cwd_path)
     if escape_target is not None:
@@ -270,13 +382,25 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
             metadata={"command": command},
         )
         if scope_error:
-            return scope_error
+            return _annotate_shell_refusal(
+                scope_error,
+                failure_class="scope_denied",
+                failure_code="workspace_access_denied",
+            )
 
     if _is_dangerous(command):
         approved, message = await _approve_command(command, cwd)
         if not approved:
-            return {"ok": False, "error": message}
+            return _shell_failure_result(
+                error=message,
+                failure_class="authorization",
+                failure_code="approval_denied",
+                retryable=False,
+                cwd=cwd,
+            )
 
+    group: Optional[ProcessGroup] = None
+    proc: Any = None
     try:
         _popen_kwargs: Dict[str, Any] = {}
         if sys.platform == "win32":  # pragma: no cover - platform specific
@@ -293,7 +417,7 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
         # Attach immediately so the shell's descendants inherit group membership
         # and a timeout can kill the whole tree, not just the shell itself.
         try:
-            group: Optional[ProcessGroup] = ProcessGroup()
+            group = ProcessGroup()
             group.attach(proc.pid)
         except OSError:
             group = None
@@ -317,13 +441,36 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
             "stdout": stdout_text,
             "stderr": stderr_text,
             "cwd": cwd,
+            **_shell_audit_metadata(
+                command,
+                stdout=stdout_text,
+                stderr=stderr_text,
+                returncode=proc.returncode,
+            ),
         }
         if proc.returncode != 0:
             # Surface a concrete error: the tail of stderr holds the real cause
             # (e.g. the last line of a Python traceback), so downstream never has
             # to fall back to a bare "unknown error".
             detail = stderr_text.strip() or stdout_text.strip()
-            result["error"] = detail[-800:] if detail else f"Command failed with exit code {proc.returncode}"
+            error = detail[-800:] if detail else f"Command failed with exit code {proc.returncode}"
+            failure_class, failure_code = _classify_nonzero_shell_exit(proc.returncode, detail)
+            return _shell_failure_result(
+                error=error,
+                failure_class=failure_class,
+                failure_code=failure_code,
+                retryable=False,
+                returncode=proc.returncode,
+                stdout=stdout_text,
+                stderr=stderr_text,
+                cwd=cwd,
+                extra=_shell_audit_metadata(
+                    command,
+                    stdout=stdout_text,
+                    stderr=stderr_text,
+                    returncode=proc.returncode,
+                ),
+            )
         return result
     except asyncio.TimeoutError:
         # Kill the whole tree: leaving the shell's children running would leak
@@ -331,11 +478,34 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
         from leapflow.daemon.lifecycle import DaemonSignal
 
         killed = group is not None and group.terminate(DaemonSignal.SIGKILL.value)
-        if not killed:
+        if not killed and proc is not None:
             try:
-                proc.kill()  # type: ignore[possibly-undefined]
+                proc.kill()
             except (ProcessLookupError, OSError):
                 pass
-        return {"ok": False, "error": f"Command timed out after {timeout}s"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return _shell_failure_result(
+            error=f"Command timed out after {timeout}s",
+            failure_class="execution_timeout",
+            failure_code="shell_timeout",
+            retryable=True,
+            cwd=cwd,
+            extra=_shell_audit_metadata(command),
+        )
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        return _shell_failure_result(
+            error=str(exc),
+            failure_class="invalid_request",
+            failure_code="shell_invalid_cwd",
+            retryable=False,
+            cwd=cwd,
+            extra=_shell_audit_metadata(command),
+        )
+    except Exception as exc:
+        return _shell_failure_result(
+            error=str(exc),
+            failure_class="shell_execution_error",
+            failure_code="shell_execution_failed",
+            retryable=False,
+            cwd=cwd,
+            extra=_shell_audit_metadata(command),
+        )

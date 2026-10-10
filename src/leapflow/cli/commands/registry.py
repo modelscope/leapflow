@@ -41,6 +41,16 @@ CommandRuntime = Literal["in_process", "daemon"]
 
 
 @dataclass(frozen=True)
+class CommandAction:
+    """A discoverable action accepted by a slash command."""
+
+    name: str
+    description: str
+    aliases: Tuple[str, ...] = ()
+    default: bool = False
+
+
+@dataclass(frozen=True)
 class CommandDef:
     """Definition of a single slash command."""
 
@@ -49,6 +59,7 @@ class CommandDef:
     category: str
     aliases: Tuple[str, ...] = ()
     args_hint: str = ""
+    actions: Tuple[CommandAction, ...] = ()
     client_local: bool = False
     requires_host: bool = False
     requires_llm: bool = False
@@ -64,6 +75,34 @@ class CommandDef:
         return True
 
 
+def _action_args_hint(actions: Tuple[CommandAction, ...]) -> str:
+    """Build a command argument hint from declared actions."""
+    return f"[{'|'.join(action.name for action in actions)}]" if actions else ""
+
+
+HOST_ACTIONS: Tuple[CommandAction, ...] = (
+    CommandAction(
+        "status",
+        "Inspect the CuaDriver connection and operation health",
+        default=True,
+    ),
+    CommandAction(
+        "start",
+        "Start CuaDriver OS control for this session",
+        aliases=("on", "up", "enable"),
+    ),
+    CommandAction(
+        "stop",
+        "Stop desktop control; chat and non-OS tools remain available",
+        aliases=("off", "down", "disable"),
+    ),
+    CommandAction(
+        "restart",
+        "Restart CuaDriver OS control and reset driver health",
+    ),
+)
+
+
 # ── Registry (single source of truth) ────────────────────────────────
 
 COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
@@ -74,9 +113,10 @@ COMMAND_REGISTRY: Tuple[CommandDef, ...] = (
     CommandDef("status", "Show session info, model, context, and platform", "Session"),
     CommandDef(
         "host",
-        "Start, stop, or inspect CuaDriver OS control",
+        "Inspect or control CuaDriver OS control",
         "Session",
-        args_hint="[status|start|stop|restart]",
+        args_hint=_action_args_hint(HOST_ACTIONS),
+        actions=HOST_ACTIONS,
         effect=CommandEffect.HOST_CONTROL,
         execution=CommandExecution.SHORT_OPERATION,
     ),
@@ -225,6 +265,34 @@ def resolve_command(text: str) -> Optional[CommandDef]:
         if key in _COMMAND_LOOKUP:
             return _COMMAND_LOOKUP[key]
     return None
+
+
+def resolve_command_action(command: CommandDef, args: str) -> CommandAction | None:
+    """Resolve one declared action, including its aliases, for ``command``."""
+    words = args.strip().lower().split()
+    if not words:
+        return next((action for action in command.actions if action.default), None)
+    if len(words) != 1:
+        return None
+    candidate = words[0]
+    return next(
+        (
+            action
+            for action in command.actions
+            if candidate == action.name or candidate in action.aliases
+        ),
+        None,
+    )
+
+
+def command_action_usage(command: CommandDef) -> str:
+    """Return the canonical usage form for a command with declared actions."""
+    return f"Usage: /{command.name} {_action_args_hint(command.actions)}".rstrip()
+
+
+def command_action_entries(command: CommandDef) -> Tuple[Tuple[str, str], ...]:
+    """Return completion-ready action names and descriptions for ``command``."""
+    return tuple((action.name, action.description) for action in command.actions)
 
 
 def commands_by_category(

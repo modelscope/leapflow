@@ -51,6 +51,31 @@ def _message_token_weight(msg: Dict[str, object]) -> int:
 # Provider
 # ──────────────────────────────────────────────────────────────────────
 
+_DEFAULT_WORKING_MEMORY_TOKENS = 8_192
+_AUTO_WORKING_MEMORY_MIN_TOKENS = 16_384
+_AUTO_WORKING_MEMORY_MAX_TOKENS = 131_072
+_AUTO_WORKING_MEMORY_CONTEXT_DIVISOR = 8
+
+
+def resolve_working_memory_max_tokens(configured_max_tokens: int, context_length: int) -> int:
+    """Resolve a safe working-memory budget from an explicit or automatic setting.
+
+    ``0`` means automatic sizing. The active conversation context cannot remain
+    useful when its short-term history is fixed at a tiny legacy buffer while the
+    selected model offers a much larger window. Explicit positive values remain
+    an operator override; automatic values reserve up to one eighth of the model
+    window, bounded so ordinary sessions do not grow without limit.
+    """
+    configured = int(configured_max_tokens or 0)
+    if configured > 0:
+        return configured
+    context = max(1, int(context_length or 1))
+    return min(
+        _AUTO_WORKING_MEMORY_MAX_TOKENS,
+        max(_AUTO_WORKING_MEMORY_MIN_TOKENS, context // _AUTO_WORKING_MEMORY_CONTEXT_DIVISOR),
+    )
+
+
 class WorkingMemoryProvider:
     """Token-budgeted ring buffer for conversation turns.
 
@@ -59,11 +84,12 @@ class WorkingMemoryProvider:
 
     _ACCEPTED_KINDS = frozenset({MemoryKind.CONVERSATION})
 
-    def __init__(self, *, max_tokens: int = 8192) -> None:
-        self._max_tokens = max_tokens
+    def __init__(self, *, max_tokens: int = _DEFAULT_WORKING_MEMORY_TOKENS) -> None:
+        self._max_tokens = max(1, int(max_tokens))
         self._items: Deque[Dict[str, object]] = deque()
         self._entries: Dict[str, MemoryEntry] = {}
         self._token_sum: int = 0
+        self._evicted_messages: int = 0
         self._pattern_counts: Counter[str] = Counter()
 
     # ── Protocol properties ───────────────────────────────────────────
@@ -224,10 +250,40 @@ class WorkingMemoryProvider:
                 out.append(msg)
         return out
 
+    @property
+    def max_tokens(self) -> int:
+        """Configured capacity available to this session's working memory."""
+        return self._max_tokens
+
+    @property
+    def token_count(self) -> int:
+        """Approximate token weight currently retained in the ring."""
+        return self._token_sum
+
+    @property
+    def evicted_messages(self) -> int:
+        """Number of messages evicted since construction or the last clear."""
+        return self._evicted_messages
+
+    def snapshot(self) -> Dict[str, int]:
+        """Return safe observability data for context diagnostics."""
+        return {
+            "token_count": self._token_sum,
+            "max_tokens": self._max_tokens,
+            "message_count": len(self._items),
+            "evicted_messages": self._evicted_messages,
+        }
+
+    def reconfigure_max_tokens(self, max_tokens: int) -> None:
+        """Apply a live capacity change while preserving the newest context."""
+        self._max_tokens = max(1, int(max_tokens))
+        self._evict_if_needed()
+
     def clear(self) -> None:
         self._items.clear()
         self._entries.clear()
         self._token_sum = 0
+        self._evicted_messages = 0
         self._pattern_counts.clear()
 
     def get_pattern_count(self, key: str) -> int:
@@ -243,3 +299,4 @@ class WorkingMemoryProvider:
         while self._token_sum > self._max_tokens and self._items:
             old = self._items.popleft()
             self._token_sum -= _message_token_weight(old)
+            self._evicted_messages += 1

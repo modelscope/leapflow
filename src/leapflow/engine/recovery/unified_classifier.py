@@ -101,6 +101,27 @@ class RecoverabilityRegistry:
 _PERMISSION_FAILURE_CLASSES = frozenset({"authorization", "scope_denied"})
 _PERMISSION_FAILURE_CODES = frozenset({"access_denied", "missing_scope", "platform_degraded"})
 
+# These codes describe deterministic precondition, infrastructure, or repeated
+# failures. Retrying the identical action cannot make them succeed, so classify
+# them from the producer's structured result before considering message text.
+_TERMINAL_TOOL_FAILURE_CODES = frozenset({
+    "approval_denied",
+    "cua_driver_unavailable",
+    "repeated_terminal_failure",
+    "shell_command_blocked",
+    "shell_command_not_found",
+    "shell_command_required",
+    "shell_cwd_blocked",
+    "shell_execution_failed",
+    "shell_invalid_cwd",
+    "shell_io_failure",
+    "shell_nonzero_exit",
+    "shell_syntax_error",
+    "window_discovery_invalid_result",
+    "window_target_required",
+    "workspace_access_denied",
+})
+
 
 # ---------------------------------------------------------------------------
 # Data-driven tool/system error message classification rules
@@ -304,7 +325,8 @@ class UnifiedErrorClassifier:
         failure_code = str(result.get("failure_code") or "")
         error_msg = str(result.get("error") or "")
         error_type = str(result.get("error_type") or "")
-        retryable = bool(result.get("retryable") if result.get("retryable") is not None else True)
+        retryable_value = result.get("retryable")
+        retryable = bool(retryable_value) if retryable_value is not None else True
 
         # Determine side-effect state based on execution policy
         side_effect_state = self._side_effect_state_from_policy(execution_policy)
@@ -324,7 +346,23 @@ class UnifiedErrorClassifier:
                 context=FailureContext.from_dict_args(tool_name=tool_name),
             )
 
-        # 2. Unknown tool with retryable flag
+        # 2. Stable terminal failure contract. The producer must name a known
+        # terminal code: a generic ``retryable=False`` failure may still require
+        # a safe read-back or a different user action (not a blind replay), and
+        # must not skip that remediation path merely because it is non-replayable.
+        if failure_code in _TERMINAL_TOOL_FAILURE_CODES:
+            return FailureEnvelope.create(
+                source=FailureSource.TOOL,
+                category="tool_terminal",
+                failure_class=failure_class or "terminal_tool_failure",
+                failure_code=failure_code,
+                message=error_msg or "Tool execution cannot be retried safely",
+                recoverability=Recoverability.NON_RECOVERABLE,
+                side_effect_state=side_effect_state,
+                context=FailureContext.from_dict_args(tool_name=tool_name),
+            )
+
+        # 3. Unknown tool with retryable flag
         if error_type == "unknown_tool" and retryable:
             return FailureEnvelope.create(
                 source=FailureSource.TOOL,
@@ -337,7 +375,7 @@ class UnifiedErrorClassifier:
                 context=FailureContext.from_dict_args(tool_name=tool_name),
             )
 
-        # 3. Timeout detection (data-driven keyword set)
+        # 4. Timeout detection (data-driven keyword set)
         error_lower = error_msg.lower()
         if any(kw in error_lower for kw in _TOOL_TIMEOUT_KEYWORDS):
             timeout_recoverability = (
@@ -356,7 +394,7 @@ class UnifiedErrorClassifier:
                 context=FailureContext.from_dict_args(tool_name=tool_name),
             )
 
-        # 4. Generic tool failure
+        # 5. Generic tool failure
         recoverability = (
             Recoverability.AUTO_RETRY if retryable else Recoverability.USER_FIXABLE
         )

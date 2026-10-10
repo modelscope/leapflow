@@ -256,7 +256,7 @@ class TestClassifyToolResultFailures:
         assert env.category == "tool_failure"
         assert env.recoverability == Recoverability.AUTO_RETRY
 
-    def test_generic_failure_not_retryable(self, classifier: UnifiedErrorClassifier) -> None:
+    def test_generic_non_retryable_failure_allows_safe_remediation(self, classifier: UnifiedErrorClassifier) -> None:
         result = {
             "ok": False,
             "error": "Invalid arguments",
@@ -266,6 +266,23 @@ class TestClassifyToolResultFailures:
         assert env is not None
         assert env.category == "tool_failure"
         assert env.recoverability == Recoverability.USER_FIXABLE
+
+    def test_structured_shell_io_failure_is_terminal(self, classifier: UnifiedErrorClassifier) -> None:
+        env = classifier.classify_tool_result(
+            {
+                "ok": False,
+                "failure_class": "environment_unavailable",
+                "failure_code": "shell_io_failure",
+                "retryable": False,
+                "returncode": 251,
+                "error": "Input/output error",
+            },
+            tool_name="shell_run",
+        )
+        assert env is not None
+        assert env.category == "tool_terminal"
+        assert env.failure_code == "shell_io_failure"
+        assert env.recoverability == Recoverability.NON_RECOVERABLE
 
     def test_execution_policy_read_only_side_effect(self, classifier: UnifiedErrorClassifier) -> None:
         result = {"ok": False, "error": "failed"}

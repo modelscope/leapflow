@@ -85,7 +85,9 @@ class Settings:
     log_level: str
 
     # ── Memory Providers ──
-    memory_working_max_tokens: int = 8192
+    # ``0`` selects an adaptive fraction of the active model context window;
+    # positive values are an explicit operator cap.
+    memory_working_max_tokens: int = 0
     memory_episodic_ttl_s: float = 300.0        # 5 minutes
     memory_episodic_max_entries: int = 200
     memory_evolution_max_episodes: int = 1000
@@ -668,6 +670,12 @@ class Settings:
     llm_context_length: int = DEFAULT_LLM_CONTEXT_LENGTH  # Primary provider's runtime context budget
     llm_credential_cooldown_s: float = 60.0  # Per-key rate-limit cooldown
 
+    # ── Benchmark Qualification ──
+    benchmark_commands: str = "{}"  # JSON benchmark id -> explicit command template
+    benchmark_data_roots: str = "{}"  # JSON benchmark id -> licensed local data root
+    benchmark_license_acceptances: str = "{}"  # JSON license id -> operator acknowledgement
+    benchmark_hardware_profiles: str = "{}"  # JSON device id -> approved Tier4 profile
+
     # ── Stream & Tool Robustness ──
     stale_stream_timeout_s: float = 180.0  # Idle timeout for streaming responses
     default_tool_timeout_s: float = 120.0  # Default per-tool execution timeout
@@ -913,8 +921,9 @@ def _build_settings_from_env(
     # belong to the daemon file log (daemon.log_level, default INFO).
     log_level = os.getenv("LEAPFLOW_LOG_LEVEL", "WARNING").strip()
 
-    # Memory Providers
-    memory_working_max_tokens = int(os.getenv("LEAPFLOW_MEMORY_WORKING_MAX_TOKENS", "8192"))
+    # Memory Providers. Zero is the safe default: derive capacity from the
+    # active context window instead of retaining the legacy fixed 8K ring.
+    memory_working_max_tokens = int(os.getenv("LEAPFLOW_MEMORY_WORKING_MAX_TOKENS", "0"))
     memory_episodic_ttl_s = float(os.getenv("LEAPFLOW_MEMORY_EPISODIC_TTL_S", "300.0"))
     memory_episodic_max_entries = int(os.getenv("LEAPFLOW_MEMORY_EPISODIC_MAX_ENTRIES", "200"))
     memory_evolution_max_episodes = int(os.getenv("LEAPFLOW_MEMORY_EVOLUTION_MAX_EPISODES", "1000"))
@@ -1337,6 +1346,12 @@ def _build_settings_from_env(
     llm_aux_base_url = os.getenv("LEAPFLOW_LLM_AUX_BASE_URL", "").strip()
     llm_context_length = int(os.getenv("LEAPFLOW_LLM_CONTEXT_LENGTH", str(DEFAULT_LLM_CONTEXT_LENGTH)))
     llm_credential_cooldown_s = float(os.getenv("LEAPFLOW_LLM_CREDENTIAL_COOLDOWN_S", "60.0"))
+
+    # Benchmark Qualification
+    benchmark_commands = os.getenv("LEAPFLOW_BENCHMARK_COMMANDS", "{}").strip() or "{}"
+    benchmark_data_roots = os.getenv("LEAPFLOW_BENCHMARK_DATA_ROOTS", "{}").strip() or "{}"
+    benchmark_license_acceptances = os.getenv("LEAPFLOW_BENCHMARK_LICENSE_ACCEPTANCES", "{}").strip() or "{}"
+    benchmark_hardware_profiles = os.getenv("LEAPFLOW_BENCHMARK_HARDWARE_PROFILES", "{}").strip() or "{}"
 
     # Stream & Tool Robustness
     stale_stream_timeout_s = float(os.getenv("LEAPFLOW_STALE_STREAM_TIMEOUT_S", "180.0"))
@@ -1776,6 +1791,11 @@ def _build_settings_from_env(
         llm_aux_base_url=llm_aux_base_url,
         llm_context_length=llm_context_length,
         llm_credential_cooldown_s=llm_credential_cooldown_s,
+        # Benchmark Qualification
+        benchmark_commands=benchmark_commands,
+        benchmark_data_roots=benchmark_data_roots,
+        benchmark_license_acceptances=benchmark_license_acceptances,
+        benchmark_hardware_profiles=benchmark_hardware_profiles,
         # Stream & Tool Robustness
         stale_stream_timeout_s=stale_stream_timeout_s,
         default_tool_timeout_s=default_tool_timeout_s,

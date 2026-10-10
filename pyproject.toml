@@ -83,9 +83,15 @@ robot = [
 robot-ros2 = [
     "rclpy>=3.0; python_version>='3.11'",
 ]
+benchmark = [
+    "gymnasium>=0.29",
+    "numpy>=1.24",
+    "pyarrow>=14.0",
+]
 
 [project.scripts]
 leap = "leapflow.__main__:main"
+leap-bench = "benchmarks.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
@@ -96,13 +102,17 @@ version = {attr = "leapflow.version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["leapflow*", "leapspace*"]
+include = ["leapflow*", "leapspace*", "benchmarks*"]
 
 [tool.setuptools.package-data]
 "leapflow.gateway.action_packs" = ["*.yaml"]
 "leapflow.dashboard.templates" = ["*.yaml"]
 "leapflow.dashboard.static" = ["*"]
 "leapflow.plugins.dsh" = ["*.js"]
+"benchmarks.manifests" = ["*.yaml"]
+"benchmarks.manifests.native" = ["*.yaml"]
+"benchmarks.manifests.external" = ["*.yaml"]
+"benchmarks.manifests.hardware" = ["*.yaml"]
 # LeapSpace task directories are data, not importable packages (note the
 # non-identifier `task-001`). Auto-discovery already ships each task's
 # action.py; this keeps its config.yaml beside it so an installed example task

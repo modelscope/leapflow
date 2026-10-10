@@ -977,7 +977,8 @@ async def test_host_status_reports_daemon_host_backend(monkeypatch, tmp_path, ca
 
     output = capsys.readouterr().out
     assert "leapd healthy" in output
-    assert "Backend: cua-driver started=True" in output
+    assert "Backend: cua-driver started=True process=MCP-managed" in output
+    assert "pid=None" not in output
     assert "Tools: 3 restarts=1" in output
 
 
