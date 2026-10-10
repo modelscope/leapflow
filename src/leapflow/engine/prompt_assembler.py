@@ -480,9 +480,14 @@ class PromptAssembler:
                     summary_lines.append(f"- [user] {first_line}")
             elif content.startswith("[Called:"):
                 # Working-memory stores tool-calling turns as "[Called: t1, t2]"
-                # summary strings.  Extract and preserve the tool list concisely.
+                # summary strings. Extract and preserve the tool list concisely.
                 called_text = content[8:].rstrip("]").strip()[:200]
                 summary_lines.append(f"- [assistant] called: {called_text}")
+            elif content.startswith("[Tool Evidence"):
+                # Bounded evidence is retained specifically for the next user
+                # turn; exposing only a one-line preview would recreate the same
+                # information-loss failure as dropping tool results entirely.
+                summary_lines.append(f"- [assistant] tool evidence: {_single_line_preview(content, limit=1_200)}")
             else:
                 # Assistant prose: single-line preview up to 300 chars.
                 preview = _single_line_preview(content, limit=300)
@@ -665,6 +670,12 @@ class PromptAssembler:
         ).as_dict()
         compressed = decision.compressed or bool(compression_trace.get("stages_applied"))
         self._engine._last_context_tokens = snapshot.total_tokens
+        working_memory = getattr(self._engine, "_wm", None)
+        working_snapshot = (
+            working_memory.snapshot()
+            if working_memory is not None and hasattr(working_memory, "snapshot")
+            else {}
+        )
         self._engine._last_context_snapshot = {
             "message_tokens": snapshot.message_tokens,
             "tool_schema_tokens": snapshot.tool_schema_tokens,
@@ -688,6 +699,8 @@ class PromptAssembler:
             "disclosure": dict(self._engine._last_disclosure_metadata),
             "disclosure_level": self._engine._last_disclosure_metadata.get("level", ""),
             "disclosure_reason": self._engine._last_disclosure_metadata.get("reason", ""),
+            "working_memory": working_snapshot,
+            "working_memory_trimmed": bool(working_snapshot.get("evicted_messages", 0)),
         }
         if compressed:
             self._engine._usage_tracker.mark_compression()

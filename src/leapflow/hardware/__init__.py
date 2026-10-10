@@ -118,6 +118,11 @@ from leapflow.hardware.health_monitor import (
     DeviceHealthRecord,
     HardwareHealthMonitor,
 )
+from leapflow.hardware.degradation import (
+    DegradationAction,
+    DegradationCoordinator,
+    DegradationOutcome,
+)
 
 __all__ = [
     "HC_VERSION",
@@ -130,6 +135,9 @@ __all__ = [
     "Channel",
     "ContextProvenance",
     "ContextSource",
+    "DegradationAction",
+    "DegradationCoordinator",
+    "DegradationOutcome",
     # control_bus.py
     "ControlBusConfig",
     "ControlBusStats",

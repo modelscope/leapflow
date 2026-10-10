@@ -310,6 +310,7 @@ class HardwareRegistry:
         self._report = LoadReport()
         self._described: set[tuple[str, str]] = set()
         self._last_command: dict[tuple[str, str], tuple[float, float]] = {}
+        self._degradation_latches: dict[str, Any] = {}
         self._stream_sources: tuple[Any, ...] | None = None
         self._reading_store: Any = None
         self._calibration_store: Any = None
@@ -344,6 +345,7 @@ class HardwareRegistry:
         set, which is what makes a declaration edit visible without a restart.
         """
         self._contexts.clear()
+        self._degradation_latches.clear()
         # Discarded so the next request rebuilds them against the new declarations; a
         # cached source would keep sampling a channel that no longer exists.
         self._stream_sources = None
@@ -1141,14 +1143,35 @@ class HardwareRegistry:
 
     # ── Describe-before-write bookkeeping ──
 
-    def is_device_degraded(self, device_id: str) -> bool:
-        """Return True if any stream source for this device has triggered degradation.
+    def latch_degradation(self, outcome: Any) -> None:
+        """Fail closed by recording a governed degradation transition."""
+        device_id = str(getattr(outcome, "device_id", ""))
+        if device_id:
+            self._degradation_latches[device_id] = outcome
 
-        Checked by the write path so a device whose sampling loop has detected
-        communication loss or sustained sensor failure cannot be commanded until
-        the condition clears.  The flag is set by ``HardwareStreamSource`` /
-        ``BatchStreamCoordinator`` and cleared automatically on recovery.
-        """
+    def clear_degradation(self, device_id: str, *, recovery: str) -> bool:
+        """Clear a non-manual latch after a verified recovery observation."""
+        outcome = self._degradation_latches.get(device_id)
+        if outcome is None:
+            return True
+        if bool(getattr(outcome, "requires_manual_clear", False)):
+            logger.warning(
+                "Refusing automatic degradation clear for %s: manual recovery required",
+                device_id,
+            )
+            return False
+        self._degradation_latches.pop(device_id, None)
+        logger.info("Cleared degradation latch for %s after %s", device_id, recovery)
+        return True
+
+    def degradation_outcome(self, device_id: str) -> Any | None:
+        """Return the current governed degradation outcome for one device."""
+        return self._degradation_latches.get(device_id)
+
+    def is_device_degraded(self, device_id: str) -> bool:
+        """Return whether a governed or in-flight degradation blocks writes."""
+        if device_id in self._degradation_latches:
+            return True
         for source in self._stream_sources or ():
             if getattr(source, "degradation_triggered", False):
                 # Match the source to the device.  Individual sources store

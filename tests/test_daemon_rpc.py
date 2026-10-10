@@ -2316,6 +2316,31 @@ def test_process_alive_reaps_exited_child_as_dead() -> None:
     assert alive is False
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no zombie process state")
+def test_process_alive_treats_nonchild_zombie_as_stale(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import leapflow.daemon.lifecycle as lifecycle_module
+
+    def not_our_child(pid, flags):
+        del pid, flags
+        raise ChildProcessError
+
+    monkeypatch.setattr(lifecycle_module.os, "waitpid", not_our_child)
+    monkeypatch.setattr(
+        lifecycle_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="Z    <defunct>\n"),
+    )
+    monkeypatch.setattr(
+        lifecycle_module.os,
+        "kill",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("zombie must not be signalled")),
+    )
+
+    assert lifecycle_module._process_alive(424242) is False
+
+
 def test_process_alive_false_for_reaped_pid() -> None:
     import subprocess
     import sys

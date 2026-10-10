@@ -24,7 +24,7 @@ from leapflow.platform.adapters.darwin import (
     DarwinPerceptionAdapter,
     _snapshot_from_payload,
 )
-from leapflow.platform.cua_client import CuaDriverClient, _local_clipboard_get
+from leapflow.platform.cua_client import CuaDriverClient, _extract_result, _local_clipboard_get
 from leapflow.platform.mock import MockBridge
 from leapflow.platform.protocol import RpcError
 
@@ -138,6 +138,31 @@ def test_unwrap_preserves_existing_ok() -> None:
     assert result["ok"] is False and result["error"] == "denied"
 
 
+def test_extract_result_reads_mcp2_snake_case_structured_content() -> None:
+    """MCP 2.x Python models use snake_case even though wire JSON is camelCase."""
+    from mcp.types import CallToolResult, TextContent
+
+    raw = CallToolResult(
+        content=[TextContent(type="text", text="Found 1 window(s).")],
+        structured_content={"windows": [{"pid": 1, "window_id": 2}]},
+        is_error=False,
+    )
+    result = _extract_result(raw)
+    assert result["isError"] is False
+    assert result["structuredContent"] == {"windows": [{"pid": 1, "window_id": 2}]}
+
+
+def test_extract_result_preserves_mcp1_camel_case_compatibility() -> None:
+    class LegacyResult:
+        isError = True
+        structuredContent = {"error": "legacy"}
+        content: list[object] = []
+
+    result = _extract_result(LegacyResult())
+    assert result["isError"] is True
+    assert result["structuredContent"] == {"error": "legacy"}
+
+
 # ── R2: local clipboard contract shape ───────────────────────────────────────
 
 def test_local_clipboard_get_returns_contract_dict(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -157,6 +182,37 @@ async def test_capture_screenshot_returns_path() -> None:
     result = await perception.capture_screenshot(pid=100, window_id=1)
     assert result["ok"] is True
     assert result["path"].endswith(".png")
+
+
+@pytest.mark.asyncio
+async def test_targetless_capture_fails_before_creating_output_or_calling_rpc() -> None:
+    class CountingRpc:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def call(self, method: str, params: dict | None = None):
+            self.calls.append((method, params or {}))
+            raise AssertionError("targetless capture must not issue an RPC")
+
+    rpc = CountingRpc()
+    perception = DarwinPerceptionAdapter(rpc, _manifest())
+    result = await perception.capture_screenshot()
+    assert result["ok"] is False
+    assert result["failure_code"] == "window_target_required"
+    assert "path" not in result and rpc.calls == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_window_discovery_shape_is_not_repackaged_as_windows() -> None:
+    class InvalidDiscoveryRpc:
+        async def call(self, method: str, params: dict | None = None):
+            assert method == "ax.list"
+            return {"windows": "driver error text"}
+
+    perception = DarwinPerceptionAdapter(InvalidDiscoveryRpc(), _manifest())
+    result = await perception.list_windows()
+    assert result["ok"] is False
+    assert result["failure_code"] == "window_discovery_invalid_result"
 
 
 # ── R7: exec_shell runs locally ──────────────────────────────────────────────

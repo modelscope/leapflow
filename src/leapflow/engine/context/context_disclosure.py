@@ -333,7 +333,10 @@ class DisclosurePlanner:
             selected_tool_names=tuple(sorted(expanded_names)),
             expanded_categories=tuple(expanded_categories),
             context_planes=("task_semantic", "control_plane"),
-            max_prior_turns=6 if expanded_categories else 2,
+            # Tool-heavy turns record bounded evidence in working memory. Keep
+            # enough recent messages to carry the user request, call summary,
+            # evidence, and final response across a follow-up question.
+            max_prior_turns=12 if expanded_categories else 4,
         )
         if commitment_status is CommitmentStatus.UNCOMMITTED and cache_benefit:
             result = result.with_cache_boundary(CacheBoundary.SOFT)
@@ -390,7 +393,7 @@ class DisclosurePlanner:
                 reason=f"cache: committed (frozen {frozen_level.value})",
                 selected_tool_names=frozen_tool_names,
                 context_planes=("task_semantic", "control_plane"),
-                max_prior_turns=6 if is_expanded else 2,
+                max_prior_turns=12 if is_expanded else 4,
             )
         return base.with_cache_boundary(
             CacheBoundary.COMMITTED, frozen_tool_names,
@@ -419,7 +422,7 @@ class DisclosurePlanner:
             selected_tool_names=names,
             expanded_categories=tuple(sorted({m.category for m in manifests if m.category})),
             context_planes=("task_semantic", "control_plane"),
-            max_prior_turns=10,
+            max_prior_turns=24,
         )
 
 

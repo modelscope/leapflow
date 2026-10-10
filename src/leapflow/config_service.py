@@ -1,5 +1,6 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 """User-facing configuration control plane for LeapFlow."""
+
 from __future__ import annotations
 
 import os
@@ -85,28 +86,47 @@ class ConfigSnapshot:
     warnings: tuple[str, ...] = ()
 
 
-_BOOTSTRAP_ONLY_SETTINGS = frozenset({
-    "data_dir",
-    "profile",
-    "workspace_root",
-    "layout",
-    "profile_layout",
-    "profile_manifest",
-    "config_sources",
-    "watched_config_paths",
-    "config_warnings",
-    "duckdb_path",
-    "runtime_dir",
-    "audit_log_path",
-    "skills_dir",
-    "visual_frame_cache_dir",
-    "video_cache_dir",
-    "perceptual_field_config",
-})
+_BOOTSTRAP_ONLY_SETTINGS = frozenset(
+    {
+        "data_dir",
+        "profile",
+        "workspace_root",
+        "layout",
+        "profile_layout",
+        "profile_manifest",
+        "config_sources",
+        "watched_config_paths",
+        "config_warnings",
+        "duckdb_path",
+        "runtime_dir",
+        "audit_log_path",
+        "skills_dir",
+        "visual_frame_cache_dir",
+        "video_cache_dir",
+        "perceptual_field_config",
+    }
+)
 
-_SECRET_SETTINGS = frozenset({"llm_api_key", "vlm_api_key", "llm_aux_api_key", "compression_api_key"})
+_SECRET_SETTINGS = frozenset(
+    {"llm_api_key", "vlm_api_key", "llm_aux_api_key", "compression_api_key"}
+)
 
 _FIELD_DESCRIPTIONS = {
+    "benchmark.commands": (
+        "JSON object mapping external benchmark ids to explicitly approved command templates. "
+        "The harness never downloads, installs, or invents commands."
+    ),
+    "benchmark.data_roots": (
+        "JSON object mapping benchmark ids to licensed local dataset roots used by external adapters."
+    ),
+    "benchmark.license_acceptances": (
+        "JSON object recording operator-accepted benchmark license identifiers."
+    ),
+    "benchmark.hardware_profiles": (
+        "JSON object mapping Tier4 device ids to operator-approved zero_motion preflight profiles. "
+        "Each profile requires preflight_mode='zero_motion' and a command that emits the "
+        "manifest-required JSON report; real motion still requires separate approval gates."
+    ),
     "mcp.approval_mode": (
         "Approval policy for tools from external MCP servers, which run third-party code "
         "with this agent's privileges. mutating_only assesses every tool that does not "
@@ -254,7 +274,10 @@ _FIELD_DESCRIPTIONS = {
     "vlm.api_key": "VLM API key stored in the local secret vault.",
     "runtime.mock_host": "Use the in-process mock host when native OS control is unavailable.",
     "runtime.log_level": "Logging verbosity for CLI, TUI, and runtime diagnostics.",
-    "memory.working_max_tokens": "Token budget for working memory injected into active reasoning.",
+    "memory.working_max_tokens": (
+        "Working-memory token budget injected into active reasoning; 0 automatically "
+        "scales with the model context window, while a positive value is a hard cap."
+    ),
     "visual.track_enabled": "Enable screenshot-based visual perception for the active profile.",
     "recording.mode": "Default recording pipeline used during teaching and observation.",
     "scheduler.tick_seconds": "Scheduler polling interval in seconds.",
@@ -338,8 +361,8 @@ _FIELD_DESCRIPTIONS = {
         "family or exact model name; each value has input_per_mtok, output_per_mtok, and "
         "cached_input_ratio (ratio applied to cached prompt tokens). When absent for the "
         "active model, cost is reported as unknown. Example: "
-        "{\"deepseek\": {\"input_per_mtok\": 0.27, \"output_per_mtok\": 1.10, "
-        "\"cached_input_ratio\": 0.1}}"
+        '{"deepseek": {"input_per_mtok": 0.27, "output_per_mtok": 1.10, '
+        '"cached_input_ratio": 0.1}}'
     ),
     "signal.noise_gate_enabled": "Enable monitor/LeapBoard suppression of low-value signal noise before it wakes watches or enters the live stream.",
     "signal.noise_same_source_cooldown_s": "Suppress repeated fs.change events from the same source path within this many seconds (0 disables burst suppression).",
@@ -492,7 +515,21 @@ def _registered_selection_policies() -> str:
         return "a registered selection policy id"
     return ids or "a registered selection policy id"
 
-_PARTIAL_RELOAD_SECTIONS = frozenset({"runtime", "mock", "gateway", "hub", "scheduler", "observer", "cua", "use", "usage", "dashboard"})
+
+_PARTIAL_RELOAD_SECTIONS = frozenset(
+    {
+        "runtime",
+        "mock",
+        "gateway",
+        "hub",
+        "scheduler",
+        "observer",
+        "cua",
+        "use",
+        "usage",
+        "dashboard",
+    }
+)
 _RESTART_REQUIRED_SECTIONS = frozenset({"daemon", "plugins", "hardware", "mcp"})
 
 _PROFILE_FILE_BY_SECTION = {
@@ -507,28 +544,30 @@ _PROFILE_FILE_BY_SECTION = {
     "cache": "cache.yaml",
 }
 
-_PERCEPTION_SECTIONS = frozenset({
-    "visual",
-    "vlm",
-    "text",
-    "clipboard",
-    "perceptual",
-    "attention",
-    "recording",
-    "causal",
-    "heuristic",
-    "prediction",
-    "curiosity",
-    "replay",
-    "semantic",
-    "budget",
-    "ast",
-    "mhms",
-    "surprise",
-    "video",
-    "learnability",
-    "signal",
-})
+_PERCEPTION_SECTIONS = frozenset(
+    {
+        "visual",
+        "vlm",
+        "text",
+        "clipboard",
+        "perceptual",
+        "attention",
+        "recording",
+        "causal",
+        "heuristic",
+        "prediction",
+        "curiosity",
+        "replay",
+        "semantic",
+        "budget",
+        "ast",
+        "mhms",
+        "surprise",
+        "video",
+        "learnability",
+        "signal",
+    }
+)
 
 _EXPLICIT_SPECS = {
     "llm_api_key": ConfigFieldSpec(
@@ -616,7 +655,6 @@ def _profile_file_for_section(section: str) -> str:
     return "runtime.yaml"
 
 
-
 class ConfigService:
     """Read and mutate LeapFlow configuration through layout-owned paths."""
 
@@ -651,7 +689,11 @@ class ConfigService:
         normalized = category.strip().lower() if category else ""
         fields_list = []
         for spec in _FIELD_SPECS.values():
-            if normalized and normalized not in spec.category.lower() and not spec.key.lower().startswith(f"{normalized}."):
+            if (
+                normalized
+                and normalized not in spec.category.lower()
+                and not spec.key.lower().startswith(f"{normalized}.")
+            ):
                 continue
             fields_list.append(self._field_view(spec))
         return tuple(sorted(fields_list, key=lambda item: (item.category, item.key)))
@@ -667,7 +709,9 @@ class ConfigService:
         value = getattr(self._settings, spec.setting_name or "", None)
         return ConfigValueView(normalized, _format_value(value), secret=False)
 
-    def set(self, key: str, value: object, *, scope: ConfigScope = "profile") -> ConfigMutationResult:
+    def set(
+        self, key: str, value: object, *, scope: ConfigScope = "profile"
+    ) -> ConfigMutationResult:
         normalized = _normalize_key(key)
         spec = _FIELD_SPECS.get(normalized)
         if spec is None:
@@ -791,7 +835,9 @@ class ConfigService:
         section[spec.name] = ref
         data[spec.section] = section
         _write_yaml_atomic(path, data)
-        return ConfigMutationResult(True, f"Updated {spec.key}", (spec.key, f"{spec.key}_ref"), path)
+        return ConfigMutationResult(
+            True, f"Updated {spec.key}", (spec.key, f"{spec.key}_ref"), path
+        )
 
     def _path_for_spec(self, spec: ConfigFieldSpec, scope: ConfigScope) -> Path:
         if scope == "profile":
@@ -889,7 +935,7 @@ def _examples_for_key(key: str) -> tuple[str, ...]:
         "llm.context_length": ("leap config set llm.context_length 1000000",),
         "runtime.mock_host": ("leap config set runtime.mock_host true",),
         "runtime.log_level": ("leap config set runtime.log_level DEBUG",),
-        "memory.working_max_tokens": ("leap config set memory.working_max_tokens 12000",),
+        "memory.working_max_tokens": ("leap config set memory.working_max_tokens 0",),
         "visual.track_enabled": ("leap config set visual.track_enabled true",),
     }
     return examples.get(key, ())
@@ -949,7 +995,7 @@ def _secret_name_parts(value: str) -> list[str]:
 def _normalize_key(key: str) -> str:
     value = key.strip()
     if value.startswith("LEAPFLOW_"):
-        parts = value[len("LEAPFLOW_"):].lower().split("_", 1)
+        parts = value[len("LEAPFLOW_") :].lower().split("_", 1)
         return parts[0] if len(parts) == 1 else f"{parts[0]}.{parts[1]}"
     if "_" in value and "." not in value:
         parts = value.lower().split("_", 1)

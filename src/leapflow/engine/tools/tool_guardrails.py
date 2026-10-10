@@ -18,10 +18,94 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
+from leapflow.engine.tools.tool_execution import exit_code_from
+
 logger = logging.getLogger(__name__)
+
+# Volatile values make raw result hashes unsuitable for a retry guard: screenshots
+# use random temp paths, errors carry traceback line numbers, and some drivers add
+# timestamps or base64. Normalize only those unstable fragments so semantically
+# distinct calls still produce distinct fingerprints.
+_TRACEBACK_LINE_RE = re.compile(r"\bline\s+\d+\b", re.IGNORECASE)
+_TIMESTAMP_RE = re.compile(r"\b1\d{9,12}(?:\.\d+)?\b")
+_UUID_RE = re.compile(r"\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b", re.IGNORECASE)
+_SCREENSHOT_TEMP_RE = re.compile(
+    r"(?:/[^\s'\"]+)?/leapflow_screenshot_[0-9a-f]{8}\.png", re.IGNORECASE
+)
+_BASE64_RE = re.compile(r"\b[A-Za-z0-9+/]{80,}={0,2}\b")
+
+
+def _normalize_failure_value(value: Any, *, key: str = "") -> Any:
+    """Return a deterministic representation with known volatile data removed."""
+    key_lower = key.lower()
+    if any(token in key_lower for token in ("base64", "image", "traceback")):
+        return "<redacted>"
+    if key_lower in {"timestamp", "ts", "created_at", "updated_at", "observed_at"}:
+        return "<timestamp>"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _normalize_failure_value(item_value, key=str(item_key))
+            for item_key, item_value in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_failure_value(item, key=key) for item in value]
+    if not isinstance(value, str):
+        return value
+    normalized = " ".join(value.split())
+    normalized = _TRACEBACK_LINE_RE.sub("line <n>", normalized)
+    normalized = _TIMESTAMP_RE.sub("<timestamp>", normalized)
+    normalized = _UUID_RE.sub("<uuid>", normalized)
+    normalized = _SCREENSHOT_TEMP_RE.sub("<screenshot_path>", normalized)
+    return _BASE64_RE.sub("<base64>", normalized)
+
+
+@dataclass(frozen=True)
+class FailureFingerprint:
+    """Stable identity for one failed tool action, independent of volatile output."""
+
+    tool_name: str
+    canonical_arguments: str
+    failure_code: str
+    error_type: str
+    returncode: int | None
+    normalized_error: str
+
+    @classmethod
+    def from_result(
+        cls,
+        tool_name: str,
+        arguments: Dict[str, Any] | None,
+        result: Dict[str, Any],
+    ) -> "FailureFingerprint":
+        normalized_arguments = _normalize_failure_value(arguments or {})
+        return cls(
+            tool_name=str(tool_name or "").removeprefix("gp_"),
+            canonical_arguments=json.dumps(
+                normalized_arguments, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":")
+            ),
+            failure_code=str(result.get("failure_code") or ""),
+            error_type=str(result.get("error_type") or ""),
+            returncode=exit_code_from(result),
+            normalized_error=str(_normalize_failure_value(result.get("error") or "")),
+        )
+
+    @property
+    def digest(self) -> str:
+        payload = {
+            "tool_name": self.tool_name,
+            "arguments": self.canonical_arguments,
+            "failure_code": self.failure_code,
+            "error_type": self.error_type,
+            "returncode": self.returncode,
+            "error": self.normalized_error,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -73,24 +157,54 @@ class RepetitionGuard:
             return GuardrailViolation(violated=False)
 
         # Correlate each native tool call with the result it produced so the
-        # signature reflects information gain, not just intent. A call whose
-        # result is not yet in history (or unmatched) contributes an empty
-        # result signature, degrading gracefully to call-only comparison.
-        results_by_id: Dict[str, str] = {}
+        # signature reflects information gain, not just intent. Failed results
+        # use ``FailureFingerprint`` rather than their raw JSON: ephemeral paths,
+        # base64, timestamps, and traceback line numbers must not turn one stuck
+        # action into an apparently new failure every round.
+        results_by_id: Dict[str, Any] = {}
         for m in history:
-            if m.get("role") == "tool":
-                content = m.get("content", "")
-                results_by_id[str(m.get("tool_call_id", ""))] = (
-                    content if isinstance(content, str) else ""
-                )
+            if m.get("role") != "tool":
+                continue
+            content = m.get("content", "")
+            if not isinstance(content, str):
+                results_by_id[str(m.get("tool_call_id", ""))] = ""
+                continue
+            try:
+                parsed = json.loads(content)
+            except (TypeError, ValueError):
+                parsed = content
+            results_by_id[str(m.get("tool_call_id", ""))] = parsed
 
         hashes: List[str] = []
         for msg in tool_msgs[-self._max_repeats * 2:]:
             for tc in (msg.get("tool_calls") or []):
                 fn = tc.get("function", {})
-                result_sig = results_by_id.get(str(tc.get("id", "")), "")
-                key = f"{fn.get('name', '')}:{fn.get('arguments', '')}:{result_sig}"
-                hashes.append(hashlib.md5(key.encode()).hexdigest()[:12])
+                raw_arguments = fn.get("arguments", "{}")
+                try:
+                    arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+                except (TypeError, ValueError):
+                    arguments = {}
+                result = results_by_id.get(str(tc.get("id", "")), "")
+                if isinstance(result, dict) and result.get("ok") is False:
+                    fingerprint = FailureFingerprint.from_result(
+                        str(fn.get("name", "")),
+                        arguments if isinstance(arguments, dict) else {},
+                        result,
+                    )
+                    hashes.append(fingerprint.digest[:12])
+                    continue
+                key = json.dumps(
+                    {
+                        "tool_name": fn.get("name", ""),
+                        "arguments": _normalize_failure_value(arguments),
+                        "result": _normalize_failure_value(result),
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    default=str,
+                    separators=(",", ":"),
+                )
+                hashes.append(hashlib.sha256(key.encode("utf-8")).hexdigest()[:12])
 
         if len(hashes) >= self._max_repeats:
             tail = hashes[-self._max_repeats:]

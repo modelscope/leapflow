@@ -187,11 +187,17 @@ async def _cmd_status() -> int:
         _ok(f"leapd healthy (PID {getattr(leapd_info, 'pid', None)})")
         host = runtime.get("host_backend") if isinstance(runtime, dict) else None
         if isinstance(host, dict):
-            _info(
-                "Backend: "
-                f"{host.get('backend')} started={host.get('started')} "
-                f"pid={host.get('pid')} ({host.get('pid_source')})"
+            backend_status = (
+                f"Backend: {host.get('backend')} started={host.get('started')}"
             )
+            pid = host.get("pid")
+            if pid is None:
+                backend_status += " process=MCP-managed"
+            else:
+                backend_status += f" pid={pid}"
+            _info(backend_status)
+            if host.get("cua_status"):
+                _info(f"Driver health: {host['cua_status']}")
             if host.get("command"):
                 args = " ".join(str(arg) for arg in host.get("args") or [])
                 _info(f"Command: {str(host.get('command'))} {args}".strip())
@@ -251,14 +257,14 @@ async def _cmd_start() -> int:
         "from leapflow.platform.event_bus import EventBus; "
         "from leapflow.platform.observers import ObservationDaemon, ObserverConfig; "
         "from leapflow.memory.providers.episodic import EpisodicMemoryProvider; "
-        "from leapflow.memory.providers.working import WorkingMemoryProvider; "
+        "from leapflow.memory.providers.working import WorkingMemoryProvider, resolve_working_memory_max_tokens; "
         "from leapflow.config import load_config; "
         "settings = load_config(); "
         "episodic = EpisodicMemoryProvider("
         "ttl=settings.memory_episodic_ttl_s, "
         "max_entries=settings.memory_episodic_max_entries); "
-        "working = WorkingMemoryProvider("
-        "max_tokens=settings.memory_working_max_tokens); "
+        "working = WorkingMemoryProvider(max_tokens=resolve_working_memory_max_tokens("
+        "settings.memory_working_max_tokens, settings.llm_context_length)); "
         "bus = EventBus(immediate=episodic, working=working); "
         "daemon = ObservationDaemon(bus=bus, config=ObserverConfig()); "
         "loop = asyncio.new_event_loop(); "

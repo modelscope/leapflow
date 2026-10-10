@@ -1,0 +1,34 @@
+id: native_realtime_local
+version: "1.0.0"
+source: "leapflow://native"
+adapter: native_realtime_local
+tier: 3
+tags:
+  - native
+  - realtime
+  - wall-clock
+  - smoke-test
+required: true
+dependencies: []
+timeouts:
+  availability: 5.0
+  trial: 30.0
+seeds:
+  - 42
+metrics:
+  - wall_clock_sample_count
+  - wall_clock_jitter_p50
+  - wall_clock_jitter_p95
+  - wall_clock_jitter_p99
+  - wall_clock_overrun_rate
+  - control_cpu_seconds
+  - gc_event_count
+gates:
+  wall_clock_sample_count: 20.0
+note: "Non-motion simulated smoke test only. It does not qualify a device for physical motion; device-specific timing and overrun gates are required before motion approval."
+scenarios:
+  - scenario_id: wall_clock_control
+    name: "Non-motion wall-clock local control smoke test"
+    tags: [native, realtime, tier3, wall-clock, smoke-test]
+    timeout_seconds: 15.0
+    required: true

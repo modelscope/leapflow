@@ -67,9 +67,21 @@ class SessionCoordinator:
             from leapflow.daemon.session_registry import SessionRegistry
             from leapflow.engine.session.session_factory import build_session_engine
             from leapflow.memory import WorkingMemoryProvider
+            from leapflow.memory.providers.working import resolve_working_memory_max_tokens
 
-            base_wm = getattr(base_engine, "_wm", None)
-            max_tokens = int(getattr(base_wm, "_max_tokens", 8192) or 8192)
+            def _build_working_memory() -> WorkingMemoryProvider:
+                runtime_settings = getattr(base_engine, "_settings", settings)
+                context_length = int(
+                    getattr(base_engine, "active_context_length", 0)
+                    or getattr(runtime_settings, "llm_context_length", 0)
+                )
+                return WorkingMemoryProvider(
+                    max_tokens=resolve_working_memory_max_tokens(
+                        int(getattr(runtime_settings, "memory_working_max_tokens", 0) or 0),
+                        context_length,
+                    )
+                )
+
             self._session_registry = SessionRegistry(
                 base_engine=base_engine,
                 build_engine=lambda base, sid, wm, workspace_root: build_session_engine(
@@ -78,7 +90,7 @@ class SessionCoordinator:
                     working_memory=wm,
                     workspace_root=workspace_root,
                 ),
-                build_working_memory=lambda: WorkingMemoryProvider(max_tokens=max_tokens),
+                build_working_memory=_build_working_memory,
                 max_sessions=int(getattr(settings, "daemon_max_live_sessions", 16) or 16),
                 idle_ttl_s=float(getattr(settings, "daemon_session_idle_ttl_s", 1800.0) or 1800.0),
             )

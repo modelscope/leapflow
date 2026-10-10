@@ -42,6 +42,49 @@ def test_command_router_parses_command_args_and_runtime_support() -> None:
     assert router.unsupported_result(invocation) is None
 
 
+@pytest.mark.parametrize(
+    "text",
+    (
+        "host CPU/内存/网络吞吐连续采样几分钟存成日志看趋势",
+        "status of the current session",
+        "model selection should preserve the prior configuration",
+        "board the architecture options",
+    ),
+)
+def test_command_router_keeps_natural_language_out_of_slash_namespace(text: str) -> None:
+    """Registered command words only become commands after an explicit slash."""
+    assert CommandRouter("daemon").parse(text) is None
+
+
+def test_command_router_accepts_leading_whitespace_before_a_slash() -> None:
+    invocation = CommandRouter("daemon").parse("  /host status")
+
+    assert invocation is not None
+    assert invocation.command.name == "host"
+    assert invocation.args == "status"
+
+
+def test_host_actions_are_declared_once_for_usage_and_alias_resolution() -> None:
+    from leapflow.cli.commands.interactive import _host_action
+    from leapflow.cli.commands.registry import (
+        HOST_ACTIONS,
+        command_action_usage,
+        resolve_command,
+        resolve_command_action,
+    )
+
+    command = resolve_command("host")
+    assert command is not None
+    assert command.actions == HOST_ACTIONS
+    assert command_action_usage(command) == "Usage: /host [status|start|stop|restart]"
+    assert resolve_command_action(command, "").name == "status"
+    assert resolve_command_action(command, "on").name == "start"
+    assert resolve_command_action(command, "disable").name == "stop"
+    assert resolve_command_action(command, "restart now") is None
+    assert _host_action("up") == "start"
+    assert _host_action("off") == "stop"
+
+
 def test_command_router_all_commands_supported_in_daemon() -> None:
     """All commands are now supported in both runtimes."""
     daemon_router = CommandRouter("daemon")
@@ -228,6 +271,104 @@ def _offered(completer, text: str) -> list[str]:
     from prompt_toolkit.document import Document
 
     return [item.text for item in completer.get_completions(Document(text, len(text)), None)]
+
+
+def test_host_completes_declared_actions_and_stops_after_the_action() -> None:
+    from leapflow.cli.tui_app.input import SlashCommandCompleter
+
+    completer = SlashCommandCompleter([("host", "Host")])
+    assert _offered(completer, "/host ") == ["status", "start", "stop", "restart"]
+    assert _offered(completer, "/host r") == ["restart"]
+    assert _offered(completer, "/host restart ") == []
+
+
+def test_host_execution_and_rendering_preserve_failure_evidence() -> None:
+    from rich.console import Console
+
+    from leapflow.cli.commands.slash_handlers import _execute_host, render_command_payload
+
+    class HostContext:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def host_backend_status(self) -> dict[str, object]:
+            self.calls.append("status")
+            return {"backend": "cua-driver", "started": True}
+
+        async def host_backend_start(self) -> dict[str, object]:
+            self.calls.append("start")
+            return {
+                "ok": False,
+                "backend": "cua-driver",
+                "started": False,
+                "last_error": "driver unavailable",
+            }
+
+        async def host_backend_stop(self) -> dict[str, object]:
+            self.calls.append("stop")
+            return {"ok": True, "backend": "mock", "started": False}
+
+        async def host_backend_restart(self) -> dict[str, object]:
+            self.calls.append("restart")
+            return {"ok": True, "backend": "cua-driver", "started": True}
+
+    ctx = HostContext()
+    failed = asyncio.run(_execute_host(ctx, "on"))
+    invalid = asyncio.run(_execute_host(ctx, "inspect now"))
+
+    assert ctx.calls == ["start"]
+    assert failed["ok"] is False
+    assert failed["action"] == "start"
+    assert failed["message"] == "driver unavailable"
+    assert invalid["ok"] is False
+    assert "Usage: /host [status|start|stop|restart]" in invalid["message"]
+    assert "Tab" in invalid["message"]
+
+    class CapturedConsole:
+        def __init__(self) -> None:
+            self.output = Console(record=True, width=120)
+
+        def print(self, value: object) -> None:
+            self.output.print(value)
+
+        def success(self, message: str) -> None:
+            self.output.print(message)
+
+        def warning(self, message: str) -> None:
+            self.output.print(message)
+
+    console = CapturedConsole()
+    render_command_payload(
+        console,
+        {
+            "ok": False,
+            "view": "host",
+            "action": "restart",
+            "message": "driver unavailable",
+            "result": {
+                "backend": "cua-driver",
+                "started": False,
+                "tools_count": 12,
+                "restart_count": 2,
+                "cua_status": "degraded",
+                "last_error": "driver unavailable",
+                "pid": None,
+                "operation_health": {
+                    "window_target": {
+                        "state": "cooling_down",
+                        "last_failure_code": "timeout",
+                    },
+                },
+            },
+        },
+    )
+    rendered = console.output.export_text()
+    assert "Host restart failed." in rendered
+    assert "Driver tools:    12" in rendered
+    assert "window_target: cooling_down (timeout)" in rendered
+    assert "/host status" in rendered
+    assert "leap host doctor" in rendered
+    assert "pid:" not in rendered
 
 
 def test_board_offers_both_verbs_and_lenses() -> None:

@@ -1,0 +1,57 @@
+id: kinder
+version: "1.0.0"
+source: "https://prpl-group.com/kinder-site/"
+paper: "https://arxiv.org/abs/2604.25788"
+repo: "https://github.com/Princeton-Robot-Planning-and-Learning/kindergarden"
+license: "UNKNOWN"
+setup_guidance: "Install the official kindergarden package or checkout, register environments with kinder.register_all_environments(), and configure benchmark.commands.kinder for the official selected environment rollouts. Configure benchmark.data_roots.kinder when official demonstration datasets are evaluated; emit success_rate and mean_episode_return as JSON."
+official:
+  implementation: "Princeton-Robot-Planning-and-Learning/kindergarden"
+  protocol: "Official Gymnasium environment rollout for kinematic and dynamic physical reasoning"
+  dataset: "Official KinDER environment assets and optional Hugging Face demonstration datasets"
+  result_contract: "Final JSON line with success_rate and mean_episode_return."
+adapter: kinder
+tier: 2
+tags:
+  - safety
+  - commonsense
+  - danger-detection
+  - embodied
+required: false
+dependencies:
+  - config:benchmark.commands.kinder
+  - config:benchmark.data_roots.kinder
+timeouts:
+  availability: 10.0
+  trial: 300.0
+seeds:
+  - 42
+metrics:
+  - success_rate
+  - mean_episode_return
+gates: {}
+scenarios:
+  - scenario_id: kinder/Obstruction2D-o3-v0
+    name: "KinDER Obstruction2D"
+    description: "Official kinematic 2D obstruction physical-reasoning environment."
+    tags: [physical-reasoning, kinematic2d, official]
+    timeout_seconds: 600.0
+    required: true
+    parameters:
+      official_metrics: [success_rate, mean_episode_return]
+  - scenario_id: kinder/PushPullHook2D-v0
+    name: "KinDER PushPullHook2D"
+    description: "Official tool-use physical-reasoning environment."
+    tags: [physical-reasoning, tool-use, official]
+    timeout_seconds: 600.0
+    required: true
+    parameters:
+      official_metrics: [success_rate, mean_episode_return]
+  - scenario_id: kinder/Obstruction3D-o2-v0
+    name: "KinDER Obstruction3D"
+    description: "Official 3D obstruction physical-reasoning environment."
+    tags: [physical-reasoning, kinematic3d, official]
+    timeout_seconds: 900.0
+    required: false
+    parameters:
+      official_metrics: [success_rate, mean_episode_return]

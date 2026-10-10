@@ -1939,6 +1939,20 @@ class AgentEngine:
                             },
                         )
 
+                    if self._tool_dispatch.task_completion_ready():
+                        # Artifact evidence is stronger than optional visual re-checks:
+                        # terminate tool selection before a later list/screenshot
+                        # failure can reopen already-completed work.
+                        messages.append(build_user_message_text(
+                            "SYSTEM: task_completion_ready. Required artifact evidence is complete; "
+                            "do not call any more tools or perform visual verification. "
+                            "Provide the final response now."
+                        ))
+                        tools_kwarg = {}
+                        use_native_tools = False
+                        planned_enable_thinking = False
+                        continue
+
                     permission_hard_stop = _permission_hard_stop_from_results(results)
                     if permission_hard_stop:
                         logger.info(
@@ -1992,6 +2006,9 @@ class AgentEngine:
                             f"[Called: {', '.join(tc.name for tc in native_calls)}]"
                         )
                     )
+                    memory_evidence = self._tool_dispatch.working_memory_evidence(results)
+                    if memory_evidence:
+                        self._wm.remember_chat(build_assistant_message(memory_evidence))
 
                     if status == BudgetStatus.SOFT_LIMIT and not self._should_extend_budget(frame):
                         messages.append(
@@ -2149,7 +2166,11 @@ class AgentEngine:
             # PCD 5b: snapshot the assembled prefix so a cache-priority resume
             # can reproduce it verbatim and hit the provider cache immediately.
             self._session_persistence._persist_session_snapshot(session_id)
-            tool_call = self._tool_dispatch._parse_tool_call_from_content(content)
+            tool_call = (
+                None
+                if frame.metadata.get("task_completion_ready")
+                else self._tool_dispatch._parse_tool_call_from_content(content)
+            )
 
             if tool_call is None:
                 if not content and not empty_response_retry_used:
@@ -2257,6 +2278,22 @@ class AgentEngine:
                     tool_name, tool_arguments, result
                 ),
             )
+            memory_evidence = self._tool_dispatch.working_memory_evidence([
+                {"name": tool_name, "evidence": result_payload}
+            ])
+            if memory_evidence:
+                self._wm.remember_chat(build_assistant_message(memory_evidence))
+
+            if self._tool_dispatch.task_completion_ready():
+                messages.append(build_user_message_text(
+                    "SYSTEM: task_completion_ready. Required artifact evidence is complete; "
+                    "do not call any more tools or perform visual verification. "
+                    "Provide the final response now."
+                ))
+                tools_kwarg = {}
+                use_native_tools = False
+                planned_enable_thinking = False
+                continue
 
             if _is_permission_hard_stop_payload(result):
                 logger.info(

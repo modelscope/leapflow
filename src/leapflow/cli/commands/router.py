@@ -69,8 +69,15 @@ class CommandRouter:
         return self._runtime
 
     def parse(self, raw_text: str) -> CommandInvocation | None:
-        """Parse raw user input into a CommandInvocation when it is a command."""
-        text = raw_text.lstrip("/") if raw_text.startswith("/") else raw_text
+        """Parse explicitly slash-prefixed input into a command invocation.
+
+        Natural-language turns must never be inferred from a registered command name;
+        only a leading slash opts an input into the command namespace.
+        """
+        candidate = raw_text.lstrip()
+        if not candidate.startswith("/"):
+            return None
+        text = candidate[1:].lstrip()
         command = resolve_command(text)
         if command is None:
             return None

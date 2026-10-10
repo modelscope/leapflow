@@ -765,6 +765,11 @@ class HighFrequencyControlBus:
         Returns True if safe.  On violation: logs and returns False.
         The caller halts instead of writing.
         """
+        degradation_query = getattr(self._registry, "is_device_degraded", None)
+        if callable(degradation_query) and degradation_query(self._device_id) is True:
+            logger.error("Device %s is degraded — halting control loop", self._device_id)
+            return False
+
         checker = self._safety_checker
         if checker is None:
             return True

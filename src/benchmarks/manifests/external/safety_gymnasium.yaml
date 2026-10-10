@@ -1,0 +1,66 @@
+id: safety_gymnasium
+version: "1.0.0"
+source: "https://www.safety-gymnasium.com/"
+paper: "https://arxiv.org/abs/2310.12567"
+repo: "https://github.com/PKU-Alignment/safety-gymnasium"
+license: "Apache-2.0"
+setup_guidance: "Run a version-pinned official Safety-Gymnasium rollout that uses its six-value step API (observation, reward, cost, terminated, truncated, info). Configure benchmark.commands.safety_gymnasium to emit a final JSON summary with the declared reward and cost metrics."
+official:
+  implementation: "PKU-Alignment/safety-gymnasium"
+  protocol: "Official constrained environment rollout via the Safety-Gymnasium step API"
+  dataset: "Official environment assets installed with the selected Safety-Gymnasium release"
+  result_contract: "Final JSON line with mean_episode_return and mean_episode_cost computed from official reward and cost outputs."
+adapter: safety_gymnasium
+tier: 2
+tags:
+  - safety
+  - constrained-rl
+  - mujoco
+  - simulation
+  - locomotion
+required: false
+dependencies:
+  - config:benchmark.commands.safety_gymnasium
+timeouts:
+  availability: 10.0
+  trial: 600.0
+seeds:
+  - 42
+  - 123
+metrics:
+  - mean_episode_return
+  - mean_episode_cost
+gates: {}
+scenarios:
+  - scenario_id: SafetyPointGoal1-v0
+    name: "Point Goal Level 1"
+    description: "Point agent must reach goal while avoiding hazards"
+    tags: [locomotion, constrained-rl]
+    timeout_seconds: 120.0
+    required: true
+    parameters:
+      official_metrics: [mean_episode_return, mean_episode_cost]
+  - scenario_id: SafetyCarGoal1-v0
+    name: "Car Goal Level 1"
+    description: "Car agent must reach goal with constraint satisfaction"
+    tags: [locomotion, constrained-rl]
+    timeout_seconds: 120.0
+    required: true
+    parameters:
+      official_metrics: [mean_episode_return, mean_episode_cost]
+  - scenario_id: SafetyPointButton1-v0
+    name: "Point Button Level 1"
+    description: "Point agent must press correct button avoiding hazards"
+    tags: [locomotion, constrained-rl]
+    timeout_seconds: 120.0
+    required: false
+    parameters:
+      official_metrics: [mean_episode_return, mean_episode_cost]
+  - scenario_id: SafetyAntVelocity-v1
+    name: "Ant Velocity"
+    description: "Ant agent must maintain velocity within safety bounds"
+    tags: [locomotion, constrained-rl]
+    timeout_seconds: 120.0
+    required: false
+    parameters:
+      official_metrics: [mean_episode_return, mean_episode_cost]
