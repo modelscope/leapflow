@@ -17,6 +17,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -26,6 +27,30 @@ from benchmarks.models import EvidenceRef
 
 
 _INDEX_FILE = "evidence.jsonl"
+
+
+def evidence_root(adapter_id: str) -> Path:
+    """Resolve a run-isolated evidence path for an adapter.
+
+    CLI and runner invocations install a persistent profile-owned root in the
+    runtime context.  Direct adapter calls retain a temporary fallback for
+    isolated unit tests and must not be used as release evidence.
+    """
+    from benchmarks.runtime import current_runtime_context
+
+    context = current_runtime_context()
+    if context.evidence_root and context.run_id:
+        _validate_path_segment(context.run_id, "run_id")
+        _validate_path_segment(adapter_id, "adapter_id")
+        return Path(context.evidence_root).expanduser().resolve() / context.run_id / adapter_id
+    _validate_path_segment(adapter_id, "adapter_id")
+    return Path(tempfile.gettempdir()) / "leapflow-benchmarks" / adapter_id
+
+
+def _validate_path_segment(value: str, field: str) -> None:
+    """Reject path-like values before deriving an evidence directory."""
+    if not value or Path(value).name != value or value in {".", ".."}:
+        raise ValueError(f"{field} must be one non-empty path segment")
 
 
 def _json_default(obj: Any) -> Any:
@@ -135,7 +160,11 @@ class EvidenceStore:
     ) -> EvidenceRef:
         """Store structured data as canonical JSON."""
         text = json.dumps(
-            data, ensure_ascii=False, sort_keys=True, indent=2, default=_json_default,
+            data,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            default=_json_default,
         )
         return self.add_text(
             text,
@@ -245,4 +274,4 @@ class EvidenceStore:
         return digest == expected and path.stat().st_size == ref.size_bytes
 
 
-__all__ = ["EvidenceStore"]
+__all__ = ["EvidenceStore", "evidence_root"]

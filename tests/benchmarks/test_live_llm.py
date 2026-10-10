@@ -8,10 +8,18 @@ from typing import Any, Sequence
 
 import pytest
 
+from benchmarks.adapters.base import SubprocessResult
 from benchmarks.adapters.hardware_preflight import HardwarePreflightAdapter
 from benchmarks.adapters.live_llm import LiveLLMAdapter
 from benchmarks.evidence import EvidenceStore
-from benchmarks.models import AvailabilityResult, BenchmarkManifest, RunConfig, Scenario, TrialResult, TrialStatus
+from benchmarks.models import (
+    AvailabilityResult,
+    BenchmarkManifest,
+    RunConfig,
+    Scenario,
+    TrialResult,
+    TrialStatus,
+)
 from benchmarks.native.harness import evidence_root
 from benchmarks.registry import AdapterRegistry
 from benchmarks.runner import BenchmarkRunner
@@ -52,6 +60,198 @@ async def test_hardware_preflight_refuses_direct_execution_without_authority(
 
     assert result.status is TrialStatus.UNAVAILABLE
     assert "--confirm-hardware" in result.error
+
+
+@pytest.mark.asyncio
+async def test_hardware_preflight_requires_persistent_run_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = HardwarePreflightAdapter()
+    scenario = Scenario(
+        "device_preflight",
+        "Device",
+        adapter_id="hardware_preflight",
+        parameters={"device_id": "device", "required_checks": ["connection"]},
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_profiles",
+        lambda: {
+            "device": {
+                "preflight_mode": "zero_motion",
+                "preflight_command": "safe",
+            },
+        },
+    )
+    monkeypatch.setattr(adapter, "_run_command", lambda *args: pytest.fail("must not execute"))
+
+    with runtime_context(BenchmarkRuntimeContext(hardware_enabled=True)):
+        result = await adapter.run_trial(scenario)
+
+    assert result.status is TrialStatus.UNAVAILABLE
+    assert "persistent run-scoped evidence" in result.error
+
+
+@pytest.mark.asyncio
+async def test_hardware_preflight_accepts_structured_zero_motion_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    adapter = HardwarePreflightAdapter()
+    scenario = Scenario(
+        "device_preflight",
+        "Device",
+        adapter_id="hardware_preflight",
+        parameters={"device_id": "device", "required_checks": ["connection", "estop"]},
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_profiles",
+        lambda: {
+            "device": {
+                "profile_id": "device-readonly",
+                "preflight_mode": "zero_motion",
+                "preflight_command": "safe",
+            },
+        },
+    )
+    report = {
+        "schema_version": 1,
+        "scope": "zero_motion",
+        "device_id": "device",
+        "motion_performed": False,
+        "checks": [
+            {"id": "connection", "status": "passed"},
+            {"id": "estop", "status": "passed"},
+        ],
+    }
+    monkeypatch.setattr(
+        adapter,
+        "_run_command",
+        lambda *args: SubprocessResult(returncode=0, stdout=json.dumps(report)),
+    )
+
+    with runtime_context(
+        BenchmarkRuntimeContext(
+            hardware_enabled=True,
+            run_id="run-test",
+            evidence_root=str(tmp_path / "evidence"),
+        )
+    ):
+        result = await adapter.run_trial(scenario)
+
+    assert result.status is TrialStatus.PASSED
+    payload_path = (
+        EvidenceStore(tmp_path / "evidence" / "run-test" / "hardware_preflight").root
+        / result.evidence[0].path
+    )
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    assert payload["preflight_mode"] == "zero_motion"
+    assert payload["report"] == report
+
+
+@pytest.mark.asyncio
+async def test_hardware_preflight_rejects_motion_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    adapter = HardwarePreflightAdapter()
+    scenario = Scenario(
+        "device_preflight",
+        "Device",
+        adapter_id="hardware_preflight",
+        parameters={"device_id": "device", "required_checks": ["connection", "estop"]},
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_profiles",
+        lambda: {
+            "device": {
+                "preflight_mode": "zero_motion",
+                "preflight_command": "safe",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_run_command",
+        lambda *args: SubprocessResult(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "schema_version": 1,
+                    "scope": "zero_motion",
+                    "device_id": "device",
+                    "motion_performed": True,
+                    "checks": [{"id": "connection", "status": "passed"}],
+                }
+            ),
+        ),
+    )
+
+    with runtime_context(
+        BenchmarkRuntimeContext(
+            hardware_enabled=True,
+            run_id="run-test",
+            evidence_root=str(tmp_path / "evidence"),
+        )
+    ):
+        result = await adapter.run_trial(scenario)
+
+    assert result.status is TrialStatus.FAILED
+    assert "motion_performed=false" in result.error
+
+
+@pytest.mark.asyncio
+async def test_hardware_preflight_rejects_missing_required_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    adapter = HardwarePreflightAdapter()
+    scenario = Scenario(
+        "device_preflight",
+        "Device",
+        adapter_id="hardware_preflight",
+        parameters={"device_id": "device", "required_checks": ["connection", "estop"]},
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_profiles",
+        lambda: {
+            "device": {
+                "preflight_mode": "zero_motion",
+                "preflight_command": "safe",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_run_command",
+        lambda *args: SubprocessResult(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "schema_version": 1,
+                    "scope": "zero_motion",
+                    "device_id": "device",
+                    "motion_performed": False,
+                    "checks": [{"id": "connection", "status": "passed"}],
+                }
+            ),
+        ),
+    )
+
+    with runtime_context(
+        BenchmarkRuntimeContext(
+            hardware_enabled=True,
+            run_id="run-test",
+            evidence_root=str(tmp_path / "evidence"),
+        )
+    ):
+        result = await adapter.run_trial(scenario)
+
+    assert result.status is TrialStatus.FAILED
+    assert "missing required checks: estop" in result.error
 
 
 @pytest.mark.asyncio
@@ -100,13 +300,20 @@ class _AuthorityAdapter:
         return AvailabilityResult(self.adapter_id, True, "ready")
 
     async def list_scenarios(
-        self, *, tags: Sequence[str] = (), limit: int = 0,
+        self,
+        *,
+        tags: Sequence[str] = (),
+        limit: int = 0,
     ) -> tuple[Scenario, ...]:
         del tags, limit
         return (Scenario("one", "One", adapter_id=self.adapter_id),)
 
     async def run_trial(
-        self, scenario: Scenario, *, seed: int = 42, timeout_seconds: float = 300.0,
+        self,
+        scenario: Scenario,
+        *,
+        seed: int = 42,
+        timeout_seconds: float = 300.0,
         parameters: dict[str, Any] | None = None,
     ) -> TrialResult:
         del timeout_seconds, parameters

@@ -12,7 +12,7 @@ timeouts:
 seeds: [42]
 metrics: []
 gates: {}
-note: "Requires an operator-approved benchmark.hardware_profiles.unitree_g1 entry with a non-motion preflight_command. Real motion remains separately approval-gated."
+note: "Requires an operator-approved zero_motion preflight profile that emits the structured JSON report required by this manifest. Real motion remains separately approval-gated."
 scenarios:
   - scenario_id: unitree_g1_preflight
     name: "Unitree G1 connection, e-stop, calibration, and topology preflight"
@@ -22,3 +22,4 @@ scenarios:
     parameters:
       device_id: unitree_g1
       topology: dual_host_mcp
+      required_checks: [connection, identity, driver, read_only_transport, estop, health, network_fallback, interlocks]

@@ -9,11 +9,10 @@ at import time.
 
 from __future__ import annotations
 
-import tempfile
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from benchmarks.evidence import evidence_root
 from leapflow.hardware.context import (
     CapabilityDeclaration,
     Channel,
@@ -253,11 +252,6 @@ def make_tools(
         session_id="native-benchmark",
         hardware_trust_gate=trust_gate,
     )
-
-
-def evidence_root(adapter_id: str) -> Path:
-    """Return a stable temporary evidence directory outside the source tree."""
-    return Path(tempfile.gettempdir()) / "leapflow-benchmarks" / adapter_id
 
 
 @dataclass
