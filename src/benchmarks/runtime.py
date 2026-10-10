@@ -16,6 +16,8 @@ class BenchmarkRuntimeContext:
     live_llm_enabled: bool = False
     require_live_llm: bool = False
     hardware_enabled: bool = False
+    run_id: str = ""
+    evidence_root: str = ""
 
 
 _RUNTIME_CONTEXT: ContextVar[BenchmarkRuntimeContext] = ContextVar(

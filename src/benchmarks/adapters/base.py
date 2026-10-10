@@ -16,13 +16,12 @@ import os
 import shlex
 import shutil
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from benchmarks.evidence import EvidenceStore
+from benchmarks.evidence import EvidenceStore, evidence_root
 from benchmarks.manifest import load_manifest
 from benchmarks.models import (
     AvailabilityResult,
@@ -410,8 +409,7 @@ def trial_from_subprocess(
         if missing:
             status = TrialStatus.FAILED
             result_error = (
-                "official evaluator completed without its declared metrics: "
-                + ", ".join(missing)
+                "official evaluator completed without its declared metrics: " + ", ".join(missing)
             )
         else:
             result_error = ""
@@ -430,9 +428,10 @@ def trial_from_subprocess(
         "stdout_sha256": hashlib.sha256(result.stdout.encode("utf-8")).hexdigest(),
         "stderr_sha256": hashlib.sha256(result.stderr.encode("utf-8")).hexdigest(),
     }
-    evidence = EvidenceStore(
-        Path(tempfile.gettempdir()) / "leapflow-benchmarks" / adapter_id
-    ).add_json(evidence_payload, kind="official_benchmark_result")
+    evidence = EvidenceStore(evidence_root(adapter_id)).add_json(
+        evidence_payload,
+        kind="official_benchmark_result",
+    )
     return TrialResult(
         trial_id="",
         scenario_id=scenario.scenario_id,
@@ -445,14 +444,13 @@ def trial_from_subprocess(
         adapter_id=adapter_id,
         adapter_version=adapter_version,
         seed=seed,
-        error=(
-            result_error
-            or (result.stderr[:4096] if status != TrialStatus.PASSED else "")
-        ),
-        error_type="TimeoutError" if result.timed_out else (
-            "ProcessError" if result.returncode != 0 else (
-                "OfficialResultContractError" if result_error else ""
-            )
+        error=(result_error or (result.stderr[:4096] if status != TrialStatus.PASSED else "")),
+        error_type="TimeoutError"
+        if result.timed_out
+        else (
+            "ProcessError"
+            if result.returncode != 0
+            else ("OfficialResultContractError" if result_error else "")
         ),
     )
 

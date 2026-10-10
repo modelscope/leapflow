@@ -73,14 +73,19 @@ def _build_parser() -> argparse.ArgumentParser:
         p_run.add_argument("manifest", nargs="?", help="Manifest file or directory")
         p_run.add_argument("--profile", choices=PROFILE_IDS, default="all")
         p_run.add_argument("--benchmark", help="Run only this benchmark id")
-        p_run.add_argument("--dry-run", action="store_true",
-                           help="Check availability only, do not run trials")
+        p_run.add_argument(
+            "--dry-run", action="store_true", help="Check availability only, do not run trials"
+        )
         p_run.add_argument("--seed", type=int)
         p_run.add_argument("--timeout", type=float, default=300.0)
         p_run.add_argument("--retries", type=int, default=0)
         p_run.add_argument("--parallel", type=int, default=1)
         p_run.add_argument("--fail-fast", action="store_true")
         p_run.add_argument("--tag", action="append", default=[])
+        p_run.add_argument(
+            "--run-id",
+            help="Reuse this path-safe identifier to group persistent evidence for one invocation",
+        )
         p_run.add_argument(
             "--live-llm",
             action="store_true",
@@ -97,8 +102,9 @@ def _build_parser() -> argparse.ArgumentParser:
             help="Confirm that an operator has authorized Tier4 preflight or motion",
         )
         p_run.add_argument("--output", type=Path, help="Write result JSON to this file")
-        p_run.add_argument("--from", dest="resume_from", type=Path,
-                           help="Prior result JSON (required by resume)")
+        p_run.add_argument(
+            "--from", dest="resume_from", type=Path, help="Prior result JSON (required by resume)"
+        )
 
     p_report = sub.add_parser("report", parents=[common], help="Summarize result JSON")
     p_report.add_argument("result", type=Path)
@@ -107,7 +113,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_gate.add_argument("result", nargs="?", type=Path, help="Existing result JSON")
     p_gate.add_argument("--manifest", type=Path, help="Manifest file or directory")
     p_gate.add_argument(
-        "--profile", choices=PROFILE_IDS,
+        "--profile",
+        choices=PROFILE_IDS,
         help="Run and gate this profile when no result JSON is supplied",
     )
     p_gate.add_argument("--seed", type=int)
@@ -116,6 +123,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_gate.add_argument("--parallel", type=int, default=1)
     p_gate.add_argument("--fail-fast", action="store_true")
     p_gate.add_argument("--tag", action="append", default=[])
+    p_gate.add_argument(
+        "--run-id",
+        help="Reuse this path-safe identifier to group persistent evidence for one invocation",
+    )
     p_gate.add_argument("--live-llm", action="store_true")
     p_gate.add_argument("--require-live-llm", action="store_true")
     p_gate.add_argument("--confirm-hardware", action="store_true")
@@ -173,8 +184,13 @@ def _save_results(path: Path, results: Sequence[BenchmarkResult]) -> None:
 def _dependency_groups(manifests: Sequence[BenchmarkManifest]) -> dict[str, list[str]]:
     """Group prefixed manifest dependency strings for doctor checks."""
     groups: dict[str, list[str]] = {
-        "python": [], "executable": [], "env": [], "data": [],
-        "license": [], "hardware": [], "config": [],
+        "python": [],
+        "executable": [],
+        "env": [],
+        "data": [],
+        "license": [],
+        "hardware": [],
+        "config": [],
     }
     for manifest in manifests:
         for dependency in manifest.dependencies:
@@ -257,15 +273,22 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     )
     data = report.to_dict()
     data["manifest_errors"] = errors
-    lines = [
-        f"[{c.status.upper():4}] {c.check_id}: {c.detail}"
-        for c in report.checks
-    ]
+    lines = [f"[{c.status.upper():4}] {c.check_id}: {c.detail}" for c in report.checks]
     lines.append(f"Ready: {'yes' if report.ready else 'no'}")
     _emit(data, as_json=args.json, human="\n".join(lines))
     if errors:
         return EXIT_USAGE
     return EXIT_READY if report.ready else EXIT_BLOCKED
+
+
+def _profile_evidence_root() -> str:
+    """Resolve the profile-owned durable root for benchmark evidence."""
+    try:
+        from leapflow.config import load_config
+
+        return str(load_config().profile_layout.benchmark_runs_dir)
+    except (ImportError, OSError, TypeError, ValueError) as exc:
+        raise _UsageError(f"cannot resolve persistent benchmark evidence root: {exc}") from exc
 
 
 async def _run_manifests(
@@ -275,6 +298,10 @@ async def _run_manifests(
 ) -> list[BenchmarkResult]:
     """Execute selected manifests and seeds sequentially; trials run concurrently."""
     runner = BenchmarkRunner(registry=default_registry())
+    run_id = str(getattr(args, "run_id", "") or RunConfig().run_id)
+    if Path(run_id).name != run_id or run_id in {".", ".."}:
+        raise _UsageError("run-id must be one non-empty path segment")
+    evidence_root = _profile_evidence_root()
     results: list[BenchmarkResult] = []
     for manifest in manifests:
         seeds = (args.seed,) if args.seed is not None else (manifest.seeds or (42,))
@@ -291,9 +318,13 @@ async def _run_manifests(
                 live_llm_enabled=bool(args.live_llm or args.require_live_llm),
                 require_live_llm=bool(args.require_live_llm),
                 hardware_enabled=bool(args.confirm_hardware),
+                run_id=run_id,
+                evidence_root=evidence_root,
             )
             result = await runner.run(
-                manifest, config, completed_ids=completed_ids,
+                manifest,
+                config,
+                completed_ids=completed_ids,
             )
             results.append(result)
     return results
@@ -304,18 +335,23 @@ def _availability_for_args(adapter: Any, args: argparse.Namespace) -> Any:
     from benchmarks.runtime import BenchmarkRuntimeContext, runtime_context
 
     async def check() -> Any:
-        with runtime_context(BenchmarkRuntimeContext(
-            live_llm_enabled=bool(getattr(args, "live_llm", False) or getattr(args, "require_live_llm", False)),
-            require_live_llm=bool(getattr(args, "require_live_llm", False)),
-            hardware_enabled=bool(getattr(args, "confirm_hardware", False)),
-        )):
+        with runtime_context(
+            BenchmarkRuntimeContext(
+                live_llm_enabled=bool(
+                    getattr(args, "live_llm", False) or getattr(args, "require_live_llm", False)
+                ),
+                require_live_llm=bool(getattr(args, "require_live_llm", False)),
+                hardware_enabled=bool(getattr(args, "confirm_hardware", False)),
+            )
+        ):
             return await adapter.availability()
 
     return asyncio.run(check())
 
 
 def _cmd_dry_run(
-    manifests: Sequence[BenchmarkManifest], args: argparse.Namespace,
+    manifests: Sequence[BenchmarkManifest],
+    args: argparse.Namespace,
 ) -> int:
     """Check adapter availability for each manifest without running trials."""
     registry = default_registry()
@@ -323,35 +359,43 @@ def _cmd_dry_run(
     for manifest in manifests:
         adapter = registry.get(manifest.adapter)
         if adapter is None:
-            results.append({
-                "benchmark_id": manifest.id, "adapter": manifest.adapter,
-                "available": False, "reason": "adapter not registered",
-            })
+            results.append(
+                {
+                    "benchmark_id": manifest.id,
+                    "adapter": manifest.adapter,
+                    "available": False,
+                    "reason": "adapter not registered",
+                }
+            )
             continue
         avail = _availability_for_args(adapter, args)
-        results.append({
-            "benchmark_id": manifest.id, "adapter": manifest.adapter,
-            **avail.to_dict(),
-        })
+        results.append(
+            {
+                "benchmark_id": manifest.id,
+                "adapter": manifest.adapter,
+                **avail.to_dict(),
+            }
+        )
     data = {"dry_run": True, "results": results}
-    lines = [f"{'AVAIL' if r.get('available') else 'MISS ':5} {r['benchmark_id']}"
-             f" (adapter={r['adapter']})"
-             f"{' — ' + r.get('reason', '') if r.get('reason') else ''}"
-             for r in results]
+    lines = [
+        f"{'AVAIL' if r.get('available') else 'MISS ':5} {r['benchmark_id']}"
+        f" (adapter={r['adapter']})"
+        f"{' — ' + r.get('reason', '') if r.get('reason') else ''}"
+        for r in results
+    ]
     _emit(data, as_json=args.json, human="\n".join(lines))
     return EXIT_READY if all(r.get("available") for r in results) else EXIT_CONDITIONAL
 
 
 def _apply_strict_live_requirement(
-    manifests: Sequence[BenchmarkManifest], args: argparse.Namespace,
+    manifests: Sequence[BenchmarkManifest],
+    args: argparse.Namespace,
 ) -> list[BenchmarkManifest]:
     """Promote selected live-LLM evidence to a required gate on request."""
     if not getattr(args, "require_live_llm", False):
         return list(manifests)
     return [
-        replace(manifest, required=True)
-        if "live-llm" in manifest.tags
-        else manifest
+        replace(manifest, required=True) if "live-llm" in manifest.tags else manifest
         for manifest in manifests
     ]
 
@@ -365,7 +409,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         _emit({"errors": errors}, as_json=args.json, human="\n".join(errors))
         return EXIT_USAGE
     manifests = _apply_strict_live_requirement(
-        select_manifests(manifests, args.profile), args,
+        select_manifests(manifests, args.profile),
+        args,
     )
 
     if args.benchmark:
@@ -385,10 +430,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if args.resume_from:
         prior = _load_result_file(args.resume_from)
     completed_ids = frozenset(
-        trial.trial_id
-        for result in prior
-        for trial in result.trials
-        if trial.status.is_terminal
+        trial.trial_id for result in prior for trial in result.trials if trial.status.is_terminal
     )
 
     results = asyncio.run(_run_manifests(manifests, args, completed_ids))
@@ -403,6 +445,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     ]
     if args.output:
         lines.append(f"Results: {args.output}")
+    if results:
+        config = results[0].config
+        lines.append(f"Evidence: {config.evidence_root}/{config.run_id}")
     _emit(payload, as_json=args.json, human="\n".join(lines))
 
     if any(r.failed for r in results):
@@ -459,7 +504,8 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         if not args.profile:
             raise _UsageError("gate requires RESULT.json or --profile PROFILE")
         selected = _apply_strict_live_requirement(
-            select_manifests(manifests, args.profile), args,
+            select_manifests(manifests, args.profile),
+            args,
         )
         if not selected:
             raise _UsageError(f"no manifests match profile {args.profile!r}")

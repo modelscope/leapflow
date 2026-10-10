@@ -1,5 +1,10 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Wall-clock control-loop benchmark for local pre-hardware qualification."""
+"""Non-motion wall-clock smoke test for the local control-loop implementation.
+
+This adapter validates only that the local Python loop can start and collect
+samples against a simulated transport.  It is not a device timing or motion
+qualification gate.
+"""
 
 from __future__ import annotations
 
@@ -13,13 +18,24 @@ from typing import Any, Mapping, Sequence
 from benchmarks.evidence import EvidenceStore
 from benchmarks.models import AvailabilityResult, MetricValue, Scenario, TrialResult, TrialStatus
 from benchmarks.native.harness import evidence_root, make_channel, make_context, make_registry
-from leapflow.hardware.control_bus import ControlBusConfig, ControlCommand, ControlState, HighFrequencyControlBus
+from leapflow.hardware.control_bus import (
+    ControlBusConfig,
+    ControlCommand,
+    ControlState,
+    HighFrequencyControlBus,
+)
 
 _ADAPTER_ID = "native_realtime_local"
 _VERSION = "1.0.0"
+_SMOKE_DURATION_SECONDS = 0.65
+_SMOKE_MIN_SAMPLE_COUNT = 20
 _SCENARIOS = (
-    Scenario("wall_clock_control", "Wall-clock local control loop timing", adapter_id=_ADAPTER_ID,
-             tags=("native", "realtime", "tier3", "wall-clock")),
+    Scenario(
+        "wall_clock_control",
+        "Non-motion wall-clock local control smoke test",
+        adapter_id=_ADAPTER_ID,
+        tags=("native", "realtime", "tier3", "wall-clock", "smoke-test"),
+    ),
 )
 
 
@@ -57,7 +73,10 @@ class RealtimeLocalAdapter:
         return AvailabilityResult(_ADAPTER_ID, True, "local wall-clock ready")
 
     async def list_scenarios(
-        self, *, tags: Sequence[str] = (), limit: int = 0,
+        self,
+        *,
+        tags: Sequence[str] = (),
+        limit: int = 0,
     ) -> tuple[Scenario, ...]:
         rows = _SCENARIOS
         if tags:
@@ -90,7 +109,9 @@ class RealtimeLocalAdapter:
             use_busy_wait=False,
             priority="normal",
         )
-        bus = HighFrequencyControlBus(registry, config=config, safety_checker=registry.check_safety_policy)
+        bus = HighFrequencyControlBus(
+            registry, config=config, safety_checker=registry.check_safety_policy
+        )
         gc_events: list[str] = []
 
         def gc_callback(phase: str, info: Mapping[str, Any]) -> None:
@@ -101,7 +122,7 @@ class RealtimeLocalAdapter:
         before_usage = resource.getrusage(resource.RUSAGE_SELF)
         try:
             await bus.async_start(context.device_id, policy)
-            await asyncio.sleep(0.65)
+            await asyncio.sleep(_SMOKE_DURATION_SECONDS)
             await bus.async_stop()
             after_usage = resource.getrusage(resource.RUSAGE_SELF)
             intervals = [
@@ -117,12 +138,13 @@ class RealtimeLocalAdapter:
             p95 = self._percentile(deviations, 95)
             p99 = self._percentile(deviations, 99)
             overrun_rate = (
-                sum(1 for interval in warm if interval > period * config.max_overrun_ratio) / sample_count
-                if sample_count else 1.0
+                sum(1 for interval in warm if interval > period * config.max_overrun_ratio)
+                / sample_count
+                if sample_count
+                else 1.0
             )
-            cpu_seconds = (
-                (after_usage.ru_utime - before_usage.ru_utime)
-                + (after_usage.ru_stime - before_usage.ru_stime)
+            cpu_seconds = (after_usage.ru_utime - before_usage.ru_utime) + (
+                after_usage.ru_stime - before_usage.ru_stime
             )
             payload = {
                 "os": os.uname().sysname,
@@ -136,32 +158,57 @@ class RealtimeLocalAdapter:
                 "gc_events": len(gc_events),
                 "bus_stats": stats,
             }
-            passed = sample_count >= 20 and stats["safety_violations"] == 0
+            passed = sample_count >= _SMOKE_MIN_SAMPLE_COUNT and stats["safety_violations"] == 0
             ref = EvidenceStore(evidence_root(_ADAPTER_ID)).add_json(payload, kind="realtime_local")
             ended = time.time()
             return TrialResult(
-                "", "wall_clock_control", TrialStatus.PASSED if passed else TrialStatus.FAILED,
+                "",
+                "wall_clock_control",
+                TrialStatus.PASSED if passed else TrialStatus.FAILED,
                 metrics=(
-                    MetricValue("wall_clock_sample_count", float(sample_count), "count", threshold=20.0),
+                    MetricValue(
+                        "wall_clock_sample_count",
+                        float(sample_count),
+                        "count",
+                        threshold=float(_SMOKE_MIN_SAMPLE_COUNT),
+                        tags=("smoke-test", "non-motion"),
+                    ),
                     MetricValue("wall_clock_jitter_p50", p50, "seconds", higher_is_better=False),
                     MetricValue("wall_clock_jitter_p95", p95, "seconds", higher_is_better=False),
                     MetricValue("wall_clock_jitter_p99", p99, "seconds", higher_is_better=False),
-                    MetricValue("wall_clock_overrun_rate", overrun_rate, "ratio", higher_is_better=False),
-                    MetricValue("control_cpu_seconds", cpu_seconds, "seconds", higher_is_better=False),
-                    MetricValue("gc_event_count", float(len(gc_events)), "count", higher_is_better=False),
+                    MetricValue(
+                        "wall_clock_overrun_rate", overrun_rate, "ratio", higher_is_better=False
+                    ),
+                    MetricValue(
+                        "control_cpu_seconds", cpu_seconds, "seconds", higher_is_better=False
+                    ),
+                    MetricValue(
+                        "gc_event_count", float(len(gc_events)), "count", higher_is_better=False
+                    ),
                 ),
-                evidence=(ref,), started_at=started, ended_at=ended,
-                duration_seconds=ended - started, adapter_id=_ADAPTER_ID,
-                adapter_version=_VERSION, seed=seed,
+                evidence=(ref,),
+                started_at=started,
+                ended_at=ended,
+                duration_seconds=ended - started,
+                adapter_id=_ADAPTER_ID,
+                adapter_version=_VERSION,
+                seed=seed,
                 error="" if passed else "insufficient wall-clock control samples",
             )
         except Exception as exc:
             ended = time.time()
             return TrialResult(
-                "", "wall_clock_control", TrialStatus.ERROR,
-                started_at=started, ended_at=ended, duration_seconds=ended - started,
-                adapter_id=_ADAPTER_ID, adapter_version=_VERSION, seed=seed,
-                error=str(exc), error_type=type(exc).__name__,
+                "",
+                "wall_clock_control",
+                TrialStatus.ERROR,
+                started_at=started,
+                ended_at=ended,
+                duration_seconds=ended - started,
+                adapter_id=_ADAPTER_ID,
+                adapter_version=_VERSION,
+                seed=seed,
+                error=str(exc),
+                error_type=type(exc).__name__,
             )
         finally:
             if gc_callback in gc.callbacks:

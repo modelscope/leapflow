@@ -5,6 +5,7 @@ This module is the single source of truth for paths under the LeapFlow data
 root. Runtime modules should depend on these immutable layout objects instead
 of constructing profile-relative paths locally.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -490,6 +491,11 @@ class ProfileLayout:
         return self.runtime_dir / "dashboard.json"
 
     @property
+    def benchmark_runs_dir(self) -> Path:
+        """Durable, run-isolated evidence root for benchmark executions."""
+        return self.root / "benchmarks" / "runs"
+
+    @property
     def audit_dir(self) -> Path:
         return self.root / "audit"
 
@@ -535,6 +541,7 @@ class ProfileLayout:
             self.plugins_dir,
             self.dsh_plugins_dir,
             self.plugin_staging_dir,
+            self.benchmark_runs_dir,
             self.audit_dir,
             self.history_dir,
             self.runtime_dir,
@@ -545,7 +552,9 @@ class ProfileLayout:
         self.approval.ensure()
         self.dashboard.ensure()
         self.cache.ensure()
-        _write_yaml_if_missing(self.manifest_path, ProfileManifest.default(self.profile_id).to_dict())
+        _write_yaml_if_missing(
+            self.manifest_path, ProfileManifest.default(self.profile_id).to_dict()
+        )
         for path in self.config_paths():
             _write_yaml_if_missing(path, _default_profile_config(path.name))
 
@@ -662,26 +671,77 @@ class PathLayout:
         normalized = str(expanded).replace("\\", "/").lower()
         name = expanded.name.lower()
         if "/secrets/" in normalized or name in {"vault.json", "vault.key"}:
-            return ManagedPathDescriptor(expanded, "secret_vault", _scope_from_path(normalized), "secrets", False, "critical" if name.endswith(".key") else "high")
-        if "/config/" in normalized or name in {"profile.yaml", "mcp_servers.json", "workspace.yaml"}:
-            category = "mcp_config" if name == "mcp_servers.json" else ("workspace_manifest" if name == "workspace.yaml" else "config")
-            return ManagedPathDescriptor(expanded, category, _scope_from_path(normalized), "config", True, "high")
+            return ManagedPathDescriptor(
+                expanded,
+                "secret_vault",
+                _scope_from_path(normalized),
+                "secrets",
+                False,
+                "critical" if name.endswith(".key") else "high",
+            )
+        if "/config/" in normalized or name in {
+            "profile.yaml",
+            "mcp_servers.json",
+            "workspace.yaml",
+        }:
+            category = (
+                "mcp_config"
+                if name == "mcp_servers.json"
+                else ("workspace_manifest" if name == "workspace.yaml" else "config")
+            )
+            return ManagedPathDescriptor(
+                expanded, category, _scope_from_path(normalized), "config", True, "high"
+            )
         if "/approval/" in normalized or name == "audit.jsonl":
-            return ManagedPathDescriptor(expanded, "approval_state", "profile", "approval", False, "high")
+            return ManagedPathDescriptor(
+                expanded, "approval_state", "profile", "approval", False, "high"
+            )
         if "/history/" in normalized:
             return ManagedPathDescriptor(expanded, "history", "profile", "tui", False, "high")
         if "/runtime/" in normalized:
-            return ManagedPathDescriptor(expanded, "runtime_state", "profile", "runtime", False, "high")
+            return ManagedPathDescriptor(
+                expanded, "runtime_state", "profile", "runtime", False, "high"
+            )
         if "/memory/" in normalized:
-            return ManagedPathDescriptor(expanded, "memory_store", "profile", "memory", False, "high")
+            return ManagedPathDescriptor(
+                expanded, "memory_store", "profile", "memory", False, "high"
+            )
         if "/cache/" in normalized:
-            sensitive = any(part in normalized for part in ("/sessions/", "/frames/", "/video/", "/vlm/", "/signals/", "/timeline/"))
-            return ManagedPathDescriptor(expanded, "cache_sensitive" if sensitive else "cache_profile", _scope_from_path(normalized), "cache", not sensitive, "high" if sensitive else "medium")
+            sensitive = any(
+                part in normalized
+                for part in (
+                    "/sessions/",
+                    "/frames/",
+                    "/video/",
+                    "/vlm/",
+                    "/signals/",
+                    "/timeline/",
+                )
+            )
+            return ManagedPathDescriptor(
+                expanded,
+                "cache_sensitive" if sensitive else "cache_profile",
+                _scope_from_path(normalized),
+                "cache",
+                not sensitive,
+                "high" if sensitive else "medium",
+            )
         if name.endswith(".duckdb") or name.endswith(".duckdb.wal"):
-            return ManagedPathDescriptor(expanded, "runtime_database", "profile", "storage", False, "critical")
-        return ManagedPathDescriptor(expanded, "leapflow_profile_data", _scope_from_path(normalized), "profile", False, "medium")
+            return ManagedPathDescriptor(
+                expanded, "runtime_database", "profile", "storage", False, "critical"
+            )
+        return ManagedPathDescriptor(
+            expanded,
+            "leapflow_profile_data",
+            _scope_from_path(normalized),
+            "profile",
+            False,
+            "medium",
+        )
 
-    def watched_config_paths(self, profile_id: str, workspace_root: Path | None = None) -> tuple[Path, ...]:
+    def watched_config_paths(
+        self, profile_id: str, workspace_root: Path | None = None
+    ) -> tuple[Path, ...]:
         profile_layout = self.profile(profile_id)
         paths: list[Path] = [
             self.user_config_path,

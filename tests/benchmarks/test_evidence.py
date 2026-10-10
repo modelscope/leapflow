@@ -7,8 +7,9 @@ import hashlib
 import json
 from pathlib import Path
 
-from benchmarks.evidence import EvidenceStore
+from benchmarks.evidence import EvidenceStore, evidence_root
 from benchmarks.models import EvidenceRef
+from benchmarks.runtime import BenchmarkRuntimeContext, runtime_context
 
 
 def _artifact(store: EvidenceStore, ref: EvidenceRef) -> Path:
@@ -16,6 +17,16 @@ def _artifact(store: EvidenceStore, ref: EvidenceRef) -> Path:
     assert not Path(ref.path).is_absolute()
     assert path.resolve().is_relative_to(store.root)
     return path
+
+
+def test_evidence_root_isolated_by_run_and_adapter(tmp_path: Path) -> None:
+    with runtime_context(
+        BenchmarkRuntimeContext(
+            run_id="run-123",
+            evidence_root=str(tmp_path / "runs"),
+        )
+    ):
+        assert evidence_root("adapter-a") == tmp_path / "runs" / "run-123" / "adapter-a"
 
 
 def test_add_jsonl_writes_valid_records_and_index_metadata(tmp_path: Path) -> None:

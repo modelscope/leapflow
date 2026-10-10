@@ -148,7 +148,9 @@ async def _run_with_retry(
         if result.status is TrialStatus.TIMEOUT and attempt < config.retry_count:
             logger.info(
                 "retrying %s (attempt %d/%d)",
-                scenario.scenario_id, attempt + 1, config.retry_count + 1,
+                scenario.scenario_id,
+                attempt + 1,
+                config.retry_count + 1,
             )
     assert last_result is not None  # at least one attempt always runs
     return last_result
@@ -176,12 +178,15 @@ async def _run_one_scenario(ctx: _RunContext, scenario: Scenario) -> TrialResult
         ctx.progress.skipped += 1
         ctx.progress.completed += 1
         result = TrialResult(
-            trial_id=trial_id, scenario_id=scenario.scenario_id,
-            status=TrialStatus.SKIPPED, benchmark_id=ctx.benchmark_id,
+            trial_id=trial_id,
+            scenario_id=scenario.scenario_id,
+            status=TrialStatus.SKIPPED,
+            benchmark_id=ctx.benchmark_id,
             benchmark_version=ctx.benchmark_version,
             adapter_id=ctx.adapter.adapter_id,
             adapter_version=ctx.adapter.adapter_version,
-            seed=ctx.config.seed, fingerprint=ctx.fingerprint,
+            seed=ctx.config.seed,
+            fingerprint=ctx.fingerprint,
         )
         if ctx.on_trial:
             ctx.on_trial(result)
@@ -190,17 +195,22 @@ async def _run_one_scenario(ctx: _RunContext, scenario: Scenario) -> TrialResult
     async with ctx.sem:
         if ctx.progress.aborted:
             return TrialResult(
-                trial_id=trial_id, scenario_id=scenario.scenario_id,
-                status=TrialStatus.SKIPPED, benchmark_id=ctx.benchmark_id,
+                trial_id=trial_id,
+                scenario_id=scenario.scenario_id,
+                status=TrialStatus.SKIPPED,
+                benchmark_id=ctx.benchmark_id,
                 benchmark_version=ctx.benchmark_version,
                 adapter_id=ctx.adapter.adapter_id,
                 adapter_version=ctx.adapter.adapter_version,
-                seed=ctx.config.seed, fingerprint=ctx.fingerprint,
+                seed=ctx.config.seed,
+                fingerprint=ctx.fingerprint,
                 error="run aborted (fail-fast)",
             )
         result = await _run_with_retry(ctx.adapter, scenario, ctx.config)
         result = replace(
-            result, trial_id=trial_id, benchmark_id=ctx.benchmark_id,
+            result,
+            trial_id=trial_id,
+            benchmark_id=ctx.benchmark_id,
             benchmark_version=ctx.benchmark_version,
             adapter_id=ctx.adapter.adapter_id,
             adapter_version=ctx.adapter.adapter_version,
@@ -248,7 +258,8 @@ async def run_benchmark(
         Optional callback invoked after each trial completes.
     """
     ctx = _RunContext(
-        adapter=adapter, config=config,
+        adapter=adapter,
+        config=config,
         fingerprint=EnvironmentFingerprint.capture(),
         benchmark_id=benchmark_id or adapter.adapter_id,
         benchmark_version=benchmark_version,
@@ -273,12 +284,19 @@ async def run_benchmark(
 
     run_ended = time.time()
     return BenchmarkResult(
-        benchmark_id=ctx.benchmark_id, version=benchmark_version,
-        adapter_id=adapter.adapter_id, adapter_version=adapter.adapter_version,
-        seed=config.seed, started_at=run_started, ended_at=run_ended,
-        duration_seconds=run_ended - run_started, fingerprint=ctx.fingerprint,
-        trials=tuple(results), aggregate_metrics=compute_standard_metrics(results),
-        config=config, availability=availability,
+        benchmark_id=ctx.benchmark_id,
+        version=benchmark_version,
+        adapter_id=adapter.adapter_id,
+        adapter_version=adapter.adapter_version,
+        seed=config.seed,
+        started_at=run_started,
+        ended_at=run_ended,
+        duration_seconds=run_ended - run_started,
+        fingerprint=ctx.fingerprint,
+        trials=tuple(results),
+        aggregate_metrics=compute_standard_metrics(results),
+        config=config,
+        availability=availability,
     )
 
 
@@ -301,13 +319,18 @@ def run_benchmark_sync(
 
     if loop is not None and loop.is_running():
         import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(
                 asyncio.run,
                 run_benchmark(
-                    adapter, scenarios, config,
-                    completed_ids=completed_ids, on_trial=on_trial,
-                    benchmark_id=benchmark_id, benchmark_version=benchmark_version,
+                    adapter,
+                    scenarios,
+                    config,
+                    completed_ids=completed_ids,
+                    on_trial=on_trial,
+                    benchmark_id=benchmark_id,
+                    benchmark_version=benchmark_version,
                     availability=availability,
                 ),
             )
@@ -315,9 +338,13 @@ def run_benchmark_sync(
     else:
         return asyncio.run(
             run_benchmark(
-                adapter, scenarios, config,
-                completed_ids=completed_ids, on_trial=on_trial,
-                benchmark_id=benchmark_id, benchmark_version=benchmark_version,
+                adapter,
+                scenarios,
+                config,
+                completed_ids=completed_ids,
+                on_trial=on_trial,
+                benchmark_id=benchmark_id,
+                benchmark_version=benchmark_version,
                 availability=availability,
             ),
         )
@@ -350,6 +377,8 @@ class BenchmarkRunner:
             live_llm_enabled=run_config.live_llm_enabled,
             require_live_llm=run_config.require_live_llm,
             hardware_enabled=run_config.hardware_enabled,
+            run_id=run_config.run_id,
+            evidence_root=run_config.evidence_root,
         )
         with runtime_context(authority):
             return await self._run_in_context(
@@ -380,7 +409,8 @@ class BenchmarkRunner:
         try:
             availability_timeout = float(manifest.timeouts.get("availability", 30.0))
             availability = await asyncio.wait_for(
-                adapter.availability(), timeout=availability_timeout,
+                adapter.availability(),
+                timeout=availability_timeout,
             )
         except asyncio.TimeoutError:
             availability = AvailabilityResult(

@@ -55,8 +55,11 @@ class TrialStatus(str, enum.Enum):
     def is_terminal(self) -> bool:
         """Return True for statuses that represent a completed trial."""
         return self in (
-            TrialStatus.PASSED, TrialStatus.FAILED, TrialStatus.ERROR,
-            TrialStatus.TIMEOUT, TrialStatus.UNAVAILABLE,
+            TrialStatus.PASSED,
+            TrialStatus.FAILED,
+            TrialStatus.ERROR,
+            TrialStatus.TIMEOUT,
+            TrialStatus.UNAVAILABLE,
         )
 
 
@@ -78,6 +81,12 @@ class GateStatus(str, enum.Enum):
 # ════════════════════════════════════════════════════════════════
 
 
+def _new_run_id() -> str:
+    """Return a path-safe identifier for one isolated benchmark invocation."""
+    timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return f"run-{timestamp}-{os.getpid():x}-{time.time_ns() & 0xFFFFFF:x}"
+
+
 @dataclass(frozen=True)
 class RunConfig:
     """Configuration governing a benchmark run."""
@@ -93,6 +102,8 @@ class RunConfig:
     live_llm_enabled: bool = False
     require_live_llm: bool = False
     hardware_enabled: bool = False
+    run_id: str = field(default_factory=_new_run_id)
+    evidence_root: str = ""
 
     def trial_id(self, benchmark_id: str, scenario_id: str, attempt: int = 0) -> str:
         """Compute a stable trial id independent of retry attempt.
@@ -118,6 +129,8 @@ class RunConfig:
             "live_llm_enabled": self.live_llm_enabled,
             "require_live_llm": self.require_live_llm,
             "hardware_enabled": self.hardware_enabled,
+            "run_id": self.run_id,
+            "evidence_root": self.evidence_root,
         }
 
     @classmethod
@@ -134,6 +147,8 @@ class RunConfig:
             live_llm_enabled=bool(data.get("live_llm_enabled", False)),
             require_live_llm=bool(data.get("require_live_llm", False)),
             hardware_enabled=bool(data.get("hardware_enabled", False)),
+            run_id=str(data.get("run_id") or _new_run_id()),
+            evidence_root=str(data.get("evidence_root", "")),
         )
 
 
@@ -319,7 +334,8 @@ class TrialResult:
             seed=int(data.get("seed", 0)),
             fingerprint=(
                 EnvironmentFingerprint.from_dict(data["fingerprint"])
-                if isinstance(data.get("fingerprint"), Mapping) else None
+                if isinstance(data.get("fingerprint"), Mapping)
+                else None
             ),
         )
 
@@ -344,21 +360,29 @@ class EnvironmentFingerprint:
         git_sha, git_branch, git_dirty = "", "", False
         try:
             git_sha = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True,
+                ["git", "rev-parse", "HEAD"],
+                stderr=subprocess.DEVNULL,
+                text=True,
                 timeout=2.0,
             ).strip()
             git_branch = subprocess.check_output(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                stderr=subprocess.DEVNULL, text=True, timeout=2.0,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2.0,
             ).strip()
             status = subprocess.check_output(
-                ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL, text=True,
+                ["git", "status", "--porcelain"],
+                stderr=subprocess.DEVNULL,
+                text=True,
                 timeout=2.0,
             ).strip()
             git_dirty = bool(status)
         except (
-            FileNotFoundError, subprocess.CalledProcessError,
-            subprocess.TimeoutExpired, OSError,
+            FileNotFoundError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
         ):
             pass
 
@@ -376,11 +400,19 @@ class EnvironmentFingerprint:
     @property
     def digest(self) -> str:
         """Return a stable SHA-256 digest of reproducibility fields."""
-        payload = "|".join((
-            self.hostname, self.os_name, self.os_version, self.python_version,
-            self.git_sha, self.git_branch, str(self.git_dirty), str(self.cpu_count),
-            repr(sorted(self.extra.items())),
-        ))
+        payload = "|".join(
+            (
+                self.hostname,
+                self.os_name,
+                self.os_version,
+                self.python_version,
+                self.git_sha,
+                self.git_branch,
+                str(self.git_dirty),
+                str(self.cpu_count),
+                repr(sorted(self.extra.items())),
+            )
+        )
         return hashlib.sha256(payload.encode()).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
@@ -477,8 +509,7 @@ class BenchmarkResult:
     @property
     def pass_rate(self) -> float:
         executed = sum(
-            1 for t in self.trials
-            if t.status not in (TrialStatus.SKIPPED, TrialStatus.UNAVAILABLE)
+            1 for t in self.trials if t.status not in (TrialStatus.SKIPPED, TrialStatus.UNAVAILABLE)
         )
         if executed == 0:
             return 0.0
@@ -535,7 +566,8 @@ class BenchmarkResult:
             duration_seconds=float(data.get("duration_seconds", 0.0)),
             fingerprint=(
                 EnvironmentFingerprint.from_dict(fingerprint_data)
-                if isinstance(fingerprint_data, Mapping) else EnvironmentFingerprint()
+                if isinstance(fingerprint_data, Mapping)
+                else EnvironmentFingerprint()
             ),
             trials=tuple(TrialResult.from_dict(item) for item in data.get("trials", ())),
             aggregate_metrics=tuple(
@@ -543,7 +575,8 @@ class BenchmarkResult:
             ),
             config=(
                 RunConfig.from_dict(config_data)
-                if isinstance(config_data, Mapping) else RunConfig()
+                if isinstance(config_data, Mapping)
+                else RunConfig()
             ),
             availability=availability,
         )

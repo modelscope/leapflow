@@ -7,6 +7,7 @@ tags:
   - native
   - realtime
   - wall-clock
+  - smoke-test
 required: true
 dependencies: []
 timeouts:
@@ -24,9 +25,10 @@ metrics:
   - gc_event_count
 gates:
   wall_clock_sample_count: 20.0
+note: "Non-motion simulated smoke test only. It does not qualify a device for physical motion; device-specific timing and overrun gates are required before motion approval."
 scenarios:
   - scenario_id: wall_clock_control
-    name: "Wall-clock local control loop timing"
-    tags: [native, realtime, tier3, wall-clock]
+    name: "Non-motion wall-clock local control smoke test"
+    tags: [native, realtime, tier3, wall-clock, smoke-test]
     timeout_seconds: 15.0
     required: true

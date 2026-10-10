@@ -12,7 +12,7 @@ timeouts:
 seeds: [42]
 metrics: []
 gates: {}
-note: "Requires an operator-approved benchmark.hardware_profiles.so100 entry with a non-motion preflight_command. Real motion remains separately approval-gated."
+note: "Requires an operator-approved zero_motion preflight profile that emits the structured JSON report required by this manifest. Real motion remains separately approval-gated."
 scenarios:
   - scenario_id: so100_preflight
     name: "SO-100 connection, e-stop, calibration, and fallback preflight"
@@ -22,3 +22,4 @@ scenarios:
     parameters:
       device_id: so100
       topology: single_usb
+      required_checks: [connection, identity, driver, read_only_transport, estop, sensor_health, calibration_state, interlocks]

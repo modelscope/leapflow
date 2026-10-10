@@ -24,12 +24,21 @@ from benchmarks.models import (
 
 # ── Frozen invariant ──────────────────────────────────────────────────
 
+
 def test_all_models_are_frozen():
     """Every domain model must be a frozen dataclass."""
     frozen_types = (
-        RunConfig, MetricValue, EvidenceRef, Scenario, TrialResult,
-        EnvironmentFingerprint, AvailabilityResult, BenchmarkResult,
-        GateResult, ManifestError, BenchmarkManifest,
+        RunConfig,
+        MetricValue,
+        EvidenceRef,
+        Scenario,
+        TrialResult,
+        EnvironmentFingerprint,
+        AvailabilityResult,
+        BenchmarkResult,
+        GateResult,
+        ManifestError,
+        BenchmarkManifest,
     )
     for cls in frozen_types:
         assert dataclasses.is_dataclass(cls), f"{cls.__name__} is not a dataclass"
@@ -47,6 +56,7 @@ def test_frozen_instances_are_immutable():
 
 
 # ── Stable trial IDs ─────────────────────────────────────────────────
+
 
 def test_trial_id_stability():
     cfg = RunConfig(seed=42)
@@ -69,6 +79,7 @@ def test_trial_id_changes_with_seed():
 
 # ── EnvironmentFingerprint ───────────────────────────────────────────
 
+
 def test_fingerprint_capture_never_raises():
     fp = EnvironmentFingerprint.capture()
     assert fp.python_version
@@ -90,6 +101,7 @@ def test_fingerprint_roundtrip():
 
 
 # ── MetricValue ──────────────────────────────────────────────────────
+
 
 def test_metric_meets_threshold_higher_is_better():
     m = MetricValue(name="accuracy", value=0.95, threshold=0.90)
@@ -120,6 +132,7 @@ def test_metric_roundtrip():
 
 # ── TrialStatus ──────────────────────────────────────────────────────
 
+
 def test_trial_status_success():
     assert TrialStatus.PASSED.is_success
     assert not TrialStatus.FAILED.is_success
@@ -134,19 +147,28 @@ def test_trial_status_counts_as_failure():
 
 
 def test_trial_status_terminal():
-    for s in (TrialStatus.PASSED, TrialStatus.FAILED, TrialStatus.ERROR,
-              TrialStatus.TIMEOUT, TrialStatus.UNAVAILABLE):
+    for s in (
+        TrialStatus.PASSED,
+        TrialStatus.FAILED,
+        TrialStatus.ERROR,
+        TrialStatus.TIMEOUT,
+        TrialStatus.UNAVAILABLE,
+    ):
         assert s.is_terminal
     assert not TrialStatus.SKIPPED.is_terminal
 
 
 # ── TrialResult roundtrip ────────────────────────────────────────────
 
+
 def test_trial_result_roundtrip():
     t = TrialResult(
-        trial_id="abc", scenario_id="s1", status=TrialStatus.PASSED,
+        trial_id="abc",
+        scenario_id="s1",
+        status=TrialStatus.PASSED,
         metrics=(MetricValue(name="x", value=1.0),),
-        seed=42, fingerprint=EnvironmentFingerprint(hostname="h"),
+        seed=42,
+        fingerprint=EnvironmentFingerprint(hostname="h"),
     )
     d = t.to_dict()
     t2 = TrialResult.from_dict(d)
@@ -156,6 +178,7 @@ def test_trial_result_roundtrip():
 
 
 # ── BenchmarkResult ──────────────────────────────────────────────────
+
 
 def test_benchmark_result_pass_rate():
     trials = (
@@ -181,14 +204,24 @@ def test_benchmark_result_roundtrip():
 
 # ── RunConfig roundtrip ──────────────────────────────────────────────
 
+
 def test_run_config_roundtrip():
-    cfg = RunConfig(seed=99, timeout_seconds=60.0, tags=("a", "b"))
+    cfg = RunConfig(
+        seed=99,
+        timeout_seconds=60.0,
+        tags=("a", "b"),
+        run_id="run-test",
+        evidence_root="/evidence",
+    )
     d = cfg.to_dict()
     cfg2 = RunConfig.from_dict(d)
     assert cfg2.seed == 99 and cfg2.tags == ("a", "b")
+    assert cfg2.run_id == "run-test"
+    assert cfg2.evidence_root == "/evidence"
 
 
 # ── GateStatus / GateResult ──────────────────────────────────────────
+
 
 def test_gate_status_values():
     assert GateStatus.READY.value == "ready"
@@ -203,6 +236,7 @@ def test_gate_result_to_dict():
 
 
 # ── ManifestError ─────────────────────────────────────────────────────
+
 
 def test_manifest_error_str():
     e = ManifestError(field="id", message="missing", path="test.yaml")
