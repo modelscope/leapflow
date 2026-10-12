@@ -3,7 +3,7 @@ name = "leapflow"
 dynamic = ["version"]
 description = "LeapFlow — Learning and Evolving from Actual Practice"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "LeapFlow Team" }]
 keywords = ["agent", "ai", "macos", "automation", "imitation-learning"]
@@ -12,6 +12,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -39,7 +40,14 @@ dependencies = [
     "pynput>=1.8.0",
     # LeapBoard web server. Part of the core surface (`leap board`), so it ships
     # with the base install rather than behind an extra.
-    "aiohttp>=3.9"
+    "aiohttp>=3.9",
+    # Python 3.10 backports of otherwise 3.11-only modules, used behind the
+    # conditional imports in domain/tool_pipeline.py and tools/repo_map.py.
+    # Declared explicitly rather than relied on transitively, for the same
+    # reason as httpx above; async-timeout 5.0 is the first release with the
+    # when()/reschedule() API that the tool execution deadline pauses.
+    "async-timeout>=5.0; python_version < '3.11'",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -68,8 +76,14 @@ web = ["trafilatura>=2.2"]
 # default install stays light. Install it with
 # `pip install 'leapflow[leapspace]'` or `uv sync --extra leapspace`. The
 # default `--all-extras` syncs deliberately exclude it (`--no-extra leapspace`,
-# see Makefile/CI/setup.sh); `make space-sync` opts back in.
-leapspace = ["pyqt6>=6.7", "cua-sandbox", "pydantic>=2"]
+# see Makefile/CI/setup.sh); `make space-sync` opts back in. cua-sandbox itself
+# supports Python 3.11–3.13 only, so it is marker-gated to that range; the rest
+# of the extra installs on every supported Python.
+leapspace = [
+    "pyqt6>=6.7",
+    "cua-sandbox; python_version >= '3.11' and python_version < '3.14'",
+    "pydantic>=2",
+]
 robot = [
     "torch>=2.0",
     "torchvision>=0.15",
@@ -80,9 +94,10 @@ robot = [
     "pyserial>=3.5",
     "Pillow>=10.0",
 ]
-robot-ros2 = [
-    "rclpy>=3.0; python_version>='3.11'",
-]
+# Intentionally no robot-ros2 extra: rclpy ships with the ROS 2 distribution
+# (apt or conda channel) and is not published on PyPI, so it cannot be a pip
+# dependency.  The ros2 hardware transport activates whenever rclpy is
+# importable; see src/leapflow/hardware/transports/ros2.py.
 benchmark = [
     "gymnasium>=0.29",
     "numpy>=1.24",
@@ -137,7 +152,7 @@ markers = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.ruff.lint]
 # Pinned explicitly so a ruff upgrade cannot silently change the enforced set.

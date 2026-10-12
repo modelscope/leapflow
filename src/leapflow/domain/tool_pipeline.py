@@ -16,11 +16,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable
+
+if sys.version_info >= (3, 11):
+    from asyncio import Timeout as _AsyncTimeout
+    from asyncio import timeout as _async_timeout
+else:  # Python 3.10 — backport declared in pyproject.toml.
+    from async_timeout import Timeout as _AsyncTimeout
+    from async_timeout import timeout as _async_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +39,10 @@ class _ToolExecutionDeadline:
     def __init__(self, loop: asyncio.AbstractEventLoop, timeout_s: float) -> None:
         self._loop = loop
         self._remaining_s = timeout_s
-        self._scope: asyncio.Timeout | None = None
+        self._scope: _AsyncTimeout | None = None
         self._pause_depth = 0
 
-    def bind(self, scope: asyncio.Timeout) -> None:
+    def bind(self, scope: _AsyncTimeout) -> None:
         """Bind the active ``asyncio.timeout`` scope to this deadline."""
         self._scope = scope
 
@@ -88,7 +96,7 @@ async def run_tool_with_timeout(
     controller = _ToolExecutionDeadline(asyncio.get_running_loop(), timeout_s)
     token = _current_tool_execution_deadline.set(controller)
     try:
-        async with asyncio.timeout(timeout_s) as scope:
+        async with _async_timeout(timeout_s) as scope:
             controller.bind(scope)
             return await awaitable
     finally:
