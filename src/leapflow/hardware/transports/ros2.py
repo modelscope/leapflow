@@ -6,10 +6,12 @@ six-method HardwareTransport contract.  Topic subscriptions become
 read channels, topic publishers and service clients become write
 channels, and action clients become long-running write operations.
 
-rclpy is an optional dependency.  When unavailable, ``open()`` returns
+rclpy is an optional dependency: it ships with the ROS 2 distribution (apt
+or conda channel) and is not published on PyPI, so it is not part of any pip
+extra.  When unavailable, ``open()`` returns
 ``TransportStatus(connected=False)`` and no other method is callable.
 The transport is discovered through the standard entry-point mechanism
-and is available when ``pip install leapflow[robot-ros2]`` is installed.
+and activates whenever ``rclpy`` is importable.
 
 Channel-to-ROS2-primitive mapping is declared in the YAML config produced
 by ``control_binding_resolver._resolve_ros2``::
@@ -123,7 +125,7 @@ class ROS2Transport:
             return TransportStatus(
                 connected=False,
                 halt_supported=False,
-                detail="rclpy is not installed; install with: pip install leapflow[robot-ros2]",
+                detail="rclpy is not installed; install it from your ROS 2 distribution",
             )
 
         # Init rclpy (idempotent -- rclpy.ok() checks first).
@@ -660,7 +662,7 @@ def _require_rclpy() -> Any:
         return rclpy
     except ImportError as exc:
         raise TransportError(
-            "rclpy is not installed; install with: pip install leapflow[robot-ros2]",
+            "rclpy is not installed; install it from your ROS 2 distribution",
             failure_code="rclpy_not_installed",
         ) from exc
 

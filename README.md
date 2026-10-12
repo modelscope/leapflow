@@ -255,7 +255,7 @@ Then install it separately (`pip install 'scrapling[ai]'` followed by `scrapling
 
 | Component | Version | Purpose |
 |-----------|---------|----------|
-| Python | ≥ 3.11 | Runtime (3.11–3.14 supported) |
+| Python | ≥ 3.10 | Runtime (3.10–3.14 supported) |
 | [uv](https://github.com/astral-sh/uv) | latest | Source installs and development only |
 | macOS | 14.0+ (Sonoma) | Required for native perception (execution backend) |
 | [cua-driver](https://github.com/trycua/cua) | latest | Default execution backend — screen capture, input injection, accessibility |
