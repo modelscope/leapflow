@@ -1,12 +1,11 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""LHP v1 wire protocol: constants, frame codec, and the error taxonomy.
+"""LHP wire protocol: versions, frame codec, and the error taxonomy.
 
-The frozen specification lives in ``temp/devices/plan/02-lhp-wire-protocol-v1.md``;
-this module is its executable half. LHP is a *hardware-domain* protocol, not a
-general-purpose RPC: it carries exactly the six-method device semantics
-(``open``/``close`` are connection lifecycle, not wire methods) plus batch
-variants. The control plane is JSON Lines; the streaming plane (subscriptions,
-binary frames) is reserved for a later version and must not claim fields here.
+The frozen v1 specification lives in ``temp/devices/plan/02-lhp-wire-protocol-v1.md``.
+Version 2 is an additive, capability-negotiated extension for bounded media frame
+requests and explicit remote capture release. LHP remains a *hardware-domain*
+protocol rather than a general-purpose RPC: scalar and write semantics are unchanged,
+and frames use request/response JSON Lines instead of introducing an unbounded stream.
 
 Error semantics are the heart of the protocol. An error response means
 "could not attempt" -- the command provably never reached a device. Anything
@@ -22,14 +21,24 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
-LHP_PROTOCOL_VERSION = 1
-"""Bump on any wire-incompatible change; both sides carry it in ``hello``."""
+LHP_PROTOCOL_VERSION = 2
+"""Newest protocol version offered by clients and nodes."""
+
+LHP_SUPPORTED_VERSIONS: tuple[int, ...] = (2, 1)
+"""Supported versions in preference order; clients fall back only on mismatch."""
 
 LHP_DEFAULT_PORT = 8767
 """Default TCP port for a node listener (8765 is reserved by Foxglove on the bench)."""
 
 MAX_FRAME_BYTES = 1024 * 1024
 """One JSON line may not exceed 1 MiB; an over-long frame closes the connection."""
+
+MAX_FRAME_DATA_BYTES = 700 * 1024
+"""Maximum encoded image bytes before base64, leaving safe JSON-envelope headroom."""
+
+MAX_FRAME_WIDTH = 4096
+MAX_FRAME_RATE_HZ = 60.0
+SAFE_FRAME_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 
 _DEVICE_ID_CHARSET = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
 
@@ -56,6 +65,8 @@ ERR_TRANSPORT_ERROR = "transport_error"
 ERR_INTERNAL_ERROR = "internal_error"
 ERR_TIMEOUT = "timeout"
 ERR_CONNECTION_CLOSED = "connection_closed"
+ERR_UNSUPPORTED_CAPABILITY = "unsupported_capability"
+ERR_FRAME_TOO_LARGE = "frame_too_large"
 
 WRITE_EFFECT_UNKNOWN_CODES = frozenset({ERR_INTERNAL_ERROR, ERR_TIMEOUT, ERR_CONNECTION_CLOSED})
 """Error codes after which a *write* may have reached the device.
@@ -72,8 +83,7 @@ FAILURE_SAFETY_DENIED = "safety_policy_denied"
 FAILURE_NOT_WRITABLE = "not_writable"
 FAILURE_BATCH_ABORTED = "batch_aborted"
 
-LHP_METHODS: tuple[str, ...] = (
-    "hello",
+LHP_V1_CAPABILITIES: tuple[str, ...] = (
     "list",
     "read",
     "read_batch",
@@ -83,8 +93,20 @@ LHP_METHODS: tuple[str, ...] = (
     "halt",
 )
 
-LHP_CAPABILITIES: tuple[str, ...] = tuple(m for m in LHP_METHODS if m != "hello")
-"""Capability set advertised in ``hello``; adding a method updates this tuple."""
+LHP_V2_CAPABILITIES: tuple[str, ...] = (*LHP_V1_CAPABILITIES, "read_frame", "release_frame")
+
+LHP_METHODS: tuple[str, ...] = ("hello", *LHP_V2_CAPABILITIES)
+LHP_CAPABILITIES: tuple[str, ...] = LHP_V2_CAPABILITIES
+"""Capabilities of the newest protocol; hello advertises the negotiated version's set."""
+
+
+def capabilities_for_version(version: int) -> tuple[str, ...]:
+    """Return the method capabilities available in a negotiated protocol version."""
+    if version == 1:
+        return LHP_V1_CAPABILITIES
+    if version == 2:
+        return LHP_V2_CAPABILITIES
+    return ()
 
 
 class LhpProtocolError(Exception):
@@ -174,6 +196,7 @@ def response_error(response: Mapping[str, Any]) -> tuple[str, str] | None:
 __all__ = [
     "ERR_BAD_REQUEST",
     "ERR_CONNECTION_CLOSED",
+    "ERR_FRAME_TOO_LARGE",
     "ERR_INTERNAL_ERROR",
     "ERR_PROTOCOL_MISMATCH",
     "ERR_TIMEOUT",
@@ -181,6 +204,7 @@ __all__ = [
     "ERR_UNAUTHORIZED",
     "ERR_UNKNOWN_CHANNEL",
     "ERR_UNKNOWN_DEVICE",
+    "ERR_UNSUPPORTED_CAPABILITY",
     "FAILURE_BATCH_ABORTED",
     "FAILURE_NOT_WRITABLE",
     "FAILURE_SAFETY_DENIED",
@@ -188,10 +212,18 @@ __all__ = [
     "LHP_DEFAULT_PORT",
     "LHP_METHODS",
     "LHP_PROTOCOL_VERSION",
+    "LHP_SUPPORTED_VERSIONS",
+    "LHP_V1_CAPABILITIES",
+    "LHP_V2_CAPABILITIES",
     "MAX_FRAME_BYTES",
+    "MAX_FRAME_DATA_BYTES",
+    "MAX_FRAME_RATE_HZ",
+    "MAX_FRAME_WIDTH",
+    "SAFE_FRAME_MEDIA_TYPES",
     "WRITE_EFFECT_UNKNOWN_CODES",
     "LhpProtocolError",
     "LhpRemoteError",
+    "capabilities_for_version",
     "decode_frame",
     "encode_frame",
     "error_response",

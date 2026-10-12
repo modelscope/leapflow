@@ -275,11 +275,10 @@ class HardwareContextPlugin:
     def _init_fleet_manager(self) -> None:
         """Create FleetManager when fleet nodes are configured.
 
-        Node configuration arrives through ``LEAPFLOW_FLEET_NODES`` (JSON
-        array); the Settings-based double-track, failure backoff and
-        re-registration lifecycle are P2 -- P1 keeps the env-first contract.
-        When no nodes are configured, FleetManager is not created and no
-        fleet tools appear in the tool index.
+        Node configuration arrives through ``hardware_fleet_nodes`` in Settings
+        (with ``LEAPFLOW_FLEET_NODES`` retained as a compatibility fallback).
+        When no nodes are configured, FleetManager is not created and no fleet
+        tools appear in the tool index.
         """
         if self._fleet_manager is not None:
             return
@@ -287,9 +286,9 @@ class HardwareContextPlugin:
             return
 
         from leapflow.hardware.fleet import FleetManager
-        from leapflow.hardware.fleet_config import configured_nodes_from_env
+        from leapflow.hardware.fleet_config import configured_nodes_from_settings
 
-        nodes = configured_nodes_from_env()
+        nodes = configured_nodes_from_settings(self._registry.settings.fleet_nodes)
         if not nodes:
             return
 

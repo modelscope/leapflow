@@ -463,13 +463,14 @@ class HostMetrics:
         if not _HAS_PSUTIL or getattr(psutil, "sensors_temperatures", None) is None:
             return []
         readings = psutil.sensors_temperatures() or {}
+        trips = _sysfs_critical_trips()
         probes: list[HostProbe] = []
         for group in sorted(readings):
             for index, entry in enumerate(readings[group]):
                 label = _slug(getattr(entry, "label", "") or f"{group}_{index}")
                 # The vendor's own critical threshold is the only defensible upper
                 # bound; inventing one would make every breach event a guess.
-                critical = getattr(entry, "critical", None)
+                critical = _critical_threshold(entry, trips.get(group, ()))
                 probes.append(
                     HostProbe(
                         channel_id=f"thermal.{_slug(group)}.{label}.celsius",
@@ -478,7 +479,7 @@ class HostMetrics:
                         reader=_thermal_reader(group, index),
                         description=f"{group} sensor {label}.",
                         min_value=0.0,
-                        max_value=float(critical) if critical else None,
+                        max_value=critical,
                         interval_multiplier=2,
                     )
                 )
@@ -486,6 +487,64 @@ class HostMetrics:
 
 
 # ── Module helpers ──
+
+
+_THERMAL_ROOT = "/sys/class/thermal"
+
+
+def _sysfs_critical_trips(root: str = _THERMAL_ROOT) -> dict[str, tuple[float, ...]]:
+    """Return each Linux thermal zone type's ``critical`` trip points, in degC.
+
+    Read here rather than taken from psutil: its thermal-zone fallback (used on
+    boards without hwmon temperature inputs, e.g. Jetson) rescales the critical
+    trip once per trip point it visits *after* it, in set order -- so the same board
+    reports 104.5, 0.1045 or 0.0001045 depending on the process, and every sample
+    then "exceeds" the declared range.
+    """
+    trips: dict[str, list[float]] = {}
+    try:
+        zones = sorted(entry for entry in os.listdir(root) if entry.startswith("thermal_zone"))
+    except OSError:
+        return {}
+    for zone in zones:
+        base = os.path.join(root, zone)
+        try:
+            with open(os.path.join(base, "type"), encoding="ascii") as handle:
+                zone_type = handle.read().strip()
+            names = sorted(name for name in os.listdir(base) if name.endswith("_type") and name.startswith("trip_point_"))
+        except OSError:
+            continue
+        for name in names:
+            try:
+                with open(os.path.join(base, name), encoding="ascii") as handle:
+                    if handle.read().strip() != "critical":
+                        continue
+                with open(os.path.join(base, name.removesuffix("_type") + "_temp"), encoding="ascii") as handle:
+                    trips.setdefault(zone_type, []).append(int(handle.read().strip()) / 1000.0)
+                break
+            except (OSError, ValueError):
+                continue
+    return {zone_type: tuple(values) for zone_type, values in trips.items()}
+
+
+def _critical_threshold(entry: Any, zone_trips: tuple[float, ...]) -> float | None:
+    """Return a trustworthy critical temperature for one psutil entry, or None.
+
+    A zone type with one unambiguous sysfs trip wins. Otherwise psutil's value is
+    kept only if it is above the current reading: a critical limit the sensor is
+    already past is a unit error, and declaring it would turn every sample into a
+    false breach. No bound is better than a wrong one.
+    """
+    if len(set(zone_trips)) == 1 and zone_trips[0] > 0:
+        return zone_trips[0]
+    critical = getattr(entry, "critical", None)
+    current = getattr(entry, "current", None)
+    if not critical:
+        return None
+    if current is not None and float(critical) <= float(current):
+        logger.debug("host metrics: ignoring implausible critical %.6g <= current %.6g", critical, current)
+        return None
+    return float(critical)
 
 
 def _disk_reader(mount: str, field_name: str) -> Callable[[], Any]:

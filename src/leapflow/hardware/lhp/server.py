@@ -33,8 +33,13 @@ typed error it would have seen locally.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import hmac
+import inspect
+import json
 import logging
+import math
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,20 +48,26 @@ from typing import Any, Mapping, Sequence
 from leapflow.hardware.context import HardwareContext
 from leapflow.hardware.lhp.protocol import (
     ERR_BAD_REQUEST,
+    ERR_FRAME_TOO_LARGE,
     ERR_INTERNAL_ERROR,
     ERR_PROTOCOL_MISMATCH,
     ERR_TRANSPORT_ERROR,
     ERR_UNAUTHORIZED,
     ERR_UNKNOWN_CHANNEL,
     ERR_UNKNOWN_DEVICE,
+    ERR_UNSUPPORTED_CAPABILITY,
     FAILURE_BATCH_ABORTED,
     FAILURE_NOT_WRITABLE,
     FAILURE_SAFETY_DENIED,
-    LHP_CAPABILITIES,
     LHP_DEFAULT_PORT,
-    LHP_PROTOCOL_VERSION,
+    LHP_SUPPORTED_VERSIONS,
     MAX_FRAME_BYTES,
+    MAX_FRAME_DATA_BYTES,
+    MAX_FRAME_RATE_HZ,
+    MAX_FRAME_WIDTH,
+    SAFE_FRAME_MEDIA_TYPES,
     LhpProtocolError,
+    capabilities_for_version,
     decode_frame,
     encode_frame,
     error_response,
@@ -68,6 +79,7 @@ from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_PARTIAL,
     BatchTransport,
+    FrameTransport,
     TransportError,
     TransportStatus,
     WriteOutcome,
@@ -85,7 +97,7 @@ class _ConnectionState:
 
 
 class LhpNodeServer:
-    """Export one registry's devices over the LHP v1 protocol."""
+    """Export one registry's devices over the newest mutually supported LHP version."""
 
     def __init__(
         self,
@@ -115,6 +127,8 @@ class LhpNodeServer:
             "list": self._handle_list,
             "read": self._handle_read,
             "read_batch": self._handle_read_batch,
+            "read_frame": self._handle_read_frame,
+            "release_frame": self._handle_release_frame,
             "write": self._handle_write,
             "write_batch": self._handle_write_batch,
             "probe": self._handle_probe,
@@ -170,9 +184,10 @@ class LhpNodeServer:
 
     async def _handle_hello(self, params: Mapping[str, Any], *, via: str) -> dict[str, Any]:
         protocol = params.get("protocol")
-        if protocol != LHP_PROTOCOL_VERSION:
+        if protocol not in LHP_SUPPORTED_VERSIONS:
             raise LhpProtocolError(
-                f"protocol mismatch: client speaks {protocol!r}, node speaks {LHP_PROTOCOL_VERSION}",
+                f"protocol mismatch: client speaks {protocol!r}, node supports "
+                f"{LHP_SUPPORTED_VERSIONS!r}",
                 code=ERR_PROTOCOL_MISMATCH,
             )
         if via != "direct" and self._token:
@@ -181,10 +196,11 @@ class LhpNodeServer:
                 raise LhpProtocolError("invalid or missing token", code=ERR_UNAUTHORIZED)
         contexts = self._exported_contexts()
         return {
-            "protocol": LHP_PROTOCOL_VERSION,
+            "protocol": protocol,
             "node_id": self._node_id,
             "device_count": len(contexts),
-            "capabilities": list(LHP_CAPABILITIES),
+            "declarations": _declarations_digest(contexts),
+            "capabilities": list(capabilities_for_version(protocol)),
         }
 
     async def _handle_list(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -240,6 +256,79 @@ class LhpNodeServer:
             "readings": [reading.to_dict() for reading in readings],
             "observed_at": float(getattr(batch, "observed_at", 0.0) or 0.0),
         }
+
+    async def _handle_read_frame(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """Return one bounded encoded frame over the negotiated v2 control plane."""
+        device_id = _require_str(params, "device_id")
+        channel_id = _require_str(params, "channel_id")
+        _, channel = self._resolve_channel(device_id, channel_id)
+        if not channel.is_readable or not bool(getattr(channel, "is_media", False)):
+            raise LhpProtocolError(
+                f"channel {channel_id!r} on {device_id!r} is not a readable frame channel",
+                code=ERR_UNKNOWN_CHANNEL,
+            )
+        max_width = _optional_int(params, "max_width", upper=MAX_FRAME_WIDTH)
+        quality = _optional_int(params, "quality", upper=100)
+        fps = _optional_float(params, "fps", upper=MAX_FRAME_RATE_HZ)
+        async with self._registry.device_io(device_id):
+            transport = await self._registry.transport(device_id)
+            if not isinstance(transport, FrameTransport):
+                raise LhpProtocolError(
+                    f"transport for {device_id!r} cannot produce frames",
+                    code=ERR_UNSUPPORTED_CAPABILITY,
+                )
+            frame_kwargs: dict[str, Any] = {
+                "max_width": max_width,
+                "quality": quality,
+            }
+            # ``fps`` postdates the original FrameTransport side protocol. Preserve
+            # structural compatibility with third-party transports while keeping a
+            # TypeError raised inside a driver visible as a real internal defect.
+            if _accepts_keyword(transport.read_frame, "fps"):
+                frame_kwargs["fps"] = fps
+            frame = await transport.read_frame(channel_id, **frame_kwargs)
+        _verify_reading_identity(frame, device_id, channel_id)
+        data = getattr(frame, "data", None)
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            raise LhpProtocolError("frame transport returned no encoded bytes", code=ERR_INTERNAL_ERROR)
+        if len(data) > MAX_FRAME_DATA_BYTES:
+            raise LhpProtocolError(
+                f"encoded frame is {len(data)} bytes; limit is {MAX_FRAME_DATA_BYTES}",
+                code=ERR_FRAME_TOO_LARGE,
+            )
+        media_type = str(getattr(frame, "media_type", "") or "")
+        if media_type not in SAFE_FRAME_MEDIA_TYPES:
+            raise LhpProtocolError(
+                f"frame media type {media_type!r} is not supported",
+                code=ERR_UNSUPPORTED_CAPABILITY,
+            )
+        width = int(getattr(frame, "width", 0) or 0)
+        height = int(getattr(frame, "height", 0) or 0)
+        if width < 0 or height < 0 or width > MAX_FRAME_WIDTH or height > MAX_FRAME_WIDTH:
+            raise LhpProtocolError("frame dimensions are outside protocol bounds", code=ERR_INTERNAL_ERROR)
+        payload = frame.to_metadata()
+        payload["data_b64"] = base64.b64encode(bytes(data)).decode("ascii")
+        return payload
+
+    async def _handle_release_frame(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """Release node-local capture when the host's last preview lease closes."""
+        device_id = _require_str(params, "device_id")
+        channel_id = _require_str(params, "channel_id")
+        _, channel = self._resolve_channel(device_id, channel_id)
+        if not bool(getattr(channel, "is_media", False)):
+            raise LhpProtocolError(
+                f"channel {channel_id!r} on {device_id!r} is not a frame channel",
+                code=ERR_UNKNOWN_CHANNEL,
+            )
+        drop_transport = getattr(self._registry, "drop_transport", None)
+        if not callable(drop_transport):
+            raise LhpProtocolError(
+                "node registry cannot release frame transports",
+                code=ERR_UNSUPPORTED_CAPABILITY,
+            )
+        async with self._registry.device_io(device_id):
+            await drop_transport(device_id)
+        return {"device_id": device_id, "channel_id": channel_id, "released": True}
 
     async def _handle_write(self, params: Mapping[str, Any]) -> dict[str, Any]:
         device_id = _require_str(params, "device_id")
@@ -525,6 +614,20 @@ class LhpNodeServer:
             await _send_frame(writer, write_lock, response)
 
 
+def _declarations_digest(contexts: Sequence[HardwareContext]) -> str:
+    """Fingerprint the exported declaration set, so a host can see it change.
+
+    Carried in ``hello`` because a heartbeat is the only conversation a host keeps
+    with an idle node. A node restarted inside one heartbeat interval never looks
+    offline, so liveness alone cannot reveal that it now declares a corrected
+    envelope or a camera plugged in since. Hashing the wire form, not the full
+    context, keeps node-private bindings out of the fingerprint too.
+    """
+    wire = [_wire_context(context) for context in contexts]
+    encoded = json.dumps(wire, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
 def _wire_context(context: HardwareContext) -> dict[str, Any]:
     """Serialize a declaration for the wire without its node-private binding.
 
@@ -544,11 +647,40 @@ def _wire_context(context: HardwareContext) -> dict[str, Any]:
     return payload
 
 
+def _accepts_keyword(callable_: Any, name: str) -> bool:
+    """Return whether a frame callable accepts an optional keyword."""
+    try:
+        parameters = inspect.signature(callable_).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def _require_str(params: Mapping[str, Any], key: str) -> str:
     value = params.get(key)
     if not isinstance(value, str) or not value:
         raise LhpProtocolError(f"{key!r} must be a non-empty string")
     return value
+
+
+def _optional_int(params: Mapping[str, Any], key: str, *, upper: int) -> int:
+    value = params.get(key, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > upper:
+        raise LhpProtocolError(f"{key!r} must be an integer from 0 through {upper}")
+    return value
+
+
+def _optional_float(params: Mapping[str, Any], key: str, *, upper: float) -> float:
+    value = params.get(key, 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise LhpProtocolError(f"{key!r} must be a number from 0 through {upper:g}")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0 or numeric > upper:
+        raise LhpProtocolError(f"{key!r} must be a number from 0 through {upper:g}")
+    return numeric
 
 
 def _require_channel_ids(params: Mapping[str, Any]) -> list[str]:

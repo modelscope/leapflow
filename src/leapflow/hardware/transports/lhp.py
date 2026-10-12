@@ -30,7 +30,10 @@ concurrency applies end to end.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
+import math
 import time
 from typing import Any, Mapping
 
@@ -41,6 +44,11 @@ from leapflow.hardware.lhp.client import (
     SocketLhpClient,
 )
 from leapflow.hardware.lhp.protocol import (
+    ERR_UNSUPPORTED_CAPABILITY,
+    MAX_FRAME_DATA_BYTES,
+    MAX_FRAME_RATE_HZ,
+    MAX_FRAME_WIDTH,
+    SAFE_FRAME_MEDIA_TYPES,
     WRITE_EFFECT_UNKNOWN_CODES,
     LhpRemoteError,
 )
@@ -48,6 +56,7 @@ from leapflow.hardware.transport import (
     SIDE_EFFECT_UNKNOWN,
     BatchReading,
     BatchWriteOutcome,
+    FrameReading,
     Reading,
     TransportError,
     TransportStatus,
@@ -73,6 +82,8 @@ class LhpTransport:
         self._client: DirectLhpClient | SocketLhpClient | None = None
         self._context: HardwareContext | None = None
         self._connected = False
+        self._capabilities: frozenset[str] = frozenset()
+        self._frame_channels: set[str] = set()
 
     # ── Lifecycle ──
 
@@ -110,17 +121,43 @@ class LhpTransport:
                 f"LHP node identity mismatch: expected {self._expected_node_id!r}, got {node_id!r}",
                 failure_code="lhp_node_mismatch",
             )
+        raw_capabilities = hello.get("capabilities", ()) if isinstance(hello, Mapping) else ()
+        self._capabilities = frozenset(
+            str(item) for item in raw_capabilities if isinstance(item, str) and item
+        )
         self._client = client
         self._connected = True
         return TransportStatus(
             connected=True,
             halt_supported=bool(context.halt_supported),
             detail=f"lhp node {node_id or '?'}",
+            metadata={
+                "protocol": hello.get("protocol"),
+                "capabilities": sorted(self._capabilities),
+            },
         )
 
     async def close(self) -> TransportStatus:
-        """Release the connection. Must never raise."""
-        client, self._client = self._client, None
+        """Release remote frame claims, then the connection. Must never raise."""
+        client = self._client
+        if client is not None and self._connected and "release_frame" in self._capabilities:
+            for channel_id in tuple(self._frame_channels):
+                try:
+                    await client.request(
+                        "release_frame",
+                        {"device_id": self._remote_device_id, "channel_id": channel_id},
+                    )
+                except Exception as exc:  # noqa: BLE001 - teardown must not propagate
+                    logger.warning(
+                        "LHP remote frame release failed for %r/%r: %s",
+                        self._remote_device_id,
+                        channel_id,
+                        exc,
+                        exc_info=True,
+                    )
+        self._frame_channels.clear()
+        self._capabilities = frozenset()
+        self._client = None
         self._connected = False
         if client is not None:
             try:
@@ -144,6 +181,40 @@ class LhpTransport:
                 "LHP read returned a malformed result", failure_code="lhp_malformed_result"
             )
         return self._localize_reading(result, channel_id)
+
+    async def read_frame(
+        self, channel_id: str, *, max_width: int = 0, quality: int = 0, fps: float = 0.0
+    ) -> FrameReading:
+        """Fetch one bounded frame while preserving host-side identity and timebase."""
+        client = self._require_client()
+        required = {"read_frame", "release_frame"}
+        if not required.issubset(self._capabilities):
+            raise TransportError(
+                "LHP node does not advertise bounded frame read and release capabilities",
+                failure_code=ERR_UNSUPPORTED_CAPABILITY,
+            )
+        if max_width < 0 or max_width > MAX_FRAME_WIDTH:
+            raise TransportError("frame width is outside protocol bounds", failure_code="bad_request")
+        if quality < 0 or quality > 100:
+            raise TransportError("frame quality is outside protocol bounds", failure_code="bad_request")
+        if not math.isfinite(float(fps)) or fps < 0 or fps > MAX_FRAME_RATE_HZ:
+            raise TransportError("frame rate is outside protocol bounds", failure_code="bad_request")
+        try:
+            result = await client.request(
+                "read_frame",
+                {
+                    "device_id": self._remote_device_id,
+                    "channel_id": channel_id,
+                    "max_width": int(max_width),
+                    "quality": int(quality),
+                    "fps": float(fps),
+                },
+            )
+        except LhpRemoteError as exc:
+            raise TransportError(str(exc) or exc.code, failure_code=exc.code) from exc
+        frame = self._frame_from_payload(result, channel_id)
+        self._frame_channels.add(channel_id)
+        return frame
 
     async def write(self, channel_id: str, value: Any) -> WriteOutcome:
         client = self._require_client()
@@ -354,6 +425,62 @@ class LhpTransport:
             quality=str(payload.get("quality") or Quality.OK.value),
         )
 
+    def _frame_from_payload(self, payload: Any, channel_id: str) -> FrameReading:
+        if not isinstance(payload, Mapping):
+            raise TransportError(
+                "LHP read_frame returned a malformed result", failure_code="lhp_malformed_result"
+            )
+        wire_device = str(payload.get("device_id") or "")
+        wire_channel = str(payload.get("channel_id") or "")
+        if wire_device != self._remote_device_id or wire_channel != channel_id:
+            raise TransportError(
+                "LHP node returned a frame for a different device or channel",
+                failure_code="lhp_result_mismatch",
+            )
+        encoded = payload.get("data_b64")
+        if not isinstance(encoded, str) or not encoded:
+            raise TransportError("LHP frame has no payload", failure_code="lhp_malformed_result")
+        try:
+            data = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+            raise TransportError(
+                "LHP frame payload is not valid base64", failure_code="lhp_malformed_result"
+            ) from exc
+        if not data or len(data) > MAX_FRAME_DATA_BYTES:
+            raise TransportError(
+                "LHP frame payload is empty or exceeds the protocol limit",
+                failure_code="lhp_malformed_result",
+            )
+        size_bytes = payload.get("size_bytes")
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes != len(data):
+            raise TransportError(
+                "LHP frame size metadata does not match its payload",
+                failure_code="lhp_result_mismatch",
+            )
+        media_type = str(payload.get("media_type") or "")
+        if media_type not in SAFE_FRAME_MEDIA_TYPES:
+            raise TransportError(
+                f"LHP frame media type {media_type!r} is not supported",
+                failure_code=ERR_UNSUPPORTED_CAPABILITY,
+            )
+        width = _bounded_nonnegative_int(payload.get("width"), MAX_FRAME_WIDTH, "width")
+        height = _bounded_nonnegative_int(payload.get("height"), MAX_FRAME_WIDTH, "height")
+        sequence = _bounded_nonnegative_int(payload.get("sequence"), 2**63 - 1, "sequence")
+        observed = _as_positive_float(payload.get("observed_at"))
+        return FrameReading(
+            device_id=self._local_device_id(),
+            channel_id=channel_id,
+            data=data,
+            media_type=media_type,
+            width=width,
+            height=height,
+            observed_at=observed if observed > 0 else time.time(),
+            monotonic_at=time.monotonic(),
+            sequence=sequence,
+            quality=str(payload.get("quality") or Quality.OK.value),
+            metadata=_frame_metadata(payload.get("metadata")),
+        )
+
     def _outcome_from_payload(self, payload: Mapping[str, Any]) -> WriteOutcome:
         raw_readback = payload.get("readback")
         readback: Reading | None = None
@@ -370,6 +497,24 @@ class LhpTransport:
             failure_code=str(payload.get("failure_code") or ""),
             preview=bool(payload.get("preview", False)),
         )
+
+
+def _frame_metadata(value: Any) -> Mapping[str, Any]:
+    """Accept only JSON-object metadata returned by a remote frame producer."""
+    if not isinstance(value, Mapping):
+        return {}
+    # Frame metadata is diagnostic/interpretive only. A shallow copy prevents a
+    # remote response object from retaining mutable references in host state.
+    return dict(value)
+
+
+def _bounded_nonnegative_int(value: Any, upper: int, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > upper:
+        raise TransportError(
+            f"LHP frame {label} is outside protocol bounds",
+            failure_code="lhp_malformed_result",
+        )
+    return value
 
 
 def _as_positive_float(value: Any) -> float:

@@ -129,7 +129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="python -m leapflow.hardware.lhp",
         description=(
             "Serve this machine's hardware devices as an LHP fabric node "
-            "(the LeapFlow Hardware Protocol, v1)."
+            "(the version-negotiated LeapFlow Hardware Protocol)."
         ),
     )
     parser.add_argument(

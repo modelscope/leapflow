@@ -183,6 +183,9 @@ class FrameReading:
     monotonic_at: float = field(default_factory=time.monotonic)
     sequence: int = 0
     quality: str = Quality.OK.value
+    # Driver-defined, JSON-safe metadata about the encoded frame. It describes
+    # interpretation (for example depth scale and alignment), never raw buffers.
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def size_bytes(self) -> int:
@@ -205,6 +208,7 @@ class FrameReading:
             "sequence": self.sequence,
             "quality": self.quality,
             "size_bytes": self.size_bytes,
+            "metadata": dict(self.metadata),
         }
 
 

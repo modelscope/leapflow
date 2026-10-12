@@ -1524,6 +1524,14 @@
       button.innerHTML = esc(t("Start preview"));
     }
 
+    // A start that failed keeps its reason on screen. stop() would reset the status to
+    // "Not streaming." and hide the one actionable fact, such as which process holds
+    // the camera.
+    function failed() {
+      stop(true);
+      stage.innerHTML = "";
+    }
+
     // A prompt belongs next to the panel whose request raised it. The promise does not
     // settle until the first media sample, so approval stays in this slot while the daemon
     // is waiting rather than falling through to a detached page-level notification.
@@ -1654,7 +1662,7 @@
           stage.innerHTML = "";
           stage.appendChild(meter.dom);
           const first = await withConsentSlot(() => pollLevel(meter));
-          if (first.value === "stop") { stop(); return; }
+          if (first.value === "stop") { failed(); return; }
           if (first.decision === "allow_once") {
             releaseViewer();
             status.innerHTML = esc(t("preview.one_sample"));
@@ -1664,12 +1672,12 @@
           button.innerHTML = esc(t("Stop preview"));
           timer = setInterval(async () => {
             if (!running) return;
-            if ((await pollLevel(meter)) === "stop") stop();
+            if ((await pollLevel(meter)) === "stop") stop(true);
           }, 250);
           return;
         }
         const ready = await withConsentSlot(() => openCameraStream(settings.current()));
-        if (!ready.value) { stop(); return; }
+        if (!ready.value) { failed(); return; }
         if (ready.decision === "allow_once") {
           stop(true);
           status.innerHTML = esc(t("preview.one_frame"));

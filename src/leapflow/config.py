@@ -253,6 +253,10 @@ class Settings:
     hardware_preview_quality: int = 85
     # Explicit browser Stop releases immediately. This is only the lost-client fallback.
     hardware_preview_idle_timeout_s: float = 5.0
+    # JSON array of named LHP edge nodes.  Each entry has node_id, display_name,
+    # endpoint, and token_env (preferred) or token. Empty retains the legacy
+    # LEAPFLOW_FLEET_NODES environment fallback.
+    hardware_fleet_nodes: str = ""
     runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
