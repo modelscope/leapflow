@@ -1463,9 +1463,10 @@ class HardwareTools:
         declared privacy tier and answers SAFE for everything else. Two failure modes
         matter and both deny:
 
-        - **No gate installed.** The in-process CLI binds none, so a camera read there
-          is refused rather than performed unguarded. Named as a configuration fault
-          because that is what it is.
+        - **No gate installed.** Normal direct CLI and daemon paths bind gates, but an
+          incomplete or non-interactive runtime may not; a camera read there is refused
+          rather than performed unguarded. Named as a configuration fault because that is
+          what it is.
         - **A gate that raises.** Handled inside ``_evaluate``, which is why this goes
           through it rather than calling the gate directly.
 

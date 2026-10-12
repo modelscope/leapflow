@@ -1414,6 +1414,35 @@ class Context:
             return
         await self._start_hardware_streams()
 
+    async def _maybe_start_hardware_fleet(self) -> None:
+        """Register configured fleet nodes when the daemon owns the runtime.
+
+        Fabric connections belong to leapd for the same single-owner reason as
+        sampling: it serves agent turns, the board, fleet tools and heartbeat
+        supervision. The in-process read plane (``leap hw list/read``) registers
+        its own nodes on demand instead; a client or one-shot process opening
+        edge connections would only duplicate leapd's job.
+
+        Failures are contained: an unreachable board is logged and skipped, and
+        never prevents the host's own devices from starting.
+        """
+        if not self._daemon_mode:
+            logger.debug(
+                "In-process CLI mode: skipping fleet node registration; "
+                "leapd owns fabric connections and the read plane registers its own."
+            )
+            return
+        from leapflow.plugins import get_registry as _get_tool_registry
+
+        plugin = _get_tool_registry().get_plugin("hardware_context")
+        start_fleet = getattr(plugin, "start_fleet", None)
+        if start_fleet is None:
+            return
+        try:
+            await start_fleet()
+        except Exception:
+            logger.warning("Fleet: startup registration failed", exc_info=True)
+
     async def _start_hardware_streams(self) -> None:
         """Begin sampling channels that declare a sample rate.
 
@@ -1823,6 +1852,7 @@ class Context:
 
         self._bind_hardware_plugin()
         await self._maybe_start_hardware_streams()
+        await self._maybe_start_hardware_fleet()
 
         # Initialize skill discovery (SkillIndex + SkillInjector)
         skills_dir = Path(settings.skills_dir).expanduser()

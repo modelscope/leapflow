@@ -690,6 +690,19 @@ def test_hermetic_env_forces_mock_host(tmp_path: Path) -> None:
     assert env["LEAPFLOW_MOCK_HOST"] == "1"
 
 
+def test_hermetic_env_excludes_loopback_from_system_proxies(tmp_path: Path) -> None:
+    """Cassette traffic must reach the loopback proxy, never a system proxy.
+
+    httpx honours macOS System Configuration proxies even for loopback
+    addresses, so on a dev machine running a local proxy app every journey
+    received a 502 from that proxy before its request could reach the cassette
+    store. ``NO_PROXY`` pins loopback to a direct connection.
+    """
+    env = hermetic_env(data_dir=tmp_path, profile="default", llm_base_url="http://x/v1")
+    assert env["NO_PROXY"] == "127.0.0.1,localhost,::1"
+    assert env["no_proxy"] == env["NO_PROXY"], "httpx reads both cases"
+
+
 # ════════════════════════════════════════════════════════════════
 # The derived fixture is a contract, not an inventory
 # ════════════════════════════════════════════════════════════════

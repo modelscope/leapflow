@@ -125,11 +125,65 @@ async def _dispatch(args: argparse.Namespace, action: str) -> int:
         return await _run_sampling_control(action, args, json_mode)
     if action in _OFFLINE_ACTIONS:
         return _run_offline(action, args, json_mode)
+    if action == "serve":
+        return await _run_serve(args)
     _fail(f"Unknown hw action: {action}")
     return 1
 
 
+# ── Edge runtime (node side) ─────────────────────────────────────────────
+
+
+async def _run_serve(args: argparse.Namespace) -> int:
+    """Serve this machine's devices as an LHP node, until interrupted."""
+    from leapflow.hardware.lhp.protocol import is_valid_device_id
+    from leapflow.hardware.lhp.runtime import resolve_endpoint_args, serve_node
+
+    node_id, token = resolve_endpoint_args(
+        str(getattr(args, "node_id", "") or ""), str(getattr(args, "token", "") or "")
+    )
+    if not is_valid_device_id(node_id):
+        _fail(
+            "serve requires a node id matching [a-z0-9_]+ "
+            "(--node-id, or LEAPFLOW_LHP_NODE_ID)"
+        )
+        return 1
+    return await serve_node(
+        node_id=node_id,
+        host=str(getattr(args, "host", "") or "127.0.0.1"),
+        port=int(getattr(args, "port", 0)),
+        unix_path=str(getattr(args, "unix_path", "") or ""),
+        token=token,
+    )
+
+
 # ── Read / estop plane ─────────────────────────────────────────────────────
+
+
+async def _register_fleet_read_plane(registry: Any) -> None:
+    """Reconcile configured fleet nodes into the in-process read registry.
+
+    ``leap hw list/read`` serves from a registry built in this process rather
+    than leapd's, so the configured nodes have to be registered here for
+    ``<node>__<device>`` ids to resolve.  Best-effort: an unreachable board
+    leaves the host's own devices fully usable.  No heartbeat -- the process
+    is short-lived and reads are on-demand.
+    """
+    from leapflow.hardware.fleet import FleetManager
+    from leapflow.hardware.fleet_config import (
+        configured_nodes_from_env,
+        register_nodes_safely,
+    )
+
+    nodes = configured_nodes_from_env()
+    if not nodes:
+        return
+    registered = await register_nodes_safely(FleetManager(registry), nodes)
+    if registered:
+        logger.info(
+            "Fleet: %d configured node(s) registered for in-process reads",
+            len(registered),
+        )
 
 
 async def _run_local(action: str, args: argparse.Namespace, json_mode: bool) -> int:
@@ -149,6 +203,10 @@ async def _run_local(action: str, args: argparse.Namespace, json_mode: bool) -> 
             },
             json_mode,
         )
+
+    # Reconcile configured fleet nodes before any action runs: reads are served
+    # in this process, so ``<node>__<device>`` ids must be admitted here too.
+    await _register_fleet_read_plane(registry)
 
     from leapflow.hardware.tools import HardwareTools
 
@@ -383,7 +441,7 @@ def _run_replay(args: argparse.Namespace, json_mode: bool) -> int:
 
 
 def _print_usage() -> None:
-    print("Usage: leap hw {list|describe|read|status|estop|pause|resume|replay} [--json]")
+    print("Usage: leap hw {list|describe|read|status|estop|pause|resume|replay|serve} [--json]")
     print()
     print("Inspect hardware and intervene in it directly.")
     print()
@@ -396,3 +454,4 @@ def _print_usage() -> None:
     print("  pause <device>       Pause daemon sampling for a device")
     print("  resume <device>      Resume daemon sampling for a device")
     print("  replay <path>        Replay a raw NDJSON segment through the event detector")
+    print("  serve                Serve this machine as an LHP fabric node (edge runtime)")

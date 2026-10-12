@@ -37,6 +37,7 @@ from leapflow.hardware.transport import (
     WriteOutcome,
 )
 from leapflow.hardware.transports import build_transport, builtin_transports
+from tests._harness.hardware_stubs import lhp_node_server
 
 
 def _conformance_context(transport_kind: str, config: dict[str, Any]) -> HardwareContext:
@@ -161,6 +162,17 @@ class _StubMcpServer:
         return {"ok": False, "error": f"unknown tool {tool_name!r}"}
 
 
+def _lhp_config(**stub_kwargs: Any) -> dict[str, Any]:
+    """An LHP declaration wired to an in-process node over the shared stub registry.
+
+    The node stub stands in for a remote board: framing, identity localisation,
+    error mapping, and the write-error table are all the transport's own
+    responsibilities and are what these cases exercise. The socket binding gets
+    its own dedicated suite in test_lhp_fabric.py.
+    """
+    return {"server": lhp_node_server(**stub_kwargs)}
+
+
 _HOST_CONFIG: dict[str, Any] = {
     # Narrowed to the two channels the standard library can always answer, so the case
     # behaves identically on every runner. The conformance context declares its own
@@ -192,6 +204,15 @@ _TRANSPORT_CASES: tuple[_Case, ...] = (
         # No halt tool named, so the device cannot be stopped. A declaration may not
         # claim the reverse: a tool that was never named cannot be called.
         without_halt=_mcp_config(halt_tool=""),
+    ),
+    _Case(
+        kind="lhp",
+        config=_lhp_config(),
+        # The failing stub declares repeat=True: one node instance serves both the
+        # hand-written cases and the conformance runner in the same process, so a
+        # one-shot failure rule would invert the contract on the second write.
+        failing_write=_lhp_config(fail_writes=True),
+        without_halt=_lhp_config(halt_supported=False),
     ),
     _Case(
         kind="simulated",

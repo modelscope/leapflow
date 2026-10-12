@@ -95,8 +95,8 @@ from leapflow.hardware.fleet import (
     FleetNode,
     FleetSessionRouter,
     FleetTopology,
-    build_fleet_tools,
 )
+from leapflow.hardware.fleet_tools import build_fleet_tools
 from leapflow.hardware.control_hierarchy import (
     ControlHierarchy,
     ControlLayer,

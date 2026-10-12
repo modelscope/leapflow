@@ -3,8 +3,10 @@
 
 Extends LeapFlow's single-machine hardware stack to a fleet of robots
 distributed across multiple edge nodes.  The central leapd manages the
-fleet topology, routes commands to the correct node via MCP Transport,
-and aggregates trust/evidence/experience across all nodes.
+fleet topology, and every node conversation is held over LHP -- the
+LeapFlow Hardware Protocol (``hardware/lhp/``): the node runs
+``LhpNodeServer`` over its own ``HardwareRegistry`` and the host talks to
+it with ``SocketLhpClient``.
 
 Three deployment scenarios (from research note 10):
 1. Dual-machine (Mac + edge board): Mac runs LLM/console, board runs RT control
@@ -13,7 +15,7 @@ Three deployment scenarios (from research note 10):
 
 Fleet management adds:
 - Node discovery and health monitoring
-- Device-to-node routing (device_id → MCP endpoint)
+- Device-to-node routing (host-side device_id → node_id)
 - Cross-node trust aggregation
 - Cross-node experience/evidence aggregation
 - Fleet-level emergency stop (halt all nodes)
@@ -21,14 +23,29 @@ Fleet management adds:
 
 Design invariants:
 
-- Fleet uses MCP Transport for bridging — no new RPC protocol.
-- Remote devices register in the local HardwareRegistry as MCP transport
-  kind, making them transparent to the agent layer above.
+- Nodes are bridged over LHP; a remote device's transport kind is ``lhp``
+  and the binding (endpoint, token, remote device id) travels in its
+  ``TransportRef.config``.
+- Remote devices register in the local HardwareRegistry as external-source
+  declarations under the node's namespace, making them transparent to the
+  agent layer above.
+- Host-side identity is namespaced ``<node_id>__<device_id>``; the node
+  keeps seeing its own node-local ids and never learns the prefix.
+- A locally declared device always wins over a node's declaration of the
+  same host-side id (LHP spec §8 merge order: providers first, external
+  sources after, duplicates rejected rather than replaced).
 - ``halt_all`` is concurrent (``asyncio.gather``), fire-and-forget.
 - Heartbeat is best-effort and never blocks data-plane operations.
 - Trust aggregation takes the conservative value (lowest trust level).
 - Nodes that go offline have their devices marked degraded automatically.
 - No dependency on ``leapflow.engine``.
+
+Module split: node configuration and startup registration live in
+``fleet_config.py``; the LLM-callable tools live in ``fleet_tools.py``.
+This module keeps only the fleet model and ``FleetManager`` mechanics, and
+is slightly above the 800-line soft limit because the manager's
+registration, supervision, halt and aggregation paths share one routing
+table and one node map -- splitting them would scatter that state.
 """
 
 from __future__ import annotations
@@ -36,10 +53,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
+from leapflow.hardware.context import HardwareContext, TransportRef
+from leapflow.hardware.lhp import LhpRemoteError, SocketLhpClient, is_valid_device_id
+
 logger = logging.getLogger(__name__)
+
+# How long a heartbeat probe may take before the node counts as unreachable.
+# Short enough to stay invisible beside a 10s heartbeat interval, long enough
+# for a busy node to answer a hello exchange.
+_HEARTBEAT_PROBE_TIMEOUT_S = 5.0
 
 # ---------------------------------------------------------------------------
 # Core types
@@ -63,46 +88,42 @@ class FleetNode:
     """One edge node in the fleet.
 
     Each node represents a physical machine (e.g. a Jetson board) that
-    hosts one or more hardware devices.  The ``mcp_endpoint`` is the
-    address of the MCP server on that node, through which all device
-    commands are routed.
+    hosts one or more hardware devices and runs ``LhpNodeServer``.  The
+    ``endpoint`` is the node's LHP binding address -- ``tcp://host:port``
+    or ``unix:///path`` -- through which all device conversations are held.
 
-    ``device_ids`` is a snapshot taken at discovery time.  Devices may
-    appear or disappear as the node's own HardwareRegistry reconciles;
-    the fleet manager re-discovers periodically via heartbeat.
+    ``device_ids`` holds the *node-local* ids the node reported and the
+    local registry admitted (host-side truth after namespacing); ids the
+    registry rejected are not routable and deliberately absent.
+
+    ``token`` is the shared secret for LHP hello-first authentication;
+    empty means an open node, acceptable only on a trusted segment.
     """
 
     node_id: str
     display_name: str
-    mcp_endpoint: str  # "http://host:port" or "stdio:command"
+    endpoint: str  # "tcp://host:port" or "unix:///path"
+    token: str = ""
     device_ids: tuple[str, ...] = ()
     status: str = _NODE_STATUS_UNKNOWN
     last_heartbeat: float = 0.0
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
+    def host_device_id(self, device_id: str) -> str:
+        """Return the host-side (namespaced) id for a node-local device id."""
+        return f"{self.node_id}__{device_id}"
+
     def with_status(self, status: str, *, heartbeat: float = 0.0) -> FleetNode:
         """Return a copy with an updated status and optional heartbeat."""
-        return FleetNode(
-            node_id=self.node_id,
-            display_name=self.display_name,
-            mcp_endpoint=self.mcp_endpoint,
-            device_ids=self.device_ids,
+        return replace(
+            self,
             status=status if status in _VALID_STATUSES else _NODE_STATUS_UNKNOWN,
             last_heartbeat=heartbeat or self.last_heartbeat,
-            metadata=self.metadata,
         )
 
     def with_devices(self, device_ids: tuple[str, ...]) -> FleetNode:
         """Return a copy with an updated device list."""
-        return FleetNode(
-            node_id=self.node_id,
-            display_name=self.display_name,
-            mcp_endpoint=self.mcp_endpoint,
-            device_ids=device_ids,
-            status=self.status,
-            last_heartbeat=self.last_heartbeat,
-            metadata=self.metadata,
-        )
+        return replace(self, device_ids=tuple(device_ids))
 
 
 @dataclass(frozen=True)
@@ -125,7 +146,10 @@ class FleetTopology:
                 {
                     "node_id": n.node_id,
                     "display_name": n.display_name,
-                    "mcp_endpoint": n.mcp_endpoint,
+                    "endpoint": n.endpoint,
+                    # Compatibility key: dashboards may still read the old
+                    # field name (G4 decision in 04-open-questions.md).
+                    "mcp_endpoint": n.endpoint,
                     "device_ids": list(n.device_ids),
                     "status": n.status,
                     "last_heartbeat": n.last_heartbeat,
@@ -149,7 +173,8 @@ class FleetManager:
 
     Coordinates with the local ``HardwareRegistry`` to present remote
     devices as if they were local — commands are transparently routed
-    through MCP Transport to the correct edge node.
+    through the ``lhp`` transport to the correct edge node, and node
+    declarations enter the registry as external sources.
     """
 
     def __init__(
@@ -170,45 +195,88 @@ class FleetManager:
     # -- Node management -------------------------------------------------
 
     async def register_node(self, node: FleetNode) -> FleetNode:
-        """Register an edge node and discover its devices.
+        """Register an edge node, reconcile its devices into the local registry.
 
-        1. Probe the node's MCP endpoint for availability.
-        2. Discover devices via MCP tools (equivalent to ``hw_list``).
-        3. Update the device→node routing table.
-        4. Register each remote device in the local registry (if a
-           reconciliation hook is available — otherwise the caller is
-           responsible for adding the MCP-backed device declarations).
+        1. Validate the node_id -- it becomes a namespace prefix, so it must
+           already satisfy the device-id charset.
+        2. Fetch the node's device declarations over LHP; the hello exchange
+           pins the node's identity.
+        3. Relabel each declaration ``<node_id>__<device_id>`` with an ``lhp``
+           transport binding, register the set as an external source, and
+           reconcile so admission (including local-wins precedence) happens
+           through the one real path.
+        4. Route the *admitted* node-local ids and mark the node online.
 
         Returns the node with updated device list and status.
-        Raises ``FleetError`` if the endpoint is unreachable.
+        Raises ``FleetError`` if the endpoint is unreachable, the node
+        reports a different identity, or its declarations are malformed.
         """
-        if not node.node_id:
-            raise FleetError("node_id must be non-empty")
-        if not node.mcp_endpoint:
-            raise FleetError(f"node {node.node_id!r} has no mcp_endpoint")
-
-        # Probe the endpoint.
-        reachable = await self._probe_endpoint(node.mcp_endpoint)
-        if not reachable:
+        if not node.node_id or not is_valid_device_id(node.node_id):
             raise FleetError(
-                f"node {node.node_id!r} at {node.mcp_endpoint!r} is unreachable"
+                f"node_id {node.node_id!r} must be non-empty and match [a-z0-9_]+",
+                failure_code="fleet_bad_node_id",
+            )
+        if not node.endpoint:
+            raise FleetError(
+                f"node {node.node_id!r} has no endpoint",
+                failure_code="fleet_no_endpoint",
             )
 
-        # Discover devices on this node.
-        device_ids = await self._discover_devices(node.mcp_endpoint)
-        registered = node.with_devices(device_ids).with_status(
-            _NODE_STATUS_ONLINE, heartbeat=time.monotonic()
+        reported, remote_contexts = await self._fetch_node_contexts(
+            node.endpoint, token=node.token
         )
+        if reported and reported != node.node_id:
+            # Identity mismatch is never resolved automatically: adopting the
+            # reported id could silently merge two boards into one namespace.
+            raise FleetError(
+                f"node at {node.endpoint!r} reports itself as {reported!r}, "
+                f"not {node.node_id!r}",
+                failure_code="fleet_node_mismatch",
+            )
 
-        # Update internal state.
+        prefix = f"{node.node_id}__"
+        local_contexts = tuple(
+            replace(
+                remote,
+                device_id=node.host_device_id(remote.device_id),
+                transport=self._transport_ref(node, remote.device_id),
+            )
+            for remote in remote_contexts
+        )
+        self._registry.register_external_contexts(node.node_id, local_contexts)
+
+        report = await self._registry.reconcile()
+        admitted_local = tuple(
+            did[len(prefix):] for did in report.admitted if did.startswith(prefix)
+        )
+        dropped = tuple(did for did in report.rejected if did.startswith(prefix))
+        if dropped:
+            logger.warning(
+                "Fleet: node %r declarations rejected at admission: %s",
+                node.node_id,
+                ", ".join(dropped),
+            )
+
+        registered = replace(
+            node,
+            device_ids=admitted_local,
+            status=_NODE_STATUS_ONLINE,
+            last_heartbeat=time.monotonic(),
+        )
+        # Re-registration replaces the previous snapshot: drop stale routing
+        # entries for device ids this node no longer declares.
+        previous = self._nodes.get(registered.node_id)
+        if previous is not None:
+            for local_did in previous.device_ids:
+                self._device_to_node.pop(previous.host_device_id(local_did), None)
         self._nodes[registered.node_id] = registered
-        for did in registered.device_ids:
-            self._device_to_node[did] = registered.node_id
+        for local_did in registered.device_ids:
+            self._device_to_node[registered.host_device_id(local_did)] = registered.node_id
 
         logger.info(
             "Fleet: registered node %r (%s) with %d device(s): %s",
             registered.node_id,
-            registered.mcp_endpoint,
+            registered.endpoint,
             len(registered.device_ids),
             ", ".join(registered.device_ids) or "(none)",
         )
@@ -217,28 +285,34 @@ class FleetManager:
     async def unregister_node(self, node_id: str) -> None:
         """Remove a node and all its devices from the fleet.
 
-        Halts all devices on the node first — best-effort, failures are
-        logged but do not prevent removal.
+        Halts all devices on the node first -- best-effort, failures are
+        logged but do not prevent removal.  Then drops the node's external
+        source and reconciles, so its devices leave the local registry
+        through the same path they arrived in.
         """
         node = self._nodes.get(node_id)
         if node is None:
-            logger.debug("Fleet: unregister_node(%r) — not found, no-op", node_id)
+            logger.debug("Fleet: unregister_node(%r) -- not found, no-op", node_id)
             return
 
         # Halt all devices on the node (best-effort).
-        for did in node.device_ids:
+        for local_did in node.device_ids:
             try:
-                await self._halt_device(did)
+                await self._halt_device(node.host_device_id(local_did))
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Fleet: halt device %r on unregister failed: %s",
-                    did, exc, exc_info=True,
+                    local_did, exc, exc_info=True,
                 )
 
         # Remove routing entries.
-        for did in node.device_ids:
-            self._device_to_node.pop(did, None)
+        for local_did in node.device_ids:
+            self._device_to_node.pop(node.host_device_id(local_did), None)
         del self._nodes[node_id]
+
+        # Drop the declarations and converge the registry (never raises).
+        self._registry.unregister_external_source(node_id)
+        await self._registry.reconcile()
 
         logger.info("Fleet: unregistered node %r", node_id)
 
@@ -248,22 +322,20 @@ class FleetManager:
         """Probe multiple endpoints for fleet nodes.
 
         Returns discovered nodes (not yet registered).  Unreachable
-        endpoints are silently skipped.
+        endpoints are silently skipped.  A reachable node's identity and
+        device list come from its own hello/list answers; the derived
+        ``_endpoint_to_node_id`` name is only a fallback for silent nodes.
         """
         discovered: list[FleetNode] = []
 
         async def _probe_one(endpoint: str) -> FleetNode | None:
-            reachable = await self._probe_endpoint(endpoint)
-            if not reachable:
-                return None
-            device_ids = await self._discover_devices(endpoint)
-            # Derive a node_id from the endpoint for convenience.
-            node_id = _endpoint_to_node_id(endpoint)
+            reported, remote_contexts = await self._fetch_node_contexts(endpoint)
+            node_id = reported or _endpoint_to_node_id(endpoint)
             return FleetNode(
                 node_id=node_id,
                 display_name=endpoint,
-                mcp_endpoint=endpoint,
-                device_ids=device_ids,
+                endpoint=endpoint,
+                device_ids=tuple(ctx.device_id for ctx in remote_contexts),
                 status=_NODE_STATUS_ONLINE,
                 last_heartbeat=time.monotonic(),
             )
@@ -327,36 +399,7 @@ class FleetManager:
         marked degraded in the routing table.
         """
         while not self._stopped.is_set():
-            for node_id in list(self._nodes):
-                node = self._nodes.get(node_id)
-                if node is None:
-                    continue
-                try:
-                    reachable = await self._probe_endpoint(node.mcp_endpoint)
-                except Exception:  # noqa: BLE001
-                    reachable = False
-
-                now = time.monotonic()
-                if reachable:
-                    self._nodes[node_id] = node.with_status(
-                        _NODE_STATUS_ONLINE, heartbeat=now
-                    )
-                else:
-                    elapsed = now - node.last_heartbeat
-                    if elapsed > self._node_timeout:
-                        if node.status != _NODE_STATUS_OFFLINE:
-                            logger.warning(
-                                "Fleet: node %r offline (%.1fs since last heartbeat)",
-                                node_id, elapsed,
-                            )
-                            self._nodes[node_id] = node.with_status(
-                                _NODE_STATUS_OFFLINE
-                            )
-                    elif node.status == _NODE_STATUS_ONLINE:
-                        self._nodes[node_id] = node.with_status(
-                            _NODE_STATUS_DEGRADED
-                        )
-
+            await self._heartbeat_sweep()
             try:
                 await asyncio.wait_for(
                     self._stopped.wait(), timeout=self._heartbeat_interval
@@ -364,6 +407,47 @@ class FleetManager:
                 break  # stopped
             except asyncio.TimeoutError:
                 pass
+
+    async def _heartbeat_sweep(self) -> None:
+        """Probe every node once, concurrently, and apply status transitions.
+
+        Concurrent because an unreachable board costs a full probe timeout;
+        probed serially, a few dark boards would delay supervision of the
+        live ones past their own timeout window.  Every transition is logged
+        so an outage and its recovery both leave evidence.
+        """
+        node_ids = list(self._nodes)
+        probes = await asyncio.gather(
+            *(
+                self._probe_endpoint(self._nodes[nid].endpoint, token=self._nodes[nid].token)
+                for nid in node_ids
+            ),
+            return_exceptions=True,
+        )
+        now = time.monotonic()
+        for node_id, probe in zip(node_ids, probes):
+            node = self._nodes.get(node_id)
+            if node is None:
+                continue  # unregistered while the sweep was in flight
+            if probe is True:
+                if node.status in (_NODE_STATUS_OFFLINE, _NODE_STATUS_DEGRADED):
+                    logger.info("Fleet: node %r back online", node_id)
+                self._nodes[node_id] = node.with_status(_NODE_STATUS_ONLINE, heartbeat=now)
+                continue
+            elapsed = now - node.last_heartbeat
+            if elapsed > self._node_timeout:
+                if node.status != _NODE_STATUS_OFFLINE:
+                    logger.warning(
+                        "Fleet: node %r offline (%.1fs since last heartbeat)",
+                        node_id, elapsed,
+                    )
+                    self._nodes[node_id] = node.with_status(_NODE_STATUS_OFFLINE)
+            elif node.status == _NODE_STATUS_ONLINE:
+                logger.info(
+                    "Fleet: node %r degraded (heartbeat missed, %.1fs since last)",
+                    node_id, elapsed,
+                )
+                self._nodes[node_id] = node.with_status(_NODE_STATUS_DEGRADED)
 
     async def node_health(self, node_id: str) -> dict[str, Any]:
         """Return health details for one node.
@@ -374,7 +458,7 @@ class FleetManager:
         if node is None:
             return {"node_id": node_id, "error": "unknown node"}
 
-        reachable = await self._probe_endpoint(node.mcp_endpoint)
+        reachable = await self._probe_endpoint(node.endpoint, token=node.token)
         now = time.monotonic()
         if reachable:
             self._nodes[node_id] = node.with_status(
@@ -383,7 +467,9 @@ class FleetManager:
         return {
             "node_id": node_id,
             "display_name": node.display_name,
-            "mcp_endpoint": node.mcp_endpoint,
+            "endpoint": node.endpoint,
+            # Compatibility key -- see FleetTopology.to_dict (G4 decision).
+            "mcp_endpoint": node.endpoint,
             "status": _NODE_STATUS_ONLINE if reachable else node.status,
             "reachable": reachable,
             "device_count": len(node.device_ids),
@@ -416,7 +502,7 @@ class FleetManager:
             failures = 0
             for did in node.device_ids:
                 try:
-                    await self._halt_device(did)
+                    await self._halt_device(node.host_device_id(did))
                     successes += 1
                 except Exception as exc:  # noqa: BLE001
                     failures += 1
@@ -469,7 +555,7 @@ class FleetManager:
         aggregated trust level name and per-node breakdown.
         """
         # Function-local import: trust module is optional at this layer.
-        from leapflow.hardware.trust import HardwareTrustGate, HardwareTrustLevel
+        from leapflow.hardware.trust import HardwareTrustGate
 
         fleet_trust: dict[str, dict[str, Any]] = {}
 
@@ -487,10 +573,9 @@ class FleetManager:
                     "sources": {"local": record.level.name},
                 }
 
-        # For remote nodes, we query via MCP if their trust endpoint is
-        # exposed.  For now this is a best-effort aggregation from the
-        # local view — remote trust queries require a fleet-trust MCP tool
-        # on each node, which is a future extension.
+        # Remote trust queries would need a dedicated LHP method on each
+        # node; until then this is a best-effort aggregation from the local
+        # view, and missing remote entries stay visible as such.
 
         return {
             "strategy": "conservative_merge",
@@ -506,8 +591,8 @@ class FleetManager:
         """Collect recent evidence from all nodes' EvidenceStores.
 
         Queries the local registry's evidence store.  Remote node
-        evidence requires a fleet-evidence MCP tool on each node,
-        which is a future extension.  For now, returns local evidence.
+        evidence would need a dedicated LHP method on each node; until
+        then this returns local evidence only.
         """
         from leapflow.hardware.evidence import EvidenceStore
 
@@ -528,73 +613,122 @@ class FleetManager:
 
     # -- Internal helpers ------------------------------------------------
 
-    async def _probe_endpoint(self, endpoint: str) -> bool:
-        """Probe an MCP endpoint for liveness.
+    async def _fetch_node_contexts(
+        self, endpoint: str, *, token: str = ""
+    ) -> tuple[str, tuple[HardwareContext, ...]]:
+        """Fetch a node's identity and raw device declarations over LHP.
 
-        Returns True if the endpoint responds to a basic health check.
-        This is a lightweight connectivity test, not a full capability
-        discovery — it must complete quickly so the heartbeat loop stays
-        responsive.
+        Returns ``(reported_node_id, contexts)``.  The *reported* id comes
+        from the node's hello answer; the caller decides whether to pin it
+        (register: mismatch refuses) or adopt it (discover: it is the
+        authoritative name).  Declarations stay in the node's own id space;
+        namespacing the ids is the caller's job.
+
+        Raises ``FleetError`` when the node is unreachable, fails the
+        exchange, or answers a declaration this host cannot read.  A
+        machine-generated declaration that does not parse is a version
+        mismatch, so the whole node is refused loudly rather than admitted
+        partially.
         """
+        client = SocketLhpClient(endpoint, token=token)
         try:
-            # Use the MCP client provider if available.
-            from leapflow.hardware.transports.mcp import _CLIENT_PROVIDER
+            hello = await client.connect()
+            devices = await client.request("list", {})
+        except (LhpRemoteError, ValueError, OSError) as exc:
+            raise FleetError(
+                f"node at {endpoint!r} unreachable: {exc}",
+                failure_code="fleet_unreachable",
+            ) from exc
+        finally:
+            await client.close()
 
-            if _CLIENT_PROVIDER is not None:
-                client = _CLIENT_PROVIDER()
-                if client is not None and hasattr(client, "call_tool"):
-                    # Attempt a lightweight call — probe_tool or list_tools.
-                    if hasattr(client, "list_tools"):
-                        raw = client.list_tools()
-                        if asyncio.iscoroutine(raw):
-                            await asyncio.wait_for(raw, timeout=5.0)
-                        return True
-            # Fallback: treat endpoint as reachable if it parses.
-            return bool(endpoint)
-        except asyncio.TimeoutError:
-            return False
-        except Exception:  # noqa: BLE001
-            return False
-
-    async def _discover_devices(self, endpoint: str) -> tuple[str, ...]:
-        """Discover devices on a node by querying its MCP server.
-
-        Calls the equivalent of ``hw_list`` via MCP.  Returns an empty
-        tuple if discovery fails.
-        """
-        try:
-            from leapflow.hardware.transports.mcp import _CLIENT_PROVIDER
-
-            if _CLIENT_PROVIDER is not None:
-                client = _CLIENT_PROVIDER()
-                if client is not None and hasattr(client, "call_tool"):
-                    response = await client.call_tool("hw_list", {})
-                    if isinstance(response, Mapping):
-                        devices = response.get("devices", ())
-                        if isinstance(devices, (list, tuple)):
-                            return tuple(
-                                str(d.get("device_id", d) if isinstance(d, dict) else d)
-                                for d in devices
-                                if d
-                            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Fleet: device discovery on %s failed: %s", endpoint, exc
+        if not isinstance(devices, Mapping):
+            raise FleetError(
+                f"node at {endpoint!r} returned a malformed list payload",
+                failure_code="fleet_malformed_list",
             )
-        return ()
+
+        contexts: list[HardwareContext] = []
+        raw_devices = devices.get("devices", ())
+        if isinstance(raw_devices, (list, tuple)):
+            for payload in raw_devices:
+                if not isinstance(payload, Mapping):
+                    continue
+                try:
+                    contexts.append(HardwareContext.from_mapping(dict(payload)))
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise FleetError(
+                        f"node at {endpoint!r} declaration is unreadable: {exc}",
+                        failure_code="fleet_bad_declaration",
+                    ) from exc
+
+        reported = str(hello.get("node_id") or "")
+        return reported, tuple(contexts)
+
+    async def _probe_endpoint(self, endpoint: str, *, token: str = "") -> bool:
+        """Probe an LHP endpoint for liveness.
+
+        One hello exchange with a short timeout: a lightweight connectivity
+        test, not capability discovery -- it must complete quickly so the
+        heartbeat loop stays responsive.  Never raises.
+        """
+        client = SocketLhpClient(
+            endpoint, token=token, timeout_s=_HEARTBEAT_PROBE_TIMEOUT_S
+        )
+        try:
+            await client.connect()
+            return True
+        except (LhpRemoteError, ValueError, OSError):
+            return False
+        finally:
+            await client.close()
+
+    @staticmethod
+    def _transport_ref(node: FleetNode, remote_device_id: str) -> TransportRef:
+        """Build the LHP binding for one remote device.
+
+        ``remote_device_id`` is what the *node* calls the device; the host
+        side calls it ``<node_id>__<device_id>``.  Both ids travel so the
+        transport can address the right device on the node while every
+        host-side artifact carries the namespaced id.
+        """
+        return TransportRef(
+            kind="lhp",
+            config={
+                "endpoint": node.endpoint,
+                "token": node.token,
+                "node_id": node.node_id,
+                "remote_device_id": remote_device_id,
+            },
+        )
 
     async def _halt_device(self, device_id: str) -> None:
         """Halt a single device through the local registry's transport.
 
         Lock-free: ``transport.halt()`` does not acquire the I/O lock
         (HCP requirement), so this preempts in-flight operations.
+
+        Raises ``FleetError`` when the transport could not deliver the halt
+        (``connected=False``, e.g. an unreachable node).  ``halt()`` never
+        raises by contract, so without this check a dead node would be
+        reported as halted -- exactly the lie an emergency stop must not
+        tell.  A transport that answers while reporting no halt support is
+        tolerated: the attempt was delivered, and the device's own
+        capability is not this layer's failure.
         """
         try:
             transport = await self._registry.transport(device_id)
-            await transport.halt()
+            status = await transport.halt()
         except Exception as exc:  # noqa: BLE001
             logger.debug("Fleet: halt device %r failed: %s", device_id, exc)
             raise
+        if status is not None and not getattr(status, "connected", True):
+            detail = getattr(status, "detail", "")
+            raise FleetError(
+                f"halt for {device_id!r} was not delivered: "
+                f"{detail or 'transport not connected'}",
+                failure_code="fleet_halt_undelivered",
+            )
 
     async def close(self) -> None:
         """Shut down the fleet manager.
@@ -623,11 +757,11 @@ class FleetSessionRouter:
 
     When an Agent targets a device managed by a remote node,
     the router transparently forwards the operation through
-    the MCP Transport connection to that node.
+    the LHP transport connection to that node.
 
     The router is a thin delegation layer — it resolves the node,
     then delegates to the local registry's transport (which is already
-    an MCP transport pointing at the correct node).
+    an ``lhp`` transport pointing at the correct node).
     """
 
     def __init__(self, fleet_manager: FleetManager) -> None:
@@ -638,7 +772,7 @@ class FleetSessionRouter:
     ) -> Any:
         """Route a write operation to the correct node.
 
-        If the device is remote, the write goes through the MCP
+        If the device is remote, the write goes through the ``lhp``
         transport already registered in the local registry.  If local,
         it goes through the local transport directly.
         """
@@ -652,7 +786,7 @@ class FleetSessionRouter:
         """Route a read operation to the correct node.
 
         Same delegation pattern as ``route_write``: the transport
-        handles the MCP bridge transparently.
+        handles the LHP bridge transparently.
         """
         registry = self._fleet._registry
         transport = await registry.transport(device_id)
@@ -667,136 +801,6 @@ class FleetSessionRouter:
         registry = self._fleet._registry
         transport = await registry.transport(device_id)
         return await transport.halt()
-
-
-# ---------------------------------------------------------------------------
-# Fleet tools (LLM-callable)
-# ---------------------------------------------------------------------------
-
-
-def build_fleet_tools(fleet_manager: FleetManager) -> list[Any]:
-    """Generate ToolMetadata for fleet management tools.
-
-    Three tools are exposed:
-
-    - ``hw_fleet_status`` — show fleet topology, node health, device count
-    - ``hw_fleet_discover`` — probe endpoints for new nodes
-    - ``hw_fleet_halt_all`` — emergency stop all fleet devices
-    """
-    from leapflow.plugins.protocol import ToolMetadata
-
-    _FLEET_READ_META = {
-        "category": "hardware",
-        "risk_level": "none",
-    }
-    _FLEET_WRITE_META = {
-        "category": "hardware",
-        "risk_level": "external",
-    }
-
-    async def _fleet_status(**kwargs: Any) -> dict[str, Any]:
-        """Return fleet topology and per-node health summary."""
-        topo = fleet_manager.topology()
-        result = topo.to_dict()
-        # Enrich with per-node health for online nodes.
-        for node_dict in result.get("nodes", ()):
-            nid = node_dict.get("node_id", "")
-            if nid:
-                health = await fleet_manager.node_health(nid)
-                node_dict["health"] = health
-        return result
-
-    async def _fleet_discover(**kwargs: Any) -> dict[str, Any]:
-        """Probe endpoints for new fleet nodes."""
-        raw = kwargs.get("endpoints", "")
-        if isinstance(raw, str):
-            endpoints = tuple(
-                ep.strip() for ep in raw.split(",") if ep.strip()
-            )
-        elif isinstance(raw, (list, tuple)):
-            endpoints = tuple(str(ep) for ep in raw)
-        else:
-            return {"error": "endpoints must be a comma-separated string or list"}
-
-        if not endpoints:
-            return {"error": "no endpoints provided"}
-
-        nodes = await fleet_manager.discover_nodes(endpoints)
-        return {
-            "discovered": [
-                {
-                    "node_id": n.node_id,
-                    "display_name": n.display_name,
-                    "mcp_endpoint": n.mcp_endpoint,
-                    "device_ids": list(n.device_ids),
-                    "status": n.status,
-                }
-                for n in nodes
-            ],
-            "total": len(nodes),
-        }
-
-    async def _fleet_halt_all(**kwargs: Any) -> dict[str, Any]:
-        """Emergency stop ALL fleet devices on ALL nodes."""
-        halt_map = await fleet_manager.halt_all()
-        return {
-            "halt_map": halt_map,
-            "node_count": len(halt_map),
-            "message": "Fleet-level emergency stop issued to all nodes",
-        }
-
-    return [
-        ToolMetadata(
-            name="hw_fleet_status",
-            description=(
-                "Show fleet topology: all nodes, their connection status, "
-                "device count, and per-node health.  Use to understand the "
-                "distributed robot fleet before issuing commands."
-            ),
-            parameters_schema={"type": "object", "properties": {}},
-            handler=_fleet_status,
-            x_leapflow=dict(_FLEET_READ_META),
-            provides_capabilities=("hw.fleet.status",),
-        ),
-        ToolMetadata(
-            name="hw_fleet_discover",
-            description=(
-                "Probe MCP endpoints for new fleet nodes.  Supply a "
-                "comma-separated list of endpoints to check.  Returns "
-                "discovered nodes that can be registered."
-            ),
-            parameters_schema={
-                "type": "object",
-                "properties": {
-                    "endpoints": {
-                        "type": "string",
-                        "description": (
-                            "Comma-separated MCP endpoints to probe, "
-                            "e.g. 'http://192.168.1.50:9000,http://192.168.1.51:9000'"
-                        ),
-                    },
-                },
-                "required": ["endpoints"],
-            },
-            handler=_fleet_discover,
-            x_leapflow=dict(_FLEET_READ_META),
-            provides_capabilities=("hw.fleet.discover",),
-        ),
-        ToolMetadata(
-            name="hw_fleet_halt_all",
-            description=(
-                "Emergency stop ALL devices on ALL fleet nodes immediately.  "
-                "Use when any fleet-wide unsafe condition is observed.  "
-                "Sends halt concurrently to every node; does not wait for "
-                "individual node responses."
-            ),
-            parameters_schema={"type": "object", "properties": {}},
-            handler=_fleet_halt_all,
-            x_leapflow=dict(_FLEET_WRITE_META),
-            mutates_state=True,
-            provides_capabilities=("hw.fleet.halt_all",),
-        ),
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -828,7 +832,7 @@ def _endpoint_to_node_id(endpoint: str) -> str:
     and lowercases for consistency with device_id conventions.
     """
     cleaned = endpoint.lower()
-    for prefix in ("http://", "https://", "stdio:"):
+    for prefix in ("tcp://", "unix://", "http://", "https://", "stdio:"):
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix):]
     return "".join(c if c.isalnum() else "_" for c in cleaned).strip("_")
@@ -840,5 +844,4 @@ __all__ = [
     "FleetNode",
     "FleetSessionRouter",
     "FleetTopology",
-    "build_fleet_tools",
 ]

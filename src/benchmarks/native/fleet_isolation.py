@@ -1,5 +1,12 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Native FleetManager isolation and emergency-stop benchmark."""
+"""Native FleetManager isolation and emergency-stop benchmark.
+
+Drives the real data plane: each trial stands up two ``LhpNodeServer``
+nodes over TCP (ephemeral port), registers them through ``FleetManager``
+over genuine LHP exchanges, then exercises node failure, concurrent halt,
+and heartbeat timeout.  No MCP client stubs -- the node declarations are
+served by real registries with simulated transports.
+"""
 
 from __future__ import annotations
 
@@ -12,10 +19,10 @@ from benchmarks.metrics import fleet_isolation_score, halt_latency
 from benchmarks.models import AvailabilityResult, MetricValue, Scenario, TrialResult, TrialStatus
 from benchmarks.native.harness import evidence_root, make_context, make_registry
 from leapflow.hardware.fleet import FleetManager, FleetNode
-from leapflow.hardware.transports.mcp import set_mcp_client_provider
+from leapflow.hardware.lhp import LhpNodeServer
 
 _ADAPTER_ID = "native_fleet_isolation"
-_VERSION = "1.0.0"
+_VERSION = "2.0.0"
 _SCENARIOS = (
     Scenario("single_node_failure", "One node failure does not block peers", adapter_id=_ADAPTER_ID,
              tags=("native", "fleet", "tier1")),
@@ -26,26 +33,42 @@ _SCENARIOS = (
 )
 
 
-class _FleetClient:
-    """Deterministic MCP client used through the public provider hook."""
+class _NodePair:
+    """Two live LHP nodes plus the host-side fleet bindings over them."""
 
-    def __init__(self, discoveries: Sequence[Sequence[str]]) -> None:
-        self._discoveries = [tuple(row) for row in discoveries]
-        self.reachable = True
+    def __init__(self) -> None:
+        self.host_registry = make_registry()
+        self.node_a_registry = make_registry(make_context("fleet_a", transport_kind="simulated"))
+        self.node_b_registry = make_registry(make_context("fleet_b", transport_kind="simulated"))
+        self.server_a = LhpNodeServer(self.node_a_registry, node_id="node_a")
+        self.server_b = LhpNodeServer(self.node_b_registry, node_id="node_b")
+        self.manager = FleetManager(
+            self.host_registry, heartbeat_interval_s=1.0, node_timeout_s=1.0
+        )
+        self.endpoint_a = ""
+        self.endpoint_b = ""
 
-    async def list_tools(self) -> list[dict[str, str]]:
-        if not self.reachable:
-            raise ConnectionError("benchmark node unavailable")
-        return [{"name": "hw_list"}]
+    async def start(self) -> None:
+        host, port = await self.server_a.start(host="127.0.0.1", port=0)
+        self.endpoint_a = f"tcp://{host}:{port}"
+        host, port = await self.server_b.start(host="127.0.0.1", port=0)
+        self.endpoint_b = f"tcp://{host}:{port}"
 
-    async def call_tool(self, name: str, params: Mapping[str, Any]) -> dict[str, Any]:
-        del params
-        if not self.reachable:
-            raise ConnectionError("benchmark node unavailable")
-        if name != "hw_list":
-            return {"ok": False, "error": "unknown tool"}
-        devices = self._discoveries.pop(0) if self._discoveries else ()
-        return {"devices": [{"device_id": device_id} for device_id in devices]}
+    async def register(self) -> None:
+        await self.manager.register_node(FleetNode("node_a", "Node A", self.endpoint_a))
+        await self.manager.register_node(FleetNode("node_b", "Node B", self.endpoint_b))
+
+    async def stop_node_a(self) -> None:
+        """Simulate node A crashing: listener down, host binding unchanged."""
+        await self.server_a.stop()
+
+    async def close(self) -> None:
+        await self.manager.close()
+        await self.server_a.stop()
+        await self.server_b.stop()
+        await self.host_registry.close_all()
+        await self.node_a_registry.close_all()
+        await self.node_b_registry.close_all()
 
 
 class FleetIsolationAdapter:
@@ -77,17 +100,11 @@ class FleetIsolationAdapter:
     ) -> TrialResult:
         del timeout_seconds, parameters
         started = time.time()
-        registry = make_registry(
-            make_context("fleet_a", transport_kind="simulated"),
-            make_context("fleet_b", transport_kind="simulated"),
-        )
-        discoveries = self._discoveries(scenario.scenario_id)
-        client = _FleetClient(discoveries)
-        undo = set_mcp_client_provider(lambda: client)
-        manager = FleetManager(registry, heartbeat_interval_s=1.0, node_timeout_s=1.0)
+        fixture = _NodePair()
         try:
-            await self._register(manager)
-            payload, passed, latency = await self._exercise(manager, client, scenario.scenario_id)
+            await fixture.start()
+            await fixture.register()
+            payload, passed, latency = await self._exercise(fixture, scenario.scenario_id)
             return self._result(scenario, seed, started, payload, passed, latency)
         except Exception as exc:
             ended = time.time()
@@ -98,33 +115,31 @@ class FleetIsolationAdapter:
                 error_type=type(exc).__name__,
             )
         finally:
-            await manager.close()
-            await registry.close_all()
-            undo()
+            await fixture.close()
 
-    @staticmethod
-    def _discoveries(scenario_id: str) -> tuple[tuple[str, ...], ...]:
-        if scenario_id == "single_node_failure":
-            return (("missing_device",), ("fleet_b",))
-        return (("fleet_a",), ("fleet_b",))
-
-    @staticmethod
-    async def _register(manager: FleetManager) -> None:
-        await manager.register_node(FleetNode("node_a", "Node A", "stdio:node-a"))
-        await manager.register_node(FleetNode("node_b", "Node B", "stdio:node-b"))
-
-    async def _exercise(self, manager: FleetManager, client: _FleetClient,
-                        scenario_id: str) -> tuple[dict[str, Any], bool, float]:
+    async def _exercise(
+        self, fixture: _NodePair, scenario_id: str
+    ) -> tuple[dict[str, Any], bool, float]:
         if scenario_id == "heartbeat_timeout":
-            client.reachable = False
-            await manager.start_heartbeat()
-            await asyncio.sleep(1.15)
-            await manager.stop_heartbeat()
-            topology = manager.topology().to_dict()
+            await fixture.stop_node_a()
+            await fixture.manager.start_heartbeat()
+            # Two heartbeat cycles are needed: the first observes the node as
+            # degraded, the second crosses node_timeout_s and marks it offline.
+            await asyncio.sleep(2.2)
+            await fixture.manager.stop_heartbeat()
+            topology = fixture.manager.topology().to_dict()
             statuses = {node["node_id"]: node["status"] for node in topology["nodes"]}
-            return {"topology": topology}, bool(statuses) and set(statuses.values()) == {"offline"}, 0.0
+            passed = (
+                statuses.get("node_a") == "offline"
+                and statuses.get("node_b") == "online"
+            )
+            return {"topology": topology}, passed, 0.0
+        if scenario_id == "single_node_failure":
+            # Node A dies after registration: its halt must fail without
+            # blocking node B's halt.
+            await fixture.stop_node_a()
         before = time.perf_counter()
-        halted = await manager.halt_all()
+        halted = await fixture.manager.halt_all()
         elapsed = time.perf_counter() - before
         if scenario_id == "single_node_failure":
             passed = halted["node_a"]["failures"] == 1 and halted["node_b"]["successes"] == 1
@@ -132,8 +147,10 @@ class FleetIsolationAdapter:
             passed = len(halted) == 2 and all(row["halted"] for row in halted.values())
         return {"halted": halted, "elapsed": elapsed}, passed, elapsed
 
-    def _result(self, scenario: Scenario, seed: int, started: float,
-                payload: dict[str, Any], passed: bool, latency: float) -> TrialResult:
+    def _result(
+        self, scenario: Scenario, seed: int, started: float,
+        payload: dict[str, Any], passed: bool, latency: float,
+    ) -> TrialResult:
         leaks = 0 if passed else 1
         metrics = (
             MetricValue("fleet_isolation_score", fleet_isolation_score(leaks, 1),

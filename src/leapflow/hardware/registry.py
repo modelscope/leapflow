@@ -20,7 +20,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque, Mapping, Sequence
+from typing import Any, Deque, Iterable, Mapping, Sequence
 
 from leapflow.hardware.context import (
     SUPPORTED_HC_VERSIONS,
@@ -304,6 +304,10 @@ class HardwareRegistry:
         self._settings = settings or HardwareSettings()
         self._explicit_providers = tuple(providers)
         self._contexts: dict[str, HardwareContext] = {}
+        # Declarations owned by external sources (fabric nodes), keyed by source id
+        # in registration order. Kept apart from ``_contexts`` because ``load()``
+        # rebuilds the admitted set from scratch and must re-merge these.
+        self._external_contexts: dict[str, tuple[HardwareContext, ...]] = {}
         self._transports: dict[str, HardwareTransport] = {}
         self._open_locks: dict[str, asyncio.Lock] = {}
         self._io_locks: dict[str, asyncio.Lock] = {}
@@ -376,7 +380,37 @@ class HardwareRegistry:
 
         admitted: list[str] = []
         rejected: list[str] = []
-        for context in discovered:
+        self._merge_candidates(discovered, notes=notes, admitted=admitted, rejected=rejected)
+        # External sources (fabric nodes) merge after local providers, in registration
+        # order -- the order *is* the precedence rule: a locally declared id always
+        # wins, and the source's duplicate is recorded as rejected rather than
+        # replacing it (frozen LHP spec §8).
+        for source_contexts in tuple(self._external_contexts.values()):
+            self._merge_candidates(source_contexts, notes=notes, admitted=admitted, rejected=rejected)
+
+        self._report = LoadReport(
+            admitted=tuple(admitted), rejected=tuple(rejected), notes=tuple(notes)
+        )
+        logger.info(
+            "Hardware registry loaded: %d admitted, %d rejected", len(admitted), len(rejected)
+        )
+        return self._report
+
+    def _merge_candidates(
+        self,
+        candidates: Iterable[HardwareContext],
+        *,
+        notes: list[AdmissionNote],
+        admitted: list[str],
+        rejected: list[str],
+    ) -> None:
+        """Admit each candidate in order, updating *notes*/*admitted*/*rejected*.
+
+        Shared by the local-provider pass and the external-source pass so both
+        obey exactly one admission implementation: V1-V7 via ``_admit``, the
+        duplicate rule inside ``_admit`` (first writer wins), and the V8 cap.
+        """
+        for context in candidates:
             verdict = self._admit(context, notes)
             if verdict is None:
                 rejected.append(context.device_id or "<unnamed>")
@@ -395,14 +429,6 @@ class HardwareRegistry:
             self._contexts[verdict.device_id] = verdict
             admitted.append(verdict.device_id)
 
-        self._report = LoadReport(
-            admitted=tuple(admitted), rejected=tuple(rejected), notes=tuple(notes)
-        )
-        logger.info(
-            "Hardware registry loaded: %d admitted, %d rejected", len(admitted), len(rejected)
-        )
-        return self._report
-
     def _resolve_providers(self, notes: list[AdmissionNote]) -> tuple[HardwareContextProvider, ...]:
         if self._explicit_providers:
             return self._explicit_providers
@@ -420,6 +446,39 @@ class HardwareRegistry:
                     )
                 )
         return tuple(resolved)
+
+    # ── External sources (fabric nodes) ──
+
+    def register_external_contexts(
+        self, source_id: str, contexts: Iterable[HardwareContext]
+    ) -> tuple[str, ...]:
+        """Record the declarations owned by an external source (a fabric node).
+
+        Recording is bookkeeping -- the declarations become live on the next
+        ``load()``/``reconcile()``, which re-merges every registered source after
+        the local providers. Re-registering the same source replaces its snapshot.
+        Returns the device ids recorded for this source.
+        """
+        text = str(source_id or "").strip()
+        if not text:
+            raise ValueError("external source_id must be non-empty")
+        snapshot = tuple(contexts)
+        self._external_contexts[text] = snapshot
+        return tuple(context.device_id for context in snapshot if context.device_id)
+
+    def unregister_external_source(self, source_id: str) -> tuple[str, ...]:
+        """Drop *source_id*'s declarations and return the ids that were recorded.
+
+        Bookkeeping only -- the admitted set keeps the devices until the next
+        ``load()``/``reconcile()`` removes them, which is where transports are
+        closed and no longer-running devices detach cleanly.
+        """
+        snapshot = self._external_contexts.pop(str(source_id or "").strip(), ())
+        return tuple(context.device_id for context in snapshot if context.device_id)
+
+    def external_source_ids(self) -> tuple[str, ...]:
+        """Return the registered external source ids, in registration order."""
+        return tuple(self._external_contexts)
 
     async def reconcile(self) -> LoadReport:
         """Re-run discovery and converge on the new device set without disrupting the old.
