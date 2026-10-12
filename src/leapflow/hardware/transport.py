@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
 
 from leapflow.hardware.context import HardwareContext, Quality
 
@@ -370,6 +370,39 @@ class BatchWriteOutcome:
     side_effect_state: str = SIDE_EFFECT_UNKNOWN
 
 
+SIDE_EFFECT_SEVERITY: dict[str, int] = {
+    SIDE_EFFECT_NONE: 0,
+    SIDE_EFFECT_COMMITTED: 1,
+    SIDE_EFFECT_PARTIAL: 2,
+    SIDE_EFFECT_UNKNOWN: 3,
+}
+"""Ranking used by :func:`worst_side_effect_state`. UNKNOWN dominates: an
+unproven verdict must outweigh every proven one, because it is the only state
+that forbids replay."""
+
+
+def worst_side_effect_state(states: Iterable[str]) -> str:
+    """Return the most severe verdict among *states*.
+
+    The merge rule for batch operations, kept here beside ``BatchWriteOutcome``
+    because it is transport-domain semantics rather than any one caller's policy.
+    An unrecognized state ranks as ``UNKNOWN`` -- a verdict this code cannot
+    interpret must not be treated as a mild one. An empty input is ``NONE``:
+    with no outcomes at all, no effect is provable.
+    """
+    worst = SIDE_EFFECT_NONE
+    worst_rank = -1
+    for state in states:
+        text = str(state)
+        rank = SIDE_EFFECT_SEVERITY.get(text)
+        if rank is None:
+            rank = SIDE_EFFECT_SEVERITY[SIDE_EFFECT_UNKNOWN]
+        if rank > worst_rank:
+            worst = text
+            worst_rank = rank
+    return worst
+
+
 @runtime_checkable
 class BatchTransport(Protocol):
     """Optional side-protocol for vectorized read/write.
@@ -424,4 +457,5 @@ __all__ = [
     "TransportError",
     "TransportStatus",
     "WriteOutcome",
+    "worst_side_effect_state",
 ]

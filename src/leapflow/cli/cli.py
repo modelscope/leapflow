@@ -333,6 +333,15 @@ def main(argv: list[str] | None = None) -> int:
     hw_resume.add_argument("device", help="Device id from `leap hw list`")
     hw_replay = hw_sub.add_parser("replay", parents=[hw_json], help="Replay a raw NDJSON segment through the event detector")
     hw_replay.add_argument("segment_path", help="Path to the NDJSON segment file")
+    hw_serve = hw_sub.add_parser(
+        "serve",
+        help="Serve this machine's devices as an LHP fabric node (edge runtime)",
+    )
+    hw_serve.add_argument("--node-id", default="", help="Node id, [a-z0-9_]+ (env LEAPFLOW_LHP_NODE_ID)")
+    hw_serve.add_argument("--host", default="127.0.0.1", help="TCP bind address (default: 127.0.0.1)")
+    hw_serve.add_argument("--port", type=int, default=8767, help="TCP bind port (default: 8767; 0 picks a free port)")
+    hw_serve.add_argument("--unix", default="", dest="unix_path", help="Bind a Unix socket path instead of TCP")
+    hw_serve.add_argument("--token", default="", help="Shared hello secret (env LEAPFLOW_LHP_TOKEN)")
 
     # leap doctor
     doctor_parser = subparsers.add_parser("doctor", help="Run system health diagnostics")

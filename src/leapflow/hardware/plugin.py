@@ -18,9 +18,7 @@ the governance decision, not a convenience.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from typing import Any
 
 from leapflow.plugins.protocol import ToolMetadata
@@ -44,11 +42,51 @@ class HardwareContextPlugin:
 
         # LHPGateway: bridges hardware state to/from LLM context.
         self._lhp_gateway: Any = None
-        # FleetManager: multi-node robot coordination.
+        # FleetManager: multi-node robot coordination.  Node configs are parsed
+        # here; registration happens in ``start_fleet`` once a loop is live.
         self._fleet_manager: Any = None
         self._fleet_tools: list[ToolMetadata] | None = None
+        self._pending_fleet_nodes: list[Any] = []
+        self._fleet_started: bool = False
+        # Managers orphaned by a registry re-bind; closed by the next async
+        # startup path (see ``start_fleet``) or by ``_teardown``.
+        self._stale_fleet_managers: list[Any] = []
         # HardwareHealthMonitor: centralized health supervision.
         self._health_monitor: Any = None
+
+    def _adopt_reload_state(self, previous: Any) -> None:
+        """Take ownership of live hardware supervisors from a retiring instance.
+
+        Plugin reload creates a new plugin object while the daemon's registry,
+        fleet connections and heartbeat remain live. Recreating those resources
+        would leave the old heartbeat orphaned and the fresh manager unstarted.
+        Transfer only long-lived runtime objects; tool handlers are rebuilt from
+        the fresh class after dependency injection.
+        """
+        if getattr(previous, "plugin_id", "") != self.plugin_id:
+            return
+        # Seed the shared registry before DI is replayed so the identity check in
+        # ``bind_runtime`` does not misclassify this ownership transfer as a
+        # registry replacement and clear the resources adopted below.
+        self._registry = getattr(previous, "_registry", None)
+        self._fleet_manager = getattr(previous, "_fleet_manager", None)
+        self._fleet_started = bool(getattr(previous, "_fleet_started", False))
+        self._pending_fleet_nodes = list(
+            getattr(previous, "_pending_fleet_nodes", ())
+        )
+        self._stale_fleet_managers = list(
+            getattr(previous, "_stale_fleet_managers", ())
+        )
+        self._health_monitor = getattr(previous, "_health_monitor", None)
+        self._health_monitor_started = bool(
+            getattr(previous, "_health_monitor_started", False)
+        )
+
+        # The retiring instance's root-scope teardown may still run later. It
+        # must not close resources whose ownership has moved to this instance.
+        previous._fleet_manager = None
+        previous._stale_fleet_managers = []
+        previous._health_monitor = None
 
     @property
     def plugin_id(self) -> str:
@@ -84,8 +122,14 @@ class HardwareContextPlugin:
         """
         registry_changed = False
         if "hardware_registry" in deps:
-            self._registry = deps.get("hardware_registry")
-            registry_changed = True
+            new_registry = deps.get("hardware_registry")
+            # Identity, not presence: a plugin hot reload re-applies every
+            # last-bound dep (``ScopedPluginRegistry.reload``) with the *same*
+            # registry. Treating that as a change dropped the live, started
+            # FleetManager for a fresh one nobody ever starts -- fleet tools
+            # then saw an empty fleet while the orphan kept supervising.
+            registry_changed = new_registry is not self._registry
+            self._registry = new_registry
         if "hardware_approval_gate" in deps:
             self._gate = deps.get("hardware_approval_gate")
             # Late-bind into the live HardwareTools so already-registered
@@ -103,11 +147,18 @@ class HardwareContextPlugin:
             self._event_bus = deps.get("event_bus")
 
         if registry_changed:
+            # The previous manager may own a live heartbeat task; stash it so
+            # an async path can close it. Clearing the reference here alone
+            # would orphan a supervisor that keeps probing the old registry.
+            if self._fleet_manager is not None:
+                self._stale_fleet_managers.append(self._fleet_manager)
             self._tools = None
             self._hw_tools = None
             self._lhp_gateway = None
             self._fleet_manager = None
             self._fleet_tools = None
+            self._pending_fleet_nodes = []
+            self._fleet_started = False
             self._health_monitor = None
             self._teardown_registered = False
 
@@ -176,12 +227,17 @@ class HardwareContextPlugin:
             except Exception:  # noqa: BLE001
                 logger.debug("Health monitor stop failed", exc_info=True)
 
-        # Fleet manager must stop before registry closes connections.
-        if self._fleet_manager is not None:
+        # Fleet managers must stop before registry closes connections. Stale
+        # managers (orphaned by a registry re-bind) are closed here too: their
+        # heartbeat otherwise keeps probing a registry nobody owns.
+        for manager in (*self._stale_fleet_managers, self._fleet_manager):
+            if manager is None:
+                continue
             try:
-                await self._fleet_manager.close()
+                await manager.close()
             except Exception:  # noqa: BLE001
                 logger.debug("Fleet manager close failed", exc_info=True)
+        self._stale_fleet_managers = []
 
         # Registry close_all.
         await self._registry.close_all()
@@ -219,81 +275,81 @@ class HardwareContextPlugin:
     def _init_fleet_manager(self) -> None:
         """Create FleetManager when fleet nodes are configured.
 
-        Fleet configuration is read from:
-        1. Environment variable LEAPFLOW_FLEET_NODES (JSON array)
-        2. Settings hardware.fleet_nodes (list of node configs)
-
-        When no fleet nodes are configured, FleetManager is not created
-        and no fleet tools appear in the tool index.
+        Node configuration arrives through ``LEAPFLOW_FLEET_NODES`` (JSON
+        array); the Settings-based double-track, failure backoff and
+        re-registration lifecycle are P2 -- P1 keeps the env-first contract.
+        When no nodes are configured, FleetManager is not created and no
+        fleet tools appear in the tool index.
         """
         if self._fleet_manager is not None:
             return
         if self._registry is None:
             return
 
-        fleet_configs = self._load_fleet_config()
-        if not fleet_configs:
+        from leapflow.hardware.fleet import FleetManager
+        from leapflow.hardware.fleet_config import configured_nodes_from_env
+
+        nodes = configured_nodes_from_env()
+        if not nodes:
             return
 
         try:
-            from leapflow.hardware.fleet import FleetManager, FleetNode
-
             self._fleet_manager = FleetManager(self._registry)
-
-            # Store node configs for deferred async registration.
-            # Actual node registration happens when tools are first accessed
-            # or when an async caller explicitly starts the fleet.
-            self._pending_fleet_nodes: list[Any] = []
-            for node_cfg in fleet_configs:
-                try:
-                    node = FleetNode(
-                        node_id=str(node_cfg.get("node_id", "")),
-                        display_name=str(node_cfg.get("display_name", "")),
-                        mcp_endpoint=str(node_cfg.get("mcp_endpoint", "")),
-                    )
-                    if node.node_id and node.mcp_endpoint:
-                        self._pending_fleet_nodes.append(node)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Fleet: failed to parse node config %r: %s",
-                        node_cfg, exc,
-                    )
-
+            # Registration is deferred to ``start_fleet``: it speaks LHP and
+            # needs a running loop, while plugin assembly is synchronous.
+            self._pending_fleet_nodes = list(nodes)
             logger.info(
-                "FleetManager initialized with %d configured node(s)",
-                len(fleet_configs),
+                "FleetManager initialized with %d configured node(s)", len(nodes)
             )
         except Exception:  # noqa: BLE001
             logger.debug("Failed to initialize FleetManager", exc_info=True)
 
-    async def _register_fleet_node_safe(self, node: Any) -> None:
-        """Register a fleet node, swallowing errors."""
-        try:
-            await self._fleet_manager.register_node(node)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Fleet: failed to register node %s: %s",
-                node.node_id, exc,
-            )
+    async def _close_stale_fleet_managers(self) -> None:
+        """Close managers orphaned by a registry re-bind.
 
-    @staticmethod
-    def _load_fleet_config() -> list[dict[str, Any]]:
-        """Load fleet node configuration from env var or settings."""
-        # 1. Environment variable (JSON array of node configs).
-        env_raw = os.environ.get("LEAPFLOW_FLEET_NODES", "")
-        if env_raw:
+        A re-bind replaces the FleetManager synchronously, but closing one is
+        async (stop heartbeat, unregister devices). Stashing keeps the
+        reference alive until this path closes it; otherwise the old
+        heartbeat task probes the old registry forever.
+        """
+        stale, self._stale_fleet_managers = self._stale_fleet_managers, []
+        for manager in stale:
             try:
-                configs = json.loads(env_raw)
-                if isinstance(configs, list):
-                    return [c for c in configs if isinstance(c, dict)]
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(
-                    "LEAPFLOW_FLEET_NODES env var is not valid JSON; ignoring"
-                )
+                await manager.close()
+            except Exception:  # noqa: BLE001 -- stale cleanup must not block startup
+                logger.debug("Stale fleet manager close failed", exc_info=True)
 
-        # 2. Settings-based config is handled by the caller that has
-        #    access to Settings; this static method only covers env.
-        return []
+    async def start_fleet(self) -> None:
+        """Register configured fleet nodes and start heartbeat supervision.
+
+        Deferred from ``bind_runtime`` because registration speaks LHP and
+        needs an event loop while assembly is synchronous; the runtime calls
+        this once its loop is live (``cli/context.py``, daemon-mode init).
+
+        Best-effort per node: an unreachable board logs and is skipped --
+        starting the host runtime must never depend on an edge node being
+        powered.  P2 adds retry/backoff and keep-last-degraded recovery.
+        Idempotent.  Also closes any manager orphaned by a registry re-bind.
+        """
+        await self._close_stale_fleet_managers()
+        if self._fleet_started or self._fleet_manager is None:
+            return
+        self._fleet_started = True
+        from leapflow.hardware.fleet_config import register_nodes_safely
+
+        registered = await register_nodes_safely(
+            self._fleet_manager, self._pending_fleet_nodes
+        )
+        self._pending_fleet_nodes = []
+        if not registered:
+            return
+        # Fleet admission happens after the initial runtime bind, so register
+        # the newly materialized remote contexts with the per-device trust gate.
+        self._register_trust_configs()
+        try:
+            await self._fleet_manager.start_heartbeat()
+        except Exception:  # noqa: BLE001 -- supervision must not fail startup
+            logger.warning("Fleet: heartbeat failed to start", exc_info=True)
 
     # -- HardwareHealthMonitor initialization ------------------------------
 
@@ -409,7 +465,7 @@ class HardwareContextPlugin:
             return []
 
         try:
-            from leapflow.hardware.fleet import build_fleet_tools
+            from leapflow.hardware.fleet_tools import build_fleet_tools
             return build_fleet_tools(self._fleet_manager)
         except Exception:  # noqa: BLE001
             logger.debug("Failed to build fleet tools", exc_info=True)

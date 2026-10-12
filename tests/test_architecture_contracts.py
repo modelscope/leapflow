@@ -215,6 +215,11 @@ def test_hardware_transports_are_not_named_after_one_device() -> None:
     format and the input spec all arrive from the declaration; the capture backend
     comes from availability. A pair of device-named modules here would have been the
     device knowledge this rule exists to keep out of code.
+
+    ``lhp.py`` qualifies as a protocol binding: it adapts any node speaking the
+    LeapFlow Hardware Protocol onto the transport contract, and holds no device
+    knowledge -- the device identity, endpoint and node id all arrive in the
+    ``TransportRef.config`` the registry admitted.
     """
     allowed = {
         "__init__.py",
@@ -224,6 +229,7 @@ def test_hardware_transports_are_not_named_after_one_device() -> None:
         "mcp.py",
         "host.py",
         "media.py",
+        "lhp.py",
         "robot_arm.py",
         "robot_channels.py",
         "ros2.py",

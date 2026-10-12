@@ -412,6 +412,26 @@ class ScopedToolRegistry:
             raise
         return module
 
+    def _prepare_reloaded_plugin(self, fresh_plugin: ToolPlugin, old_plugin: ToolPlugin | None) -> None:
+        """Restore optional live state and inject dependencies before tool discovery.
+
+        A dependency-bound plugin may expose no tools until ``bind_runtime`` has
+        run. Registration and publication both inspect ``plugin.tools``, so
+        binding only after those steps silently removes its catalog on reload.
+        Stateful plugins may additionally steal long-lived resources from the
+        old instance through the private, optional reload hook.
+        """
+        adopt_state = getattr(fresh_plugin, "_adopt_reload_state", None)
+        if callable(adopt_state) and old_plugin is not None:
+            adopt_state(old_plugin)
+        relevant = {
+            key: value
+            for key, value in self._registry.last_bound_deps.items()
+            if key in fresh_plugin.dependencies
+        }
+        if relevant:
+            fresh_plugin.bind_runtime(**relevant)
+
     def reload(self, plugin_id: str) -> PluginFiber:
         """Reload a plugin: dispose old fiber, re-import module, register new instance.
 
@@ -428,9 +448,11 @@ class ScopedToolRegistry:
             mid-turn tool table swap.
 
         Late-bound dependency re-injection:
-            After the new fiber is activated, the registry's last_bound_deps are re-applied
-            via bind_runtime(). This ensures gates, managers, and other runtime deps that
-            were previously injected are also available to the new plugin instance.
+            Before registration discovers the fresh plugin's tools, the plugin
+            receives its previously-bound runtime dependencies. This preserves
+            dependency-generated catalogs and prevents a reload from publishing
+            an empty tool set. Stateful plugins may adopt live resources from the
+            retiring instance through ``_adopt_reload_state``.
         """
         if plugin_id not in self._fibers:
             raise KeyError(f"Plugin '{plugin_id}' not scoped-registered")
@@ -458,8 +480,10 @@ class ScopedToolRegistry:
         if old_tool_names:
             self._unregister_tools(plugin_id, old_tool_names)
 
-        # 2. Re-import the plugin module to get a fresh instance.
+        # 2. Re-import the plugin module and prepare the fresh instance before
+        # registration inspects its dependency-generated tool catalog.
         fresh_plugin = self._load_fresh_plugin(plugin_id, module_path)
+        self._prepare_reloaded_plugin(fresh_plugin, old_plugin)
 
         # 3. Create new fiber and register the fresh plugin
         new_fiber = self.create_fiber(plugin_id)
@@ -470,9 +494,5 @@ class ScopedToolRegistry:
         #    and bump the registry version so consumer caches (e.g. the engine
         #    tool registry) rebuild on the next turn.
         self._registry.publish_plugin_tools(fresh_plugin)
-
-        # 5. Re-inject last-bound runtime dependencies onto the new plugin instance
-        if self._registry.last_bound_deps:
-            self._registry.bind_runtime(**self._registry.last_bound_deps)
 
         return new_fiber
