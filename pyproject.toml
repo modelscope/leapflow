@@ -44,8 +44,8 @@ dependencies = [
     # Python 3.10 backports of otherwise 3.11-only modules, used behind the
     # conditional imports in domain/tool_pipeline.py and tools/repo_map.py.
     # Declared explicitly rather than relied on transitively, for the same
-    # reason as httpx above; async-timeout 5.0 is the first release with the
-    # when()/reschedule() API that the tool execution deadline pauses.
+    # reason as httpx above; the tool execution deadline is adapted to
+    # async-timeout's scope API (deadline/update/reject), verified against 5.0.
     "async-timeout>=5.0; python_version < '3.11'",
     "tomli>=2.0; python_version < '3.11'",
 ]
