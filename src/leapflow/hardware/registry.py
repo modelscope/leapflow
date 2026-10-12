@@ -83,6 +83,9 @@ class HardwareSettings:
     preview_max_fps: float = 30.0
     preview_max_width: int = 1280
     preview_quality: int = 85
+    # Typed root Settings input for LHP edge nodes; parsed by fleet_config at
+    # plugin startup so the registry remains free of topology concerns.
+    fleet_nodes: str = ""
 
     @property
     def denies_unverified_writes(self) -> bool:
@@ -144,6 +147,7 @@ class HardwareSettings:
             reading_store_sensitive=bool(
                 getattr(settings, "hardware_reading_store_sensitive", True)
             ),
+            fleet_nodes=str(getattr(settings, "hardware_fleet_nodes", "") or ""),
             instrument_db_path=(
                 str(profile_layout.instrument_db_path) if profile_layout is not None else ""
             ),

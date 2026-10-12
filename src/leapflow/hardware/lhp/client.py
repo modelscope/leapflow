@@ -35,7 +35,7 @@ from leapflow.hardware.lhp.protocol import (
     ERR_CONNECTION_CLOSED,
     ERR_PROTOCOL_MISMATCH,
     ERR_TIMEOUT,
-    LHP_PROTOCOL_VERSION,
+    LHP_SUPPORTED_VERSIONS,
     MAX_FRAME_BYTES,
     LhpRemoteError,
     decode_frame,
@@ -70,24 +70,29 @@ class DirectLhpClient:
         self._closed = False
 
     async def connect(self) -> Mapping[str, Any]:
-        """Perform the hello exchange. Returns the node's hello payload."""
-        hello = await self._serve(
-            make_request(
-                next(self._ids),
-                "hello",
-                {"protocol": LHP_PROTOCOL_VERSION, "token": "", "client": "direct"},
-            )
+        """Negotiate the newest mutually supported version and return hello."""
+        mismatch: LhpRemoteError | None = None
+        for protocol in LHP_SUPPORTED_VERSIONS:
+            try:
+                hello = await self._serve(
+                    make_request(
+                        next(self._ids),
+                        "hello",
+                        {"protocol": protocol, "token": "", "client": "direct"},
+                    )
+                )
+                validated = _validated_hello(hello, protocol)
+            except LhpRemoteError as exc:
+                if exc.code == ERR_PROTOCOL_MISMATCH:
+                    mismatch = exc
+                    continue
+                raise
+            self._node_id = str(validated.get("node_id") or "")
+            return validated
+        raise mismatch or LhpRemoteError(
+            ERR_PROTOCOL_MISMATCH,
+            f"node supports none of {LHP_SUPPORTED_VERSIONS!r}",
         )
-        if not isinstance(hello, Mapping):
-            raise LhpRemoteError(ERR_PROTOCOL_MISMATCH, "malformed hello payload")
-        remote_protocol = hello.get("protocol")
-        if remote_protocol != LHP_PROTOCOL_VERSION:
-            raise LhpRemoteError(
-                ERR_PROTOCOL_MISMATCH,
-                f"node speaks protocol {remote_protocol!r}, expected {LHP_PROTOCOL_VERSION}",
-            )
-        self._node_id = str(hello.get("node_id") or "")
-        return hello
 
     async def request(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
         """Send one request; raise ``LhpRemoteError`` when the node answers an error."""
@@ -187,39 +192,43 @@ class SocketLhpClient:
                 if self._closed:
                     raise LhpRemoteError(ERR_CONNECTION_CLOSED, "client closed")
                 return
-            await self._open_transport()
-            if self._closed:
-                # ``close()`` ran while the transport was being opened; the
-                # check at method entry predates the flag. Without this the
-                # handshake below would complete on a closed client and leave
-                # the fresh socket live.
-                await self._teardown_locked(ERR_CONNECTION_CLOSED, "client closed")
-                raise LhpRemoteError(ERR_CONNECTION_CLOSED, "client closed")
-            try:
-                hello = await self._exchange(
-                    "hello",
-                    {
-                        "protocol": LHP_PROTOCOL_VERSION,
-                        "token": self._token,
-                        "client": self._client_name,
-                    },
-                )
-            except BaseException:
-                # A failed handshake must not leave a half-open socket behind.
-                await self._teardown_locked(ERR_CONNECTION_CLOSED, "handshake failed")
-                raise
-            self._node_id = str((hello or {}).get("node_id") or "")
-            remote_protocol = (hello or {}).get("protocol")
-            if remote_protocol != LHP_PROTOCOL_VERSION:
-                await self._teardown_locked(
-                    ERR_PROTOCOL_MISMATCH,
-                    f"node speaks protocol {remote_protocol!r}",
-                )
-                raise LhpRemoteError(
-                    ERR_PROTOCOL_MISMATCH,
-                    f"node speaks protocol {remote_protocol!r}, expected {LHP_PROTOCOL_VERSION}",
-                )
-            self._hello = dict(hello) if isinstance(hello, Mapping) else {}
+            mismatch: LhpRemoteError | None = None
+            for protocol in LHP_SUPPORTED_VERSIONS:
+                await self._open_transport()
+                if self._closed:
+                    # ``close()`` ran while the transport was being opened; the
+                    # check at method entry predates the flag. Without this the
+                    # handshake below would complete on a closed client and leave
+                    # the fresh socket live.
+                    await self._teardown_locked(ERR_CONNECTION_CLOSED, "client closed")
+                    raise LhpRemoteError(ERR_CONNECTION_CLOSED, "client closed")
+                try:
+                    hello = await self._exchange(
+                        "hello",
+                        {
+                            "protocol": protocol,
+                            "token": self._token,
+                            "client": self._client_name,
+                        },
+                    )
+                    validated = _validated_hello(hello, protocol)
+                except LhpRemoteError as exc:
+                    await self._teardown_locked(ERR_CONNECTION_CLOSED, "handshake failed")
+                    if exc.code == ERR_PROTOCOL_MISMATCH:
+                        mismatch = exc
+                        continue
+                    raise
+                except BaseException:
+                    # A failed handshake must not leave a half-open socket behind.
+                    await self._teardown_locked(ERR_CONNECTION_CLOSED, "handshake failed")
+                    raise
+                self._node_id = str(validated.get("node_id") or "")
+                self._hello = validated
+                return
+            raise mismatch or LhpRemoteError(
+                ERR_PROTOCOL_MISMATCH,
+                f"node supports none of {LHP_SUPPORTED_VERSIONS!r}",
+            )
 
     async def _open_transport(self) -> None:
         parsed = urlparse(self._endpoint)
@@ -356,6 +365,19 @@ class SocketLhpClient:
             with suppress(Exception):
                 writer.close()
                 await writer.wait_closed()
+
+
+def _validated_hello(payload: Any, requested_protocol: int) -> dict[str, Any]:
+    """Validate one hello result without silently accepting version drift."""
+    if not isinstance(payload, Mapping):
+        raise LhpRemoteError(ERR_PROTOCOL_MISMATCH, "malformed hello payload")
+    remote_protocol = payload.get("protocol")
+    if remote_protocol != requested_protocol:
+        raise LhpRemoteError(
+            ERR_PROTOCOL_MISMATCH,
+            f"node speaks protocol {remote_protocol!r}, expected {requested_protocol}",
+        )
+    return dict(payload)
 
 
 __all__ = [

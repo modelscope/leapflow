@@ -25,8 +25,12 @@ from typing import Any, Mapping
 import pytest
 
 from leapflow.hardware.context import (
+    Channel,
     ContextProvenance,
+    Direction,
     HardwareContext,
+    PrivacyTier,
+    Representation,
     TransportRef,
     TrustConfig,
 )
@@ -51,6 +55,7 @@ from leapflow.hardware.lhp import (
     FAILURE_SAFETY_DENIED,
     LHP_CAPABILITIES,
     LHP_PROTOCOL_VERSION,
+    LHP_V1_CAPABILITIES,
     MAX_FRAME_BYTES,
     DirectLhpClient,
     LhpNodeServer,
@@ -67,7 +72,10 @@ from leapflow.hardware.lhp import (
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_UNKNOWN,
+    FrameReading,
+    FrameTransport,
     TransportError,
+    TransportStatus,
     WriteOutcome,
 )
 from leapflow.hardware.transports.lhp import build_transport
@@ -76,6 +84,113 @@ from tests._harness.hardware_stubs import (
     lhp_node_server,
     stub_node_context,
 )
+
+
+_FRAME_JPEG = (
+    b"\xff\xd8"
+    b"\xff\xc0\x00\x11\x08\x00\x02\x00\x04\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+    b"\xff\xd9"
+)
+
+
+class _FrameNodeTransport:
+    """Node-local frame source with observable profile and release state."""
+
+    kind = "frame_stub"
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, int, int, float]] = []
+        self.closes = 0
+
+    async def read_frame(
+        self, channel_id: str, *, max_width: int = 0, quality: int = 0, fps: float = 0.0
+    ) -> FrameReading:
+        self.requests.append((channel_id, max_width, quality, fps))
+        return FrameReading(
+            device_id="camera",
+            channel_id=channel_id,
+            data=_FRAME_JPEG,
+            width=4,
+            height=2,
+            sequence=len(self.requests),
+        )
+
+    async def close(self) -> TransportStatus:
+        self.closes += 1
+        return TransportStatus(connected=False)
+
+
+class _LegacyFrameNodeTransport:
+    """Frame source implementing the original signature without cadence control."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, int, int]] = []
+
+    async def read_frame(
+        self, channel_id: str, *, max_width: int = 0, quality: int = 0
+    ) -> FrameReading:
+        self.requests.append((channel_id, max_width, quality))
+        return FrameReading(
+            device_id="camera",
+            channel_id=channel_id,
+            data=_FRAME_JPEG,
+            width=4,
+            height=2,
+            sequence=len(self.requests),
+        )
+
+
+class _FrameNodeRegistry:
+    """Small node registry exposing one privacy-gated frame channel."""
+
+    def __init__(self, source: Any | None = None) -> None:
+        self.source = source or _FrameNodeTransport()
+        self.drops = 0
+        self._lock = asyncio.Lock()
+        self._context = HardwareContext(
+            device_id="camera",
+            display_name="Remote camera",
+            device_class="camera",
+            transport=TransportRef(kind="mock", config={}),
+            channels=(
+                Channel(
+                    channel_id="frame",
+                    direction=Direction.READ.value,
+                    quantity="image_frame",
+                    representation=Representation.FRAME.value,
+                    media_type="image/jpeg",
+                    privacy=PrivacyTier.ENVIRONMENT.value,
+                ),
+            ),
+            provenance=ContextProvenance(verified_by="frame-test"),
+        )
+
+    def contexts(self) -> tuple[HardwareContext, ...]:
+        return (self._context,)
+
+    def context(self, device_id: str) -> HardwareContext | None:
+        return self._context if device_id == "camera" else None
+
+    def device_io(self, device_id: str) -> asyncio.Lock:
+        return self._lock
+
+    async def transport(self, device_id: str) -> Any:
+        return self.source
+
+    async def drop_transport(self, device_id: str) -> None:
+        self.drops += 1
+        await self.source.close()
+
+
+def _frame_host_context(config: dict[str, Any]) -> HardwareContext:
+    return HardwareContext(
+        device_id="jetson__camera",
+        display_name="Remote camera",
+        device_class="camera",
+        transport=TransportRef(kind="lhp", config=config),
+        channels=_FrameNodeRegistry().contexts()[0].channels,
+        provenance=ContextProvenance(verified_by="frame-test"),
+    )
 
 
 def _host_context(
@@ -102,9 +217,16 @@ class _ScriptedServer:
     covered against the real ``LhpNodeServer``.
     """
 
-    def __init__(self, responder: Any, *, protocol: int = LHP_PROTOCOL_VERSION) -> None:
+    def __init__(
+        self,
+        responder: Any,
+        *,
+        protocol: int = LHP_PROTOCOL_VERSION,
+        capabilities: tuple[str, ...] = (),
+    ) -> None:
         self._responder = responder
         self._protocol = protocol
+        self._capabilities = capabilities
 
     async def handle_request(
         self, request: Mapping[str, Any], *, via: str = "direct"
@@ -112,7 +234,11 @@ class _ScriptedServer:
         if request.get("method") == "hello":
             return ok_response(
                 request.get("id"),
-                {"protocol": self._protocol, "node_id": "scripted", "capabilities": []},
+                {
+                    "protocol": self._protocol,
+                    "node_id": "scripted",
+                    "capabilities": list(self._capabilities),
+                },
             )
         return self._responder(request)
 
@@ -236,6 +362,22 @@ async def test_hello_protocol_mismatch_is_refused() -> None:
         {"id": 1, "method": "hello", "params": {"protocol": 999}}
     )
     assert response["error"]["code"] == ERR_PROTOCOL_MISMATCH
+
+
+async def test_v1_hello_remains_compatible_without_advertising_frame_methods() -> None:
+    response = await lhp_node_server().handle_request(
+        {"id": 1, "method": "hello", "params": {"protocol": 1}}
+    )
+    assert response["ok"] is True
+    assert response["result"]["protocol"] == 1
+    assert tuple(response["result"]["capabilities"]) == LHP_V1_CAPABILITIES
+    assert "read_frame" not in response["result"]["capabilities"]
+
+
+async def test_client_falls_back_to_a_v1_only_direct_node() -> None:
+    server = _ScriptedServer(lambda request: ok_response(request.get("id"), {}), protocol=1)
+    hello = await DirectLhpClient(server).connect()
+    assert hello["protocol"] == 1
 
 
 async def test_token_gate_applies_to_socket_via_but_not_direct() -> None:
@@ -430,6 +572,127 @@ async def test_socket_binding_carries_every_data_plane_method() -> None:
         await server.stop()
 
 
+async def test_socket_client_reconnects_and_falls_back_to_a_v1_only_node() -> None:
+    connections = 0
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal connections
+        connections += 1
+        try:
+            request = decode_frame(await reader.readline())
+            protocol = request.get("params", {}).get("protocol")
+            if protocol != 1:
+                writer.write(
+                    encode_frame(
+                        error_response(request.get("id"), ERR_PROTOCOL_MISMATCH, "v1 only")
+                    )
+                )
+            else:
+                writer.write(
+                    encode_frame(
+                        ok_response(
+                            request.get("id"),
+                            {"protocol": 1, "node_id": "legacy", "capabilities": []},
+                        )
+                    )
+                )
+            await writer.drain()
+            await reader.read()
+        finally:
+            writer.close()
+
+    raw_server, endpoint = await _start_raw_tcp(handler)
+    client = SocketLhpClient(endpoint)
+    try:
+        hello = await client.connect()
+        assert hello["protocol"] == 1
+        assert hello["node_id"] == "legacy"
+        assert connections == 2, "v2 mismatch must reconnect before the v1 hello"
+    finally:
+        await client.close()
+        raw_server.close()
+        await raw_server.wait_closed()
+
+
+async def test_remote_frame_round_trips_over_socket_and_releases_node_capture() -> None:
+    registry = _FrameNodeRegistry()
+    server = LhpNodeServer(registry, node_id="jetson")
+    socket_host, port = await server.start(host="127.0.0.1", port=0)
+    config = {
+        "endpoint": f"tcp://{socket_host}:{port}",
+        "node_id": "jetson",
+        "remote_device_id": "camera",
+        "timeout_s": 2.0,
+    }
+    transport = build_transport(config)
+    try:
+        status = await transport.open(_frame_host_context(config))
+        assert status.metadata["protocol"] == LHP_PROTOCOL_VERSION
+        assert isinstance(transport, FrameTransport)
+        frame = await transport.read_frame("frame", max_width=640, quality=70, fps=4.0)
+        assert frame.device_id == "jetson__camera"
+        assert frame.channel_id == "frame"
+        assert frame.data == _FRAME_JPEG
+        assert (frame.width, frame.height, frame.sequence) == (4, 2, 1)
+        assert registry.source.requests == [("frame", 640, 70, 4.0)]
+        await transport.close()
+        assert registry.drops == 1
+        assert registry.source.closes == 1
+    finally:
+        await transport.close()
+        await server.stop()
+
+
+async def test_node_preserves_legacy_frame_transport_without_fps_keyword() -> None:
+    source = _LegacyFrameNodeTransport()
+    server = LhpNodeServer(_FrameNodeRegistry(source), node_id="jetson")
+    response = await server.handle_request(
+        {
+            "id": 1,
+            "method": "read_frame",
+            "params": {
+                "device_id": "camera",
+                "channel_id": "frame",
+                "max_width": 640,
+                "quality": 70,
+                "fps": 4.0,
+            },
+        }
+    )
+
+    assert response["ok"] is True
+    assert source.requests == [("frame", 640, 70)]
+
+
+async def test_malformed_remote_frame_payload_is_refused() -> None:
+    def respond(request: Mapping[str, Any]) -> dict[str, Any]:
+        return ok_response(
+            request.get("id"),
+            {
+                "device_id": "camera",
+                "channel_id": "frame",
+                "data_b64": "not base64!",
+                "size_bytes": 5,
+                "media_type": "image/jpeg",
+                "width": 4,
+                "height": 2,
+                "sequence": 1,
+            },
+        )
+
+    server = _ScriptedServer(
+        respond,
+        capabilities=("read_frame", "release_frame"),
+    )
+    config = {"server": server, "remote_device_id": "camera"}
+    transport = build_transport(config)
+    await transport.open(_frame_host_context(config))
+    with pytest.raises(TransportError) as caught:
+        await transport.read_frame("frame")
+    assert caught.value.failure_code == "lhp_malformed_result"
+    await transport.close()
+
+
 async def test_unix_socket_binding_round_trips() -> None:
     # A short path on purpose: pytest's tmp_path (~100 chars on macOS) exceeds
     # the AF_UNIX sun_path limit before the socket name is even appended.
@@ -598,8 +861,13 @@ class _StaticProvider:
         return self._contexts
 
 
-def _node_registry(*contexts: HardwareContext) -> HardwareRegistry:
-    """A real registry: declarations reach the wire via ``to_dict()``."""
+def _node_registry(
+    *contexts: HardwareContext, provider: _StaticProvider | None = None
+) -> HardwareRegistry:
+    """A real registry: declarations reach the wire via ``to_dict()``.
+
+    Pass ``provider`` to change the node's declarations later, as a rescan would.
+    """
     settings = HardwareSettings(
         enabled=True,
         unverified_context_policy=UnverifiedContextPolicy.ALLOW,
@@ -608,7 +876,7 @@ def _node_registry(*contexts: HardwareContext) -> HardwareRegistry:
         stream_enabled=False,
         persist_readings=False,
     )
-    registry = HardwareRegistry(settings, providers=(_StaticProvider(contexts),))
+    registry = HardwareRegistry(settings, providers=(provider or _StaticProvider(contexts),))
     registry.load()
     return registry
 
@@ -1298,13 +1566,13 @@ async def test_heartbeat_sweep_logs_outage_and_recovery(
     peak = 0
     answers = {"a": False, "b": False}
 
-    async def _probe(endpoint: str, *, token: str = "") -> bool:
+    async def _probe(endpoint: str, *, token: str = "") -> dict[str, Any] | None:
         nonlocal in_flight, peak
         in_flight += 1
         peak = max(peak, in_flight)
         await asyncio.sleep(0.01)
         in_flight -= 1
-        return answers[endpoint]
+        return {} if answers[endpoint] else None
 
     manager._probe_endpoint = _probe  # type: ignore[method-assign]
     stale = time.monotonic() - 5.0
@@ -1321,6 +1589,71 @@ async def test_heartbeat_sweep_logs_outage_and_recovery(
     assert manager._nodes["b"].status == "offline"
     assert "node 'a' back online" in caplog.text
     await registry.close_all()
+
+
+async def test_hello_fingerprints_declarations_without_node_private_bindings() -> None:
+    """Stable while nothing changes; moves with any declaration; blind to secrets."""
+    provider = _StaticProvider((_node_device("host"),))
+    registry = _node_registry(provider=provider)
+    server = LhpNodeServer(registry, node_id="yahboom")
+    first = (await DirectLhpClient(server).connect())["declarations"]
+    assert first and first == (await DirectLhpClient(server).connect())["declarations"]
+
+    provider._contexts = (_with_transport(
+        _node_device("host"), TransportRef(kind="mock", config={"api_token": "rotated"})
+    ),)
+    registry.load()
+    assert (await DirectLhpClient(server).connect())["declarations"] == first, (
+        "a node-private binding never crosses the wire, so it must not move the fingerprint"
+    )
+
+    provider._contexts = (_node_device("host", display_name="Renamed"),)
+    registry.load()
+    assert (await DirectLhpClient(server).connect())["declarations"] != first
+    await registry.close_all()
+
+
+async def test_heartbeat_re_registers_a_node_whose_declarations_changed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The board defect: a node redeployed inside one heartbeat never looked offline.
+
+    The host kept the envelope it first admitted -- a thermal limit of 0.1045 degC
+    raised false alarms after the node already declared 104.5 -- and a device
+    added on the node would never have appeared. Liveness alone cannot see either.
+    """
+    provider = _StaticProvider((_node_device("arm"),))
+    node_registry = _node_registry(provider=provider)
+    node_server, endpoint = await _start_node(node_registry, "jetson01")
+    host_registry = _node_registry()
+    manager = FleetManager(host_registry)
+    try:
+        await manager.register_node(FleetNode("jetson01", "Bench Jetson", endpoint))
+        with caplog.at_level("INFO", logger="leapflow.hardware.fleet"):
+            await manager._heartbeat_sweep()
+        assert "re-registering" not in caplog.text, "an unchanged node must not churn"
+
+        provider._contexts = (
+            _node_device("arm", display_name="Arm (redeployed)"),
+            _node_device("camera"),
+        )
+        node_registry.load()
+        with caplog.at_level("INFO", logger="leapflow.hardware.fleet"):
+            await manager._heartbeat_sweep()
+        assert "declarations changed; re-registering" in caplog.text
+        assert manager.route_device("jetson01__camera") == "jetson01"
+        arm = host_registry.context("jetson01__arm")
+        assert arm is not None and arm.display_name == "Arm (redeployed)"
+
+        caplog.clear()
+        with caplog.at_level("INFO", logger="leapflow.hardware.fleet"):
+            await manager._heartbeat_sweep()
+        assert "re-registering" not in caplog.text, "the new fingerprint is adopted once"
+    finally:
+        await manager.close()
+        await node_server.stop()
+        await host_registry.close_all()
+        await node_registry.close_all()
 
 
 def _with_transport(context: HardwareContext, transport: TransportRef) -> HardwareContext:

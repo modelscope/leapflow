@@ -63,7 +63,7 @@ TransportRef(kind="lhp", config)
 
 | method | params | result | 说明 |
 |---|---|---|---|
-| `hello` | `{protocol, token, client}` | `{protocol, node_id, device_count, capabilities}` | **socket 绑定必须先发**；令牌校验；版本协商 |
+| `hello` | `{protocol, token, client}` | `{protocol, node_id, device_count, declarations?, capabilities}` | **socket 绑定必须先发**；令牌校验；版本协商；`declarations` 是导出声明集的稳定指纹，旧节点可不提供 |
 | `list` | `{}` | `{node_id, devices: [HardwareContext.to_dict()…]}` | 完整声明（主机据此构建本地 context）；**`transport.config` 置空、仅保留 `kind`**（节点私有绑定——串口路径/驱动凭据/链式 lhp 令牌——不过线；主机本就以自己的 `lhp` 绑定替换）；**`control_bindings` 不导出**（未解析的同类绑定原文，RV2 R2-7） |
 | `read` | `{device_id, channel_id}` | `Reading.to_dict` | |
 | `read_batch` | `{device_id, channel_ids: []}` | `{device_id, readings: [], observed_at}` | 原子批量（`BatchTransport`） |
@@ -72,7 +72,7 @@ TransportRef(kind="lhp", config)
 | `probe` | `{device_id}` | `TransportStatus.to_dict` | **不在 I/O 锁内**：可回答"某读卡住时它还活着吗" |
 | `halt` | `{device_id}` | `TransportStatus.to_dict` | **不在 I/O 锁内**：物理急停不得排队 |
 
-`capabilities` = 除 `hello` 外的全部方法名（本版固定集合，为 P3 增删留位）。
+`capabilities` = 除 `hello` 外的全部方法名（本版固定集合，为 P3 增删留位）。`declarations` 对 wire-safe `list.devices` 的规范 JSON 计算 SHA-256 短指纹；心跳发现指纹变化时，Host 重新注册该节点并由 registry reconcile 差量替换声明。这样节点在一次心跳内重启、没有经历 offline 状态时，Host 也不会长期保留旧 envelope 或遗漏新设备。
 `SocketLhpClient.connect()` 与 `DirectLhpClient.connect()` 均返回该 hello 结果全文（RV2 统一），
 主机侧据 `capabilities` 做特性探测（P3 `subscribe`/帧方法上线后的前向兼容门）。
 

@@ -98,6 +98,9 @@ class FleetNode:
 
     ``token`` is the shared secret for LHP hello-first authentication;
     empty means an open node, acceptable only on a trusted segment.
+
+    ``declarations`` is the fingerprint the node's hello carried when its
+    declarations were last admitted; empty for a node that does not send one.
     """
 
     node_id: str
@@ -108,6 +111,7 @@ class FleetNode:
     status: str = _NODE_STATUS_UNKNOWN
     last_heartbeat: float = 0.0
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    declarations: str = ""
 
     def host_device_id(self, device_id: str) -> str:
         """Return the host-side (namespaced) id for a node-local device id."""
@@ -222,7 +226,7 @@ class FleetManager:
                 failure_code="fleet_no_endpoint",
             )
 
-        reported, remote_contexts = await self._fetch_node_contexts(
+        reported, remote_contexts, declarations = await self._fetch_node_contexts(
             node.endpoint, token=node.token
         )
         if reported and reported != node.node_id:
@@ -262,6 +266,7 @@ class FleetManager:
             device_ids=admitted_local,
             status=_NODE_STATUS_ONLINE,
             last_heartbeat=time.monotonic(),
+            declarations=declarations,
         )
         # Re-registration replaces the previous snapshot: drop stale routing
         # entries for device ids this node no longer declares.
@@ -329,7 +334,7 @@ class FleetManager:
         discovered: list[FleetNode] = []
 
         async def _probe_one(endpoint: str) -> FleetNode | None:
-            reported, remote_contexts = await self._fetch_node_contexts(endpoint)
+            reported, remote_contexts, _ = await self._fetch_node_contexts(endpoint)
             node_id = reported or _endpoint_to_node_id(endpoint)
             return FleetNode(
                 node_id=node_id,
@@ -415,7 +420,13 @@ class FleetManager:
         probed serially, a few dark boards would delay supervision of the
         live ones past their own timeout window.  Every transition is logged
         so an outage and its recovery both leave evidence.
+
+        A live node whose hello carries a different declarations fingerprint
+        is re-registered: it restarted or re-scanned with changes, and without
+        this the host would keep admitting the declarations it first saw --
+        stale envelopes, and no trace of a camera plugged in since.
         """
+        changed: list[str] = []
         node_ids = list(self._nodes)
         probes = await asyncio.gather(
             *(
@@ -429,10 +440,13 @@ class FleetManager:
             node = self._nodes.get(node_id)
             if node is None:
                 continue  # unregistered while the sweep was in flight
-            if probe is True:
+            if isinstance(probe, Mapping):
                 if node.status in (_NODE_STATUS_OFFLINE, _NODE_STATUS_DEGRADED):
                     logger.info("Fleet: node %r back online", node_id)
                 self._nodes[node_id] = node.with_status(_NODE_STATUS_ONLINE, heartbeat=now)
+                declarations = str(probe.get("declarations") or "")
+                if declarations and declarations != node.declarations:
+                    changed.append(node_id)
                 continue
             elapsed = now - node.last_heartbeat
             if elapsed > self._node_timeout:
@@ -448,6 +462,25 @@ class FleetManager:
                     node_id, elapsed,
                 )
                 self._nodes[node_id] = node.with_status(_NODE_STATUS_DEGRADED)
+        for node_id in changed:
+            await self._refresh_node(node_id)
+
+    async def _refresh_node(self, node_id: str) -> None:
+        """Re-admit a node's changed declarations through ``register_node``.
+
+        Re-registration replaces the routing snapshot and lets reconcile diff
+        the declarations, so unchanged devices keep running and only altered
+        ones are rebuilt.  A failure keeps the previous snapshot and is retried
+        on the next sweep, because the stored fingerprint is left unchanged.
+        """
+        node = self._nodes.get(node_id)
+        if node is None:
+            return
+        logger.info("Fleet: node %r declarations changed; re-registering", node_id)
+        try:
+            await self.register_node(node)
+        except FleetError as exc:
+            logger.warning("Fleet: re-registering node %r failed: %s", node_id, exc)
 
     async def node_health(self, node_id: str) -> dict[str, Any]:
         """Return health details for one node.
@@ -458,7 +491,7 @@ class FleetManager:
         if node is None:
             return {"node_id": node_id, "error": "unknown node"}
 
-        reachable = await self._probe_endpoint(node.endpoint, token=node.token)
+        reachable = await self._probe_endpoint(node.endpoint, token=node.token) is not None
         now = time.monotonic()
         if reachable:
             self._nodes[node_id] = node.with_status(
@@ -615,14 +648,14 @@ class FleetManager:
 
     async def _fetch_node_contexts(
         self, endpoint: str, *, token: str = ""
-    ) -> tuple[str, tuple[HardwareContext, ...]]:
+    ) -> tuple[str, tuple[HardwareContext, ...], str]:
         """Fetch a node's identity and raw device declarations over LHP.
 
-        Returns ``(reported_node_id, contexts)``.  The *reported* id comes
-        from the node's hello answer; the caller decides whether to pin it
-        (register: mismatch refuses) or adopt it (discover: it is the
-        authoritative name).  Declarations stay in the node's own id space;
-        namespacing the ids is the caller's job.
+        Returns ``(reported_node_id, contexts, declarations_fingerprint)``.
+        The *reported* id comes from the node's hello answer; the caller
+        decides whether to pin it (register: mismatch refuses) or adopt it
+        (discover: it is the authoritative name).  Declarations stay in the
+        node's own id space; namespacing the ids is the caller's job.
 
         Raises ``FleetError`` when the node is unreachable, fails the
         exchange, or answers a declaration this host cannot read.  A
@@ -663,23 +696,26 @@ class FleetManager:
                     ) from exc
 
         reported = str(hello.get("node_id") or "")
-        return reported, tuple(contexts)
+        return reported, tuple(contexts), str(hello.get("declarations") or "")
 
-    async def _probe_endpoint(self, endpoint: str, *, token: str = "") -> bool:
-        """Probe an LHP endpoint for liveness.
+    async def _probe_endpoint(
+        self, endpoint: str, *, token: str = ""
+    ) -> Mapping[str, Any] | None:
+        """Probe an LHP endpoint for liveness; return its hello, or None.
 
         One hello exchange with a short timeout: a lightweight connectivity
         test, not capability discovery -- it must complete quickly so the
-        heartbeat loop stays responsive.  Never raises.
+        heartbeat loop stays responsive.  The hello is returned because its
+        declarations fingerprint is how a sweep notices changed devices.
+        Never raises.
         """
         client = SocketLhpClient(
             endpoint, token=token, timeout_s=_HEARTBEAT_PROBE_TIMEOUT_S
         )
         try:
-            await client.connect()
-            return True
+            return await client.connect()
         except (LhpRemoteError, ValueError, OSError):
-            return False
+            return None
         finally:
             await client.close()
 

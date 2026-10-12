@@ -26,62 +26,60 @@ logger = logging.getLogger(__name__)
 FLEET_NODES_ENV = "LEAPFLOW_FLEET_NODES"
 
 
-def configured_nodes_from_env() -> tuple[FleetNode, ...]:
-    """Parse ``LEAPFLOW_FLEET_NODES`` (JSON array) into node configurations.
+def configured_nodes_from_settings(raw: str = "") -> tuple[FleetNode, ...]:
+    """Parse typed Settings fleet JSON, falling back to the legacy environment.
 
-    Entry keys: ``node_id``, ``display_name``, ``endpoint`` (preferred) or the
-    legacy ``mcp_endpoint``, and ``token``.  Entries without a node id or an
-    endpoint are skipped with a warning; id charset and reachability stay in
-    ``register_node`` so validation has a single authority.  Malformed JSON
-    disables fleet configuration for the process rather than failing startup --
-    a profile typo must not take the daemon down.
-
-    Diagnostics never echo a raw entry: entries carry the node's shared
-    secret, and a log line is not a secret store.
+    A settings entry may name ``token_env`` instead of embedding a shared secret.
+    Diagnostics intentionally never print the raw entry or resolved token.
     """
-    raw = os.environ.get(FLEET_NODES_ENV, "")
+    source = "hardware_fleet_nodes"
+    raw = str(raw or "").strip()
+    if not raw:
+        raw = os.environ.get(FLEET_NODES_ENV, "")
+        source = FLEET_NODES_ENV
     if not raw:
         return ()
     try:
         configs = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        logger.warning("%s is not valid JSON; ignoring", FLEET_NODES_ENV)
+        logger.warning("%s is not valid JSON; ignoring", source)
         return ()
     if not isinstance(configs, list):
-        logger.warning("%s must be a JSON array; ignoring", FLEET_NODES_ENV)
+        logger.warning("%s must be a JSON array; ignoring", source)
         return ()
 
     nodes: list[FleetNode] = []
     for index, config in enumerate(configs):
         if not isinstance(config, Mapping):
-            logger.warning(
-                "Fleet: ignoring %s entry #%d: not a JSON object", FLEET_NODES_ENV, index
-            )
+            logger.warning("Fleet: ignoring %s entry #%d: not a JSON object", source, index)
             continue
+        token_env = str(config.get("token_env") or "").strip()
+        token = os.environ.get(token_env, "") if token_env else str(config.get("token") or "")
         node = FleetNode(
             node_id=str(config.get("node_id") or ""),
             display_name=str(config.get("display_name") or ""),
-            # ``endpoint`` is the LHP binding (tcp://host:port or unix:///path);
-            # ``mcp_endpoint`` remains accepted so pre-LHP profiles keep loading.
-            # Every key coalesces ``null`` to "": a templated JSON null means
-            # "unset", and ``str(None)`` would turn an absent token into the
-            # literal string "None" -- a wrong shared secret that fails hello
-            # with a confusing auth error.
             endpoint=str(config.get("endpoint") or config.get("mcp_endpoint") or ""),
-            token=str(config.get("token") or ""),
+            token=token,
         )
         if not node.node_id or not node.endpoint:
             logger.warning(
                 "Fleet: ignoring %s entry #%d without node_id/endpoint "
                 "(node_id=%r, endpoint=%r)",
-                FLEET_NODES_ENV,
+                source,
                 index,
                 node.node_id,
                 node.endpoint,
             )
             continue
+        if token_env and not token:
+            logger.warning("Fleet: node %r token_env %r is unset", node.node_id, token_env)
         nodes.append(node)
     return tuple(nodes)
+
+
+def configured_nodes_from_env() -> tuple[FleetNode, ...]:
+    """Compatibility wrapper for callers using ``LEAPFLOW_FLEET_NODES``."""
+    return configured_nodes_from_settings()
 
 
 async def register_nodes_safely(
@@ -119,4 +117,9 @@ async def register_nodes_safely(
     return tuple(registered)
 
 
-__all__ = ["FLEET_NODES_ENV", "configured_nodes_from_env", "register_nodes_safely"]
+__all__ = [
+    "FLEET_NODES_ENV",
+    "configured_nodes_from_env",
+    "configured_nodes_from_settings",
+    "register_nodes_safely",
+]

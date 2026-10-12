@@ -1186,6 +1186,68 @@ leap --mock-host          # Runs with in-process mock (for testing/exploration)
 
 ---
 
+## Hardware Deployment Modes (Host ↔ Edge Node)
+
+Assume you can already SSH to the edge node. Hardware is declared where it is physically connected; choose one mode:
+
+| Mode | Choose it when | LeapFlow runs on |
+|------|----------------|------------------|
+| **1 — Host only** | You only need remote OS tools for bring-up or debugging. | Host only; the edge node has no LeapFlow runtime. |
+| **2 — Host + node** | **Recommended:** keep the agent on the host and hardware on the edge node. | Host agent + edge `leap hw serve`. |
+| **3 — Node only** | The edge node must operate without the host. | Edge node only. |
+
+### Mode 1 — Host only
+
+Do not install LeapFlow on the edge node. Use your existing SSH session and normal OS tools.
+
+### Mode 2 — Host + node (recommended)
+
+The edge node owns drivers, capture, and local safety. The host owns the agent, approvals, and LeapBoard. Remote devices appear on the host as `edge01__<device_id>`.
+
+**1. On the edge node, install LeapFlow and start its LHP node.**
+
+```bash
+python -m pip install -e ~/leapflow-src           # or: python -m pip install leapflow
+openssl rand -hex 24 > ~/.leapflow/.lhp-token && chmod 600 ~/.leapflow/.lhp-token
+LEAPFLOW_LHP_TOKEN="$(cat ~/.leapflow/.lhp-token)" \
+  leap hw serve --node-id edge01 --host 0.0.0.0 --port 8767
+```
+
+Keep this terminal open until the node is moved to a managed service. It prints `lhp_node_ready` when ready.
+
+**2. On the host, register the node and start LeapFlow.**
+
+```bash
+export EDGE_LHP_TOKEN='paste-the-token-here'
+export LEAPFLOW_FLEET_NODES='[{"node_id":"edge01","endpoint":"tcp://<edge-host>:8767","token_env":"EDGE_LHP_TOKEN"}]'
+leap daemon restart                               # inherits the variables above
+leap hw list                                      # remote devices use edge01__<device_id>
+leap
+```
+
+The host does not need device YAML. Add device YAML only on the edge node before starting `leap hw serve`.
+
+### Mode 3 — Node only
+
+Install and run LeapFlow directly on the edge node:
+
+```bash
+python -m pip install -e ~/leapflow-src           # or: python -m pip install leapflow
+leap config llm set --base-url https://... --model ... --ask-api-key
+leap hw list                                      # verify local device declarations
+leap --mock-host                                  # local terminal or ssh -t
+```
+
+No LHP node or host configuration is required. Start `leap hw serve` only if another machine needs to access this node's hardware.
+
+**Keep in mind**
+
+- Device YAML is a profile asset on the owning node: `~/.leapflow/profiles/<profile>/hardware/devices/`.
+- Store the LHP token in a protected file or environment variable; never commit it.
+- Camera and other privacy-sensitive reads still require normal approval.
+
+---
+
 ## Development
 
 ```bash
