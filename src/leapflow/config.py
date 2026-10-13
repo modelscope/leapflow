@@ -1286,6 +1286,10 @@ def _build_settings_from_env(
     hardware_preview_idle_timeout_s = float(
         os.getenv("LEAPFLOW_HARDWARE_PREVIEW_IDLE_TIMEOUT_S", "5") or 5.0
     )
+    # Typed fleet-node JSON. Read here so `leap config set hardware.fleet_nodes`
+    # (which persists into runtime.yaml) actually reaches Settings; the legacy
+    # LEAPFLOW_FLEET_NODES fallback is applied later, in fleet_config.
+    hardware_fleet_nodes = os.getenv("LEAPFLOW_HARDWARE_FLEET_NODES", "").strip()
     web_transport = os.getenv("LEAPFLOW_WEB_TRANSPORT", "auto").strip().lower() or "auto"
     web_timeout_s = float(os.getenv("LEAPFLOW_WEB_TIMEOUT_S", "20"))
     web_max_bytes = int(os.getenv("LEAPFLOW_WEB_MAX_BYTES", "2000000"))
@@ -1736,6 +1740,7 @@ def _build_settings_from_env(
         hardware_preview_max_width=hardware_preview_max_width,
         hardware_preview_quality=hardware_preview_quality,
         hardware_preview_idle_timeout_s=hardware_preview_idle_timeout_s,
+        hardware_fleet_nodes=hardware_fleet_nodes,
         web_transport=web_transport,
         web_timeout_s=web_timeout_s,
         web_max_bytes=web_max_bytes,

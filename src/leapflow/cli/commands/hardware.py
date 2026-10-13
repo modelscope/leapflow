@@ -171,11 +171,16 @@ async def _register_fleet_read_plane(registry: Any) -> None:
     """
     from leapflow.hardware.fleet import FleetManager
     from leapflow.hardware.fleet_config import (
-        configured_nodes_from_env,
+        configured_nodes_from_settings,
         register_nodes_safely,
     )
 
-    nodes = configured_nodes_from_env()
+    # Same source the daemon plugin reads: typed Settings (``hardware.fleet_nodes``)
+    # as carried on the registry, with the legacy env fallback handled inside
+    # fleet_config.  Reading the env directly here left the settings-configured
+    # nodes invisible to ``leap hw list`` while leapd saw them.
+    fleet_nodes_raw = str(getattr(getattr(registry, "settings", None), "fleet_nodes", "") or "")
+    nodes = configured_nodes_from_settings(fleet_nodes_raw)
     if not nodes:
         return
     registered = await register_nodes_safely(FleetManager(registry), nodes)
