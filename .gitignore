@@ -238,4 +238,3 @@ leapflow.sock
 # Entire temp directory is ignored (scratch / transient artifacts only).
 temp/
 .DS_Store
-AGENTS.md
