@@ -121,6 +121,33 @@ def test_hw_list_reports_admitted_devices(monkeypatch, tmp_path, capsys) -> None
     assert payload["devices"][0]["device_id"] == "rig"
 
 
+def test_run_local_reconciles_fleet_nodes_before_actions(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The read plane must register configured fleet nodes before serving.
+
+    ``leap hw`` serves from its own in-process registry rather than leapd's, so
+    without this hook a configured node's ``<node>__<device>`` ids would never
+    appear in ``leap hw list`` -- a wiring gap no unit test sees, because each
+    test builds its own registry.
+    """
+    import leapflow.cli.commands.hardware as hardware_module
+    from leapflow.cli.commands.hardware import cmd_hardware
+
+    registry = _loaded_registry()
+    _install_local_registry(monkeypatch, tmp_path, registry)
+    seen: list[Any] = []
+
+    async def _spy(target: Any) -> None:
+        seen.append(target)
+
+    monkeypatch.setattr(hardware_module, "_register_fleet_read_plane", _spy)
+
+    assert cmd_hardware(_ns("list")) == 0
+    assert seen == [registry], "list must reconcile fleet nodes into its own registry"
+    assert _json_out(capsys)["ok"] is True
+
+
 def test_hw_describe_returns_full_reference(monkeypatch, tmp_path, capsys) -> None:
     from leapflow.cli.commands.hardware import cmd_hardware
 

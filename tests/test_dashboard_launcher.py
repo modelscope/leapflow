@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Optional
 
 import pytest
 
@@ -135,15 +137,47 @@ class _FakeUrlResponse:
         return False
 
 
+class _StubOpener:
+    """Stands in for launcher._local_probe_opener() so the URL hop stays in the test."""
+
+    def __init__(self, *, response: Any = None, error: Optional[Exception] = None) -> None:
+        self._response = response
+        self._error = error
+        self.urls: list[str] = []
+
+    def open(self, url: str, timeout: float = 0.0) -> Any:
+        self.urls.append(url)
+        if self._error is not None:
+            raise self._error
+        return self._response
+
+
+def _stub_local_opener(
+    monkeypatch: pytest.MonkeyPatch, *, response: Any = None, error: Optional[Exception] = None
+) -> _StubOpener:
+    opener = _StubOpener(response=response, error=error)
+    monkeypatch.setattr(launcher, "_local_probe_opener", lambda: opener)
+    return opener
+
+
 def test_fetch_server_info_parses_json_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = {"build": {"commit": "abc123", "pid": 42}, "stale": True}
-
-    def _fake_urlopen(url: str, timeout: float = 0.0) -> _FakeUrlResponse:
-        assert "/api/server-info" in url and "token=tok" in url
-        return _FakeUrlResponse(200, json.dumps(payload).encode("utf-8"))
-
-    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    opener = _stub_local_opener(
+        monkeypatch, response=_FakeUrlResponse(200, json.dumps(payload).encode("utf-8"))
+    )
     assert launcher.fetch_server_info("127.0.0.1", 8766, "tok") == payload
+    assert "/api/server-info" in opener.urls[0] and "token=tok" in opener.urls[0]
+
+
+def test_probe_token_rejects_a_server_that_refuses_the_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.error
+
+    _stub_local_opener(
+        monkeypatch, error=urllib.error.HTTPError("http://x", 401, "unauthorized", {}, None)
+    )
+    assert launcher.probe_token("127.0.0.1", 8765, "tok") is False
 
 
 def test_fetch_server_info_returns_none_without_token() -> None:
@@ -151,27 +185,93 @@ def test_fetch_server_info_returns_none_without_token() -> None:
 
 
 def test_fetch_server_info_returns_none_when_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _raise(url: str, timeout: float = 0.0) -> None:
-        raise OSError("connection refused")
-
-    monkeypatch.setattr("urllib.request.urlopen", _raise)
+    _stub_local_opener(monkeypatch, error=OSError("connection refused"))
     assert launcher.fetch_server_info("127.0.0.1", 8766, "tok") is None
 
 
 def test_fetch_server_info_returns_none_on_non_2xx(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        lambda url, timeout=0.0: _FakeUrlResponse(401, b'{"error": "unauthorized"}'),
-    )
+    _stub_local_opener(monkeypatch, response=_FakeUrlResponse(401, b'{"error": "unauthorized"}'))
     assert launcher.fetch_server_info("127.0.0.1", 8766, "tok") is None
 
 
 def test_fetch_server_info_returns_none_on_malformed_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        lambda url, timeout=0.0: _FakeUrlResponse(200, b"not json"),
-    )
+    _stub_local_opener(monkeypatch, response=_FakeUrlResponse(200, b"not json"))
     assert launcher.fetch_server_info("127.0.0.1", 8766, "tok") is None
+
+
+# ── Loopback probes must ignore configured proxies ───────────────────────────
+#
+# urlopen consults the OS proxy (macOS scutil) and *_proxy env vars; neither
+# macOS's default bypass list (*.local, 169.254/16) nor a rule-based local proxy
+# exempts loopback, so the proxy answered every probe with 502 while the board
+# served fine on a direct connection. /board then reported "did not become
+# ready in time" on every attempt and spawned one more orphan server each time.
+
+
+@pytest.fixture()
+def loopback_board() -> Iterator[int]:
+    """A real loopback endpoint shaped like the board's token-gated routes."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+            parsed = urlparse(self.path)
+            if parse_qs(parsed.query).get("token") != ["tok"]:
+                self.send_response(401)
+                self.end_headers()
+                return
+            body = (
+                json.dumps({"revision": "r1"}).encode("utf-8")
+                if parsed.path == "/api/server-info"
+                else b"ok"
+            )
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass  # keep pytest output clean
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield int(server.server_address[1])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture()
+def dead_proxies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every proxy family points at a dead port; loopback probes must not use it."""
+    proxy = "http://127.0.0.1:9"
+    for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(name, proxy)
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_probe_token_ignores_configured_proxies(loopback_board: int, dead_proxies: None) -> None:
+    import urllib.request
+
+    # Premise: a default opener really is steered into the dead proxy, so the
+    # assertions below are meaningful rather than passing vacuously.
+    with pytest.raises(OSError):
+        urllib.request.build_opener().open(
+            f"http://127.0.0.1:{loopback_board}/?token=tok", timeout=1.0
+        )
+
+    assert launcher.probe_token("127.0.0.1", loopback_board, "tok") is True
+    assert launcher.probe_token("127.0.0.1", loopback_board, "wrong") is False
+
+
+def test_fetch_server_info_ignores_configured_proxies(
+    loopback_board: int, dead_proxies: None
+) -> None:
+    assert launcher.fetch_server_info("127.0.0.1", loopback_board, "tok") == {"revision": "r1"}
 
 
 def test_retire_stale_server_skips_kill_when_pid_unverified(
@@ -809,6 +909,56 @@ def test_only_an_unreachable_board_is_inconclusive(monkeypatch) -> None:
     for info in ({}, {"stale": None}, {"build": {"commit": None}}):
         monkeypatch.setattr(launcher, "fetch_server_info", lambda *a, **k: info)
         assert launcher.server_is_stale({"port": 1, "bind": "127.0.0.1", "token": "t"}) is True
+
+
+# ── A failed start must not leak the server it spawned ───────────────────────
+#
+# The child is detached (new session); a readiness failure used to leave it
+# running forever -- occupying its port and serving a token nobody had
+# published, so every failed /board accumulated one more orphan server on the
+# next port. The failure itself also left no evidence: output went to DEVNULL.
+
+
+def test_a_failed_readiness_check_stops_the_child_and_reports_its_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+
+    class _FakeProc:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.terminated = False
+
+        def poll(self) -> None:
+            return None  # "still starting" -- only the deadline can end the wait
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float = 0.0) -> int:
+            return 0
+
+    proc = _FakeProc()
+
+    def _fake_popen(cmd: list[str], **kwargs: Any) -> _FakeProc:
+        assert kwargs["stderr"] == launcher.subprocess.STDOUT
+        kwargs["stdout"].write(b"Traceback: cannot import leapflow\n")
+        return proc
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(launcher, "is_port_open", lambda *a, **k: False)
+    monkeypatch.setattr(launcher, "probe_token", lambda *a, **k: False)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        launcher._spawn_verified_server(settings, wait_s=0.01)
+
+    message = str(excinfo.value)
+    assert "did not become ready in time" in message
+    assert "cannot import leapflow" in message, "the child's output must explain the failure"
+    assert str(launcher.server_log_path(settings)) in message
+    assert proc.terminated, "a failed start must not orphan the child"
+    assert launcher.load_state(settings) is None, "an unready server must not be published"
 
 
 def test_asset_urls_are_versioned_by_content(tmp_path, monkeypatch) -> None:

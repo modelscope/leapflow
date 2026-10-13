@@ -20,8 +20,8 @@ class PythonVersionCheck:
         f = Finding()
         major, minor = sys.version_info[:2]
         version_str = f"{major}.{minor}.{sys.version_info[2]}"
-        if major != 3 or minor < 11:
-            f.error(f"Python >= 3.11 required, found {version_str}")
+        if major != 3 or minor < 10:
+            f.error(f"Python >= 3.10 required, found {version_str}")
         elif minor >= 14:
             f.warn(f"Python {version_str} is newer than tested range (3.11–3.13)")
         else:

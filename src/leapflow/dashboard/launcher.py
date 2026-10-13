@@ -29,6 +29,9 @@ from leapflow.dashboard.revision import board_revision
 logger = logging.getLogger(__name__)
 
 _STATE_FILE = "dashboard.json"
+_SERVER_LOG_FILE = "dashboard-server.log"
+_SERVER_LOG_MAX_BYTES = 256 * 1024
+_SERVER_LOG_TAIL_LINES = 5
 
 
 def aiohttp_available() -> bool:
@@ -55,6 +58,16 @@ def state_path(settings: Any) -> Path:
         except Exception:
             pass
     return Path(settings.runtime_dir) / _STATE_FILE
+
+
+def server_log_path(settings: Any) -> Path:
+    """Path of the detached server's captured stdout/stderr.
+
+    The server is spawned without a terminal, so its startup evidence (init
+    logging mirrors stderr, plus any traceback before logging exists) must land
+    somewhere durable; a failed start reports the tail of this file.
+    """
+    return state_path(settings).with_name(_SERVER_LOG_FILE)
 
 
 def load_state(settings: Any) -> Optional[dict[str, Any]]:
@@ -134,6 +147,22 @@ def is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
         return False
 
 
+def _local_probe_opener() -> Any:
+    """An HTTP opener for loopback probes that never routes through a proxy.
+
+    ``urllib`` reads proxy settings from the OS (macOS ``scutil``) and from
+    ``*_proxy`` environment variables, and neither macOS's default bypass list
+    (``*.local``, ``169.254/16``) nor a typical rule-based local proxy exempts
+    loopback: the proxy answers the probe with 502/403 while the dashboard
+    server itself answers fine on a direct connection. The failure surfaces as
+    "did not become ready in time" on every ``/board`` even though the spawned
+    server is healthy, and each attempt spawns one more orphan server.
+    """
+    import urllib.request
+
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def probe_token(bind: str, port: int, token: str, *, timeout: float = 0.6) -> bool:
     """Return True when the server on (bind, port) actually accepts ``token``.
 
@@ -143,12 +172,11 @@ def probe_token(bind: str, port: int, token: str, *, timeout: float = 0.6) -> bo
     server so callers only ever trust a token that works.
     """
     import urllib.error
-    import urllib.request
 
     if not token:
         return False
     try:
-        with urllib.request.urlopen(  # noqa: S310 - fixed localhost URL
+        with _local_probe_opener().open(  # noqa: S310 - fixed localhost URL
             build_url(bind, port, token), timeout=timeout
         ) as response:
             return 200 <= int(getattr(response, "status", 200)) < 400
@@ -169,12 +197,11 @@ def fetch_server_info(bind: str, port: int, token: str, *, timeout: float = 0.8)
     """
     import json
     import urllib.error
-    import urllib.request
 
     if not token:
         return None
     try:
-        with urllib.request.urlopen(  # noqa: S310 - fixed localhost URL
+        with _local_probe_opener().open(  # noqa: S310 - fixed localhost URL
             build_url(bind, port, token, path="/api/server-info"), timeout=timeout
         ) as response:
             if not (200 <= int(getattr(response, "status", 200)) < 400):
@@ -239,6 +266,60 @@ def _find_free_port(bind: str, start: int, *, span: int = 20) -> int:
         if not is_port_open(bind, candidate):
             return candidate
     return start
+
+
+def _prepare_server_log(path: Path) -> int:
+    """Return the offset this spawn's output starts at, trimming an oversized log."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > _SERVER_LOG_MAX_BYTES:
+            path.unlink(missing_ok=True)
+        return path.stat().st_size if path.exists() else 0
+    except OSError:
+        logger.debug("dashboard: cannot prepare server log", exc_info=True)
+        return 0
+
+
+def _read_log_tail(path: Path, start_offset: int, *, max_bytes: int = 800) -> str:
+    """Best-effort tail of what one spawn wrote, never raising from a failure path."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            handle.seek(max(start_offset if 0 <= start_offset <= end else 0, end - max_bytes))
+            data = handle.read()
+    except OSError:
+        return ""
+    lines = [line.strip() for line in data.decode("utf-8", errors="replace").splitlines()]
+    return "\n".join(line for line in lines if line)[-_SERVER_LOG_TAIL_LINES * 200:]
+
+
+def _startup_failure(message: str, log_path: Path, start_offset: int) -> RuntimeError:
+    """A failure that names itself: the child's own output explains why."""
+    tail = _read_log_tail(log_path, start_offset)
+    if tail:
+        return RuntimeError(f"{message}; server output:\n{tail}\n(log: {log_path})")
+    return RuntimeError(f"{message} (no output; log: {log_path})")
+
+
+def _terminate_child(proc: subprocess.Popen) -> None:
+    """Stop a spawned server that never became ready so a failure cannot orphan it.
+
+    The child is detached (new session), so without this a timed-out readiness
+    check leaves it running forever: occupying its port and serving a token that
+    was never published, accumulating one dead-weight server per failed attempt.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2.0)
+    except OSError:
+        logger.debug("dashboard: failed to stop an unready server pid=%s", proc.pid, exc_info=True)
 
 
 def _pid_is_dashboard_server(pid: int) -> bool:
@@ -339,24 +420,37 @@ def _spawn_verified_server(settings: Any, *, wait_s: float = 8.0) -> dict[str, A
     if os.name == "nt":  # pragma: no cover - platform specific
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         start_new_session = False
-    proc = subprocess.Popen(  # noqa: S603 - trusted, fixed argv
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=start_new_session,
-        creationflags=creationflags,
-    )
+    # The child has no terminal; its stderr (init logging, tracebacks) is the only
+    # startup evidence and lands here so a failed start can explain itself.
+    log_path = server_log_path(settings)
+    log_offset = _prepare_server_log(log_path)
+    with open(log_path, "ab") as log_file:
+        proc = subprocess.Popen(  # noqa: S603 - trusted, fixed argv
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=start_new_session,
+            creationflags=creationflags,
+        )
 
-    deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
-        # Token-aware readiness: a mere open port could be a foreign/stale server.
-        if probe_token(bind, port, token):
-            break
-        if proc.poll() is not None:
-            raise RuntimeError("dashboard server exited before becoming ready")
-        time.sleep(0.15)
-    else:
-        raise RuntimeError("dashboard server did not become ready in time")
+    try:
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            # Token-aware readiness: a mere open port could be a foreign/stale server.
+            if probe_token(bind, port, token):
+                break
+            if proc.poll() is not None:
+                raise _startup_failure(
+                    "dashboard server exited before becoming ready", log_path, log_offset
+                )
+            time.sleep(0.15)
+        else:
+            raise _startup_failure(
+                "dashboard server did not become ready in time", log_path, log_offset
+            )
+    except BaseException:
+        _terminate_child(proc)
+        raise
 
     state = {
         "port": port,
@@ -374,6 +468,7 @@ __all__ = [
     "aiohttp_available",
     "generate_token",
     "state_path",
+    "server_log_path",
     "load_state",
     "write_state",
     "clear_state",

@@ -574,6 +574,56 @@ class TestReloadReinjectsLastBoundDeps:
         # Cleanup
         sys.modules.pop(module_name, None)
 
+    def test_reload_prepares_dependency_generated_tools_before_publication(
+        self, fresh_registry: ToolPluginRegistry, scoped_registry: ScopedToolRegistry
+    ) -> None:
+        """Reload state and DI must precede discovery of the fresh tool catalog."""
+        module_name = "tests._fake_dependency_tools"
+        events: list[str] = []
+
+        class DependencyToolPlugin(FakeToolPlugin):
+            @property
+            def tools(self) -> list[ToolMetadata]:
+                if "memory_manager" not in self._bound_deps:
+                    return []
+                return self._tools
+
+            def _adopt_reload_state(self, previous: Any) -> None:
+                assert previous.plugin_id == self.plugin_id
+                events.append("adopt")
+
+            def bind_runtime(self, **deps: Any) -> None:
+                events.append("bind")
+                super().bind_runtime(**deps)
+
+        plugin = FakeToolPlugin(
+            _plugin_id="dependency-tools",
+            _tools=[_make_tool_metadata("dependency_tool")],
+            _dependencies=["memory_manager"],
+        )
+        plugin.__class__ = type(
+            "InitialDependencyPlugin", (FakeToolPlugin,), {"__module__": module_name}
+        )
+        fake_mod = _make_fake_module(plugin, module_name)
+        sys.modules[module_name] = fake_mod
+        _register_and_assemble(scoped_registry, plugin, fresh_registry)
+        mock_memory = MagicMock(name="MockMemoryManager")
+        fresh_registry.bind_runtime(memory_manager=mock_memory)
+
+        new_plugin = DependencyToolPlugin(
+            _plugin_id="dependency-tools",
+            _tools=[_make_tool_metadata("dependency_tool", _handler_v2)],
+            _dependencies=["memory_manager"],
+        )
+        fake_mod.plugin = new_plugin
+
+        with patch("importlib.reload", return_value=fake_mod):
+            scoped_registry.reload("dependency-tools")
+
+        assert events == ["adopt", "bind"]
+        assert fresh_registry.tool_handlers["dependency_tool"] is _handler_v2
+        sys.modules.pop(module_name, None)
+
 
 # ════════════════════════════════════════════════════════════════
 # Test 11: disabled_plugins E2E - tools excluded at runtime
