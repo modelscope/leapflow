@@ -2,12 +2,13 @@
 #
 # Install the optional ``leapflow-realsense`` transport package and place this
 # file in the Jetson profile's hardware/devices directory.  Use the immutable
-# serial reported by ``rs-enumerate-devices``; never select a camera by index.
-# The host receives this declaration through LHP as
-# ``<node_id>__sensor.realsense_435if`` and must not duplicate it locally.
+# serial reported by ``rs-enumerate-devices``; never select a camera by index
+# and never use the USB ``iSerial`` descriptor, which differs from the SDK
+# serial this transport matches on.  The host receives this declaration through
+# LHP as ``<node_id>__sensor_realsense_435if`` and must not duplicate it locally.
 
 hc_version: "hc.v1"
-device_id: "sensor.realsense_435if"
+device_id: "sensor_realsense_435if"
 display_name: "Jetson RealSense D435if"
 device_class: "camera"
 vendor: "Intel"
