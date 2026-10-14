@@ -19,8 +19,9 @@
 | `08-j-rv2-results.md` | RV2 真机门：真实 reload 缺陷、修复、工具/设备保持、失联恢复与令牌轮换 |
 | `09-plan-audit-2026-10-12.md` | 全量计划/代码审计：完成度、缺口、过期内容处置与当前测试证据 |
 | `10-human-approval-deployment.md` | 端侧单独部署与 host+edge 双端部署的人类审批架构、实施与回归门 |
+| `11-ooda-closed-loop-execution.md` | Mode 2/3 感知—决策—执行全闭环审计：执行安全缺口、统一写入治理、验证/信任、接入向导、Jetson 逐项审批验证计划 |
 
-Active execution authority: `README`, `00`, `01`, `02`, `07`, `09`, and `10`.
+Active execution authority: `README`, `00`, `01`, `02`, `07`, `09`, `10`, and `11`.
 Completed/closed evidence retained for causality: `03`, `04`, `05`, `06`, and `08`.
 
 ## 执行状态看板（随进度更新）
@@ -39,6 +40,7 @@ Completed/closed evidence retained for causality: `03`, `04`, `05`, `06`, and `0
 | F | Identity, credentials, audit and environment evolution | ⏳ Approved; follows E |
 | G | Robot/peripheral convergence and safety completion | ⏳ Approved; follows F |
 | I | Human-interaction broker, edge approval channels and signed remote execution permits | ▶️ Selected cross-cutting target; implementation pending; see `10` |
+| X0–X5 | OODA execution closure: unified write governance, verification/trust, node control lease, event decisions, onboarding and board validation | ▶️ X0-A safety slice complete locally; X0-B next; no board action executed; see `11` |
 | R1 | Mac ↔ Jetson real-board regression R1.1–R1.10 | ✅ Complete; edge node stopped |
 
 ## 本轮（P1）执行范围 —— 已完成 / 待完成
@@ -56,6 +58,9 @@ Completed/closed evidence retained for causality: `03`, `04`, `05`, `06`, and `0
 - [x] J-RV2 real-board gate (including R2-9 found/fixed/reverified; `08-j-rv2-results.md`)
 - [x] Full plan/current-code audit and document classification (`09-plan-audit-2026-10-12.md`; focused suites: 307 passed)
 - [x] Edge-only and dual-deployment approval architecture target selected (`10-human-approval-deployment.md`; implementation Stage I remains pending)
+- [x] Mode 2/3 OODA execution-plane audit and phased closure plan (`11-ooda-closed-loop-execution.md`)
+- [x] X0-A high-risk execution safety slice: governed control startup, inference-only VLA default, canonical single-step governance, multi-step fail-closed, ControlBus/LHP envelope-rate defense, and regression evidence; no board action executed
+- [ ] X0-B request-scoped session identity, persistent audit, health/alert lifecycle wiring, and governance extraction
 - [x] 端侧部署审批请求（R1 前置）—— **全部获批**（A1 ✅ 已执行；A3 ✅ 改板上 conda env `leap`；A4 ✅ 前台；A5 ✅ 停-启-终停均已批准执行；Q2/Q3/Q4 均已关闭）
 - [x] R1 真机回归：R1.1–R1.10 全部通过（证据 `06-r1-results.md` + `../jetson/r1-evidence/` 9 个文件）
 - [x] 端侧收尾：A5 终停（用户批准「结束后停止」），8767 已释放，板上恢复测试前状态

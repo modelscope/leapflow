@@ -573,8 +573,8 @@ class RuntimeLeapService:
 
                 physical_source = PhysicalEnvironmentSource(
                     hardware_registry,
-                    evidence_store=None,
-                    capability_index=None,
+                    evidence_store=getattr(hardware_registry, "evidence_store", None),
+                    capability_index=getattr(hardware_registry, "capability_index", None),
                 )
                 manager.register(physical_source)
                 registered_any = True

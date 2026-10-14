@@ -9,6 +9,8 @@ never writes them and never rewrites them.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from pathlib import Path
 from typing import Any, Mapping
@@ -70,19 +72,53 @@ class YamlContextProvider:
         person who confirms a context must not have to edit the file they are
         confirming, or the confirmation would be self-attested.
 
-        ``replace`` rather than a field-by-field rebuild: the hand-written copy
-        silently dropped every field added to ``HardwareContext`` after it, which
-        is a defect that only shows up as a missing value on a board.
+        New format (digest-bound): ``{device_id: {verifier, declaration_digest, verified_at}}``.
+        Old format (legacy): ``{device_id: verifier_string}``.
+
+        Digest-bound entries whose digest does not match the current declaration
+        are treated as unbound: the context is demoted (V7) with a warning.
+        Old string entries are treated as unbound (no digest) with a warning.
         """
-        verifier = self._verified.get(context.device_id, "")
-        if not verifier or context.provenance.is_verified:
+        entry = self._verified.get(context.device_id)
+        if entry is None or context.provenance.is_verified:
             return context
+
         from dataclasses import replace
 
-        return replace(
-            context,
-            provenance=replace(context.provenance, verified_by=verifier),
-        )
+        if isinstance(entry, str):
+            # Legacy format: plain verifier string, no digest binding
+            if not entry:
+                return context
+            logger.warning(
+                "verified.json: device %r uses legacy string format (no digest binding); "
+                "run 'leap hw verify %s' to create a digest-bound entry",
+                context.device_id, context.device_id,
+            )
+            return replace(
+                context,
+                provenance=replace(context.provenance, verified_by=entry),
+            )
+
+        if isinstance(entry, Mapping):
+            verifier = str(entry.get("verifier") or "")
+            if not verifier:
+                return context
+            stored_digest = str(entry.get("declaration_digest") or "")
+            if stored_digest:
+                current_digest = _declaration_digest(context)
+                if current_digest != stored_digest:
+                    logger.warning(
+                        "verified.json: device %r declaration digest mismatch "
+                        "(stored=%s, current=%s); verification demoted",
+                        context.device_id, stored_digest[:12], current_digest[:12],
+                    )
+                    return context  # demoted: declaration changed since verification
+            return replace(
+                context,
+                provenance=replace(context.provenance, verified_by=verifier),
+            )
+
+        return context
 
 
 def _read_yaml(path: Path) -> dict[str, Any] | None:
@@ -100,8 +136,16 @@ def _read_yaml(path: Path) -> dict[str, Any] | None:
     return payload
 
 
-def _load_verified(path: Any) -> dict[str, str]:
-    """Read ``{device_id: verifier}`` confirmations, tolerating absence."""
+def _load_verified(path: Any) -> dict[str, Any]:
+    """Read verification confirmations, tolerating absence.
+
+    Supports two formats:
+    - New (digest-bound): ``{device_id: {verifier, declaration_digest, verified_at}}``
+    - Legacy: ``{device_id: verifier_string}``
+
+    Returns a dict of ``{device_id: entry}`` where entry is either a string
+    (legacy) or a dict (new format).
+    """
     if not path:
         return {}
     target = Path(str(path)).expanduser()
@@ -114,7 +158,37 @@ def _load_verified(path: Any) -> dict[str, str]:
         return {}
     if not isinstance(raw, Mapping):
         return {}
-    return {str(key): str(value) for key, value in raw.items() if value}
+    result: dict[str, Any] = {}
+    for key, value in raw.items():
+        if not value:
+            continue
+        if isinstance(value, str):
+            result[str(key)] = value  # legacy format
+        elif isinstance(value, Mapping):
+            result[str(key)] = dict(value)  # new digest-bound format
+        else:
+            result[str(key)] = str(value)
+    return result
+
+
+def _declaration_digest(context: HardwareContext) -> str:
+    """Compute a sha256 digest of the context's wire form for verification binding.
+
+    Uses the same canonical form as the LHP server's _declarations_digest,
+    ensuring consistency between local and remote verification.
+    """
+    payload = context.to_dict()
+    # Remove transport config (node-private) and control_bindings
+    if "transport" in payload:
+        payload["transport"] = {"kind": payload.get("transport", {}).get("kind", ""), "config": {}}
+    payload.pop("control_bindings", None)
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def declaration_digest(context: HardwareContext) -> str:
+    """Public API for computing a context's declaration digest."""
+    return _declaration_digest(context)
 
 
 def build_provider(config: Mapping[str, Any] | None = None) -> YamlContextProvider:

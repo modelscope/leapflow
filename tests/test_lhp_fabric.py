@@ -87,9 +87,7 @@ from tests._harness.hardware_stubs import (
 
 
 _FRAME_JPEG = (
-    b"\xff\xd8"
-    b"\xff\xc0\x00\x11\x08\x00\x02\x00\x04\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01"
-    b"\xff\xd9"
+    b"\xff\xd8\xff\xc0\x00\x11\x08\x00\x02\x00\x04\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01\xff\xd9"
 )
 
 
@@ -325,7 +323,9 @@ async def test_hello_advertises_identity_capabilities_and_device_count() -> None
     assert hello["protocol"] == LHP_PROTOCOL_VERSION
     assert hello["node_id"] == "stub_node"
     assert hello["device_count"] == 1
-    assert tuple(hello["capabilities"]) == LHP_CAPABILITIES
+    assert tuple(hello["capabilities"][:len(LHP_CAPABILITIES)]) == LHP_CAPABILITIES
+    # control.v1 is always advertised now
+    assert "control.v1" in hello["capabilities"]
     await client.close()
 
 
@@ -337,16 +337,28 @@ async def test_hello_advertises_identity_capabilities_and_device_count() -> None
         ({"method": "nope"}, ERR_BAD_REQUEST),
         ({"method": "read", "params": [1]}, ERR_BAD_REQUEST),
         (
-            {"method": "write", "params": {"device_id": "conformance_device", "channel_id": "setpoint"}},
+            {
+                "method": "write",
+                "params": {"device_id": "conformance_device", "channel_id": "setpoint"},
+            },
             ERR_BAD_REQUEST,
         ),
-        ({"method": "read", "params": {"device_id": "ghost", "channel_id": "sensor"}}, ERR_UNKNOWN_DEVICE),
         (
-            {"method": "read", "params": {"device_id": "conformance_device", "channel_id": "ghost"}},
+            {"method": "read", "params": {"device_id": "ghost", "channel_id": "sensor"}},
+            ERR_UNKNOWN_DEVICE,
+        ),
+        (
+            {
+                "method": "read",
+                "params": {"device_id": "conformance_device", "channel_id": "ghost"},
+            },
             ERR_UNKNOWN_CHANNEL,
         ),
         (
-            {"method": "write_batch", "params": {"device_id": "conformance_device", "commands": []}},
+            {
+                "method": "write_batch",
+                "params": {"device_id": "conformance_device", "commands": []},
+            },
             ERR_BAD_REQUEST,
         ),
     ],
@@ -370,8 +382,9 @@ async def test_v1_hello_remains_compatible_without_advertising_frame_methods() -
     )
     assert response["ok"] is True
     assert response["result"]["protocol"] == 1
-    assert tuple(response["result"]["capabilities"]) == LHP_V1_CAPABILITIES
+    assert tuple(response["result"]["capabilities"][:len(LHP_V1_CAPABILITIES)]) == LHP_V1_CAPABILITIES
     assert "read_frame" not in response["result"]["capabilities"]
+    assert "control.v1" in response["result"]["capabilities"]
 
 
 async def test_client_falls_back_to_a_v1_only_direct_node() -> None:
@@ -382,12 +395,20 @@ async def test_client_falls_back_to_a_v1_only_direct_node() -> None:
 
 async def test_token_gate_applies_to_socket_via_but_not_direct() -> None:
     server = lhp_node_server(token="s3cret")
-    wrong = {"id": 1, "method": "hello", "params": {"protocol": LHP_PROTOCOL_VERSION, "token": "wrong"}}
+    wrong = {
+        "id": 1,
+        "method": "hello",
+        "params": {"protocol": LHP_PROTOCOL_VERSION, "token": "wrong"},
+    }
     refused = await server.handle_request(wrong, via="socket")
     assert refused["error"]["code"] == ERR_UNAUTHORIZED
     accepted = await server.handle_request(wrong, via="direct")
     assert accepted["ok"] is True, "the same-process trust domain skips the token gate"
-    good = {"id": 2, "method": "hello", "params": {"protocol": LHP_PROTOCOL_VERSION, "token": "s3cret"}}
+    good = {
+        "id": 2,
+        "method": "hello",
+        "params": {"protocol": LHP_PROTOCOL_VERSION, "token": "s3cret"},
+    }
     assert (await server.handle_request(good, via="socket"))["ok"] is True
 
 
@@ -425,6 +446,38 @@ async def test_a_write_to_a_read_only_channel_provably_lands_nowhere() -> None:
     assert outcome.ok is False
     assert outcome.side_effect_state == SIDE_EFFECT_NONE
     assert outcome.failure_code == FAILURE_NOT_WRITABLE
+
+
+async def test_node_refuses_out_of_envelope_write_before_transport() -> None:
+    registry = StubNodeRegistry()
+    config = {"server": LhpNodeServer(registry, node_id="stub_node", write_mode="trusted_v1")}
+    transport = build_transport(config)
+    await transport.open(_host_context(config))
+
+    outcome = await transport.write("setpoint", 101.0)
+
+    assert outcome.ok is False
+    assert outcome.side_effect_state == SIDE_EFFECT_NONE
+    assert outcome.failure_code == FAILURE_SAFETY_DENIED
+    assert "outside" in outcome.error
+    assert registry.write_log == ()
+
+
+async def test_node_aborts_batch_when_one_value_is_out_of_envelope() -> None:
+    registry = StubNodeRegistry()
+    config = {"server": LhpNodeServer(registry, node_id="stub_node", write_mode="trusted_v1")}
+    transport = build_transport(config)
+    await transport.open(_host_context(config))
+
+    batch = await transport.write_batch((("setpoint", 10.0), ("setpoint", 101.0)))
+
+    assert batch.ok is False
+    assert batch.side_effect_state == SIDE_EFFECT_NONE
+    assert [outcome.failure_code for outcome in batch.outcomes] == [
+        FAILURE_BATCH_ABORTED,
+        FAILURE_SAFETY_DENIED,
+    ]
+    assert registry.write_log == ()
 
 
 @pytest.mark.parametrize("code", [ERR_INTERNAL_ERROR, ERR_CONNECTION_CLOSED])
@@ -496,7 +549,7 @@ async def test_a_write_to_an_unknown_channel_is_a_could_not_attempt() -> None:
 
 async def test_a_batch_refusal_aborts_before_anything_is_attempted() -> None:
     registry = StubNodeRegistry()
-    config = {"server": LhpNodeServer(registry, node_id="stub_node")}
+    config = {"server": LhpNodeServer(registry, node_id="stub_node", write_mode="trusted_v1")}
     transport = build_transport(config)
     await transport.open(_host_context(config))
     batch = await transport.write_batch((("setpoint", 10.0), ("sensor", 1.0)))
@@ -549,7 +602,9 @@ async def test_socket_binding_carries_every_data_plane_method() -> None:
         assert hello["node_id"] == "stub_node"
         devices = (await raw.request("list"))["devices"]
         assert devices[0]["device_id"] == "conformance_device"
-        assert (await raw.request("probe", {"device_id": "conformance_device"}))["connected"] is True
+        assert (await raw.request("probe", {"device_id": "conformance_device"}))[
+            "connected"
+        ] is True
         await raw.close()
 
         config = {"endpoint": endpoint, "token": "s3cret", "timeout_s": 2.0}
@@ -616,7 +671,7 @@ async def test_socket_client_reconnects_and_falls_back_to_a_v1_only_node() -> No
 
 async def test_remote_frame_round_trips_over_socket_and_releases_node_capture() -> None:
     registry = _FrameNodeRegistry()
-    server = LhpNodeServer(registry, node_id="jetson")
+    server = LhpNodeServer(registry, node_id="jetson", write_mode="trusted_v1")
     socket_host, port = await server.start(host="127.0.0.1", port=0)
     config = {
         "endpoint": f"tcp://{socket_host}:{port}",
@@ -645,7 +700,7 @@ async def test_remote_frame_round_trips_over_socket_and_releases_node_capture() 
 
 async def test_node_preserves_legacy_frame_transport_without_fps_keyword() -> None:
     source = _LegacyFrameNodeTransport()
-    server = LhpNodeServer(_FrameNodeRegistry(source), node_id="jetson")
+    server = LhpNodeServer(_FrameNodeRegistry(source), node_id="jetson", write_mode="trusted_v1")
     response = await server.handle_request(
         {
             "id": 1,
@@ -715,7 +770,9 @@ async def test_socket_gate_admits_only_hello_and_only_with_the_token() -> None:
     try:
         reader, writer = await asyncio.open_connection(socket_host, port)
         try:
-            request = make_request(7, "read", {"device_id": "conformance_device", "channel_id": "sensor"})
+            request = make_request(
+                7, "read", {"device_id": "conformance_device", "channel_id": "sensor"}
+            )
             writer.write(encode_frame(request))
             await writer.drain()
             frame = decode_frame(await reader.readline())
@@ -898,7 +955,7 @@ def _node_device(device_id: str, *, display_name: str = "") -> HardwareContext:
 async def _start_node(
     registry: HardwareRegistry, node_id: str, *, token: str = ""
 ) -> tuple[LhpNodeServer, str]:
-    server = LhpNodeServer(registry, node_id=node_id, token=token)
+    server = LhpNodeServer(registry, node_id=node_id, token=token, write_mode="trusted_v1")
     host, port = await server.start(host="127.0.0.1", port=0)
     return server, f"tcp://{host}:{port}"
 
@@ -970,13 +1027,9 @@ async def test_register_node_wrong_token_is_refused() -> None:
     manager = FleetManager(_node_registry())
     try:
         with pytest.raises(FleetError) as caught:
-            await manager.register_node(
-                FleetNode("jetson01", "J", endpoint, token="wrong")
-            )
+            await manager.register_node(FleetNode("jetson01", "J", endpoint, token="wrong"))
         assert caught.value.failure_code == "fleet_unreachable"
-        node = await manager.register_node(
-            FleetNode("jetson01", "J", endpoint, token="s3cret")
-        )
+        node = await manager.register_node(FleetNode("jetson01", "J", endpoint, token="s3cret"))
         assert node.status == "online"
     finally:
         await manager.close()
@@ -1064,9 +1117,7 @@ def test_local_declarations_win_over_external_sources() -> None:
 
 def test_unregister_external_source_returns_recorded_ids() -> None:
     registry = _node_registry()
-    registry.register_external_contexts(
-        "node_a", (_node_device("arm"), _node_device("wrench"))
-    )
+    registry.register_external_contexts("node_a", (_node_device("arm"), _node_device("wrench")))
     assert registry.load().admitted == ("arm", "wrench")
     assert registry.unregister_external_source("node_a") == ("arm", "wrench")
     assert registry.external_source_ids() == ()
@@ -1121,7 +1172,12 @@ def test_configured_nodes_from_env_parses_and_skips_invalid(
             [
                 {"node_id": "yahboom", "endpoint": "tcp://192.168.55.1:8767", "token": "t0ken"},
                 {"node_id": "legacy", "mcp_endpoint": "tcp://127.0.0.1:9"},
-                {"node_id": "nulls", "endpoint": "tcp://127.0.0.1:11", "token": None, "display_name": None},
+                {
+                    "node_id": "nulls",
+                    "endpoint": "tcp://127.0.0.1:11",
+                    "token": None,
+                    "display_name": None,
+                },
                 {"node_id": "", "endpoint": "tcp://127.0.0.1:10"},
                 {"display_name": "no endpoint"},
                 "not-a-dict",
@@ -1179,9 +1235,7 @@ async def test_start_fleet_registers_env_nodes_and_skips_unreachable(
     registered_trust: dict[str, TrustConfig | None] = {}
 
     class _RecordingTrustGate:
-        def register_device(
-            self, device_id: str, trust_config: TrustConfig | None = None
-        ) -> None:
+        def register_device(self, device_id: str, trust_config: TrustConfig | None = None) -> None:
             registered_trust.setdefault(device_id, trust_config)
 
     plugin = HardwareContextPlugin()
@@ -1212,9 +1266,7 @@ async def test_cli_read_plane_registers_configured_fleet_nodes(
     """`leap hw` serves in-process, so it must register nodes itself."""
     from leapflow.cli.commands.hardware import _register_fleet_read_plane
 
-    node_server, endpoint = await _start_node(
-        _node_registry(_node_device("host")), "yahboom"
-    )
+    node_server, endpoint = await _start_node(_node_registry(_node_device("host")), "yahboom")
     monkeypatch.setenv(
         "LEAPFLOW_FLEET_NODES",
         json.dumps([{"node_id": "yahboom", "endpoint": endpoint}]),
@@ -1282,9 +1334,7 @@ async def test_rebind_closes_the_previous_fleet_manager_before_reregistering(
     """
     from leapflow.hardware.plugin import HardwareContextPlugin
 
-    node_server, endpoint = await _start_node(
-        _node_registry(_node_device("host")), "yahboom"
-    )
+    node_server, endpoint = await _start_node(_node_registry(_node_device("host")), "yahboom")
     monkeypatch.setenv(
         "LEAPFLOW_FLEET_NODES",
         json.dumps([{"node_id": "yahboom", "endpoint": endpoint}]),
@@ -1465,13 +1515,11 @@ async def test_list_exports_declarations_without_node_private_bindings() -> None
     device = dataclasses.replace(
         _with_transport(
             _node_device("host"),
-            TransportRef(
-                kind="mock", config={"values": {"sensor": 1.0}, "api_token": "node-only"}
-            ),
+            TransportRef(kind="mock", config={"values": {"sensor": 1.0}, "api_token": "node-only"}),
         ),
         control_bindings={"mcp_server": {"url": "http://10.0.0.5", "token": "bind-only"}},
     )
-    server = LhpNodeServer(_node_registry(device), node_id="yahboom")
+    server = LhpNodeServer(_node_registry(device), node_id="yahboom", write_mode="trusted_v1")
     client = DirectLhpClient(server)
     await client.connect()
     listing = await client.request("list", {})
@@ -1490,7 +1538,8 @@ async def test_socket_and_direct_clients_return_the_same_hello_payload() -> None
         direct_hello = await DirectLhpClient(node_server).connect()
         assert hello == direct_hello
         assert hello["device_count"] == 1
-        assert list(hello["capabilities"]) == list(LHP_CAPABILITIES)
+        assert list(hello["capabilities"][:len(LHP_CAPABILITIES)]) == list(LHP_CAPABILITIES)
+        assert "control.v1" in hello["capabilities"]
     finally:
         await client.close()
         await node_server.stop()
@@ -1577,7 +1626,9 @@ async def test_heartbeat_sweep_logs_outage_and_recovery(
     manager._probe_endpoint = _probe  # type: ignore[method-assign]
     stale = time.monotonic() - 5.0
     for node_id in answers:
-        manager._nodes[node_id] = FleetNode(node_id, "", node_id, status="online", last_heartbeat=stale)
+        manager._nodes[node_id] = FleetNode(
+            node_id, "", node_id, status="online", last_heartbeat=stale
+        )
 
     with caplog.at_level("INFO", logger="leapflow.hardware.fleet"):
         await manager._heartbeat_sweep()
@@ -1595,13 +1646,15 @@ async def test_hello_fingerprints_declarations_without_node_private_bindings() -
     """Stable while nothing changes; moves with any declaration; blind to secrets."""
     provider = _StaticProvider((_node_device("host"),))
     registry = _node_registry(provider=provider)
-    server = LhpNodeServer(registry, node_id="yahboom")
+    server = LhpNodeServer(registry, node_id="yahboom", write_mode="trusted_v1")
     first = (await DirectLhpClient(server).connect())["declarations"]
     assert first and first == (await DirectLhpClient(server).connect())["declarations"]
 
-    provider._contexts = (_with_transport(
-        _node_device("host"), TransportRef(kind="mock", config={"api_token": "rotated"})
-    ),)
+    provider._contexts = (
+        _with_transport(
+            _node_device("host"), TransportRef(kind="mock", config={"api_token": "rotated"})
+        ),
+    )
     registry.load()
     assert (await DirectLhpClient(server).connect())["declarations"] == first, (
         "a node-private binding never crosses the wire, so it must not move the fingerprint"

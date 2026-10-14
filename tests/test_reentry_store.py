@@ -174,8 +174,9 @@ def test_build_reentry_trigger_time_event_deadline() -> None:
     d = build_reentry_trigger(task_id="t1", deadline_seconds=100.0, now=1000.0)
     assert d.deadline == 1100.0
 
-    b = build_reentry_trigger(task_id="t1", kind="weird", now=1000.0)
-    assert b.kind == "time"                                  # unknown kind -> time
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="unsupported reentry kind"):
+        build_reentry_trigger(task_id="t1", kind="weird", now=1000.0)
 
 
 def test_schedule_reentry_handler_registers(tmp_path) -> None:

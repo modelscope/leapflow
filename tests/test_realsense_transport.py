@@ -11,7 +11,7 @@ import yaml
 
 from leapflow.hardware.context import HardwareContext
 from leapflow.hardware.transport import TransportError
-from leapflow.hardware.transports.realsense import RealSenseTransport, _meets_usb_minimum
+from leapflow.hardware.drivers.realsense import RealSenseTransport, _meets_usb_minimum
 
 
 _EXAMPLE = (

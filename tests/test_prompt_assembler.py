@@ -306,6 +306,124 @@ class TestTaskScopeKeywords:
         assert kw.count("test") == 1
 
 
+# ── Provider volatile context gating ──────────────────────────────────
+
+
+class TestProviderVolatileContext:
+    """Verify PCD level and category gating in _provider_volatile_context."""
+
+    @staticmethod
+    def _provider(
+        provider_id: str,
+        categories: frozenset[str],
+        output: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            provider_id=provider_id,
+            categories=categories,
+            render_volatile_context=lambda *, session_id, disclosure_level: output,
+        )
+
+    @staticmethod
+    def _tool_def(name: str, category: str) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": f"{name} tool",
+                "parameters": {},
+            },
+            "x_leapflow": {"category": category, "risk_level": "read_only"},
+        }
+
+    def _make_assembler_with_providers(
+        self,
+        providers: Dict[str, Any],
+        current_session_id: str = "test-session",
+    ) -> PromptAssembler:
+        engine = _stub_engine()
+        engine._volatile_context_providers = providers
+        engine._current_session_id = current_session_id
+        return PromptAssembler(engine)
+
+    def test_core_level_returns_empty(self) -> None:
+        from leapflow.engine.context.context_disclosure import DisclosureLevel, PromptAssemblyPlan
+
+        provider = self._provider("hw", frozenset({"hardware"}), "hw context")
+        assembler = self._make_assembler_with_providers({"hw": provider})
+        plan = PromptAssemblyPlan(
+            level=DisclosureLevel.CORE,
+            tool_definitions=(self._tool_def("hw_read", "hardware"),),
+        )
+        result = assembler._provider_volatile_context(plan)
+        assert result == ""
+
+    def test_expanded_with_matching_category(self) -> None:
+        from leapflow.engine.context.context_disclosure import DisclosureLevel, PromptAssemblyPlan
+
+        provider = self._provider("hw", frozenset({"hardware"}), "hw context")
+        assembler = self._make_assembler_with_providers({"hw": provider})
+        plan = PromptAssemblyPlan(
+            level=DisclosureLevel.EXPANDED,
+            tool_definitions=(self._tool_def("hw_read", "hardware"),),
+        )
+        result = assembler._provider_volatile_context(plan)
+        assert result == "hw context"
+
+    def test_expanded_without_matching_category(self) -> None:
+        from leapflow.engine.context.context_disclosure import DisclosureLevel, PromptAssemblyPlan
+
+        provider = self._provider("hw", frozenset({"hardware"}), "hw context")
+        assembler = self._make_assembler_with_providers({"hw": provider})
+        plan = PromptAssemblyPlan(
+            level=DisclosureLevel.EXPANDED,
+            tool_definitions=(self._tool_def("shell", "execution"),),
+        )
+        result = assembler._provider_volatile_context(plan)
+        assert result == ""
+
+    def test_full_includes_all_providers(self) -> None:
+        from leapflow.engine.context.context_disclosure import DisclosureLevel, PromptAssemblyPlan
+
+        p_hw = self._provider("hw", frozenset({"hardware"}), "hw context")
+        p_net = self._provider("net", frozenset({"network"}), "net context")
+        assembler = self._make_assembler_with_providers({"hw": p_hw, "net": p_net})
+        plan = PromptAssemblyPlan(
+            level=DisclosureLevel.FULL,
+            tool_definitions=(self._tool_def("shell", "execution"),),  # no matching category
+        )
+        result = assembler._provider_volatile_context(plan)
+        assert "hw context" in result
+        assert "net context" in result
+
+    def test_empty_providers_returns_empty(self) -> None:
+        from leapflow.engine.context.context_disclosure import DisclosureLevel, PromptAssemblyPlan
+
+        assembler = self._make_assembler_with_providers({})
+        plan = PromptAssemblyPlan(level=DisclosureLevel.EXPANDED)
+        result = assembler._provider_volatile_context(plan)
+        assert result == ""
+
+    def test_provider_exception_contained(self) -> None:
+        from leapflow.engine.context.context_disclosure import DisclosureLevel, PromptAssemblyPlan
+
+        def _boom(*, session_id: str, disclosure_level: str) -> str:
+            raise RuntimeError("provider crash")
+
+        failing = SimpleNamespace(
+            provider_id="boom",
+            categories=frozenset({"hardware"}),
+            render_volatile_context=_boom,
+        )
+        assembler = self._make_assembler_with_providers({"boom": failing})
+        plan = PromptAssemblyPlan(
+            level=DisclosureLevel.FULL,
+            tool_definitions=(),
+        )
+        result = assembler._provider_volatile_context(plan)
+        assert result == ""
+
+
 # ── Auto-extract findings ────────────────────────────────────────────
 
 

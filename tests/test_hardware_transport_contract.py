@@ -260,6 +260,11 @@ _EXTERNAL_ONLY_TRANSPORTS = frozenset(
         # Depends on rclpy (ROS2 Python client library), which is an optional
         # heavy dependency not installed in the standard test environment.
         "ros2",
+        # Device-specific driver (Intel RealSense D435 family) that lives in
+        # hardware/drivers/ and is discovered through entry points. Requires
+        # pyrealsense2 + a physical camera; read-only contracts are exercised
+        # in tests/test_realsense_transport.py against a fake frame source.
+        "realsense",
     }
 )
 

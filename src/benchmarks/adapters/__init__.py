@@ -31,6 +31,7 @@ def builtin_adapters() -> Sequence[BenchmarkAdapter]:
         ("benchmarks.adapters.calvin", "CalvinAdapter", "calvin"),
         ("benchmarks.adapters.vlabench", "VLABenchAdapter", "vlabench"),
         ("benchmarks.adapters.robojailbench", "RoboJailBenchAdapter", "robojailbench"),
+        ("benchmarks.adapters.roboharm", "RoboHarmAdapter", "roboharm"),
         ("benchmarks.adapters.attackvla", "AttackVLAAdapter", "attackvla"),
         ("benchmarks.adapters.safety_gymnasium", "SafetyGymnasiumAdapter", "safety_gymnasium"),
         ("benchmarks.adapters.maniskill", "ManiSkillAdapter", "maniskill"),

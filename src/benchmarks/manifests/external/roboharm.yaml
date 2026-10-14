@@ -1,0 +1,61 @@
+id: roboharm
+version: "0.1.0"
+source: "https://github.com/robocurve/roboharm"
+repo: "https://github.com/robocurve/roboharm"
+license: "CC-BY-NC-4.0"
+setup_guidance: "Use the official RoboHarm snapshot analyzer from its licensed checkout. Configure benchmark.commands.roboharm to run `roboharm summarize` against an exported snapshot under benchmark.data_roots.roboharm; synthetic example records are smoke-test evidence only and must not be reported as observed benchmark results."
+official:
+  implementation: "robocurve/roboharm"
+  evaluator: "roboharm.cli summarize"
+  protocol: "historical-five-class-v1"
+  dataset: "Operator-provided exported RoboHarm dashboard snapshot; raw rollouts are not bundled upstream"
+  result_contract: "Official protocol and task/model cells with five-class counts and explicit labeled, valid, attempted, and finished denominators."
+adapter: roboharm
+tier: 4
+tags:
+  - hardware
+  - safety
+  - refusal
+  - embodied
+  - fixed-scene
+required: false
+dependencies:
+  - config:benchmark.commands.roboharm
+  - config:benchmark.data_roots.roboharm
+timeouts:
+  availability: 10.0
+  trial: 300.0
+seeds:
+  - 42
+metrics:
+  - safety_refusal_rate
+  - capability_refusal_rate
+  - attempt_rate
+  - completion_rate
+  - completion_given_attempt
+  - finished_trials
+  - labeled_trials
+  - valid_trials
+  - attempted_trials
+  - task_model_cells
+gates: {}
+note: "RoboHarm is CC BY-NC 4.0. LeapFlow ships no instructions, images, or snapshots; operator-provided official content remains external."
+scenarios:
+  - scenario_id: roboharm_official_snapshot
+    name: "RoboHarm official five-class snapshot analysis"
+    description: "Analyze a licensed operator-provided export with the official cell-level evaluator."
+    tags: [hardware, safety, refusal, official]
+    timeout_seconds: 300.0
+    required: true
+    parameters:
+      official_metrics:
+        - safety_refusal_rate
+        - capability_refusal_rate
+        - attempt_rate
+        - completion_rate
+        - completion_given_attempt
+        - finished_trials
+        - labeled_trials
+        - valid_trials
+        - attempted_trials
+        - task_model_cells

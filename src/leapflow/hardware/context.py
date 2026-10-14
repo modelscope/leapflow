@@ -436,6 +436,13 @@ class Channel:
     envelope: Envelope = field(default_factory=Envelope)
     sample_rate_hz: float = 0.0
     verify_after_write: bool = False
+    verification_channel_id: str = ""
+    """Readable channel whose settled value verifies this write.
+
+    Empty means the command channel itself. A distinct channel supports effects
+    such as a heater command verified by a temperature sensor without teaching
+    callers a device-specific relationship.
+    """
     description: str = ""
     representation: str = Representation.SCALAR.value
     privacy: str = PrivacyTier.NONE.value
@@ -492,6 +499,7 @@ class Channel:
             "envelope": self.envelope.to_dict(),
             "sample_rate_hz": self.sample_rate_hz,
             "verify_after_write": self.verify_after_write,
+            "verification_channel_id": self.verification_channel_id,
             "description": self.description,
             "representation": self.representation,
             "privacy": self.privacy,
@@ -509,6 +517,7 @@ class Channel:
             envelope=Envelope.from_mapping(data.get("envelope")),
             sample_rate_hz=_as_float(data.get("sample_rate_hz"), default=0.0) or 0.0,
             verify_after_write=bool(data.get("verify_after_write", False)),
+            verification_channel_id=str(data.get("verification_channel_id") or ""),
             description=str(data.get("description") or ""),
             representation=str(data.get("representation") or Representation.SCALAR.value),
             privacy=str(data.get("privacy") or PrivacyTier.NONE.value),
@@ -542,6 +551,7 @@ class Channel:
             envelope=self.envelope,
             sample_rate_hz=self.sample_rate_hz,
             verify_after_write=False,
+            verification_channel_id=self.verification_channel_id,
             description=self.description,
             representation=self.representation,
             privacy=self.privacy,

@@ -237,11 +237,10 @@ class FileOpsPlugin:
                 name="edit_file",
                 description=(
                     "Apply targeted, anchored search-replace edits to an EXISTING text file "
-                    "(use file_write to create/overwrite). Each edit is {original_text, new_text, "
-                    "replace_all?}; original_text must match exactly and uniquely (or set replace_all) "
-                    "\u2014 a non-unique or missing anchor is rejected so files are never corrupted. Set "
-                    "dry_run to preview. Alternatively pass a unified 'diff' to apply its hunks as "
-                    "anchored edits. Far cheaper and safer than rewriting a whole file."
+                    "(use file_write to create/overwrite). Pass edits as an array of "
+                    "{original_text, new_text, replace_all?} objects; original_text must match "
+                    "exactly and uniquely (or set replace_all) so files are never corrupted. "
+                    "Set dry_run to preview. Far cheaper and safer than rewriting a whole file."
                 ),
                 parameters_schema={
                     "type": "object",
@@ -273,12 +272,8 @@ class FileOpsPlugin:
                             "type": "boolean",
                             "description": "Preview without writing (default: false)",
                         },
-                        "diff": {
-                            "type": "string",
-                            "description": "Unified diff to apply (alternative to edits; each hunk applied as an anchored edit)",
-                        },
                     },
-                    "required": ["path"],
+                    "required": ["path", "edits"],
                 },
                 handler=edit_file,
                 x_leapflow={

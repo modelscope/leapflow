@@ -366,16 +366,6 @@ class PromptAssembler:
             skill_section=skill_section,
         )
         system = self._append_task_contract_to_system(system)
-        # Active subagent status — injected only at EXPANDED/FULL level and
-        # only when at least one subagent is in-flight (zero cost otherwise).
-        subagent_status = self._active_subagent_status_section(plan)
-        # Volatile context (memory, knowledge, semantic focus) is assembled
-        # separately and injected as an independent message so the system
-        # prompt prefix stays byte-stable across turns for DeepSeek automatic
-        # prefix caching.  The model still receives the full context.
-        volatile_context = "\n\n".join(
-            part for part in (memory_context, subagent_status) if part
-        )
         # PCD cache-aware (5c): a resumed, cache-priority session reuses the
         # persisted system prompt and tool schema verbatim on its first turn so
         # the provider's prefix cache is hit immediately. ``_begin_turn_context``
@@ -398,6 +388,13 @@ class PromptAssembler:
             self._engine._prefix_commitment.force_commit()
             self._engine._frozen_system_prompt = None
             self._engine._frozen_tool_schema = None
+        # Volatile context is assembled only after a resumed plan has been
+        # restored. It remains a separate message, outside the stable prefix.
+        subagent_status = self._active_subagent_status_section(plan)
+        provider_context = self._provider_volatile_context(plan)
+        volatile_context = "\n\n".join(
+            part for part in (memory_context, subagent_status, provider_context) if part
+        )
         # PCD cache-aware (5b): remember exactly what this turn assembled so the
         # turn-end persistence path can snapshot the committed prefix and the
         # commitment evaluator can freeze against a stable system-prompt hash.
@@ -732,6 +729,40 @@ class PromptAssembler:
         except Exception:
             logger.debug("app connector prompt section unavailable", exc_info=True)
             return ""
+
+    def _provider_volatile_context(self, plan: PromptAssemblyPlan) -> str:
+        """Render relevant plugin context without changing the stable prefix."""
+        if plan.level == DisclosureLevel.CORE:
+            return ""
+        providers = getattr(self._engine, "_volatile_context_providers", {})
+        if not providers:
+            return ""
+        disclosed_categories = {
+            manifest.category
+            for manifest in build_capability_manifests(plan.tool_definitions)
+            if manifest.category
+        }
+        sections: list[str] = []
+        for provider_id in sorted(providers):
+            provider = providers[provider_id]
+            categories = frozenset(getattr(provider, "categories", ()) or ())
+            if plan.level != DisclosureLevel.FULL and categories.isdisjoint(
+                disclosed_categories
+            ):
+                continue
+            try:
+                section = provider.render_volatile_context(
+                    session_id=str(self._engine._current_session_id or ""),
+                    disclosure_level=plan.level.value,
+                )
+            except Exception:  # noqa: BLE001 - dynamic context is never a turn gate
+                logger.debug(
+                    "volatile context provider %s failed", provider_id, exc_info=True
+                )
+                continue
+            if isinstance(section, str) and section.strip():
+                sections.append(section.strip())
+        return "\n\n".join(sections)
 
     def _active_subagent_status_section(self, plan: PromptAssemblyPlan) -> str:
         """Render active-subagent status for the volatile prompt context.

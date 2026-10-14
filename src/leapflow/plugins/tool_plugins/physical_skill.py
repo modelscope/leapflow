@@ -157,7 +157,7 @@ class PhysicalSkillPlugin:
         """Execute one inference step and optionally write the action to hardware."""
         device_id: str = params.get("device_id", "")
         policy_path: str = params.get("policy", "")
-        execute: bool = params.get("execute", True)
+        execute: bool = params.get("execute", False)
         chunk_size: int = max(1, int(params.get("chunk_size", 1) or 1))
         verify: bool = params.get("verify", False)
         budget = _coerce_compute_budget(params.get("compute_budget"), chunk_size)
@@ -182,7 +182,9 @@ class PhysicalSkillPlugin:
         # 3. Run policy inference through the strategy contract.
         try:
             result = await self._run_inference(
-                strategy, observation, budget=budget,
+                strategy,
+                observation,
+                budget=budget,
             )
         except Exception as exc:
             return {"ok": False, "error": f"inference failed: {exc}"}
@@ -193,11 +195,15 @@ class PhysicalSkillPlugin:
         if execute:
             try:
                 execution = await self._execute_action(
-                    device_id, action, verify=verify,
+                    device_id,
+                    action,
+                    verify=verify,
                 )
             except Exception as exc:
                 return self._format_result(
-                    result, {"ok": False, "error": str(exc)}, None,
+                    result,
+                    {"ok": False, "error": str(exc)},
+                    None,
                 )
 
         # 5. Verification result is embedded in execution if requested.
@@ -425,7 +431,9 @@ class PhysicalSkillPlugin:
             except Exception:
                 logger.debug(
                     "Failed to read channel %s/%s for observation",
-                    device_id, cid, exc_info=True,
+                    device_id,
+                    cid,
+                    exc_info=True,
                 )
         return obs
 
@@ -438,115 +446,79 @@ class PhysicalSkillPlugin:
         *,
         verify: bool = False,
     ) -> dict[str, Any]:
-        """Write action vector to robot and optionally verify.
+        """Execute one policy action through the canonical hardware governor.
 
-        When the action contains multiple steps (chunked inference) and a
-        hardware registry with RT control support is available, the chunk
-        is dispatched through a :class:`RealtimeControlLoop` for smooth,
-        high-frequency execution.  Falls back to sequential batch writes
-        when the RT path is unavailable or fails.
+        Multi-step policy chunks fail closed until LHP exposes an approved,
+        node-local control-session protocol. Running a host-side hierarchy or RT
+        loop here would let physical writes occur before feasibility and approval.
         """
         if self._registry is None:
             raise RuntimeError("hardware registry is not bound")
 
-        # Attempt ControlHierarchy path for multi-step chunks when available.
-        # This provides three-layer control (System-2/1.5/1) orchestration
-        # instead of the simpler RT control loop path.
         action_sequence = self._extract_action_sequence(action)
-        if len(action_sequence) > 1:
-            hierarchy = self._get_or_create_hierarchy(device_id)
-            if hierarchy is not None:
-                try:
-                    result = await self._execute_chunk_via_hierarchy(
-                        device_id, action_sequence, hierarchy,
-                    )
-                    if result is not None:
-                        return result
-                except Exception:  # noqa: BLE001 - fallback to RT/batch
-                    logger.debug(
-                        "Hierarchy execution failed for %s; "
-                        "falling back to RT/batch path",
-                        device_id,
-                        exc_info=True,
-                    )
-
-        # Multi-step chunk: attempt RT control loop execution first.
-        if (
-            len(action_sequence) > 1
-            and hasattr(self._registry, "create_control_bus")
-        ):
-            try:
-                result = await self._execute_chunk_via_rt(
-                    device_id, action_sequence,
-                )
-                if result is not None:
-                    return result
-            except Exception:  # noqa: BLE001 - fallback to batch path
-                logger.debug(
-                    "RT control loop execution failed for %s; "
-                    "falling back to sequential batch writes",
-                    device_id,
-                    exc_info=True,
-                )
-
-        device = await self._resolve_device(device_id)
-        transport = getattr(device, "transport", None)
-        if transport is None:
-            transport = device
-
-        # Build command tuples from the action vector.
-        commands = _action_to_commands(action, device)
-
-        # Approval gate -- every physical write must be authorised before it
-        # touches an actuator.  Fail closed: an absent or failing gate denies.
-        if commands and not await self._approve_write(device_id, commands):
+        if len(action_sequence) != 1:
             return {
                 "ok": False,
                 "side_effect_state": "none",
+                "failure_code": "governed_control_session_required",
                 "channels_written": 0,
-                "error": "Physical operation not approved by hardware approval gate",
+                "error": (
+                    "Multi-step policy execution requires a governed node-local "
+                    "control session. No action was sent; run inference-only or "
+                    "execute one approved step at a time."
+                ),
             }
 
-        from leapflow.hardware.transport import BatchTransport, BatchWriteOutcome
-
-        result: dict[str, Any]
-        if isinstance(transport, BatchTransport) and commands:
-            outcome: BatchWriteOutcome = await transport.write_batch(tuple(commands))
-            result = {
-                "ok": outcome.ok,
-                "side_effect_state": outcome.side_effect_state,
-                "channels_written": len(commands),
+        device = await self._resolve_device(device_id)
+        commands = _action_to_commands(action_sequence[0], device)
+        if not commands:
+            return {
+                "ok": False,
+                "side_effect_state": "none",
+                "failure_code": "empty_policy_action",
+                "channels_written": 0,
+                "error": "The policy produced no actuator commands.",
             }
-        else:
-            # Fallback: sequential writes through the transport directly.
-            # Uses device_io lock for serialisation, matching the governed path.
-            written = 0
-            last_error = ""
-            for cid, val in commands:
-                try:
-                    async with self._registry.device_io(device_id):
-                        t = await self._registry.transport(device_id)
-                        w = await t.write(cid, val)
-                    if w.ok:
-                        written += 1
-                    else:
-                        last_error = getattr(w, "error", "") or getattr(w, "failure_code", "unknown")
-                except Exception as exc:
-                    last_error = str(exc)
-            result = {
-                "ok": written == len(commands),
-                "channels_written": written,
-                "channels_total": len(commands),
+
+        from leapflow.hardware.tools import HardwareTools
+
+        governor = HardwareTools(
+            self._registry,
+            gate=self._gate,
+            session_id=self._session_id,
+            hardware_trust_gate=self._trust_gate,
+        )
+        result = await governor.batch_actuate(
+            {
+                "device_id": device_id,
+                "commands": [
+                    {"channel_id": channel_id, "value": value} for channel_id, value in commands
+                ],
+                "verify": verify,
+                "source": "hw_policy_infer",
             }
-            if last_error:
-                result["last_error"] = last_error
-
-        # Optional verification.
-        if verify and result.get("ok"):
-            verification = await self._verify_execution(device_id, action, commands)
-            if verification:
-                result["verification"] = verification
-
+        )
+        if result.get("failure_code") == "approval_denied":
+            result["error"] = f"Physical operation not approved: {result.get('error', '')}"
+        result.setdefault("channels_written", len(commands) if result.get("ok") else 0)
+        if verify and result.get("channels"):
+            verifications = [
+                channel_result["verification"]
+                for channel_result in result["channels"]
+                if "verification" in channel_result
+            ]
+            if verifications:
+                statuses = {str(verdict.get("status") or "") for verdict in verifications}
+                if "mismatch" in statuses:
+                    aggregate_status = "failure"
+                elif statuses == {"verified"}:
+                    aggregate_status = "success"
+                else:
+                    aggregate_status = "inconclusive"
+                result["verification"] = {
+                    "status": aggregate_status,
+                    "channels": verifications,
+                }
         return result
 
     @staticmethod
@@ -626,7 +598,8 @@ class PhysicalSkillPlugin:
             if _asyncio.get_event_loop().time() > deadline:
                 logger.warning(
                     "RT chunk execution timed out after %.1fs on %s",
-                    timeout, device_id,
+                    timeout,
+                    device_id,
                 )
                 break
             await _asyncio.sleep(0.05)
@@ -655,8 +628,7 @@ class PhysicalSkillPlugin:
         """
         if self._gate is None:
             logger.error(
-                "No hardware approval gate is bound; refusing physical write "
-                "to %s (fail-closed).",
+                "No hardware approval gate is bound; refusing physical write to %s (fail-closed).",
                 device_id,
             )
             return False
@@ -667,7 +639,9 @@ class PhysicalSkillPlugin:
         except Exception as exc:  # noqa: BLE001 - a failing gate must deny, not propagate
             logger.error(
                 "Hardware approval gate raised for %s: %s",
-                device_id, exc, exc_info=True,
+                device_id,
+                exc,
+                exc_info=True,
             )
             return False
         return bool(getattr(result, "approved", False))
@@ -685,9 +659,7 @@ class PhysicalSkillPlugin:
         """
         from leapflow.security.actions import ActionDescriptor, ActionKind
 
-        channel_summaries = [
-            {"channel_id": cid, "value": val} for cid, val in commands
-        ]
+        channel_summaries = [{"channel_id": cid, "value": val} for cid, val in commands]
         return ActionDescriptor.device(
             kind=ActionKind.DEVICE_ACTUATE.value,
             device_id=device_id,
@@ -744,7 +716,9 @@ class PhysicalSkillPlugin:
                 verdict = await v.verify(evidence)
                 verdict_dict = verdict.to_dict()
                 self._update_trust_from_verdict(
-                    device_id, channel_id, verdict_dict.get("status"),
+                    device_id,
+                    channel_id,
+                    verdict_dict.get("status"),
                 )
                 return verdict_dict
             except Exception as exc:
@@ -851,7 +825,8 @@ class PhysicalSkillPlugin:
         except (RuntimeError, ValueError) as exc:
             logger.warning(
                 "Could not register physical skill teardown effect: %s",
-                exc, exc_info=True,
+                exc,
+                exc_info=True,
             )
 
     async def _cleanup(self) -> None:
@@ -891,13 +866,15 @@ class PhysicalSkillPlugin:
             )
             self._hierarchies[device_id] = hierarchy
             logger.info(
-                "Created ControlHierarchy for device %s", device_id,
+                "Created ControlHierarchy for device %s",
+                device_id,
             )
             return hierarchy
         except Exception:  # noqa: BLE001 — hierarchy is optional
             logger.debug(
                 "Failed to create ControlHierarchy for %s",
-                device_id, exc_info=True,
+                device_id,
+                exc_info=True,
             )
             return None
 
@@ -952,7 +929,8 @@ class PhysicalSkillPlugin:
             except Exception:  # noqa: BLE001 — teardown must not propagate
                 logger.debug(
                     "Failed to shut down hierarchy for %s",
-                    device_id, exc_info=True,
+                    device_id,
+                    exc_info=True,
                 )
         self._hierarchies.clear()
 
@@ -973,10 +951,10 @@ class PhysicalSkillPlugin:
                 await close()
             except Exception:  # noqa: BLE001 - teardown must not propagate
                 logger.debug(
-                    "Failed to close inference strategy for %s", path, exc_info=True,
+                    "Failed to close inference strategy for %s",
+                    path,
+                    exc_info=True,
                 )
-
-
 
 
 plugin = PhysicalSkillPlugin()

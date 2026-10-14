@@ -184,11 +184,13 @@ class StubNodeRegistry:
 
 
 def lhp_node_server(
-    *, node_id: str = "stub_node", token: str = "", device_ids: tuple[str, ...] = (), **stub_kwargs: Any
+    *, node_id: str = "stub_node", token: str = "", device_ids: tuple[str, ...] = (),
+    write_mode: str = "trusted_v1", **stub_kwargs: Any
 ) -> LhpNodeServer:
     """Build an ``LhpNodeServer`` over a ``StubNodeRegistry`` for direct-binding configs."""
     return LhpNodeServer(
-        StubNodeRegistry(**stub_kwargs), node_id=node_id, token=token, device_ids=device_ids
+        StubNodeRegistry(**stub_kwargs), node_id=node_id, token=token,
+        device_ids=device_ids, write_mode=write_mode,
     )
 
 

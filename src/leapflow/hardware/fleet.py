@@ -241,7 +241,7 @@ class FleetManager:
         prefix = f"{node.node_id}__"
         local_contexts = tuple(
             replace(
-                remote,
+                self._adjust_remote_provenance(remote, node.node_id),
                 device_id=node.host_device_id(remote.device_id),
                 transport=self._transport_ref(node, remote.device_id),
             )
@@ -629,7 +629,7 @@ class FleetManager:
         """
         from leapflow.hardware.evidence import EvidenceStore
 
-        store: EvidenceStore | None = getattr(self._registry, "_evidence_store", None)
+        store: EvidenceStore | None = getattr(self._registry, "evidence_store", None)
         if store is None:
             # Try reading_store as a fallback attribute name.
             store = getattr(self._registry, "reading_store", None)
@@ -737,6 +737,71 @@ class FleetManager:
                 "remote_device_id": remote_device_id,
             },
         )
+
+    def _adjust_remote_provenance(
+        self, context: Any, node_id: str
+    ) -> Any:
+        """Strip self-reported verified status from remote contexts (P2-J).
+
+        A node cannot be trusted to assert its own verification. The host
+        only trusts verification for remote devices when it has a local
+        digest-bound ``verified.json`` entry for ``<node>__<device>``.
+        Otherwise, provenance is marked ``remote:<node>`` declared.
+        """
+        provenance = getattr(context, "provenance", None)
+        if provenance is None:
+            return context
+        if not getattr(provenance, "is_verified", False):
+            return context
+        # Remote context claims verified — check local verified.json
+        host_device_id = f"{node_id}__{context.device_id}"
+        local_verified = self._check_local_verification(host_device_id, context)
+        if local_verified:
+            return context  # host has digest-bound verification
+        # Strip: mark as remote-declared only
+        logger.info(
+            "Fleet: stripping self-reported verification for %s from node %s; "
+            "no local digest-bound entry exists",
+            context.device_id, node_id,
+        )
+        return replace(
+            context,
+            provenance=replace(
+                provenance,
+                verified_by="",
+                source=f"remote:{node_id}",
+            ),
+        )
+
+    def _check_local_verification(self, host_device_id: str, context: Any) -> bool:
+        """Check if the host has a digest-bound verification for this remote device."""
+        try:
+            verified_path = getattr(
+                getattr(self._registry, "_settings", None),
+                "hardware_verified_path", None
+            )
+            if not verified_path:
+                layout = getattr(self._registry, "_layout", None)
+                if layout is not None:
+                    verified_path = getattr(layout, "verified_path", None)
+            if not verified_path:
+                return False
+            from pathlib import Path
+
+            import yaml
+
+            target = Path(str(verified_path)).expanduser()
+            if not target.is_file():
+                return False
+            raw = yaml.safe_load(target.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return False
+            entry = raw.get(host_device_id)
+            if not isinstance(entry, dict):
+                return False
+            return bool(entry.get("declaration_digest"))
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _halt_device(self, device_id: str) -> None:
         """Halt a single device through the local registry's transport.

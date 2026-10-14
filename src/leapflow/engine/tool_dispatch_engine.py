@@ -161,6 +161,28 @@ class ToolDispatchEngine:
                 )
             )
         return None
+    def _annotate_argument_repair_repeat(
+        self, tool_name: str, result: Dict[str, Any]
+    ) -> None:
+        """Bound repeated schema repairs by their missing-field condition.
+
+        Invalid calls are not executed and do not normally count as failures. A
+        model can nevertheless vary irrelevant arguments while omitting the same
+        required fields, which defeats exact-action fingerprints. Fingerprint the
+        stable validation condition so the first miss remains self-repairable and
+        the second identical miss becomes the normal terminal loop breaker.
+        """
+        if result.get("error_type") != "invalid_arguments":
+            return
+        missing = sorted(str(name) for name in (result.get("missing") or []) if name)
+        if not missing:
+            return
+        counts_as_failure = result.get("counts_as_failure")
+        result["counts_as_failure"] = True
+        self._annotate_terminal_repeat(tool_name, {"missing": missing}, result)
+        if result.get("failure_code") != "repeated_terminal_failure":
+            result["counts_as_failure"] = counts_as_failure
+
     def _task_completion_tracker(self) -> TaskCompletionTracker:
         """Get the active frame's non-prompt completion evidence ledger."""
         frame = getattr(self._engine, "_active_frame", None)
@@ -946,6 +968,7 @@ class ToolDispatchEngine:
                 logger.info(
                     "tool_args_invalid: tool=%s missing=%s", tool_name, invalid_args.get("missing")
                 )
+                self._annotate_argument_repair_repeat(tool_name, invalid_args)
                 return invalid_args
         session_id = self._engine._current_session_id or "ephemeral"
         turn_id = self._engine._current_turn_id or f"turn-{self._engine._session_turn_count}"

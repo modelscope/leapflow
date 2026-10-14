@@ -53,6 +53,7 @@ from leapflow.hardware.lhp.protocol import (
     LhpRemoteError,
 )
 from leapflow.hardware.transport import (
+    SIDE_EFFECT_NONE,
     SIDE_EFFECT_UNKNOWN,
     BatchReading,
     BatchWriteOutcome,
@@ -79,11 +80,14 @@ class LhpTransport:
         self._expected_node_id = str(config.get("node_id") or "")
         self._remote_device_id = str(config.get("remote_device_id") or "")
         self._timeout_s = float(config.get("timeout_s") or DEFAULT_REQUEST_TIMEOUT_S)
+        self._permit_issuer = config.get("permit_issuer")  # PermitIssuer (not serialized)
         self._client: DirectLhpClient | SocketLhpClient | None = None
         self._context: HardwareContext | None = None
         self._connected = False
         self._capabilities: frozenset[str] = frozenset()
         self._frame_channels: set[str] = set()
+        self._remote_write_mode: str = ""  # from hello
+        self._remote_node_id: str = ""  # from hello
 
     # ── Lifecycle ──
 
@@ -125,6 +129,8 @@ class LhpTransport:
         self._capabilities = frozenset(
             str(item) for item in raw_capabilities if isinstance(item, str) and item
         )
+        self._remote_write_mode = str(hello.get("write_mode") or "") if isinstance(hello, Mapping) else ""
+        self._remote_node_id = node_id or self._expected_node_id
         self._client = client
         self._connected = True
         return TransportStatus(
@@ -218,10 +224,24 @@ class LhpTransport:
 
     async def write(self, channel_id: str, value: Any) -> WriteOutcome:
         client = self._require_client()
+        params: dict[str, Any] = {
+            "device_id": self._remote_device_id,
+            "channel_id": channel_id,
+            "value": value,
+        }
+        permit_dict = self._maybe_issue_permit(
+            method="write",
+            device_id=self._remote_device_id,
+            commands=[(channel_id, value)],
+        )
+        if isinstance(permit_dict, WriteOutcome):
+            return permit_dict  # local refusal
+        if permit_dict is not None:
+            params["permit"] = permit_dict
         try:
             result = await client.request(
                 "write",
-                {"device_id": self._remote_device_id, "channel_id": channel_id, "value": value},
+                params,
             )
         except LhpRemoteError as exc:
             if exc.code in WRITE_EFFECT_UNKNOWN_CODES:
@@ -326,14 +346,21 @@ class LhpTransport:
 
     async def write_batch(self, commands: tuple[tuple[str, Any], ...]) -> BatchWriteOutcome:
         client = self._require_client()
+        params: dict[str, Any] = {
+            "device_id": self._remote_device_id,
+            "commands": [[channel_id, value] for channel_id, value in commands],
+        }
+        permit_dict = self._maybe_issue_permit(
+            method="write_batch",
+            device_id=self._remote_device_id,
+            commands=list(commands),
+        )
+        if isinstance(permit_dict, BatchWriteOutcome):
+            return permit_dict  # local refusal
+        if permit_dict is not None:
+            params["permit"] = permit_dict
         try:
-            result = await client.request(
-                "write_batch",
-                {
-                    "device_id": self._remote_device_id,
-                    "commands": [[channel_id, value] for channel_id, value in commands],
-                },
-            )
+            result = await client.request("write_batch", params)
         except LhpRemoteError as exc:
             if exc.code in WRITE_EFFECT_UNKNOWN_CODES:
                 return BatchWriteOutcome(ok=False, outcomes=(), side_effect_state=SIDE_EFFECT_UNKNOWN)
@@ -374,6 +401,175 @@ class LhpTransport:
             outcomes=tuple(outcomes),
             side_effect_state=str(result.get("side_effect_state") or SIDE_EFFECT_UNKNOWN),
         )
+
+    # ── Remote control (control.v1) ──
+
+    async def open_control(
+        self,
+        *,
+        device_id: str,
+        mode: str,
+        frequency_hz: float,
+        channels: list[str],
+        targets: Any = None,
+        waypoints: Any = None,
+        lease_s: float = 1.0,
+        comm_loss_policy: str = "halt",
+    ) -> dict[str, Any]:
+        """Open a control session on the remote node and start auto-renewal."""
+        from leapflow.hardware.lhp.protocol import CAP_CONTROL_V1
+
+        client = self._require_client()
+        if CAP_CONTROL_V1 not in self._capabilities:
+            raise TransportError(
+                "remote node does not advertise control.v1",
+                failure_code="remote_control_unsupported",
+            )
+        params: dict[str, Any] = {
+            "device_id": self._remote_device_id,
+            "mode": mode,
+            "frequency_hz": frequency_hz,
+            "channels": channels,
+            "lease_s": lease_s,
+            "comm_loss_policy": comm_loss_policy,
+        }
+        if targets is not None:
+            params["targets"] = targets
+        if waypoints is not None:
+            params["waypoints"] = waypoints
+        try:
+            result = await client.request("control.open", params)
+        except LhpRemoteError as exc:
+            raise TransportError(str(exc) or exc.code, failure_code=exc.code) from exc
+        if not isinstance(result, Mapping) or not result.get("ok"):
+            error_msg = result.get("error", "control.open refused") if isinstance(result, Mapping) else "malformed"
+            raise TransportError(str(error_msg), failure_code="control_open_failed")
+
+        control_id = str(result.get("control_id") or "")
+        actual_lease = float(result.get("lease_s") or lease_s)
+        # Start auto-renewal task
+        self._start_renewal_loop(control_id, actual_lease)
+        return dict(result)
+
+    async def renew_control(self, control_id: str) -> dict[str, Any]:
+        """Renew the lease on a remote control session."""
+        client = self._require_client()
+        try:
+            result = await client.request("control.renew", {"control_id": control_id})
+        except LhpRemoteError as exc:
+            raise TransportError(str(exc) or exc.code, failure_code=exc.code) from exc
+        return dict(result) if isinstance(result, Mapping) else {}
+
+    async def update_control(
+        self, control_id: str, *, targets: Any = None, waypoints: Any = None
+    ) -> dict[str, Any]:
+        """Update targets/waypoints on a running session."""
+        client = self._require_client()
+        params: dict[str, Any] = {"control_id": control_id}
+        if targets is not None:
+            params["targets"] = targets
+        if waypoints is not None:
+            params["waypoints"] = waypoints
+        try:
+            result = await client.request("control.update", params)
+        except LhpRemoteError as exc:
+            raise TransportError(str(exc) or exc.code, failure_code=exc.code) from exc
+        return dict(result) if isinstance(result, Mapping) else {}
+
+    async def close_control(self, control_id: str) -> dict[str, Any]:
+        """Close a remote control session and stop auto-renewal."""
+        self._stop_renewal_loop()
+        client = self._require_client()
+        try:
+            result = await client.request("control.close", {"control_id": control_id})
+        except LhpRemoteError as exc:
+            raise TransportError(str(exc) or exc.code, failure_code=exc.code) from exc
+        return dict(result) if isinstance(result, Mapping) else {}
+
+    def _start_renewal_loop(self, control_id: str, lease_s: float) -> None:
+        """Start a background task that renews the lease at lease_s/3 intervals."""
+        import asyncio as _asyncio
+
+        self._stop_renewal_loop()  # cancel any existing
+        interval = max(0.1, lease_s / 3.0)
+
+        async def _renew_loop() -> None:
+            while True:
+                await _asyncio.sleep(interval)
+                try:
+                    await self.renew_control(control_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "LHP control renewal failed for %s: %s",
+                        control_id[:8], exc,
+                    )
+                    return  # stop renewing; node will fire comm_loss_policy
+
+        try:
+            loop = _asyncio.get_running_loop()
+            self._renewal_task = loop.create_task(
+                _renew_loop(), name=f"lhp-control-renew-{control_id[:8]}"
+            )
+        except RuntimeError:
+            logger.debug("no running event loop for control renewal")
+
+    def _stop_renewal_loop(self) -> None:
+        """Cancel the auto-renewal background task."""
+        task = getattr(self, "_renewal_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._renewal_task = None
+
+    # ── Permit integration ──
+
+    def _maybe_issue_permit(
+        self,
+        *,
+        method: str,
+        device_id: str,
+        commands: list[tuple[str, Any]] | None = None,
+    ) -> dict[str, Any] | WriteOutcome | BatchWriteOutcome | None:
+        """Issue a permit if the node requires one. Returns permit dict, local refusal, or None."""
+        if self._remote_write_mode != "permit_required":
+            return None
+        if "permit.v1" not in self._capabilities:
+            return None
+        # Read the execution authorization from the contextvar
+        from leapflow.hardware.execution_authorization import current_authorization
+        from leapflow.hardware.lhp.permit import action_digest as _action_digest
+
+        auth = current_authorization()
+        issuer = self._permit_issuer
+        if auth is None or issuer is None:
+            refusal_error = (
+                "remote node requires a signed permit but no execution authorization "
+                "is active (host-side refusal; nothing was sent)"
+            )
+            if method == "write_batch":
+                return BatchWriteOutcome(
+                    ok=False, outcomes=(), side_effect_state=SIDE_EFFECT_NONE,
+                )
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=refusal_error,
+                failure_code="permit_required",
+            )
+        digest = _action_digest(
+            method=method,
+            device_id=device_id,
+            commands=commands if commands else None,
+            effect=auth.effect,
+            envelope_band=auth.envelope_band,
+        )
+        permit = issuer.issue(
+            audience=self._remote_node_id,
+            session_id=auth.session_id,
+            workspace=auth.workspace,
+            approval_id=auth.approval_id,
+            digest=digest,
+        )
+        return permit.to_dict()
 
     # ── Internals ──
 
