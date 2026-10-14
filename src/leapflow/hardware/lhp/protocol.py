@@ -82,6 +82,18 @@ layer never replays a physical command whose fate is unproven.
 FAILURE_SAFETY_DENIED = "safety_policy_denied"
 FAILURE_NOT_WRITABLE = "not_writable"
 FAILURE_BATCH_ABORTED = "batch_aborted"
+FAILURE_INTERLOCK_UNSATISFIED = "interlock_unsatisfied"
+FAILURE_DEVICE_DEGRADED = "device_degraded"
+
+# Permit-related failure codes (side_effect=NONE; command never attempted).
+FAILURE_PERMIT_REQUIRED = "permit_required"
+FAILURE_PERMIT_INVALID = "permit_invalid"
+FAILURE_PERMIT_EXPIRED = "permit_expired"
+FAILURE_PERMIT_REPLAYED = "permit_replayed"
+FAILURE_PERMIT_AUDIENCE_MISMATCH = "permit_audience_mismatch"
+FAILURE_PERMIT_DIGEST_MISMATCH = "permit_digest_mismatch"
+FAILURE_WRITES_DISABLED = "writes_disabled"
+FAILURE_REMOTE_CONTROL_UNSUPPORTED = "remote_control_unsupported"
 
 LHP_V1_CAPABILITIES: tuple[str, ...] = (
     "list",
@@ -95,7 +107,20 @@ LHP_V1_CAPABILITIES: tuple[str, ...] = (
 
 LHP_V2_CAPABILITIES: tuple[str, ...] = (*LHP_V1_CAPABILITIES, "read_frame", "release_frame")
 
-LHP_METHODS: tuple[str, ...] = ("hello", *LHP_V2_CAPABILITIES)
+# v2 optional capability tokens negotiated at hello.
+CAP_PERMIT_V1 = "permit.v1"
+CAP_CONTROL_V1 = "control.v1"
+
+LHP_METHODS: tuple[str, ...] = (
+    "hello",
+    *LHP_V2_CAPABILITIES,
+    # control.v1 methods are only accepted when the capability is advertised.
+    "control.open",
+    "control.renew",
+    "control.update",
+    "control.close",
+    "control.status",
+)
 LHP_CAPABILITIES: tuple[str, ...] = LHP_V2_CAPABILITIES
 """Capabilities of the newest protocol; hello advertises the negotiated version's set."""
 
@@ -194,6 +219,8 @@ def response_error(response: Mapping[str, Any]) -> tuple[str, str] | None:
 
 
 __all__ = [
+    "CAP_CONTROL_V1",
+    "CAP_PERMIT_V1",
     "ERR_BAD_REQUEST",
     "ERR_CONNECTION_CLOSED",
     "ERR_FRAME_TOO_LARGE",
@@ -206,8 +233,18 @@ __all__ = [
     "ERR_UNKNOWN_DEVICE",
     "ERR_UNSUPPORTED_CAPABILITY",
     "FAILURE_BATCH_ABORTED",
+    "FAILURE_DEVICE_DEGRADED",
+    "FAILURE_INTERLOCK_UNSATISFIED",
     "FAILURE_NOT_WRITABLE",
+    "FAILURE_PERMIT_AUDIENCE_MISMATCH",
+    "FAILURE_PERMIT_DIGEST_MISMATCH",
+    "FAILURE_PERMIT_EXPIRED",
+    "FAILURE_PERMIT_INVALID",
+    "FAILURE_PERMIT_REPLAYED",
+    "FAILURE_PERMIT_REQUIRED",
+    "FAILURE_REMOTE_CONTROL_UNSUPPORTED",
     "FAILURE_SAFETY_DENIED",
+    "FAILURE_WRITES_DISABLED",
     "LHP_CAPABILITIES",
     "LHP_DEFAULT_PORT",
     "LHP_METHODS",

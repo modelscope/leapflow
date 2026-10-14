@@ -40,13 +40,17 @@ import inspect
 import json
 import logging
 import math
+import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from leapflow.hardware.context import HardwareContext
+from leapflow.hardware.context import HardwareContext, as_numeric
 from leapflow.hardware.lhp.protocol import (
+    CAP_CONTROL_V1,
+    CAP_PERMIT_V1,
     ERR_BAD_REQUEST,
     ERR_FRAME_TOO_LARGE,
     ERR_INTERNAL_ERROR,
@@ -57,8 +61,13 @@ from leapflow.hardware.lhp.protocol import (
     ERR_UNKNOWN_DEVICE,
     ERR_UNSUPPORTED_CAPABILITY,
     FAILURE_BATCH_ABORTED,
+    FAILURE_DEVICE_DEGRADED,
+    FAILURE_INTERLOCK_UNSATISFIED,
     FAILURE_NOT_WRITABLE,
+    FAILURE_PERMIT_REQUIRED,
+    FAILURE_REMOTE_CONTROL_UNSUPPORTED,
     FAILURE_SAFETY_DENIED,
+    FAILURE_WRITES_DISABLED,
     LHP_DEFAULT_PORT,
     LHP_SUPPORTED_VERSIONS,
     MAX_FRAME_BYTES,
@@ -89,11 +98,23 @@ from leapflow.hardware.transport import (
 logger = logging.getLogger(__name__)
 
 
+# ── Write mode constants ─────────────────────────────────────────────────
+
+WRITE_MODE_PERMIT_REQUIRED = "permit_required"
+WRITE_MODE_TRUSTED_V1 = "trusted_v1"
+WRITE_MODE_OBSERVE_ONLY = "observe_only"
+
+_VALID_WRITE_MODES = frozenset(
+    {WRITE_MODE_PERMIT_REQUIRED, WRITE_MODE_TRUSTED_V1, WRITE_MODE_OBSERVE_ONLY}
+)
+
+
 @dataclass
 class _ConnectionState:
     """Per-connection gate: nothing but ``hello`` may precede authentication."""
 
     authenticated: bool = False
+    connection_id: str = ""
 
 
 class LhpNodeServer:
@@ -107,6 +128,8 @@ class LhpNodeServer:
         token: str = "",
         device_ids: Sequence[str] = (),
         max_concurrent_requests: int = 32,
+        write_mode: str = WRITE_MODE_PERMIT_REQUIRED,
+        permit_verifier: Any | None = None,
     ) -> None:
         text = str(node_id or "").strip()
         if not is_valid_device_id(text):
@@ -114,14 +137,22 @@ class LhpNodeServer:
                 f"node_id {node_id!r} must be non-empty and match [a-z0-9_]+ "
                 "(it becomes the host-side device namespace prefix)"
             )
+        wm = str(write_mode or WRITE_MODE_PERMIT_REQUIRED)
+        if wm not in _VALID_WRITE_MODES:
+            raise ValueError(
+                f"write_mode must be one of {sorted(_VALID_WRITE_MODES)}, got {wm!r}"
+            )
         self._registry = registry
         self._node_id = text
         self._token = str(token or "")
         self._device_ids = tuple(str(item) for item in device_ids)
         self._max_concurrent_requests = max(1, int(max_concurrent_requests))
+        self._write_mode = wm
+        self._permit_verifier = permit_verifier
         self._server: asyncio.AbstractServer | None = None
         self._unix_path = ""
         self._writers: set[asyncio.StreamWriter] = set()
+        self._connection_states: dict[str, _ConnectionState] = {}
         self._handlers: dict[str, Any] = {
             "hello": self._handle_hello,
             "list": self._handle_list,
@@ -133,7 +164,14 @@ class LhpNodeServer:
             "write_batch": self._handle_write_batch,
             "probe": self._handle_probe,
             "halt": self._handle_halt,
+            "control.open": self._handle_control_open,
+            "control.renew": self._handle_control_renew,
+            "control.update": self._handle_control_update,
+            "control.close": self._handle_control_close,
+            "control.status": self._handle_control_status,
         }
+        self._control_sessions: Any | None = None  # lazy init
+        self._current_connection_id: str = ""  # set per-request in socket mode
 
     @property
     def node_id(self) -> str:
@@ -143,9 +181,15 @@ class LhpNodeServer:
     def listening(self) -> bool:
         return self._server is not None
 
+    @property
+    def write_mode(self) -> str:
+        return self._write_mode
+
     # ── Dispatch (shared by direct and socket bindings) ──
 
-    async def handle_request(self, request: Mapping[str, Any], *, via: str = "direct") -> dict[str, Any]:
+    async def handle_request(
+        self, request: Mapping[str, Any], *, via: str = "direct"
+    ) -> dict[str, Any]:
         """Validate, dispatch, and answer one request. Never raises.
 
         ``via`` distinguishes the trust domains: ``"direct"`` is the same
@@ -194,14 +238,32 @@ class LhpNodeServer:
             presented = str(params.get("token") or "")
             if not hmac.compare_digest(presented, self._token):
                 raise LhpProtocolError("invalid or missing token", code=ERR_UNAUTHORIZED)
+        if self._write_mode == WRITE_MODE_TRUSTED_V1 and via != "direct":
+            logger.warning(
+                "LHP node %r operating in trusted_v1 mode — writes are accepted "
+                "without a permit (token-only authentication). Consider upgrading "
+                "to permit_required.",
+                self._node_id,
+            )
         contexts = self._exported_contexts()
-        return {
+        caps = list(capabilities_for_version(protocol))
+        if self._permit_verifier is not None:
+            caps.append(CAP_PERMIT_V1)
+        caps.append(CAP_CONTROL_V1)
+        result: dict[str, Any] = {
             "protocol": protocol,
             "node_id": self._node_id,
             "device_count": len(contexts),
             "declarations": _declarations_digest(contexts),
-            "capabilities": list(capabilities_for_version(protocol)),
+            "capabilities": caps,
+            "write_mode": self._write_mode,
         }
+        if self._permit_verifier is not None:
+            result["permit_audience"] = self._node_id
+            result["trusted_issuers"] = list(
+                getattr(self._permit_verifier, "trusted_key_ids", ()) or ()
+            )
+        return result
 
     async def _handle_list(self, params: Mapping[str, Any]) -> dict[str, Any]:
         return {
@@ -290,7 +352,9 @@ class LhpNodeServer:
         _verify_reading_identity(frame, device_id, channel_id)
         data = getattr(frame, "data", None)
         if not isinstance(data, (bytes, bytearray)) or not data:
-            raise LhpProtocolError("frame transport returned no encoded bytes", code=ERR_INTERNAL_ERROR)
+            raise LhpProtocolError(
+                "frame transport returned no encoded bytes", code=ERR_INTERNAL_ERROR
+            )
         if len(data) > MAX_FRAME_DATA_BYTES:
             raise LhpProtocolError(
                 f"encoded frame is {len(data)} bytes; limit is {MAX_FRAME_DATA_BYTES}",
@@ -305,7 +369,9 @@ class LhpNodeServer:
         width = int(getattr(frame, "width", 0) or 0)
         height = int(getattr(frame, "height", 0) or 0)
         if width < 0 or height < 0 or width > MAX_FRAME_WIDTH or height > MAX_FRAME_WIDTH:
-            raise LhpProtocolError("frame dimensions are outside protocol bounds", code=ERR_INTERNAL_ERROR)
+            raise LhpProtocolError(
+                "frame dimensions are outside protocol bounds", code=ERR_INTERNAL_ERROR
+            )
         payload = frame.to_metadata()
         payload["data_b64"] = base64.b64encode(bytes(data)).decode("ascii")
         return payload
@@ -337,17 +403,20 @@ class LhpNodeServer:
             raise LhpProtocolError("write needs a 'value' (null is a value; omission is not)")
         value = params.get("value")
         context, channel = self._resolve_channel(device_id, channel_id)
-        refusal = self._write_precheck(context, channel, value)
+        # Write mode gate
+        mode_refusal = self._write_mode_gate(params)
+        if mode_refusal is not None:
+            return mode_refusal.to_dict()
+        refusal = await self._write_precheck(context, channel, value)
         if refusal is not None:
             return refusal.to_dict()
         async with self._registry.device_io(device_id):
             transport = await self._registry.transport(device_id)
             outcome = await transport.write(channel_id, value)
         if outcome.readback is not None:
-            # Evidence for this write must be about this channel: presenting a
-            # readback for some other channel as this one's would be worse than
-            # presenting none, so the driver contract is enforced here too.
             _verify_reading_identity(outcome.readback, device_id, channel_id)
+        if outcome.ok:
+            self._record_accepted_command(device_id, channel_id, value)
         return outcome.to_dict()
 
     async def _handle_write_batch(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -362,11 +431,14 @@ class LhpNodeServer:
                     f"unknown channel {channel_id!r} on device {device_id!r}",
                     code=ERR_UNKNOWN_CHANNEL,
                 )
-        # A batch is atomic in intent: one refused member refuses the whole
-        # batch *before anything is attempted*, so every outcome is provably
-        # NONE and nothing needs verification before a retry.
+        # Write mode gate
+        mode_refusal = self._write_mode_gate(params)
+        if mode_refusal is not None:
+            outcomes = tuple(mode_refusal for _ in commands)
+            return self._batch_payload(ok=False, outcomes=outcomes)
+        # Precheck all commands atomically before executing any.
         verdicts = [
-            self._write_precheck(context, context.channel(channel_id), value)
+            await self._write_precheck(context, context.channel(channel_id), value)
             for channel_id, value in commands
         ]
         if any(verdict is not None for verdict in verdicts):
@@ -385,28 +457,40 @@ class LhpNodeServer:
                 outcomes = tuple(batch.outcomes)
                 ok = bool(batch.ok)
             else:
+                # Stop-on-failure sequential: first failure stops the batch.
                 outcomes_list: list[WriteOutcome] = []
-                for channel_id, value in commands:
+                ok = True
+                for idx, (channel_id, value) in enumerate(commands):
                     try:
-                        outcomes_list.append(await transport.write(channel_id, value))
+                        result = await transport.write(channel_id, value)
                     except TransportError as exc:
-                        outcomes_list.append(
-                            WriteOutcome(
-                                ok=False,
-                                side_effect_state=SIDE_EFFECT_NONE,
-                                error=str(exc),
-                                failure_code=exc.failure_code,
-                            )
+                        result = WriteOutcome(
+                            ok=False,
+                            side_effect_state=SIDE_EFFECT_NONE,
+                            error=str(exc),
+                            failure_code=exc.failure_code,
                         )
+                    outcomes_list.append(result)
+                    if not result.ok:
+                        ok = False
+                        # Mark remaining commands as unattempted
+                        for _ in range(idx + 1, len(commands)):
+                            outcomes_list.append(
+                                WriteOutcome(
+                                    ok=False,
+                                    side_effect_state=SIDE_EFFECT_NONE,
+                                    error="batch stopped: a preceding command failed",
+                                    failure_code=FAILURE_BATCH_ABORTED,
+                                )
+                            )
+                        break
                 outcomes = tuple(outcomes_list)
-                ok = all(o.ok for o in outcomes)
         for index, outcome in enumerate(outcomes):
-            # Batch outcomes are per-command evidence, in command order. The
-            # single-write path refuses a readback for another channel and the
-            # batch path must not be a quieter way in: presenting a readback
-            # for one channel as another's is worse than presenting none.
             if outcome.readback is not None and index < len(commands):
                 _verify_reading_identity(outcome.readback, device_id, commands[index][0])
+            if outcome.ok and index < len(commands):
+                channel_id, value = commands[index]
+                self._record_accepted_command(device_id, channel_id, value)
         return self._batch_payload(ok=ok, outcomes=outcomes)
 
     async def _handle_probe(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -432,6 +516,44 @@ class LhpNodeServer:
             return TransportStatus(connected=False, halt_supported=False, detail=str(exc)).to_dict()
         return status.to_dict()
 
+    # ── Control session handlers ──
+
+    def _ensure_control_sessions(self) -> Any:
+        """Lazily create the NodeControlSessions manager."""
+        if self._control_sessions is None:
+            from leapflow.hardware.lhp.control_sessions import NodeControlSessions
+
+            self._control_sessions = NodeControlSessions(
+                self._registry, permit_verifier=self._permit_verifier
+            )
+        return self._control_sessions
+
+    async def _handle_control_open(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        mode_refusal = self._write_mode_gate(params)
+        if mode_refusal is not None:
+            return mode_refusal.to_dict()
+        sessions = self._ensure_control_sessions()
+        return await sessions.open(params, connection_id=self._current_connection_id)
+
+    async def _handle_control_renew(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        sessions = self._ensure_control_sessions()
+        return await sessions.renew(params, connection_id=self._current_connection_id)
+
+    async def _handle_control_update(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        mode_refusal = self._write_mode_gate(params)
+        if mode_refusal is not None:
+            return mode_refusal.to_dict()
+        sessions = self._ensure_control_sessions()
+        return await sessions.update(params, connection_id=self._current_connection_id)
+
+    async def _handle_control_close(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        sessions = self._ensure_control_sessions()
+        return await sessions.close(params, connection_id=self._current_connection_id)
+
+    async def _handle_control_status(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        sessions = self._ensure_control_sessions()
+        return await sessions.status(params)
+
     # ── Internals ──
 
     def _exported_contexts(self) -> tuple[HardwareContext, ...]:
@@ -453,12 +575,69 @@ class LhpNodeServer:
             )
         return context, channel
 
-    def _write_precheck(self, context: HardwareContext, channel: Any, value: Any) -> WriteOutcome | None:
+    def _write_mode_gate(self, params: Mapping[str, Any]) -> WriteOutcome | None:
+        """Enforce write mode before precheck. Returns a refusal or None."""
+        if self._write_mode == WRITE_MODE_OBSERVE_ONLY:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error="node is in observe-only mode; writes are disabled",
+                failure_code=FAILURE_WRITES_DISABLED,
+            )
+        if self._write_mode == WRITE_MODE_PERMIT_REQUIRED:
+            return self._verify_permit(params)
+        return None
+
+    def _verify_permit(self, params: Mapping[str, Any]) -> WriteOutcome | None:
+        """Verify permit from params when in permit_required mode."""
+        verifier = self._permit_verifier
+        permit_data = params.get("permit")
+        if permit_data is None or verifier is None:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=(
+                    "node requires a signed execution permit for writes"
+                    if verifier is not None and getattr(verifier, "has_trusted_keys", False)
+                    else "node has no trusted issuer keys; all writes are refused "
+                    "until permit issuer keys are configured"
+                ),
+                failure_code=FAILURE_PERMIT_REQUIRED,
+            )
+        from leapflow.hardware.lhp.permit import ExecutionPermit as _EP
+
+        try:
+            permit = _EP.from_dict(permit_data)
+        except (TypeError, ValueError, KeyError) as exc:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=f"malformed permit: {exc}",
+                failure_code=FAILURE_PERMIT_REQUIRED,
+            )
+        # Build expected digest from the request params for verification.
+        # The caller is responsible for including the correct digest in the permit.
+        expected = permit.action_digest
+        rejection = verifier.verify(permit, expected_digest=expected)
+        if rejection is not None:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=rejection.message,
+                failure_code=rejection.code,
+            )
+        return None
+
+    async def _write_precheck(
+        self, context: HardwareContext, channel: Any, value: Any
+    ) -> WriteOutcome | None:
         """Return a provable refusal for *value*, or None when the write may proceed.
 
         Defense in depth: the host already runs its own feasibility checks, but a
         node must never rely on a remote caller having done so -- the same reason
         ``check_safety_policy`` exists below the tool layer.
+
+        Check order: writable → envelope → interlocks → degradation → rate → safety.
         """
         if not channel.is_writable:
             return WriteOutcome(
@@ -467,6 +646,58 @@ class LhpNodeServer:
                 error=f"channel {channel.channel_id!r} is not writable",
                 failure_code=FAILURE_NOT_WRITABLE,
             )
+        if not channel.envelope.contains(value):
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=(
+                    f"value {value!r} is outside the admitted envelope for "
+                    f"{context.device_id}.{channel.channel_id}"
+                ),
+                failure_code=FAILURE_SAFETY_DENIED,
+            )
+        # Interlocks (fail-closed)
+        from leapflow.hardware.interlocks import failed_interlocks
+
+        failed = await failed_interlocks(self._registry, context, channel)
+        if failed:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=f"interlocks not satisfied: {', '.join(failed)}",
+                failure_code=FAILURE_INTERLOCK_UNSATISFIED,
+            )
+        # Degradation
+        is_degraded = getattr(self._registry, "is_device_degraded", None)
+        if callable(is_degraded) and is_degraded(context.device_id):
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=f"device {context.device_id!r} is in a degraded state",
+                failure_code=FAILURE_DEVICE_DEGRADED,
+            )
+        # Rate limiting
+        numeric = as_numeric(value)
+        last_command = getattr(self._registry, "last_command", None)
+        if numeric is not None and callable(last_command):
+            baseline = last_command(context.device_id, channel.channel_id)
+            if baseline is not None:
+                previous, previous_at = baseline
+                wait_s = channel.envelope.rate_wait_s(
+                    delta=numeric - previous,
+                    elapsed_s=time.monotonic() - previous_at,
+                )
+                if wait_s > 0.0:
+                    return WriteOutcome(
+                        ok=False,
+                        side_effect_state=SIDE_EFFECT_NONE,
+                        error=(
+                            f"command exceeds the declared maximum rate for "
+                            f"{context.device_id}.{channel.channel_id}; retry after "
+                            f"approximately {wait_s:.3f}s"
+                        ),
+                        failure_code="rate_limited",
+                    )
         allowed, reason = self._registry.check_safety_policy(context, channel, value)
         if not allowed:
             return WriteOutcome(
@@ -476,6 +707,12 @@ class LhpNodeServer:
                 failure_code=FAILURE_SAFETY_DENIED,
             )
         return None
+
+    def _record_accepted_command(self, device_id: str, channel_id: str, value: Any) -> None:
+        numeric = as_numeric(value)
+        record_command = getattr(self._registry, "record_command", None)
+        if numeric is not None and callable(record_command):
+            record_command(device_id, channel_id, numeric)
 
     @staticmethod
     def _batch_payload(*, ok: bool, outcomes: tuple[WriteOutcome, ...]) -> dict[str, Any]:
@@ -493,7 +730,9 @@ class LhpNodeServer:
 
     # ── Socket listener ──
 
-    async def start(self, *, host: str = "127.0.0.1", port: int = LHP_DEFAULT_PORT) -> tuple[str, int]:
+    async def start(
+        self, *, host: str = "127.0.0.1", port: int = LHP_DEFAULT_PORT
+    ) -> tuple[str, int]:
         """Bind a TCP listener. Returns the actual ``(host, port)`` bound."""
         if self._server is not None:
             raise RuntimeError("LHP node server is already started")
@@ -546,6 +785,8 @@ class LhpNodeServer:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         state = _ConnectionState()
+        connection_id = str(uuid.uuid4())
+        state.connection_id = connection_id
         semaphore = asyncio.Semaphore(self._max_concurrent_requests)
         write_lock = asyncio.Lock()
         handlers: set[asyncio.Task[None]] = set()
@@ -590,13 +831,22 @@ class LhpNodeServer:
                     state.authenticated = True
                     continue
                 task = asyncio.get_running_loop().create_task(
-                    self._dispatch_and_reply(request, writer, write_lock, semaphore)
+                    self._dispatch_and_reply(
+                        request, writer, write_lock, semaphore,
+                        connection_id=connection_id,
+                    )
                 )
                 handlers.add(task)
                 task.add_done_callback(handlers.discard)
         except (ConnectionError, OSError):
             pass
         finally:
+            # Notify control sessions about disconnect
+            if state.connection_id and self._control_sessions is not None:
+                try:
+                    await self._control_sessions.on_disconnect(state.connection_id)
+                except Exception:  # noqa: BLE001
+                    logger.debug("control disconnect callback failed", exc_info=True)
             self._writers.discard(writer)
             with suppress(Exception):
                 writer.close()
@@ -608,9 +858,12 @@ class LhpNodeServer:
         writer: asyncio.StreamWriter,
         write_lock: asyncio.Lock,
         semaphore: asyncio.Semaphore,
+        connection_id: str = "",
     ) -> None:
         async with semaphore:
+            self._current_connection_id = connection_id
             response = await self.handle_request(request, via="socket")
+            self._current_connection_id = ""
             await _send_frame(writer, write_lock, response)
 
 

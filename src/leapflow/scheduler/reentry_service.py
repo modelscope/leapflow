@@ -225,3 +225,52 @@ class ReentryService:
             except Exception:
                 logger.error("reentry event dispatch failed for %s", claimed.trigger_id, exc_info=True)
         return dispatched
+
+    async def on_hardware_event(
+        self,
+        *,
+        device_id: str,
+        event: str,
+        event_class: str = "",
+        summary: str = "",
+    ) -> int:
+        """Match a deliberative hardware event against armed EVENT triggers.
+
+        Only deliberative events should be forwarded here; reflex and record
+        events never trigger reentry (safety: a reflex event must be handled
+        by the hardware subsystem, not deferred to an LLM round).
+
+        Returns the number of triggers dispatched.
+        """
+        if not self._enabled():
+            return 0
+        if not self._hardware_reentry_enabled():
+            return 0
+        dispatched = 0
+        for trig in self._store.list_armed_events():
+            if not event_matches(
+                trig.event_match,
+                source="hardware",
+                device_id=device_id,
+                event=event,
+            ):
+                continue
+            claimed = self._store.fire(trig.trigger_id)
+            if claimed is None or claimed.orient is None:
+                continue
+            try:
+                await self._dispatch(claimed.orient, claimed)
+                dispatched += 1
+            except Exception:
+                logger.error(
+                    "reentry hardware event dispatch failed for %s",
+                    claimed.trigger_id, exc_info=True,
+                )
+        return dispatched
+
+    def _hardware_reentry_enabled(self) -> bool:
+        """Hardware reentry requires both base reentry and hardware reentry enabled."""
+        return bool(
+            getattr(self._settings, "agent_reentry_enabled", False)
+            and getattr(self._settings, "agent_reentry_hardware_enabled", False)
+        )

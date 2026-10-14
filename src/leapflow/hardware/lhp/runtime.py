@@ -28,19 +28,27 @@ import logging
 import os
 import signal
 import sys
-from typing import Sequence
+from pathlib import Path
+from typing import Any, Sequence
 
 from leapflow.hardware.lhp.protocol import (
     LHP_DEFAULT_PORT,
     LHP_PROTOCOL_VERSION,
     is_valid_device_id,
 )
-from leapflow.hardware.lhp.server import LhpNodeServer
+from leapflow.hardware.lhp.server import (
+    LhpNodeServer,
+    WRITE_MODE_PERMIT_REQUIRED,
+    WRITE_MODE_TRUSTED_V1,
+    WRITE_MODE_OBSERVE_ONLY,
+)
 
 logger = logging.getLogger(__name__)
 
 _NODE_ID_ENV = "LEAPFLOW_LHP_NODE_ID"
 _TOKEN_ENV = "LEAPFLOW_LHP_TOKEN"
+_WRITE_MODE_ENV = "LEAPFLOW_LHP_WRITE_MODE"
+_PERMIT_KEYS_ENV = "LEAPFLOW_LHP_PERMIT_ISSUER_KEYS"
 
 
 def resolve_endpoint_args(node_id: str, token: str) -> tuple[str, str]:
@@ -54,6 +62,44 @@ def resolve_endpoint_args(node_id: str, token: str) -> tuple[str, str]:
     return resolved_id, resolved_token
 
 
+def _resolve_write_mode(write_mode: str) -> str:
+    """Resolve write mode from flag or environment."""
+    wm = str(write_mode or "").strip() or os.environ.get(_WRITE_MODE_ENV, "").strip()
+    return wm or WRITE_MODE_PERMIT_REQUIRED
+
+
+def _load_permit_verifier(
+    key_paths: list[str], *, node_id: str
+) -> Any:
+    """Load a PermitVerifier from issuer public key PEM files."""
+    # Combine flag paths and environment paths
+    env_paths = os.environ.get(_PERMIT_KEYS_ENV, "").strip()
+    all_paths = list(key_paths)
+    if env_paths:
+        all_paths.extend(p.strip() for p in env_paths.split(os.pathsep) if p.strip())
+    if not all_paths:
+        return None
+    from leapflow.hardware.lhp.permit import PermitVerifier, key_id_from_public, public_key_from_pem
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    trusted: dict[str, Ed25519PublicKey] = {}
+    for path_str in all_paths:
+        path = Path(path_str)
+        if not path.exists():
+            sys.stderr.write(f"warning: permit issuer key not found: {path}\n")
+            continue
+        try:
+            pub = public_key_from_pem(path.read_bytes())
+            kid = key_id_from_public(pub)
+            trusted[kid] = pub
+            logger.info("Loaded permit issuer key %s from %s", kid, path)
+        except Exception as exc:
+            sys.stderr.write(f"warning: failed to load key {path}: {exc}\n")
+    if not trusted:
+        return PermitVerifier(trusted, node_id=node_id)
+    return PermitVerifier(trusted, node_id=node_id)
+
+
 async def serve_node(
     *,
     node_id: str,
@@ -61,6 +107,8 @@ async def serve_node(
     port: int = LHP_DEFAULT_PORT,
     unix_path: str = "",
     token: str = "",
+    write_mode: str = WRITE_MODE_PERMIT_REQUIRED,
+    permit_issuer_keys: list[str] | None = None,
 ) -> int:
     """Serve the profile's hardware registry over LHP until interrupted.
 
@@ -76,8 +124,6 @@ async def serve_node(
     from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
 
     settings = HardwareSettings.from_settings(load_config())
-    # A node answers requests; it does not accumulate history or own sampling
-    # loops in P1. Storage and streaming stay host-side concerns.
     registry = HardwareRegistry(
         replace(settings, persist_readings=False, stream_enabled=False)
     )
@@ -89,7 +135,14 @@ async def serve_node(
             "Declare devices (`leap hw list` shows the active profile's view) and retry.\n"
         )
 
-    server = LhpNodeServer(registry, node_id=node_id, token=token)
+    verifier = _load_permit_verifier(permit_issuer_keys or [], node_id=node_id)
+    server = LhpNodeServer(
+        registry,
+        node_id=node_id,
+        token=token,
+        write_mode=write_mode,
+        permit_verifier=verifier,
+    )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -112,6 +165,10 @@ async def serve_node(
             "device_ids": [context.device_id for context in contexts],
             "device_count": len(contexts),
             "token_required": bool(token),
+            "write_mode": write_mode,
+            "trusted_issuers": list(
+                getattr(verifier, "trusted_key_ids", ()) or ()
+            ) if verifier is not None else [],
         }
         print(json.dumps(ready, ensure_ascii=False), flush=True)
         logger.info("LHP node %r serving %d device(s) at %s", node_id, len(contexts), endpoint)
@@ -158,6 +215,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=f"Shared secret required in hello (env {_TOKEN_ENV}); empty means an open node",
     )
     parser.add_argument("--verbose", action="store_true", help="Log at DEBUG level")
+    parser.add_argument(
+        "--write-mode",
+        default="",
+        help=(
+            f"Write authorization mode: permit_required (default), trusted_v1, "
+            f"or observe_only (env {_WRITE_MODE_ENV})"
+        ),
+    )
+    parser.add_argument(
+        "--permit-issuer-key",
+        action="append",
+        default=[],
+        dest="permit_issuer_keys",
+        help=(
+            f"Path to an Ed25519 public key PEM of a trusted permit issuer "
+            f"(repeatable; env {_PERMIT_KEYS_ENV} with {os.pathsep!r} separator)"
+        ),
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     logging.basicConfig(
@@ -165,6 +240,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
     node_id, token = resolve_endpoint_args(args.node_id, args.token)
+    write_mode = _resolve_write_mode(args.write_mode)
     if not is_valid_device_id(node_id):
         parser.error(
             f"--node-id is required and must match [a-z0-9_]+ (got {args.node_id!r}); "
@@ -178,6 +254,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 port=args.port,
                 unix_path=args.unix_path,
                 token=token,
+                write_mode=write_mode,
+                permit_issuer_keys=args.permit_issuer_keys,
             )
         )
     except KeyboardInterrupt:  # pragma: no cover - interactive interrupt

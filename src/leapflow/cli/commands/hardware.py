@@ -52,6 +52,10 @@ _LOCAL_ACTIONS = frozenset({"list", "describe", "read", "status", "estop"})
 _SAMPLING_ACTIONS = frozenset({"pause", "resume"})
 # Subcommands that operate on recorded data, no registry required.
 _OFFLINE_ACTIONS = frozenset({"replay"})
+# Verification subcommands (in-process, write verified.json).
+_VERIFICATION_ACTIONS = frozenset({"verify", "validate"})
+# Onboarding subcommands (in-process, template/probe/commission).
+_ONBOARDING_ACTIONS = frozenset({"init", "probe", "commission"})
 
 
 def _ok(msg: str) -> None:
@@ -127,6 +131,12 @@ async def _dispatch(args: argparse.Namespace, action: str) -> int:
         return _run_offline(action, args, json_mode)
     if action == "serve":
         return await _run_serve(args)
+    if action in _VERIFICATION_ACTIONS:
+        return await _run_verification(action, args, json_mode)
+    if action == "permit-key":
+        return _run_permit_key(args, json_mode)
+    if action in _ONBOARDING_ACTIONS:
+        return await _run_onboarding(action, args, json_mode)
     _fail(f"Unknown hw action: {action}")
     return 1
 
@@ -445,8 +455,475 @@ def _run_replay(args: argparse.Namespace, json_mode: bool) -> int:
     return _emit_result("replay", result, json_mode)
 
 
+# ── Verification commands ──────────────────────────────────────────────────────────
+
+
+async def _run_verification(action: str, args: argparse.Namespace, json_mode: bool) -> int:
+    """Handle verify/validate subcommands."""
+    import time as _time
+
+    import yaml
+
+    from leapflow.hardware.providers.yaml_provider import declaration_digest
+
+    settings = load_config()
+    registry = _build_local_registry(settings)
+    if registry is None:
+        return _emit_result(action, {"ok": False, "error": "hardware is not enabled"}, json_mode)
+
+    from leapflow.layout import HardwareLayout
+
+    layout = HardwareLayout(settings.profile_dir)
+    verified_path = layout.verified_path
+    device_id = str(getattr(args, "device_id", "") or "")
+
+    if action == "verify":
+        if not device_id:
+            return _emit_result("verify", {"ok": False, "error": "device_id is required"}, json_mode)
+        context = registry.context(device_id)
+        if context is None:
+            return _emit_result("verify", {"ok": False, "error": f"unknown device {device_id!r}"}, json_mode)
+
+        digest = declaration_digest(context)
+        # Read existing verified.json
+        existing: dict[str, Any] = {}
+        if verified_path.is_file():
+            try:
+                raw = yaml.safe_load(verified_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    existing = raw
+            except (OSError, yaml.YAMLError):
+                pass
+
+        import getpass
+
+        verifier = getpass.getuser()
+        existing[device_id] = {
+            "verifier": verifier,
+            "declaration_digest": digest,
+            "verified_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        }
+        verified_path.parent.mkdir(parents=True, exist_ok=True)
+        verified_path.write_text(
+            yaml.dump(existing, default_flow_style=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        result = {
+            "ok": True,
+            "device_id": device_id,
+            "verifier": verifier,
+            "declaration_digest": digest,
+            "verified_path": str(verified_path),
+        }
+        if not json_mode:
+            _ok(f"Verified {device_id} (digest={digest[:12]}...) by {verifier}")
+            _info(f"Written to {verified_path}")
+        return _emit_result("verify", result, json_mode) if json_mode else 0
+
+    if action == "validate":
+        contexts = registry.contexts()
+        # Load verified.json
+        verified: dict[str, Any] = {}
+        if verified_path.is_file():
+            try:
+                raw = yaml.safe_load(verified_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    verified = raw
+            except (OSError, yaml.YAMLError):
+                pass
+
+        results: list[dict[str, Any]] = []
+        for ctx in contexts:
+            if device_id and ctx.device_id != device_id:
+                continue
+            entry = verified.get(ctx.device_id)
+            status = "unverified"
+            if entry is None:
+                status = "unverified"
+            elif isinstance(entry, str):
+                status = "legacy_unbound"
+            elif isinstance(entry, dict):
+                stored = str(entry.get("declaration_digest") or "")
+                if not stored:
+                    status = "unbound"
+                else:
+                    current = declaration_digest(ctx)
+                    status = "valid" if current == stored else "digest_mismatch"
+
+            item = {
+                "device_id": ctx.device_id,
+                "status": status,
+                "is_verified": ctx.provenance.is_verified,
+            }
+            results.append(item)
+            if not json_mode:
+                icon = _ok if status == "valid" else (_warn if status in ("legacy_unbound", "unbound") else _fail)
+                icon(f"{ctx.device_id}: {status}")
+
+        all_ok = all(r["status"] == "valid" for r in results)
+        return _emit_result(
+            "validate",
+            {"ok": all_ok, "devices": results},
+            json_mode,
+        )
+
+    return 1
+
+
+def _run_permit_key(args: argparse.Namespace, json_mode: bool) -> int:
+    """Show the permit issuer's public key and key_id."""
+    settings = load_config()
+    from leapflow.layout import HardwareLayout
+
+    layout = HardwareLayout(settings.profile_dir)
+    key_path = layout.root / "lhp_permit_issuer.key"
+    if not key_path.is_file():
+        result = {
+            "ok": False,
+            "error": f"No permit issuer key found at {key_path}. "
+            "Start a node with --write-mode permit_required to generate one.",
+        }
+        if not json_mode:
+            _fail(result["error"])
+        return 1
+
+    try:
+        from leapflow.hardware.lhp.permit import (
+            key_id_from_public,
+            load_private_key,
+            public_key_pem,
+        )
+
+        private_key = load_private_key(key_path)
+        pub = private_key.public_key()
+        kid = key_id_from_public(pub)
+        pem = public_key_pem(pub)
+        result = {
+            "ok": True,
+            "key_id": kid,
+            "public_key_pem": pem,
+            "key_path": str(key_path),
+        }
+        if not json_mode:
+            _ok(f"key_id: {kid}")
+            print(pem)
+            _info(f"Key file: {key_path}")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        if not json_mode:
+            _fail(f"Could not load permit key: {exc}")
+        return 1
+
+
+# ── Onboarding commands (init / probe / commission) ───────────────────────────────
+
+
+_DEVICE_TEMPLATE = """\
+# LeapFlow hardware device declaration (hc.v1)
+# Documentation: https://leapflow.dev/hardware/declarations
+schema: hc.v1
+
+device_id: "{device_id}"
+display_name: "{display_name}"
+device_class: sensor           # sensor | robot_arm | mobile_robot | actuator
+location: "lab bench"          # physical placement description
+
+transport:
+  type: serial                 # serial | realsense | lhp | simulated
+  # port: /dev/ttyUSB0
+  # baud_rate: 115200
+
+channels:
+  - channel_id: sensor.temperature
+    quantity: temperature
+    unit: degC
+    direction: read
+    representation: scalar
+    # min_value: -40.0
+    # max_value: 125.0
+
+  # - channel_id: actuator.motor
+  #   quantity: position
+  #   unit: rad
+  #   direction: write
+  #   effect: actuate
+  #   min_value: -3.14
+  #   max_value: 3.14
+  #   max_rate: 1.0
+  #   tolerance: 0.01
+  #   settling_s: 0.5
+  #   reversible: true
+
+# interlocks:
+#   - name: emergency_stop
+#     condition: "sensor.estop == 1"
+
+# degradation:
+#   timeout_s: 5.0
+#   policy: halt
+"""
+
+
+async def _run_onboarding(action: str, args: argparse.Namespace, json_mode: bool) -> int:
+    """Handle init/probe/commission subcommands."""
+    if action == "init":
+        return _run_init(args, json_mode)
+    if action == "probe":
+        return await _run_probe(args, json_mode)
+    if action == "commission":
+        return await _run_commission(args, json_mode)
+    return 1
+
+
+def _run_init(args: argparse.Namespace, json_mode: bool) -> int:
+    """Generate an annotated hc.v1 device declaration template."""
+    from pathlib import Path
+
+    device_id = str(getattr(args, "device_id", "") or "my_device")
+    display_name = device_id.replace("_", " ").replace(".", " ").title()
+
+    template = _DEVICE_TEMPLATE.format(
+        device_id=device_id,
+        display_name=display_name,
+    )
+
+    settings = load_config()
+    profile_layout = getattr(settings, "profile_layout", None)
+    if profile_layout is not None:
+        devices_dir = profile_layout.hardware.devices_dir
+    else:
+        devices_dir = Path(".") / "devices"
+
+    out_path = devices_dir / f"{device_id}.yaml"
+    if out_path.exists():
+        if json_mode:
+            return _emit_result("init", {"ok": False, "error": f"{out_path} already exists"}, True)
+        _fail(f"{out_path} already exists; edit it directly or remove it first")
+        return 1
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(template, encoding="utf-8")
+
+    result = {
+        "ok": True,
+        "device_id": device_id,
+        "path": str(out_path),
+        "hint": "Edit the template, then run `leap hw probe <device>` to verify connectivity.",
+    }
+    if not json_mode:
+        _ok(f"Generated declaration template: {out_path}")
+        _info(f"Edit it, then: leap hw probe {device_id}")
+        return 0
+    return _emit_result("init", result, True)
+
+
+async def _run_probe(args: argparse.Namespace, json_mode: bool) -> int:
+    """Read-only connectivity and channel readability check."""
+    settings = load_config()
+    registry = _build_local_registry(settings)
+    if registry is None:
+        return _emit_result("probe", {"ok": False, "error": "hardware is not enabled"}, json_mode)
+
+    await _register_fleet_read_plane(registry)
+
+    device_id = str(getattr(args, "device_id", "") or "")
+    if not device_id:
+        return _emit_result("probe", {"ok": False, "error": "device_id is required"}, json_mode)
+
+    context = registry.context(device_id)
+    if context is None:
+        await registry.close_all()
+        return _emit_result(
+            "probe", {"ok": False, "error": f"unknown device {device_id!r}"}, json_mode
+        )
+
+    # Try to open the transport.
+    probe_results: list[dict[str, Any]] = []
+    transport_ok = False
+    try:
+        transport = await registry.transport(device_id)
+        status = await transport.status()
+        transport_ok = getattr(status, "connected", False)
+    except Exception as exc:  # noqa: BLE001
+        probe_results.append({"check": "transport", "ok": False, "error": str(exc)})
+    else:
+        probe_results.append({
+            "check": "transport",
+            "ok": transport_ok,
+            "detail": getattr(status, "detail", ""),
+            "halt_supported": getattr(status, "halt_supported", False),
+        })
+
+    # Try reading each readable channel.
+    for ch in context.channels:
+        if not ch.is_readable:
+            continue
+        try:
+            reading = await registry.read(device_id, ch.channel_id)
+            probe_results.append({
+                "check": f"read:{ch.channel_id}",
+                "ok": True,
+                "value": getattr(reading, "value", None),
+                "unit": ch.unit,
+            })
+        except Exception as exc:  # noqa: BLE001
+            probe_results.append({
+                "check": f"read:{ch.channel_id}",
+                "ok": False,
+                "error": str(exc),
+            })
+
+    # Check halt availability.
+    if transport_ok:
+        try:
+            transport = await registry.transport(device_id)
+            halt_status = await transport.status()
+            probe_results.append({
+                "check": "halt_available",
+                "ok": getattr(halt_status, "halt_supported", False),
+            })
+        except Exception:  # noqa: BLE001
+            probe_results.append({"check": "halt_available", "ok": False})
+
+    await registry.close_all()
+
+    all_ok = all(r.get("ok") for r in probe_results)
+    result = {
+        "ok": all_ok,
+        "device_id": device_id,
+        "checks": probe_results,
+        "hint": "All checks passed. Run `leap hw verify` then `leap hw commission` to complete onboarding."
+        if all_ok else "Fix the failing checks and re-run `leap hw probe`.",
+    }
+    if not json_mode:
+        for check in probe_results:
+            icon = _ok if check.get("ok") else _fail
+            detail = check.get("detail") or check.get("value") or check.get("error") or ""
+            icon(f"{check['check']}: {detail}")
+    return _emit_result("probe", result, json_mode)
+
+
+async def _run_commission(args: argparse.Namespace, json_mode: bool) -> int:
+    """Controlled first-write: dry-run → real write → verify → restore."""
+    settings = load_config()
+    registry = _build_local_registry(settings)
+    if registry is None:
+        return _emit_result("commission", {"ok": False, "error": "hardware is not enabled"}, json_mode)
+
+    await _register_fleet_read_plane(registry)
+
+    device_id = str(getattr(args, "device_id", "") or "")
+    if not device_id:
+        await registry.close_all()
+        return _emit_result("commission", {"ok": False, "error": "device_id is required"}, json_mode)
+
+    context = registry.context(device_id)
+    if context is None:
+        await registry.close_all()
+        return _emit_result(
+            "commission", {"ok": False, "error": f"unknown device {device_id!r}"}, json_mode
+        )
+
+    # Find the first writable actuate channel for the commissioning write.
+    target_ch = None
+    for ch in context.channels:
+        if ch.is_writable and getattr(ch, "effect", "") == "actuate":
+            target_ch = ch
+            break
+    if target_ch is None:
+        await registry.close_all()
+        return _emit_result(
+            "commission",
+            {"ok": False, "error": f"device {device_id!r} has no writable actuate channel"},
+            json_mode,
+        )
+
+    # Use the channel's min_value as a safe commissioning target.
+    envelope = getattr(target_ch, "envelope", None)
+    safe_value = getattr(envelope, "min_value", None)
+    if safe_value is None:
+        safe_value = 0.0
+
+    steps: list[dict[str, Any]] = []
+    from leapflow.hardware.tools import HardwareTools
+
+    tools = HardwareTools(registry)
+
+    # Step 1: Read baseline.
+    try:
+        baseline = await registry.read(device_id, target_ch.channel_id)
+        baseline_value = getattr(baseline, "value", None)
+        steps.append({"step": "baseline_read", "ok": True, "value": baseline_value})
+    except Exception as exc:  # noqa: BLE001
+        baseline_value = None
+        steps.append({"step": "baseline_read", "ok": False, "error": str(exc)})
+
+    # Step 2: Dry-run write.
+    dry_result = await tools.hw_write(
+        device_id=device_id,
+        channel_id=target_ch.channel_id,
+        value=safe_value,
+        dry_run=True,
+    )
+    steps.append({"step": "dry_run", "ok": dry_result.get("ok", False), "detail": dry_result})
+
+    if not dry_result.get("ok"):
+        await registry.close_all()
+        return _emit_result(
+            "commission",
+            {"ok": False, "device_id": device_id, "steps": steps,
+             "error": "Dry-run failed; aborting commissioning."},
+            json_mode,
+        )
+
+    # Step 3: Real write (minimum-step command).
+    write_result = await tools.hw_write(
+        device_id=device_id,
+        channel_id=target_ch.channel_id,
+        value=safe_value,
+    )
+    steps.append({"step": "write", "ok": write_result.get("ok", False), "detail": write_result})
+
+    # Step 4: Read-back verification.
+    try:
+        readback = await registry.read(device_id, target_ch.channel_id)
+        readback_value = getattr(readback, "value", None)
+        steps.append({"step": "readback", "ok": True, "value": readback_value})
+    except Exception as exc:  # noqa: BLE001
+        readback_value = None
+        steps.append({"step": "readback", "ok": False, "error": str(exc)})
+
+    # Step 5: Restore baseline if we have one.
+    if baseline_value is not None and write_result.get("ok"):
+        restore_result = await tools.hw_write(
+            device_id=device_id,
+            channel_id=target_ch.channel_id,
+            value=baseline_value,
+        )
+        steps.append({"step": "restore", "ok": restore_result.get("ok", False)})
+
+    await registry.close_all()
+
+    all_ok = write_result.get("ok", False)
+    result = {
+        "ok": all_ok,
+        "device_id": device_id,
+        "channel_id": target_ch.channel_id,
+        "steps": steps,
+        "hint": (
+            f"Commission complete. Run `leap hw verify {device_id}` to record trust evidence."
+            if all_ok else "Commission failed. Review the steps above."
+        ),
+    }
+    if not json_mode:
+        for step in steps:
+            icon = _ok if step.get("ok") else _fail
+            icon(f"{step['step']}: {step.get('value') or step.get('error') or 'done'}")
+    return _emit_result("commission", result, json_mode)
+
+
 def _print_usage() -> None:
-    print("Usage: leap hw {list|describe|read|status|estop|pause|resume|replay|serve} [--json]")
+    print("Usage: leap hw {list|describe|read|status|estop|pause|resume|replay|serve|verify|validate|permit-key|init|probe|commission} [--json]")
     print()
     print("Inspect hardware and intervene in it directly.")
     print()
@@ -460,3 +937,9 @@ def _print_usage() -> None:
     print("  resume <device>      Resume daemon sampling for a device")
     print("  replay <path>        Replay a raw NDJSON segment through the event detector")
     print("  serve                Serve this machine as an LHP fabric node (edge runtime)")
+    print("  verify <device>      Write a digest-bound verification entry for a device")
+    print("  validate [device]    Validate declarations against their verification entries")
+    print("  permit-key           Show the permit issuer public key and key_id")
+    print("  init [device]        Generate an annotated device declaration template")
+    print("  probe <device>       Read-only connectivity and channel check")
+    print("  commission <device>  Controlled first-write with dry-run, verify, and restore")

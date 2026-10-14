@@ -150,8 +150,8 @@ def test_all_shipped_manifests_are_valid() -> None:
         errors.extend(found_errors)
 
     assert errors == []
-    assert len(manifests) == 27
-    assert len({manifest.id for manifest in manifests}) == 27
+    assert len(manifests) == 29
+    assert len({manifest.id for manifest in manifests}) == 29
 
 
 def test_external_manifests_match_shipped_source_catalog() -> None:
@@ -160,9 +160,9 @@ def test_external_manifests_match_shipped_source_catalog() -> None:
     manifests, errors = load_manifests(root / "external")
 
     assert errors == []
-    assert len(manifests) == 12
+    assert len(manifests) == 13
     catalog_manifests = [manifest for manifest in manifests if manifest.id != "live_llm"]
-    assert len(catalog_manifests) == 11
+    assert len(catalog_manifests) == 12
     for manifest in catalog_manifests:
         assert manifest.id in catalog
         assert manifest.official, f"{manifest.id} must declare its official contract"
@@ -204,7 +204,7 @@ def test_external_benchmarks_require_explicit_official_configuration() -> None:
     root = _repo_root() / "src" / "benchmarks" / "manifests" / "external"
     data_backed = {
         "asimov", "attackvla", "calvin", "embodyguard", "is_bench",
-        "kinder", "robojailbench", "vlabench",
+        "kinder", "roboharm", "robojailbench", "vlabench",
     }
     manifests, errors = load_manifests(root)
 

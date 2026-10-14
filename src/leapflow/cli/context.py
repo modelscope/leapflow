@@ -2179,6 +2179,13 @@ class Context:
             action_executor=self._action_executor,
         )
         self.engine.set_distilled_knowledge_store(self._evolution_knowledge_store)
+        hardware_registry = getattr(self, "_hardware_registry", None)
+        if hardware_registry is not None:
+            from leapflow.hardware.volatile_context import HardwareVolatileContextProvider
+
+            self.engine.register_volatile_context_provider(
+                HardwareVolatileContextProvider(hardware_registry)
+            )
 
         # ── Wire CompressorConfig with archive_fn into engine ──
         from leapflow.engine.context.context_compressor import ContextCompressor

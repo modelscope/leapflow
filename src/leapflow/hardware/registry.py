@@ -18,9 +18,9 @@ import asyncio
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Deque, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Deque, Iterable, Mapping, Sequence
 
 from leapflow.hardware.context import (
     SUPPORTED_HC_VERSIONS,
@@ -35,6 +35,9 @@ from leapflow.hardware.providers import (
 )
 from leapflow.hardware.transport import HardwareTransport, TransportError
 from leapflow.hardware.transports import available_transports, build_transport
+
+if TYPE_CHECKING:
+    from leapflow.hardware.stream import HardwareDeliberativeObserver
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +89,10 @@ class HardwareSettings:
     # Typed root Settings input for LHP edge nodes; parsed by fleet_config at
     # plugin startup so the registry remains free of topology concerns.
     fleet_nodes: str = ""
+    # JSON array (or already parsed sequence in tests) of reflex alert rules.
+    hardware_alert_policies: Any = ""
+    # Profile-owned append-only audit destination for HardwareTools.
+    audit_log_path: str = ""
 
     @property
     def denies_unverified_writes(self) -> bool:
@@ -111,7 +118,10 @@ class HardwareSettings:
             # Tests and small in-process callers may deliberately provide no profile
             # layout. They still own the explicit enable/disable decision; returning the
             # class default here would silently re-enable a subsystem a caller set False.
-            return cls(enabled=bool(getattr(settings, "hardware_enabled", True)))
+            return cls(
+                enabled=bool(getattr(settings, "hardware_enabled", True)),
+                hardware_alert_policies=getattr(settings, "hardware_alert_policies", ""),
+            )
         return cls(
             enabled=bool(getattr(settings, "hardware_enabled", True)),
             providers=_provider_rows(
@@ -126,9 +136,7 @@ class HardwareSettings:
                 getattr(settings, "hardware_require_describe", True)
             ),
             envelope_grant=bool(getattr(settings, "hardware_envelope_grant", True)),
-            trust_skip_enabled=bool(
-                getattr(settings, "hardware_trust_skip_enabled", False)
-            ),
+            trust_skip_enabled=bool(getattr(settings, "hardware_trust_skip_enabled", False)),
             stream_enabled=bool(getattr(settings, "hardware_stream_enabled", True)),
             stream_ring_capacity=int(
                 getattr(settings, "hardware_stream_ring_capacity", 4096) or 4096
@@ -137,9 +145,7 @@ class HardwareSettings:
             downsample_interval_s=float(
                 getattr(settings, "hardware_downsample_interval_s", 60.0) or 60.0
             ),
-            raw_retention_days=float(
-                getattr(settings, "hardware_raw_retention_days", 7.0) or 7.0
-            ),
+            raw_retention_days=float(getattr(settings, "hardware_raw_retention_days", 7.0) or 7.0),
             history_retention_days=float(
                 getattr(settings, "hardware_history_retention_days", 90.0) or 90.0
             ),
@@ -148,6 +154,10 @@ class HardwareSettings:
                 getattr(settings, "hardware_reading_store_sensitive", True)
             ),
             fleet_nodes=str(getattr(settings, "hardware_fleet_nodes", "") or ""),
+            hardware_alert_policies=getattr(settings, "hardware_alert_policies", ""),
+            audit_log_path=(
+                str(profile_layout.hardware.audit_log_path) if profile_layout is not None else ""
+            ),
             instrument_db_path=(
                 str(profile_layout.instrument_db_path) if profile_layout is not None else ""
             ),
@@ -157,12 +167,8 @@ class HardwareSettings:
             preview_idle_timeout_s=float(
                 getattr(settings, "hardware_preview_idle_timeout_s", 5.0) or 5.0
             ),
-            preview_max_fps=float(
-                getattr(settings, "hardware_preview_max_fps", 30.0) or 30.0
-            ),
-            preview_max_width=int(
-                getattr(settings, "hardware_preview_max_width", 1280) or 1280
-            ),
+            preview_max_fps=float(getattr(settings, "hardware_preview_max_fps", 30.0) or 30.0),
+            preview_max_width=int(getattr(settings, "hardware_preview_max_width", 1280) or 1280),
             preview_quality=int(getattr(settings, "hardware_preview_quality", 85) or 85),
         )
 
@@ -204,17 +210,13 @@ def _provider_rows(
     configs: dict[str, Mapping[str, Any]] = {
         "yaml": {"devices_dir": str(devices_dir), "verified_path": str(verified_path)},
         "host": {
-            "sample_interval_s": float(
-                getattr(settings, "hardware_host_interval_s", 0.0) or 0.0
-            ),
+            "sample_interval_s": float(getattr(settings, "hardware_host_interval_s", 0.0) or 0.0),
             "include": str(getattr(settings, "hardware_host_include", "") or ""),
             "exclude": str(getattr(settings, "hardware_host_exclude", "") or ""),
         },
         "media": {
             "include_screens": bool(getattr(settings, "hardware_media_screens", False)),
-            "include_microphones": bool(
-                getattr(settings, "hardware_media_microphones", True)
-            ),
+            "include_microphones": bool(getattr(settings, "hardware_media_microphones", True)),
             "max_fps": float(getattr(settings, "hardware_preview_max_fps", 0.0) or 0.0),
         },
     }
@@ -320,6 +322,8 @@ class HardwareRegistry:
         self._last_command: dict[tuple[str, str], tuple[float, float]] = {}
         self._degradation_latches: dict[str, Any] = {}
         self._stream_sources: tuple[Any, ...] | None = None
+        self._alert_orchestrator: Any = None
+        self._alert_policy: Any = None
         self._reading_store: Any = None
         self._calibration_store: Any = None
         self._preview_broker: Any = None
@@ -328,19 +332,78 @@ class HardwareRegistry:
         # same DuckDB file, so the registry owns the holder and injects it into both.
         self._instrument_conn: Any = None
         self._outcome_recorder: Any = None
+        self._pending_write_expectations: dict[tuple[str, str], list[Any]] = {}
         self._cache_manager: Any = None
         self._session_id: str = ""
         # Bounded on purpose: an unbounded event log on a long-running bench is a leak
         # with a schedule, and hw_status only ever shows a recent tail.
         self._recent_events: Deque[Any] = deque(maxlen=200)
         self._event_emitter: Any = None
+        self._deliberative_observer: HardwareDeliberativeObserver | None = None
         self._control_buses: dict[str, Any] = {}
+        self._evidence_store: Any = None
+        self._capability_index: Any = None
 
     # ── Loading ──
 
     @property
     def settings(self) -> HardwareSettings:
         return self._settings
+
+    def set_alert_orchestrator(self, orchestrator: Any) -> None:
+        """Bind the live approval route used by non-estop alert actions."""
+        self._alert_orchestrator = orchestrator
+        if self._alert_policy is not None:
+            self._alert_policy.set_orchestrator(orchestrator)
+
+    @property
+    def alert_policy(self) -> Any:
+        """Return the lazily built alert policy, if rules are configured."""
+        return self._alert_policy
+
+    @property
+    def evidence_store(self) -> Any:
+        """Lazily constructed evidence store backed by the shared instrument DB.
+
+        Uses the same ``_instrument_holder()`` as the reading and calibration
+        stores so all three tiers share one DuckDB connection.  Returns None
+        when no instrument database is configured.
+        """
+        if self._evidence_store is None and self._settings.instrument_db_path:
+            try:
+                from leapflow.hardware.evidence import EvidenceStore
+
+                self._evidence_store = EvidenceStore(
+                    db_path=Path(self._settings.instrument_db_path),
+                    connection_holder=self._instrument_holder(),
+                )
+            except Exception:  # noqa: BLE001 - evidence is diagnostic, not gating
+                logger.debug("Failed to initialize EvidenceStore", exc_info=True)
+        return self._evidence_store
+
+    @evidence_store.setter
+    def evidence_store(self, store: Any) -> None:
+        self._evidence_store = store
+
+    @property
+    def capability_index(self) -> Any:
+        """Lazily constructed capability index from admitted devices.
+
+        Rebuilt on first access; callers may force a re-scan with
+        ``capability_index.rebuild()`` after the registry reloads.
+        """
+        if self._capability_index is None:
+            try:
+                from leapflow.hardware.capability_router import CapabilityIndex
+
+                self._capability_index = CapabilityIndex(self)
+            except Exception:  # noqa: BLE001
+                logger.debug("Failed to initialize CapabilityIndex", exc_info=True)
+        return self._capability_index
+
+    @capability_index.setter
+    def capability_index(self, index: Any) -> None:
+        self._capability_index = index
 
     @property
     def report(self) -> LoadReport:
@@ -390,7 +453,9 @@ class HardwareRegistry:
         # wins, and the source's duplicate is recorded as rejected rather than
         # replacing it (frozen LHP spec §8).
         for source_contexts in tuple(self._external_contexts.values()):
-            self._merge_candidates(source_contexts, notes=notes, admitted=admitted, rejected=rejected)
+            self._merge_candidates(
+                source_contexts, notes=notes, admitted=admitted, rejected=rejected
+            )
 
         self._report = LoadReport(
             admitted=tuple(admitted), rejected=tuple(rejected), notes=tuple(notes)
@@ -756,11 +821,7 @@ class HardwareRegistry:
             )
         for index, channel in enumerate(channels):
             required = set(channel.envelope.requires_interlocks)
-            missing = {
-                name
-                for name in required
-                if context.interlock(name) is None
-            }
+            missing = {name for name in required if context.interlock(name) is None}
             if channel.is_writable and (missing or (required & broken)):
                 notes.append(
                     AdmissionNote(
@@ -843,9 +904,7 @@ class HardwareRegistry:
         """
         context = self.context(device_id)
         if context is None:
-            raise TransportError(
-                f"unknown device {device_id!r}", failure_code="unknown_device"
-            )
+            raise TransportError(f"unknown device {device_id!r}", failure_code="unknown_device")
         existing = self._transports.get(device_id)
         if existing is not None:
             return existing
@@ -881,22 +940,28 @@ class HardwareRegistry:
         if not self._settings.stream_enabled:
             return ()
         if self._stream_sources is None:
+            from leapflow.hardware.alert_policy import build_alert_policy
             from leapflow.hardware.stream import build_batch_coordinators, build_stream_sources
 
+            self._alert_policy = build_alert_policy(
+                self._settings,
+                orchestrator=self._alert_orchestrator,
+                registry=self,
+            )
             batch_coordinators = build_batch_coordinators(
                 self,
                 ring_capacity=self._settings.stream_ring_capacity,
-                event_sink=self.record_event,
+                event_sink=self.publish_event,
                 reading_store=self.reading_store,
+                alert_policy=self._alert_policy,
             )
-            batch_device_ids = frozenset(
-                c._context.device_id for c in batch_coordinators
-            )
+            batch_device_ids = frozenset(c._context.device_id for c in batch_coordinators)
             individual_sources = build_stream_sources(
                 self,
                 ring_capacity=self._settings.stream_ring_capacity,
-                event_sink=self.record_event,
+                event_sink=self.publish_event,
                 reading_store=self.reading_store,
+                alert_policy=self._alert_policy,
                 batch_device_ids=batch_device_ids,
             )
             self._stream_sources = (*batch_coordinators, *individual_sources)
@@ -951,9 +1016,7 @@ class HardwareRegistry:
         if self._instrument_conn is None:
             from leapflow.storage.connection import LocalConnectionHolder
 
-            self._instrument_conn = LocalConnectionHolder(
-                Path(self._settings.instrument_db_path)
-            )
+            self._instrument_conn = LocalConnectionHolder(Path(self._settings.instrument_db_path))
         return self._instrument_conn
 
     @property
@@ -1075,6 +1138,11 @@ class HardwareRegistry:
         """
         return self._outcome_recorder
 
+    @property
+    def pending_write_expectations(self) -> dict[tuple[str, str], list[Any]]:
+        """Return process-local expectations shared by all governed write entry points."""
+        return self._pending_write_expectations
+
     def channel_history(
         self, device_id: str, channel_id: str, *, limit: int = 200
     ) -> tuple[dict[str, Any], ...]:
@@ -1092,10 +1160,7 @@ class HardwareRegistry:
         unaffordable, and a summary is what a decision actually needs.
         """
         for source in self.stream_sources():
-            if (
-                source.source_id == f"hw:{device_id}:{channel_id}"
-                and len(source.ring) > 0
-            ):
+            if source.source_id == f"hw:{device_id}:{channel_id}" and len(source.ring) > 0:
                 return source.ring.summary()
         return None
 
@@ -1119,7 +1184,7 @@ class HardwareRegistry:
         started = 0
         for source in sources:
             try:
-                await source.start(self._event_emitter)
+                await source.start(None)
                 started += 1
             except Exception as exc:  # noqa: BLE001 - one source must not stop the rest
                 logger.warning(
@@ -1175,18 +1240,59 @@ class HardwareRegistry:
         """
         self._event_emitter = emit
 
+    def set_deliberative_observer(
+        self, observer: HardwareDeliberativeObserver | None
+    ) -> None:
+        """Install the observer notified when a deliberative hardware event occurs.
+
+        The observer must implement ``HardwareDeliberativeObserver`` (Protocol).
+        Setting to ``None`` disables deliberative event forwarding.
+        """
+        self._deliberative_observer = observer
+
+    def _notify_deliberative_observer(self, event: Any) -> None:
+        """Forward a classified event to the deliberative observer, if applicable."""
+        observer = self._deliberative_observer
+        if observer is None:
+            return
+        from leapflow.hardware.stream import HardwareEvent, HardwareEventClass
+
+        if not isinstance(event, HardwareEvent):
+            return
+        event_class = event.resolved_event_class
+        if event_class != HardwareEventClass.DELIBERATIVE:
+            return
+        try:
+            observer.on_deliberative_event(event)
+        except Exception as exc:  # noqa: BLE001 - observer must not fail the command
+            logger.warning(
+                "Deliberative observer raised on %s event: %s",
+                getattr(event, "kind", "?"),
+                exc,
+                exc_info=True,
+            )
+
     def publish_event(self, event: Any) -> None:
         """Record an event and put it on the signal path.
 
-        Used by the command path. The sampling loop keeps its own dispatch because it
-        must pace per channel first, and that state belongs to the source.
+        Classification is applied here so every downstream consumer -- EventBus,
+        alert policy, dashboard, watch -- receives an event whose behavioural class
+        (reflex / deliberative / record) is already resolved. Events that arrive
+        pre-classified (e.g. WriteVerdictEvent with its own class) are left as-is.
+
+        Deliberative events are additionally forwarded to the registered
+        ``HardwareDeliberativeObserver``, which may schedule an agent reentry
+        round.  The observer is non-blocking by contract.
 
         Not paced here: a command is a human-scale act and each refusal is one the
         operator asked for, so suppressing repeats would hide the very thing that
         makes a stalled bench visible. Downstream deduplication remains free to
         collapse them.
         """
+        event = self._ensure_classified(event)
         self.record_event(event)
+        # Forward deliberative events to the reentry trigger observer.
+        self._notify_deliberative_observer(event)
         emit = self._event_emitter
         if emit is None:
             return
@@ -1195,6 +1301,22 @@ class HardwareRegistry:
         except Exception as exc:  # noqa: BLE001 - a sink must not fail the command
             logger.warning("Hardware event emit raised: %s", exc, exc_info=True)
 
+    @staticmethod
+    def _ensure_classified(event: Any) -> Any:
+        """Return the event with ``event_class`` populated if missing.
+
+        Only applies to ``HardwareEvent`` instances that have an empty
+        ``event_class`` field. Other event types (WriteVerdictEvent, etc.) are
+        returned unchanged.
+        """
+        from leapflow.hardware.stream import HardwareEvent, classify_hardware_event
+
+        if not isinstance(event, HardwareEvent):
+            return event
+        if event.event_class:
+            return event
+        return replace(event, event_class=classify_hardware_event(event.kind))
+
     def recent_events(self, device_id: str = "", limit: int = 10) -> tuple[Any, ...]:
         """Return the most recent derived events, newest last."""
         items = [
@@ -1202,7 +1324,7 @@ class HardwareRegistry:
             for event in self._recent_events
             if not device_id or getattr(event, "device_id", "") == device_id
         ]
-        return tuple(items[-max(0, limit):])
+        return tuple(items[-max(0, limit) :])
 
     # ── Describe-before-write bookkeeping ──
 
@@ -1351,10 +1473,7 @@ class HardwareRegistry:
             return True, ""
 
         # 1. Global velocity limit
-        if (
-            safety.max_velocity_rad_s > 0
-            and channel.quantity in ("angular_velocity", "velocity")
-        ):
+        if safety.max_velocity_rad_s > 0 and channel.quantity in ("angular_velocity", "velocity"):
             num = as_numeric(value)
             if num is not None and abs(num) > safety.max_velocity_rad_s:
                 return (
@@ -1369,8 +1488,7 @@ class HardwareRegistry:
             if num is not None and abs(num) > safety.max_force_n:
                 return (
                     False,
-                    f"force {abs(num):.3f} N exceeds device limit "
-                    f"{safety.max_force_n:.3f} N",
+                    f"force {abs(num):.3f} N exceeds device limit {safety.max_force_n:.3f} N",
                 )
 
         # 3. Collision zones -- requires forward kinematics (not yet available).
@@ -1412,9 +1530,7 @@ class HardwareRegistry:
 
     # ── Control loop management ──
 
-    def create_control_bus(
-        self, device_id: str, config: Any = None
-    ) -> Any:
+    def create_control_bus(self, device_id: str, config: Any = None) -> Any:
         """Create a :class:`HighFrequencyControlBus` for a device.
 
         Caches per device — one bus per device at a time.  Returns the
@@ -1428,7 +1544,9 @@ class HardwareRegistry:
 
         bus_config = config if isinstance(config, ControlBusConfig) else ControlBusConfig()
         bus = HighFrequencyControlBus(
-            self, config=bus_config, safety_checker=self.check_safety_policy,
+            self,
+            config=bus_config,
+            safety_checker=self.check_safety_policy,
         )
         self._control_buses[device_id] = bus
         return bus
@@ -1444,7 +1562,19 @@ class HardwareRegistry:
 
         Creates the bus if needed, then starts it with the given policy.
         Raises ``RuntimeError`` if the device already has a running loop.
+        Raises ``RuntimeError`` if the transport is LHP (remote): the host must
+        never run a ControlBus across the network.
         """
+        # Guard: refuse to run a local ControlBus on a remote device
+        context = self._contexts.get(device_id)
+        if context is not None:
+            transport_kind = getattr(getattr(context, "transport", None), "kind", "")
+            if transport_kind == "lhp":
+                raise RuntimeError(
+                    f"device {device_id!r} is served by an LHP node; the host must "
+                    "not run a ControlBus across the network. Use RemoteControlTransport "
+                    "(control.v1) instead."
+                )
         bus = self.create_control_bus(device_id, config)
         if bus.is_running:
             raise RuntimeError(
@@ -1530,7 +1660,9 @@ class HardwareRegistry:
             except Exception as exc:  # noqa: BLE001 - teardown must not propagate
                 logger.warning(
                     "Control bus stop failed for %r during close_all: %s",
-                    device_id, exc, exc_info=True,
+                    device_id,
+                    exc,
+                    exc_info=True,
                 )
         self._control_buses.clear()
         if self._preview_broker is not None:

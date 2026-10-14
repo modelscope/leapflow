@@ -852,6 +852,22 @@ def _hunks_to_edits(diff_text: str) -> List[Dict[str, str]]:
     return edits
 
 
+def _edit_file_input_failure(
+    error: str, failure_code: str, *, recovery_hint: str, **details: Any
+) -> Dict[str, Any]:
+    """Return a structured, self-repairable edit input failure."""
+    return {
+        "ok": False,
+        "error": error,
+        "error_type": "invalid_arguments",
+        "failure_class": "invalid_request",
+        "failure_code": failure_code,
+        "retryable": True,
+        "recovery_hint": recovery_hint,
+        **details,
+    }
+
+
 async def edit_file(params: Dict[str, Any]) -> Dict[str, Any]:
     """Apply targeted, anchored search-replace edits to an existing text file.
 
@@ -863,20 +879,68 @@ async def edit_file(params: Dict[str, Any]) -> Dict[str, Any]:
     """
     path = str(params.get("path", "") or "")
     if not path:
-        return {"ok": False, "error": "Missing required parameter: path"}
-    edits = params.get("edits")
-    if not edits and params.get("diff"):
+        return _edit_file_input_failure(
+            "Missing required parameter: path",
+            "missing_required_fields",
+            recovery_hint="Provide the existing file path and a non-empty edits array.",
+            missing=["path"],
+        )
+
+    edits: Any = params.get("edits")
+    if edits is None and params.get("diff"):
         edits = _hunks_to_edits(str(params.get("diff") or ""))
         if not edits:
-            return {"ok": False, "error": "Could not parse any hunks from the provided diff.", "error_type": "invalid_diff"}
-    if not edits and (params.get("original_text") is not None or params.get("old_text") is not None):
+            return _edit_file_input_failure(
+                "Could not parse any hunks from the provided diff.",
+                "edit_file_invalid_diff",
+                recovery_hint="Use the canonical edits array with original_text and new_text fields.",
+            )
+    if edits is None and (
+        params.get("original_text") is not None or params.get("old_text") is not None
+    ):
         edits = [{
             "original_text": params.get("original_text", params.get("old_text", "")),
             "new_text": params.get("new_text", params.get("new", "")),
             "replace_all": bool(params.get("replace_all", False)),
         }]
-    if not isinstance(edits, list) or not edits:
-        return {"ok": False, "error": "Missing required parameter: edits (list of {original_text, new_text, replace_all?})"}
+    if isinstance(edits, str):
+        try:
+            edits = json.loads(edits)
+        except (json.JSONDecodeError, TypeError):
+            return _edit_file_input_failure(
+                "Parameter 'edits' must be an array, not an invalid JSON string.",
+                "edit_file_invalid_edits_type",
+                recovery_hint=(
+                    "Pass edits directly as an array of objects; do not encode the array as text."
+                ),
+                received_type="string",
+            )
+    if isinstance(edits, dict):
+        edits = [edits]
+    if edits is None:
+        return _edit_file_input_failure(
+            "Missing required parameter: edits",
+            "missing_required_fields",
+            recovery_hint=(
+                "Pass edits as a non-empty array of {original_text, new_text, replace_all?} objects."
+            ),
+            missing=["edits"],
+        )
+    if not isinstance(edits, list):
+        return _edit_file_input_failure(
+            "Parameter 'edits' must be an array of edit objects.",
+            "edit_file_invalid_edits_type",
+            recovery_hint=(
+                "Pass edits as a non-empty array of {original_text, new_text, replace_all?} objects."
+            ),
+            received_type=type(edits).__name__,
+        )
+    if not edits:
+        return _edit_file_input_failure(
+            "Parameter 'edits' must contain at least one edit object.",
+            "edit_file_empty_edits",
+            recovery_hint="Add at least one object containing original_text and new_text.",
+        )
     dry_run = bool(params.get("dry_run", False))
 
     target = resolve_workspace_path(path)

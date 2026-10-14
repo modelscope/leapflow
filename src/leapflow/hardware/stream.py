@@ -29,7 +29,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Deque, Iterable, Iterator
+from typing import Any, Callable, Deque, Iterable, Iterator, Protocol, runtime_checkable
 
 from leapflow.hardware.context import Channel, DegradationPolicy, HardwareContext, Quality, as_numeric
 from leapflow.hardware.degradation import DegradationCoordinator
@@ -51,6 +51,78 @@ suppressions are counted rather than discarded silently.
 
 EventSink = Callable[["HardwareEvent"], None]
 """Receives derived events. Must be thread-safe and non-blocking."""
+
+
+class HardwareEventClass:
+    """Behavioural classification for hardware events (D-X4 three-way split).
+
+    Every event kind maps to exactly one class. The classification determines the
+    dispatch path:
+
+    ``REFLEX``
+        Safety-critical, handled without LLM involvement.  Alert-policy actions
+        (hw_estop, degradation) execute immediately via the reflex path.
+    ``DELIBERATIVE``
+        May require an LLM decision.  If hardware-triggered reentry is enabled,
+        these events can open an isolated subagent round (writes still gated by
+        normal approval).
+    ``RECORD``
+        Informational only.  Stored in the reading store, visible on the board
+        and in the watch pipeline, but not routed to any decision path.
+    """
+
+    REFLEX = "reflex"
+    DELIBERATIVE = "deliberative"
+    RECORD = "record"
+
+
+# Canonical mapping: event kind → behavioural class.
+# The mapping is intentionally conservative: when in doubt an event is REFLEX
+# (fail-closed). Adding a new EventKind without extending this mapping makes it
+# REFLEX by default, which is the only safe choice for an unknown condition.
+_EVENT_CLASS_MAP: dict[str, str] = {
+    # ── Reflex (safety-critical, no LLM) ──
+    "threshold_exceeded": HardwareEventClass.REFLEX,
+    "rate_exceeded": HardwareEventClass.REFLEX,
+    "unreachable": HardwareEventClass.REFLEX,
+    # ── Deliberative (may trigger reentry round) ──
+    "quality_degraded": HardwareEventClass.DELIBERATIVE,
+    "stale": HardwareEventClass.DELIBERATIVE,
+    # ── Record (informational, store only) ──
+    "settled": HardwareEventClass.RECORD,
+    "sample_loss": HardwareEventClass.RECORD,
+    "calibration_started": HardwareEventClass.RECORD,
+    "calibration_completed": HardwareEventClass.RECORD,
+    "calibration_failed": HardwareEventClass.RECORD,
+    "calibration_expired": HardwareEventClass.RECORD,
+}
+
+
+def classify_hardware_event(kind: str) -> str:
+    """Return the behavioural class for the given event kind.
+
+    Unknown kinds default to REFLEX (fail-closed): an unrecognised condition is
+    assumed safety-critical until explicitly classified.
+    """
+    return _EVENT_CLASS_MAP.get(kind, HardwareEventClass.REFLEX)
+
+
+@runtime_checkable
+class HardwareDeliberativeObserver(Protocol):
+    """Receives deliberative hardware events for potential reentry triggering.
+
+    Registered on the hardware registry and called from ``publish_event`` when
+    a classified event has ``event_class == DELIBERATIVE``.  The observer decides
+    whether the event warrants an agent reentry round; the write path inside that
+    round still runs through normal approval gates.
+
+    Implementations must be non-blocking: long work should be scheduled rather
+    than awaited.
+    """
+
+    def on_deliberative_event(self, event: "HardwareEvent") -> None:
+        """Accept a deliberative hardware event for evaluation."""
+        ...
 
 
 class EventKind:
@@ -102,6 +174,13 @@ class HardwareEvent:
     observed_at: float = 0.0
     """Wall-clock. This crosses module boundaries, so it must be the clock every
     consumer outside ``leapflow.hardware`` already uses."""
+    event_class: str = ""
+    """Behavioural classification (reflex / deliberative / record).
+
+    Populated by ``classify_hardware_event`` at creation time. An empty string
+    means the classification has not been applied yet; consumers that depend on
+    it should fall back to ``classify_hardware_event(self.kind)``.
+    """
 
     @property
     def event_type(self) -> str:
@@ -123,6 +202,11 @@ class HardwareEvent:
         rendered = "" if self.value is None else f" value={self.value}{f' {self.unit}' if self.unit else ''}"
         return f"[{self.kind}] {where}{rendered}: {self.detail}"
 
+    @property
+    def resolved_event_class(self) -> str:
+        """Return the event class, computing it from kind if not set."""
+        return self.event_class or classify_hardware_event(self.kind)
+
     def to_payload(self) -> dict[str, Any]:
         """Return the EventBus payload, using that layer's key names.
 
@@ -140,6 +224,7 @@ class HardwareEvent:
         """
         return {
             "kind": self.kind,
+            "event_class": self.resolved_event_class,
             "source": self.source,
             "device_id": self.device_id,
             "channel_id": self.channel_id,
@@ -1183,6 +1268,7 @@ __all__ = [
     "DEFAULT_RING_CAPACITY",
     "MIN_EVENT_INTERVAL_S",
     "EventKind",
+    "HardwareDeliberativeObserver",
     "HardwareEvent",
     "HardwareEventDetector",
     "HardwareStreamSource",

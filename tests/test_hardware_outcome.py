@@ -36,6 +36,7 @@ from leapflow.hardware.outcome import (
 )
 from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
 from leapflow.hardware.tools import HardwareTools
+from leapflow.hardware.trust import HardwareTrustGate, HardwareTrustLevel
 from leapflow.security.approval import ApprovalDecision, SessionAwareGate
 from leapflow.security.orchestrator import ApprovalOrchestrator
 from leapflow.security.policy import ApprovalPolicyEngine
@@ -158,7 +159,13 @@ class _StaticProvider:
 class Bench:
     """Registry plus the real approval chain plus a recording experience store."""
 
-    def __init__(self, context: HardwareContext, **overrides: Any) -> None:
+    def __init__(
+        self,
+        context: HardwareContext,
+        *,
+        trust_gate: HardwareTrustGate | None = None,
+        **overrides: Any,
+    ) -> None:
         self.registry = HardwareRegistry(
             HardwareSettings(
                 enabled=True,
@@ -175,7 +182,12 @@ class Bench:
         self.orchestrator = ApprovalOrchestrator(
             SessionAwareGate(self.human), policy=ApprovalPolicyEngine()
         )
-        self.tools = HardwareTools(self.registry, gate=self.orchestrator, session_id="s")
+        self.tools = HardwareTools(
+            self.registry,
+            gate=self.orchestrator,
+            session_id="s",
+            hardware_trust_gate=trust_gate,
+        )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -799,6 +811,57 @@ def test_outcome_reports_whether_the_device_tracked() -> None:
 # ════════════════════════════════════════════════════════════════
 # Tool integration
 # ════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_transport_acceptance_without_observation_does_not_promote_trust() -> None:
+    trust = HardwareTrustGate(candidate_at=1)
+    bench = Bench(_context(settling=0.0, verify=False), trust_gate=trust)
+
+    result = await bench.tools.hw_dispense(
+        device_id="fluent_p1", channel_id="aspirate", value=10.0
+    )
+
+    assert result["ok"] is True
+    assert trust.level("fluent_p1", "aspirate") is HardwareTrustLevel.UNTRUSTED
+    assert trust.trust_record("fluent_p1", "aspirate").consecutive_ok == 0
+
+
+@pytest.mark.asyncio
+async def test_immediate_verified_outcome_promotes_trust() -> None:
+    trust = HardwareTrustGate(candidate_at=1)
+    bench = Bench(_context(settling=0.0, verify=True), trust_gate=trust)
+
+    result = await bench.tools.hw_dispense(
+        device_id="fluent_p1", channel_id="aspirate", value=10.0
+    )
+
+    assert result["ok"] is True
+    assert trust.level("fluent_p1", "aspirate") is HardwareTrustLevel.CANDIDATE
+    assert trust.trust_record("fluent_p1", "aspirate").consecutive_ok == 1
+
+
+@pytest.mark.asyncio
+async def test_settled_mismatch_records_trust_failure_without_success() -> None:
+    trust = HardwareTrustGate(candidate_at=1)
+    bench = Bench(_context(settling=0.01, verify=True), trust_gate=trust)
+
+    result = await bench.tools.hw_dispense(
+        device_id="fluent_p1", channel_id="aspirate", value=25.0
+    )
+    assert result["ok"] is True
+    assert trust.trust_record("fluent_p1", "aspirate").consecutive_ok == 0
+
+    transport = await bench.registry.transport("fluent_p1")
+    await transport.write("aspirate", 100.0)
+    time.sleep(0.02)
+    read = await bench.tools.hw_read(device_id="fluent_p1", channel_id="aspirate")
+
+    assert read["command_outcome"]["delta"] > 0.05
+    record = trust.trust_record("fluent_p1", "aspirate")
+    assert record.consecutive_ok == 0
+    assert record.consecutive_fail == 1
+    assert record.level is HardwareTrustLevel.UNTRUSTED
 
 
 @pytest.mark.asyncio

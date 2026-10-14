@@ -63,15 +63,41 @@ def build_reentry_subagent_config(orient: OrientSnapshot) -> Any:
     )
 
 
-def event_matches(event_match: dict, *, platform: str = "", chat: str = "", text: str = "") -> bool:
-    """Whether an inbound gateway message matches an EVENT trigger's filter.
+def event_matches(
+    event_match: dict,
+    *,
+    platform: str = "",
+    chat: str = "",
+    text: str = "",
+    source: str = "gateway",
+    device_id: str = "",
+    event: str = "",
+) -> bool:
+    """Whether an inbound event matches a trigger's filter.
 
     An empty filter matches *nothing* (safety: never fire on all traffic). Each
-    present field must match: platform (exact), chat (exact, ``chat`` or
-    ``chat_id``), keyword (case-insensitive substring of the message text).
+    present field must match. Filters carry an optional ``source`` field that
+    partitions gateway triggers from hardware triggers so they never cross-fire.
+
+    Source values: ``"gateway"`` (default, for IM/platform events) and
+    ``"hardware"`` (for deliberative hardware events).
     """
     if not event_match:
         return False
+    # Source domain gate: a hardware trigger does not match a gateway event
+    filter_source = event_match.get("source", "gateway")
+    if str(filter_source) != str(source):
+        return False
+    if source == "hardware":
+        # Hardware-specific fields
+        want_device = event_match.get("device_id")
+        if want_device and str(want_device) != str(device_id):
+            return False
+        want_event = event_match.get("event")
+        if want_event and str(want_event) != str(event):
+            return False
+        return True
+    # Gateway (IM/platform) matching
     want_platform = event_match.get("platform")
     if want_platform and str(want_platform) != str(platform):
         return False

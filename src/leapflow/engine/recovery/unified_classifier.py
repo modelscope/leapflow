@@ -101,24 +101,30 @@ class RecoverabilityRegistry:
 _PERMISSION_FAILURE_CLASSES = frozenset({"authorization", "scope_denied"})
 _PERMISSION_FAILURE_CODES = frozenset({"access_denied", "missing_scope", "platform_degraded"})
 
-# These codes describe deterministic precondition, infrastructure, or repeated
-# failures. Retrying the identical action cannot make them succeed, so classify
-# them from the producer's structured result before considering message text.
+# Non-replayable is not the same as turn-terminal. These failures require the
+# agent to inspect the observation and change its next action; replaying the
+# identical call is unsafe or pointless, but the task can still continue.
+_AGENT_CORRECTABLE_TOOL_FAILURE_CODES = frozenset({
+    "shell_command_not_found",
+    "shell_command_required",
+    "shell_invalid_cwd",
+    "shell_nonzero_exit",
+    "shell_syntax_error",
+    "window_discovery_invalid_result",
+    "window_target_required",
+})
+
+# These failures represent policy refusal, unavailable infrastructure, or the
+# repeated-action loop breaker. Continuing autonomously cannot satisfy their
+# preconditions, so they terminate the turn through RecoveryCoordinator.
 _TERMINAL_TOOL_FAILURE_CODES = frozenset({
     "approval_denied",
     "cua_driver_unavailable",
     "repeated_terminal_failure",
     "shell_command_blocked",
-    "shell_command_not_found",
-    "shell_command_required",
     "shell_cwd_blocked",
     "shell_execution_failed",
-    "shell_invalid_cwd",
     "shell_io_failure",
-    "shell_nonzero_exit",
-    "shell_syntax_error",
-    "window_discovery_invalid_result",
-    "window_target_required",
     "workspace_access_denied",
 })
 
@@ -328,8 +334,10 @@ class UnifiedErrorClassifier:
         retryable_value = result.get("retryable")
         retryable = bool(retryable_value) if retryable_value is not None else True
 
-        # Determine side-effect state based on execution policy
-        side_effect_state = self._side_effect_state_from_policy(execution_policy)
+        # Producer evidence is more precise than the tool's static execution policy.
+        # A rejected hardware write can prove that no effect occurred, while a
+        # transport failure can report a partial or unknown physical outcome.
+        side_effect_state = self._side_effect_state_from_result(result, execution_policy)
 
         # Classification rules (priority order)
 
@@ -346,10 +354,24 @@ class UnifiedErrorClassifier:
                 context=FailureContext.from_dict_args(tool_name=tool_name),
             )
 
-        # 2. Stable terminal failure contract. The producer must name a known
+        # 2. Agent-correctable failures are observations, not terminal decisions.
+        # The current action must not be replayed blindly, but the agent can
+        # inspect the result and continue with a corrected or alternate action.
+        if failure_code in _AGENT_CORRECTABLE_TOOL_FAILURE_CODES:
+            return FailureEnvelope.create(
+                source=FailureSource.TOOL,
+                category="tool_failure",
+                failure_class=failure_class or "agent_correctable_tool_failure",
+                failure_code=failure_code,
+                message=error_msg or "Tool action failed and requires a changed approach",
+                recoverability=Recoverability.USER_FIXABLE,
+                side_effect_state=side_effect_state,
+                context=FailureContext.from_dict_args(tool_name=tool_name),
+            )
+
+        # 3. Stable terminal failure contract. The producer must name a known
         # terminal code: a generic ``retryable=False`` failure may still require
-        # a safe read-back or a different user action (not a blind replay), and
-        # must not skip that remediation path merely because it is non-replayable.
+        # a safe read-back or a different action and must remain agent-correctable.
         if failure_code in _TERMINAL_TOOL_FAILURE_CODES:
             return FailureEnvelope.create(
                 source=FailureSource.TOOL,
@@ -362,7 +384,7 @@ class UnifiedErrorClassifier:
                 context=FailureContext.from_dict_args(tool_name=tool_name),
             )
 
-        # 3. Unknown tool with retryable flag
+        # 4. Unknown tool with retryable flag
         if error_type == "unknown_tool" and retryable:
             return FailureEnvelope.create(
                 source=FailureSource.TOOL,
@@ -375,7 +397,7 @@ class UnifiedErrorClassifier:
                 context=FailureContext.from_dict_args(tool_name=tool_name),
             )
 
-        # 4. Timeout detection (data-driven keyword set)
+        # 5. Timeout detection (data-driven keyword set)
         error_lower = error_msg.lower()
         if any(kw in error_lower for kw in _TOOL_TIMEOUT_KEYWORDS):
             timeout_recoverability = (
@@ -394,7 +416,7 @@ class UnifiedErrorClassifier:
                 context=FailureContext.from_dict_args(tool_name=tool_name),
             )
 
-        # 5. Generic tool failure
+        # 6. Generic tool failure
         recoverability = (
             Recoverability.AUTO_RETRY if retryable else Recoverability.USER_FIXABLE
         )
@@ -486,6 +508,38 @@ class UnifiedErrorClassifier:
             recoverability=Recoverability.USER_FIXABLE,
             side_effect_state=SideEffectState.UNKNOWN,
         )
+
+    @classmethod
+    def _side_effect_state_from_result(
+        cls, result: dict[str, Any], execution_policy: str
+    ) -> SideEffectState:
+        """Resolve side-effect evidence, falling back to the execution policy.
+
+        Tool results describe what happened during this specific attempt, whereas
+        the execution policy only describes what could happen in general. Explicit
+        producer evidence therefore wins. Contradictory or malformed evidence is
+        treated as unknown so it cannot accidentally enable an automatic replay.
+        """
+        if result.get("effect_uncertain") is True:
+            return SideEffectState.UNKNOWN
+
+        if "side_effect_state" not in result:
+            return cls._side_effect_state_from_policy(execution_policy)
+
+        raw_state = result.get("side_effect_state")
+        if isinstance(raw_state, SideEffectState):
+            return raw_state
+        if isinstance(raw_state, str):
+            try:
+                return SideEffectState(raw_state.strip().lower())
+            except ValueError:
+                pass
+
+        logger.warning(
+            "invalid tool side_effect_state %r; treating the failed effect as unknown",
+            raw_state,
+        )
+        return SideEffectState.UNKNOWN
 
     @staticmethod
     def _side_effect_state_from_policy(policy: str) -> SideEffectState:

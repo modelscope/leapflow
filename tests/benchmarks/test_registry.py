@@ -121,8 +121,10 @@ def test_entry_point_conflict_preserves_builtin(monkeypatch) -> None:
 def test_default_registry_contains_all_native_and_external_adapters() -> None:
     adapter_ids = default_registry().list_available()
 
-    assert len(adapter_ids) == 25
-    assert sum(adapter_id.startswith("native_") for adapter_id in adapter_ids) == 11
+    assert len(adapter_ids) == 27
+    assert sum(adapter_id.startswith("native_") for adapter_id in adapter_ids) == 12
+    assert "roboharm" in adapter_ids
+    assert "native_roboharm_simulation" in adapter_ids
     assert "external_command" in adapter_ids
     assert "live_llm" in adapter_ids
     assert "hardware_preflight" in adapter_ids

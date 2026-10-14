@@ -245,6 +245,67 @@ class TestClassifyToolResultFailures:
         assert env.recoverability == Recoverability.USER_FIXABLE
         assert env.side_effect_state == SideEffectState.UNKNOWN
 
+    @pytest.mark.parametrize(
+        ("reported_state", "expected"),
+        [
+            ("none", SideEffectState.NONE),
+            ("committed", SideEffectState.COMMITTED),
+            ("partial", SideEffectState.PARTIAL),
+            ("unknown", SideEffectState.UNKNOWN),
+        ],
+    )
+    def test_explicit_side_effect_state_overrides_policy(
+        self,
+        classifier: UnifiedErrorClassifier,
+        reported_state: str,
+        expected: SideEffectState,
+    ) -> None:
+        result = {
+            "ok": False,
+            "error": "hardware write failed",
+            "side_effect_state": reported_state,
+        }
+
+        env = classifier.classify_tool_result(
+            result, tool_name="hw_actuate", execution_policy="external_side_effect"
+        )
+
+        assert env is not None
+        assert env.side_effect_state is expected
+
+    def test_effect_uncertain_overrides_reported_none(
+        self, classifier: UnifiedErrorClassifier
+    ) -> None:
+        result = {
+            "ok": False,
+            "error": "driver contract failed after dispatch",
+            "side_effect_state": "none",
+            "effect_uncertain": True,
+        }
+
+        env = classifier.classify_tool_result(
+            result, tool_name="hw_actuate", execution_policy="external_side_effect"
+        )
+
+        assert env is not None
+        assert env.side_effect_state is SideEffectState.UNKNOWN
+
+    def test_invalid_explicit_side_effect_state_fails_closed(
+        self, classifier: UnifiedErrorClassifier
+    ) -> None:
+        result = {
+            "ok": False,
+            "error": "hardware write failed",
+            "side_effect_state": "maybe",
+        }
+
+        env = classifier.classify_tool_result(
+            result, tool_name="hw_actuate", execution_policy="read_only"
+        )
+
+        assert env is not None
+        assert env.side_effect_state is SideEffectState.UNKNOWN
+
     def test_generic_failure_retryable(self, classifier: UnifiedErrorClassifier) -> None:
         result = {
             "ok": False,
@@ -265,6 +326,36 @@ class TestClassifyToolResultFailures:
         env = classifier.classify_tool_result(result, tool_name="file_write")
         assert env is not None
         assert env.category == "tool_failure"
+        assert env.recoverability == Recoverability.USER_FIXABLE
+
+    @pytest.mark.parametrize(
+        "failure_code",
+        [
+            "shell_command_not_found",
+            "shell_command_required",
+            "shell_invalid_cwd",
+            "shell_nonzero_exit",
+            "shell_syntax_error",
+            "window_discovery_invalid_result",
+            "window_target_required",
+        ],
+    )
+    def test_structured_agent_correctable_failure_continues_turn(
+        self, classifier: UnifiedErrorClassifier, failure_code: str
+    ) -> None:
+        env = classifier.classify_tool_result(
+            {
+                "ok": False,
+                "failure_class": "invalid_action",
+                "failure_code": failure_code,
+                "retryable": False,
+                "error": "The attempted action needs correction",
+            },
+            tool_name="shell_run",
+        )
+        assert env is not None
+        assert env.category == "tool_failure"
+        assert env.failure_code == failure_code
         assert env.recoverability == Recoverability.USER_FIXABLE
 
     def test_structured_shell_io_failure_is_terminal(self, classifier: UnifiedErrorClassifier) -> None:

@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 _NATIVE_ADAPTER_FACTORIES: tuple[tuple[str, str, str], ...] = (
     ("benchmarks.native.harmful_instruction", "HarmfulInstructionAdapter",
      "native_harmful_instruction"),
+    ("benchmarks.native.roboharm_simulation", "RoboHarmSimulationAdapter",
+     "native_roboharm_simulation"),
     ("benchmarks.native.approval_and_trust", "ApprovalAndTrustAdapter",
      "native_approval_and_trust"),
     ("benchmarks.native.safety_policy", "SafetyPolicyAdapter",
@@ -82,6 +84,7 @@ def __getattr__(name: str):
 __all__ = [
     "native_adapters",
     "HarmfulInstructionAdapter",
+    "RoboHarmSimulationAdapter",
     "ApprovalAndTrustAdapter",
     "SafetyPolicyAdapter",
     "DegradationRecoveryAdapter",
