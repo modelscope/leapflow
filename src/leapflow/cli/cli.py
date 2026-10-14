@@ -342,6 +342,21 @@ def main(argv: list[str] | None = None) -> int:
     hw_serve.add_argument("--port", type=int, default=8767, help="TCP bind port (default: 8767; 0 picks a free port)")
     hw_serve.add_argument("--unix", default="", dest="unix_path", help="Bind a Unix socket path instead of TCP")
     hw_serve.add_argument("--token", default="", help="Shared hello secret (env LEAPFLOW_LHP_TOKEN)")
+    # Verification subcommands
+    hw_verify = hw_sub.add_parser("verify", parents=[hw_json], help="Verify a device declaration (digest-bound)")
+    hw_verify.add_argument("device", help="Device id to verify")
+    hw_verify.add_argument("--as", dest="verifier", default="", help="Verifier identity (e.g. operator name)")
+    hw_validate = hw_sub.add_parser("validate", parents=[hw_json], help="Validate a device YAML without loading")
+    hw_validate.add_argument("file_or_device", help="YAML file path or device id")
+    hw_sub.add_parser("permit-key", parents=[hw_json], help="Generate an Ed25519 keypair for execution permits")
+    # Onboarding subcommands
+    hw_init = hw_sub.add_parser("init", parents=[hw_json], help="Generate an annotated hc.v1 device template")
+    hw_init.add_argument("device_id", help="Device id for the new template")
+    hw_probe = hw_sub.add_parser("probe", parents=[hw_json], help="Read-only device connectivity check")
+    hw_probe.add_argument("device", help="Device id to probe")
+    hw_commission = hw_sub.add_parser("commission", parents=[hw_json], help="Controlled first-write commissioning")
+    hw_commission.add_argument("device", help="Device id to commission")
+    hw_commission.add_argument("channel", nargs="?", default="", help="Optional channel id (default: first writable)")
 
     # leap doctor
     doctor_parser = subparsers.add_parser("doctor", help="Run system health diagnostics")
