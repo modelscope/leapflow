@@ -458,6 +458,31 @@ def _run_replay(args: argparse.Namespace, json_mode: bool) -> int:
 # ── Verification commands ──────────────────────────────────────────────────────────
 
 
+def _load_raw_yaml_context(devices_dir: Path, device_id: str) -> Any:
+    """Load a raw HardwareContext from YAML *without* admission processing.
+
+    The digest must be computed on the same representation that the YAML
+    provider will later load, so we must bypass the registry (which applies
+    V5/V7 demotions, provenance changes, etc.).
+    """
+    import yaml as _yaml
+
+    from leapflow.hardware.context import HardwareContext
+
+    if not devices_dir.is_dir():
+        return None
+    for path in sorted(devices_dir.iterdir()):
+        if path.suffix.lower() not in (".yaml", ".yml") or not path.is_file():
+            continue
+        try:
+            raw = _yaml.safe_load(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and raw.get("device_id") == device_id:
+                return HardwareContext.from_mapping(raw)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 async def _run_verification(action: str, args: argparse.Namespace, json_mode: bool) -> int:
     """Handle verify/validate subcommands."""
     import time as _time
@@ -473,18 +498,23 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
 
     from leapflow.layout import HardwareLayout
 
-    layout = HardwareLayout(settings.profile_dir)
+    layout = HardwareLayout(settings.profile_dir / "hardware")
     verified_path = layout.verified_path
-    device_id = str(getattr(args, "device_id", "") or "")
+    device_id = str(getattr(args, "device_id", "") or getattr(args, "device", "") or getattr(args, "file_or_device", "") or "")
 
     if action == "verify":
         if not device_id:
             return _emit_result("verify", {"ok": False, "error": "device_id is required"}, json_mode)
-        context = registry.context(device_id)
-        if context is None:
+        # Load the raw (pre-admission) context from the YAML file so the
+        # digest matches what the YAML provider will compute on next load.
+        # registry.context() returns the post-admission copy whose channels
+        # and provenance may have been modified by V5/V7 rules, producing a
+        # different digest.
+        raw_context = _load_raw_yaml_context(layout.devices_dir, device_id)
+        if raw_context is None:
             return _emit_result("verify", {"ok": False, "error": f"unknown device {device_id!r}"}, json_mode)
 
-        digest = declaration_digest(context)
+        digest = declaration_digest(raw_context)
         # Read existing verified.json
         existing: dict[str, Any] = {}
         if verified_path.is_file():
@@ -497,7 +527,7 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
 
         import getpass
 
-        verifier = getpass.getuser()
+        verifier = str(getattr(args, "verifier", "") or "") or getpass.getuser()
         existing[device_id] = {
             "verifier": verifier,
             "declaration_digest": digest,
@@ -547,7 +577,9 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
                 if not stored:
                     status = "unbound"
                 else:
-                    current = declaration_digest(ctx)
+                    current = declaration_digest(
+                        _load_raw_yaml_context(layout.devices_dir, ctx.device_id) or ctx
+                    )
                     status = "valid" if current == stored else "digest_mismatch"
 
             item = {
@@ -575,7 +607,7 @@ def _run_permit_key(args: argparse.Namespace, json_mode: bool) -> int:
     settings = load_config()
     from leapflow.layout import HardwareLayout
 
-    layout = HardwareLayout(settings.profile_dir)
+    layout = HardwareLayout(settings.profile_dir / "hardware")
     key_path = layout.root / "lhp_permit_issuer.key"
     if not key_path.is_file():
         result = {
@@ -726,7 +758,7 @@ async def _run_probe(args: argparse.Namespace, json_mode: bool) -> int:
 
     await _register_fleet_read_plane(registry)
 
-    device_id = str(getattr(args, "device_id", "") or "")
+    device_id = str(getattr(args, "device_id", "") or getattr(args, "device", "") or "")
     if not device_id:
         return _emit_result("probe", {"ok": False, "error": "device_id is required"}, json_mode)
 
@@ -812,7 +844,7 @@ async def _run_commission(args: argparse.Namespace, json_mode: bool) -> int:
 
     await _register_fleet_read_plane(registry)
 
-    device_id = str(getattr(args, "device_id", "") or "")
+    device_id = str(getattr(args, "device_id", "") or getattr(args, "device", "") or "")
     if not device_id:
         await registry.close_all()
         return _emit_result("commission", {"ok": False, "error": "device_id is required"}, json_mode)
