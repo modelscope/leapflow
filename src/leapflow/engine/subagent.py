@@ -13,6 +13,11 @@ Fits leapflow's architecture:
 - Extends TaskScheduler with isolated execution contexts
 - Emits SubagentCompleted/SubagentFailed events on EventBus
 - Uses existing SkillRegistry with tool intersection
+
+Size note (>800-line registered exception per AGENTS.md): isolation policy,
+context construction, lifecycle, and EventBus reporting form one delegation
+contract; the pieces share the subagent session lineage and stay together
+to keep that lineage's invariants in one place.
 """
 from __future__ import annotations
 
