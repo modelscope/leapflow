@@ -92,6 +92,18 @@ class ReentryCoordinator:
             except Exception:
                 logger.debug("daemon: reentry event observer wiring failed", exc_info=True)
 
+            # N4-hw: observe deliberative hardware events for hardware EVENT-triggers.
+            if getattr(settings, "agent_reentry_hardware_enabled", False):
+                try:
+                    setattr(ctx, "_reentry_hardware_observer", service.on_hardware_event)
+                    hardware_registry = getattr(ctx, "_hardware_registry", None)
+                    if hardware_registry is not None:
+                        _observer = _HardwareReentryBridge(service.on_hardware_event)
+                        hardware_registry.set_deliberative_observer(_observer)
+                        logger.debug("daemon: hardware reentry observer wired")
+                except Exception:
+                    logger.debug("daemon: hardware reentry observer wiring failed", exc_info=True)
+
             base_interval = max(5.0, float(getattr(settings, "agent_reentry_tick_seconds", 30.0) or 30.0))
             idle_interval = max(
                 base_interval,
@@ -153,3 +165,35 @@ class ReentryCoordinator:
     def service(self) -> Any:
         """Access the underlying ReentryService (may be None)."""
         return self._reentry_service
+
+
+class _HardwareReentryBridge:
+    """Adapts the ReentryService.on_hardware_event to the HardwareDeliberativeObserver protocol.
+
+    The observer protocol is synchronous (called from the registry's publish_event),
+    so we schedule the async on_hardware_event call without awaiting it.
+    """
+
+    def __init__(self, on_hardware_event: Any) -> None:
+        self._on_hardware_event = on_hardware_event
+
+    def on_deliberative_event(self, event: Any) -> None:
+        device_id = str(getattr(event, "device_id", "") or "")
+        event_kind = str(getattr(event, "kind", "") or "")
+        event_class = str(getattr(event, "resolved_event_class", "") or "")
+        summary = str(getattr(event, "summary", "") or getattr(event, "detail", "") or "")
+        try:
+            import asyncio
+
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self._on_hardware_event(
+                    device_id=device_id,
+                    event=event_kind,
+                    event_class=event_class,
+                    summary=summary,
+                ),
+                name="reentry-hardware-event",
+            )
+        except RuntimeError:
+            logger.debug("no event loop for hardware reentry dispatch")

@@ -30,15 +30,6 @@ from leapflow.engine.recovery.recovery_decision import (
 
 logger = logging.getLogger(__name__)
 
-# Actions that re-run work already attempted. Safe only when the failed attempt
-# left no trace; after a mutation they can duplicate the effect.
-_REPLAYING_ACTIONS = frozenset({
-    RecoveryAction.RETRY_WITH_BACKOFF,
-    RecoveryAction.TRANSFORM_AND_RETRY,
-    RecoveryAction.FAILOVER,
-})
-
-
 @dataclass
 class RecoveryState:
     """Shared mutable state visible to all strategies during a turn.
@@ -136,6 +127,14 @@ class RecoveryCoordinator:
         3. For each: check source/category match → one-shot guard → can_apply → decide.
         4. If none applies: return terminal decision.
         """
+        # A failed attempt with any observed or uncertain effect must stop at a
+        # user-mediated checkpoint before budget, recoverability, or strategy
+        # selection can turn it into an ordinary clean halt or automatic replay.
+        if envelope.side_effect_state is not SideEffectState.NONE:
+            decision = self._side_effect_halt(envelope, ["all automatic recovery"])
+            self._record_audit(decision, strategy_key="<side_effect_gated>")
+            return decision
+
         # Deadline check
         if self._budget.is_deadline_exceeded():
             reason = (
@@ -168,7 +167,6 @@ class RecoveryCoordinator:
             return decision
 
         # Strategy evaluation
-        blocked_by_side_effect: list[str] = []
         for strategy in self._strategies:
             if not self._matches_source(strategy, envelope):
                 continue
@@ -182,15 +180,6 @@ class RecoveryCoordinator:
 
             # Budget pre-check for the strategy's expected cost
             decision = strategy.decide(envelope, self._state)
-
-            # Side-effect gating: once the attempt may have mutated state, a
-            # replaying action can duplicate it. Reject the candidate (rolling
-            # back whatever decide() staged) and keep looking for a strategy
-            # that does not replay; if none exists, halt with a checkpoint below.
-            if self._replay_blocked_by_side_effect(envelope, decision):
-                self._rollback_state_changes(decision, strategy)
-                blocked_by_side_effect.append(strategy.key)
-                continue
 
             if decision.budget_cost > 0:
                 if not self._budget.can_afford(decision.budget_cost, envelope.category):
@@ -216,32 +205,10 @@ class RecoveryCoordinator:
             self._record_audit(decision, strategy_key=strategy.key)
             return decision
 
-        if blocked_by_side_effect:
-            decision = self._side_effect_halt(envelope, blocked_by_side_effect)
-            self._record_audit(decision, strategy_key="<side_effect_gated>")
-            return decision
-
         # No strategy matched
         decision = self.terminal_decision(envelope)
         self._record_audit(decision, strategy_key="<none_matched>")
         return decision
-
-    @staticmethod
-    def _replay_blocked_by_side_effect(
-        envelope: FailureEnvelope, decision: RecoveryDecision,
-    ) -> bool:
-        """Return whether the side-effect state forbids this replaying action.
-
-        Every state other than ``NONE`` blocks: ``COMMITTED`` and ``PARTIAL``
-        mean state changed, and ``UNKNOWN`` means it may have. ``UNKNOWN`` is
-        deliberately included rather than treated as safe — it is both the
-        classifier's fallback and the state it assigns to ``external_side_effect``
-        (an outbound send, an external API call), so exempting it would leave the
-        highest-risk case ungated.
-        """
-        if envelope.side_effect_state is SideEffectState.NONE:
-            return False
-        return decision.action in _REPLAYING_ACTIONS
 
     def _side_effect_halt(
         self, envelope: FailureEnvelope, blocked_strategies: list[str],

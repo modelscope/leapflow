@@ -214,6 +214,59 @@ def test_the_default_provider_set_excludes_emitting_scanners() -> None:
     assert "mdns" not in DEFAULT_PROVIDER_KINDS
 
 
+def _thermal_zone(root: Any, index: int, zone_type: str, trips: list[tuple[str, int]]) -> None:
+    zone = root / f"thermal_zone{index}"
+    zone.mkdir()
+    (zone / "type").write_text(zone_type + "\n", encoding="ascii")
+    for number, (trip_type, millidegrees) in enumerate(trips):
+        (zone / f"trip_point_{number}_type").write_text(trip_type + "\n", encoding="ascii")
+        (zone / f"trip_point_{number}_temp").write_text(f"{millidegrees}\n", encoding="ascii")
+
+
+def test_a_thermal_limit_comes_from_sysfs_not_psutils_rescaled_copy(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a Jetson, psutil reported critical=0.1045 for a 104.5 degC trip.
+
+    Its thermal-zone fallback divides the critical trip by 1000 again for every trip
+    point it visits afterwards, so each 51 degC sample was a "threshold exceeded" event.
+    """
+    from types import SimpleNamespace
+
+    from leapflow.hardware import host_metrics
+
+    _thermal_zone(tmp_path, 0, "cpu-thermal", [("passive", 99000), ("critical", 104500), ("active", 70000)])
+    _thermal_zone(tmp_path, 1, "gpu-thermal", [("passive", 99000)])
+    trips = host_metrics._sysfs_critical_trips(str(tmp_path))  # noqa: SLF001
+    assert trips == {"cpu-thermal": (104.5,)}
+
+    reported = {
+        "cpu-thermal": [SimpleNamespace(label="", current=51.0, high=0.1045, critical=0.1045)],
+        "gpu-thermal": [SimpleNamespace(label="", current=50.0, high=0.1045, critical=0.1045)],
+    }
+    monkeypatch.setattr(host_metrics, "_HAS_PSUTIL", True)
+    monkeypatch.setattr(host_metrics, "psutil", SimpleNamespace(sensors_temperatures=lambda: reported), raising=False)
+    monkeypatch.setattr(host_metrics, "_sysfs_critical_trips", lambda: trips)
+
+    limits = {probe.channel_id: probe.max_value for probe in HostMetrics({})._thermal()}  # noqa: SLF001
+
+    assert limits["thermal.cpu_thermal.cpu_thermal_0.celsius"] == 104.5
+    # No sysfs trip and an impossible psutil one: declare no ceiling rather than a wrong one.
+    assert limits["thermal.gpu_thermal.gpu_thermal_0.celsius"] is None
+
+
+def test_a_plausible_psutil_limit_is_kept_where_sysfs_has_none() -> None:
+    """macOS and hwmon-backed Linux sensors report a correct limit; keep it."""
+    from types import SimpleNamespace
+
+    from leapflow.hardware.host_metrics import _critical_threshold
+
+    assert _critical_threshold(SimpleNamespace(current=45.0, critical=100.0), ()) == 100.0
+    assert _critical_threshold(SimpleNamespace(current=45.0, critical=None), ()) is None
+    # Two zones of one type with different trips are ambiguous; fall back to psutil.
+    assert _critical_threshold(SimpleNamespace(current=45.0, critical=95.0), (90.0, 105.0)) == 95.0
+
+
 # ════════════════════════════════════════════════════════════════
 # reconcile(): hot-plug without orphaning sampling loops
 # ════════════════════════════════════════════════════════════════

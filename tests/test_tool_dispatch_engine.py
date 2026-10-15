@@ -409,6 +409,65 @@ class TestPostProcessToolResult:
 
 
 class TestFailureAndCompletionEvidence:
+    def test_shell_nonzero_exit_is_feedback_not_turn_halt(self) -> None:
+        from leapflow.engine.recovery.recovery_coordinator import RecoveryCoordinator
+        from leapflow.engine.recovery.unified_classifier import UnifiedErrorClassifier
+
+        class AuditSink:
+            def __init__(self) -> None:
+                self.entries: list[Any] = []
+
+            def record(self, entry: Any) -> None:
+                self.entries.append(entry)
+
+        coordinator = RecoveryCoordinator()
+        audit = AuditSink()
+        engine = SimpleNamespace(
+            _active_frame=SimpleNamespace(metadata={}),
+            _recovery_coordinator=coordinator,
+            _unified_classifier=UnifiedErrorClassifier(),
+            _audit_sink=audit,
+            _current_session_id="session-1",
+        )
+        dispatch = ToolDispatchEngine(engine)
+        failure = {
+            "ok": False,
+            "failure_class": "shell_command_failed",
+            "failure_code": "shell_nonzero_exit",
+            "error": "grep found no match",
+            "retryable": False,
+            "returncode": 1,
+        }
+
+        reason = dispatch._evaluate_tool_failures([("shell_run", failure)], turn_id=1)
+
+        assert reason is None
+        assert len(audit.entries) == 1
+        assert audit.entries[0].failure_code == "shell_nonzero_exit"
+        assert audit.entries[0].strategy_key == "tool_feedback"
+
+    def test_repeated_missing_fields_ignore_irrelevant_argument_drift(self) -> None:
+        engine = SimpleNamespace(_active_frame=SimpleNamespace(metadata={}))
+        dispatch = ToolDispatchEngine(engine)
+        first = {
+            "ok": False,
+            "error": "Invalid arguments for edit_file: missing required parameter(s): edits",
+            "error_type": "invalid_arguments",
+            "failure_code": "missing_required_fields",
+            "missing": ["edits"],
+            "counts_as_failure": False,
+        }
+        second = dict(first)
+
+        dispatch._annotate_argument_repair_repeat("edit_file", first)
+        dispatch._annotate_argument_repair_repeat("edit_file", second)
+
+        assert first["failure_repeat_count"] == 1
+        assert first["counts_as_failure"] is False
+        assert second["failure_code"] == "repeated_terminal_failure"
+        assert second["original_failure_code"] == "missing_required_fields"
+        assert second["counts_as_failure"] is True
+
     def test_second_failure_fingerprint_becomes_terminal_interaction(self) -> None:
         from leapflow.engine.recovery.recovery_coordinator import RecoveryCoordinator
         from leapflow.engine.recovery.unified_classifier import UnifiedErrorClassifier

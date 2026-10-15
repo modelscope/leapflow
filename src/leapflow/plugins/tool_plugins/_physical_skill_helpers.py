@@ -52,10 +52,19 @@ def build_physical_skill_tools(
                 "type": "object",
                 "properties": {
                     "device_id": {"type": "string", "description": "Target robot device"},
-                    "policy": {"type": "string", "description": "Policy path or 'remote:host:port'"},
+                    "policy": {
+                        "type": "string",
+                        "description": "Policy path or 'remote:host:port'",
+                    },
                     "task": {"type": "string", "description": "Natural language task description"},
-                    "execute": {"type": "boolean", "description": "Write action to device (default true)"},
-                    "chunk_size": {"type": "integer", "description": "Action steps to predict (default 1)"},
+                    "execute": {
+                        "type": "boolean",
+                        "description": "Write one governed action to the device (default false)",
+                    },
+                    "chunk_size": {
+                        "type": "integer",
+                        "description": "Action steps to predict (default 1)",
+                    },
                     "verify": {"type": "boolean", "description": "Run post-execution verification"},
                     "compute_budget": {
                         "type": "object",
@@ -95,14 +104,17 @@ def build_physical_skill_tools(
             },
             x_leapflow={
                 "category": "hardware",
-                "risk_level": "high",
+                "risk_level": "external",
                 "mutates_state": True,
-                "execution_policy": "serial",
+                "requires_approval": True,
+                "effect_scope": "external",
+                "idempotency_scope": "session",
+                "execution_policy": "external_side_effect",
                 "requires_capabilities": ["hardware_control"],
                 "provides_capabilities": ["physical_skill_inference"],
             },
             mutates_state=True,
-            execution_policy="serial",
+            execution_policy="external_side_effect",
             requires_capabilities=("hardware_control",),
             provides_capabilities=("physical_skill_inference",),
         ),
@@ -254,12 +266,14 @@ def discover_local_policies() -> list[dict[str, Any]]:
             # Heuristic: policy repos typically contain "policy" or "act" in the name.
             repo_id = str(repo.repo_id)
             if any(kw in repo_id.lower() for kw in ("policy", "act", "vla", "diffusion")):
-                policies.append({
-                    "name": repo_id,
-                    "type": "local",
-                    "loaded": False,
-                    "source": "huggingface_cache",
-                })
+                policies.append(
+                    {
+                        "name": repo_id,
+                        "type": "local",
+                        "loaded": False,
+                        "source": "huggingface_cache",
+                    }
+                )
     except Exception:  # noqa: BLE001 - discovery must not crash the plugin
         logger.debug("Local policy discovery failed", exc_info=True)
     return policies

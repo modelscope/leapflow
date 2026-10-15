@@ -1,1410 +1,456 @@
 # LeapFlow
 
-**A signal-driven, self-evolving agent framework that learns autonomously from the real world.**
+**Everything is a signal**
 
+LeapFlow is a signal-driven, self-evolving agent framework. Virtual signals (IM apps, OS events, web) and physical signals (robot arms, depth cameras, scientific instruments, IoT) flow through one pipeline into observation → learning → decision-control loops. Knowledge compounds across episodes: skills, device trust, and environment understanding accumulate — the agent gets smarter the more you use it.
+
+---
 
 ### News
 
-- **2026-09-15**: v0.2.0 released — teacher/student world-model self-evolution: hindsight adaptation verdicts (absorb / rebind / acquire / escalate) distill environment knowledge into the student's context, rebind-based selection preference, and a default-off `evolution.enabled` switch. 3,733 tests.
-- **2026-08-12**: v0.0.9 released — TUI thinking display, approval bypass mode, approval-gated workspace boundary, long-task convergence hardening, cross-session task history, dynamic tool registry rebuild, and terminal sessions on by default.
+- **v0.6.0** — Benchmark qualification suite (36 scenarios, 12 external integrations), governed hardware degradation coordinator, failure fingerprints, CUA window-target contract, adaptive context retention.
+- **v0.5.0** — LeapRobot: governed robot control, local/remote VLA inference, real-time servo, teleoperation + episode export; hc.v1 descriptors, robot-arm & ROS 2 transports.
+- **v0.4.0** — Engine decomposition (6 delegates, 5 sub-packages), BM25 progressive tool disclosure, PCD prefix-commitment, cache-hit telemetry, skill curator, scheduler productization.
 
 <details>
 <summary>Previous releases</summary>
 
-- **2026-08-06**: v0.0.8 released — Cross-platform Windows support (DaemonTransport protocol with TCP loopback IPC), real journey test layer with cassette-backed CI (6 e2e journeys, cost-bounded), community Windows fixes (@fanqiNO1). 1,540 tests.
-- **2026-08-06**: v0.0.7 released — 1M-class context windows end-to-end, self-calibrating token estimator, internal-defect failure category, concurrent-TUI session identity isolation. 1,442 tests.
-
-- **2026-07-31**: v0.0.6 released — side-effect-gated recovery (checkpointed halts with structured `InteractionRequest`), uncertain-effect reporting for failed outbound calls, centralized logging with an independent daemon log level, session-bound LeapBoard analysis, platform-neutral gateway validators, and end-to-end architecture contract tests with the CI gate restored.
-- **2026-07-28**: v0.0.5 released — adaptive-depth execution for long-horizon tasks, built-in coding tools, per-session daemon concurrency, improved TUI stability, and hardened leapd recovery/status diagnostics.
-- **2026-07-16**: **LeapBoard** — general-purpose monitoring web dashboard (Watch→Finding + Server-Driven UI); `/board` entry, live session analysis, and finance/sentiment/research templates.
-- **2026-07-16**: v0.0.4 released — protocol-driven recovery coordinator with budget-constrained strategies, unified error classification, checkpoint-based cross-turn resumption, structured audit trail, and tool execution idempotency ledger.
-- **2026-07-15**: v0.0.3 released — layered YAML config, Path/Profile/Cache layouts, encrypted secret refs, DuckDB cache indexing, `leap config`, and robustness hardening.
-- **2026-07-15**: v0.0.2 released — TUI, Gateway/App Connector, Hub sync, Scheduler, Workflow Copilot, and runtime hardening.
-- **2025-06-30**: LeapFlow Preview released — initial public release with record & replay, multi-modal signal fusion, and Workflow Copilot.
+- **v0.3.0** — Event-sourced self-evolution pipeline, `leap evolve` CLI, LeapBoard evolution & causal views.
+- **v0.2.0** — Teacher/student world-model self-evolution, Hardware Context Protocol (hc.v0), 8 generic hardware tools, LeapBoard hardware lens, device preview pipeline.
+- **v0.1.1** — DeepSeek Harness plugin compatibility, restricted Node.js bridge, component-aware verdicts.
+- **v0.1.0** — First-class plugin subsystem: adaptive evolution, marketplace (Ed25519 signing), sandbox isolation, Gateway adapter registry.
+- **v0.0.9** — Real-time signal pipeline, TUI thinking display, cross-session history, long-task convergence hardening.
+- **v0.0.8** — Cross-platform Windows support (DaemonTransport), journey test layer with cassette-backed CI.
+- **v0.0.7** — 1M-class context windows, self-calibrating token estimator, concurrent-TUI session isolation.
 
 </details>
 
 ---
 
-## What is LeapFlow?
+## Quick Start
 
-LeapFlow is a **general-purpose intelligent agent framework** designed around a single conviction: agents should learn the way humans do — by observing the world, forming causal understanding, and continuously refining their skills through practice.
-
-Unlike instruction-driven agents (Computer-Use, RPA) that reason from scratch on every request, LeapFlow **accumulates knowledge across episodes**. It perceives multi-modal signals from the operating environment, distills reusable skills from demonstrations, and self-improves every time those skills are executed. The result is an agent that gets smarter the more you use it.
-
-**LeapFlow is not another desktop automation tool.** Where RPA replays brittle scripts and Computer-Use agents burn tokens re-deriving every action, LeapFlow builds a persistent, evolving cognitive model — fusing perception, causal reasoning, world modeling, and skill synthesis into a self-reinforcing learning loop.
-
-## Core Philosophy
-
-- **Signal-Grounded Intelligence** — All intelligence derives from observing real-world signals. LeapFlow learns from what actually happens in the environment, not from brittle hardcoded rules.
-- **Evolution over Instruction** — Learning is not a one-shot prompt; it is a continuous loop of observation, hypothesis, verification, and refinement across episodes.
-- **Signals as First-Class Citizens** — Multi-modal signals (visual, accessibility tree, file system, clipboard, keyboard, etc.) are fused into a unified causal timeline, not treated as isolated events.
-- **Persistent Knowledge** — Skills, world-model experiences, and causal patterns are durably stored and compound over time. Nothing learned is ever lost to a session boundary.
-- **Trust Gradient** — New skills start under full human supervision (`STEP`) and progressively earn autonomy (`CONFIRM → NOTIFY → AUTO`) by proving competence through successful executions.
-- **Prediction-Error-Driven Learning** — The world model predicts outcomes before execution and learns from the delta between prediction and reality — mirroring predictive coding in cognitive neuroscience.
-- **Safety as Architecture** — Tiered autonomy, sandbox verification, and reversibility checks are structural guarantees, not bolt-on constraints.
-
-## Architecture Overview
-
-LeapFlow implements a **three-layer hybrid architecture** — a Python intelligence core, a protocol-driven platform adaptation layer, and pluggable execution backends — communicating via the MCP (Model Control Protocol) standard:
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Intelligence Core (Python)                             │
-│  ├── Engine / OODA Loop + Learning + Copilot           │
-│  ├── Signal Fusion → Causal Engine → World Model       │
-│  └── Skill Synthesis + Memory System                   │
-├─────────────────────────────────────────────────────────┤
-│  Platform Adaptation Layer                              │
-│  ├── Protocol Client (MCP stdio / WebSocket / gRPC)    │
-│  ├── Event Normalizer + Reorder Buffer                 │
-│  └── Capability Negotiation                            │
-├─────────────────────────────────────────────────────────┤
-│  Execution Layer (pluggable backends)                   │
-│  ├── cua-driver (macOS native — default)               │
-│  ├── Mock Host (in-process, for testing)               │
-│  └── (future: remote VM, cloud sandbox, ...)           │
-└─────────────────────────────────────────────────────────┘
-```
-
-The cognitive pipeline built on top:
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│  Copilot           Workflow-level next-step prediction    │
-├───────────────────────────────────────────────────────────────┤
-│  World Model       State prediction · Experience replay   │
-├───────────────────────────────────────────────────────────────┤
-│  Skill Synthesis   Hypothesis → Draft → Verified → Prod  │
-├───────────────────────────────────────────────────────────────┤
-│  Causal Engine     Rule · Heuristic · VLM verification    │
-├───────────────────────────────────────────────────────────────┤
-│  Perception        Multi-channel signal fusion (7 ch)     │
-├───────────────────────────────────────────────────────────────┤
-│  Execution Layer   OS interaction (screen, input, AX)     │
-└───────────────────────────────────────────────────────────────┘
-```
-
-The **Execution Layer** provides native OS interactions — screen capture, accessibility tree queries, and input injection. The default backend is `cua-driver` (macOS, MCP stdio transport), but the architecture is backend-agnostic via the Platform Adaptation Layer. **Perception** fuses raw signals into a causal timeline. The **Causal Engine** infers why things happened, not just what. The **World Model** builds an internal representation of the environment and learns from prediction errors. **Skill Synthesis** distills observations into parameterized, reusable skills with maturity tracking. The **Copilot** predicts your next workflow step and offers proactive suggestions — like GitHub Copilot, but for everything you do on your computer.
-
-
----
-
-## Adaptive-Depth Execution (Toward Infinite OODA)
-
-LeapFlow's agent loop adapts its **depth** to each task's difficulty and can — under strict governance — extend beyond a single turn. Rather than a fixed iteration cap, the loop treats depth and autonomy as *signal-driven, bounded gradients*: a hard task earns a wider budget and a research posture while a simple one stays short; long tasks keep a persistent research ledger; recursive subagents run the *same* adaptive loop on isolated frames; and outcome data can self-calibrate the difficulty thresholds. "Infinite" capability comes from **composing bounded OODA frames**, never from removing a frame's bounds — so every step stays accountable, inspectable, and safe.
-
-Defaults benefit every session automatically (adaptive depth); the rest is **opt-in and off by default**:
-
-| Capability | Config key (`leap config set …`) |
-|---|---|
-| Full adaptive loop for delegated subagents | `agent.subagent_full_loop` |
-| Event-driven re-entry (resume on time/event) | `agent.reentry_enabled` |
-| Online difficulty/threshold self-calibration | `agent.calibration_enabled` (+ `agent.calibration_interval_turns`) |
-| Governed proactive outbound (trust + approval) | `agent.reentry_send_enabled` |
-| Cache-stable compression write-back | `agent.compression_writeback` |
-
-Inspect the agent's layered orientation and pending re-entries anytime with the read-only **`/orient`** command. Design methodology: [`docs/design/adaptive_depth_ooda.md`](docs/design/adaptive_depth_ooda.md).
-
----
-
-## Real-Time Signal Processing
-
-LeapFlow continuously observes the operating environment through a unified signal pipeline — signals are never dropped, noise never reaches the agent, and resources are never wasted on redundant data.
-
-### End-to-End Pipeline
-
-```
-Signal Sources ─────────────────────────────────────────────────────────────
-  app_focus │ clipboard │ fs_watcher │ input_tap │ gateway │ perception
-       │          │           │           │          │          │
-       ▼──────────▼───────────▼───────────▼──────────▼──────────▼
-EventBus ─────────────────────────────────────────────────────────────────
-  normalize → privacy gate → dedup (2s) → memory ingest → subscriber fan-out
-       │                                              │
-       ▼                                              ▼
-  EventReorderBuffer (50ms settle, monotonic sort)    Monitor / Scheduler
-       │                                              │
-       ▼                                              ▼
-CausalFusionPipeline (<10ms SLA)                   EventTrigger → Finding
-  denoise → chain_build → infer → hotspots            │
-       │                                              ▼
-       ▼                                         NotificationBus → LeapBoard
-CausalGraph (ring_limit=100)
-       │
-       ▼
-Learning (Progressive Trust: DRAFT → CANDIDATE → VERIFIED → PRODUCTION)
-```
-
-### Signal Sources
-
-| Source | Transport | Rate / Throttle | Module |
-|--------|-----------|-----------------|--------|
-| `app_focus` | 0.5s polling | — | `platform/observers/` |
-| `clipboard` | 1.0s polling | — | `platform/observers/` |
-| `fs_watcher` | watchdog push | — | `platform/observers/` |
-| `input_tap` | CGEventTap / pynput | 50ms throttle | `platform/observers/` |
-| `gateway` | NDJSON / webhook / long-poll | per-platform | `gateway/` |
-| `perception` | information-gain gated | max 5 fps | `perception/` |
-
-### Core Mechanisms
-
-- **EventBus** (`platform/event_bus.py`) — single entry point for all signals. Applies normalization, a privacy gate (redaction before downstream), deduplication within a 2-second sliding window, and routes to subscribers in batch.
-- **EventReorderBuffer** — optional 50ms settling window that re-sorts out-of-order events by monotonic timestamp before processing, critical for fusing cross-channel signals.
-- **CausalFusionPipeline** (`causal/`) — T1 tier with <10ms SLA; constructs causal chains from temporally adjacent events, infers reliability, and maintains a ring-buffered `CausalGraph` (100 nodes max).
-- **Monitor / EventBridge** (`monitor/`) — pattern-matched subscribers (fnmatch globs) with 1s debounce; triggers wake the Scheduler (<2s), which drives Producers to emit scored Findings onto the NotificationBus.
-
-### LeapBoard Observation
-
-The `/board` web dashboard exposes real-time signal health:
-
-- **Signal Health** — subscriber count, active triggers, watches, drops, debounced events
-- **Live Signal Stream** — last 50 raw events, rolling
-- **Watch Portfolio** — active event-driven watches and their trigger state
-- **Recent Findings** — latest scored observations from Producers
-
-### Testing Signals Locally
-
-```bash
-# Emit mock signals for development / integration tests
-uv run pytest tests/mock_signals/ -q
-
-# Inject a synthetic event into the running EventBus
-from leapflow.platform.event_bus import EventBus
-bus = EventBus()
-bus.handle_event("clipboard_change", {"content": "test", "app": "Terminal"})
-```
-
-See `tests/mock_signals/` for ready-made fixtures covering all six source types.
-
----
-
-## Built-in Coding Tools
-
-LeapFlow ships a first-class coding toolset so the agent can *locate → read → edit → verify* code precisely instead of rewriting whole files or shelling out blindly. Every tool is registered with governance metadata (`x_leapflow`) so it flows through the existing idempotency, approval, redaction, path-sensitivity, and audit paths.
-
-| Tool | Purpose | Governance |
-|---|---|---|
-| `repo_map` | Compact project orientation: languages, detected test/lint commands, top-level structure, entry points, VCS branch | read-only |
-| `code_search` | Regex search across a tree (ripgrep-backed, structured `path:line:col`, optional `context_lines`); skips VCS/dep/build dirs | read-only |
-| `file_find` | Locate files by recursive glob (e.g. `**/test_*.py`) | read-only |
-| `edit_file` | Targeted **anchored** search-replace (unique-anchor or `replace_all`, `dry_run`) or apply a unified **`diff`** — a missing/ambiguous anchor is rejected, never a partial write | mutating · approval + path gate |
-| `code_intel` | Document symbols (outline): Python via exact **AST**, other languages via heuristic | read-only |
-| `git_query` | Structured read-only git: `diff` / `log` / `status` / `branch` / `show` | read-only |
-| `git_write` | Mutating git: `commit` / `branch` / `checkout` | mutating · approval |
-| `test_run` | Run the test suite (auto-detect pytest/npm/go/cargo); structured pass/fail | verify (via governed shell) |
-| `lint_check` | Run the linter (auto-detect ruff/eslint/go vet/clippy); structured issues | verify (via governed shell) |
-| `terminal_session` | Persistent shell sessions (`open`/`send`/`read`/`close`/`list`) for REPLs/dev servers | **off by default** · opt-in · approval |
-
-**Notes**
-
-- **Seamless search:** `code_search` always works with zero install via a pure-Python fallback; when [ripgrep](https://github.com/BurntSushi/ripgrep) is present it is used for speed, and a best-effort background install (macOS/Homebrew, no sudo) is attempted otherwise. A manual-install hint is surfaced if it stays unavailable.
-- **`test_run`/`lint_check` semantics:** `ok=true` means the *runner executed* — a failing suite is informative feedback (`success`/`clean`), not a tool error.
-- **Persistent terminals** are long-lived resources kept separate from one-shot execution (Transport-Lifecycle Separation); enabling is the operator opt-in and sessions are bounded with process-group cleanup.
-
-Config keys (all via `leap config set …` / TUI `/config`):
-
-| Key | Default | Meaning |
-|---|---|---|
-| `tools.ripgrep_autoinstall` | `true` | Best-effort seamless ripgrep provisioning (fallback + manual hint regardless) |
-| `tools.test_command` / `tools.lint_command` | *(auto-detect)* | Override the test/lint command |
-| `tools.terminal_session_enabled` | `false` | Enable persistent terminal sessions (high-risk, opt-in) |
-
----
-
-## Web Access (`web_fetch`)
-
-Reading the internet is a first-class **read-only** capability, not a shell command. `web_fetch` is disclosed on every turn, so the agent never has to improvise `curl … | python3 -c …` — which is what turned an HTTP 429 into a Python traceback and dragged a plain GET through side-effect gating (batch stop, session-scoped dedup, "this may already have taken effect").
-
-```
-web_fetch(url, select=?, timeout=?, max_bytes=?)
-  → { ok, status, kind, data | text | cache_path, title, links, from_cache, error_type, retryable }
-```
-
-| Behavior | Detail |
-|---|---|
-| **JSON APIs** | Parsed, with an optional dotted `select` (`chart.result.0.meta.regularMarketPrice`) so only the needed branch enters context |
-| **Web pages** | Boilerplate removed, returned as readable text plus extracted links |
-| **Binary** (PDF/images) | Never inlined; written to the session cache and returned as `cache_path` |
-| **HTTP errors** | Reported as `status` + `error_type` + a body excerpt, and marked `retryable` for 429/5xx |
-| **Retry & failover** | Rate limits and 5xx are retried; a client refused 403/429 by one transport is retried on the other (httpx / system curl) |
-| **Egress safety** | URLs resolving to loopback, private, link-local, or cloud-metadata addresses require approval; the grant is scoped to the **origin**, so approving once trusts that host for the session. `file://` and other schemes are refused outright |
-| **Caching** | Session-scoped, TTL'd, never synced off the machine |
-
-Config keys: `web.transport`, `web.timeout_s`, `web.max_bytes`, `web.max_retries`, `web.max_redirects`, `web.user_agent`, `web.extractor`, `web.private_targets`, `web.cache_ttl_s` (`leap config list web`).
-
-**Better HTML extraction (optional).** The built-in reader is dependency-free and always available. For article-grade boilerplate removal:
-
-```bash
-pip install 'leapflow[web]'   # adds trafilatura; used automatically when present
-```
-
-**JavaScript-rendered or bot-protected pages (opt-in, not bundled).** `web_fetch` performs no browser rendering and no anti-bot bypass. If you need them, register a scraping MCP server — LeapFlow already loads MCP servers, so this needs no code change. Add to `~/.leapflow/config/mcp_servers.json`:
-
-```json
-{
-  "scrapling": { "command": "scrapling", "args": ["mcp"] }
-}
-```
-
-Then install it separately (`pip install 'scrapling[ai]'` followed by `scrapling install`, which downloads Chromium — several hundred MB). Its tools appear with an `mcp_` prefix. Deliberately kept outside the default install: it is ~85 MB of wheels plus browsers, and fingerprint spoofing / CAPTCHA bypass carry compliance implications for the sites you fetch, so that choice stays yours rather than shipping on by default.
-
----
-
-## Prerequisites
-
-| Component | Version | Purpose |
-|-----------|---------|----------|
-| Python | ≥ 3.11 | Runtime (3.11–3.14 supported) |
-| [uv](https://github.com/astral-sh/uv) | latest | Source installs and development only |
-| macOS | 14.0+ (Sonoma) | Required for native perception (execution backend) |
-| [cua-driver](https://github.com/trycua/cua) | latest | Default execution backend — screen capture, input injection, accessibility |
-| LLM API Key | — | DashScope, OpenAI, DeepSeek, or any OpenAI-compatible provider |
-
-> **Note:** You can run LeapFlow on any platform with `--mock-host` (no native perception), but full signal capture requires macOS with an execution backend (currently `cua-driver`) installed and Accessibility permissions granted.
-
-## Installation
-
-### 1. Install LeapFlow
+**1. Install**
 
 ```bash
 pip install leapflow
 ```
 
-This installs the `leap` command. The first `leap` run creates the local LeapFlow home under `~/.leapflow` automatically.
-
 <details>
-<summary>Install from source</summary>
+<summary>From source</summary>
 
 ```bash
-git clone https://github.com/modelscope/leapflow.git
-cd leapflow
+git clone https://github.com/modelscope/leapflow.git && cd leapflow
 uv sync --all-extras --no-extra leapspace
-uv run leap --help
 ```
+
 </details>
 
-### 2. Configure Your LLM
-
-Launch the interactive TUI and configure your provider with the built-in `/config` command. It stores the API key in the local secret vault and writes only a `secret://` reference into durable config:
+**2. Configure LLM** — launch the TUI and set your provider (key goes to the local secret vault, never plaintext):
 
 ```bash
 leap
 ```
 
-Inside the TUI (subcommands, keys, and values all auto-complete as you type):
-
 ```text
-/config llm set --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 --model qwen3.7-plus --api-key sk-...
-/config show llm.model       # verify the model and base URL
-/config show llm.api_key     # confirm the key is stored (shown masked, e.g. ***abc)
+/config llm set --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
+  --model qwen3.8-flash --api-key sk-...
 ```
 
-Changes hot-reload the active session when possible, so you can start chatting right away.
+Any OpenAI-compatible endpoint works — DashScope, OpenAI, DeepSeek, Anthropic, etc.
 
 <details>
-<summary>More: configure from the shell (CLI)</summary>
-
-The same control plane is available as `leap config` for terminals, scripts, or CI. Use `--ask-api-key` for a secure masked prompt, or `--api-key` to pass it explicitly:
+<summary>Shell / CI</summary>
 
 ```bash
-# Interactive, secure key prompt:
-leap config llm set \
-  --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 \
-  --model qwen3.7-plus \
-  --ask-api-key
-
-# Non-interactive (scripts/CI):
 leap config llm set \
   --base-url https://api.openai.com/v1 \
-  --model gpt-4o \
-  --api-key "$OPENAI_API_KEY"
+  --model gpt-6.1-sol \
+  --ask-api-key
 ```
 
-LeapFlow stores the key in the local secret vault and writes only a `secret://` reference into durable config.
 </details>
 
-### 3. Install Execution Backend (macOS only)
-
-The native execution backend enables screen capture, accessibility tree access, and input injection. Skip this step if you only want to chat or explore with `--mock-host`.
+**3. Go**
 
 ```bash
-brew install trycua/tap/cua-driver
-leap host doctor
+leap                          # interactive TUI
+leap "summarize this repo"    # one-shot
+leap --mock-host              # no native execution backend
 ```
 
-macOS may ask for Accessibility and Screen Recording permissions on first use. Grant both in System Settings → Privacy & Security.
-
-### 4. Verify Installation
-
-```bash
-leap --mock-host "hello, are you ready?"
-```
-
-Expected: LeapFlow responds with a greeting confirming it's operational.
-
-### 5. (Optional) LeapSpace evaluation environment
-
-LeapSpace (`src/leapspace`) is an opt-in, environment-side CUA sandbox: PyQt6
-scenario apps plus a harness that boots a disposable sandbox, drives a task, and
-records signal-mode trajectories as ground truth. Its code ships inside the
-leapflow distribution, but the heavy stack (PyQt6 / cua-sandbox / pydantic) is
-gated behind an extra so the default install — and CI — stays light:
-
-```bash
-pip install 'leapflow[leapspace]'    # from PyPI
-uv sync --extra leapspace            # or from a source checkout (make space-sync)
-```
-
-Without the extra, `import leapspace.app_space` still works; only the submodules
-that pull in PyQt6 / cua-sandbox / pydantic require it, and the LeapSpace tests
-skip cleanly when those dependencies are absent.
+Have hardware? See [Physical AI](#physical-ai).
 
 ---
 
-## Configuration Reference
+## Features
 
-For normal setup, follow the Installation steps above. For day-to-day changes, use `leap config` as the durable configuration control plane:
+### Coding Tools
 
-```bash
-leap config list                  # human-readable catalog: key, value, type, scope, reload, description
-leap config show llm.model        # detailed metadata and effective value for one key
-leap config keys                  # compact key-only output for scripts
-leap config get llm.model
-leap config set memory.working_max_tokens 12000
-leap config set visual.track_enabled true
-```
+Locate → read → edit → verify code, out of the box:
 
-Inside the TUI, the same control plane is available as `/config`. It supports hot reload for the active session when possible and provides inline completion for subcommands, config keys, and simple values:
+| Tool | What it does |
+|---|---|
+| `repo_map` | Project orientation — languages, structure, entry points |
+| `code_search` | Regex search (ripgrep) |
+| `edit_file` | Anchored search-replace or unified diff — rejects ambiguous edits |
+| `code_intel` | Document symbols (Python AST) |
+| `git_query` / `git_write` | Structured git operations |
+| `test_run` / `lint_check` | Auto-detect and run test / lint suites |
+| `web_fetch` | Fetch pages and JSON APIs — read-only, cached, retried |
+| `terminal_session` | Persistent shell sessions (opt-in) |
 
-```text
-/config list
-/config list llm
-/config show llm.model
-/config get llm.model
-/config set runtime.log_level DEBUG
-/config set visual.track_enabled true
-```
-
-### Important Config Keys
-
-| Key | Typical value | Description |
-|-----|---------------|-------------|
-| `llm.api_key` | secret value | Primary LLM API key; stored in the local vault, never as durable plaintext |
-| `llm.base_url` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI-compatible LLM endpoint |
-| `llm.model` | `qwen3.7-plus` | Primary model used for chat, planning, and tool reasoning |
-| `llm.context_length` | `1000000` | Runtime context budget shown in the TUI status bar |
-| `memory.working_max_tokens` | `12000` | Working-memory budget injected into active reasoning |
-| `visual.track_enabled` | `true` / `false` | Enable screenshot-based visual perception |
-| `recording.mode` | `video` | Default teaching/observation recording pipeline |
-| `runtime.mock_host` | `true` / `false` | Use the in-process mock host when native OS control is unavailable |
-| `runtime.log_level` | `DEBUG` / `INFO` | Runtime diagnostic verbosity |
-| `scheduler.tick_seconds` | `1.0` | Scheduler polling interval |
-
-`leap config list` is the authoritative source for all writable keys and generated metadata for less common runtime, perception, learning, gateway, hub, safety, and scheduler settings; use `leap config show <key>` or `/config show <key>` when you need one field's details. LeapFlow does not load `.env` files; durable settings belong in the config control plane and secrets belong in the vault.
-
----
-
-## Multi-Profile
-
-LeapFlow supports multiple **profiles** — isolated runtime environments that can run in parallel. Each profile owns its own daemon process, databases, configuration, and credential vault.
-
-Select a profile via the `LEAPFLOW_PROFILE` environment variable (defaults to `default`):
+### Teach & Learn
 
 ```bash
-# Run with the default profile
-leap
-
-# Run a separate instance under a different profile
-LEAPFLOW_PROFILE=work leap
-
-# Check daemon status for a specific profile
-LEAPFLOW_PROFILE=work leap daemon status
+leap teach "open Safari and bookmark this page"
 ```
 
-Profiles are stored under `~/.leapflow/profiles/<name>/`. Multiple profiles can run simultaneously without interference — useful for separating personal and work contexts, or running parallel experiments.
+Record your actions → distill into parameterized skills → earn autonomy through success:
+`DRAFT → CANDIDATE → VERIFIED → PRODUCTION`.
 
----
-
-## Quick Start — Use the TUI First
-
-LeapFlow's default experience is the interactive terminal UI. Start here for chat, tool execution, runtime status, session continuity, and progressively learning workflows from one surface.
-
-### Step 1: Launch LeapFlow
-
-```bash
-leap
-```
-
-If you only want to try the interface without a native execution backend, run:
-
-```bash
-leap --mock-host
-```
-
-You'll see the banner, active model, context budget, platform status, current directory, and the `❯` prompt.
-
-### Step 2: Check Setup Hints
-
-On first launch, LeapFlow surfaces missing setup directly in the TUI. For example, if no LLM API key is configured, it shows a short action hint instead of failing silently.
-
-The bottom status bar keeps the important runtime state visible:
+### LeapBoard
 
 ```text
-qwen3.7-plus │ 0/1M │ [░░░░░░░░░░] 0%
+/board                  # session analysis (default)
+/board finance          # finance lens
+/board templates add ./custom.yaml
 ```
 
-### Step 3: Ask Naturally
+Real-time monitoring dashboard with Server-Driven UI. Bring your own YAML template — one file, zero code.
+
+### Gateway
 
 ```text
-❯ What can you help me with in this repo?
+❯ connect to Telegram
 ```
 
-LeapFlow streams responses, shows tool activity as it works, and keeps recoverable status visible instead of leaving the terminal idle.
+Turn any IM channel (Feishu, DingTalk, Telegram, Slack, …) into a signal boundary. Inbound events are classified, filtered, and routed; each chat gets an isolated session. Setup is conversational — no config files to edit.
 
-### Step 4: Use TUI Commands When Needed
+### Physical AI
 
-Inside the TUI, use slash commands for quick inspection and control:
+LeapFlow bridges LLM intelligence and real-world hardware through a **three-layer protocol stack** and a **layered control hierarchy**:
 
-```text
-/status   show runtime and backend status
-/tool     inspect available tools
-/config   view or update saved config; `/config keys` lists writable settings
-/model    show the active model; `/model qwen3.7-plus` updates and hot-reloads it
-/usage    inspect context and token usage
-/clear    clear the visible conversation
+```
+  LHP Fabric          cross-node data plane (JSON Lines)
+  ────────────────    inventory · reads · writes · halts · permits · fleet
+  HCP                 per-device contract
+  ────────────────    6-method transport: open / close / read / write / probe / halt
+  Southbound          transport plugins
+  ────────────────    ROS2 · Feetech · RealSense · VLA · MCP · media · simulated …
 ```
 
-For example, this changes the model without leaving the TUI:
-
-```text
-/config llm set --model qwen3.7-plus
+```
+  System-2  (LLM)     0.2–1 Hz     task planning → SubtaskGoal
+                          ↓
+  System-1.5 (VLA)    5–30 Hz      observation + goal → action chunks
+                          ↓
+  System-1  (servo)   100–1000 Hz  PID / impedance — never crosses the fabric
+                          ↓
+                      actuators     escalation flows back up ↑
 ```
 
-Use the TUI for day-to-day work. Reach for standalone CLI subcommands only when scripting, automation, or explicit one-shot operations are more convenient.
+The host sends **goals**; the node decomposes them locally. A 1 kHz servo loop stays safe regardless of network latency.
+
+**Protocol once, devices for free** — new device = one YAML on the node; new protocol = one transport plugin; new node = one fleet entry.
 
 <details>
-<summary>Extended CLI usage — one-shot chat, teaching, skills, host, daemon</summary>
+<summary>Hardware tools</summary>
 
-### One-shot Chat
+| Group | Tools | Risk |
+|---|---|---|
+| Inspect | `hw_list` · `hw_describe` · `hw_read` · `hw_status` | read-only |
+| Act | `hw_configure` · `hw_actuate` · `hw_dispense` · `hw_batch_actuate` | approval-gated |
+| Safety | `hw_estop` | no approval — node-local |
+| Control | `hw_control_start` · `hw_control_stop` · `hw_control_status` | leased deadman |
+| Fleet | `hw_fleet_status` · `hw_fleet_discover` · `hw_fleet_halt_all` | multi-node |
+| Policy | `hw_policy_infer` · `hw_policy_episode` · `hw_policy_list` | VLA inference |
+
+</details>
+
+<details>
+<summary>Governance</summary>
+
+- **Admission before visibility** — unverified or halt-less devices are demoted to read-only.
+- **Signed execution permits** — Ed25519, single-use, nonce-protected, TTL-limited; node verifies and still re-runs local safety.
+- **Halt never waits** — node-local, bypasses approval and network.
+- **Progressive trust** — autonomy earned per device/action on verified success, lost on failure.
+
+</details>
+
+<details>
+<summary>Bundled physical-AI stack</summary>
+
+- **Robot arms** (`leapflow.robot`) — LeRobot-derived: serial bus (Feetech), teleop, camera capture, episode export, policy registry (`vla_local` / `vla_remote` / `position_control`).
+- **VLA as a device** — policy server (gRPC or HTTP) appears as an HCP virtual device; inference is a CONFIGURE effect — physical motion happens only when the returned action is written to an actuator.
+- **Depth cameras** — RealSense integration; frames as governed binary channels.
+- **ROS2** — sidecar transport over Unix socket; topics/services/actions map into HCP.
+
+</details>
+
+<details>
+<summary>Deployment modes</summary>
+
+| Mode | Description |
+|------|-------------|
+| **Host only** | Edge node has no LeapFlow runtime. |
+| **Host + node** | Host agent + edge `leap hw serve` (recommended). |
+| **Node only** | Edge node operates independently. |
+
+**Host + node setup:**
 
 ```bash
-leap "summarize this repo"
+# Edge node
+pip install leapflow
+openssl rand -hex 24 > ~/.leapflow/.lhp-token && chmod 600 ~/.leapflow/.lhp-token
+LEAPFLOW_LHP_TOKEN="$(cat ~/.leapflow/.lhp-token)" \
+  leap hw serve --node-id edge01 --host 0.0.0.0 --port 8767
+
+# Host
+export EDGE_LHP_TOKEN='paste-the-token-here'
+export LEAPFLOW_FLEET_NODES='[{"node_id":"edge01","endpoint":"tcp://<ip>:8767","token_env":"EDGE_LHP_TOKEN"}]'
+leap daemon restart && leap hw list
 ```
 
-### Teach Mode — Learn from Demonstration
+</details>
+
+<details>
+<summary>Device onboarding</summary>
 
 ```bash
-leap teach "describe what you'll demonstrate"
+leap hw init my_sensor          # generate hc.v1 template
+leap hw validate my_sensor      # parse + check
+leap hw probe my_sensor         # connectivity test
+leap hw verify my_sensor --as operator   # digest-bound verification
+leap hw permit-key              # Ed25519 keypair for permits
 ```
-
-LeapFlow records your actions as a trajectory, then distills them into a parameterized skill. The skill progresses through maturity tiers: `DRAFT → VERIFIED → PRODUCTION`.
-
-Options:
-- `--timeout 600` — Custom idle timeout before auto-stopping
-- `--field "Safari:browsing:full"` — Per-app perception rules
-
-### Autonomous Mode — Execute Learned Skills
-
-```bash
-leap run "trigger phrase"         # Match by natural language
-leap run --skill "exact-name"     # Match by skill name
-leap run --step "careful task"    # Step-through with confirmation
-leap run --auto "routine task"    # Skip confirmations
-```
-
-Skills start at `STEP` tier (human confirms each action) and graduate to `AUTO` as confidence grows.
-
-### Command Reference
-
-| Command | Syntax | Description |
-|---------|--------|-------------|
-| _(default)_ | `leap` | Launch the interactive TUI with multi-turn conversation |
-| _(prompt)_ | `leap "question"` | Single-turn chat, then exit |
-| `teach` | `leap teach [goal] [options]` | Record a demonstration and distill into a skill |
-| `run` | `leap run [prompt] [options]` | Execute a matched skill |
-| `skills` | `leap skills [action] [name]` | Manage the skill library |
-| `relearn` | `leap relearn <trajectory_id>` | Re-run learning pipeline on a saved trajectory |
-| `host` | `leap host <action>` | Manage execution backend diagnostics |
-| `daemon` | `leap daemon <action>` | Manage the persistent leapd runtime |
-
-**Global Flags:**
-
-| Flag | Effect |
-|------|--------|
-| `--mock-host` | Use in-process mock host without native perception |
-| `--thinking` | Enable LLM extended reasoning mode |
-
-**`leap skills` actions:**
-
-| Action | Description |
-|--------|-------------|
-| `list` | List all registered skills (default) |
-| `show <name>` | Inspect a specific skill's details |
-| `export <name> [-o file]` | Export skill definition to JSON |
-| `import <file>` | Import skill from JSON file |
-| `disable <name>` | Deactivate a skill without deletion |
-| `delete <name>` | Permanently delete a skill |
-| `audit [name] [--limit N]` | View execution history |
-| `sessions` | List recorded learning sessions |
-
-**`leap host` actions:**
-
-| Action | Description |
-|--------|-------------|
-| `doctor` | Check execution backend installation, version, and macOS permissions |
-| `status` | Show connection status to execution backend |
-
-**`leap daemon` actions:**
-
-| Action | Description |
-|--------|-------------|
-| `status` | Show daemon runtime, config, DB, model, and context status |
-| `start` | Start leapd for the active profile |
-| `stop` | Stop the running leapd process for the active profile |
-| `restart` | Restart leapd after reinstalling, upgrading, or changing runtime code |
 
 </details>
 
 ---
 
-## Terminal UI
+## Architecture
 
-LeapFlow provides a rich interactive terminal experience built on [Rich](https://github.com/Textualize/rich) (output rendering) and [prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit) (input handling). The TUI activates automatically when you launch `leap` in a terminal.
+### Everything is a Signal
 
-### Features
+```
+  Virtual                              Physical
+  IM · OS · clipboard · web            arms · cameras · instruments · IoT
+          │                                    │
+          └──────────────┬─────────────────────┘
+                         ▼
+              ┌─────────────────────┐
+              │  Unified Pipeline   │
+              │  normalize → gate → │
+              │  dedup → memory →   │
+              │  causal fusion      │
+              └────────┬────────────┘
+                       ▼
+              ┌─────────────────────┐
+              │  OODA Engine        │
+              │  Observe → Orient → │
+              │  Decide → Act       │
+              └─────────────────────┘
+```
 
-| Feature | Description |
+Three nested loops on the pipeline:
+
+| Loop | Scope | Example |
+|------|-------|---------|
+| **Decision** | per turn | Depth adapts to task difficulty; bounded frames compose |
+| **Learning** | per outcome | World-model verdicts, skill distillation, trust accrual |
+| **Evolution** | per environment delta | Typed capability requirements → resolution before acquisition |
+
+### Everything is a Plugin
+
+Every capability arrives behind a `typing.Protocol` (`@runtime_checkable`). One lifecycle applies to all: reversible registration, fiber state machine, hot-reload, trust ledger.
+
+| Protocol | Role |
+|----------|------|
+| `ToolPlugin` | Expose tools to the LLM |
+| `GatewayAdapterPlugin` | IM platform adapter |
+| `LLMProviderPlugin` | LLM inference backend |
+| `SignalSource` / `ActiveSignalSource` | Signal sources |
+| `HardwareTransport` | Southbound device protocol (entry point) |
+| `InferenceStrategy` | VLA / policy inference (entry point) |
+| `CVProcessor` | Computer-vision processor |
+
+---
+
+## Reference
+
+### TUI Commands
+
+| Command | Description |
 |---------|-------------|
-| **Markdown rendering** | LLM responses rendered as styled markdown with syntax-highlighted code blocks |
-| **Streaming display** | Real-time token streaming with live markdown updates via `rich.Live` |
-| **Tool activity** | Tool calls shown with elapsed timers; completed tools persist in scrollback |
-| **Thinking display** | LLM reasoning/thinking rendered in a dimmed panel |
-| **Persistent history** | Input history saved to `~/.leapflow/history` (Up/Down to navigate) |
-| **Command completion** | Tab-completion for all REPL commands |
-| **Multiline editing** | Alt+Enter inserts a newline for multi-line prompts |
-| **Status bar** | Live bottom toolbar: mode, skills, platform, model, context usage, turn elapsed |
-| **Adaptive theming** | Automatic light/dark detection via `COLORFGBG` / `LEAPFLOW_TUI_THEME` |
-| **Session info** | Startup display showing model, platform status, cwd, and skill count |
-| **Mode indicators** | Prompt character changes with session mode (idle ❯ / recording ● / paused ⏸) |
+| `/status` | Runtime and backend status |
+| `/tool` | Inspect available tools |
+| `/config` | View or update settings (tab-completion) |
+| `/model` | Show or switch the active model |
+| `/usage` | Context and token usage |
+| `/board` | Open the monitoring dashboard |
+| `/gateway` | Platform connection status |
+| `/orient` | Layered orientation and re-entries |
 
-The context maximum shown in the status bar is the active runtime budget from `LEAPFLOW_LLM_CONTEXT_LENGTH`. In daemon mode, the TUI synchronizes this value from the daemon runtime so multiple terminal clients show the same budget.
+### Safety
 
-### Daemon-backed TUI Lifecycle
-
-By default, `leap` uses `leapd`, a per-profile background runtime shared across terminal clients. Exiting the TUI closes the current client; before returning, LeapFlow asks whether to stop `leapd` and defaults to stopping it. Keep it running when you want another terminal to reuse the same runtime.
-
-After reinstalling or upgrading LeapFlow, restart the daemon so the background process loads the new code:
-
-```bash
-leap daemon restart
-```
-
-Use diagnostics when the TUI appears stale:
-
-```bash
-leap daemon status
-```
-
-`status` prints the daemon PID, socket, runtime source path, Python executable, model, context usage, config paths, and DB path.
-
-### Theme Configuration
-
-The TUI auto-detects your terminal background. Override with:
-
-```bash
-LEAPFLOW_TUI_THEME=light   # or: dark (default)
-```
-
-### Architecture
-
-```
-tui_app/
-├── theme.py      # Color palette + light/dark detection
-├── console.py    # Rich console wrapper (markdown, panels, tools, errors)
-├── input.py      # prompt_toolkit session (history, completion, keybindings)
-├── stream.py     # Live streaming renderer (markdown + tool timers)
-└── status.py     # Bottom toolbar (mode, context %, model, elapsed)
-```
-
-All output flows through `LeapConsole`, ensuring consistent theming. All input flows through `LeapInput`, providing history persistence and command completion. The `StreamRenderer` handles live-updating displays during LLM streaming with zero flicker.
-
----
-
-## External Platform Integration (Gateway)
-
-LeapFlow can connect to external messaging platforms — **Feishu (Lark)**, **DingTalk**, **Telegram**, and more — turning any IM channel into a natural-language interface to the agent. Platforms are integrated through a declarative **manifest** system and configured via a conversational setup flow, with no source-code changes required.
-
-### Design Highlights
-
-| Aspect | Approach |
+| Action | Behavior |
 |--------|----------|
-| **Config-as-Conversation** | Say *"connect to Feishu"* in the REPL. The agent walks you through credential setup in 1–2 turns — no config files to edit by hand. |
-| **Declarative Manifests** | Each platform is defined by a YAML manifest (credentials, setup guide, adapter module). Add a new platform by dropping a `.yaml` file. |
-| **Credential Security** | Secrets are encrypted at rest (Fernet AES-128-CBC), never appear in LLM context or logs, and are stored through profile-scoped vault references. |
-| **Lazy Loading** | Platform SDK dependencies are imported only when a platform is first connected, keeping CLI startup instant. |
-| **Adapter Protocol** | Platform adapters implement a simple Python `Protocol` — `connect()`, `disconnect()`, `send()`, `on_message` callback — extensible via `PlatformAdapterMixin` for graceful degradation. |
-| **Auto-Reconnect** | Previously configured platforms are automatically reconnected on startup. Connection state persists across sessions via `gateway.yaml`. |
-| **Bidirectional** | Inbound: platform messages are processed through LLM with safe tool access. Outbound: the agent can proactively send messages via `gateway_send`. |
-| **Independent Sessions** | Each external chat gets its own conversation history with a restricted tool set (read-only), isolated from the CLI session. |
-| **Event-Driven** | Inbound messages are logged to episodic memory and emitted as typed events (`GatewayMessageReceived`, `GatewaySessionCreated`, `GatewaySessionEnded`) for downstream subscribers. |
-
-### Architecture
-
-```
-                       ┌──────────────────┐
-                       │  CLI Agent       │
-                       │  (AgentEngine)   │
-                       │                  │
-                       │  gateway_send ──▶│──┐
-                       └──────────────────┘  │
-                                             │ send_message()
-  ┌─────────────┐    ┌──────────────┐    ┌───▼─────────┐
-  │  Platform    │───▶│  Gateway     │───▶│  Gateway    │───▶ LLM + safe tools
-  │  Adapter     │    │  Server      │    │  Router     │◀─── reply
-  │  (Protocol)  │◀───│  (lifecycle) │◀───│  (per-      │
-  └─────────────┘    │              │    │   session)  │
-    send reply       │  on_event ──▶│    └─────────────┘
-                     └──────┬───────┘
-                            │
-                   ┌────────▼────────┐
-                   │ Episodic Memory │
-                   │ (event logging) │
-                   └─────────────────┘
-```
-
-`Context` is the sole integration point — gateway modules have no dependency on engine or CLI.
-
-### Quick Start
-
-```
-❯ connect to Telegram
-# Agent shows setup steps, asks for Bot Token
-❯ <paste your bot token>
-# Agent validates, encrypts, connects — done.
-```
-
-Or use the `/gateway` slash command to check connection status:
-
-```
-❯ /gateway
-┌── Gateway ─────────────────────┐
-│ Connected                      │
-│   ● Telegram (5m 32s)          │
-│ Available                      │
-│   飞书, DingTalk, Webhook      │
-│                                │
-│ Say "connect to <platform>"    │
-│ to set up a new integration.   │
-└────────────────────────────────┘
-```
-
-### Adding a Custom Platform
-
-1. Create a YAML manifest in `~/.leapflow/profiles/<profile>/gateway/manifests/`:
-
-```yaml
-platform_id: my_platform
-display_name: My Platform
-category: im
-
-credentials:
-  - key: api_key
-    label: API Key
-    required: true
-    secret: true
-
-setup_guide:
-  summary_en: "Provide your API key to connect."
-
-adapter:
-  module: my_package.adapter
-  class: MyAdapter
-  dependencies: [my-sdk]
-```
-
-2. Implement the adapter:
-
-```python
-from leapflow.gateway.protocol import PlatformAdapter
-
-class MyAdapter:
-    def __init__(self, api_key: str, **kwargs): ...
-    async def connect(self, *, is_reconnect: bool = False) -> None: ...
-    async def send(self, target, content) -> SendResult: ...
-    async def disconnect(self) -> None: ...
-```
-
-3. Say *"connect to my_platform"* in the REPL — the agent handles the rest.
-
-### Credential Management
-
-For deployment environments, provision platform credentials through the same gateway setup flow or profile-scoped secret vault used by interactive sessions. `gateway.yaml` stores only non-secret values and `secret://profile/...` references; plaintext credentials should not be committed or placed in ad-hoc environment files.
-
----
-
-## Plugin Architecture
-
-LeapFlow extends itself through **structurally-typed plugins**. Every extension point is a `typing.Protocol` marked `@runtime_checkable` — implementers satisfy the contract by shape, with no base class to inherit. The same lifecycle machinery (reversible registration, hot-reload, trust gradient) applies uniformly across subsystems.
-
-The subsystem is a first-class package, `src/leapflow/plugins/`, and it is the only owner of plugin contracts, discovery, lifecycle, isolation, and distribution:
-
-```
-src/leapflow/plugins/
-├── __init__.py         # get_registry / get_scoped_registry / reload_plugin
-├── protocol.py         # ToolPlugin Protocol + ToolMetadata
-├── registry.py         # ToolPluginRegistry (discovery, DI, assembly, gates)
-├── scoped_registry.py  # PluginFiber lifecycle + hot-reload
-├── tool_plugins/       # built-in ToolPlugin declarations
-├── sandbox/            # subprocess isolation for untrusted plugins
-└── marketplace/        # manifest, client, HTTP source, prototype server
-```
-
-`src/leapflow/tools/` keeps what tools *do* plus the Tool Capability Contract. The dependency direction is one-way — plugin core never imports a tool module, and `tests/test_architecture_contracts.py` fails the build if it starts to.
-
-### Extension Protocols
-
-| Protocol | Module | Role |
-|----------|--------|------|
-| `ToolPlugin` | `plugins/protocol.py` | Expose callable tools to the LLM (`ToolMetadata` is the single source of truth; `to_openai_schema()` renders the wire schema) |
-| `GatewayAdapterPlugin` | `gateway/adapter_registry.py` | Connect an external IM/collaboration platform |
-| `LLMProviderPlugin` | `llm/provider_registry.py` | Provide an LLM inference backend |
-| `SignalSource` | `perception/signal_source.py` | Transform-only: `(event, payload, ctx) → Optional[Signal]`, stateless |
-| `ActiveSignalSource` | `perception/active_signal_source.py` | Lifecycle-bearing source with `start(emit)`/`stop()` |
-| `CVProcessor` | `perception/cv_processor.py` | Frame-pair computer-vision algorithm |
-
-`FrameStore` (`perception/storage/frame_store.py`) was upgraded from an ABC to a `@runtime_checkable` Protocol so storage backends compose the same way.
-
-### Registry & Lifecycle
-
-- **`ToolPluginRegistry`** (`plugins/registry.py`) — discovery, dependency injection (`bind_runtime`), one-shot `assemble()`, `publish_plugin_tools()` for plugins that arrive later (install / hot-reload), and monotonic **version / generation** counters that drive downstream cache invalidation.
-- **`EffectScope`** (`domain/effect_scope.py`) — hierarchical, LIFO, exception-safe cleanup collector (`ACTIVE → DISPOSING → DISPOSED`).
-- **`PluginFiber`** (`domain/plugin_fiber.py`) — per-instance state machine (`PENDING → LOADING → ACTIVE → UNLOADING → DISPOSED`, with `FAILED` branch and retry) carrying an `EffectScope` and a `generation` counter.
-- **`ScopedToolRegistry`** (`plugins/scoped_registry.py`) — wraps the registry so every registration is reversible; `adopt_existing_plugins()` fiberizes the built-in plugins at boot. Parallel `ScopedGatewayAdapterRegistry` and `ScopedLLMProviderRegistry` give the Gateway/LLM subsystems the same lifecycle.
-
-Plugin assembly is fully fiberized from startup; there is no bootstrap shim and no module-level tool globals.
-
-### Hot-Reload
-
-`reload_plugin(plugin_id)` (public API in `plugins/__init__.py`) disposes the old fiber, reloads built-ins through their module and profile-installed plugins directly from their current source file, registers the fresh instance, re-binds runtime dependencies, and bumps the registry version so engine caches invalidate. In-flight turns are unaffected: the engine snapshots the handler table per turn, so a reload only takes effect on the **next** turn.
-
-### Self-Modification
-
-The `self_management` plugin exposes **twelve** tools to the agent:
-
-| Tool | Kind | Effect |
-|------|------|--------|
-| `plugin_list` | read-only | List plugins across the Tool/Gateway/LLM subsystems and return a live `capability_report` for self-capability answers |
-| `plugin_status` | read-only | Inspect one plugin (tools, deps, fiber state, trust level, advisor recommendation) |
-| `plugin_versions` | read-only | Inspect recorded source snapshots and the active version pointer for a profile plugin |
-| `plugin_propose` | read-only | Create a side-effect-free PluginProposal from explicit capability-gap evidence |
-| `assess_compatibility` | read-only | Assess a foreign plugin manifest for LeapFlow compatibility (no approval) |
-| `plugin_generate` | mutating | Ask the LLM to synthesize + validate new plugin code |
-| `plugin_install` | mutating | Install from generated code or a marketplace entry, optionally linked to a proposal and version label |
-| `plugin_rollback` | mutating | Restore a recorded profile plugin source snapshot and hot-reload it |
-| `plugin_reload` | mutating | Hot-reload a plugin; proposal-linked behavior tests run before recording a new version |
-| `plugin_disable` | mutating | Disable a plugin (takes effect immediately; tools re-resolved per read) |
-| `plugin_remove` | mutating | Terminally remove a plugin, dispose its fiber, unregister tools, and optionally delete source |
-| `plugin_enable` | mutating | Re-enable a disabled plugin |
-
-For questions about LeapFlow's own capabilities (for example whether plugins, hot reload, generation, marketplace install, versioning, or rollback are available), the agent should use `plugin_list` as the live evidence source and report configuration-dependent limits from its `capability_report` instead of inferring from documentation alone.
-
-Every mutation routes through the `ApprovalGate` at **HIGH** risk with `allow_permanent=False` — `security/risk.py` forces HIGH for `platform == "plugin_management"`, so no permanent grant can be minted. `self_management` cannot disable or reload itself.
-
-`plugin_install` writes to a **profile-scoped** directory (`ProfileLayout.plugins_dir`) and loads the code dynamically — it is never injected into the installed Python package. A duplicate `plugin_id` is rejected cleanly, a real **sandbox smoke-test** gates the install, proposal-defined behavior tests can gate install/reload, and `marketplace_name` installs are wired when a `MarketplaceClient` is configured.
-
-### Learning Loop (closed)
-
-```
-TurnUsageTracker → PluginUsageTracker → PluginTrustLedger → PluginAdvisor → PluginHealthProducer
-                                        DRAFT → CANDIDATE → VERIFIED → PRODUCTION
-```
-
-Trust progresses on consecutive successes (5 / 20 / 50), demotes after repeated failure, and freezes to DRAFT on a hard failure. Trust state now **persists to DuckDB** (`plugin_stats.duckdb` via `ProfileLayout`, wired in `engine/session_factory.py`): restored on startup, saved on each transition and at exit. Under **Progressive Trust**, reloading a PRODUCTION-level plugin is auto-approved; `disable`/`enable` always require human approval.
-
-### Self-Evolution Endgame
-
-- **Sandbox** (`plugins/sandbox/`) — subprocess JSON-RPC isolation (`SandboxHost` + `SandboxedToolPlugin`); a sandboxed plugin looks like any other `ToolPlugin` to the engine.
-- **Marketplace** (`plugins/marketplace/`) — `PluginManifest` with SHA-256 checksum **and** Ed25519 signing/verification, `LocalDirectorySource` + `HttpMarketplaceSource`, `MarketplaceClient`, and an asyncio HTTP `MarketplaceServer`.
-- **Generator** (`learning/plugin_generator.py`) — LLM code generation plus staged validation: syntax / import / Protocol conformance at generate-time, sandbox smoke-test at install-time. The generation path is enabled by default in current config, but installation remains approval-gated; set `plugin.generation_enabled=false` to disable code synthesis for a profile.
-
-### IM ActiveSignalSources
-
-Stdlib-only, platform-neutral sources with self-message filtering and loopback listeners (`perception/active_sources/`): `feishu_im` (webhook), `telegram_bot` (long-poll `getUpdates`), `slack_bot` (webhook), `discord_bot` (webhook).
-
-### ToolBridge Removed
-
-The legacy `ToolBridge` compatibility layer is fully gone — `bridge_adapter.py` and `bridge_factory.py` no longer exist. The 18 desktop semantic tools are now served by the `desktop_semantic` `ToolPlugin`, and the bounded ReAct skill executor uses a dedicated `ExecutionToolset`. Two **intentional narrowings** came with the removal:
-
-1. The bounded ReAct fallback no longer carries plugin-catalog tools (it is scoped to desktop execution).
-2. The `SemanticAdapter` "last observed window" state is no longer shared across surfaces/turns.
-
-### Lifecycle & Composability (Cordis-inspired)
-
-The plugin subsystem incorporates design principles from the Cordis spatiotemporal composability model, delivering production-grade lifecycle and composition primitives:
-
-- **6-state fiber machine** — `PluginFiber` implements a full `PENDING → LOADING → ACTIVE → UNLOADING → DISPOSED` automaton with a `FAILED` branch and retry semantics (`FAILED → LOADING → ACTIVE`). Plugins with no async init use the fast path (`PENDING → ACTIVE`).
-- **Scope-bound EventBus subscriptions** — `event_bus.subscribe(event, handler, scope=fiber.scope)` ties subscriptions to the fiber's `EffectScope`. Dispose cascades unsubscription automatically — O(1) unsubscribe, zero registration leaks.
-- **Dependency-driven fiber activation** — fibers stay `PENDING` until all declared dependencies are satisfied. A fixpoint loop in `ScopedToolRegistry` re-evaluates satisfaction after every `bind_runtime()` update, activating providers before consumers.
-- **Topological `bind_runtime` ordering** — when multiple plugins declare interdependencies, `graphlib.TopologicalSorter` determines a safe injection order, guaranteeing that providers are initialized before consumers.
-- **Waterfall tool execution pipeline** — `ToolExecutionPipeline` (backed by a `ToolInterceptor` Protocol) wraps tool dispatch with composable pre/post hooks (audit, timeout, approval, custom logic). Interceptors are scope-bound and auto-removed on fiber dispose.
-- **Async EffectScope cleanup** — `async_effect()` + `async_dispose()` support non-blocking teardown for plugins with network connections or background tasks. Each async cleanup is bounded by a configurable timeout.
-
-> **Performance note:** All Cordis-inspired upgrades are cold-path only (boot, reload, dispose). The per-turn hot path — handler snapshot, tool dispatch, result recording — remains unchanged with zero additional overhead.
-
-### Compatibility Assessment
-
-Before a foreign plugin is hosted, LeapFlow evaluates it through the **Compatibility Assessment Engine** (`learning/compatibility/`). The public entry point is `assess_plugin()`, which drives a **six-stage pipeline** and short-circuits on the first blocking finding:
-
-1. **Manifest parsing** — normalize a raw LeapFlow or DSH manifest into a common `PluginManifestInput`.
-2. **Category resolution** — look the declared category up in the pluggability taxonomy.
-3. **Interface analysis** — check declared interfaces against the target protocol's requirements.
-4. **Dependency checking** — classify each dependency as satisfiable / shimmable / blocking.
-5. **Execution model** — check the execution model and source language for bridge requirements.
-6. **Security classification** — assess declared permissions and recommend isolation (or rejection).
-
-The synthesized `CompatibilityReport` carries one of four verdicts:
-
-| Verdict | Meaning |
-|---------|---------|
-| `COMPATIBLE` | Direct install; no modification needed |
-| `ADAPTABLE` | Needs a thin, auto-generatable bridge/shim |
-| `PARTIAL` | Only a subset of features is usable; limitations documented |
-| `INCOMPATIBLE` | Targets a system layer LeapFlow does not expose |
-
-The verdict is decided by a **30+ entry pluggability taxonomy** (`taxonomy.py`) that maps deepseek-harness (DSH) plugin categories to LeapFlow protocols — from directly mappable tool types (`tools`, `web`, `filesystem`, `shell`, …) through adaptable surfaces (`llm`, `mcp`, `lsp`, `signal`, …) and partial ones (`guard`, `scheduler`, `skill`) to non-pluggable system layers (`agent-loop`, `session`, `context`, `storage`, `credentials`, …). Unknown categories fall back to `INCOMPATIBLE`.
-
-- **Tool** — `assess_compatibility` (read-only, no approval) runs the pipeline on a manifest dict and returns the verdict, target protocol, adaptation notes, adapter spec, and per-stage results.
-- **Install gate** — marketplace installs run the assessment as a **pre-gate**: an `INCOMPATIBLE` verdict is rejected with a structured error before any file is written; `ADAPTABLE` verdicts surface their adaptation notes alongside the install result.
-- **Adapter generation** — `adapter_generator.generate_adapter_template()` emits a template-based Python bridge wrapper (a `ToolPlugin` skeleton delegating to a SandboxHost subprocess) for `ADAPTABLE` plugins; an optional LLM-enhanced mode refines it and degrades gracefully back to the template.
-- **Manifest converter** — `convert_dsh_to_leapflow()` translates a DSH `package.json`-style manifest into a LeapFlow `PluginManifest`-compatible dict for ecosystem interop.
+| Safe shell (`ls`, `git status`) | Auto-execute |
+| Dangerous shell (`sudo`, `rm -r`) | Approval prompt — **[a]lways** for session |
+| Destructive (`rm -rf /`, `mkfs`) | Always blocked |
+| File writes (safe types) | Auto-approve |
+| Hardware actuation | Approval-gated; `hw_estop` always allowed |
 
 ### Configuration
 
-All keys are set via `leap config set …` (shell) or `/config set …` (TUI):
-
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `plugin.generation_enabled` | `true` | Allow the LLM to synthesize plugin code (`plugin_generate`); set `false` to disable generation |
-| `plugin.install_dir` | *(profile-derived)* | Override the profile-scoped install directory |
-| `plugin.marketplace_root` | *(none)* | Local directory acting as a marketplace source |
-| `plugin.marketplace_url` | *(none)* | HTTP(S) marketplace registry base URL (takes precedence over `root`) |
-| `plugin.marketplace_trusted_pubkeys` | *(empty)* | Hex Ed25519 public keys required to sign marketplace plugins (empty ⇒ checksum-only) |
-
 ```bash
-leap config set plugin.generation_enabled true
-leap config set plugin.marketplace_url https://plugins.example.com
+leap config list                  # all settings
+leap config set memory.working_max_tokens 12000
 ```
 
-> **Slash commands:** any `/plugin` slash command (list/status/reload/disable/enable) still requires a **second human confirmation** per the engineering contract. A human should verify: `reload` reflects the new version on the next turn; `disable` removes the plugin's tools from the catalog/disclosure; `enable` restores them; `list`/`status` are read-only and need no approval.
->
-> - `/plugin generate <description>` — generate + validate + install a plugin from natural language (flags: `--preview`, `--dry-run`, `--id`).
+Inside the TUI: `/config list`, `/config set …` — hot-reloads the active session.
 
-Full authoring walkthrough: see the [Plugin Developer Guide](temp/deepseek_harness/PLUGIN_DEVELOPER_GUIDE.md).
+<details>
+<summary>Common keys</summary>
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `llm.model` | — | Primary model |
+| `llm.base_url` | — | OpenAI-compatible endpoint |
+| `llm.context_length` | `1000000` | Context budget |
+| `memory.working_max_tokens` | `12000` | Working memory budget |
+| `tools.terminal_session_enabled` | `false` | Persistent terminal sessions |
+| `dashboard.enabled` | `true` | LeapBoard |
+| `evolution.enabled` | `false` | Self-evolution |
+
+</details>
 
 ---
 
-## World-Model-Driven Self-Evolution
+## Advanced
 
-LeapFlow's Harness can **autonomously evolve its plugin composition** in response to dynamic environment changes. A world-model trajectory grader retrospectively evaluates execution evidence and produces a four-value **adaptation verdict** — `absorb` (update knowledge), `rebind` (select a better installed capability), `acquire` (generate a new plugin), or `escalate` (defer to a human) — so most adaptation happens without writing any code at all.
+<details>
+<summary><strong>Self-Evolution</strong></summary>
 
-When a genuine capability gap is detected, the evolution pipeline governs the entire journey from observation to production:
-
-```
-environment observation
-    → adaptation verdict (absorb / rebind / acquire / escalate)
-    → capability gap detection
-    → resolution-first check (existing catalog)
-    → proposal
-    → LLM code generation
-    → multi-stage validation (syntax → import → Protocol conformance → sandbox smoke)
-    → dual approval (content + plugin mutation)
-    → install at DRAFT trust
-    → progressive trust accrual (DRAFT → CANDIDATE → VERIFIED → PRODUCTION)
-    → governance (quarantine, rollback, proposal sweep)
-```
-
-### Enabling Self-Evolution
-
-Self-evolution is **disabled by default** as a safety constraint — the agent must be explicitly granted the ability to acquire new capabilities:
+Disabled by default. When enabled, LeapFlow observes environment deltas and evolves its plugin composition under governance:
 
 ```bash
 leap config set evolution.enabled true
 ```
 
-When disabled, the world model still produces adaptation verdicts and distils knowledge (absorb/rebind paths remain active), but the `acquire` path that generates and installs new plugins is gated off.
+Pipeline: observation → adaptation verdict → capability gap → resolution-first check → proposal → LLM code generation → multi-stage validation → dual approval → install at DRAFT trust → progressive accrual.
 
-### Key Features
-
-- **Resolution-first** — before proposing a new plugin, the pipeline checks whether an existing capability already satisfies the requirement; duplicates are never created
-- **Dual approval gate** — generated content is reviewed for correctness, and the plugin mutation itself requires a separate HIGH-risk approval (no permanent grants)
-- **Progressive trust lifecycle** — new plugins start at DRAFT and promote through CANDIDATE → VERIFIED → PRODUCTION on consecutive successes; repeated failures trigger automatic demotion
-- **Sandbox isolation** — untrusted plugins run in a subprocess over JSON-RPC with bounded invocation timeouts
-- **Append-only causal audit trail** — 22 event types record the full causal chain from environment observation through install, validation, approval, trust transitions, and terminal outcomes
-- **Cold-path governance** — all evolution machinery (trust ledgers, proposal queues, sweep) runs on boot/reload/dispose paths with zero per-turn overhead
-- **Quarantine with recovery** — a plugin that fails hard is frozen at DRAFT with a quarantine record; it can be investigated and restored or removed
-- **DSH bundle rollback** — profile plugins maintain versioned source snapshots; `plugin_rollback` restores a previous version and hot-reloads it
-- **Proposal TTL and automated sweep** — stale proposals expire after a configurable TTL and are cleaned up by a periodic sweep
-
-For the formal specification — including system roles, architectural thesis, validation stages, and governance contracts — see [World-Model Plugin & Harness Evolution](docs/world_model_plugin_harness_evolution.md).
-
----
-
-## LeapBoard — Monitoring Dashboard
-
-> **Signals into insight.**
-
-**LeapBoard** extends LeapFlow's Observe/Orient boundary into a general-purpose, always-on monitoring surface. Launch independent, persistent **watches** — for financial-market anomalies, public-opinion (sentiment) shifts, new research papers, or your own live conversation — and each one continuously observes its source, filters signal from noise, and surfaces **findings** (typed, scored, with evidence) onto a real-time web board.
-
-It is domain-neutral by design: finance, sentiment, research, and session analysis differ only by a small YAML template and their finding payload — never by branching in core code.
-
-### How it works
-
-```
-Watch (leapd-hosted) ── observe → SNR filter → score → Finding ──▶ NotificationBus
-        ▲                                                              │ push
-        └── trigger / manual refresh / session batch / salience ───────┘
-  YAML template ─▶ ViewSpec (validated) ─▶ Web board (SDUI) ◀── WebSocket
-```
-
-- **Continuous observation** — a board starts as a `Watch` in `leapd`. Scheduler triggers, manual `/board refresh`, and session-analysis batch thresholds all run the same observe→finding cycle; new findings are persisted, severity-gated, and pushed to browsers over WebSocket.
-- **Refresh model** — the session board re-analyzes as the conversation accumulates turns, when written workspace artifacts change, or on manual `/board refresh`; `/board pause`/`stop` halt re-analysis until resumed. The chosen **template** only changes rendering, never what is analyzed (always the current session).
-- **Server-Driven UI** — each scenario is authored as a **YAML template** compiled into a validated **ViewSpec** over a fixed component catalog (cards, tables, charts, timelines, gauges, story panels…). Interactive components talk back through a bidirectional action protocol; unknown component types degrade gracefully, and bespoke visuals use a `Custom` escape hatch. The board never renders arbitrary HTML/JS.
-- **View client** — the board connects to `leapd` like the TUI does, with no privileged coupling. The web server (`aiohttp`) ships with the base install, so `leap board` works out of the box.
-
-### Install & enable
-
-```bash
-pip install leapflow   # the aiohttp web server ships with the base install
-```
-
-The board binds to `127.0.0.1` with a per-session access token. Tune it through `leap config`:
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `dashboard.enabled` | `true` | Enable the local monitoring web board |
-| `dashboard.bind` | `127.0.0.1` | Bind address (keep loopback) |
-| `dashboard.port` | `8765` | Web server port |
-| `dashboard.auto_open` | `true` | Open the default browser automatically |
-| `monitor.session_batch_turns` | `6` | Re-analyze the session every N new turns |
-
-### Usage
-
-**Analyze the current session** — from the TUI or shell. LeapBoard always analyzes the *current session*; a **template** is just the lens it renders through (`generic` is the default; an unrecognized name is rejected rather than silently coerced):
-
-```text
-/board                 open the session board with the default (generic) template
-/board finance         render the same session analysis through the finance lens
-/board status          show watch state, recent findings, and available templates
-/board refresh         re-analyze now (append an id to target a specific watch)
-/board pause|resume    pause / resume analysis (append an id to target a watch)
-/board stop            stop the current session, or `/board stop <id>` a specific watch
-```
-
-```bash
-leap board             # ensure the server is running and open the browser
-leap board --no-open   # print the URL instead of opening a browser
-```
-
-Executing any open entry auto-launches your default browser at the token-scoped local URL. Inside the browser, the language switcher supports English, Chinese, French, Spanish, Arabic, and Russian.
-
-**Templates (view lenses)** — templates are the single view dimension, and you can add your own with one command:
-
-```text
-/board templates                  list built-in and custom templates
-/board templates add ./my.yaml    validate and register a custom lens (profile-scoped)
-/board templates show <id>        show a template's source and title
-/board templates remove <id>      remove a custom template (builtins stay)
-```
-
-A custom template is any SDUI YAML file. `add` validates it (rejecting templates that will not compile), copies it into `profiles/<profile>/dashboard/templates/`, and makes it immediately openable via `/board <id>`. Custom templates override built-ins of the same name.
-
-**Session context coverage** — the session board watches more than chat text. It also scans current-session `file_write` tool results and, when the path is inside the workspace and safe to read without approval, includes a capped/redacted file excerpt in the analysis. The **Observation status** panel shows refresh reason, coverage, observed targets, included/skipped file artifacts, and missing context notes.
-
-**Natural language** — just ask ("analyze this conversation", "show the finance lens"); the agent opens the board with the right template when the runtime can safely map the request.
-
-### Showcase
-
-- **Session analysis (default `generic`)** — a storyline, insights, decisions, action items, open questions, an entity map, artifact coverage, and suggested next prompts; refreshes automatically as the conversation grows or workspace artifacts change.
-- **Finance / Sentiment / Research lenses** — the same session analysis, reframed: finance surfaces calls, an execution checklist, and exposures; sentiment surfaces the narrative pulse and themes; research surfaces open questions, evidence, and follow-ups.
-- **Custom lenses** — bring your own YAML template and open it with `/board <name>`; it renders the current session through your layout with zero code changes.
-
-> Adding a lens = one YAML template dropped in (or `/board templates add`). The board core stays untouched — one analysis target, no domain branching, no hardcoded layouts.
-
----
-
-## Safety & Approval
-
-LeapFlow enforces a **layered safety architecture** that balances autonomy with human oversight. The goal is minimal interruption — the agent asks for permission only when an action carries real consequences.
-
-### Multi-Layer Defense
-
-```
-               ┌───────────────────────────────┐
-               │    Hardline Block (always)     │  rm -rf /, mkfs, fork bomb
-               ├───────────────────────────────┤
-               │    Dangerous Detection         │  sudo, chmod, kill -9 ...
-               │    → Approval Gate (prompt)    │  [y]es / [a]lways / [n]o
-               ├───────────────────────────────┤
-               │    Safe Path / Size Bypass     │  .md, .json, < 500 chars
-               ├───────────────────────────────┤
-               │    Output Redaction            │  Secrets stripped from results
-               ├───────────────────────────────┤
-               │    Untrusted Result Wrapping   │  MCP/web tool output delimited
-               └───────────────────────────────┘
-```
-
-### Approval System
-
-| Feature | Behavior |
-|---------|----------|
-| **Unified Gate** | A single `ApprovalGate` protocol handles shell commands, file writes, and outbound messages — swappable for TUI, Web UI, or CI modes. |
-| **Session Memory** | Choose **[a]lways** once and the same category won't prompt again for the rest of the session. |
-| **Per-Category Scoping** | Shell commands, file writes, and each gateway platform are tracked independently. |
-| **Smart Approval** | When an auxiliary LLM is configured, low-risk commands (risk < 0.3) are auto-approved; medium/high-risk still prompt. |
-| **Fail-Closed** | In non-interactive environments (pipes, CI), all dangerous actions are denied by default. |
-| **Rich TUI Display** | Approval prompts render as styled panels in the terminal — not raw text — with full action detail. |
-| **Gateway Send** | First outbound message to each platform requires explicit approval; subsequent sends are auto-approved for the session. |
-| **Audit Trail** | Every approval decision (allow/deny/session) is logged with timestamp and category. |
-
-### What Gets Approved
-
-| Action | Default | Approval Needed? |
-|--------|---------|-----------------|
-| Safe shell commands (`ls`, `cat`, `git status`) | Auto-execute | No |
-| Dangerous shell (`sudo`, `rm -r`, `kill -9`) | Prompt | Yes (once per session) |
-| Destructive shell (`rm -rf /`, `mkfs`) | Always blocked | Cannot override |
-| File write (`.md`, `.json`, small files) | Auto-approve | No |
-| File write (large, non-safe extensions) | Prompt | Yes (once per session) |
-| Gateway send (first message to platform) | Prompt | Yes (once per platform per session) |
-| Gateway inbound (external messages) | Restricted tools | Only safe read-only tools |
-
----
-
-## Workflow Copilot (Preview)
-
-LeapFlow includes a **Workflow Copilot** that predicts your next action and offers proactive suggestions — like GitHub Copilot, but for any workflow on your computer.
-
-### How It Works
-
-```
-You work normally → LeapFlow observes patterns → Suggests next steps → You accept/ignore
-       │                                                                    │
-       └──────────────── Gets smarter (Loop γ) ──────────────────┘
-```
-
-The Copilot operates on a **multi-tier prediction model**:
-
-| Tier | Method | Latency | Use Case |
-|------|--------|---------|----------|
-| L0 | Context hash → exact history match | <1ms | Daily routines |
-| L1 | N-gram sequence prediction | <5ms | Common action chains |
-| L2 | Embedding retrieval from experience store | <50ms | Cross-app patterns |
-| L3 | LLM reasoning + RAG | 200–2000ms | Novel situations |
-
-### Real-Time Design
-
-Predictions are **speculative** — computed while you work, not after you pause:
-
-- When you perform action A, the system immediately predicts Top-K next steps
-- Results are cached in memory; displayed only when you naturally pause (>300ms)
-- If you start your next action before the suggestion appears, it’s silently discarded
-- L0–L2 are fully local (no network); L3 runs asynchronously in the background
-
-### Example Scenarios
-
-- **File operations:** Move one PDF → system suggests moving matching PDFs too
-- **App switching:** Open Zoom + Calendar → system offers to open meeting docs
-- **Terminal:** `cd project && git pull` → system suggests `npm install && npm run dev`
-- **Cross-app:** Copy text from Slack → system offers to create a Jira ticket
-
-### Trust Gradient for Suggestions
-
-Suggestions follow the same trust model as skills:
-
-- **Low confidence (<0.5):** Silent — logged but not shown
-- **Medium (0.5–0.8):** Ghost hint (dim text, Tab to accept)
-- **High (>0.8):** Explicit suggestion with shortcut key
-- **Very high (>0.95) + non-destructive + always accepted:** Auto-execute
-
-### Configuration
-
-```bash
-# Temporary process override
-LEAPFLOW_STREAM_OUTPUT=true        # Enable real-time token streaming
-LEAPFLOW_VERBOSE_PROGRESS=true     # Show tool execution progress inline
-```
-
-> **Status:** The Copilot module is **fully implemented** — L0–L3 predictors, speculative pipeline, idle detection, feedback loop, and graceful degradation are all in place. The infrastructure is active internally (confidence tracking, pattern learning). Rendering of ghost-hint overlays to end-users is the remaining integration step.
-
-<details>
-<summary>Copilot — Current Implementation Status</summary>
-
-| Component | Status | Module |
-|-----------|--------|--------|
-| L0 Hash Predictor | ✅ Implemented | `copilot/predictors/l0_hash.py` |
-| L1 Markov Predictor | ✅ Implemented | `copilot/predictors/l1_markov.py` |
-| L2 Embedding Predictor | ✅ Implemented | `copilot/predictors/l2_embed.py` |
-| L3 LLM Predictor | ✅ Implemented | `copilot/predictors/l3_llm.py` |
-| Speculative Pipeline | ✅ Implemented | `copilot/pipeline.py` |
-| Idle Detection | ✅ Implemented | `copilot/idle.py` |
-| Context Encoder | ✅ Implemented | `copilot/context.py` |
-| Feedback Collector | ✅ Implemented | `copilot/feedback.py` |
-| Evolution Loop (Loop γ) | ✅ Implemented | `copilot/feedback.py` |
-| Graceful Degradation | ✅ Implemented | `copilot/degradation.py` |
-| Memory Adapters | ✅ Implemented | `copilot/adapters.py` |
-| Display Gate & Renderer | ✅ Implemented | `copilot/renderer.py` |
-| CLI Ghost-Hint Overlay | ⏳ Pending | — |
-
-**Capability Boundaries (Preview):**
-- Predictions are computed and cached; display-to-user path is log-only (`LogHintRenderer`)
-- L0–L2 run entirely locally with zero network dependency
-- L3 requires LLM credentials and runs asynchronously
-- Auto-execute is disabled for destructive actions regardless of confidence
-- The system learns from implicit feedback (accept/ignore/correct) to improve over time
+Even when disabled, the world model still produces verdicts and distils knowledge. See [`docs/world_model_plugin_harness_evolution.md`](docs/world_model_plugin_harness_evolution.md).
 
 </details>
 
----
+<details>
+<summary><strong>Plugin Self-Management</strong></summary>
 
-## Host Management (Execution Backend)
+The agent manages its own plugins at runtime: `plugin_list`, `plugin_generate`, `plugin_install`, `plugin_reload`, `plugin_disable`, `plugin_remove`, `plugin_rollback`.
 
-For full perception (screen capture, accessibility tree, input events), you need an execution backend installed. The default is `cua-driver`:
+All mutations require HIGH-risk approval. Trust: `DRAFT → CANDIDATE → VERIFIED → PRODUCTION`. Untrusted plugins run sandboxed (subprocess JSON-RPC). Marketplace plugins are Ed25519-signature verified.
+
+</details>
+
+<details>
+<summary><strong>Adaptive-Depth Execution</strong></summary>
+
+The agent loop adapts depth to task difficulty. Hard tasks earn wider budgets; recursive subagents run isolated OODA frames.
+
+Config: `agent.subagent_full_loop`, `agent.reentry_enabled`, `agent.calibration_enabled`. Inspect with `/orient`. Design doc: [`docs/design/adaptive_depth_ooda.md`](docs/design/adaptive_depth_ooda.md).
+
+</details>
+
+<details>
+<summary><strong>Workflow Copilot (Preview)</strong></summary>
+
+Multi-tier next-action predictor: L0 hash match (<1ms) → L1 n-gram (<5ms) → L2 embedding (<50ms) → L3 LLM+RAG (200–2000ms). Display overlay pending; predictions are computed and cached internally.
+
+</details>
+
+<details>
+<summary><strong>Native Execution Backend (macOS)</strong></summary>
+
+For desktop perception — screen capture, accessibility tree, input injection:
 
 ```bash
-# Check execution backend and permissions
-leap host doctor          # Verifies backend binary, version, permissions
-
-# Start with full perception
-leap                      # Connects to execution backend via MCP automatically
-
-# Without native perception
-leap --mock-host          # Runs with in-process mock (for testing/exploration)
+brew install trycua/tap/cua-driver && leap host doctor
 ```
 
-> **Important:** macOS will prompt for Accessibility and Screen Recording permissions on first use. Grant both in System Settings → Privacy & Security.
+Without this, use `--mock-host`.
+
+</details>
+
+<details>
+<summary><strong>Multi-Profile</strong></summary>
+
+```bash
+LEAPFLOW_PROFILE=work leap
+```
+
+Each profile owns its own daemon, config, credentials, and databases under `~/.leapflow/profiles/<name>/`.
+
+</details>
+
+<details>
+<summary><strong>Custom Gateway Platform</strong></summary>
+
+Drop a YAML manifest in `~/.leapflow/profiles/<profile>/gateway/manifests/`, implement the adapter Protocol (`connect`, `send`, `disconnect`), and say *"connect to my_platform"* in the TUI.
+
+</details>
+
+<details>
+<summary><strong>CLI Reference</strong></summary>
+
+| Command | Description |
+|---------|-------------|
+| `leap` | Interactive TUI |
+| `leap "question"` | One-shot chat |
+| `leap teach [goal]` | Record and distill a skill |
+| `leap run [prompt]` | Execute a matched skill |
+| `leap skills list\|show\|export\|import` | Skill library |
+| `leap evolve` | Run the learning boundary |
+| `leap board` | LeapBoard dashboard |
+| `leap hw list\|serve\|verify\|estop\|…` | Hardware / LHP node |
+| `leap daemon start\|stop\|restart\|status` | Manage leapd |
+| `leap config list\|set\|show` | Configuration |
+| `leap host doctor` | Execution backend check |
+
+Flags: `--mock-host`, `--thinking`
+
+</details>
 
 ---
 
 ## Development
 
 ```bash
-make setup            # Initialize environment
-make test             # Run tests (pytest)
-make lint             # Lint (ruff)
+make setup && make test && make lint
 ```
 
 <details>
-<summary>Project Structure & Extension Guide</summary>
-
-### Directory Layout
-
-```
-leapflow/
-├── src/leapflow/           # Python brain (src layout)
-│   ├── cli/                # CLI entry + subcommands
-│   ├── copilot/            # Workflow Copilot (L0–L3 predictors)
-│   ├── engine/             # Session + ReAct execution loop
-│   ├── perception/         # Signal channels + fusion
-│   ├── signal_fusion/      # Cross-modal temporal fusion
-│   ├── causal/             # Causal inference pipeline
-│   ├── world_model/        # Predictive coding + experience store
-│   ├── learning/           # Skill distillation + assessment
-│   ├── skills/             # Skill library + execution
-│   ├── analysis/           # Trajectory denoising
-│   ├── memory/             # Three-tier memory system
-│   ├── recording/          # Trajectory recording orchestration
-│   ├── llm/                # LLM provider abstraction
-│   ├── platform/           # Platform adaptation (CuaDriver client, observers, event bus)
-│   ├── domain/             # Shared types & events
-│   ├── storage/            # DuckDB persistence
-│   ├── plugins/            # Plugin subsystem: contracts, registry, lifecycle, sandbox, marketplace
-│   ├── tools/              # Tool implementations + capability contract
-│   ├── prompts/            # LLM prompt templates
-│   └── utils/              # Shared utilities
-├── tests/                  # Pytest suite
-├── docs/design/            # Design documents
-└── scripts/                # Setup & run scripts
-```
-
-### Adding a New Skill (Plugin)
-
-1. Create a skill JSON (or teach via `leap teach`).
-2. Import it: `leap skills import my_skill.json`
-3. The skill appears in the registry with `DRAFT` maturity.
-4. Each successful execution increases confidence → `VERIFIED` → `PRODUCTION`.
-
-### Adding a New Copilot Predictor
-
-Implement the `PredictorLayer` protocol:
-
-```python
-from leapflow.copilot.types import PredictorLayer, ContextState, PredictionCandidate, FeedbackSignal
-
-class MyPredictor:
-    @property
-    def layer_id(self) -> str: return "L_custom"
-    @property
-    def priority(self) -> int: return 5  # lower = higher priority
-    @property
-    def timeout_ms(self) -> int: return 50
-
-    async def predict(self, context: ContextState) -> list[PredictionCandidate]: ...
-    async def on_feedback(self, signal: FeedbackSignal) -> None: ...
-```
-
-Register it with `PredictionEngine.register_layer(MyPredictor())`.
-
-### Adding a New Signal Channel
-
-Implement the `SignalChannel` protocol:
-
-```python
-from leapflow.copilot.types import SignalChannel, Signal
-
-class MyChannel:
-    @property
-    def channel_id(self) -> str: return "my_sensor"
-    async def start(self) -> None: ...
-    async def stop(self) -> None: ...
-    def subscribe(self, handler) -> None: ...
-```
-
-### Running Tests
-
-The suite has two layers. The **mock layer** is broad and fast; the **real layer** is six
-coarse journeys that drive an actual `leapd` subprocess over RPC, with the LLM boundary
-served from committed recordings. Both run offline.
+<summary>More</summary>
 
 ```bash
-make test                              # Mock layer + real journeys (the default gate)
-make test-unit                         # Mock layer only, parallel
-make test-e2e                          # Real journeys + always-on guards
-make test-impact BASE=origin/main      # Mock layer scoped to what changed (local)
-make test-full                         # Everything, unscoped
-
-uv run pytest tests/test_pure_algorithms.py -q   # Single file
-uv run pytest -k "test_world_model" -q            # By keyword
+make test-unit              # mock layer, parallel
+make test-e2e               # real journeys
+make test-impact BASE=origin/main
+make test-live              # real provider (needs API key)
 ```
 
-CI runs both layers in full. Change-scoped selection exists (`tools/impact.py`,
-backed by a coverage-derived map in `tests/.impact/`) and narrows a single-module
-change to 2–3 test files, but it is a *local* convenience: the always-on tiers
-cannot be selected away and already account for most of the run, so selecting in
-CI would save only a few seconds.
-
-The live lane is the exception — there a journey costs real tokens, so it selects.
-Each journey declares `SUBJECT_PATHS` and `LIVE_SIGNAL`, and every journey caps
-its own provider calls *and* tokens, so neither a non-converging turn nor prompt
-growth can run up a bill.
-
-Against a real provider (needs `LEAPFLOW_LLM_API_KEY`, `LEAPFLOW_LLM_BASE_URL` and
-`LEAPFLOW_LLM_MODEL`):
-
-```bash
-make test-live                         # Journeys against the real provider
-make record-traffic                    # Capture real traffic into recordings/
-make sync-fixtures                     # Re-derive mock-layer response shapes
 ```
-
-There are two stores, with different jobs:
-
-- `tests/_fixtures/cassettes/` — deterministic inputs the offline lanes replay.
-  Rebuild with `make seed-cassettes`.
-- `tests/_fixtures/recordings/` — real provider traffic, kept as evidence of wire
-  shape. `sync-fixtures` distils both into `llm_responses/response_shapes.json`,
-  which the mock layer checks against, so a provider dropping a field turns the
-  build red instead of passing forever.
-
-Recording deliberately never writes to the replay store: a multi-turn agent
-conversation cannot be replayed from a recording, because each turn's prompt
-embeds the exact round-by-round history of the turns before it.
-
-When a journey reports a cassette miss it prints a diff against the nearest
-recorded request, so you can see which prompt drifted.
-
-</details>
-
-## Key Modules
-
-| Module | Role |
-|--------|------|
-| `perception/` | Multi-channel signal capture and fusion (trajectory, AX tree, clipboard, keyboard, file system, etc.) |
-| `signal_fusion/` | Cross-modal temporal alignment and surprise detection |
-| `causal/` | Three-tier causal inference engine (rule → heuristic → VLM) |
-| `world_model/` | Predictive coding loop, experience store, curiosity-driven learning |
-| `learning/` | Skill distillation, parameterization, and maturity lifecycle |
-| `skills/` | Skill library, runtime execution, and self-evolution (Loop γ) |
-| `copilot/` | Workflow-level next-step prediction and proactive suggestion |
-| `monitor/` | Domain-neutral Watch→Finding monitoring runtime (leapd-hosted scheduler, findings store) |
-| `dashboard/` | LeapBoard — Server-Driven UI web board (ViewSpec catalog, YAML templates, WebSocket fan-out) |
-| `analysis/` | Six-layer denoising pipeline for trajectory refinement |
-| `engine/` | Session orchestration and ReAct execution loop |
-| `memory/` | Three-tier event-driven memory (working → episodic → long-term) |
-| `platform/` | Platform adaptation layer — protocol abstraction for pluggable execution backends |
-| `gateway/` | External platform integration — declarative manifests, credential vault, adapter lifecycle |
-| `hub/` | Multi-source skill hub (ModelScope, GitHub, local) |
-
-<details>
-<summary>Architecture — Detailed Module Map</summary>
-
-| Module | Path | Key Files | Responsibility |
-|--------|------|-----------|----------------|
-| Perception | `src/leapflow/perception/` | channels, fusion, pipeline | Raw signal capture (7 channels), frame extraction, privacy gating |
-| Signal Fusion | `src/leapflow/signal_fusion/` | timeline, surprise, mhms | Temporal alignment, surprise scoring, multi-hypothesis fusion |
-| Causal Engine | `src/leapflow/causal/` | rule, heuristic, vlm_tier | Three-tier causal chain construction (rule→heuristic→VLM) |
-| World Model | `src/leapflow/world_model/` | predictor, experience_store, curiosity | Predict-then-verify loop, experience replay, curiosity-driven exploration |
-| Learning | `src/leapflow/learning/` | distiller, parameterizer, assessor | Trajectory → skill distillation, learnability assessment |
-| Skills | `src/leapflow/skills/` | registry, executor, lifecycle | Skill storage (DuckDB), runtime execution, maturity progression |
-| Copilot | `src/leapflow/copilot/` | pipeline, predictors/, engine | Speculative L0–L3 prediction cascade, idle detection, feedback loop |
-| Analysis | `src/leapflow/analysis/` | denoiser, layers | Six-layer denoising pipeline for raw trajectory refinement |
-| Engine | `src/leapflow/engine/` | session, react_loop, tools | Session orchestration, ReAct loop, tool dispatch, context compression |
-| Memory | `src/leapflow/memory/` | working, episodic, long_term | Three-tier event-driven memory with promotion/eviction |
-| LLM | `src/leapflow/llm/` | provider, message_builder | LLM abstraction (OpenAI-compatible), streaming, retry logic |
-| Platform | `src/leapflow/platform/` | cua_client, adapter, observers | Platform adaptation layer — CuaDriver MCP client, event normalization, observation daemon |
-| Domain | `src/leapflow/domain/` | events, perception, types | Shared domain types, event definitions, perception models |
-| Recording | `src/leapflow/recording/` | recorder, video, segmenter | Trajectory recording orchestration, segmentation, caching |
-| Plugins | `src/leapflow/plugins/` | protocol, registry, scoped_registry, tool_plugins, sandbox, marketplace | Plugin contracts, discovery, PluginFiber lifecycle, isolation, distribution |
-| Tools | `src/leapflow/tools/` | file_operations, shell_tools, web_fetch, name_resolver | Tool behaviour + Tool Capability Contract for the ReAct loop |
-| CLI | `src/leapflow/cli/` | cli, commands/, banner | Argument parsing, subcommand dispatch, interactive REPL |
-| Storage | `src/leapflow/storage/` | duckdb, skill_library | DuckDB-backed persistent storage for skills, trajectories, audit |
-| Gateway | `src/leapflow/gateway/` | server, manifest, protocol, credential_vault | External platform integration — manifest discovery, adapter lifecycle, vault-backed credential refs |
-| Execution Backend | external (pluggable) | — | OS interaction: screen capture, AX tree, input injection (default: `cua-driver` via MCP) |
-
-</details>
-
-<details>
-<summary>Key Protocols & Interfaces</summary>
-
-| Protocol | Module | Purpose |
-|----------|--------|---------|
-| `Signal` | `copilot/types.py` | Unified abstraction for any signal source (event_type, timestamp, payload, source) |
-| `PredictorLayer` | `copilot/types.py` | Prediction algorithm interface (predict, on_feedback, priority, timeout) |
-| `SignalChannel` | `copilot/types.py` | Dynamically registerable signal source (start, stop, subscribe) |
-| `HintRenderer` | `copilot/types.py` | Ghost-hint display abstraction (show, dismiss, is_visible) |
-| `PlatformAdapter` | `gateway/protocol.py` | External platform adapter contract (connect, disconnect, send, on_message) |
-
-**Core Data Types:**
-
-| Type | Description |
-|------|-------------|
-| `ContextState` | Incremental operational context snapshot with delta updates and O(1) hash lookup |
-| `PredictionCandidate` | Immutable prediction result (action, confidence, source layer, expiry) |
-| `FeedbackSignal` | Structured user response (accept/ignore/correct/reject + latency) |
-| `FeedbackType` | Enum: `ACCEPT`, `IGNORE`, `CORRECT`, `EXPLICIT_REJECT` |
-
-**MCP Protocol (LeapFlow → Execution Backend):**
-
-Transport: stdio (JSON-RPC over stdin/stdout) by default. The `PlatformClient` in `platform/` manages the connection lifecycle and abstracts the specific backend.
-
-| Method | Direction | Description |
-|--------|-----------|-------------|
-| `screen.capture` | LeapFlow → Backend | Capture screen frame(s) |
-| `accessibility.tree` | LeapFlow → Backend | Query accessibility tree |
-| `accessibility.perform` | LeapFlow → Backend | Perform action on UI element |
-| `input.type` / `input.shortcut` | LeapFlow → Backend | Inject keyboard input |
-| `input.click` / `input.scroll` | LeapFlow → Backend | Inject mouse input |
-| `system.info` | LeapFlow → Backend | Query platform capabilities |
+src/leapflow/
+├── cli/              ├── engine/           ├── hardware/
+├── robot/            ├── tools/            ├── plugins/
+├── llm/              ├── memory/           ├── perception/
+├── signal_fusion/    ├── causal/           ├── world_model/
+├── evolution/        ├── learning/         ├── skills/
+├── copilot/          ├── monitor/          ├── dashboard/
+├── gateway/          ├── platform/         ├── security/
+├── daemon/           ├── scheduler/        ├── domain/
+├── storage/          ├── recording/        └── analysis/
+```
 
 </details>
 
@@ -1412,13 +458,14 @@ Transport: stdio (JSON-RPC over stdin/stdout) by default. The `PlatformClient` i
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `cua-driver not found` | Execution backend not installed | `brew install trycua/tap/cua-driver` |
-| `MCP connection failed` | Backend process not responding | Run `leap host doctor` to diagnose; ensure backend is on PATH |
-| `LLM API key is empty` | Missing API key | Follow **Configure Your LLM** above or run `leap config llm key` |
-| `Accessibility permission denied` | macOS privacy gate | System Settings → Privacy & Security → Accessibility → grant permission |
-| `Screen Recording blocked` | macOS privacy gate | System Settings → Privacy & Security → Screen Recording → grant permission |
+| Symptom | Fix |
+|---------|-----|
+| `cua-driver not found` | `brew install trycua/tap/cua-driver` |
+| `MCP connection failed` | `leap host doctor` |
+| `LLM API key is empty` | `/config llm set --api-key …` |
+| Accessibility denied | System Settings → Privacy & Security → grant |
+| Device `writable: 0` | `leap hw verify` — unverified devices are read-only |
+| `permit_required` | `leap hw permit-key` and configure issuer keys |
 
 ---
 
@@ -1426,19 +473,10 @@ Transport: stdio (JSON-RPC over stdin/stdout) by default. The `PlatformClient` i
 
 Apache 2.0 — see [LICENSE](LICENSE).
 
-
-
----
-
 <div align="center">
 
-**[ModelScope](https://github.com/modelscope)** · [⭐ Star us](https://github.com/modelscope/leapflow/stargazers) · [🐛 Report a bug](https://github.com/modelscope/leapflow/issues) · [💬 Discussions](https://github.com/modelscope/leapflow/discussions)
+**[ModelScope](https://github.com/modelscope)** · [Star](https://github.com/modelscope/leapflow/stargazers) · [Issues](https://github.com/modelscope/leapflow/issues) · [Discussions](https://github.com/modelscope/leapflow/discussions)
 
-*✨ LeapFlow: Learning and Evolving from Actual Practice. *
+*LeapFlow — Learning and Evolving from Actual Practice.*
 
 </div>
-
-<p align="center">
-  <em> ❤️ Thanks for Visiting ✨ LeapFlow !</em><br><br>
-  <img src="https://visitor-badge.laobi.icu/badge?page_id=modelscope.leapflow&style=for-the-badge&color=00d4ff" alt="Views">
-</p>

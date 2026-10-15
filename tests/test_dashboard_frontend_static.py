@@ -227,3 +227,21 @@ def test_bar_chart_labels_preserve_full_text_for_accessibility() -> None:
     src = _app()
     assert 'const label = el("span", "bar-label", esc(tx(row.label)));' in src
     assert "label.title = tx(row.label);" in src
+
+
+# ════════════════════════════════════════════════════════════════
+# Preview: a refused camera fell back to "Not streaming." silently
+# ════════════════════════════════════════════════════════════════
+
+
+def test_a_failed_preview_start_keeps_its_reason_on_screen() -> None:
+    """The defect, on a Jetson whose ROS driver owns /dev/video*: the daemon answered
+    ``device_busy`` naming the holder, the socket handler wrote it into the status, and
+    the start path immediately called ``stop()`` -- which reset it to "Not streaming."
+    """
+    src = _app()
+    assert "if (!ready.value) { failed(); return; }" in src
+    assert 'if (first.value === "stop") { failed(); return; }' in src
+    assert "if (!ready.value) { stop(); return; }" not in src
+    failed = src[src.index("function failed() {"):]
+    assert failed.index("stop(true);") < failed.index("}"), "failed() must preserve the status"

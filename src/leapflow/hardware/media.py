@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -101,6 +103,19 @@ A preview is a glance at a device, not a video feed: 320px at 2 fps is a few ten
 kilobytes per second per viewer, which is affordable over a JSON-RPC-adjacent HTTP
 hop and on a laptop battery. The ceiling is raised by configuration, never silently.
 """
+
+
+@dataclass(frozen=True)
+class _LinuxVideoCandidate:
+    """Sysfs-only facts for one Linux video node, collected without opening it."""
+
+    node_index: int
+    stream_index: int
+    name: str
+    interface_name: str
+    spec: str
+    parent_key: str
+    driver: str
 
 
 @dataclass(frozen=True)
@@ -227,23 +242,13 @@ def _enumerate_darwin() -> tuple[MediaDevice, ...]:
 def _enumerate_linux() -> tuple[MediaDevice, ...]:
     """List V4L2 cameras and ALSA capture cards from sysfs and procfs.
 
-    No subprocess at all on this platform: the kernel already publishes both lists as
-    files, so enumeration costs a handful of reads.
+    No subprocess and no device open: the kernel already publishes both lists as files.
+    UVC also publishes metadata-only companions as ``/dev/video*`` nodes; those are
+    removed from the preview inventory using their driver and stream-index topology.
     """
-    devices: list[MediaDevice] = []
-    v4l = Path("/sys/class/video4linux")
-    if v4l.is_dir():
-        for entry in sorted(v4l.iterdir()):
-            node = Path("/dev") / entry.name
-            if not node.exists():
-                continue
-            name_file = entry / "name"
-            name = name_file.read_text(encoding="utf-8").strip() if name_file.is_file() else entry.name
-            index = int("".join(ch for ch in entry.name if ch.isdigit()) or 0)
-            devices.append(MediaDevice(
-                kind=CAMERA, index=index, name=name, spec=str(node),
-                input_format="v4l2", device_class=CAMERA,
-            ))
+    devices: list[MediaDevice] = list(
+        _linux_video_devices(Path("/sys/class/video4linux"), Path("/dev"))
+    )
     cards = Path("/proc/asound/cards")
     if cards.is_file():
         for line in cards.read_text(encoding="utf-8").splitlines():
@@ -256,6 +261,88 @@ def _enumerate_linux() -> tuple[MediaDevice, ...]:
                 input_format="alsa", device_class=MICROPHONE,
             ))
     return tuple(devices)
+
+
+def _linux_video_devices(v4l: Path, dev_root: Path) -> tuple[MediaDevice, ...]:
+    if not v4l.is_dir():
+        return ()
+    candidates: list[_LinuxVideoCandidate] = []
+    for entry in sorted(v4l.iterdir()):
+        node = dev_root / entry.name
+        if not node.exists():
+            continue
+        node_index = int("".join(ch for ch in entry.name if ch.isdigit()) or 0)
+        resolved = entry.resolve()
+        candidates.append(
+            _LinuxVideoCandidate(
+                node_index=node_index,
+                stream_index=_read_int(entry / "index", node_index),
+                name=_read_text(entry / "name") or entry.name,
+                interface_name=_read_text(resolved.parent.parent / "interface"),
+                spec=str(node),
+                parent_key=str(resolved.parent),
+                driver=(resolved / "device" / "driver").resolve().name,
+            )
+        )
+    return _select_linux_video_candidates(tuple(candidates))
+
+
+def _select_linux_video_candidates(
+    candidates: tuple[_LinuxVideoCandidate, ...],
+) -> tuple[MediaDevice, ...]:
+    """Remove UVC metadata companions and give multi-stream inputs distinct labels.
+
+    ``uvcvideo`` numbers a metadata node immediately after the capture node it
+    accompanies. The rule is intentionally topology-bound: an odd-index node from any
+    other driver, or one without its predecessor in the same interface, is retained.
+    This avoids model-name special cases while filtering RealSense and ordinary UVC
+    metadata endpoints using only permission-free sysfs evidence.
+    """
+    indexes_by_parent: dict[str, set[int]] = {}
+    for candidate in candidates:
+        indexes_by_parent.setdefault(candidate.parent_key, set()).add(candidate.stream_index)
+    retained = tuple(
+        candidate
+        for candidate in candidates
+        if not (
+            candidate.driver == "uvcvideo"
+            and candidate.stream_index % 2 == 1
+            and candidate.stream_index - 1 in indexes_by_parent[candidate.parent_key]
+        )
+    )
+    counts: dict[str, int] = {}
+    for candidate in retained:
+        counts[candidate.parent_key] = counts.get(candidate.parent_key, 0) + 1
+    devices = []
+    for candidate in retained:
+        label = candidate.interface_name or candidate.name
+        if counts[candidate.parent_key] > 1:
+            label = f"{label} stream {candidate.stream_index}"
+        devices.append(
+            MediaDevice(
+                kind=CAMERA,
+                index=candidate.node_index,
+                name=label,
+                spec=candidate.spec,
+                input_format="v4l2",
+                device_class=CAMERA,
+            )
+        )
+    return tuple(devices)
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _read_int(path: Path, default: int) -> int:
+    try:
+        return int(_read_text(path))
+    except ValueError:
+        return default
 
 
 def _enumerate_windows() -> tuple[MediaDevice, ...]:
@@ -352,6 +439,7 @@ class FfmpegFrameGrabber:
         self._condition = asyncio.Condition()
         self._pump_task: asyncio.Task[None] | None = None
         self._pump_error: MediaCaptureError | None = None
+        self._sync_option = _FPS_MODE_OPTION
 
     @property
     def captured_at(self) -> float:
@@ -390,7 +478,7 @@ class FfmpegFrameGrabber:
             # discard the extra work at the encoder. The source device stays at a supported
             # 30fps mode; the page profile changes the expensive scale/JPEG path.
             "-vf", f"fps={self._fps:g},scale={self._max_width}:-2",
-            "-fps_mode", "passthrough", "-q:v", str(qscale),
+            self._sync_option, "passthrough", "-q:v", str(qscale),
             "-flush_packets", "1", "-f", "mjpeg", "pipe:1",
         ]
 
@@ -403,6 +491,9 @@ class FfmpegFrameGrabber:
                 "ffmpeg (macOS: `brew install ffmpeg`) or the opencv-python package.",
                 failure_code="capture_backend_missing",
             )
+        # Probed off the loop and cached per binary: the edge board's distro FFmpeg is
+        # routinely older than the host's, and an unknown option kills capture outright.
+        self._sync_option = await asyncio.to_thread(_ffmpeg_sync_option, _ffmpeg_binary())
         try:
             self._process = await asyncio.create_subprocess_exec(
                 *self._command(),
@@ -477,12 +568,7 @@ class FfmpegFrameGrabber:
                 chunk = await process.stdout.read(65536)
                 if not chunk:
                     detail = await self._stderr_detail(process)
-                    await self._set_pump_error(
-                        MediaCaptureError(
-                            f"capture ended for {self._device.name!r}{detail}",
-                            failure_code="capture_stream_ended",
-                        )
-                    )
+                    await self._set_pump_error(self._ended_error(detail))
                     return
                 self._buffer.extend(chunk)
                 if len(self._buffer) > 4 * 1024 * 1024:
@@ -502,6 +588,30 @@ class FfmpegFrameGrabber:
                 str(exc), failure_code="capture_stream_failed"
             )
             await self._set_pump_error(failure)
+
+    def _ended_error(self, detail: str) -> MediaCaptureError:
+        """Classify why ffmpeg's stream ended, separating contention from failure.
+
+        V4L2 capture is exclusive. On a robot the camera driver (a ROS node, a vendor
+        streamer) usually owns the device already, and "capture ended" would read as a
+        broken camera when the actionable fact is *who* holds it. uvcvideo reports that
+        contention as EBUSY on some nodes and as EIO on others; EIO is also what an
+        unplugged camera gives, so it only counts as contention when a holder is found.
+        """
+        busy = "Device or resource busy" in detail
+        holders = _device_holders(self._device.spec) if busy or "Input/output error" in detail else []
+        if not busy and not holders:
+            return MediaCaptureError(
+                f"capture ended for {self._device.name!r}{detail}",
+                failure_code="capture_stream_ended",
+            )
+        owner = f" by {', '.join(holders)}" if holders else " by another process"
+        return MediaCaptureError(
+            f"{self._device.name!r} ({self._device.spec}) is held{owner}. Preview the "
+            "owner's published stream instead (for a ROS camera driver, declare a ros2 "
+            "device bound to its image topic), or stop the owner before previewing here.",
+            failure_code="device_busy",
+        )
 
     def _take_frame(self) -> tuple[bytes, int, int] | None:
         """Cut the newest complete JPEG out of the buffer, discarding older ones.
@@ -846,6 +956,37 @@ def _ffmpeg_binary() -> str:
     return shutil.which("ffmpeg") or ""
 
 
+_FPS_MODE_OPTION = "-fps_mode"
+_LEGACY_SYNC_OPTION = "-vsync"
+_FPS_MODE_SINCE = (5, 1)
+"""FFmpeg 5.1 introduced ``-fps_mode`` and deprecated ``-vsync`` for the same setting.
+
+Ubuntu 22.04 -- the JetPack 6 base -- ships 4.4, which rejects ``-fps_mode`` as an
+unrecognized option, so every Jetson preview failed before producing a frame.
+"""
+
+
+@functools.lru_cache(maxsize=8)
+def _ffmpeg_sync_option(binary: str) -> str:
+    """Return the frame-sync option name this FFmpeg build accepts.
+
+    Unparseable versions (git snapshots print ``N-...``) are treated as modern: only a
+    numbered release older than 5.1 needs the legacy spelling.
+    """
+    if not binary:
+        return _FPS_MODE_OPTION
+    return _sync_option_for_version(_run([binary, "-hide_banner", "-version"]))
+
+
+def _sync_option_for_version(version_text: str) -> str:
+    """Map ``ffmpeg -version`` output to the frame-sync option it understands."""
+    match = re.search(r"ffmpeg version n?(\d+)\.(\d+)", version_text)
+    if match is None:
+        return _FPS_MODE_OPTION
+    version = (int(match.group(1)), int(match.group(2)))
+    return _LEGACY_SYNC_OPTION if version < _FPS_MODE_SINCE else _FPS_MODE_OPTION
+
+
 def _import_cv2(*, required: bool = True) -> Any:
     try:
         import cv2
@@ -878,6 +1019,44 @@ def _run(command: list[str]) -> str:
         logger.debug("media listing %r failed: %s", command[0], exc)
         return ""
     return (completed.stdout + completed.stderr).decode("utf-8", "replace")
+
+
+def _device_holders(spec: str, *, limit: int = 3, proc_root: str = "/proc") -> list[str]:
+    """Name the processes holding a device node open, best-effort and Linux-only.
+
+    Only the process name and pid are reported -- never its arguments, which can carry
+    credentials. Descriptors of processes owned by other users are unreadable, which
+    simply yields fewer names rather than an error.
+    """
+    target = Path(spec)
+    root = Path(proc_root)
+    if not spec.startswith("/dev/") or not root.is_dir():
+        return []
+    try:
+        resolved = target.resolve()
+    except OSError:
+        return []
+    holders: list[str] = []
+    try:
+        entries = sorted(root.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            held = any(
+                Path(os.readlink(fd)) in (target, resolved) for fd in (entry / "fd").iterdir()
+            )
+            if not held:
+                continue
+            name = (entry / "comm").read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        holders.append(f"{name or 'unknown'} (pid {entry.name})")
+        if len(holders) >= limit:
+            break
+    return holders
 
 
 def _jpeg_size(data: bytes) -> tuple[int, int] | None:

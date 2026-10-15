@@ -1,0 +1,74 @@
+# Intel RealSense D435-family camera served from a Jetson LHP node.
+#
+# Install the optional ``leapflow-realsense`` transport package and place this
+# file in the Jetson profile's hardware/devices directory.  Use the immutable
+# serial reported by ``rs-enumerate-devices``; never select a camera by index
+# and never use the USB ``iSerial`` descriptor, which differs from the SDK
+# serial this transport matches on.  The host receives this declaration through
+# LHP as ``<node_id>__sensor_realsense_435if`` and must not duplicate it locally.
+
+hc_version: "hc.v1"
+device_id: "sensor_realsense_435if"
+display_name: "Jetson RealSense D435if"
+device_class: "camera"
+vendor: "Intel"
+model: "D435 family"
+location: "yahboom"
+halt_supported: false
+
+capabilities:
+  affordances: ["observe_rgb", "observe_depth", "observe_infrared"]
+  notes: "Passive RealSense sensor; all observation channels require privacy approval."
+
+transport:
+  kind: "realsense"
+  config:
+    # Replace before deployment; do not use a USB index.
+    serial_number: "REPLACE_WITH_REAL_DEVICE_SERIAL"
+    expected_product: "D435"
+    minimum_usb: "3.0"
+    align_depth_to_color: true
+    color: {width: 1280, height: 720, fps: 30}
+    depth: {width: 848, height: 480, fps: 30}
+    infrared: {width: 848, height: 480, fps: 30}
+
+channels:
+  - channel_id: "camera.color.preview"
+    direction: "read"
+    quantity: "image_frame"
+    representation: "frame"
+    media_type: "image/jpeg"
+    effect: "read"
+    privacy: "environment"
+    description: "RGB preview encoded on the Jetson."
+  - channel_id: "camera.depth.preview"
+    direction: "read"
+    quantity: "depth_preview"
+    representation: "frame"
+    media_type: "image/jpeg"
+    effect: "read"
+    privacy: "environment"
+    description: "Colorized depth preview aligned to the RGB stream."
+  - channel_id: "camera.infrared_left.preview"
+    direction: "read"
+    quantity: "infrared_image"
+    representation: "frame"
+    media_type: "image/jpeg"
+    effect: "read"
+    privacy: "environment"
+    description: "Left infrared preview."
+  - channel_id: "camera.infrared_right.preview"
+    direction: "read"
+    quantity: "infrared_image"
+    representation: "frame"
+    media_type: "image/jpeg"
+    effect: "read"
+    privacy: "environment"
+    description: "Right infrared preview."
+  - channel_id: "camera.metadata"
+    direction: "read"
+    quantity: "camera_metadata"
+    representation: "state"
+    effect: "read"
+    privacy: "environment"
+    description: "Bounded calibration, profile, and latest-frame metadata; never frame bytes."

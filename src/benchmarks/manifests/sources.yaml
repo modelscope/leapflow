@@ -276,7 +276,7 @@ sources:
     full_name: "RoboHarm: Five Fixed-Scene Robot Refusal Tasks"
     status: tier4
     paper: null
-    homepage: null
+    homepage: "https://github.com/robocurve/roboharm"
     repository: "https://github.com/robocurve/roboharm"
     venue: "Software release; no paper verified"
     year: 2026
@@ -285,6 +285,7 @@ sources:
       count: null
     license:
       code_and_content: "CC BY-NC 4.0"
+    manifest_license: "CC-BY-NC-4.0"
     run_cost: very_high
     evidence_date: "2026-10-08"
 

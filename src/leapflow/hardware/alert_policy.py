@@ -30,6 +30,7 @@ loop is never blocked by an approval prompt or a slow transport.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -135,6 +136,10 @@ class HardwareAlertPolicy:
     @property
     def rules(self) -> tuple[AlertRule, ...]:
         return self._rules
+
+    def set_orchestrator(self, orchestrator: Any) -> None:
+        """Replace the approval route after runtime or gate re-binding."""
+        self._orchestrator = orchestrator
 
     @property
     def fired_count(self) -> int:
@@ -306,6 +311,12 @@ def load_alert_policies(settings: Any) -> tuple[AlertRule, ...]:
     raw = getattr(settings, "hardware_alert_policies", None)
     if not raw:
         return ()
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("hardware.alert_policies must be valid JSON; ignoring")
+            return ()
     if not isinstance(raw, (list, tuple)):
         logger.warning("hardware.alert_policies must be a list; ignoring")
         return ()

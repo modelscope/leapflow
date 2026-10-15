@@ -24,6 +24,7 @@ or would be one:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -220,6 +221,34 @@ def test_enumerated_device_ids_survive_admission() -> None:
     only_cjk = MediaDevice(kind="camera", index=2, name="相机", spec="2:none", input_format="avfoundation")
     assert only_cjk.device_id == "camera_2"
     assert set(only_cjk.device_id) <= allowed
+
+
+def test_linux_uvc_metadata_nodes_are_filtered_without_model_name_rules() -> None:
+    from leapflow.hardware.media import _LinuxVideoCandidate, _select_linux_video_candidates
+
+    candidates = (
+        _LinuxVideoCandidate(0, 0, "RealSense", "D435IF Depth", "/dev/video0", "depth", "uvcvideo"),
+        _LinuxVideoCandidate(1, 1, "RealSense", "D435IF Depth", "/dev/video1", "depth", "uvcvideo"),
+        _LinuxVideoCandidate(2, 2, "RealSense", "D435IF Depth", "/dev/video2", "depth", "uvcvideo"),
+        _LinuxVideoCandidate(3, 3, "RealSense", "D435IF Depth", "/dev/video3", "depth", "uvcvideo"),
+        _LinuxVideoCandidate(4, 0, "RealSense", "D435IF RGB", "/dev/video4", "rgb", "uvcvideo"),
+        _LinuxVideoCandidate(5, 1, "RealSense", "D435IF RGB", "/dev/video5", "rgb", "uvcvideo"),
+        # An odd-index node without UVC predecessor evidence is a legitimate camera.
+        _LinuxVideoCandidate(7, 1, "Board camera", "", "/dev/video7", "board", "tegra-video"),
+    )
+
+    devices = _select_linux_video_candidates(candidates)
+
+    assert [device.spec for device in devices] == [
+        "/dev/video0",
+        "/dev/video2",
+        "/dev/video4",
+        "/dev/video7",
+    ]
+    assert devices[0].name == "D435IF Depth stream 0"
+    assert devices[1].name == "D435IF Depth stream 2"
+    assert devices[2].name == "D435IF RGB"
+    assert devices[3].name == "Board camera"
 
 
 def test_enumeration_opens_nothing_and_tolerates_a_bare_platform(monkeypatch) -> None:
@@ -900,6 +929,69 @@ def test_the_device_rate_is_an_input_option() -> None:
     assert "-fflags" in command and "nobuffer" in command, (
         "latest-frame capture must ask ffmpeg to avoid an input backlog"
     )
+
+
+def test_frame_sync_option_matches_the_installed_ffmpeg_release() -> None:
+    """JetPack 6's distro FFmpeg 4.4 rejects ``-fps_mode``; capture must not die on argv."""
+    from leapflow.hardware.media import FfmpegFrameGrabber, _sync_option_for_version
+
+    assert _sync_option_for_version("ffmpeg version 4.4.2-1ubuntu0.1 Copyright") == "-vsync"
+    assert _sync_option_for_version("ffmpeg version 5.0.3") == "-vsync"
+    assert _sync_option_for_version("ffmpeg version 5.1 Copyright") == "-fps_mode"
+    assert _sync_option_for_version("ffmpeg version n7.1.1") == "-fps_mode"
+    assert _sync_option_for_version("ffmpeg version N-118000-gabcdef") == "-fps_mode"
+    assert _sync_option_for_version("") == "-fps_mode"
+
+    device = MediaDevice(
+        kind="camera", index=0, name="Cam", spec="/dev/video4", input_format="v4l2"
+    )
+    grabber = FfmpegFrameGrabber(device, max_width=640, quality=70, fps=2.0)
+    grabber._sync_option = "-vsync"  # noqa: SLF001 - the value start() probes on a 4.4 board
+    command = grabber._command()  # noqa: SLF001 - argv is the contract under test
+
+    assert "-fps_mode" not in command
+    assert command[command.index("-vsync") + 1] == "passthrough"
+
+
+def test_a_device_held_by_another_process_is_a_typed_busy_failure_naming_the_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EBUSY is contention, not a broken camera: the answer must say who holds it."""
+    from leapflow.hardware import media as media_module
+    from leapflow.hardware.media import FfmpegFrameGrabber, _device_holders
+
+    owner = tmp_path / "57234"
+    (owner / "fd").mkdir(parents=True)
+    (owner / "fd" / "7").symlink_to("/dev/video4")
+    (owner / "comm").write_text("realsense2_came\n", encoding="utf-8")
+    bystander = tmp_path / "100"
+    (bystander / "fd").mkdir(parents=True)
+    (bystander / "fd" / "0").symlink_to("/dev/null")
+    (bystander / "comm").write_text("bash\n", encoding="utf-8")
+    (tmp_path / "self").mkdir()
+
+    assert _device_holders("/dev/video4", proc_root=str(tmp_path)) == ["realsense2_came (pid 57234)"]
+    assert _device_holders("0", proc_root=str(tmp_path)) == []  # avfoundation index, not a node
+
+    monkeypatch.setattr(media_module, "_device_holders", lambda spec: ["realsense2_came (pid 57234)"])
+    device = MediaDevice(kind="camera", index=0, name="Cam", spec="/dev/video4", input_format="v4l2")
+    grabber = FfmpegFrameGrabber(device, max_width=640, quality=70, fps=2.0)
+
+    busy = grabber._ended_error(": /dev/video4: Device or resource busy")  # noqa: SLF001
+    # On the board, uvcvideo answers a second opener of some RealSense nodes with EIO.
+    contended = grabber._ended_error(": /dev/video2: Input/output error")  # noqa: SLF001
+    other = grabber._ended_error(": Invalid data found when processing input")  # noqa: SLF001
+
+    assert busy.failure_code == "device_busy"
+    assert "realsense2_came (pid 57234)" in str(busy)
+    assert "ros2" in str(busy)
+    assert contended.failure_code == "device_busy"
+    assert other.failure_code == "capture_stream_ended"
+
+    # Without a holder, EIO is an unplugged or failing camera, not contention.
+    monkeypatch.setattr(media_module, "_device_holders", lambda spec: [])
+    unplugged = grabber._ended_error(": /dev/video2: Input/output error")  # noqa: SLF001
+    assert unplugged.failure_code == "capture_stream_ended"
 
 
 def test_a_refused_rate_is_learned_from_the_devices_own_answer() -> None:

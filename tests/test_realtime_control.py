@@ -11,15 +11,20 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
-import math
 import threading
 import time
 from typing import Any, Mapping
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from leapflow.hardware.context import (
+    Channel,
+    Direction,
+    Envelope,
+    HardwareContext,
+    HardwareEffect,
+)
 from leapflow.hardware.control_bus import (
     ControlBusConfig,
     ControlBusStats,
@@ -95,6 +100,81 @@ def test_control_bus_refuses_commands_when_device_is_degraded() -> None:
     registry.context.assert_not_called()
 
 
+def _control_context() -> HardwareContext:
+    return HardwareContext(
+        device_id="arm",
+        channels=(
+            Channel(
+                channel_id="joint_0",
+                direction=Direction.READWRITE.value,
+                effect=HardwareEffect.ACTUATE.value,
+                envelope=Envelope(
+                    declared=True,
+                    min_value=-1.0,
+                    max_value=1.0,
+                    max_rate=10.0,
+                ),
+            ),
+            Channel(
+                channel_id="mode",
+                direction=Direction.WRITE.value,
+                effect=HardwareEffect.CONFIGURE.value,
+                envelope=Envelope(declared=True, allowed_values=("idle", "run")),
+            ),
+        ),
+    )
+
+
+def test_control_bus_enforces_envelope_without_device_safety_policy() -> None:
+    registry = MagicMock()
+    registry.is_device_degraded.return_value = False
+    registry.context.return_value = _control_context()
+    bus = HighFrequencyControlBus(registry)
+    bus._device_id = "arm"
+
+    safe = bus._check_safety(
+        _make_state({"joint_0": 0.0}),
+        ControlCommand(joint_commands={"joint_0": 1.5}),
+    )
+
+    assert safe is False
+
+
+@pytest.mark.parametrize("channel_id,value", [("ghost", 0.1), ("mode", "run")])
+def test_control_bus_rejects_unknown_or_non_actuation_channels(
+    channel_id: str,
+    value: Any,
+) -> None:
+    registry = MagicMock()
+    registry.is_device_degraded.return_value = False
+    registry.context.return_value = _control_context()
+    bus = HighFrequencyControlBus(registry)
+    bus._device_id = "arm"
+
+    safe = bus._check_safety(
+        _make_state({"joint_0": 0.0}),
+        ControlCommand(joint_commands={channel_id: value}),
+    )
+
+    assert safe is False
+
+
+def test_control_bus_enforces_declared_command_rate() -> None:
+    registry = MagicMock()
+    registry.is_device_degraded.return_value = False
+    registry.context.return_value = _control_context()
+    bus = HighFrequencyControlBus(registry)
+    bus._device_id = "arm"
+    bus._last_commands["joint_0"] = (0.0, time.monotonic())
+
+    safe = bus._check_safety(
+        _make_state({"joint_0": 0.0}),
+        ControlCommand(joint_commands={"joint_0": 1.0}),
+    )
+
+    assert safe is False
+
+
 # ---------------------------------------------------------------------------
 # PIDJointController
 # ---------------------------------------------------------------------------
@@ -139,8 +219,12 @@ class TestPIDJointController:
     def test_position_mode(self) -> None:
         """In position mode, command = current + clamped_output."""
         pid = PIDJointController(
-            ("j1",), kp=1.0, ki=0.0, kd=0.0,
-            max_output=0.5, output_mode="position",
+            ("j1",),
+            kp=1.0,
+            ki=0.0,
+            kd=0.0,
+            max_output=0.5,
+            output_mode="position",
         )
         pid.set_target({"j1": 10.0})
         state = _make_state({"j1": 1.0})
@@ -187,8 +271,10 @@ class TestPIDJointController:
 
         t1 = threading.Thread(target=writer)
         t2 = threading.Thread(target=reader)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
         assert not errors
 
     def test_invalid_output_mode(self) -> None:
@@ -215,7 +301,10 @@ class TestImpedanceController:
     def test_spring_restoring_force(self) -> None:
         """With only stiffness, controller should push toward reference."""
         imp = ImpedanceController(
-            ("j1",), stiffness=100.0, damping=0.0, inertia=1.0,
+            ("j1",),
+            stiffness=100.0,
+            damping=0.0,
+            inertia=1.0,
         )
         imp.set_reference({"j1": 1.0})
         state = _make_state({"j1": 0.0}, velocities={"j1": 0.0})
@@ -226,7 +315,10 @@ class TestImpedanceController:
     def test_damping_opposes_velocity(self) -> None:
         """Damping should slow down a moving joint."""
         imp = ImpedanceController(
-            ("j1",), stiffness=0.0, damping=10.0, inertia=1.0,
+            ("j1",),
+            stiffness=0.0,
+            damping=10.0,
+            inertia=1.0,
         )
         imp.set_reference({"j1": 0.0}, velocity={"j1": 0.0})
         # Joint moving at v=5.0 with ref=0 and no stiffness → damping decelerates.
@@ -383,19 +475,24 @@ class TestPolicyChain:
 
         class _CountingOuter:
             policy_id = "counting_outer"
+
             def compute(self, state: ControlState) -> ControlCommand:
                 outer_calls["count"] += 1
                 return ControlCommand(joint_commands={"j1": 1.0})
+
             def reset(self) -> None:
                 pass
 
         class _CountingInner:
             policy_id = "counting_inner"
+
             def compute(self, state: ControlState) -> ControlCommand:
                 inner_calls["count"] += 1
                 return ControlCommand(joint_commands={"j1": 0.5})
+
             def reset(self) -> None:
                 pass
+
             def set_target(self, targets: Mapping[str, float]) -> None:
                 pass
 
@@ -479,7 +576,10 @@ class TestRealtimeControlLoop:
         loop = RealtimeControlLoop(bus)
         outer = _ConstantPolicy({"j1": 1.0}, pid="outer")
         sid = await loop.start_policy_chain(
-            "dev0", outer, joint_ids=("j1",), outer_rate_hz=10.0,
+            "dev0",
+            outer,
+            joint_ids=("j1",),
+            outer_rate_hz=10.0,
         )
         assert isinstance(sid, str)
         call_args = bus.async_start.call_args

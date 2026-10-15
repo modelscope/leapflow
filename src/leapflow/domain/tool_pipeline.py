@@ -16,13 +16,46 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
+if sys.version_info >= (3, 11):
+    from asyncio import Timeout as _AsyncTimeout
+    from asyncio import timeout as _async_timeout
+else:  # Python 3.10 — backport declared in pyproject.toml.
+    from async_timeout import Timeout as _AsyncTimeout
+    from async_timeout import timeout as _async_timeout
+
 logger = logging.getLogger(__name__)
+
+
+def _scope_deadline(scope: _AsyncTimeout) -> Optional[float]:
+    """Absolute loop time at which *scope* fires, or ``None`` when disarmed.
+
+    ``asyncio.Timeout`` (3.11+) exposes the armed deadline via ``when()``;
+    the async-timeout 3.10 backport keeps it on the ``deadline`` property.
+    """
+    if sys.version_info >= (3, 11):
+        return scope.when()
+    return scope.deadline  # type: ignore[attr-defined]
+
+
+def _scope_reschedule(scope: _AsyncTimeout, when: Optional[float]) -> None:
+    """Arm *scope*'s deadline at absolute loop time *when* (``None`` disarms).
+
+    The backport spells ``reschedule(when)`` as ``update(when)`` and
+    ``reschedule(None)`` as ``reject()``.
+    """
+    if sys.version_info >= (3, 11):
+        scope.reschedule(when)
+    elif when is None:
+        scope.reject()  # type: ignore[attr-defined]
+    else:
+        scope.update(when)  # type: ignore[attr-defined]
 
 
 class _ToolExecutionDeadline:
@@ -31,11 +64,11 @@ class _ToolExecutionDeadline:
     def __init__(self, loop: asyncio.AbstractEventLoop, timeout_s: float) -> None:
         self._loop = loop
         self._remaining_s = timeout_s
-        self._scope: asyncio.Timeout | None = None
+        self._scope: _AsyncTimeout | None = None
         self._pause_depth = 0
 
-    def bind(self, scope: asyncio.Timeout) -> None:
-        """Bind the active ``asyncio.timeout`` scope to this deadline."""
+    def bind(self, scope: _AsyncTimeout) -> None:
+        """Bind the active timeout scope to this deadline."""
         self._scope = scope
 
     def pause(self) -> None:
@@ -44,9 +77,9 @@ class _ToolExecutionDeadline:
             scope = self._scope
             if scope is None:
                 return
-            deadline = scope.when()
+            deadline = _scope_deadline(scope)
             self._remaining_s = max(0.0, (deadline or self._loop.time()) - self._loop.time())
-            scope.reschedule(None)
+            _scope_reschedule(scope, None)
         self._pause_depth += 1
 
     def resume(self) -> None:
@@ -55,7 +88,7 @@ class _ToolExecutionDeadline:
             return
         self._pause_depth -= 1
         if self._pause_depth == 0 and self._scope is not None:
-            self._scope.reschedule(self._loop.time() + self._remaining_s)
+            _scope_reschedule(self._scope, self._loop.time() + self._remaining_s)
 
 
 _current_tool_execution_deadline: ContextVar[_ToolExecutionDeadline | None] = ContextVar(
@@ -88,7 +121,7 @@ async def run_tool_with_timeout(
     controller = _ToolExecutionDeadline(asyncio.get_running_loop(), timeout_s)
     token = _current_tool_execution_deadline.set(controller)
     try:
-        async with asyncio.timeout(timeout_s) as scope:
+        async with _async_timeout(timeout_s) as scope:
             controller.bind(scope)
             return await awaitable
     finally:

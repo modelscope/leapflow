@@ -32,7 +32,9 @@ def test_validate_missing_required_returns_structured_error() -> None:
     assert result is not None
     assert result["ok"] is False and result["error_type"] == "invalid_arguments"
     assert result["missing"] == ["path"]
+    assert result["failure_code"] == "missing_required_fields"
     assert "path" in result["accepted_parameters"]
+    assert "required parameter" in result["recovery_hint"]
     # Must not penalize failure budgets or trip the batch-stop gate.
     assert result["counts_as_failure"] is False and result["retryable"] is True
     assert "execution_policy" not in result
@@ -182,6 +184,7 @@ def test_shell_run_populates_error_on_failure() -> None:
     assert "BOOM_ERR" in result["error"] and "BOOM_ERR" in result["stderr"]
     assert result["failure_code"] == "shell_nonzero_exit"
     assert result["retryable"] is False
+    assert "change the command" in result["recovery_hint"]
 
 
 def test_shell_run_classifies_io_exit_251_without_overgeneralizing() -> None:

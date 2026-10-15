@@ -1,0 +1,52 @@
+# RealSense camera previewed through the ROS 2 driver that already owns it.
+#
+# V4L2 capture is exclusive: while ``realsense2_camera_node`` runs, a direct
+# capture of /dev/video* fails with "Device or resource busy". This declaration
+# instead subscribes, read-only, to the driver's JPEG ``/compressed`` topics, so
+# the robot keeps its camera pipeline and LeapBoard still gets a live preview.
+# Place it in the edge node's hardware/devices directory and start the LHP node
+# from a shell that has sourced the ROS distribution (``rclpy`` comes from apt).
+# The host receives it over LHP as ``<node_id>__realsense_ros2``.
+#
+# Topic names below match ``ros2 launch realsense2_camera rs_launch.py`` with its
+# default ``camera`` namespace and name; depth is previewable as JPEG only when
+# the driver runs with ``colorizer.enable:=true``.
+
+hc_version: "hc.v1"
+device_id: "realsense_ros2"
+display_name: "RealSense (ROS 2 driver)"
+device_class: "camera"
+vendor: "Intel"
+model: "D435 family"
+location: "yahboom"
+halt_supported: false
+
+capabilities:
+  affordances: ["observe_rgb", "observe_depth"]
+  notes: "Passive subscriber to a running ROS 2 camera driver; never opens the device."
+
+transport:
+  kind: "ros2"
+  config:
+    node_name: "leapflow_preview_bridge"
+    topics:
+      camera.color.preview: "/camera/camera/color/image_raw/compressed"
+      camera.depth.preview: "/camera/camera/depth/image_rect_raw/compressed"
+
+channels:
+  - channel_id: "camera.color.preview"
+    direction: "read"
+    quantity: "image_frame"
+    representation: "frame"
+    media_type: "image/jpeg"
+    effect: "read"
+    privacy: "environment"
+    description: "RGB stream published by the ROS 2 camera driver."
+  - channel_id: "camera.depth.preview"
+    direction: "read"
+    quantity: "depth_preview"
+    representation: "frame"
+    media_type: "image/jpeg"
+    effect: "read"
+    privacy: "environment"
+    description: "Colorized depth published by the ROS 2 camera driver."

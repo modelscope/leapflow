@@ -127,6 +127,14 @@ def hermetic_env(
             "LEAPFLOW_LLM_AUX_API_KEY": llm_api_key,
             "LEAPFLOW_VLM_BASE_URL": llm_base_url,
             "LEAPFLOW_VLM_API_KEY": llm_api_key,
+            # macOS System Configuration proxies are honoured by httpx even for
+            # loopback addresses, so a dev machine running a local proxy app
+            # answers the cassette traffic itself (502 Bad Gateway) and every
+            # journey stops before it reaches the cassette store. Loopback must
+            # never traverse a proxy; remote egress (record/live upstreams) is
+            # unaffected because it happens in the test process, not the daemon.
+            "NO_PROXY": "127.0.0.1,localhost,::1",
+            "no_proxy": "127.0.0.1,localhost,::1",
         }
     )
     if extra:
