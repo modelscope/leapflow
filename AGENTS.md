@@ -4,21 +4,23 @@ This document is the LeapFlow engineering collaboration contract. It is not only
 
 ## Design Philosophy
 
-1. **Signal-Driven Intelligence** — All agent intelligence derives from observing real-world signals, not from hardcoded rules. If a behavior cannot be learned from signals, it is not in scope.
+1. **Everything Is a Signal** — Virtual signals (IM, OS events, clipboard, web) and physical signals (robot arms, cameras, instruments, IoT) form one signal space: every source is normalized, gated, and deduplicated through the unified pipeline before it can reach the OODA loop, and knowledge — skills, device trust, environment understanding — compounds across episodes only from signals that entered this way. Every new event source must be integrated as a typed signal through this single entry; a bespoke or side-channel ingestion path is a design failure.
 
-2. **Context Pipeline as Core** — Signal → Filter (SNR) → Compress (intent-preserving) → Store (multi-layer) → Retrieve (goal-dependent) → Decide. Every feature and every external signal source, including IM collaboration events, must map to this pipeline before it can drive action.
+2. **Signal-Driven Intelligence** — All agent intelligence derives from observing real-world signals, not from hardcoded rules. If a behavior cannot be learned from signals, it is not in scope.
 
-3. **Everything Is a Plugin** — Capability is composed, not built in. Tools, LLM backends, platform adapters, signal sources, and vision processors all arrive behind a `runtime_checkable` Protocol and are discovered, injected, and disposed by the same machinery. A capability that can only exist by editing core is a design failure; the answer is a new Protocol, not a special case.
+3. **Context Pipeline as Core** — Signal → Filter (SNR) → Compress (intent-preserving) → Store (multi-layer) → Retrieve (goal-dependent) → Decide. Every feature and every external signal source, including IM collaboration events, must map to this pipeline before it can drive action.
 
-4. **Progressive Trust** — Never auto-execute on first encounter. Autonomy is earned through repeated observed success and lost the same way: DRAFT → CANDIDATE → VERIFIED → PRODUCTION on consecutive successes, demotion on consecutive failures, permanent freeze on an internal defect. Trust is per plugin, persisted, and the only legitimate source of an approval exemption.
+4. **Everything Is a Plugin** — Capability is composed, not built in. Tools, LLM backends, platform adapters, signal sources, and vision processors all arrive behind a `runtime_checkable` Protocol and are discovered, injected, and disposed by the same machinery. A capability that can only exist by editing core is a design failure; the answer is a new Protocol, not a special case.
 
-5. **Occam's Razor** — The simplest correct solution wins. Reject complexity that doesn't directly serve user value. Every abstraction must pay for itself.
+5. **Progressive Trust** — Never auto-execute on first encounter. Autonomy is earned through repeated observed success and lost the same way: DRAFT → CANDIDATE → VERIFIED → PRODUCTION on consecutive successes, demotion on consecutive failures, permanent freeze on an internal defect. Trust is per plugin, persisted, and the only legitimate source of an approval exemption.
 
-6. **LLM-Native Design** — Design for LLM reasoning first. Protocols over classes. Declarative over imperative. Context over configuration.
+6. **Occam's Razor** — The simplest correct solution wins. Reject complexity that doesn't directly serve user value. Every abstraction must pay for itself.
 
-7. **User-Centric Reliability** — User experience is part of correctness. Every change must keep common paths easy, predictable, recoverable, and must not degrade adjacent workflows.
+7. **LLM-Native Design** — Design for LLM reasoning first. Protocols over classes. Declarative over imperative. Context over configuration.
 
-8. **Environment–Harness Co-evolution** — An environmental change is an observable hypothesis, never authority to mutate the framework. Only a typed, task-relevant delta that survives evidence validation and live capability resolution may produce a governed capability requirement; policy, approval, trust, and lifecycle control every subsequent plugin addition, change, disablement, or removal. The complete causal record — including rejected and no-op branches — must remain available so evolution is explainable, reproducible, and reversible.
+8. **User-Centric Reliability** — User experience is part of correctness. Every change must keep common paths easy, predictable, recoverable, and must not degrade adjacent workflows.
+
+9. **Environment–Harness Co-evolution** — An environmental change is an observable hypothesis, never authority to mutate the framework. Only a typed, task-relevant delta that survives evidence validation and live capability resolution may produce a governed capability requirement; policy, approval, trust, and lifecycle control every subsequent plugin addition, change, disablement, or removal. The complete causal record — including rejected and no-op branches — must remain available so evolution is explainable, reproducible, and reversible.
 
 ## Code Quality Requirements
 
