@@ -7,7 +7,7 @@ with six channels each would be 40+ schemas if tools were generated per channel,
 which would swamp the tool index; instead the index stays constant and the
 per-channel limits arrive through ``hw_describe`` when a model actually intends to
 act. That is progressive disclosure applied to hardware, and it is also the reason
-an upstream standard's "reference file" is a rendered view here rather than a
+an upstream standard's \"reference file\" is a rendered view here rather than a
 separate document to keep in sync.
 
 Writes are split into three tools by effect class rather than collapsed into one
@@ -15,11 +15,24 @@ Writes are split into three tools by effect class rather than collapsed into one
 and reaches a decision instead of a fallback; the tool name is itself a safety
 signal the model cannot overlook; and if channel lookup ever fails, the name still
 says what class of thing was attempted.
+
+**Why this file exceeds 800 lines**: the twelve tool handlers and their three
+feasibility evaluators (single/batch/control) share a common approval pipeline,
+trust-skip path, rate evaluator, safety checker, and interlock evaluator, all of
+which live on the ``HardwareTools`` instance.  ``WriteGovernor`` already owns the
+approval decision.  ``WriteVerificationCoordinator`` owns the post-write verdict.
+The remaining feasibility methods are tightly coupled to instance-local helpers
+(``_rate_wait_s``, ``_check_safety``, ``_requires_describe``, ``_grant_band``)
+that need the live registry and last-command state.  Extracting them into a
+separate file would require either injecting HardwareTools or duplicating its
+half-dozen stateful helpers.  The decomposition plan targets a ``FeasibilityChain``
+delegate as the next structural step; the present size is the justified interim.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Mapping
 
@@ -32,10 +45,25 @@ from leapflow.hardware.context import (
 from leapflow.hardware.reference import describe, summarize
 from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.transport import (
+    SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_NONE,
+    SIDE_EFFECT_PARTIAL,
     SIDE_EFFECT_UNKNOWN,
     TransportError,
     WriteOutcome,
+)
+from leapflow.hardware.write_verification import (
+    WriteExpectation,
+    WriteVerdict,
+    WriteVerificationCoordinator,
+)
+from leapflow.hardware.write_governor import (
+    BatchFeasibilityResult,
+    ControlFeasibilityResult,
+    WriteFeasibilityResult,
+    WriteGovernanceRequest,
+    WriteGovernor,
+    execute_sequential_batch,
 )
 from leapflow.plugins.protocol import ToolMetadata
 from leapflow.security.actions import ActionDescriptor, ActionKind
@@ -156,9 +184,21 @@ class HardwareTools:
     ) -> None:
         self._registry = registry
         self._gate = gate
-        self._session_id = session_id
+        self._fallback_session_id = session_id
         self._audit = audit_log or HardwareAuditLog(None)
         self._trust_gate = hardware_trust_gate
+        self._write_verifier = WriteVerificationCoordinator(
+            registry,
+            audit_log=self._audit,
+            trust_gate=hardware_trust_gate,
+            identity_provider=self._session_identity,
+        )
+        self._governor = WriteGovernor(
+            gate=gate,
+            trust_gate=hardware_trust_gate,
+            audit_log=self._audit,
+            trust_skip_enabled=False,
+        )
 
     def set_gate(self, gate: Any) -> None:
         """Replace the approval gate used by all write handlers.
@@ -169,6 +209,15 @@ class HardwareTools:
         orchestrator without re-assembly.
         """
         self._gate = gate
+        self._governor.set_gate(gate)
+
+    def _session_identity(self) -> str:
+        """Resolve the active request identity without sharing it across sessions."""
+        from leapflow.tools.execution_context import current_tool_context
+
+        context = current_tool_context()
+        active_session_id = getattr(context, "session_id", "") if context is not None else ""
+        return str(active_session_id or self._fallback_session_id)
 
     # ── Discovery ──
 
@@ -187,7 +236,7 @@ class HardwareTools:
         context = self._registry.context(device_id)
         if context is None:
             return self._unknown_device(device_id)
-        self._registry.mark_described(self._session_id, device_id)
+        self._registry.mark_described(self._session_identity(), device_id)
         payload = describe(context)
         payload["ok"] = True
         # Prior outcomes for each writable channel, best-tracking first. This is what turns
@@ -311,18 +360,29 @@ class HardwareTools:
             channel=channel_id,
             value=reading.value,
             outcome="ok",
-            identity=self._session_id,
+            identity=self._session_identity(),
         )
         # A read is a trustworthy observation, so it is also the moment a pending command
         # on this channel can finally be scored -- which is how a channel with settling
         # time gets learned from at all.
         recorder = self._registry.outcome_recorder
+        resolved = None
         if recorder is not None:
             resolved = recorder.observe(
                 device_id=device_id, channel_id=channel_id, value=reading.value
             )
             if resolved is not None:
                 payload["command_outcome"] = resolved.to_dict()
+        write_verdicts = self._write_verifier.settle_pending(
+            device_id,
+            channel_id,
+            reading,
+            resolved_outcome=resolved,
+        )
+        if write_verdicts:
+            payload["write_verdicts"] = [verdict.to_dict() for verdict in write_verdicts]
+            if len(write_verdicts) == 1:
+                payload["verification"] = write_verdicts[0].to_dict()
         # Sampled history arrives as a summary, never as the raw series: the series is
         # what makes a long run unaffordable in context, and the summary is what a
         # decision needs -- where the value is, where it has been, whether it drifted.
@@ -364,9 +424,7 @@ class HardwareTools:
             transport = await self._registry.transport(device_id)
             status = await transport.halt()
         except TransportError as exc:
-            logger.error(
-                "Emergency stop for %r failed: %s", device_id, exc, exc_info=True
-            )
+            logger.error("Emergency stop for %r failed: %s", device_id, exc, exc_info=True)
             return {
                 "ok": False,
                 "device_id": device_id,
@@ -383,7 +441,7 @@ class HardwareTools:
             action="estop",
             device=device_id,
             outcome="ok" if status.halt_supported else "unsupported",
-            identity=self._session_id,
+            identity=self._session_identity(),
         )
         # When the device declares an emergency deceleration time, report it so
         # the caller knows how long the device needs to reach zero velocity.
@@ -411,143 +469,191 @@ class HardwareTools:
     async def batch_actuate(self, params: dict) -> dict:
         """Write multiple ACTUATE channels in one atomic bus transaction.
 
-        Parameters:
-        - device_id (str, required): Target device identifier
-        - commands (list[dict], required): List of {channel_id: str, value: number}
-        - dry_run (bool, optional): Preview mode, default false
-        - verify (bool, optional): Run post-write verification, default false
+        The structure is a three-phase pipeline mirroring ``_write``:
 
-        This tool is the primary interface for policy-driven control: a VLA
-        model produces a full joint-space action vector, and this tool writes
-        all joints atomically rather than one at a time.
-
-        Uses BatchTransport.write_batch() when available, falling back to
-        sequential writes otherwise.  Each channel in the command list must
-        be an ACTUATE-effect channel on the target device.
-
-        Approval: follows the same approval chain as hw_actuate -- each
-        channel's trust level and reversibility are checked.  The batch
-        is approved as a unit: if any channel requires approval, the
-        entire batch requires approval.
+        1. **Feasibility** (_check_batch_feasibility): per-channel resolve,
+           writable, effect, envelope, rate, safety, degraded, reachable,
+           interlocks, descriptor construction.  Returns a BatchFeasibilityResult.
+        2. **Approval** (_evaluate via WriteGovernor): trust skip or gate.
+        3. **Execution** (_execute_batch_write): transport write, per-channel
+           audit, trust, verification, result aggregation.
         """
-        from leapflow.hardware.transport import BatchTransport, BatchWriteOutcome
+        feasibility = await self._check_batch_feasibility(params)
+        if not feasibility.ok:
+            return feasibility.error  # type: ignore[return-value]
 
+        device_id = feasibility.context.device_id
+
+        if feasibility.dry_run:
+            return _batch_preview_result(feasibility)
+
+        if feasibility.interlocks_failed:
+            return self._not_ready(
+                feasibility.context,
+                feasibility.resolved[0][0],
+                feasibility.interlocks_failed,
+            )
+
+        allowed, denial, no_gate = await self._evaluate(feasibility.descriptor)
+        if not allowed:
+            result = self._refusal(device_id, "", "approval_denied", denial)
+            if no_gate:
+                result["interaction_request"] = _no_gate_interaction(device_id)
+            return result
+
+        return await self._execute_batch_write(feasibility)
+
+    async def _check_batch_feasibility(
+        self, params: Mapping[str, Any]
+    ) -> BatchFeasibilityResult:
+        """Run the full pre-approval feasibility chain for a batch write.
+
+        Validates every command in the batch sequentially: resolve, writable,
+        effect class, envelope, rate.  Then device-level: safety, degradation,
+        reachability, interlocks.  On failure returns a BatchFeasibilityResult
+        with ``ok=False`` and the refusal payload in ``error``.
+        """
         device_id = str(params.get("device_id") or "")
         commands = params.get("commands") or []
         dry_run = bool(params.get("dry_run"))
         verify = bool(params.get("verify"))
+        source = str(params.get("source") or "")
 
         context = self._registry.context(device_id)
         if context is None:
-            return self._unknown_device(device_id)
+            return BatchFeasibilityResult(ok=False, error=self._unknown_device(device_id))
 
         if self._requires_describe(device_id):
-            return self._refusal(
-                device_id,
-                "",
-                "describe_required",
-                f"Call hw_describe(device_id={device_id!r}) before commanding it. Writing to "
-                "channels whose envelope you have not read risks out-of-range commands; the "
-                "describe result carries the allowed range, rate, and reversibility.",
+            return BatchFeasibilityResult(
+                ok=False,
+                error=self._refusal(
+                    device_id,
+                    "",
+                    "describe_required",
+                    f"Call hw_describe(device_id={device_id!r}) before commanding it. Writing to "
+                    "channels whose envelope you have not read risks out-of-range commands; the "
+                    "describe result carries the allowed range, rate, and reversibility.",
+                ),
             )
 
         if not commands:
-            return self._refusal(
-                device_id, "", "empty_commands", "No commands provided in the batch."
+            return BatchFeasibilityResult(
+                ok=False,
+                error=self._refusal(
+                    device_id, "", "empty_commands", "No commands provided in the batch."
+                ),
             )
 
         # ── Validate every channel ──
-        resolved: list[tuple[Channel, Any]] = []  # (channel, value)
+        resolved: list[tuple[Channel, Any]] = []
         for idx, cmd in enumerate(commands):
             channel_id = str(cmd.get("channel_id") or "")
             value = cmd.get("value")
             channel = context.channel(channel_id)
             if channel is None:
                 known = ", ".join(c.channel_id for c in context.channels) or "(none)"
-                return self._refusal(
-                    device_id,
-                    channel_id,
-                    "unknown_channel",
-                    f"Command [{idx}]: device {device_id!r} has no channel "
-                    f"{channel_id!r}. Declared: {known}.",
+                return BatchFeasibilityResult(
+                    ok=False,
+                    error=self._refusal(
+                        device_id,
+                        channel_id,
+                        "unknown_channel",
+                        f"Command [{idx}]: device {device_id!r} has no channel "
+                        f"{channel_id!r}. Declared: {known}.",
+                    ),
                 )
             if not channel.is_writable:
-                return self._refusal(
-                    device_id,
-                    channel_id,
-                    "channel_not_writable",
-                    f"Command [{idx}]: channel {channel_id!r} on {device_id!r} is read-only "
-                    "in the admitted declaration.",
+                return BatchFeasibilityResult(
+                    ok=False,
+                    error=self._refusal(
+                        device_id,
+                        channel_id,
+                        "channel_not_writable",
+                        f"Command [{idx}]: channel {channel_id!r} on {device_id!r} is read-only "
+                        "in the admitted declaration.",
+                    ),
                 )
             if channel.effect != HardwareEffect.ACTUATE.value:
-                return self._refusal(
-                    device_id,
-                    channel_id,
-                    "effect_class_mismatch",
-                    f"Command [{idx}]: channel {channel_id!r} declares effect "
-                    f"{channel.effect!r}; hw_batch_actuate requires effect=actuate.",
+                return BatchFeasibilityResult(
+                    ok=False,
+                    error=self._refusal(
+                        device_id,
+                        channel_id,
+                        "effect_class_mismatch",
+                        f"Command [{idx}]: channel {channel_id!r} declares effect "
+                        f"{channel.effect!r}; hw_batch_actuate requires effect=actuate.",
+                    ),
                 )
 
             envelope = channel.envelope
-            in_envelope = envelope.contains(value)
-            if not in_envelope:
-                return self._refusal(
-                    device_id,
-                    channel_id,
-                    "value_out_of_envelope",
-                    f"Command [{idx}]: value {value!r} lies outside the declared "
-                    f"envelope for {device_id}.{channel_id}. Call hw_describe to "
-                    "read the allowed range.",
+            if not envelope.contains(value):
+                return BatchFeasibilityResult(
+                    ok=False,
+                    error=self._refusal(
+                        device_id,
+                        channel_id,
+                        "value_out_of_envelope",
+                        f"Command [{idx}]: value {value!r} lies outside the declared "
+                        f"envelope for {device_id}.{channel_id}. Call hw_describe to "
+                        "read the allowed range.",
+                    ),
                 )
 
             wait_s = self._rate_wait_s(device_id, channel, value)
             if wait_s > 0.0:
-                return {
-                    "ok": False,
-                    "device_id": device_id,
-                    "channel_id": channel_id,
-                    "error": (
-                        f"Command [{idx}]: commanding {device_id}.{channel_id} to {value} now "
-                        f"would exceed its declared maximum rate of "
-                        f"{envelope.max_rate:g} {channel.unit or 'units'}/s. Wait about "
-                        f"{wait_s:.2f}s and issue the same command again, or command a "
-                        "smaller step."
-                    ),
-                    "failure_code": "rate_limited",
-                    "retry_after_s": round(wait_s, 3),
-                    "side_effect_state": SIDE_EFFECT_NONE,
-                }
+                return BatchFeasibilityResult(
+                    ok=False,
+                    error={
+                        "ok": False,
+                        "device_id": device_id,
+                        "channel_id": channel_id,
+                        "error": (
+                            f"Command [{idx}]: commanding {device_id}.{channel_id} to {value} now "
+                            f"would exceed its declared maximum rate of "
+                            f"{envelope.max_rate:g} {channel.unit or 'units'}/s. Wait about "
+                            f"{wait_s:.2f}s and issue the same command again, or command a "
+                            "smaller step."
+                        ),
+                        "failure_code": "rate_limited",
+                        "retry_after_s": round(wait_s, 3),
+                        "side_effect_state": SIDE_EFFECT_NONE,
+                    },
+                )
             resolved.append((channel, value))
 
         # ── SafetyPolicy (device-level, once per command) ──
         for idx, (channel, value) in enumerate(resolved):
             safety_ok, safety_reason = self._check_safety(context, channel, value)
             if not safety_ok:
-                return {
-                    "ok": False,
-                    "device_id": device_id,
-                    "channel_id": channel.channel_id,
-                    "error": (
-                        f"Command [{idx}]: safety policy violation: {safety_reason}"
-                    ),
-                    "failure_code": "safety_policy_violation",
-                    "side_effect_state": SIDE_EFFECT_NONE,
-                }
+                return BatchFeasibilityResult(
+                    ok=False,
+                    error={
+                        "ok": False,
+                        "device_id": device_id,
+                        "channel_id": channel.channel_id,
+                        "error": (f"Command [{idx}]: safety policy violation: {safety_reason}"),
+                        "failure_code": "safety_policy_violation",
+                        "side_effect_state": SIDE_EFFECT_NONE,
+                    },
+                )
 
         # ── DegradationPolicy (device-level, once) ──
         if self._registry.is_device_degraded(device_id):
-            return self._refusal(
-                device_id,
-                "",
-                "device_degraded",
-                "Device is in degraded state (communication or sensor loss). "
-                "Commands blocked until recovery.",
+            return BatchFeasibilityResult(
+                ok=False,
+                error=self._refusal(
+                    device_id,
+                    "",
+                    "device_degraded",
+                    "Device is in degraded state (communication or sensor loss). "
+                    "Commands blocked until recovery.",
+                ),
             )
 
         # ── Reachability (once for the device) ──
         unreachable = await self._unreachable(device_id, resolved[0][0])
         if unreachable is not None:
-            return unreachable
+            return BatchFeasibilityResult(ok=False, error=unreachable)
 
         # ── Interlocks (union of all channels) ──
         all_interlocks_failed: list[str] = []
@@ -558,12 +664,8 @@ class HardwareTools:
                     all_interlocks_failed.append(name)
 
         # ── Build batch approval descriptor ──
-        # Use the first channel for the primary descriptor; metadata carries
-        # the full command list so the approval UI can render all of them.
-        any_irreversible = any(
-            not ch.envelope.reversible for ch, _ in resolved
-        )
-        channel_summaries = [
+        any_irreversible = any(not ch.envelope.reversible for ch, _ in resolved)
+        channel_summaries = tuple(
             {
                 "channel_id": ch.channel_id,
                 "quantity": ch.quantity,
@@ -573,7 +675,7 @@ class HardwareTools:
                 "reversible": ch.envelope.reversible,
             }
             for ch, v in resolved
-        ]
+        )
         descriptor = ActionDescriptor.device(
             kind=ActionKind.DEVICE_ACTUATE.value,
             device_id=device_id,
@@ -581,66 +683,48 @@ class HardwareTools:
             quantity="batch",
             value=f"{len(resolved)} channels",
             unit="",
-            envelope_band="batch",
+            envelope_band=_batch_grant_identity(channel_summaries),
             location=context.location,
             reversible=not any_irreversible,
             metadata={
                 "batch": True,
-                "commands": channel_summaries,
+                "commands": list(channel_summaries),
                 "interlocks_satisfied": not all_interlocks_failed,
                 "interlocks_failed": list(all_interlocks_failed),
-                "session_id": self._session_id,
+                "session_id": self._session_identity(),
+                "grant_identity": _batch_grant_identity(channel_summaries),
+                **({"source": source} if source else {}),
             },
         )
 
-        if dry_run:
-            ok = not all_interlocks_failed
-            return {
-                "ok": ok,
-                "device_id": device_id,
-                "preview": True,
-                "side_effect_state": SIDE_EFFECT_NONE,
-                "plan": {
-                    "summary": descriptor.summary,
-                    "detail": descriptor.detail,
-                    "resource": descriptor.resource,
-                    "batch_size": len(resolved),
-                    "commands": channel_summaries,
-                    "any_irreversible": any_irreversible,
-                    "requires_approval": True,
-                    "interlocks_satisfied": not all_interlocks_failed,
-                    "interlocks_failed": list(all_interlocks_failed),
-                },
-                **({
-                    "failure_code": "interlocks_unsatisfied",
-                    "error": (
-                        f"Interlocks {all_interlocks_failed} are not satisfied; "
-                        "the real command would be refused."
-                    ),
-                } if all_interlocks_failed else {
-                    "next_step": (
-                        "Dry run only: nothing was commanded. Re-issue the same call "
-                        "without dry_run to execute it, which will require approval."
-                    ),
-                }),
-            }
+        return BatchFeasibilityResult(
+            ok=True,
+            context=context,
+            resolved=tuple(resolved),
+            descriptor=descriptor,
+            interlocks_failed=tuple(all_interlocks_failed),
+            dry_run=dry_run,
+            verify=verify,
+            any_irreversible=any_irreversible,
+            channel_summaries=tuple(channel_summaries),
+            source=source,
+        )
 
-        if all_interlocks_failed:
-            # Use the first channel for the readiness failure, listing all failed interlocks.
-            return self._not_ready(context, resolved[0][0], tuple(all_interlocks_failed))
+    async def _execute_batch_write(
+        self, feasibility: BatchFeasibilityResult
+    ) -> dict[str, Any]:
+        """Execute the approved batch write: transport, audit, trust, verification."""
+        from leapflow.hardware.transport import BatchTransport
 
-        allowed, denial = await self._evaluate(descriptor)
-        if not allowed:
-            return self._refusal(device_id, "", "approval_denied", denial)
+        device_id = feasibility.context.device_id
+        resolved = list(feasibility.resolved)
+        context = feasibility.context
 
-        # ── Execute ──
         try:
             async with self._registry.device_io(device_id):
                 transport = await self._registry.transport(device_id)
                 if isinstance(transport, BatchTransport):
-                    command_tuples = tuple(
-                        (ch.channel_id, v) for ch, v in resolved
-                    )
+                    command_tuples = tuple((ch.channel_id, v) for ch, v in resolved)
                     batch_outcome = await transport.write_batch(command_tuples)
                 else:
                     logger.warning(
@@ -648,19 +732,8 @@ class HardwareTools:
                         "falling back to sequential writes (non-atomic)",
                         device_id,
                     )
-                    outcomes: list[WriteOutcome] = []
-                    for ch, v in resolved:
-                        outcome = await transport.write(ch.channel_id, v)
-                        outcomes.append(outcome)
-                    # Build a synthetic BatchWriteOutcome from sequential results.
-                    all_ok = all(o.ok for o in outcomes)
-                    worst_effect = self._worst_side_effect(
-                        [o.side_effect_state for o in outcomes]
-                    )
-                    batch_outcome = BatchWriteOutcome(
-                        ok=all_ok,
-                        outcomes=tuple(outcomes),
-                        side_effect_state=worst_effect,
+                    batch_outcome = await execute_sequential_batch(
+                        transport, tuple((ch.channel_id, v) for ch, v in resolved)
                     )
         except TransportError as exc:
             if self._trust_gate is not None:
@@ -675,8 +748,7 @@ class HardwareTools:
             }
         except Exception as exc:  # noqa: BLE001 - see _write for rationale
             logger.error(
-                "Hardware transport raised a non-contract exception on batch write "
-                "to %s: %s",
+                "Hardware transport raised a non-contract exception on batch write to %s: %s",
                 device_id,
                 exc,
                 exc_info=True,
@@ -698,10 +770,24 @@ class HardwareTools:
             }
 
         # ── Post-write bookkeeping per channel ──
+        expectation_time = time.time()
+        identity = self._session_identity()
+        expectations = [
+            WriteExpectation.from_channel(
+                device_id=device_id,
+                channel=channel,
+                commanded_value=value,
+                now=expectation_time,
+                identity=identity,
+            )
+            for channel, value in resolved
+        ]
+        resolved_outcomes: list[Any | None] = []
         per_channel_results: list[dict] = []
         for i, (channel, value) in enumerate(resolved):
             outcome = batch_outcome.outcomes[i] if i < len(batch_outcome.outcomes) else None
             ch_ok = outcome.ok if outcome else False
+            resolved_outcome = None
 
             self._audit.record(
                 action="batch_write",
@@ -709,25 +795,29 @@ class HardwareTools:
                 channel=channel.channel_id,
                 value=value,
                 outcome="ok" if ch_ok else (outcome.failure_code if outcome else "error"),
-                identity=self._session_id,
+                identity=self._session_identity(),
             )
 
-            if self._trust_gate is not None:
-                if ch_ok:
-                    self._trust_gate.record_success(device_id, channel.channel_id)
-                else:
-                    self._trust_gate.record_failure(device_id, channel.channel_id)
+            not_attempted = outcome is not None and outcome.failure_code == "batch_not_attempted"
+            if self._trust_gate is not None and not ch_ok and not not_attempted:
+                self._trust_gate.record_failure(
+                    device_id, channel.channel_id,
+                    hard=outcome is not None and outcome.failure_code == "driver_contract_violation",
+                )
 
             if ch_ok:
                 numeric = as_numeric(value)
                 if numeric is not None:
                     self._registry.record_command(device_id, channel.channel_id, numeric)
                 if outcome:
-                    self._learn_from_write(device_id, channel, value, "", outcome)
-            else:
+                    resolved_outcome = self._learn_from_write(
+                        device_id, channel, value, "", outcome
+                    )
+            elif not not_attempted:
                 recorder = self._registry.outcome_recorder
                 if recorder is not None:
                     recorder.drop_pending(device_id, channel.channel_id)
+            resolved_outcomes.append(resolved_outcome)
 
             ch_result: dict = {
                 "channel_id": channel.channel_id,
@@ -735,19 +825,32 @@ class HardwareTools:
             }
             if outcome:
                 ch_result["side_effect_state"] = outcome.side_effect_state
+                if outcome.failure_code:
+                    ch_result["failure_code"] = outcome.failure_code
+                if not_attempted:
+                    ch_result["attempted"] = False
                 if outcome.readback is not None:
                     ch_result["readback"] = outcome.readback.to_dict()
                 if not ch_ok and outcome.error:
                     ch_result["error"] = outcome.error
             per_channel_results.append(ch_result)
 
-        # ── Optional verification ──
-        if verify and batch_outcome.ok:
-            verification_results = await self._batch_verify(device_id, resolved)
-            if verification_results:
-                for i, vr in enumerate(verification_results):
-                    if i < len(per_channel_results) and vr is not None:
-                        per_channel_results[i]["verification"] = vr
+        # ── Typed physical-effect verification ──
+        if batch_outcome.ok:
+            if feasibility.verify:
+                verdicts = await self._write_verifier.verify_batch(
+                    device_id,
+                    resolved,
+                    expectations,
+                    resolved_outcomes,
+                )
+            else:
+                verdicts = [
+                    self._write_verifier.defer_or_refuse(context, expectation)
+                    for expectation in expectations
+                ]
+            for channel_result, verdict in zip(per_channel_results, verdicts, strict=True):
+                channel_result["verification"] = verdict.to_dict()
 
         payload: dict = {
             "ok": batch_outcome.ok,
@@ -757,10 +860,14 @@ class HardwareTools:
             "channels": per_channel_results,
         }
         if not batch_outcome.ok:
-            failed_channels = [
-                r["channel_id"] for r in per_channel_results if not r.get("ok")
-            ]
+            failed_channels = [r["channel_id"] for r in per_channel_results if not r.get("ok")]
             payload["failed_channels"] = failed_channels
+            if batch_outcome.side_effect_state != SIDE_EFFECT_NONE:
+                payload["effect_uncertain"] = True
+                payload["next_step"] = (
+                    "The batch did not complete and some effects may have landed. "
+                    "Verify each attempted channel before resuming; do not replay the batch."
+                )
             if any(not ch.envelope.reversible for ch, _ in resolved):
                 payload["effect_uncertain"] = True
                 payload["next_step"] = (
@@ -769,53 +876,6 @@ class HardwareTools:
                     "irreversible channels."
                 )
         return payload
-
-    async def _batch_verify(
-        self,
-        device_id: str,
-        resolved: list[tuple[Channel, Any]],
-    ) -> list[dict | None]:
-        """Run post-write verification for each channel in a batch.
-
-        Returns a list parallel to *resolved*, with verification result dicts
-        or None when verification is not applicable or not available.
-        Uses tolerance-based comparison for floating-point values to avoid
-        false negatives on robot joint positions.
-        """
-        from leapflow.hardware.context import as_numeric
-
-        results: list[dict | None] = []
-        for channel, value in resolved:
-            try:
-                transport = await self._registry.transport(device_id)
-                reading = await transport.read(channel.channel_id)
-                commanded_num = as_numeric(value)
-                readback_num = as_numeric(reading.value)
-                if commanded_num is not None and readback_num is not None:
-                    deviation = abs(readback_num - commanded_num)
-                    # Use envelope tolerance or default 1e-3.
-                    tol = getattr(channel.envelope, "tolerance", 0.0) or 1e-3
-                    match = deviation <= tol
-                else:
-                    deviation = None
-                    match = reading.value == value
-                results.append({
-                    "channel_id": channel.channel_id,
-                    "commanded": value,
-                    "readback": reading.value,
-                    "match": match,
-                    "deviation": deviation,
-                })
-            except Exception as exc:  # noqa: BLE001 - verification must not fail the batch
-                logger.warning(
-                    "Post-write verification failed for %s.%s: %s",
-                    device_id,
-                    channel.channel_id,
-                    exc,
-                    exc_info=True,
-                )
-                results.append(None)
-        return results
 
     @staticmethod
     def _worst_side_effect(states: list[str]) -> str:
@@ -840,116 +900,198 @@ class HardwareTools:
     # ── Real-time control tools ──
 
     async def control_start(self, **params: Any) -> dict[str, Any]:
-        """Start a real-time control loop on a device.
+        """Validate, approve, and start a local real-time control session.
 
-        Constructs the appropriate :class:`ControlPolicy` based on *mode* and
-        delegates to ``registry.start_control_loop``.  The bus is created once
-        per device and cached by the registry.
+        The structure is a three-phase pipeline mirroring ``_write``:
+
+        1. **Feasibility** (_check_control_feasibility): resolve, describe,
+           LHP rejection, frequency, control plan validation, degradation,
+           reachability, interlocks, descriptor construction.
+        2. **Approval** (_evaluate via WriteGovernor): trust skip or gate.
+        3. **Execution** (_execute_control_start): policy build, loop start,
+           audit.
+        """
+        feasibility = await self._check_control_feasibility(params)
+        if not feasibility.ok:
+            return feasibility.error  # type: ignore[return-value]
+
+        device_id = feasibility.context.device_id
+
+        if feasibility.dry_run:
+            return _control_preview_result(feasibility)
+
+        if feasibility.interlocks_failed:
+            return self._not_ready(
+                feasibility.context,
+                feasibility.resolved[0][0],
+                feasibility.interlocks_failed,
+            )
+
+        allowed, denial, no_gate = await self._evaluate(feasibility.descriptor)
+        if not allowed:
+            result = self._refusal(device_id, "", "approval_denied", denial)
+            if no_gate:
+                result["interaction_request"] = _no_gate_interaction(device_id)
+            return result
+
+        return await self._execute_control_start(feasibility, params)
+
+    async def _check_control_feasibility(
+        self, params: Mapping[str, Any]
+    ) -> ControlFeasibilityResult:
+        """Run the full pre-approval feasibility chain for a control session.
+
+        Returns a ``ControlFeasibilityResult`` whose ``ok`` field indicates
+        whether the session passed all checks. On failure, ``error`` carries
+        the refusal payload; on success all plan fields are populated.
         """
         device_id = str(params.get("device_id") or "")
         mode = str(params.get("mode") or "")
-        targets = params.get("targets") or {}
-        frequency_hz = float(params.get("frequency_hz") or 100)
-        trajectory = params.get("trajectory") or []
-        policy_path = str(params.get("policy") or "")
-        gains = params.get("gains") or {}
+        dry_run = bool(params.get("dry_run"))
 
         context = self._registry.context(device_id)
         if context is None:
-            return self._unknown_device(device_id)
+            return ControlFeasibilityResult(
+                ok=False, error=self._unknown_device(device_id)
+            )
+        if self._requires_describe(device_id):
+            return ControlFeasibilityResult(
+                ok=False,
+                error=self._refusal(
+                    device_id,
+                    "",
+                    "describe_required",
+                    f"Call hw_describe(device_id={device_id!r}) before opening a control session.",
+                ),
+            )
+        if context.transport.kind == "lhp":
+            # Remote control via control.v1 — route through RemoteControlTransport.
+            # We check the *already-opened* transport to avoid forcing a
+            # connection during feasibility evaluation.  If the transport
+            # hasn't been opened yet (no prior read/write), we can't know
+            # whether the node advertises control.v1 -- reject early.
+            from leapflow.hardware.transport import RemoteControlTransport
 
-        from leapflow.hardware.control_bus import ControlBusConfig
-        from leapflow.hardware.realtime import (
-            ImpedanceController,
-            PIDJointController,
-            TrajectoryTracker,
-        )
-
-        joint_ids = tuple(
-            ch.channel_id for ch in context.channels if ch.is_writable
-        )
-        if not joint_ids:
-            return self._refusal(
-                device_id, "", "no_writable_channels",
-                f"Device {device_id!r} has no writable channels for control.",
+            try:
+                existing_transport = self._registry.get_open_transport(device_id)
+            except Exception:  # noqa: BLE001
+                existing_transport = None
+            if existing_transport is None or not isinstance(
+                existing_transport, RemoteControlTransport
+            ):
+                return ControlFeasibilityResult(
+                    ok=False,
+                    error=self._refusal(
+                        device_id,
+                        "",
+                        "remote_control_unsupported",
+                        "Node does not advertise control.v1 capability; "
+                        "remote control sessions are not available.",
+                    ),
+                )
+            # Fall through: LHP with RemoteControlTransport is allowed
+            pass
+        try:
+            frequency_hz = float(params.get("frequency_hz", 100.0))
+        except (TypeError, ValueError):
+            frequency_hz = 0.0
+        if not math.isfinite(frequency_hz) or frequency_hz <= 0.0:
+            return ControlFeasibilityResult(
+                ok=False,
+                error=self._refusal(
+                    device_id,
+                    "",
+                    "invalid_frequency",
+                    "frequency_hz must be a positive finite number.",
+                ),
             )
 
-        bus_config = ControlBusConfig(frequency_hz=frequency_hz)
+        plan, error = self._control_plan(context, mode, params)
+        if error is not None:
+            return ControlFeasibilityResult(ok=False, error=error)
+        assert plan is not None
+        resolved, targets, waypoints = plan
 
-        kp = float(gains.get("kp", 10.0))
-        ki = float(gains.get("ki", 0.1))
-        kd = float(gains.get("kd", 1.0))
-        stiffness = float(gains.get("stiffness", 100.0))
-        damping = float(gains.get("damping", 10.0))
+        if self._registry.is_device_degraded(device_id):
+            return ControlFeasibilityResult(
+                ok=False,
+                error=self._refusal(
+                    device_id,
+                    "",
+                    "device_degraded",
+                    "Device is degraded; control startup is blocked until recovery.",
+                ),
+            )
+        unreachable = await self._unreachable(device_id, resolved[0][0])
+        if unreachable is not None:
+            return ControlFeasibilityResult(ok=False, error=unreachable)
 
-        policy: Any
+        failed_interlocks = await self._control_interlocks(context, resolved)
+        descriptor = self._control_descriptor(
+            context, mode, frequency_hz, resolved, failed_interlocks,
+        )
+
+        return ControlFeasibilityResult(
+            ok=True,
+            context=context,
+            resolved=tuple(resolved),
+            mode=mode,
+            frequency_hz=frequency_hz,
+            targets=targets,
+            waypoints=tuple(waypoints),
+            descriptor=descriptor,
+            interlocks_failed=failed_interlocks,
+            dry_run=dry_run,
+        )
+
+    async def _execute_control_start(
+        self,
+        feasibility: ControlFeasibilityResult,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Build the control policy, start the loop, and record audit."""
+        device_id = feasibility.context.device_id
+        mode = feasibility.mode
+        frequency_hz = feasibility.frequency_hz
+        resolved = list(feasibility.resolved)
+
+        # Remote device (LHP with control.v1) → delegate to RemoteControlTransport
+        if feasibility.context.transport.kind == "lhp":
+            return await self._execute_remote_control_start(feasibility, params)
+
+        policy, policy_error = self._build_control_policy(
+            mode,
+            tuple(channel.channel_id for channel, _ in resolved),
+            feasibility.targets,
+            feasibility.waypoints,
+            params,
+        )
+        if policy_error is not None:
+            return policy_error
         try:
-            if mode == "pid":
-                policy = PIDJointController(joint_ids, kp=kp, ki=ki, kd=kd)
-                if targets:
-                    policy.set_target(targets)
-            elif mode == "impedance":
-                policy = ImpedanceController(
-                    joint_ids, stiffness=stiffness, damping=damping,
-                )
-                if targets:
-                    policy.set_reference(targets)
-            elif mode == "trajectory":
-                if not trajectory:
-                    return self._refusal(
-                        device_id, "", "missing_trajectory",
-                        "trajectory parameter is required for trajectory mode.",
-                    )
-                inner = PIDJointController(joint_ids, kp=kp, ki=ki, kd=kd)
-                waypoints = tuple(
-                    (float(wp.get("t", i)), dict(wp.get("positions", {})))
-                    for i, wp in enumerate(trajectory)
-                )
-                policy = TrajectoryTracker(inner, waypoints, loop_mode="hold_final")
-            elif mode == "policy_chain":
-                if not policy_path:
-                    return self._refusal(
-                        device_id, "", "missing_policy",
-                        "policy parameter is required for policy_chain mode.",
-                    )
-                # Defer to the caller for the outer policy; return a descriptor
-                # that can be chained later.
-                return {
-                    "ok": False,
-                    "error": (
-                        "policy_chain mode requires an external policy; "
-                        "use hw_policy_infer with real-time execution instead."
-                    ),
-                }
-            else:
-                return self._refusal(
-                    device_id, "", "unknown_mode",
-                    f"Unknown control mode {mode!r}; "
-                    "supported: pid, impedance, trajectory, policy_chain.",
-                )
-        except (ValueError, TypeError) as exc:
-            return {
-                "ok": False,
-                "device_id": device_id,
-                "error": f"Failed to create control policy: {exc}",
-            }
-
-        try:
-            # Ensure the transport is opened in the main event loop *before*
-            # the RT control thread starts.  The thread uses the lock-free
-            # ``get_open_transport()`` to avoid crossing event-loop boundaries
-            # with the registry's asyncio.Lock (H1 fix).
             await self._registry.transport(device_id)
-            self._registry.start_control_loop(device_id, policy, config=bus_config)
-        except RuntimeError as exc:
-            return {"ok": False, "device_id": device_id, "error": str(exc)}
+            from leapflow.hardware.control_bus import ControlBusConfig
+
+            self._registry.start_control_loop(
+                device_id,
+                policy,
+                config=ControlBusConfig(frequency_hz=frequency_hz),
+            )
+        except (RuntimeError, ValueError) as exc:
+            return self._refusal(
+                device_id,
+                "",
+                "control_start_failed",
+                str(exc),
+                side_effect_state=SIDE_EFFECT_UNKNOWN,
+            )
 
         self._audit.record(
             action="control_start",
             device=device_id,
             value=mode,
             outcome="ok",
-            identity=self._session_id,
+            identity=self._session_identity(),
         )
         return {
             "ok": True,
@@ -957,7 +1099,290 @@ class HardwareTools:
             "mode": mode,
             "frequency_hz": frequency_hz,
             "policy_id": getattr(policy, "policy_id", mode),
+            "side_effect_state": SIDE_EFFECT_COMMITTED,
         }
+
+    async def _execute_remote_control_start(
+        self,
+        feasibility: ControlFeasibilityResult,
+        params: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Start a remote control session via RemoteControlTransport (control.v1)."""
+        from leapflow.hardware.transport import RemoteControlTransport
+
+        device_id = feasibility.context.device_id
+        mode = feasibility.mode
+        frequency_hz = feasibility.frequency_hz
+        resolved = list(feasibility.resolved)
+
+        transport = await self._registry.transport(device_id)
+        if not isinstance(transport, RemoteControlTransport):
+            return self._refusal(
+                device_id, "", "remote_control_unsupported",
+                "transport does not support remote control sessions",
+            )
+        lease_s = float(params.get("lease_s", 1.0) or 1.0)
+        comm_loss_policy = str(params.get("comm_loss_policy", "halt") or "halt")
+        try:
+            result = await transport.open_control(
+                device_id=device_id,
+                mode=mode,
+                frequency_hz=frequency_hz,
+                channels=[ch.channel_id for ch, _ in resolved],
+                targets=feasibility.targets,
+                lease_s=lease_s,
+                comm_loss_policy=comm_loss_policy,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return self._refusal(
+                device_id, "", "control_start_failed", str(exc),
+                side_effect_state=SIDE_EFFECT_UNKNOWN,
+            )
+        self._audit.record(
+            action="control_start",
+            device=device_id,
+            value=f"remote:{mode}",
+            outcome="ok",
+            identity=self._session_identity(),
+        )
+        result["ok"] = True
+        result["device_id"] = device_id
+        result["mode"] = mode
+        result["frequency_hz"] = frequency_hz
+        result["side_effect_state"] = SIDE_EFFECT_COMMITTED
+        return result
+
+    def _control_points(
+        self, device_id: str, mode: str, params: Mapping[str, Any]
+    ) -> tuple[
+        list[tuple[float, Mapping[str, Any]]] | None,
+        dict[str, Any] | None,
+    ]:
+        """Parse control targets without allowing malformed inputs to escape."""
+        if mode in {"pid", "impedance"}:
+            targets = params.get("targets")
+            if not isinstance(targets, Mapping) or not targets:
+                return None, self._refusal(
+                    device_id,
+                    "",
+                    "missing_targets",
+                    f"targets are required for {mode} mode.",
+                )
+            return [(0.0, targets)], None
+        if mode != "trajectory":
+            return None, self._refusal(
+                device_id,
+                "",
+                "unknown_mode",
+                f"Unknown control mode {mode!r}; supported: pid, impedance, trajectory.",
+            )
+
+        trajectory = params.get("trajectory")
+        if not isinstance(trajectory, list) or not trajectory:
+            return None, self._refusal(
+                device_id,
+                "",
+                "missing_trajectory",
+                "A non-empty trajectory is required for trajectory mode.",
+            )
+        points: list[tuple[float, Mapping[str, Any]]] = []
+        for index, waypoint in enumerate(trajectory):
+            if not isinstance(waypoint, Mapping) or not isinstance(
+                waypoint.get("positions"), Mapping
+            ):
+                return None, self._refusal(
+                    device_id,
+                    "",
+                    "invalid_trajectory",
+                    f"Waypoint [{index}] must contain a positions object.",
+                )
+            try:
+                point_time = float(waypoint.get("t", index))
+            except (TypeError, ValueError):
+                return None, self._refusal(
+                    device_id,
+                    "",
+                    "invalid_trajectory_time",
+                    f"Waypoint [{index}] time must be a finite number.",
+                )
+            points.append((point_time, waypoint["positions"]))
+        return points, None
+
+    def _control_plan(
+        self, context: HardwareContext, mode: str, params: Mapping[str, Any]
+    ) -> tuple[
+        tuple[
+            list[tuple[Channel, Any]],
+            dict[str, float],
+            tuple[tuple[float, dict[str, float]], ...],
+        ]
+        | None,
+        dict[str, Any] | None,
+    ]:
+        """Normalize and validate every setpoint before control startup."""
+        device_id = context.device_id
+        channels = {
+            channel.channel_id: channel
+            for channel in context.channels
+            if channel.is_writable and channel.effect == HardwareEffect.ACTUATE.value
+        }
+        if not channels:
+            return None, self._refusal(
+                device_id,
+                "",
+                "no_actuation_channels",
+                f"Device {device_id!r} has no writable effect=actuate channels.",
+            )
+        if mode == "policy_chain":
+            return None, self._refusal(
+                device_id,
+                "",
+                "unsupported_control_mode",
+                "policy_chain cannot be opened through hw_control_start; use governed "
+                "single-step hw_policy_infer execution until node-local sessions exist.",
+            )
+        raw_points, point_error = self._control_points(device_id, mode, params)
+        if point_error is not None:
+            return None, point_error
+        if raw_points is None:
+            return None, self._refusal(
+                device_id,
+                "",
+                "invalid_control_plan",
+                "Control targets could not be normalized.",
+            )
+
+        resolved_by_id: dict[str, tuple[Channel, Any]] = {}
+        normalized_points: list[tuple[float, dict[str, float]]] = []
+        previous_time = -1.0
+        previous_values: dict[str, tuple[float, float]] = {}
+        for point_index, (point_time, values) in enumerate(raw_points):
+            if not math.isfinite(point_time) or point_time < previous_time:
+                return None, self._refusal(
+                    device_id,
+                    "",
+                    "invalid_trajectory_time",
+                    f"Waypoint [{point_index}] time must be finite and nondecreasing.",
+                )
+            normalized: dict[str, float] = {}
+            for channel_id, raw_value in values.items():
+                channel = channels.get(str(channel_id))
+                if channel is None:
+                    return None, self._refusal(
+                        device_id,
+                        str(channel_id),
+                        "invalid_control_channel",
+                        f"Control channel {channel_id!r} must be writable with effect=actuate.",
+                    )
+                numeric = as_numeric(raw_value)
+                if numeric is None or not channel.envelope.contains(numeric):
+                    return None, self._refusal(
+                        device_id,
+                        channel.channel_id,
+                        "value_out_of_envelope",
+                        f"Control value {raw_value!r} is outside {device_id}.{channel.channel_id}'s envelope.",
+                    )
+                safety_ok, reason = self._check_safety(context, channel, numeric)
+                if not safety_ok:
+                    return None, self._refusal(
+                        device_id,
+                        channel.channel_id,
+                        "safety_policy_violation",
+                        reason,
+                    )
+                prior = previous_values.get(channel.channel_id)
+                if (
+                    prior is not None
+                    and channel.envelope.rate_wait_s(
+                        delta=numeric - prior[1],
+                        elapsed_s=point_time - prior[0],
+                    )
+                    > 0.0
+                ):
+                    return None, self._refusal(
+                        device_id,
+                        channel.channel_id,
+                        "trajectory_rate_exceeded",
+                        f"Waypoint [{point_index}] exceeds {channel.channel_id}'s declared maximum rate.",
+                    )
+                normalized[channel.channel_id] = numeric
+                previous_values[channel.channel_id] = (point_time, numeric)
+                resolved_by_id[channel.channel_id] = (channel, numeric)
+            if not normalized:
+                return None, self._refusal(
+                    device_id,
+                    "",
+                    "empty_control_point",
+                    f"Control point [{point_index}] contains no actuator targets.",
+                )
+            normalized_points.append((point_time, normalized))
+            previous_time = point_time
+        final_targets = dict(normalized_points[-1][1])
+        return (list(resolved_by_id.values()), final_targets, tuple(normalized_points)), None
+
+    async def _control_interlocks(
+        self, context: HardwareContext, resolved: list[tuple[Channel, Any]]
+    ) -> tuple[str, ...]:
+        failed: list[str] = []
+        for channel, _ in resolved:
+            for name in await self._failed_interlocks(context, channel):
+                if name not in failed:
+                    failed.append(name)
+        return tuple(failed)
+
+    def _control_descriptor(
+        self,
+        context: HardwareContext,
+        mode: str,
+        frequency_hz: float,
+        resolved: list[tuple[Channel, Any]],
+        failed_interlocks: tuple[str, ...],
+    ) -> ActionDescriptor:
+        primary = resolved[0][0]
+        # Per-channel band + mode/frequency superset forms the grant identity.
+        channel_bands = sorted(
+            f"{ch.channel_id}:{ch.envelope.band_key()}"
+            for ch, _ in resolved
+        )
+        grant_id = f"control:{mode}@{frequency_hz:g}Hz|" + "|".join(channel_bands)
+        return ActionDescriptor.device(
+            kind=ActionKind.DEVICE_ACTUATE.value,
+            device_id=context.device_id,
+            channel_id=primary.channel_id,
+            quantity="control_session",
+            value=f"{mode} at {frequency_hz:g} Hz",
+            envelope_band=grant_id,
+            location=context.location,
+            reversible=all(channel.envelope.reversible for channel, _ in resolved),
+            metadata={
+                "control_session": True,
+                "mode": mode,
+                "frequency_hz": frequency_hz,
+                "channels": [channel.channel_id for channel, _ in resolved],
+                "value_in_envelope": True,
+                "interlocks_satisfied": not failed_interlocks,
+                "interlocks_failed": list(failed_interlocks),
+                "session_id": self._session_identity(),
+                "grant_identity": grant_id,
+            },
+        )
+
+    def _build_control_policy(
+        self,
+        mode: str,
+        joint_ids: tuple[str, ...],
+        targets: dict[str, float],
+        waypoints: tuple[tuple[float, dict[str, float]], ...],
+        params: Mapping[str, Any],
+    ) -> tuple[Any, dict[str, Any] | None]:
+        from leapflow.hardware.control_policies import (
+            build_control_policy as _shared_build,
+        )
+
+        policy, error_msg = _shared_build(mode, joint_ids, targets, waypoints, params)
+        if error_msg is not None:
+            return None, self._refusal("", "", "invalid_control_policy", error_msg)
+        return policy, None
 
     async def control_stop(self, **params: Any) -> dict[str, Any]:
         """Stop the real-time control loop on a device."""
@@ -971,8 +1396,16 @@ class HardwareTools:
             action="control_stop",
             device=device_id,
             outcome=result.get("status", "unknown"),
-            identity=self._session_id,
+            identity=self._session_identity(),
         )
+        if result.get("status") == "no_loop":
+            result.update(
+                ok=False,
+                failure_code="not_running",
+                counts_as_failure=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+            )
+            return result
         result["ok"] = True
         return result
 
@@ -998,10 +1431,66 @@ class HardwareTools:
     async def _write(self, tool_name: str, params: Mapping[str, Any]) -> dict[str, Any]:
         """Validate, gate, and execute one physical write.
 
+        The structure is a three-phase pipeline:
+
+        1. **Feasibility** (_check_write_feasibility): resolve, writable, effect,
+           describe, envelope, rate, safety, degraded, reachable, interlocks,
+           descriptor construction. Returns a WriteFeasibilityResult.
+        2. **Approval** (_evaluate via WriteGovernor): trust skip or gate.
+        3. **Execution** (_execute_single_write): transport write, audit, trust,
+           verification.
+        """
+        feasibility = await self._check_write_feasibility(tool_name, params)
+        if not feasibility.ok:
+            return feasibility.error  # type: ignore[return-value]
+
+        if feasibility.dry_run:
+            return _preview_result(
+                feasibility.context.device_id,
+                feasibility.channel,
+                feasibility.descriptor,
+                value=feasibility.value,
+                in_envelope=feasibility.in_envelope,
+                interlocks_failed=feasibility.interlocks_failed,
+            )
+
+        if feasibility.interlocks_failed:
+            return self._not_ready(
+                feasibility.context,
+                feasibility.channel,
+                feasibility.interlocks_failed,
+            )
+
+        allowed, denial, no_gate = await self._evaluate(feasibility.descriptor)
+        if not allowed:
+            result = self._refusal(
+                feasibility.context.device_id,
+                feasibility.channel.channel_id,
+                "approval_denied",
+                denial,
+            )
+            if no_gate:
+                result["interaction_request"] = _no_gate_interaction(
+                    feasibility.context.device_id
+                )
+            return result
+
+        return await self._execute_single_write(feasibility)
+
+    async def _check_write_feasibility(
+        self, tool_name: str, params: Mapping[str, Any]
+    ) -> WriteFeasibilityResult:
+        """Run the full pre-approval feasibility chain for a single-channel write.
+
         Order is fixed and matches the platform rule that feasibility precedes
         consent: resolve the target, check that the command *could* succeed, and
-        only then ask a human. Prompting for a command that will be refused anyway
-        teaches people to click through prompts.
+        only then present it for approval. Prompting for a command that will be
+        refused anyway teaches people to click through prompts.
+
+        Returns a ``WriteFeasibilityResult`` whose ``ok`` field indicates whether
+        the command passed all checks. On failure, ``error`` carries the refusal
+        payload; on success, ``context``, ``channel``, ``descriptor``, and
+        ``value`` are all populated.
         """
         kind, expected_effect = _WRITE_TOOLS[tool_name]
         device_id = str(params.get("device_id") or "")
@@ -1012,107 +1501,99 @@ class HardwareTools:
 
         context, channel, error = self._resolve(device_id, channel_id)
         if error is not None:
-            return error
+            return WriteFeasibilityResult(ok=False, error=error)
 
         # Writability is checked before the effect class, because a channel demoted
         # by an admission rule is the *root* cause and naming anything else sends the
         # reader looking in the wrong place.
         if not channel.is_writable:
-            return self._refusal(
-                device_id,
-                channel_id,
-                "channel_not_writable",
-                f"Channel {channel_id!r} on {device_id!r} is read-only in the admitted "
-                "declaration. Run hw_describe to see why, and check the device declaration.",
+            return WriteFeasibilityResult(
+                ok=False,
+                error=self._refusal(
+                    device_id,
+                    channel_id,
+                    "channel_not_writable",
+                    f"Channel {channel_id!r} on {device_id!r} is read-only in the admitted "
+                    "declaration. Run hw_describe to see why, and check the device declaration.",
+                ),
             )
 
         if channel.effect != expected_effect:
-            return self._refusal(
-                device_id,
-                channel_id,
-                "effect_class_mismatch",
-                f"Channel {channel_id!r} declares effect {channel.effect!r}; use "
-                f"{_tool_for_effect(channel.effect)} instead of {tool_name}.",
+            return WriteFeasibilityResult(
+                ok=False,
+                error=self._refusal(
+                    device_id,
+                    channel_id,
+                    "effect_class_mismatch",
+                    f"Channel {channel_id!r} declares effect {channel.effect!r}; use "
+                    f"{_tool_for_effect(channel.effect)} instead of {tool_name}.",
+                ),
             )
 
         if self._requires_describe(device_id):
-            return self._refusal(
-                device_id,
-                channel_id,
-                "describe_required",
-                f"Call hw_describe(device_id={device_id!r}) before commanding it. Writing to a "
-                "channel whose envelope you have not read risks an out-of-range command; the "
-                "describe result carries the allowed range, rate, and reversibility.",
+            return WriteFeasibilityResult(
+                ok=False,
+                error=self._refusal(
+                    device_id,
+                    channel_id,
+                    "describe_required",
+                    f"Call hw_describe(device_id={device_id!r}) before commanding it. Writing to a "
+                    "channel whose envelope you have not read risks an out-of-range command; the "
+                    "describe result carries the allowed range, rate, and reversibility.",
+                ),
             )
 
         envelope = channel.envelope
         in_envelope = envelope.contains(value)
-        # Pacing applies only to a command that would otherwise be permitted. A value
-        # outside the envelope is never valid, so telling the caller to wait and retry
-        # would send it to sleep on advice that cannot work; that case must fall
-        # through to the hardline denial below, which is terminal for a reason.
         wait_s = self._rate_wait_s(device_id, channel, value) if in_envelope else 0.0
         if wait_s > 0.0:
-            # Refused before consent is sought, and refused *retryably*: unlike an
-            # out-of-envelope value, this exact command becomes safe once enough time
-            # has passed, so the caller is told how long rather than being handed a
-            # terminal denial it cannot act on.
-            return {
-                "ok": False,
-                "device_id": device_id,
-                "channel_id": channel_id,
-                "error": (
-                    f"Commanding {device_id}.{channel_id} to {value} now would exceed its "
-                    f"declared maximum rate of {envelope.max_rate:g} {channel.unit or 'units'}"
-                    f"/s. Wait about {wait_s:.2f}s and issue the same command again, or "
-                    "command a smaller step."
-                ),
-                "failure_code": "rate_limited",
-                "retry_after_s": round(wait_s, 3),
-                "side_effect_state": SIDE_EFFECT_NONE,
-            }
-
-        # SafetyPolicy is a device-level constraint layer above the per-channel
-        # envelope. It is evaluated after the envelope (which governs per-channel
-        # bounds) and before reachability/approval, because a command that violates
-        # the safety policy must never reach the transport, and prompting for a
-        # command the safety layer will refuse teaches people to click through
-        # prompts.  When no SafetyPolicy is declared (hc.v0 device), the check
-        # passes -- backward compatible.
-        safety_ok, safety_reason = self._check_safety(context, channel, value)
-        if not safety_ok:
-            return {
-                "ok": False,
-                "device_id": device_id,
-                "channel_id": channel_id,
-                "error": f"Safety policy violation: {safety_reason}",
-                "failure_code": "safety_policy_violation",
-                "side_effect_state": SIDE_EFFECT_NONE,
-            }
-
-        # DegradationPolicy: a device whose stream source has entered a degraded
-        # state (communication loss or sustained sensor failure) must not accept
-        # new commands.  The flag is set by the sampling loop and cleared
-        # automatically on recovery.  Checked after the safety policy because a
-        # safety violation is a harder failure; degradation is transient.
-        if self._registry.is_device_degraded(device_id):
-            return self._refusal(
-                device_id,
-                channel_id,
-                "device_degraded",
-                "Device is in degraded state (communication or sensor loss). "
-                "Commands blocked until recovery.",
+            return WriteFeasibilityResult(
+                ok=False,
+                error={
+                    "ok": False,
+                    "device_id": device_id,
+                    "channel_id": channel_id,
+                    "error": (
+                        f"Commanding {device_id}.{channel_id} to {value} now would exceed its "
+                        f"declared maximum rate of {envelope.max_rate:g} {channel.unit or 'units'}"
+                        f"/s. Wait about {wait_s:.2f}s and issue the same command again, or "
+                        "command a smaller step."
+                    ),
+                    "failure_code": "rate_limited",
+                    "retry_after_s": round(wait_s, 3),
+                    "side_effect_state": SIDE_EFFECT_NONE,
+                },
             )
 
-        # Reachability precedes both interlocks and consent. Before interlocks,
-        # because an interlock cannot be evaluated on a device that cannot be reached
-        # and reporting "interlock unevaluable" would name the wrong root cause --
-        # the same reason writability is checked before the effect class. Before
-        # consent, because asking a human to authorise a command against a device
-        # that was never reachable is how people learn to click through prompts.
+        safety_ok, safety_reason = self._check_safety(context, channel, value)
+        if not safety_ok:
+            return WriteFeasibilityResult(
+                ok=False,
+                error={
+                    "ok": False,
+                    "device_id": device_id,
+                    "channel_id": channel_id,
+                    "error": f"Safety policy violation: {safety_reason}",
+                    "failure_code": "safety_policy_violation",
+                    "side_effect_state": SIDE_EFFECT_NONE,
+                },
+            )
+
+        if self._registry.is_device_degraded(device_id):
+            return WriteFeasibilityResult(
+                ok=False,
+                error=self._refusal(
+                    device_id,
+                    channel_id,
+                    "device_degraded",
+                    "Device is in degraded state (communication or sensor loss). "
+                    "Commands blocked until recovery.",
+                ),
+            )
+
         unreachable = await self._unreachable(device_id, channel)
         if unreachable is not None:
-            return unreachable
+            return WriteFeasibilityResult(ok=False, error=unreachable)
 
         interlocks_failed = await self._failed_interlocks(context, channel)
 
@@ -1130,54 +1611,43 @@ class HardwareTools:
                 "value_in_envelope": in_envelope,
                 "interlocks_satisfied": not interlocks_failed,
                 "interlocks_failed": list(interlocks_failed),
-                "session_id": self._session_id,
+                "session_id": self._session_identity(),
             },
         )
 
-        if dry_run:
-            # A dry run stops here on purpose. Every feasibility check above has
-            # already run -- resolution, writability, effect class, describe,
-            # envelope, rate, reachability, interlocks -- and the approval
-            # descriptor is built, but neither consent nor the physical write is
-            # attempted. The verdict is NONE because nothing reached the device,
-            # which is the whole point: a preview must be safe to issue against an
-            # irreversible channel. It works even with no gate installed, since it
-            # returns before ``_evaluate``.
-            return _preview_result(
-                device_id,
-                channel,
-                descriptor,
-                value=value,
-                in_envelope=in_envelope,
-                interlocks_failed=interlocks_failed,
-            )
+        return WriteFeasibilityResult(
+            ok=True,
+            context=context,
+            channel=channel,
+            descriptor=descriptor,
+            in_envelope=in_envelope,
+            interlocks_failed=interlocks_failed,
+            dry_run=dry_run,
+            value=value,
+            conditions=conditions,
+        )
 
-        # Readiness is a feasibility verdict, so it is settled before consent is
-        # sought. A channel guarded by an interlock -- the declared form of "must
-        # be homed/initialised/calibrated first" -- cannot be commanded until that
-        # precondition holds, and an unmet one is a deterministic hard stop rather
-        # than a prompt: asking a human to approve a command that cannot yet
-        # succeed teaches them to click through prompts. The refusal names the
-        # exact precondition and the init to run, routed through the shared
-        # permission-failure authority so the engine and TUI report it alike. The
-        # risk classifier keeps its own interlock hardline as defence in depth for
-        # any descriptor built outside this path.
-        if interlocks_failed:
-            return self._not_ready(context, channel, interlocks_failed)
+    async def _execute_single_write(
+        self, feasibility: WriteFeasibilityResult
+    ) -> dict[str, Any]:
+        """Execute a single-channel write after approval has been granted.
 
-        allowed, denial = await self._evaluate(descriptor)
-        if not allowed:
-            return self._refusal(device_id, channel_id, "approval_denied", denial)
+        Takes a passed WriteFeasibilityResult and performs the physical write via
+        the transport, records audit, handles trust updates, and produces the
+        typed verification verdict.
+        """
+        context = feasibility.context
+        channel = feasibility.channel
+        device_id = context.device_id
+        channel_id = channel.channel_id
+        value = feasibility.value
+        conditions = feasibility.conditions
 
         try:
-            # Serialised against every other data-plane call on this device: an
-            # interleaved write and read on one bus is how a command lands on the
-            # wrong channel, and that outcome is indistinguishable from success.
             async with self._registry.device_io(device_id):
                 transport = await self._registry.transport(device_id)
                 outcome = await transport.write(channel_id, value)
         except TransportError as exc:
-            # A transport raises this only for "could not attempt", so no effect landed.
             if self._trust_gate is not None:
                 self._trust_gate.record_failure(device_id, channel_id)
             return {
@@ -1189,12 +1659,6 @@ class HardwareTools:
                 "side_effect_state": SIDE_EFFECT_NONE,
             }
         except Exception as exc:  # noqa: BLE001 - see below
-            # A driver that raises something other than TransportError has broken
-            # the contract, and at that point nothing can be concluded about what
-            # reached the device. Reporting it as UNKNOWN rather than letting it
-            # propagate is the safe reading: UNKNOWN blocks replay just as
-            # COMMITTED does, whereas an escaping exception carries no effect
-            # verdict at all and invites the caller to simply try again.
             logger.error(
                 "Hardware transport raised a non-contract exception on write to %s.%s: %s",
                 device_id,
@@ -1224,29 +1688,48 @@ class HardwareTools:
             channel=channel_id,
             value=value,
             outcome="ok" if outcome.ok else (outcome.failure_code or "error"),
-            identity=self._session_id,
+            identity=self._session_identity(),
         )
 
-        # ── Trust gate: record success / failure ──
-        if self._trust_gate is not None:
-            if outcome.ok:
-                self._trust_gate.record_success(device_id, channel_id)
-            else:
-                self._trust_gate.record_failure(device_id, channel_id)
+        if self._trust_gate is not None and not outcome.ok:
+            self._trust_gate.record_failure(device_id, channel_id)
 
+        resolved_outcome = None
         if outcome.ok:
             numeric = as_numeric(value)
             if numeric is not None:
                 self._registry.record_command(device_id, channel_id, numeric)
-            self._learn_from_write(device_id, channel, value, conditions, outcome)
+            resolved_outcome = self._learn_from_write(
+                device_id, channel, value, conditions, outcome
+            )
         else:
-            # A failed command must not later be scored as an outcome: whatever the device
-            # settles at is not a measurement of what was asked, and recording it would
-            # teach the store something false.
-            recorder = self._registry.outcome_recorder
-            if recorder is not None:
-                recorder.drop_pending(device_id, channel_id)
-        return _write_result(device_id, channel, outcome)
+            self._write_verifier.drop_pending_outcome(device_id, channel_id)
+
+        result = _write_result(device_id, channel, outcome)
+        if outcome.ok:
+            expectation = WriteExpectation.from_channel(
+                device_id=device_id,
+                channel=channel,
+                commanded_value=value,
+                identity=self._session_identity(),
+            )
+            if resolved_outcome is not None:
+                verdict = WriteVerdict.from_physical_outcome(
+                    resolved_outcome,
+                    expectation=expectation,
+                )
+                self._write_verifier.record_verdict(verdict)
+            elif (
+                outcome.readback is not None
+                and expectation.observation_channel_id == channel.channel_id
+                and expectation.is_settled()
+            ):
+                verdict = WriteVerdict.from_reading(expectation, outcome.readback)
+                self._write_verifier.record_verdict(verdict)
+            else:
+                verdict = self._write_verifier.defer_or_refuse(context, expectation)
+            result["verification"] = verdict.to_dict()
+        return result
 
     def _learn_from_write(
         self,
@@ -1255,7 +1738,7 @@ class HardwareTools:
         value: Any,
         conditions: str,
         outcome: WriteOutcome,
-    ) -> None:
+    ) -> Any | None:
         """Register the command for comparison, resolving it now when possible.
 
         A channel that reads back and has no settling time can be compared immediately.
@@ -1265,16 +1748,19 @@ class HardwareTools:
         """
         recorder = self._registry.outcome_recorder
         if recorder is None:
-            return
+            return None
         recorder.record_command(
             device_id=device_id, channel=channel, value=value, conditions=conditions
         )
-        if outcome.readback is not None and channel.envelope.settling_time_s <= 0:
-            recorder.observe(
+        if outcome.readback is not None and channel.envelope.effective_settling_s <= 0:
+            resolved = recorder.observe(
                 device_id=device_id,
                 channel_id=channel.channel_id,
                 value=outcome.readback.value,
             )
+            if resolved is not None:
+                return resolved
+        return None
 
     def _grant_band(self, envelope: Any, value: Any) -> str:
         """Return the band string that defines this command's grant identity.
@@ -1389,9 +1875,7 @@ class HardwareTools:
                 exc_info=True,
             )
             await self._registry.drop_transport(device_id)
-            self._report_unreachable(
-                device_id, channel, f"the driver raised {type(exc).__name__}"
-            )
+            self._report_unreachable(device_id, channel, f"the driver raised {type(exc).__name__}")
             return {
                 "ok": False,
                 "device_id": device_id,
@@ -1463,9 +1947,10 @@ class HardwareTools:
         declared privacy tier and answers SAFE for everything else. Two failure modes
         matter and both deny:
 
-        - **No gate installed.** The in-process CLI binds none, so a camera read there
-          is refused rather than performed unguarded. Named as a configuration fault
-          because that is what it is.
+        - **No gate installed.** Normal direct CLI and daemon paths bind gates, but an
+          incomplete or non-interactive runtime may not; a camera read there is refused
+          rather than performed unguarded. Named as a configuration fault because that is
+          what it is.
         - **A gate that raises.** Handled inside ``_evaluate``, which is why this goes
           through it rather than calling the gate directly.
 
@@ -1489,10 +1974,10 @@ class HardwareTools:
             metadata={
                 "privacy": channel.privacy,
                 "representation": channel.representation,
-                "session_id": self._session_id,
+                "session_id": self._session_identity(),
             },
         )
-        allowed, denial = await self._evaluate(descriptor)
+        allowed, denial, _no_gate = await self._evaluate(descriptor)
         if allowed:
             return None
         self._audit.record(
@@ -1500,7 +1985,7 @@ class HardwareTools:
             device=context.device_id,
             channel=channel.channel_id,
             outcome=f"privacy={channel.privacy}",
-            identity=self._session_id,
+            identity=self._session_identity(),
         )
         return self._refusal(
             context.device_id,
@@ -1513,113 +1998,50 @@ class HardwareTools:
             ),
         )
 
-    async def _evaluate(self, descriptor: ActionDescriptor) -> tuple[bool, str]:
+    async def _evaluate(self, descriptor: ActionDescriptor) -> tuple[bool, str, bool]:
         """Run the approval gate, failing closed on absence and on exception.
 
-        When trust-based approval skip is enabled and the channel qualifies
-        (reversible + trust >= VERIFIED + config on), the gate is bypassed and
-        the write proceeds with an audit record noting ``trust_skip=True``.
+        Delegates to WriteGovernor.evaluate via a thin WriteGovernanceRequest.
         The invariant is absolute: **irreversible channels always require
         full approval**, even at PRODUCTION trust, even with the switch on.
 
-        No gate installed, or a gate that raises, both mean deny. A broken gate must
-        never become an open door, and for a physical device the cost of getting
-        that wrong is not measured in data.
+        Returns ``(allowed, denial_message, no_gate)``.
         """
-        # ── Trust-based short-circuit (reversible + VERIFIED+ + config) ──
-        if self._trust_gate is not None and self._trust_skip_enabled():
-            meta = descriptor.metadata or {}
-            device_id = str(meta.get("device_id") or "")
-            channel_id = str(meta.get("channel_id") or "")
-            reversible = bool(meta.get("reversible", False))
-            if self._trust_gate.may_skip_approval(
-                device_id, channel_id, reversible=reversible
-            ):
-                level = self._trust_gate.level(device_id, channel_id)
-                logger.info(
-                    "Trust-based approval skip: device=%s channel=%s "
-                    "level=%s reversible=%s",
-                    device_id,
-                    channel_id,
-                    level.name,
-                    reversible,
-                )
-                self._audit.record(
-                    action="trust_skip",
-                    device=device_id,
-                    channel=channel_id,
-                    outcome=f"trust_skip=True level={level.name}",
-                    identity=self._session_id,
-                )
-                return True, ""
-
-        if self._gate is None:
-            return False, (
-                "No approval gate is installed for hardware commands, so the command was "
-                "refused. This is a configuration fault, not a user decision."
+        self._governor.set_trust_skip_enabled(self._trust_skip_enabled())
+        meta = getattr(descriptor, "metadata", None) or {}
+        commands = meta.get("commands") or ()
+        if meta.get("batch") or meta.get("control_session"):
+            channel_ids = (
+                tuple(str(command.get("channel_id") or "") for command in commands)
+                if commands else tuple(str(cid) for cid in meta.get("channels", ()))
             )
-        try:
-            result = await self._gate.evaluate(descriptor)
-        except Exception as exc:  # noqa: BLE001 - a failing gate must deny, not propagate
-            logger.error(
-                "Hardware approval gate raised for %s: %s", descriptor.kind, exc, exc_info=True
+            request = WriteGovernanceRequest.batch(
+                device_id=str(meta.get("device_id") or ""),
+                channel_ids=channel_ids,
+                values=tuple(command.get("value") for command in commands),
+                descriptor=descriptor,
+                identity=self._session_identity(),
+                reversible=bool(meta.get("reversible", False)),
             )
-            return False, (
-                "The approval gate failed while assessing this command, so it was refused."
+        else:
+            request = WriteGovernanceRequest.single(
+                device_id=str(meta.get("device_id") or ""),
+                channel_id=str(meta.get("channel_id") or ""),
+                value=meta.get("value"),
+                descriptor=descriptor,
+                identity=self._session_identity(),
+                reversible=bool(meta.get("reversible", False)),
             )
-        # ``approved`` is the orchestrator's own field name. Reading a plausible
-        # synonym here would make every command look denied while the gate reported
-        # success, so the attribute is asserted against the real ApprovalResult in
-        # tests/test_hardware_governance.py rather than trusted.
-        if getattr(result, "approved", False):
-            return True, ""
-        # The gate's own message states that a human withheld consent and that the
-        # outcome must not be pursued another way; substituting a generic tool error
-        # here would let the agent reroute around a refusal.
-        message = getattr(result, "denial_message", "") or getattr(result, "reason", "")
-        return False, str(message or "The command was not approved.")
+        decision = await self._governor.evaluate(request)
+        return decision.allowed, decision.denial, decision.no_gate
 
     async def _failed_interlocks(
         self, context: HardwareContext, channel: Channel
     ) -> tuple[str, ...]:
-        """Return the interlocks that do not currently hold.
+        """Delegate to the shared interlock evaluation in ``hardware.interlocks``."""
+        from leapflow.hardware.interlocks import failed_interlocks
 
-        Fails closed in every uncertain case: a missing interlock, an unreadable
-        source channel, or a read that raises all count as unsatisfied. "Cannot
-        check" and "not satisfied" must have the same consequence.
-        """
-        required = channel.envelope.requires_interlocks
-        if not required:
-            return ()
-        failed: list[str] = []
-        for name in required:
-            lock = context.interlock(name)
-            if lock is None:
-                failed.append(name)
-                continue
-            try:
-                transport = await self._registry.transport(context.device_id)
-                reading = await transport.read(lock.channel_id)
-            except Exception as exc:  # noqa: BLE001 - see below
-                # Deliberately wider than TransportError. A driver is *supposed* to
-                # raise only that, but this is a safety precondition: if a
-                # third-party driver raises anything else, the correct reading is
-                # "the interlock could not be checked", not "the turn crashes".
-                # Letting it propagate would also lose the distinction between a
-                # safety mechanism engaging and the system falling over.
-                logger.warning(
-                    "Interlock %r could not be evaluated on %s.%s (%s); treating as unsatisfied",
-                    name,
-                    context.device_id,
-                    lock.channel_id,
-                    exc,
-                    exc_info=True,
-                )
-                failed.append(name)
-                continue
-            if not lock.evaluate(reading.value):
-                failed.append(name)
-        return tuple(failed)
+        return await failed_interlocks(self._registry, context, channel)
 
     def _not_ready(
         self,
@@ -1717,7 +2139,7 @@ class HardwareTools:
         settings = getattr(self._registry, "settings", None)
         if not getattr(settings, "require_describe_before_write", False):
             return False
-        return not self._registry.was_described(self._session_id, device_id)
+        return not self._registry.was_described(self._session_identity(), device_id)
 
     def _unknown_device(self, device_id: str) -> dict[str, Any]:
         known = ", ".join(c.device_id for c in self._registry.contexts()) or "(none admitted)"
@@ -1726,17 +2148,77 @@ class HardwareTools:
             "device_id": device_id,
             "error": f"Unknown device {device_id!r}. Admitted devices: {known}.",
             "failure_code": "unknown_device",
+            "side_effect_state": SIDE_EFFECT_NONE,
         }
 
     @staticmethod
-    def _refusal(device_id: str, channel_id: str, code: str, message: str) -> dict[str, Any]:
+    def _refusal(
+        device_id: str,
+        channel_id: str,
+        code: str,
+        message: str,
+        *,
+        side_effect_state: str = SIDE_EFFECT_NONE,
+    ) -> dict[str, Any]:
         return {
             "ok": False,
             "device_id": device_id,
             "channel_id": channel_id,
             "error": message,
             "failure_code": code,
+            "side_effect_state": side_effect_state,
         }
+
+
+def _batch_grant_identity(channel_summaries: tuple[dict[str, Any], ...]) -> str:
+    """Compute a deterministic per-channel band identity for batch writes.
+
+    Sorts channel bands alphabetically so two batch writes targeting the same
+    channels with the same envelope bands produce the same grant identity,
+    allowing one approval to cover repeated in-envelope batches.
+    """
+    parts = sorted(
+        f"{cs.get('channel_id', '')}:{cs.get('envelope_band', 'unknown')}"
+        for cs in channel_summaries
+    )
+    return "batch:" + "|".join(parts) if parts else "batch:empty"
+
+
+def _no_gate_interaction(device_id: str) -> dict[str, Any]:
+    """Build a structured InteractionRequest payload for Mode 3 (no TUI).
+
+    When no approval gate is installed the write is refused, and this request
+    gives the user two actionable choices instead of a raw denial.
+    """
+    return {
+        "interaction_type": "approval_required",
+        "severity": "warning",
+        "title": "Hardware write requires an approval surface",
+        "description": (
+            f"The command targeting {device_id!r} was refused because no approval "
+            "gate is available. Hardware writes are fail-closed: without a surface "
+            "to present the approval prompt, no physical effect can occur."
+        ),
+        "suggested_actions": [
+            {
+                "label": "Start a TUI session",
+                "command": "leap chat",
+                "description": (
+                    "Launch an interactive session where the approval prompt "
+                    "can be presented and answered."
+                ),
+                "is_default": True,
+            },
+            {
+                "label": "Configure edge approval",
+                "command": "leap config set hardware.approval_channel edge",
+                "description": (
+                    "Set up an edge approval channel so headless/daemon-mode "
+                    "writes can be reviewed without a TUI."
+                ),
+            },
+        ],
+    }
 
 
 def _write_result(device_id: str, channel: Channel, outcome: WriteOutcome) -> dict[str, Any]:
@@ -1830,6 +2312,75 @@ def _preview_result(
             f"Interlocks {list(interlocks_failed)} are not satisfied for "
             f"{device_id}.{channel.channel_id}, so the real command would be refused. "
             "Restore the interlock conditions before commanding it."
+        )
+    return payload
+
+
+def _batch_preview_result(feasibility: BatchFeasibilityResult) -> dict[str, Any]:
+    """Shape a batch dry-run into a tool result without touching the device."""
+    device_id = feasibility.context.device_id
+    descriptor = feasibility.descriptor
+    interlocks_failed = feasibility.interlocks_failed
+    ok = not interlocks_failed
+    payload: dict[str, Any] = {
+        "ok": ok,
+        "device_id": device_id,
+        "preview": True,
+        "side_effect_state": SIDE_EFFECT_NONE,
+        "plan": {
+            "summary": descriptor.summary,
+            "detail": descriptor.detail,
+            "resource": descriptor.resource,
+            "batch_size": len(feasibility.resolved),
+            "commands": list(feasibility.channel_summaries),
+            "any_irreversible": feasibility.any_irreversible,
+            "requires_approval": True,
+            "interlocks_satisfied": not interlocks_failed,
+            "interlocks_failed": list(interlocks_failed),
+        },
+    }
+    if interlocks_failed:
+        payload["failure_code"] = "interlocks_unsatisfied"
+        payload["error"] = (
+            f"Interlocks {list(interlocks_failed)} are not satisfied; "
+            "the real command would be refused."
+        )
+    else:
+        payload["next_step"] = (
+            "Dry run only: nothing was commanded. Re-issue the same call "
+            "without dry_run to execute it, which will require approval."
+        )
+    return payload
+
+
+def _control_preview_result(feasibility: ControlFeasibilityResult) -> dict[str, Any]:
+    """Shape a control-session dry-run into a tool result without starting the loop."""
+    device_id = feasibility.context.device_id
+    descriptor = feasibility.descriptor
+    interlocks_failed = feasibility.interlocks_failed
+    ok = not interlocks_failed
+    payload: dict[str, Any] = {
+        "ok": ok,
+        "device_id": device_id,
+        "preview": True,
+        "side_effect_state": SIDE_EFFECT_NONE,
+        "plan": {
+            "summary": descriptor.summary,
+            "mode": feasibility.mode,
+            "frequency_hz": feasibility.frequency_hz,
+            "channels": [
+                channel.channel_id for channel, _ in feasibility.resolved
+            ],
+            "interlocks_satisfied": not interlocks_failed,
+            "interlocks_failed": list(interlocks_failed),
+            "requires_approval": True,
+        },
+    }
+    if interlocks_failed:
+        payload["failure_code"] = "interlocks_unsatisfied"
+        payload["error"] = (
+            f"Interlocks {list(interlocks_failed)} are not satisfied; "
+            "control startup would be refused."
         )
     return payload
 
@@ -1999,12 +2550,13 @@ def build_hardware_tools(tools: HardwareTools) -> list[ToolMetadata]:
             },
             handler=tools.batch_actuate,
             x_leapflow={
-                "category": "hardware",
-                "risk_level": "high",
+                **_WRITE_METADATA,
                 "mutates_state": True,
-                "execution_policy": "serial",
+                "execution_policy": "external_side_effect",
                 "provides_capabilities": ["hardware_batch_control"],
             },
+            mutates_state=True,
+            execution_policy="external_side_effect",
         ),
         # ── Real-time control tools ──
         ToolMetadata(
@@ -2043,17 +2595,21 @@ def build_hardware_tools(tools: HardwareTools) -> list[ToolMetadata]:
                         "type": "object",
                         "description": "PID gains {kp, ki, kd} or impedance {stiffness, damping}",
                     },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Validate and preview the control session without starting it",
+                    },
                 },
                 "required": ["device_id", "mode"],
             },
             handler=tools.control_start,
             x_leapflow={
-                "category": "hardware",
-                "risk_level": "high",
+                **_WRITE_METADATA,
                 "mutates_state": True,
-                "execution_policy": "serial",
+                "execution_policy": "external_side_effect",
             },
             mutates_state=True,
+            execution_policy="external_side_effect",
             provides_capabilities=("hw.control_start",),
         ),
         ToolMetadata(

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +40,16 @@ from leapflow.hardware.context import (
 )
 from leapflow.hardware.reading_store import SCHEMA_VERSION, ReadingStore
 from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
+from leapflow.hardware.stream import (
+    BatchStreamCoordinator,
+    HardwareEvent,
+    HardwareEventClass,
+    HardwareStreamSource,
+)
+from leapflow.hardware.transports.mock import MockTransport
 from leapflow.hardware.transport import (
+    BatchReading,
+    BatchWriteOutcome,
     Reading,
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_PARTIAL,
@@ -146,12 +156,14 @@ def test_sample_to_persist_to_wall_ordered_query(tmp_path: Path) -> None:
     for window_index in range(3):
         mono = float(window_index * 10)
         wall = _WALL_NOW + window_index * 60.0  # 60s apart
-        store.record(_reading(
-            20.0 + window_index,
-            seq=window_index,
-            mono=mono,
-            wall=wall,
-        ))
+        store.record(
+            _reading(
+                20.0 + window_index,
+                seq=window_index,
+                mono=mono,
+                wall=wall,
+            )
+        )
         store.flush(force=True)
 
     history = store.history("bench", "level")
@@ -199,9 +211,7 @@ def test_persisted_schema_version_is_current(tmp_path: Path) -> None:
     db_path = tmp_path / "instrument.duckdb"
     conn = duckdb.connect(str(db_path), read_only=True)
     try:
-        rows = conn.execute(
-            "SELECT schema_version FROM reading_windows"
-        ).fetchall()
+        rows = conn.execute("SELECT schema_version FROM reading_windows").fetchall()
     finally:
         conn.close()
 
@@ -258,7 +268,9 @@ async def test_persist_failure_does_not_stop_sampling(tmp_path: Path) -> None:
     from leapflow.hardware.stream import build_stream_sources
 
     registry._stream_sources = build_stream_sources(  # noqa: SLF001
-        registry, ring_capacity=64, reading_store=broken,
+        registry,
+        ring_capacity=64,
+        reading_store=broken,
     )
     source = registry.stream_sources()[0]
     await source.start(lambda _signal: None)
@@ -270,9 +282,7 @@ async def test_persist_failure_does_not_stop_sampling(tmp_path: Path) -> None:
         "sampling stopped when persistence failed; "
         "G24 regression: a broken store must not kill the observation loop"
     )
-    assert broken.write_failures_count > 0, (
-        "the broken store was never called — wiring issue"
-    )
+    assert broken.write_failures_count > 0, "the broken store was never called — wiring issue"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -331,7 +341,11 @@ async def test_event_emitter_wiring_reaches_eventbus(tmp_path: Path) -> None:
     assert len(received_events) == 1, (
         "G15 regression: publish_event did not reach the installed emitter"
     )
-    assert received_events[0] is test_event
+    assert received_events[0] == test_event or (
+        received_events[0].kind == test_event.kind
+        and received_events[0].device_id == test_event.device_id
+        and received_events[0].channel_id == test_event.channel_id
+    )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -374,24 +388,26 @@ async def test_mock_transport_failure_injection_preserves_side_effect() -> None:
     """
     from leapflow.hardware.transports.mock import MockTransport
 
-    transport = MockTransport({
-        "values": {"ch": 0.0},
-        "halt_supported": True,
-        "failures": [
-            {
-                "channel_id": "ch",
-                "on_call": 1,
-                "side_effect_state": SIDE_EFFECT_PARTIAL,
-                "error": "partial write",
-            },
-            {
-                "channel_id": "ch",
-                "on_call": 2,
-                "side_effect_state": SIDE_EFFECT_UNKNOWN,
-                "error": "unknown write",
-            },
-        ],
-    })
+    transport = MockTransport(
+        {
+            "values": {"ch": 0.0},
+            "halt_supported": True,
+            "failures": [
+                {
+                    "channel_id": "ch",
+                    "on_call": 1,
+                    "side_effect_state": SIDE_EFFECT_PARTIAL,
+                    "error": "partial write",
+                },
+                {
+                    "channel_id": "ch",
+                    "on_call": 2,
+                    "side_effect_state": SIDE_EFFECT_UNKNOWN,
+                    "error": "unknown write",
+                },
+            ],
+        }
+    )
     ctx = _context(device_id="dev")
     await transport.open(ctx)
 
@@ -458,14 +474,133 @@ async def test_streaming_produces_wall_clock_history(tmp_path: Path) -> None:
     yesterday = time.time() - 86400.0
     for row in history:
         assert row["started_at"] > yesterday, (
-            f"started_at={row['started_at']} predates yesterday, not wall-clock "
-            "(G16 regression)"
+            f"started_at={row['started_at']} predates yesterday, not wall-clock (G16 regression)"
         )
         assert row["ended_at"] > yesterday, (
-            f"ended_at={row['ended_at']} predates yesterday, not wall-clock "
-            "(G16 regression)"
+            f"ended_at={row['ended_at']} predates yesterday, not wall-clock (G16 regression)"
         )
 
     # G16: oldest first.
     ends = [row["ended_at"] for row in history]
     assert ends == sorted(ends), "history not sorted oldest-first (G16 regression)"
+
+
+class _ScriptedStreamTransport(MockTransport):
+    """Deliver only queued readings so integration assertions need no timed sleeps."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.samples: asyncio.Queue[tuple[float, str]] = asyncio.Queue()
+        self.sequences: dict[str, int] = {}
+
+    async def read(self, channel_id: str) -> Reading:
+        value, quality = await self.samples.get()
+        return self._reading(channel_id, value, quality)
+
+    def _reading(self, channel_id: str, value: float, quality: str) -> Reading:
+        sequence = self.sequences.get(channel_id, 0) + 1
+        self.sequences[channel_id] = sequence
+        return Reading(
+            device_id="bench",
+            channel_id=channel_id,
+            value=value,
+            quantity="generic.level",
+            unit="C",
+            sequence=sequence,
+            quality=quality,
+        )
+
+
+class _ScriptedBatchStreamTransport(_ScriptedStreamTransport):
+    """Batch protocol fixture; both channels observe the same scripted sample."""
+
+    async def read_batch(self, channel_ids: tuple[str, ...]) -> BatchReading:
+        value, quality = await self.samples.get()
+        readings = tuple(self._reading(cid, value, quality) for cid in channel_ids)
+        return BatchReading(device_id="bench", readings=readings)
+
+    async def write_batch(self, commands: tuple[tuple[str, Any], ...]) -> BatchWriteOutcome:
+        raise AssertionError("Streaming integration must never perform a write")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("bind_after_start", [False, True])
+@pytest.mark.parametrize("observer_raises", [False, True])
+async def test_registry_stream_publication_is_classified_once_and_rebindable(
+    monkeypatch: pytest.MonkeyPatch,
+    batch: bool,
+    bind_after_start: bool,
+    observer_raises: bool,
+) -> None:
+    """Sampling reaches publication, not just recording, for both stream builders."""
+    context = _context(sample_rate_hz=200.0)
+    if batch:
+        context = replace(
+            context,
+            channels=(
+                *context.channels,
+                replace(context.channels[0], channel_id="other"),
+            ),
+        )
+    transport = _ScriptedBatchStreamTransport() if batch else _ScriptedStreamTransport()
+    monkeypatch.setattr("leapflow.hardware.registry.build_transport", lambda *_: transport)
+    monkeypatch.setattr("leapflow.hardware.transports.build_transport", lambda *_: transport)
+    registry = HardwareRegistry(
+        HardwareSettings(enabled=True, persist_readings=False, stream_ring_capacity=64),
+        providers=[_StaticProvider(context)],
+    )
+    registry.load()
+    initial_events: list[HardwareEvent] = []
+    rebound_events: list[HardwareEvent] = []
+    observed: list[HardwareEvent] = []
+    degraded = asyncio.Event()
+    recovered = asyncio.Event()
+    channel_count = len(context.channels)
+
+    class _Observer:
+        def on_deliberative_event(self, event: HardwareEvent) -> None:
+            observed.append(event)
+            if len(observed) == channel_count:
+                degraded.set()
+            if observer_raises:
+                raise RuntimeError("Injected observer failure")
+
+    def rebound_emitter(event: HardwareEvent) -> None:
+        rebound_events.append(event)
+        if len(rebound_events) == channel_count:
+            recovered.set()
+
+    registry.set_deliberative_observer(_Observer())
+    if not bind_after_start:
+        registry.set_event_emitter(initial_events.append)
+    sources = registry.stream_sources()
+    assert len(sources) == 1
+    assert isinstance(sources[0], BatchStreamCoordinator if batch else HardwareStreamSource)
+    try:
+        assert await registry.start_streams() == 1
+        if bind_after_start:
+            registry.set_event_emitter(initial_events.append)
+        for _ in range(3):
+            transport.samples.put_nowait((105.0, Quality.SUSPECT.value))
+        await asyncio.wait_for(degraded.wait(), timeout=2.0)
+        assert len(initial_events) == 2 * channel_count
+        assert {event.kind: event.event_class for event in initial_events} == {
+            "threshold_exceeded": HardwareEventClass.REFLEX,
+            "quality_degraded": HardwareEventClass.DELIBERATIVE,
+        }
+        assert all(event.kind == "quality_degraded" for event in observed)
+        assert all(any(event is emitted for emitted in initial_events) for event in observed)
+        registry.set_event_emitter(rebound_emitter)
+        transport.samples.put_nowait((20.0, Quality.OK.value))
+        await asyncio.wait_for(recovered.wait(), timeout=2.0)
+        assert len(initial_events) == 2 * channel_count
+        assert len(rebound_events) == channel_count
+        assert all(event.kind == "settled" for event in rebound_events)
+        assert all(event.event_class == HardwareEventClass.RECORD for event in rebound_events)
+        assert len(observed) == channel_count
+        assert registry.recent_events(limit=20) == tuple(initial_events + rebound_events)
+    finally:
+        await registry.close_all()
+    assert not (await transport.probe()).connected
+    assert sources[0]._task is None  # noqa: SLF001 - lifecycle completion is the assertion

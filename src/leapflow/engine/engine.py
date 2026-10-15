@@ -1,5 +1,12 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Main ReAct-style engine with routing, skills, and audit logging."""
+"""Main ReAct-style engine with routing, skills, and audit logging.
+
+Size note (>800-line registered exception per AGENTS.md): this is the core
+orchestrator -- the agent loop, public entry points, and thin delegation
+wrappers. Behavior is progressively extracted into delegate components and
+sub-packages; the remaining length is loop-iteration state shared across
+those components, which resists further splitting without indirection that
+costs more than it saves."""
 
 from __future__ import annotations
 
@@ -261,6 +268,9 @@ class AgentEngine:
 
         # EventBus for learning signal emission (injected by CLI)
         self._event_bus: Optional[Any] = None
+
+        # Plugin-owned dynamic context stays outside the stable prompt prefix.
+        self._volatile_context_providers: Dict[str, Any] = {}
 
         # ExperienceStore bridge for world-model trajectory data (injected by CLI)
         self._experience_store: Optional[Any] = None
@@ -771,6 +781,13 @@ class AgentEngine:
     def set_event_bus(self, event_bus: Any) -> None:
         """Inject EventBus for emitting learning signals (episode events)."""
         self._event_bus = event_bus
+
+    def register_volatile_context_provider(self, provider: Any) -> None:
+        """Register a plugin-owned dynamic context provider by stable identity."""
+        provider_id = str(getattr(provider, "provider_id", "") or "")
+        if not provider_id:
+            raise ValueError("volatile context provider requires provider_id")
+        self._volatile_context_providers[provider_id] = provider
 
     def set_experience_store(self, store: Any) -> None:
         """Inject ExperienceStore for world-model trajectory bridge."""
@@ -2356,9 +2373,9 @@ class AgentEngine:
             return final
 
         # The loop stopped without a written answer (repetition halt or
-        # exhausted budget). Give the model one tool-free round to answer
-        # from what it gathered before falling back to the canned notice;
-        # a genuine terminal failure (fatal_error) still surfaces.
+        # exhausted budget). Preserve deterministic guidance for structured
+        # blockers, then give the model one tool-free round to synthesize the
+        # gathered evidence before exposing generic raw tool output.
         if empty_response_retry_used:
             # Empty response persisted after retry — use degraded message
             logger.warning(
@@ -2373,9 +2390,10 @@ class AgentEngine:
         else:
             fallback = (
                 _app_onboarding_recovery_message(messages)
+                or _last_tool_failures_recovery_message(messages, include_generic=False)
+                or await self._synthesize_forced_answer(messages)
                 or _last_tool_failures_recovery_message(messages)
                 or fatal_error
-                or await self._synthesize_forced_answer(messages)
                 or self._budget_exhausted_response(messages)
             )
         self._learning_bridge._emit_chat_event("response", {"content": fallback[:500]})

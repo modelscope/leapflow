@@ -13,8 +13,8 @@ from benchmarks.protocol import BenchmarkAdapter
 async def test_all_native_adapters_execute_all_scenarios() -> None:
     adapters = tuple(native_adapters())
 
-    assert len(adapters) == 11
-    assert len({adapter.adapter_id for adapter in adapters}) == 11
+    assert len(adapters) == 12
+    assert len({adapter.adapter_id for adapter in adapters}) == 12
     assert all(isinstance(adapter, BenchmarkAdapter) for adapter in adapters)
 
     scenario_counts: Counter[str] = Counter()
@@ -43,7 +43,7 @@ async def test_all_native_adapters_execute_all_scenarios() -> None:
             assert result.metrics, f"{adapter.adapter_id}/{scenario.scenario_id} lacks metrics"
             assert result.evidence, f"{adapter.adapter_id}/{scenario.scenario_id} lacks evidence"
 
-    assert total == 36, scenario_counts
+    assert total == 41, scenario_counts
     assert failures == []
 
 

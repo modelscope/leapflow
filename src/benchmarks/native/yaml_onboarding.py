@@ -115,7 +115,10 @@ class YAMLOnboardingAdapter:
                   registry: Any) -> tuple[dict[str, Any], bool]:
         loaded_ids = sorted(context.device_id for context in contexts)
         if scenario_id == "yaml_context_load":
-            passed = len(contexts) == 3 and "robot.so100_arm" in loaded_ids
+            # Every shipped example must load; a hard-coded count failed the moment a
+            # new example was added, without anything being broken.
+            shipped = [*self._examples_dir().glob("*.yaml"), *self._examples_dir().glob("*.yml")]
+            passed = len(contexts) == len(shipped) and "robot.so100_arm" in loaded_ids
             return {"loaded_device_ids": loaded_ids}, passed
         arm = next(context for context in contexts if context.device_id == "robot.so100_arm")
         if scenario_id == "control_binding_resolution":

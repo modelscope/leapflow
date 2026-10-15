@@ -6,7 +6,9 @@ from leapflow.layout import build_layout
 from leapflow.security.secrets import FernetSecretVault, secret_ref
 
 
-def test_secret_vault_atomic_save_preserves_existing_file_on_replace_failure(monkeypatch, tmp_path) -> None:
+def test_secret_vault_atomic_save_preserves_existing_file_on_replace_failure(
+    monkeypatch, tmp_path
+) -> None:
     import leapflow.security.secrets as secrets_module
 
     vault = FernetSecretVault(tmp_path / "vault.json", tmp_path / "vault.key")
@@ -30,7 +32,9 @@ def test_secret_vault_atomic_save_preserves_existing_file_on_replace_failure(mon
     assert vault.get(second_ref) is None
 
 
-def test_config_loader_resolves_profile_secret_refs_without_writing_plaintext(monkeypatch, tmp_path) -> None:
+def test_config_loader_resolves_profile_secret_refs_without_writing_plaintext(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.delenv("LEAPFLOW_LLM_API_KEY", raising=False)
 
     layout = build_layout(tmp_path / "leap-home")
@@ -66,9 +70,7 @@ def test_config_loader_warns_on_missing_secret_ref_and_bad_section(monkeypatch, 
     profile_layout = layout.ensure(profile_id="default")
     missing_ref = secret_ref("profile", "llm", "primary", "missing")
     profile_layout.llm_config_path.write_text(
-        "llm:\n"
-        f"  api_key_ref: {missing_ref}\n"
-        "cache: invalid-shape\n",
+        f"llm:\n  api_key_ref: {missing_ref}\ncache: invalid-shape\n",
         encoding="utf-8",
     )
 
@@ -119,6 +121,29 @@ def test_daemon_log_level_config_chain(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("LEAPFLOW_DAEMON_LOG_LEVEL", "DEBUG")
     built = _build_settings_from_env()
     assert built.daemon_log_level == "DEBUG"
+
+
+def test_hardware_alert_policy_config_chain(monkeypatch, tmp_path) -> None:
+    from leapflow.config import _build_settings_from_env
+    from leapflow.config_service import _build_field_specs
+    from leapflow.hardware.alert_policy import load_alert_policies
+    from leapflow.hardware.registry import HardwareSettings
+
+    raw = '[{"event_kind":"threshold_exceeded","action":"hw_estop"}]'
+    monkeypatch.setenv("LEAPFLOW_DATA_DIR", str(tmp_path / "home"))
+    monkeypatch.setenv("LEAPFLOW_HARDWARE_ALERT_POLICIES", raw)
+
+    settings = _build_settings_from_env()
+    policy = HardwareSettings.from_settings(settings)
+    rules = load_alert_policies(policy)
+
+    assert settings.hardware_alert_policies == raw
+    assert policy.audit_log_path == str(settings.profile_layout.hardware.audit_log_path)
+    assert len(rules) == 1
+    assert rules[0].action == "hw_estop"
+    assert _build_field_specs()["hardware.alert_policies"].setting_name == (
+        "hardware_alert_policies"
+    )
 
 
 def test_logging_setup_is_idempotent_and_redacting(monkeypatch) -> None:

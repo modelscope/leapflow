@@ -30,6 +30,7 @@ from leapflow.engine.recovery.recovery_budget import RecoveryBudget
 from leapflow.engine.recovery.recovery_coordinator import RecoveryCoordinator
 from leapflow.engine.recovery.recovery_decision import RecoveryAction
 from leapflow.engine.recovery.strategies import default_strategies
+from leapflow.engine.recovery.unified_classifier import UnifiedErrorClassifier
 
 # Actions that re-run work and can therefore duplicate an already-applied effect.
 _AUTOMATIC_RETRY_ACTIONS = frozenset({
@@ -252,6 +253,28 @@ def test_applied_side_effects_block_automatic_retry(side_effect_state) -> None:
     assert decision.interaction.resumption_key
     assert decision.interaction.suggested_actions
     assert "gateway_send" in decision.reason
+
+
+def test_reported_hardware_partial_effect_reaches_checkpoint_halt() -> None:
+    """Producer evidence must survive classification and block blind replay."""
+    envelope = UnifiedErrorClassifier().classify_tool_result(
+        {
+            "ok": False,
+            "error": "hardware write timed out",
+            "failure_code": "transport_timeout",
+            "side_effect_state": "partial",
+        },
+        tool_name="hw_actuate",
+        execution_policy="external_side_effect",
+    )
+    assert envelope is not None
+    assert envelope.side_effect_state is SideEffectState.PARTIAL
+
+    decision = _coordinator(total_recovery_actions=16).evaluate(envelope)
+
+    assert decision.action is RecoveryAction.HALT_WITH_CHECKPOINT
+    assert decision.interaction is not None
+    assert decision.interaction.context_dict["side_effect_state"] == "partial"
 
 
 def test_side_effect_gate_does_not_consume_recovery_budget() -> None:

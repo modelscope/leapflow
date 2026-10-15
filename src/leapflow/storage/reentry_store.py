@@ -296,7 +296,12 @@ def build_reentry_trigger(
     persists the result.
     """
     now = time.time() if now is None else now
-    kind = kind if kind in (ReentryKind.TIME.value, ReentryKind.EVENT.value) else ReentryKind.TIME.value
+    kind = kind if kind in (ReentryKind.TIME.value, ReentryKind.EVENT.value) else None
+    if kind is None:
+        raise ValueError(
+            f"unsupported reentry kind {kind!r}; must be "
+            f"{ReentryKind.TIME.value!r} or {ReentryKind.EVENT.value!r}"
+        )
     snapshot = OrientSnapshot(
         task_id=task_id,
         ledger_state=dict(ledger_state or {}),

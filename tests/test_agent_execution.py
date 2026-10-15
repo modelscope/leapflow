@@ -1627,6 +1627,40 @@ def test_last_tool_failures_recovery_message_missing_fields() -> None:
     assert "text" in result
 
 
+def test_generic_tool_failure_can_be_deferred_to_forced_synthesis() -> None:
+    """Raw generic tool output must not preempt the tool-free synthesis round."""
+    import json
+    from leapflow.engine._message_helpers import _last_tool_failures_recovery_message
+
+    failure_payload = {
+        "ok": False,
+        "failure_code": "shell_nonzero_exit",
+        "error": "raw diagnostic output",
+        "recovery_hint": "change the command",
+    }
+    messages = [{"role": "tool", "content": json.dumps(failure_payload)}]
+
+    assert _last_tool_failures_recovery_message(messages, include_generic=False) == ""
+    assert "raw diagnostic output" in _last_tool_failures_recovery_message(messages)
+
+
+def test_structured_tool_failure_precedes_forced_synthesis() -> None:
+    """Deterministic recovery guidance remains available in structured-only mode."""
+    import json
+    from leapflow.engine._message_helpers import _last_tool_failures_recovery_message
+
+    failure_payload = {
+        "ok": False,
+        "failure_code": "missing_required_fields",
+        "error": "Missing required fields: text",
+    }
+    messages = [{"role": "tool", "content": json.dumps(failure_payload)}]
+
+    result = _last_tool_failures_recovery_message(messages, include_generic=False)
+    assert "text" in result
+    assert "Please provide" in result
+
+
 def test_duplicate_suppression_is_not_counted_as_consecutive_tool_failure() -> None:
     """Suppressed duplicate side effects are control signals, not failed executions."""
     import json

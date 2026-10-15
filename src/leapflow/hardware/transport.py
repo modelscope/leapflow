@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
 
 from leapflow.hardware.context import HardwareContext, Quality
 
@@ -183,6 +183,9 @@ class FrameReading:
     monotonic_at: float = field(default_factory=time.monotonic)
     sequence: int = 0
     quality: str = Quality.OK.value
+    # Driver-defined, JSON-safe metadata about the encoded frame. It describes
+    # interpretation (for example depth scale and alignment), never raw buffers.
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def size_bytes(self) -> int:
@@ -205,6 +208,7 @@ class FrameReading:
             "sequence": self.sequence,
             "quality": self.quality,
             "size_bytes": self.size_bytes,
+            "metadata": dict(self.metadata),
         }
 
 
@@ -370,6 +374,39 @@ class BatchWriteOutcome:
     side_effect_state: str = SIDE_EFFECT_UNKNOWN
 
 
+SIDE_EFFECT_SEVERITY: dict[str, int] = {
+    SIDE_EFFECT_NONE: 0,
+    SIDE_EFFECT_COMMITTED: 1,
+    SIDE_EFFECT_PARTIAL: 2,
+    SIDE_EFFECT_UNKNOWN: 3,
+}
+"""Ranking used by :func:`worst_side_effect_state`. UNKNOWN dominates: an
+unproven verdict must outweigh every proven one, because it is the only state
+that forbids replay."""
+
+
+def worst_side_effect_state(states: Iterable[str]) -> str:
+    """Return the most severe verdict among *states*.
+
+    The merge rule for batch operations, kept here beside ``BatchWriteOutcome``
+    because it is transport-domain semantics rather than any one caller's policy.
+    An unrecognized state ranks as ``UNKNOWN`` -- a verdict this code cannot
+    interpret must not be treated as a mild one. An empty input is ``NONE``:
+    with no outcomes at all, no effect is provable.
+    """
+    worst = SIDE_EFFECT_NONE
+    worst_rank = -1
+    for state in states:
+        text = str(state)
+        rank = SIDE_EFFECT_SEVERITY.get(text)
+        if rank is None:
+            rank = SIDE_EFFECT_SEVERITY[SIDE_EFFECT_UNKNOWN]
+        if rank > worst_rank:
+            worst = text
+            worst_rank = rank
+    return worst
+
+
 @runtime_checkable
 class BatchTransport(Protocol):
     """Optional side-protocol for vectorized read/write.
@@ -409,10 +446,58 @@ class BatchTransport(Protocol):
         ...
 
 
+@runtime_checkable
+class RemoteControlTransport(Protocol):
+    """Optional side-protocol for node-local control sessions (control.v1).
+
+    Discovered via ``isinstance(transport, RemoteControlTransport)``. A
+    transport that satisfies this protocol can delegate control loop
+    execution to the remote node, with the host maintaining the session
+    via lease renewals.
+
+    The host opens a session, the node runs the ControlBus locally, and
+    the host renews the lease at ``lease_s / 3`` intervals.  If renewal
+    fails, the node executes its ``comm_loss_policy``.
+    """
+
+    async def open_control(
+        self,
+        *,
+        device_id: str,
+        mode: str,
+        frequency_hz: float,
+        channels: list[str],
+        targets: Any = None,
+        waypoints: Any = None,
+        lease_s: float = 1.0,
+        comm_loss_policy: str = "halt",
+    ) -> dict[str, Any]:
+        """Open a control session on the remote node.
+
+        Returns ``{control_id, lease_s, expires_in_s}``.
+        """
+        ...
+
+    async def renew_control(self, control_id: str) -> dict[str, Any]:
+        """Renew the lease on a remote control session."""
+        ...
+
+    async def update_control(
+        self, control_id: str, *, targets: Any = None, waypoints: Any = None
+    ) -> dict[str, Any]:
+        """Update targets/waypoints on a running session (requires new permit)."""
+        ...
+
+    async def close_control(self, control_id: str) -> dict[str, Any]:
+        """Close a remote control session and return stats."""
+        ...
+
+
 __all__ = [
     "BatchReading",
     "BatchTransport",
     "BatchWriteOutcome",
+    "RemoteControlTransport",
     "SIDE_EFFECT_COMMITTED",
     "SIDE_EFFECT_NONE",
     "SIDE_EFFECT_PARTIAL",
@@ -424,4 +509,5 @@ __all__ = [
     "TransportError",
     "TransportStatus",
     "WriteOutcome",
+    "worst_side_effect_state",
 ]

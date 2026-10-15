@@ -152,6 +152,15 @@ _FIELD_DESCRIPTIONS = {
         "Scanners that transmit or leave the host are opt-in and must be named here. "
         "Providers run at startup, so a change needs a daemon restart."
     ),
+    "hardware.fleet_nodes": (
+        "JSON array of named LHP edge nodes. Connections and heartbeat supervision are "
+        "assembled at startup, so a change needs a daemon restart."
+    ),
+    "hardware.alert_policies": (
+        "JSON array of hardware event-to-action rules. Empty disables alert reflexes; "
+        "hw_estop rules halt directly while other actions use approval. Stream sources "
+        "bind these rules at startup, so a change needs a daemon restart."
+    ),
     "hardware.host_interval_s": (
         "Seconds between samples of fast host channels (cpu, memory, network); disk, "
         "battery and thermal channels sample less often. 0 uses the 5s default. Read "

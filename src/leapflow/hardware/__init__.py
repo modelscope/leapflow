@@ -40,6 +40,13 @@ from leapflow.hardware.context import (
     Representation,
     TransportRef,
 )
+from leapflow.hardware.stream import (
+    EventKind,
+    HardwareDeliberativeObserver,
+    HardwareEvent,
+    HardwareEventClass,
+    classify_hardware_event,
+)
 from leapflow.hardware.registry import (
     AdmissionNote,
     HardwareRegistry,
@@ -73,6 +80,22 @@ from leapflow.hardware.verification import (
     VerificationMode,
     collect_evidence,
 )
+from leapflow.hardware.write_verification import (
+    WriteExpectation,
+    WriteVerdict,
+    WriteVerdictEvent,
+    WriteVerdictStatus,
+    WriteVerificationCoordinator,
+    aggregate_write_verdicts,
+)
+from leapflow.hardware.write_governor import (
+    BatchFeasibilityResult,
+    ControlFeasibilityResult,
+    GovernanceDecision,
+    WriteFeasibilityResult,
+    WriteGovernanceRequest,
+    WriteGovernor,
+)
 from leapflow.hardware.control_bus import (
     ControlBusConfig,
     ControlBusStats,
@@ -95,8 +118,8 @@ from leapflow.hardware.fleet import (
     FleetNode,
     FleetSessionRouter,
     FleetTopology,
-    build_fleet_tools,
 )
+from leapflow.hardware.fleet_tools import build_fleet_tools
 from leapflow.hardware.control_hierarchy import (
     ControlHierarchy,
     ControlLayer,
@@ -172,7 +195,19 @@ __all__ = [
     "UnverifiedContextPolicy",
     "VerdictStatus",
     "VerificationMode",
+    "WriteExpectation",
     "WriteOutcome",
+    "WriteVerdict",
+    "WriteVerdictEvent",
+    "WriteVerdictStatus",
+    "WriteVerificationCoordinator",
+    "WriteGovernanceRequest",
+    "WriteGovernor",
+    "WriteFeasibilityResult",
+    "BatchFeasibilityResult",
+    "ControlFeasibilityResult",
+    "GovernanceDecision",
+    "aggregate_write_verdicts",
     "collect_evidence",
     # realtime.py
     "ControlTelemetryEvent",
@@ -203,6 +238,12 @@ __all__ = [
     "FleetSessionRouter",
     "FleetTopology",
     "build_fleet_tools",
+    # stream.py -- event classification
+    "EventKind",
+    "HardwareDeliberativeObserver",
+    "HardwareEvent",
+    "HardwareEventClass",
+    "classify_hardware_event",
     # health_monitor.py
     "DeviceHealthRecord",
     "HardwareHealthMonitor",

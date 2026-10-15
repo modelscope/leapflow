@@ -15,12 +15,18 @@ production code, because the protocol must not know what a liquid handler is.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from leapflow.engine.tools.tool_execution import effect_is_uncertain_on_failure, execution_policy_for
+from leapflow.engine.tools.tool_execution import (
+    effect_is_uncertain_on_failure,
+    execution_policy_for,
+)
+from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.context import (
     HC_VERSION,
     Channel,
@@ -44,6 +50,11 @@ from leapflow.security.orchestrator import ApprovalOrchestrator
 from leapflow.security.permission_failures import is_permission_hard_stop_payload
 from leapflow.security.policy import ApprovalPolicyEngine
 from leapflow.security.risk import DefaultRiskClassifier, RiskLevel
+from leapflow.tools.execution_context import (
+    ToolExecutionContext,
+    reset_tool_context,
+    set_tool_context,
+)
 from leapflow.tools.name_resolver import ToolRegistry
 from tests._harness.hardware_stubs import ScriptedHuman, with_transport_config
 
@@ -190,9 +201,7 @@ def bench_node_context() -> HardwareContext:
                 quantity="ratio.aux_level",
                 unit="percent",
                 effect=HardwareEffect.ACTUATE.value,
-                envelope=Envelope(
-                    declared=True, min_value=0.0, max_value=100.0, reversible=True
-                ),
+                envelope=Envelope(declared=True, min_value=0.0, max_value=100.0, reversible=True),
             ),
             Channel(
                 channel_id="indicator",
@@ -235,6 +244,7 @@ class Bench:
         decisions: tuple[ApprovalDecision, ...] = (ApprovalDecision.ALLOW_ONCE,),
         bypass: bool = False,
         require_describe: bool = False,
+        audit_log: HardwareAuditLog | None = None,
         **setting_overrides: Any,
     ) -> None:
         self.registry = HardwareRegistry(
@@ -253,7 +263,12 @@ class Bench:
             risk_classifier=build_risk_classifier(self.registry),
             policy=ApprovalPolicyEngine(bypass=bypass),
         )
-        self.tools = HardwareTools(self.registry, gate=self.orchestrator, session_id=SESSION)
+        self.tools = HardwareTools(
+            self.registry,
+            gate=self.orchestrator,
+            session_id=SESSION,
+            audit_log=audit_log,
+        )
 
     async def transport(self, device_id: str) -> Any:
         return await self.registry.transport(device_id)
@@ -277,6 +292,104 @@ def with_values(context: HardwareContext, **values: Any) -> HardwareContext:
     current = dict(dict(context.transport.config).get("values") or {})
     current.update(values)
     return with_transport_config(context, values=current)
+
+
+# ════════════════════════════════════════════════════════════════
+# Request-scoped session isolation
+# ════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_hardware_session_identity_falls_back_without_tool_context() -> None:
+    bench = Bench(bench_node_context(), require_describe=True)
+
+    await bench.tools.hw_describe(device_id="bench_node")
+
+    assert bench.registry.was_described(SESSION, "bench_node")
+
+
+@pytest.mark.asyncio
+async def test_hardware_session_identity_reaches_approval_descriptor(tmp_path: Path) -> None:
+    bench = Bench(
+        bench_node_context(),
+        decisions=(ApprovalDecision.ALLOW_ONCE,),
+        require_describe=True,
+        audit_log=HardwareAuditLog(tmp_path / "hardware-audit.ndjson"),
+    )
+    context = ToolExecutionContext.from_strings(
+        workspace_root=str(tmp_path / "workspace-a"),
+        session_id="session-a",
+    )
+    token = set_tool_context(context)
+    try:
+        await bench.tools.hw_describe(device_id="bench_node")
+        result = await bench.tools.hw_actuate(
+            device_id="bench_node",
+            channel_id="fan_duty",
+            value=30.0,
+        )
+    finally:
+        reset_tool_context(token)
+
+    assert result["ok"] is True
+    assert bench.human.prompts[-1].action.metadata["session_id"] == "session-a"
+    entries = HardwareAuditLog(tmp_path / "hardware-audit.ndjson").read_entries()
+    assert entries[-1].identity == "session-a"
+
+
+@pytest.mark.asyncio
+async def test_hardware_session_identity_isolated_across_concurrent_contexts(
+    tmp_path: Path,
+) -> None:
+    audit = HardwareAuditLog(tmp_path / "hardware-audit.ndjson")
+    bench = Bench(
+        bench_node_context(),
+        liquid_handler_context(),
+        require_describe=True,
+        audit_log=audit,
+    )
+
+    async def describe_and_read(
+        *, session_id: str, workspace: str, device_id: str, channel_id: str
+    ) -> None:
+        context = ToolExecutionContext.from_strings(
+            workspace_root=str(tmp_path / workspace),
+            session_id=session_id,
+        )
+        token = set_tool_context(context)
+        try:
+            await asyncio.sleep(0)
+            await bench.tools.hw_describe(device_id=device_id)
+            await asyncio.sleep(0)
+            result = await bench.tools.hw_read(
+                device_id=device_id,
+                channel_id=channel_id,
+            )
+            assert result["ok"] is True
+        finally:
+            reset_tool_context(token)
+
+    await asyncio.gather(
+        describe_and_read(
+            session_id="session-a",
+            workspace="workspace-a",
+            device_id="bench_node",
+            channel_id="cpu_temp",
+        ),
+        describe_and_read(
+            session_id="session-b",
+            workspace="workspace-b",
+            device_id="fluent_p1",
+            channel_id="plate_temp",
+        ),
+    )
+
+    assert bench.registry.was_described("session-a", "bench_node")
+    assert not bench.registry.was_described("session-a", "fluent_p1")
+    assert bench.registry.was_described("session-b", "fluent_p1")
+    assert not bench.registry.was_described("session-b", "bench_node")
+    identities = {entry.device: entry.identity for entry in audit.read_entries()}
+    assert identities == {"bench_node": "session-a", "fluent_p1": "session-b"}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -311,9 +424,7 @@ async def test_t1_failed_dispense_is_reported_as_uncertain_not_retried() -> None
     bench = Bench(context, decisions=(ApprovalDecision.ALLOW_SESSION,))
     await _describe(bench, "fluent_p1")
 
-    result = await bench.tools.hw_dispense(
-        device_id="fluent_p1", channel_id="aspirate", value=10.0
-    )
+    result = await bench.tools.hw_dispense(device_id="fluent_p1", channel_id="aspirate", value=10.0)
 
     assert result["ok"] is False
     # The effect verdict survives from the transport into the tool result.
@@ -356,9 +467,7 @@ def test_t1_write_tools_are_classified_as_non_replayable() -> None:
         metadata.to_openai_schema()
         for metadata in build_hardware_tools(HardwareTools(registry_stub))
     ]
-    handlers = {
-        definition["function"]["name"]: (lambda **_: None) for definition in definitions
-    }
+    handlers = {definition["function"]["name"]: (lambda **_: None) for definition in definitions}
     resolver = ToolRegistry.from_definitions(definitions, handlers)
 
     for tool_name in ("hw_configure", "hw_actuate", "hw_dispense"):
@@ -462,6 +571,7 @@ def test_t1_an_explicit_no_effect_claim_outranks_the_name() -> None:
     wins. A mutating bridge still overrides both, since a declaration contradicted
     by the handler's own answer is the stale one.
     """
+
     def _define(name: str, **metadata: object) -> ToolRegistry:
         return ToolRegistry.from_definitions(
             [
@@ -549,9 +659,7 @@ async def test_t2_approval_bypass_config_cannot_open_a_hardline() -> None:
 async def test_t2_unsatisfied_interlock_is_a_hardline() -> None:
     bench = Bench(with_values(liquid_handler_context(), tip_state=False))
     await _describe(bench, "fluent_p1")
-    result = await bench.tools.hw_dispense(
-        device_id="fluent_p1", channel_id="aspirate", value=10.0
-    )
+    result = await bench.tools.hw_dispense(device_id="fluent_p1", channel_id="aspirate", value=10.0)
     assert result["ok"] is False
     assert bench.human.prompts == []
     transport = await bench.transport("fluent_p1")
@@ -579,9 +687,7 @@ async def test_ic1_unready_device_is_hard_stopped_with_executable_repair() -> No
     """
     bench = Bench(with_values(liquid_handler_context(), tip_state=False))
     await _describe(bench, "fluent_p1")
-    result = await bench.tools.hw_dispense(
-        device_id="fluent_p1", channel_id="aspirate", value=10.0
-    )
+    result = await bench.tools.hw_dispense(device_id="fluent_p1", channel_id="aspirate", value=10.0)
     assert result["ok"] is False
     # Feasibility precedes consent: refused deterministically, no human asked.
     assert bench.human.prompts == []
@@ -615,9 +721,7 @@ async def test_ic1_write_is_released_once_readiness_is_satisfied() -> None:
     """
     bench = Bench(liquid_handler_context(), decisions=(ApprovalDecision.ALLOW_ONCE,))
     await _describe(bench, "fluent_p1")
-    result = await bench.tools.hw_dispense(
-        device_id="fluent_p1", channel_id="aspirate", value=10.0
-    )
+    result = await bench.tools.hw_dispense(device_id="fluent_p1", channel_id="aspirate", value=10.0)
     assert result["ok"] is True
     # A human was asked exactly once: the readiness hard stop did not pre-empt it.
     assert len(bench.human.prompts) == 1
@@ -634,9 +738,7 @@ async def test_ic1_channel_without_readiness_precondition_is_unaffected() -> Non
     """
     bench = Bench(bench_node_context(), decisions=(ApprovalDecision.ALLOW_ONCE,))
     await _describe(bench, "bench_node")
-    result = await bench.tools.hw_actuate(
-        device_id="bench_node", channel_id="fan_duty", value=20.0
-    )
+    result = await bench.tools.hw_actuate(device_id="bench_node", channel_id="fan_duty", value=20.0)
     assert result["ok"] is True
     assert result.get("failure_code") != "not_ready"
     assert len(bench.human.prompts) == 1
@@ -691,9 +793,7 @@ async def test_t3_undeclared_envelope_blocks_writes_without_prompting() -> None:
 async def test_t3_unverified_context_blocks_writes_by_default() -> None:
     bench = Bench(liquid_handler_context(verified=False))
     await _describe(bench, "fluent_p1")
-    result = await bench.tools.hw_dispense(
-        device_id="fluent_p1", channel_id="aspirate", value=10.0
-    )
+    result = await bench.tools.hw_dispense(device_id="fluent_p1", channel_id="aspirate", value=10.0)
     assert result["ok"] is False
     assert bench.human.prompts == []
 
@@ -722,7 +822,8 @@ async def test_absent_gate_denies_rather_than_proceeding() -> None:
     tools = HardwareTools(registry, gate=None, session_id=SESSION)
     result = await tools.hw_actuate(device_id="bench_node", channel_id="fan_duty", value=20.0)
     assert result["ok"] is False
-    assert "configuration fault" in result["error"]
+    assert "No approval gate is installed" in result["error"]
+    assert result.get("interaction_request") is not None
     transport = await registry.transport("bench_node")
     assert transport.write_log == ()
 
@@ -753,9 +854,7 @@ async def test_user_denial_message_reaches_the_caller_verbatim() -> None:
     """A denial is terminal and must not be softened into a generic tool error."""
     bench = Bench(bench_node_context(), decisions=(ApprovalDecision.DENY,))
     await _describe(bench, "bench_node")
-    result = await bench.tools.hw_actuate(
-        device_id="bench_node", channel_id="fan_duty", value=30.0
-    )
+    result = await bench.tools.hw_actuate(device_id="bench_node", channel_id="fan_duty", value=30.0)
     assert result["ok"] is False
     assert "User denied" in result["error"]
     assert "Do not retry" in result["error"]
@@ -777,7 +876,9 @@ async def test_in_band_values_reuse_one_grant() -> None:
     await _describe(bench, "bench_node")
     # aux_level declares no max_rate, so this exercises grant reuse rather than pacing.
     first = await bench.tools.hw_actuate(device_id="bench_node", channel_id="aux_level", value=25.0)
-    second = await bench.tools.hw_actuate(device_id="bench_node", channel_id="aux_level", value=61.0)
+    second = await bench.tools.hw_actuate(
+        device_id="bench_node", channel_id="aux_level", value=61.0
+    )
     third = await bench.tools.hw_actuate(device_id="bench_node", channel_id="aux_level", value=12.0)
     assert [first["ok"], second["ok"], third["ok"]] == [True, True, True]
     # The human was asked exactly once.
@@ -916,9 +1017,7 @@ async def test_denied_command_does_not_move_the_rate_baseline() -> None:
         await bench.tools.hw_actuate(device_id="bench_node", channel_id="fan_duty", value=200.0)
     )["ok"] is False
     # Still measured from 10, so a 60-point jump is still too fast.
-    third = await bench.tools.hw_actuate(
-        device_id="bench_node", channel_id="fan_duty", value=70.0
-    )
+    third = await bench.tools.hw_actuate(device_id="bench_node", channel_id="fan_duty", value=70.0)
     assert third["failure_code"] == "rate_limited"
 
 
@@ -1029,9 +1128,7 @@ async def test_interlock_read_raising_the_wrong_exception_fails_closed(
     )
     bench = Bench(context, decisions=(ApprovalDecision.ALLOW_ONCE,))
     await _describe(bench, "fluent_p1")
-    result = await bench.tools.hw_dispense(
-        device_id="fluent_p1", channel_id="aspirate", value=10.0
-    )
+    result = await bench.tools.hw_dispense(device_id="fluent_p1", channel_id="aspirate", value=10.0)
     assert result["ok"] is False
     # Hardline, so the human was never asked.
     assert bench.human.prompts == []
@@ -1074,9 +1171,7 @@ async def test_concurrent_first_use_opens_one_transport() -> None:
     import asyncio
 
     bench = Bench(bench_node_context())
-    transports = await asyncio.gather(
-        *(bench.registry.transport("bench_node") for _ in range(8))
-    )
+    transports = await asyncio.gather(*(bench.registry.transport("bench_node") for _ in range(8)))
     assert len({id(item) for item in transports}) == 1
     assert bench.registry.opened_devices() == ("bench_node",)
 
@@ -1208,6 +1303,159 @@ async def test_audit_detail_carries_no_raw_transport_payload() -> None:
 
 
 # ════════════════════════════════════════════════════════════════
+# Governed real-time control startup
+# ════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_control_start_requires_describe_and_approval() -> None:
+    bench = Bench(bench_node_context(), require_describe=True)
+    started: dict[str, Any] = {}
+
+    def _start(device_id: str, policy: Any, *, config: Any = None) -> None:
+        started.update(device_id=device_id, policy=policy, config=config)
+
+    bench.registry.start_control_loop = _start  # type: ignore[method-assign]
+    params = {
+        "device_id": "bench_node",
+        "mode": "pid",
+        "targets": {"fan_duty": 30.0, "aux_level": 25.0},
+    }
+
+    undescribed = await bench.tools.control_start(**params)
+    assert undescribed["failure_code"] == "describe_required"
+    assert bench.human.prompts == []
+    assert started == {}
+
+    await _describe(bench, "bench_node")
+    result = await bench.tools.control_start(**params)
+
+    assert result["ok"] is True
+    assert result["side_effect_state"] == "committed"
+    assert len(bench.human.prompts) == 1
+    assert started["device_id"] == "bench_node"
+
+
+@pytest.mark.asyncio
+async def test_control_start_rejects_non_actuation_target_without_prompting() -> None:
+    bench = Bench(bench_node_context())
+    result = await bench.tools.control_start(
+        device_id="bench_node",
+        mode="pid",
+        targets={"indicator": True},
+    )
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "invalid_control_channel"
+    assert bench.human.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_control_start_dry_run_does_not_start_or_prompt() -> None:
+    bench = Bench(bench_node_context())
+    started = False
+
+    def _start(device_id: str, policy: Any, *, config: Any = None) -> None:
+        nonlocal started
+        started = True
+
+    bench.registry.start_control_loop = _start  # type: ignore[method-assign]
+    result = await bench.tools.control_start(
+        device_id="bench_node",
+        mode="impedance",
+        targets={"aux_level": 20.0},
+        dry_run=True,
+    )
+
+    assert result["ok"] is True
+    assert result["preview"] is True
+    assert result["side_effect_state"] == SIDE_EFFECT_NONE
+    assert bench.human.prompts == []
+    assert started is False
+
+
+@pytest.mark.asyncio
+async def test_control_start_rejects_malformed_trajectory_time_without_prompting() -> None:
+    bench = Bench(bench_node_context())
+
+    result = await bench.tools.control_start(
+        device_id="bench_node",
+        mode="trajectory",
+        trajectory=[{"t": "not-a-time", "positions": {"aux_level": 20.0}}],
+    )
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "invalid_trajectory_time"
+    assert result["side_effect_state"] == SIDE_EFFECT_NONE
+    assert bench.human.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_control_start_failure_reports_uncertain_effect() -> None:
+    bench = Bench(bench_node_context())
+
+    def _fail_start(device_id: str, policy: Any, *, config: Any = None) -> None:
+        raise RuntimeError("loop startup failed")
+
+    bench.registry.start_control_loop = _fail_start  # type: ignore[method-assign]
+    result = await bench.tools.control_start(
+        device_id="bench_node",
+        mode="pid",
+        targets={"aux_level": 20.0},
+    )
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "control_start_failed"
+    assert result["side_effect_state"] == "unknown"
+    assert len(bench.human.prompts) == 1
+
+
+@pytest.mark.asyncio
+async def test_control_start_refuses_remote_lhp_until_node_sessions_exist() -> None:
+    remote = replace(
+        bench_node_context(),
+        transport=TransportRef(kind="lhp", config={"endpoint": "tcp://node:8767"}),
+    )
+    bench = Bench(remote)
+
+    result = await bench.tools.control_start(
+        device_id="bench_node",
+        mode="pid",
+        targets={"aux_level": 20.0},
+    )
+
+    assert result["failure_code"] == "remote_control_unsupported"
+    assert bench.human.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_control_stop_reports_not_running_without_counting_failure() -> None:
+    bench = Bench(bench_node_context())
+
+    result = await bench.tools.control_stop(device_id="bench_node")
+
+    assert result == {
+        "ok": False,
+        "status": "no_loop",
+        "device_id": "bench_node",
+        "failure_code": "not_running",
+        "counts_as_failure": False,
+        "side_effect_state": "none",
+    }
+
+
+def test_high_risk_hardware_tools_declare_external_side_effect_policy() -> None:
+    registry = HardwareRegistry(HardwareSettings(enabled=True))
+    metadata = {tool.name: tool for tool in build_hardware_tools(HardwareTools(registry))}
+    for name in ("hw_batch_actuate", "hw_control_start"):
+        tool = metadata[name]
+        assert tool.execution_policy == "external_side_effect"
+        assert tool.x_leapflow["execution_policy"] == "external_side_effect"
+        assert tool.x_leapflow["effect_scope"] == "external"
+        assert tool.x_leapflow["requires_approval"] is True
+
+
+# ════════════════════════════════════════════════════════════════
 # Composite classifier neutrality
 # ════════════════════════════════════════════════════════════════
 
@@ -1327,9 +1575,7 @@ def test_irreversible_actuate_forbids_reusable_consent() -> None:
         _single_channel_context(effect=HardwareEffect.ACTUATE.value, reversible=False)
     )
     classifier = build_risk_classifier(registry)
-    assessment = classifier.assess(
-        _in_envelope_descriptor(ActionKind.DEVICE_ACTUATE.value, 40.0)
-    )
+    assessment = classifier.assess(_in_envelope_descriptor(ActionKind.DEVICE_ACTUATE.value, 40.0))
     assert assessment.level == RiskLevel.HIGH
     assert assessment.allow_permanent is False
     assert "irreversible" in assessment.reasons
@@ -1349,9 +1595,7 @@ def test_dispense_forbids_reusable_consent_even_when_declared_reversible() -> No
         )
     )
     classifier = build_risk_classifier(registry)
-    assessment = classifier.assess(
-        _in_envelope_descriptor(ActionKind.DEVICE_DISPENSE.value, 40.0)
-    )
+    assessment = classifier.assess(_in_envelope_descriptor(ActionKind.DEVICE_DISPENSE.value, 40.0))
     assert assessment.level == RiskLevel.HIGH
     assert assessment.allow_permanent is False
 
@@ -1366,9 +1610,7 @@ def test_reversible_actuate_keeps_reusable_consent() -> None:
         _single_channel_context(effect=HardwareEffect.ACTUATE.value, reversible=True)
     )
     classifier = build_risk_classifier(registry)
-    assessment = classifier.assess(
-        _in_envelope_descriptor(ActionKind.DEVICE_ACTUATE.value, 40.0)
-    )
+    assessment = classifier.assess(_in_envelope_descriptor(ActionKind.DEVICE_ACTUATE.value, 40.0))
     assert assessment.level == RiskLevel.HIGH
     assert assessment.allow_permanent is True
     assert "irreversible" not in assessment.reasons
@@ -1380,9 +1622,7 @@ def test_reversible_configure_setpoint_keeps_reusable_consent() -> None:
         _single_channel_context(effect=HardwareEffect.CONFIGURE.value, reversible=True)
     )
     classifier = build_risk_classifier(registry)
-    assessment = classifier.assess(
-        _in_envelope_descriptor(ActionKind.DEVICE_CONFIGURE.value, 40.0)
-    )
+    assessment = classifier.assess(_in_envelope_descriptor(ActionKind.DEVICE_CONFIGURE.value, 40.0))
     assert assessment.level == RiskLevel.MEDIUM
     assert assessment.allow_permanent is True
 
@@ -1434,6 +1674,90 @@ def test_plugin_exposes_exactly_twelve_tools_when_bound() -> None:
         "hw_read",
         "hw_status",
     ]
+
+
+@pytest.mark.asyncio
+async def test_plugin_starts_health_monitor_without_fleet_nodes() -> None:
+    from leapflow.hardware.plugin import HardwareContextPlugin
+
+    registry = HardwareRegistry(
+        HardwareSettings(enabled=True),
+        providers=[_StaticProvider(bench_node_context())],
+    )
+    registry.load()
+    plugin = HardwareContextPlugin()
+    plugin.bind_runtime(hardware_registry=registry)
+
+    try:
+        await plugin.start_fleet()
+        poll_task = plugin._health_monitor._poll_task
+
+        assert plugin._health_monitor_started is True
+        assert poll_task is not None
+        assert plugin._health_monitor.device_health("bench_node")["status"] != "unknown"
+
+        await plugin.start_fleet()
+        assert plugin._health_monitor._poll_task is poll_task
+    finally:
+        await plugin._teardown()
+
+    assert plugin._health_monitor_started is False
+    assert poll_task.done()
+
+
+@pytest.mark.asyncio
+async def test_plugin_injects_profile_hardware_audit_path(tmp_path: Path) -> None:
+    from leapflow.hardware.plugin import HardwareContextPlugin
+
+    audit_path = tmp_path / "audit" / "hardware_audit.ndjson"
+    registry = HardwareRegistry(
+        HardwareSettings(enabled=True, audit_log_path=str(audit_path)),
+        providers=[_StaticProvider(bench_node_context())],
+    )
+    registry.load()
+    plugin = HardwareContextPlugin()
+    plugin.bind_runtime(hardware_registry=registry, session_id="fallback-session")
+    read_tool = next(tool for tool in plugin.tools if tool.name == "hw_read")
+
+    result = await read_tool.handler(device_id="bench_node", channel_id="cpu_temp")
+
+    assert result["ok"] is True
+    entries = HardwareAuditLog(audit_path).read_entries()
+    assert len(entries) == 1
+    assert entries[0].action == "read"
+    assert entries[0].identity == "fallback-session"
+
+
+def test_registry_injects_configured_alert_policy_into_stream_sources() -> None:
+    registry = HardwareRegistry(
+        HardwareSettings(
+            enabled=True,
+            persist_readings=False,
+            hardware_alert_policies=(
+                {
+                    "event_kind": "threshold_exceeded",
+                    "action": "hw_estop",
+                    "require_consecutive": 1,
+                },
+            ),
+        ),
+        providers=[_StaticProvider(bench_node_context())],
+    )
+    registry.load()
+    first_orchestrator = object()
+    registry.set_alert_orchestrator(first_orchestrator)
+
+    sources = registry.stream_sources()
+
+    assert sources
+    assert registry.alert_policy is not None
+    assert all(source._alert_policy is registry.alert_policy for source in sources)
+    assert registry.alert_policy.rules[0].action == "hw_estop"
+    assert registry.alert_policy._orchestrator is first_orchestrator
+
+    replacement_orchestrator = object()
+    registry.set_alert_orchestrator(replacement_orchestrator)
+    assert registry.alert_policy._orchestrator is replacement_orchestrator
 
 
 def test_plugin_registers_teardown_as_an_async_effect() -> None:
@@ -1537,6 +1861,8 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.preview_max_width",
         "hardware.preview_quality",
         "hardware.preview_idle_timeout_s",
+        "hardware.fleet_nodes",
+        "hardware.alert_policies",
     }
     for key in keys:
         view = service.describe(key)
@@ -1663,10 +1989,20 @@ def _unreachable_context(**config: Any) -> HardwareContext:
     would, and the refusal comes from production code rather than a test double.
     """
     base = bench_node_context()
-    return replace(base, transport=TransportRef(kind="mcp", config=config or {
-        "read_tool": "r", "write_tool": "w", "halt_tool": "h",
-        "channel_arg": "c", "value_arg": "v",
-    }))
+    return replace(
+        base,
+        transport=TransportRef(
+            kind="mcp",
+            config=config
+            or {
+                "read_tool": "r",
+                "write_tool": "w",
+                "halt_tool": "h",
+                "channel_arg": "c",
+                "value_arg": "v",
+            },
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -1680,9 +2016,7 @@ async def test_an_unreachable_device_never_reaches_the_human() -> None:
     the same one that guards a command which *can* be delivered.
     """
     bench = Bench(_unreachable_context())
-    result = await bench.tools.hw_actuate(
-        device_id="bench_node", channel_id="fan_duty", value=30.0
-    )
+    result = await bench.tools.hw_actuate(device_id="bench_node", channel_id="fan_duty", value=30.0)
     assert result["ok"] is False
     assert bench.human.prompts == [], "nobody may be asked about an undeliverable command"
     assert result["failure_code"] == "mcp_client_unavailable"
@@ -1694,9 +2028,7 @@ async def test_an_unreachable_device_never_reaches_the_human() -> None:
 async def test_a_reachable_device_is_still_put_to_the_human() -> None:
     """The check must gate on reachability alone, not quietly swallow the prompt."""
     bench = Bench(bench_node_context())
-    result = await bench.tools.hw_actuate(
-        device_id="bench_node", channel_id="fan_duty", value=30.0
-    )
+    result = await bench.tools.hw_actuate(device_id="bench_node", channel_id="fan_duty", value=30.0)
     assert result["ok"] is True
     assert len(bench.human.prompts) == 1
 
@@ -1729,8 +2061,12 @@ async def test_a_device_that_dies_after_opening_is_caught_before_consent() -> No
     try:
         bench = Bench(
             _unreachable_context(
-                read_tool="r", write_tool="w", probe_tool="status", halt_tool="h",
-                channel_arg="c", value_arg="v",
+                read_tool="r",
+                write_tool="w",
+                probe_tool="status",
+                halt_tool="h",
+                channel_arg="c",
+                value_arg="v",
             )
         )
         result = await bench.tools.hw_actuate(
@@ -1775,8 +2111,12 @@ async def test_a_dead_transport_is_dropped_so_the_next_attempt_reconnects() -> N
     try:
         bench = Bench(
             _unreachable_context(
-                read_tool="r", write_tool="w", probe_tool="status", halt_tool="h",
-                channel_arg="c", value_arg="v",
+                read_tool="r",
+                write_tool="w",
+                probe_tool="status",
+                halt_tool="h",
+                channel_arg="c",
+                value_arg="v",
             )
         )
         first = await bench.tools.hw_actuate(
@@ -1825,9 +2165,7 @@ async def test_an_unreachable_refusal_reaches_the_signal_path() -> None:
     bench = Bench(_unreachable_context())
     bench.registry.set_event_emitter(published.append)
 
-    result = await bench.tools.hw_actuate(
-        device_id="bench_node", channel_id="fan_duty", value=30.0
-    )
+    result = await bench.tools.hw_actuate(device_id="bench_node", channel_id="fan_duty", value=30.0)
     assert result["ok"] is False
 
     recorded = bench.registry.recent_events(device_id="bench_node")
@@ -1847,9 +2185,7 @@ async def test_a_refusal_still_happens_when_nothing_is_listening() -> None:
     """Reporting is telemetry; it must never be what decides a command's fate."""
     bench = Bench(_unreachable_context())  # no emitter installed
 
-    result = await bench.tools.hw_actuate(
-        device_id="bench_node", channel_id="fan_duty", value=30.0
-    )
+    result = await bench.tools.hw_actuate(device_id="bench_node", channel_id="fan_duty", value=30.0)
     assert result["failure_code"] == "mcp_client_unavailable"
     assert len(bench.registry.recent_events(device_id="bench_node")) == 1
 
@@ -1864,9 +2200,7 @@ async def test_a_raising_event_sink_does_not_fail_the_command() -> None:
     bench = Bench(_unreachable_context())
     bench.registry.set_event_emitter(_explode)
 
-    result = await bench.tools.hw_actuate(
-        device_id="bench_node", channel_id="fan_duty", value=30.0
-    )
+    result = await bench.tools.hw_actuate(device_id="bench_node", channel_id="fan_duty", value=30.0)
     assert result["failure_code"] == "mcp_client_unavailable"
     assert result["side_effect_state"] == SIDE_EFFECT_NONE
 
@@ -2016,7 +2350,8 @@ class TestDaemonHardwareGateRebinding:
             device_id="bench_node", channel_id="fan_duty", value=20.0
         )
         assert result["ok"] is False
-        assert "configuration fault" in result["error"]
+        assert "No approval gate is installed" in result["error"]
+        assert result.get("interaction_request") is not None
 
     @pytest.mark.asyncio
     async def test_teardown_not_double_registered_on_gate_rebind(self) -> None:
@@ -2103,15 +2438,19 @@ async def test_install_gate_rebinds_hardware_approval_gate() -> None:
     fake_ctx = _FakeCtx()
     fake_ctx._approval_orchestrator = pre_orchestrator  # type: ignore[attr-defined]
     fake_ctx._hardware_registry = hw_registry  # type: ignore[attr-defined]
-    fake_ctx.settings = type("S", (), {  # type: ignore[attr-defined]
-        "approval_bypass": False,
-        "plugin_generation_enabled": False,
-        "plugin_install_dir": None,
-        "profile_layout": None,
-        "plugin_marketplace_root": None,
-        "plugin_marketplace_url": None,
-        "plugin_marketplace_trusted_pubkeys": (),
-    })()
+    fake_ctx.settings = type(
+        "S",
+        (),
+        {  # type: ignore[attr-defined]
+            "approval_bypass": False,
+            "plugin_generation_enabled": False,
+            "plugin_install_dir": None,
+            "profile_layout": None,
+            "plugin_marketplace_root": None,
+            "plugin_marketplace_url": None,
+            "plugin_marketplace_trusted_pubkeys": (),
+        },
+    )()
     fake_ctx.llm = None  # type: ignore[attr-defined]
 
     class _FakeService:
@@ -2119,6 +2458,7 @@ async def test_install_gate_rebinds_hardware_approval_gate() -> None:
 
     # Monkey-patch get_registry so install_gate finds our test registry.
     import leapflow.plugins as _plugins_mod
+
     original_get_registry = _plugins_mod.get_registry
     _plugins_mod.get_registry = lambda: tool_registry
     try:
@@ -2129,9 +2469,7 @@ async def test_install_gate_rebinds_hardware_approval_gate() -> None:
 
     # 5. The daemon orchestrator is now on fake_ctx._approval_orchestrator.
     daemon_orchestrator = fake_ctx._approval_orchestrator
-    assert daemon_orchestrator is not pre_orchestrator, (
-        "install_gate must replace the orchestrator"
-    )
+    assert daemon_orchestrator is not pre_orchestrator, "install_gate must replace the orchestrator"
 
     # The hardware plugin's live tools must reference the daemon orchestrator.
     assert hw_plugin._hw_tools is not None, "tools must have been created"
@@ -2141,8 +2479,6 @@ async def test_install_gate_rebinds_hardware_approval_gate() -> None:
     assert hw_plugin._hw_tools._gate is daemon_orchestrator, (
         "the live HardwareTools instance must reference the daemon orchestrator"
     )
-
-
 
 
 def test_passive_hardware_discovery_defaults_on_without_opening_devices() -> None:

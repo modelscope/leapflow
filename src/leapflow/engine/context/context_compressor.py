@@ -14,6 +14,10 @@ Design principles:
 - Message-pair integrity: tool-call/tool-result pairs are never split
 - Summarization uses structured prompts with iterative updates
 - All character/token thresholds adapt to the model's context window size
+
+Size note (>800-line registered exception per AGENTS.md): the stage protocol
+and all four stage implementations live together so frozen-segment and
+cache-boundary invariants stay reviewable in one file.
 """
 from __future__ import annotations
 

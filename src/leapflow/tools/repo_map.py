@@ -13,10 +13,10 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
-try:  # Python 3.11+ stdlib; the project targets >=3.11.
+try:  # Python 3.11+ stdlib; tomli backport covers 3.10 (declared in pyproject.toml).
     import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    tomllib = None  # type: ignore[assignment]
+except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10 only
+    import tomli as tomllib  # type: ignore[no-redef]
 
 from leapflow.tools.dev_tools import _detect_lint_command, _detect_test_command
 from leapflow.tools.execution_context import require_workspace_access, resolve_workspace_path
@@ -70,7 +70,7 @@ def _vcs_info(root: Path) -> Dict[str, Any]:
 def _python_manifest(root: Path) -> Dict[str, Any]:
     info: Dict[str, Any] = {}
     pyproject = root / "pyproject.toml"
-    if tomllib is None or not pyproject.exists():
+    if not pyproject.exists():
         return info
     try:
         data = tomllib.loads(pyproject.read_text(encoding="utf-8", errors="replace"))

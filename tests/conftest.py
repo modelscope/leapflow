@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -23,6 +24,31 @@ from leapflow.memory import (
 )
 from leapflow.skills.registry import Skill, SkillMetadata, SkillRegistry
 from leapflow.storage.trajectory_store import TrajectoryStore
+
+
+# ════════════════════════════════════════════════════════════════
+# Ambient proxy neutrality
+# ════════════════════════════════════════════════════════════════
+
+
+def _pin_loopback_out_of_proxies() -> None:
+    """Keep loopback traffic out of any ambient proxy.
+
+    On developer machines running a local proxy app, macOS System Configuration
+    proxies are honoured by httpx even for ``127.0.0.1``: the unrelated proxy
+    answers the cassette proxy's socket itself (502 Bad Gateway), and replay
+    misses then look like product failures. CI has no system proxy; pinning
+    loopback here keeps local runs equivalent without touching remote egress.
+    """
+    for key in ("NO_PROXY", "no_proxy"):
+        entries = [part.strip() for part in os.environ.get(key, "").split(",") if part.strip()]
+        for host in ("127.0.0.1", "localhost", "::1"):
+            if host not in entries:
+                entries.append(host)
+        os.environ[key] = ",".join(entries)
+
+
+_pin_loopback_out_of_proxies()
 
 
 # ════════════════════════════════════════════════════════════════

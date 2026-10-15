@@ -88,12 +88,14 @@ async def request_hardware_frame(
     not in what is being consented to. A second implementation for the slash command
     would be a second gate free to disagree with the one that protects the device.
 
-    That difference in routing is the whole reason the slash command exists. The daemon
-    installs an approval route for ``command.execute`` but not for an ordinary RPC, so a
-    browser-initiated frame request has nowhere to prompt and is denied
+    The callers differ in where the prompt appears. The daemon installs an approval
+    route for ``command.execute`` and for the hardware observation RPCs
+    (``_APPROVAL_ROUTED_METHODS`` in ``daemon/server.py``), so the prompt travels
+    either to the TUI or as an interleaved stream event on the requesting socket --
+    which means an RPC caller that cannot answer it waits until it disconnects (the
+    route then denies). A caller with no route at all is denied immediately
     (``ApprovalCoordinator.request_approval`` returns ``deny`` when ``route is None``).
-    Running this from a slash command puts the prompt in the TUI, and the grant it mints
-    is what the browser's later requests are covered by.
+    Either way, the grant a prompt mints is what later requests are covered by.
 
     Returns the JSON-safe reply -- ``{ok, ...metadata, data_b64}`` or
     ``{ok: False, code, error}`` -- never raising, because both callers report rather
@@ -571,8 +573,8 @@ class RuntimeLeapService:
 
                 physical_source = PhysicalEnvironmentSource(
                     hardware_registry,
-                    evidence_store=None,
-                    capability_index=None,
+                    evidence_store=getattr(hardware_registry, "evidence_store", None),
+                    capability_index=getattr(hardware_registry, "capability_index", None),
                 )
                 manager.register(physical_source)
                 registered_any = True
@@ -1391,11 +1393,11 @@ class RuntimeLeapService:
         A thin wrapper over ``request_hardware_frame``, which is the single gated frame
         path and is shared with ``/board preview``.
 
-        One caveat is structural and worth naming here, where callers look: an ordinary
-        RPC has no approval route installed, so a privacy-gated channel is refused unless
-        a grant already exists. That is fail-closed and correct -- and it is why the
-        refusal message points at the slash command, which does have a route and can
-        therefore mint the grant.
+        One caveat is structural and worth naming here, where callers look: this RPC has
+        an approval route, so a privacy-gated channel without a grant *waits for a
+        human*. The prompt arrives as a stream event on the caller's own socket; an
+        unattended client must answer it (``approval.resolve``) or bound the call with a
+        timeout, because heartbeats keep the request alive indefinitely.
 
         Base64 over JSON-RPC rather than a binary channel: the transport is line-based,
         and a preview frame at the default ceiling is tens of kilobytes -- the 33%

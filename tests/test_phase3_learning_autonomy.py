@@ -785,6 +785,7 @@ class TestTrustGateApprovalBypass:
             )
             # Replace audit
             tools._audit = audit
+            tools._governor.set_audit_log(audit)
             for _ in range(3):
                 trust_gate.record_success("dev", "ch")
 
@@ -799,7 +800,13 @@ class TestTrustGateApprovalBypass:
 
     @pytest.mark.asyncio
     async def test_successful_write_accrues_trust(self) -> None:
-        """(d) A successful write increments the trust gate."""
+        """(d) A verified write observation increments the trust gate.
+
+        Trust no longer accrues from bare transport acceptance; it requires a
+        verified readback observation.  We simulate this by calling the
+        trust gate's record_success directly (as the verification coordinator
+        would when a settled readback matches the command).
+        """
         tools, trust_gate, human = _make_trust_bench(
             trust_skip_enabled=False, reversible=True, effect="configure",
         )
@@ -809,9 +816,15 @@ class TestTrustGateApprovalBypass:
         # Scripted human will approve
         result = await tools.hw_configure(device_id="dev", channel_id="ch", value=50.0)
         assert result["ok"] is True
-        # Trust was incremented by the write path
+        # Bare transport acceptance does NOT promote trust
+        rec = trust_gate.trust_record("dev", "ch")
+        assert rec.consecutive_ok == 0
+
+        # Simulate a verified observation (as WriteVerificationCoordinator would)
+        trust_gate.record_success("dev", "ch")
         rec = trust_gate.trust_record("dev", "ch")
         assert rec.consecutive_ok == 1
+        assert trust_gate.level("dev", "ch") == HardwareTrustLevel.CANDIDATE
 
     @pytest.mark.asyncio
     async def test_below_verified_still_prompts(self) -> None:

@@ -34,6 +34,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, runtime_checkable
 
+from leapflow.hardware.context import HardwareEffect, as_numeric
+
 logger = logging.getLogger(__name__)
 
 
@@ -147,6 +149,9 @@ class ControlBusStats:
     policy_errors: int = 0
     started_at: float = 0.0
     stopped_at: float = 0.0
+    verified_ticks: int = 0
+    mismatch_ticks: int = 0
+    unobservable_ticks: int = 0
 
     # Internal accumulators — not part of the public dict.
     _jitter_sum: float = field(default=0.0, repr=False)
@@ -164,6 +169,9 @@ class ControlBusStats:
             "safety_violations": self.safety_violations,
             "degradation_halts": self.degradation_halts,
             "policy_errors": self.policy_errors,
+            "verified_ticks": self.verified_ticks,
+            "mismatch_ticks": self.mismatch_ticks,
+            "unobservable_ticks": self.unobservable_ticks,
             "started_at": self.started_at,
             "stopped_at": self.stopped_at,
         }
@@ -219,6 +227,11 @@ class HighFrequencyControlBus:
         # Pre-resolved channel lists — populated in start().
         self._read_channel_ids: tuple[str, ...] = ()
         self._write_channel_ids: tuple[str, ...] = ()
+        self._last_commands: dict[str, tuple[float, float]] = {}
+        # Per-tick verification: channel_id → (commanded_value, cycle_number)
+        self._pending_tick_expectations: dict[str, tuple[float, int]] = {}
+        # Tolerance for tick verification, derived from channel envelope.
+        self._channel_tolerances: dict[str, float] = {}
 
     # -- Public interface --------------------------------------------------
 
@@ -232,30 +245,39 @@ class HighFrequencyControlBus:
         """
         if self._running.is_set():
             raise RuntimeError(
-                "HighFrequencyControlBus is already running; "
-                "call stop() before starting again"
+                "HighFrequencyControlBus is already running; call stop() before starting again"
             )
         self._device_id = device_id
         self._policy = policy
         self._latest_state = None
         self._stats = ControlBusStats(started_at=time.monotonic())
         self._stop_requested.clear()
+        self._last_commands.clear()
+        self._pending_tick_expectations.clear()
+        self._channel_tolerances.clear()
 
         # Resolve channel topology from the registry before spawning the
         # thread so a misconfigured device fails loudly here.
         context = self._registry.context(device_id)
         if context is None:
             raise ValueError(f"unknown device {device_id!r}")
-        self._read_channel_ids = tuple(
-            ch.channel_id for ch in context.channels if ch.is_readable
-        )
+        self._read_channel_ids = tuple(ch.channel_id for ch in context.channels if ch.is_readable)
         self._write_channel_ids = tuple(
-            ch.channel_id for ch in context.channels if ch.is_writable
+            ch.channel_id
+            for ch in context.channels
+            if ch.is_writable and ch.effect == HardwareEffect.ACTUATE.value
         )
         if not self._read_channel_ids:
+            raise ValueError(f"device {device_id!r} has no readable channels for control")
+        if not self._write_channel_ids:
             raise ValueError(
-                f"device {device_id!r} has no readable channels for control"
+                f"device {device_id!r} has no writable effect=actuate channels for control"
             )
+        # Pre-compute per-channel tolerances for tick verification.
+        for ch in context.channels:
+            tol = getattr(getattr(ch, "envelope", None), "tolerance", 0.0)
+            if tol and tol > 0:
+                self._channel_tolerances[ch.channel_id] = float(tol)
 
         self._thread = threading.Thread(
             target=self._control_thread_main,
@@ -265,9 +287,7 @@ class HighFrequencyControlBus:
         self._thread.start()
         # Wait until the thread signals that it is running (transport opened).
         if not self._running.wait(timeout=10.0):
-            raise RuntimeError(
-                f"control thread for {device_id!r} did not start within 10s"
-            )
+            raise RuntimeError(f"control thread for {device_id!r} did not start within 10s")
 
     def stop(self, timeout_s: float = 2.0) -> None:
         """Request graceful stop: finishes current cycle, halts device, joins thread."""
@@ -419,8 +439,7 @@ class HighFrequencyControlBus:
                     # DegradationPolicy: comm-loss check.
                     if (
                         comm_loss_start is not None
-                        and (time.monotonic() - comm_loss_start)
-                        > config.comm_loss_timeout_s
+                        and (time.monotonic() - comm_loss_start) > config.comm_loss_timeout_s
                     ):
                         logger.error(
                             "Control bus comm loss exceeded %.2fs on %s — halting",
@@ -431,9 +450,7 @@ class HighFrequencyControlBus:
                         self._sync_halt(loop, transport)
                         break
                     # Back-off briefly and retry.
-                    self._precise_wait(
-                        time.monotonic() + min(period_s, 0.01)
-                    )
+                    self._precise_wait(time.monotonic() + min(period_s, 0.01))
                     next_cycle_at = time.monotonic() + period_s
                     continue
 
@@ -467,6 +484,9 @@ class HighFrequencyControlBus:
                 # GIL-atomic publish.
                 self._latest_state = state
 
+                # (b.2) Tick verification against pending expectations ------
+                self._verify_tick(state, stats)
+
                 # (c) Compute command -------------------------------------
                 try:
                     command = policy.compute(state)
@@ -496,25 +516,39 @@ class HighFrequencyControlBus:
                     break
 
                 # (d) Safety check ----------------------------------------
-                if (
+                # Channel identity, effect, envelope, and slew constraints are
+                # checked every cycle. The configurable interval applies only to
+                # the more expensive device-level SafetyPolicy checks.
+                check_device_policy = (
                     config.safety_check_interval > 0
                     and stats.cycles % config.safety_check_interval == 0
+                )
+                if not self._check_safety(
+                    state,
+                    command,
+                    check_device_policy=check_device_policy,
                 ):
-                    safe = self._check_safety(state, command)
-                    if not safe:
-                        stats.safety_violations += 1
-                        logger.error(
-                            "Safety violation on cycle %d — halting %s",
-                            stats.cycles,
-                            device_id,
-                        )
-                        self._sync_halt(loop, transport)
-                        break
+                    stats.safety_violations += 1
+                    logger.error(
+                        "Safety violation on cycle %d — halting %s",
+                        stats.cycles,
+                        device_id,
+                    )
+                    self._sync_halt(loop, transport)
+                    break
 
                 # (e) Write actuators -------------------------------------
                 if command.joint_commands:
                     try:
-                        self._sync_write_batch(loop, transport, command)
+                        accepted = self._sync_write_batch(loop, transport, command)
+                        accepted_at = time.monotonic()
+                        for channel_id, value in accepted:
+                            numeric = as_numeric(value)
+                            if numeric is not None:
+                                self._last_commands[channel_id] = (numeric, accepted_at)
+                                record_command = getattr(self._registry, "record_command", None)
+                                if callable(record_command):
+                                    record_command(device_id, channel_id, numeric)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "Control bus write failed on %s cycle %d: %s",
@@ -526,17 +560,20 @@ class HighFrequencyControlBus:
                         # fatal — the next cycle will attempt again.  A
                         # persistent failure is caught by the read-side
                         # comm-loss path.
+                    else:
+                        # Record expectations for next-tick verification.
+                        for channel_id, value in accepted:
+                            numeric = as_numeric(value)
+                            if numeric is not None:
+                                self._pending_tick_expectations[channel_id] = (
+                                    numeric, stats.cycles
+                                )
 
                 # (f) Update stats ----------------------------------------
-                self._update_cycle_stats(
-                    stats, cycle_start, period_s, config.max_overrun_ratio
-                )
+                self._update_cycle_stats(stats, cycle_start, period_s, config.max_overrun_ratio)
 
                 # Check for consecutive overrun halt.
-                if (
-                    stats.consecutive_overruns
-                    >= config.consecutive_overrun_limit
-                ):
+                if stats.consecutive_overruns >= config.consecutive_overrun_limit:
                     logger.error(
                         "Control bus hit %d consecutive overruns on %s — halting",
                         stats.consecutive_overruns,
@@ -596,8 +633,7 @@ class HighFrequencyControlBus:
                 self._set_priority_darwin(target)
             else:
                 logger.info(
-                    "Thread priority elevation not supported on %s; "
-                    "continuing at normal priority",
+                    "Thread priority elevation not supported on %s; continuing at normal priority",
                     system,
                 )
         except Exception as exc:  # noqa: BLE001
@@ -651,9 +687,7 @@ class HighFrequencyControlBus:
 
         prio = 47 if target == "realtime" else 31
         param = _SchedParam(sched_priority=prio)
-        ret = libpthread.pthread_setschedparam(
-            thread_self, SCHED_RR, ctypes.byref(param)
-        )
+        ret = libpthread.pthread_setschedparam(thread_self, SCHED_RR, ctypes.byref(param))
         if ret != 0:
             errno = ctypes.get_errno()
             raise OSError(errno, os.strerror(errno))
@@ -661,9 +695,7 @@ class HighFrequencyControlBus:
 
     # -- Synchronous transport wrappers ------------------------------------
 
-    def _sync_read_batch(
-        self, loop: asyncio.AbstractEventLoop, transport: Any
-    ) -> Any:
+    def _sync_read_batch(self, loop: asyncio.AbstractEventLoop, transport: Any) -> Any:
         """Synchronous read_batch wrapper for the control thread.
 
         Uses the thread-local event loop created in ``_control_thread_main``.
@@ -674,9 +706,8 @@ class HighFrequencyControlBus:
         from leapflow.hardware.transport import BatchReading, BatchTransport, Reading
 
         if isinstance(transport, BatchTransport):
-            return loop.run_until_complete(
-                transport.read_batch(self._read_channel_ids)
-            )
+            return loop.run_until_complete(transport.read_batch(self._read_channel_ids))
+
         # Sequential fallback — still under one loop.run_until_complete to
         # keep the overhead per-cycle rather than per-channel.
         async def _seq_read() -> BatchReading:
@@ -695,8 +726,8 @@ class HighFrequencyControlBus:
         loop: asyncio.AbstractEventLoop,
         transport: Any,
         command: ControlCommand,
-    ) -> None:
-        """Synchronous write_batch wrapper for the control thread."""
+    ) -> tuple[tuple[str, Any], ...]:
+        """Write one command and return only channel values accepted by the driver."""
         from leapflow.hardware.transport import BatchTransport
 
         commands_tuple = tuple(
@@ -705,17 +736,25 @@ class HighFrequencyControlBus:
             if ch_id in self._write_channel_ids
         )
         if not commands_tuple:
-            return
+            return ()
 
         if isinstance(transport, BatchTransport):
-            loop.run_until_complete(transport.write_batch(commands_tuple))
-        else:
-            # Sequential fallback.
-            async def _seq_write() -> None:
-                for ch_id, val in commands_tuple:
-                    await transport.write(ch_id, val)
+            batch = loop.run_until_complete(transport.write_batch(commands_tuple))
+            return tuple(
+                command_item
+                for command_item, outcome in zip(commands_tuple, batch.outcomes, strict=False)
+                if outcome.ok
+            )
 
-            loop.run_until_complete(_seq_write())
+        async def _seq_write() -> tuple[tuple[str, Any], ...]:
+            accepted: list[tuple[str, Any]] = []
+            for ch_id, val in commands_tuple:
+                outcome = await transport.write(ch_id, val)
+                if outcome.ok:
+                    accepted.append((ch_id, val))
+            return tuple(accepted)
+
+        return loop.run_until_complete(_seq_write())
 
     @staticmethod
     def _sync_halt(loop: asyncio.AbstractEventLoop, transport: Any) -> None:
@@ -755,59 +794,132 @@ class HighFrequencyControlBus:
         while time.monotonic() < target_time:
             pass
 
+    # -- Per-tick verification ---------------------------------------------
+
+    def _verify_tick(
+        self,
+        state: ControlState,
+        stats: ControlBusStats,
+    ) -> None:
+        """Compare observed positions against pending expectations from the previous tick.
+
+        Expectations are created after each write (step e) and verified on the
+        next read (step b.2).  A channel is *verified* when the observed position
+        is within the declared envelope tolerance; *mismatch* otherwise.
+        Channels without a readable position are recorded as *unobservable*.
+        """
+        if not self._pending_tick_expectations:
+            return
+        consumed: list[str] = []
+        for channel_id, (commanded, _cycle) in self._pending_tick_expectations.items():
+            observed = state.joint_positions.get(channel_id)
+            if observed is None:
+                stats.unobservable_ticks += 1
+                consumed.append(channel_id)
+                continue
+            tolerance = self._channel_tolerances.get(channel_id, 0.01)
+            deviation = abs(float(observed) - commanded)
+            if deviation <= tolerance:
+                stats.verified_ticks += 1
+            else:
+                stats.mismatch_ticks += 1
+                logger.debug(
+                    "Tick verification mismatch on %s: commanded=%.4f observed=%.4f deviation=%.4f tolerance=%.4f",
+                    channel_id, commanded, observed, deviation, tolerance,
+                )
+            consumed.append(channel_id)
+        for ch in consumed:
+            self._pending_tick_expectations.pop(ch, None)
+
     # -- Safety checks -----------------------------------------------------
 
     def _check_safety(
-        self, state: ControlState, command: ControlCommand
+        self,
+        state: ControlState,
+        command: ControlCommand,
+        *,
+        check_device_policy: bool = True,
     ) -> bool:
-        """Check SafetyPolicy constraints on the computed command.
-
-        Returns True if safe.  On violation: logs and returns False.
-        The caller halts instead of writing.
-        """
+        """Enforce per-command hardlines and optional device-level policy."""
         degradation_query = getattr(self._registry, "is_device_degraded", None)
         if callable(degradation_query) and degradation_query(self._device_id) is True:
             logger.error("Device %s is degraded — halting control loop", self._device_id)
             return False
 
-        checker = self._safety_checker
-        if checker is None:
-            return True
-
         context = self._registry.context(self._device_id)
-        if context is None or context.safety is None:
-            return True
+        if context is None:
+            logger.error("Control context for %s disappeared", self._device_id)
+            return False
 
-        # Check each commanded joint against the device-level safety policy.
-        for ch_id, val in command.joint_commands.items():
-            channel = context.channel(ch_id)
-            if channel is None:
-                continue
-            allowed, reason = checker(context, channel, val)
-            if not allowed:
+        now = time.monotonic()
+        for channel_id, value in command.joint_commands.items():
+            channel = context.channel(channel_id)
+            if (
+                channel is None
+                or not channel.is_writable
+                or channel.effect != HardwareEffect.ACTUATE.value
+            ):
                 logger.error(
-                    "Safety violation on %s.%s: %s (value=%s)",
+                    "Control policy commanded unknown or non-actuation channel %s.%s",
                     self._device_id,
-                    ch_id,
-                    reason,
-                    val,
+                    channel_id,
                 )
                 return False
-
-        # Check velocity limits against state readings.
-        if context.safety.max_velocity_rad_s > 0:
-            for ch_id, vel in state.joint_velocities.items():
-                if abs(vel) > context.safety.max_velocity_rad_s:
+            if not channel.envelope.contains(value):
+                logger.error(
+                    "Control command is outside the envelope for %s.%s: %r",
+                    self._device_id,
+                    channel_id,
+                    value,
+                )
+                return False
+            numeric = as_numeric(value)
+            baseline = self._last_commands.get(channel_id)
+            if numeric is not None and baseline is not None:
+                previous, previous_at = baseline
+                if (
+                    channel.envelope.rate_wait_s(
+                        delta=numeric - previous,
+                        elapsed_s=now - previous_at,
+                    )
+                    > 0.0
+                ):
                     logger.error(
-                        "Safety: observed velocity %.3f rad/s on %s.%s "
-                        "exceeds limit %.3f rad/s",
-                        abs(vel),
+                        "Control command exceeds the declared rate for %s.%s",
                         self._device_id,
-                        ch_id,
-                        context.safety.max_velocity_rad_s,
+                        channel_id,
                     )
                     return False
 
+        if not check_device_policy or context.safety is None:
+            return True
+        checker = self._safety_checker
+        if checker is not None:
+            for channel_id, value in command.joint_commands.items():
+                channel = context.channel(channel_id)
+                assert channel is not None
+                allowed, reason = checker(context, channel, value)
+                if not allowed:
+                    logger.error(
+                        "Safety violation on %s.%s: %s (value=%s)",
+                        self._device_id,
+                        channel_id,
+                        reason,
+                        value,
+                    )
+                    return False
+
+        if context.safety.max_velocity_rad_s > 0:
+            for channel_id, velocity in state.joint_velocities.items():
+                if abs(velocity) > context.safety.max_velocity_rad_s:
+                    logger.error(
+                        "Safety: observed velocity %.3f rad/s on %s.%s exceeds limit %.3f rad/s",
+                        abs(velocity),
+                        self._device_id,
+                        channel_id,
+                        context.safety.max_velocity_rad_s,
+                    )
+                    return False
         return True
 
     # -- Stats helpers -----------------------------------------------------

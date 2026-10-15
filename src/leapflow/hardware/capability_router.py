@@ -216,11 +216,13 @@ class CapabilityExecutor:
         registry: Any,
         skill_plugin: Any = None,  # PhysicalSkillPlugin reference
         gate: Any = None,  # approval gate
+        hardware_tools: Any = None,  # shared HardwareTools for audit/trust/session
     ) -> None:
         self._index = index
         self._registry = registry
         self._skill_plugin = skill_plugin
         self._gate = gate
+        self._hardware_tools_provider = hardware_tools
         self._hw_tools: Any = None
 
     async def execute(self, affordance: str, params: dict) -> dict:
@@ -342,6 +344,8 @@ class CapabilityExecutor:
             return {"ok": False, "error": "batch_actuate_failed", "detail": str(exc)}
 
     def _hardware_tools(self) -> Any:
+        if self._hardware_tools_provider is not None:
+            return self._hardware_tools_provider
         if self._hw_tools is None and self._registry is not None:
             from leapflow.hardware.tools import HardwareTools
 
@@ -377,18 +381,15 @@ class CapabilityExecutor:
         return None
 
     def _selected_policy(self) -> str | None:
-        """Return a loaded policy key from the skill plugin, if any.
-
-        Reads the plugin's policy cache directly: without a cached policy there
-        is no path to hand ``hw_policy_infer``, so the executor falls through to
-        the batch or error strategy instead of guessing one.
-        """
+        """Return a loaded policy key from the skill plugin, if any."""
         if self._skill_plugin is None:
             return None
-        policies = getattr(self._skill_plugin, "_policies", None)
+        policies = getattr(self._skill_plugin, "policies", None)
+        if policies is None:
+            # Fallback to private attribute for backward compat
+            policies = getattr(self._skill_plugin, "_policies", None)
         if not policies:
             return None
-        # The most recently loaded policy is the most likely intended one.
         try:
             return next(reversed(list(policies.keys())))
         except StopIteration:
@@ -541,7 +542,7 @@ class CapabilityRouterPlugin:
 
     plugin_id = "capability_router"
     category = "hardware"
-    dependencies = ["hardware_registry", "hardware_approval_gate"]
+    dependencies = ["hardware_registry", "hardware_approval_gate", "hardware_trust_gate", "session_id"]
 
     def __init__(self) -> None:
         self._registry: Any = None
@@ -549,6 +550,9 @@ class CapabilityRouterPlugin:
         self._skill_plugin: Any = None
         self._tools: list[ToolMetadata] | None = None
         self._orchestrator: Any = None
+        self._hardware_tools_provider: Any = None
+        self._trust_gate: Any = None
+        self._session_id: str = ""
 
     def bind_runtime(self, **deps: Any) -> None:
         """Receive the registry, the approval gate, and an optional skill plugin.
@@ -565,15 +569,43 @@ class CapabilityRouterPlugin:
         if "hardware_approval_gate" in deps:
             self._gate = deps.get("hardware_approval_gate")
             changed = True
-        # Optional: the physical skill plugin enables the policy execution path.
-        # Not in ``dependencies`` because it is an enhancement, not a requirement;
-        # accepted opportunistically when the assembler injects it.
         if "physical_skill_plugin" in deps:
             self._skill_plugin = deps.get("physical_skill_plugin")
+            changed = True
+        if "hardware_trust_gate" in deps:
+            self._trust_gate = deps.get("hardware_trust_gate")
+            changed = True
+        if "session_id" in deps:
+            self._session_id = str(deps.get("session_id") or "")
+            changed = True
+        if "hardware_tools" in deps:
+            self._hardware_tools_provider = deps.get("hardware_tools")
             changed = True
         if changed:
             self._tools = None
             self._orchestrator = None
+
+    # -- Shared HardwareTools builder ------------------------------------
+
+    def _build_hardware_tools(self) -> Any:
+        """Build a HardwareTools instance with full audit/trust/session context."""
+        from leapflow.hardware.tools import HardwareTools
+
+        audit_log = None
+        audit_path = str(getattr(getattr(self._registry, "settings", None), "audit_log_path", "") or "")
+        if audit_path:
+            from pathlib import Path
+
+            from leapflow.hardware.audit import HardwareAuditLog
+
+            audit_log = HardwareAuditLog(Path(audit_path))
+        return HardwareTools(
+            self._registry,
+            gate=self._gate,
+            session_id=self._session_id,
+            audit_log=audit_log,
+            hardware_trust_gate=self._trust_gate,
+        )
 
     # -- Orchestrator tool handler ------------------------------------------
 
@@ -581,9 +613,10 @@ class CapabilityRouterPlugin:
         """Lazily construct a :class:`MultiDeviceOrchestrator`."""
         if self._orchestrator is None and self._registry is not None:
             from leapflow.robot.orchestrator import MultiDeviceOrchestrator
-            from leapflow.hardware.tools import HardwareTools
 
-            hw_tools = HardwareTools(self._registry, gate=self._gate)
+            hw_tools = self._hardware_tools_provider
+            if hw_tools is None:
+                hw_tools = self._build_hardware_tools()
             index = CapabilityIndex(self._registry)
             self._orchestrator = MultiDeviceOrchestrator(
                 self._registry,
@@ -721,6 +754,7 @@ class CapabilityRouterPlugin:
                 self._registry,
                 skill_plugin=self._skill_plugin,
                 gate=self._gate,
+                hardware_tools=self._hardware_tools_provider,
             )
             generator = CapabilityToolGenerator(index, executor)
             self._tools = generator.generate()
