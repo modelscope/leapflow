@@ -556,10 +556,15 @@ def _validate_tool_arguments(spec: Any, args: Dict[str, Any]) -> Optional[Dict[s
         "ok": False,
         "error": f"Invalid arguments for {tool_name}: missing required parameter(s): {', '.join(sorted(missing))}",
         "error_type": "invalid_arguments",
+        "failure_class": "invalid_request",
+        "failure_code": "missing_required_fields",
         "tool_name": tool_name,
         "missing": sorted(missing),
         "required": sorted(required),
         "accepted_parameters": accepted,
+        "recovery_hint": (
+            "Call the tool again with every required parameter using the declared schema."
+        ),
         "retryable": True,
         "counts_as_failure": False,
     }
@@ -745,12 +750,14 @@ def _permission_override_message(messages: List[Dict[str, Any]]) -> str:
     return _build_permission_recovery_text(payload)
 
 
-def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
+def _last_tool_failures_recovery_message(
+    messages: List[Dict[str, Any]], *, include_generic: bool = True
+) -> str:
     """Build a user-facing message from the last consecutive tool failures.
 
-    Called when the loop exits with no content due to hitting
-    max_consecutive_tool_failures.  Returns "" when no useful failure context
-    is available in the recent message history.
+    Structured failures always produce deterministic recovery guidance. Generic
+    failures are included only when ``include_generic`` is true, allowing the
+    engine to give tool-free synthesis priority over raw tool output.
     """
     failures = _extract_recent_tool_failures(messages)
     if not failures:
@@ -791,13 +798,13 @@ def _last_tool_failures_recovery_message(messages: List[Dict[str, Any]]) -> str:
         lines.append(
             f"Action parameter incomplete: {error}. Please provide the missing field(s) and retry."
         )
-    elif error:
+    elif include_generic and error:
         lines.append(f"Action failed: {error}")
 
-    if recovery_hint and not any(recovery_hint[:50] in line for line in lines):
+    if lines and recovery_hint and not any(recovery_hint[:50] in line for line in lines):
         lines.append(f"Hint: {recovery_hint}")
 
-    if len(failures) > 1:
+    if lines and len(failures) > 1:
         lines.append(f"({len(failures)} consecutive tool failures in this turn)")
 
     return "\n".join(lines) if lines else ""

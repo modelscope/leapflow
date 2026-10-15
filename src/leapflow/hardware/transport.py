@@ -446,10 +446,58 @@ class BatchTransport(Protocol):
         ...
 
 
+@runtime_checkable
+class RemoteControlTransport(Protocol):
+    """Optional side-protocol for node-local control sessions (control.v1).
+
+    Discovered via ``isinstance(transport, RemoteControlTransport)``. A
+    transport that satisfies this protocol can delegate control loop
+    execution to the remote node, with the host maintaining the session
+    via lease renewals.
+
+    The host opens a session, the node runs the ControlBus locally, and
+    the host renews the lease at ``lease_s / 3`` intervals.  If renewal
+    fails, the node executes its ``comm_loss_policy``.
+    """
+
+    async def open_control(
+        self,
+        *,
+        device_id: str,
+        mode: str,
+        frequency_hz: float,
+        channels: list[str],
+        targets: Any = None,
+        waypoints: Any = None,
+        lease_s: float = 1.0,
+        comm_loss_policy: str = "halt",
+    ) -> dict[str, Any]:
+        """Open a control session on the remote node.
+
+        Returns ``{control_id, lease_s, expires_in_s}``.
+        """
+        ...
+
+    async def renew_control(self, control_id: str) -> dict[str, Any]:
+        """Renew the lease on a remote control session."""
+        ...
+
+    async def update_control(
+        self, control_id: str, *, targets: Any = None, waypoints: Any = None
+    ) -> dict[str, Any]:
+        """Update targets/waypoints on a running session (requires new permit)."""
+        ...
+
+    async def close_control(self, control_id: str) -> dict[str, Any]:
+        """Close a remote control session and return stats."""
+        ...
+
+
 __all__ = [
     "BatchReading",
     "BatchTransport",
     "BatchWriteOutcome",
+    "RemoteControlTransport",
     "SIDE_EFFECT_COMMITTED",
     "SIDE_EFFECT_NONE",
     "SIDE_EFFECT_PARTIAL",

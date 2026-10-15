@@ -90,12 +90,14 @@ class TestAlertRuleMatching:
 
 class TestAlertRuleFromDict:
     def test_basic_parse(self) -> None:
-        rule = AlertRule.from_dict({
-            "event_kind": "threshold_exceeded",
-            "action": "hw_estop",
-            "channel_filter": "dev1.level",
-            "require_consecutive": 5,
-        })
+        rule = AlertRule.from_dict(
+            {
+                "event_kind": "threshold_exceeded",
+                "action": "hw_estop",
+                "channel_filter": "dev1.level",
+                "require_consecutive": 5,
+            }
+        )
         assert rule.event_kind == "threshold_exceeded"
         assert rule.action == "hw_estop"
         assert rule.channel_filter == "dev1.level"
@@ -107,11 +109,13 @@ class TestAlertRuleFromDict:
         assert rule.require_consecutive == DEFAULT_CONSECUTIVE
 
     def test_consecutive_clamped_to_one(self) -> None:
-        rule = AlertRule.from_dict({
-            "event_kind": "x",
-            "action": "y",
-            "require_consecutive": 0,
-        })
+        rule = AlertRule.from_dict(
+            {
+                "event_kind": "x",
+                "action": "y",
+                "require_consecutive": 0,
+            }
+        )
         assert rule.require_consecutive == 1
 
 
@@ -125,21 +129,42 @@ class TestLoadAlertPolicies:
         assert load_alert_policies(settings) == ()
 
     def test_valid_rules_loaded(self) -> None:
-        settings = SimpleNamespace(hardware_alert_policies=[
-            {"event_kind": "threshold_exceeded", "action": "hw_estop"},
-            {"event_kind": "rate_exceeded", "action": "notify", "require_consecutive": 5},
-        ])
+        settings = SimpleNamespace(
+            hardware_alert_policies=[
+                {"event_kind": "threshold_exceeded", "action": "hw_estop"},
+                {"event_kind": "rate_exceeded", "action": "notify", "require_consecutive": 5},
+            ]
+        )
         rules = load_alert_policies(settings)
         assert len(rules) == 2
         assert rules[0].action == "hw_estop"
         assert rules[1].require_consecutive == 5
 
+    def test_json_rules_loaded_from_settings_control_plane(self) -> None:
+        settings = SimpleNamespace(
+            hardware_alert_policies=(
+                '[{"event_kind":"threshold_exceeded","action":"hw_estop","require_consecutive":2}]'
+            )
+        )
+
+        rules = load_alert_policies(settings)
+
+        assert len(rules) == 1
+        assert rules[0].action == "hw_estop"
+        assert rules[0].require_consecutive == 2
+
+    def test_invalid_json_is_ignored(self) -> None:
+        settings = SimpleNamespace(hardware_alert_policies="[invalid")
+        assert load_alert_policies(settings) == ()
+
     def test_malformed_entries_skipped(self) -> None:
-        settings = SimpleNamespace(hardware_alert_policies=[
-            "not a dict",
-            {"event_kind": "", "action": "hw_estop"},  # missing event_kind
-            {"event_kind": "stale", "action": "alert"},  # valid
-        ])
+        settings = SimpleNamespace(
+            hardware_alert_policies=[
+                "not a dict",
+                {"event_kind": "", "action": "hw_estop"},  # missing event_kind
+                {"event_kind": "stale", "action": "alert"},  # valid
+            ]
+        )
         rules = load_alert_policies(settings)
         assert len(rules) == 1
         assert rules[0].event_kind == "stale"
@@ -151,9 +176,11 @@ class TestBuildAlertPolicy:
         assert build_alert_policy(settings) is None
 
     def test_returns_policy_when_rules_present(self) -> None:
-        settings = SimpleNamespace(hardware_alert_policies=[
-            {"event_kind": "threshold_exceeded", "action": "hw_estop"},
-        ])
+        settings = SimpleNamespace(
+            hardware_alert_policies=[
+                {"event_kind": "threshold_exceeded", "action": "hw_estop"},
+            ]
+        )
         policy = build_alert_policy(settings)
         assert policy is not None
         assert len(policy.rules) == 1
@@ -183,7 +210,9 @@ class TestConsecutiveGating:
         assert policy.fired_count == 1
 
     def test_different_kinds_tracked_independently(self) -> None:
-        rule_a = AlertRule(event_kind="threshold_exceeded", action="hw_estop", require_consecutive=2)
+        rule_a = AlertRule(
+            event_kind="threshold_exceeded", action="hw_estop", require_consecutive=2
+        )
         rule_b = AlertRule(event_kind="rate_exceeded", action="notify", require_consecutive=2)
         policy = HardwareAlertPolicy((rule_a, rule_b))
 
@@ -492,9 +521,8 @@ class TestCalibrationDashboard:
         # Walk the tree to find the calibration Section
         found = False
         for node in _walk(spec.get("root", [])):
-            if (
-                node.get("type") == "Section"
-                and "alibration" in str(node.get("props", {}).get("title", ""))
+            if node.get("type") == "Section" and "alibration" in str(
+                node.get("props", {}).get("title", "")
             ):
                 found = True
                 break
@@ -548,9 +576,7 @@ class TestStreamAlertPolicyIntegration:
             provenance=ContextProvenance(verified_by="test"),
         )
 
-        source = HardwareStreamSource(
-            None, context, context.channels[0], alert_policy=_Policy()
-        )
+        source = HardwareStreamSource(None, context, context.channels[0], alert_policy=_Policy())
 
         event = HardwareEvent(
             kind=EventKind.THRESHOLD_EXCEEDED,
@@ -603,9 +629,7 @@ class TestStreamAlertPolicyIntegration:
             provenance=ContextProvenance(verified_by="test"),
         )
 
-        source = HardwareStreamSource(
-            None, context, context.channels[0], alert_policy=_Policy()
-        )
+        source = HardwareStreamSource(None, context, context.channels[0], alert_policy=_Policy())
 
         settled_event = HardwareEvent(
             kind=EventKind.SETTLED,

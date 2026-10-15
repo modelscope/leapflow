@@ -445,8 +445,13 @@ class HardwareSignalGenerator(BaseGenerator):
         value = round(ch.center + random.gauss(0, ch.amplitude), 4)
 
         detail = self._event_detail(ch, kind, value)
+
+        # Import at function level to avoid circular dependency.
+        from leapflow.hardware.stream import classify_hardware_event
+
         return {
             "kind": kind,
+            "event_class": classify_hardware_event(kind),
             "source": f"{self.device_id}.{ch.channel_id}",
             "device_id": self.device_id,
             "channel_id": ch.channel_id,

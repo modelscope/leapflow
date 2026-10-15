@@ -8,6 +8,7 @@ the tool registry so a failed read-only search never trips the batch-stop gate.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import PurePath
 
 from leapflow.tools import file_operations as fo
@@ -203,6 +204,50 @@ def test_edit_file_unique_anchor_replaces(tmp_path) -> None:
 
     assert result["ok"] is True and result["changed"] is True and result["replacements"] == 1
     assert f.read_text() == "a = 1\nb = 20\nc = 3\n"
+
+
+def test_edit_file_normalizes_singleton_edit_object(tmp_path) -> None:
+    f = tmp_path / "m.py"
+    f.write_text("value = 1\n")
+
+    result = _run(edit_file({
+        "path": str(f),
+        "edits": {"original_text": "value = 1", "new_text": "value = 2"},
+    }))
+
+    assert result["ok"] is True
+    assert f.read_text() == "value = 2\n"
+
+
+def test_edit_file_normalizes_json_encoded_edits(tmp_path) -> None:
+    f = tmp_path / "m.py"
+    f.write_text("value = 1\n")
+    encoded = json.dumps([{"original_text": "value = 1", "new_text": "value = 3"}])
+
+    result = _run(edit_file({"path": str(f), "edits": encoded}))
+
+    assert result["ok"] is True
+    assert f.read_text() == "value = 3\n"
+
+
+def test_edit_file_missing_edits_returns_structured_repair() -> None:
+    result = _run(edit_file({"path": "m.py"}))
+
+    assert result["ok"] is False
+    assert result["failure_code"] == "missing_required_fields"
+    assert result["missing"] == ["edits"]
+    assert "non-empty array" in result["recovery_hint"]
+
+
+def test_edit_file_schema_requires_canonical_edits_array() -> None:
+    from leapflow.plugins.tool_plugins.file_ops import FileOpsPlugin
+
+    metadata = next(tool for tool in FileOpsPlugin().tools if tool.name == "edit_file")
+    schema = metadata.parameters_schema
+
+    assert schema["required"] == ["path", "edits"]
+    assert schema["properties"]["edits"]["type"] == "array"
+    assert "diff" not in schema["properties"]
 
 
 def test_edit_file_non_unique_anchor_is_rejected(tmp_path) -> None:
@@ -446,7 +491,7 @@ def test_edit_file_invalid_diff_is_rejected(tmp_path) -> None:
     f = tmp_path / "m.py"
     f.write_text("x\n")
     result = _run(edit_file({"path": str(f), "diff": "not a diff, no hunks"}))
-    assert result["ok"] is False and result["error_type"] == "invalid_diff"
+    assert result["ok"] is False and result["failure_code"] == "edit_file_invalid_diff"
     assert f.read_text() == "x\n"
 
 

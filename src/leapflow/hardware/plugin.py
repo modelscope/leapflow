@@ -53,6 +53,8 @@ class HardwareContextPlugin:
         self._stale_fleet_managers: list[Any] = []
         # HardwareHealthMonitor: centralized health supervision.
         self._health_monitor: Any = None
+        self._health_monitor_started: bool = False
+        self._stale_health_monitors: list[Any] = []
 
     def _adopt_reload_state(self, previous: Any) -> None:
         """Take ownership of live hardware supervisors from a retiring instance.
@@ -71,22 +73,19 @@ class HardwareContextPlugin:
         self._registry = getattr(previous, "_registry", None)
         self._fleet_manager = getattr(previous, "_fleet_manager", None)
         self._fleet_started = bool(getattr(previous, "_fleet_started", False))
-        self._pending_fleet_nodes = list(
-            getattr(previous, "_pending_fleet_nodes", ())
-        )
-        self._stale_fleet_managers = list(
-            getattr(previous, "_stale_fleet_managers", ())
-        )
+        self._pending_fleet_nodes = list(getattr(previous, "_pending_fleet_nodes", ()))
+        self._stale_fleet_managers = list(getattr(previous, "_stale_fleet_managers", ()))
         self._health_monitor = getattr(previous, "_health_monitor", None)
-        self._health_monitor_started = bool(
-            getattr(previous, "_health_monitor_started", False)
-        )
+        self._health_monitor_started = bool(getattr(previous, "_health_monitor_started", False))
+        self._stale_health_monitors = list(getattr(previous, "_stale_health_monitors", ()))
 
         # The retiring instance's root-scope teardown may still run later. It
         # must not close resources whose ownership has moved to this instance.
         previous._fleet_manager = None
         previous._stale_fleet_managers = []
         previous._health_monitor = None
+        previous._health_monitor_started = False
+        previous._stale_health_monitors = []
 
     @property
     def plugin_id(self) -> str:
@@ -152,6 +151,8 @@ class HardwareContextPlugin:
             # would orphan a supervisor that keeps probing the old registry.
             if self._fleet_manager is not None:
                 self._stale_fleet_managers.append(self._fleet_manager)
+            if self._health_monitor is not None and self._health_monitor_started:
+                self._stale_health_monitors.append(self._health_monitor)
             self._tools = None
             self._hw_tools = None
             self._lhp_gateway = None
@@ -160,11 +161,15 @@ class HardwareContextPlugin:
             self._pending_fleet_nodes = []
             self._fleet_started = False
             self._health_monitor = None
+            self._health_monitor_started = False
             self._teardown_registered = False
 
         if self._registry is None:
             return
 
+        set_alert_orchestrator = getattr(self._registry, "set_alert_orchestrator", None)
+        if callable(set_alert_orchestrator):
+            set_alert_orchestrator(self._gate)
         self._register_trust_configs()
         self._register_teardown()
         self._init_lhp_gateway()
@@ -221,11 +226,15 @@ class HardwareContextPlugin:
     async def _teardown(self) -> None:
         """Shut down all hardware sub-components on scope unwind."""
         # Health monitor must stop before registry closes connections.
-        if self._health_monitor is not None:
+        for monitor in (*self._stale_health_monitors, self._health_monitor):
+            if monitor is None:
+                continue
             try:
-                await self._health_monitor.stop()
+                await monitor.stop()
             except Exception:  # noqa: BLE001
                 logger.debug("Health monitor stop failed", exc_info=True)
+        self._stale_health_monitors = []
+        self._health_monitor_started = False
 
         # Fleet managers must stop before registry closes connections. Stale
         # managers (orphaned by a registry re-bind) are closed here too: their
@@ -258,8 +267,8 @@ class HardwareContextPlugin:
         try:
             from leapflow.hardware.lhp_gateway import LHPGateway
 
-            cap_index = getattr(self._registry, "_capability_index", None)
-            env_source = None  # will be set when PhysicalEnvironmentSource starts
+            cap_index = getattr(self._registry, "capability_index", None)
+            env_source = getattr(self._registry, "evidence_store", None) and None  # evidence store feeds env later
 
             self._lhp_gateway = LHPGateway(
                 self._registry,
@@ -297,9 +306,7 @@ class HardwareContextPlugin:
             # Registration is deferred to ``start_fleet``: it speaks LHP and
             # needs a running loop, while plugin assembly is synchronous.
             self._pending_fleet_nodes = list(nodes)
-            logger.info(
-                "FleetManager initialized with %d configured node(s)", len(nodes)
-            )
+            logger.info("FleetManager initialized with %d configured node(s)", len(nodes))
         except Exception:  # noqa: BLE001
             logger.debug("Failed to initialize FleetManager", exc_info=True)
 
@@ -319,7 +326,7 @@ class HardwareContextPlugin:
                 logger.debug("Stale fleet manager close failed", exc_info=True)
 
     async def start_fleet(self) -> None:
-        """Register configured fleet nodes and start heartbeat supervision.
+        """Start hardware supervisors and register configured fleet nodes.
 
         Deferred from ``bind_runtime`` because registration speaks LHP and
         needs an event loop while assembly is synchronous; the runtime calls
@@ -331,15 +338,16 @@ class HardwareContextPlugin:
         Idempotent.  Also closes any manager orphaned by a registry re-bind.
         """
         await self._close_stale_fleet_managers()
+        await self._close_stale_health_monitors()
         if self._fleet_started or self._fleet_manager is None:
+            await self._start_health_monitor()
             return
         self._fleet_started = True
         from leapflow.hardware.fleet_config import register_nodes_safely
 
-        registered = await register_nodes_safely(
-            self._fleet_manager, self._pending_fleet_nodes
-        )
+        registered = await register_nodes_safely(self._fleet_manager, self._pending_fleet_nodes)
         self._pending_fleet_nodes = []
+        await self._start_health_monitor()
         if not registered:
             return
         # Fleet admission happens after the initial runtime bind, so register
@@ -349,6 +357,26 @@ class HardwareContextPlugin:
             await self._fleet_manager.start_heartbeat()
         except Exception:  # noqa: BLE001 -- supervision must not fail startup
             logger.warning("Fleet: heartbeat failed to start", exc_info=True)
+
+    async def _close_stale_health_monitors(self) -> None:
+        """Stop monitors orphaned by a registry replacement."""
+        stale, self._stale_health_monitors = self._stale_health_monitors, []
+        for monitor in stale:
+            try:
+                await monitor.stop()
+            except Exception:  # noqa: BLE001 -- stale cleanup must not block startup
+                logger.debug("Stale health monitor stop failed", exc_info=True)
+
+    async def _start_health_monitor(self) -> None:
+        """Start health supervision even when no fleet nodes are configured."""
+        if self._health_monitor is None or self._health_monitor_started:
+            return
+        try:
+            await self._health_monitor.start()
+        except Exception:  # noqa: BLE001 -- supervision must not fail startup
+            logger.warning("Hardware health monitor failed to start", exc_info=True)
+            return
+        self._health_monitor_started = True
 
     # -- HardwareHealthMonitor initialization ------------------------------
 
@@ -375,9 +403,7 @@ class HardwareContextPlugin:
 
             logger.debug("HardwareHealthMonitor initialized (start deferred)")
         except Exception:  # noqa: BLE001
-            logger.debug(
-                "Failed to initialize HardwareHealthMonitor", exc_info=True
-            )
+            logger.debug("Failed to initialize HardwareHealthMonitor", exc_info=True)
 
     # -- Tool property (hw_context_snapshot + fleet tools) -----------------
 
@@ -387,12 +413,17 @@ class HardwareContextPlugin:
         if self._registry is None:
             return []
         if self._tools is None:
+            from pathlib import Path
+
+            from leapflow.hardware.audit import HardwareAuditLog
             from leapflow.hardware.tools import HardwareTools, build_hardware_tools
 
+            audit_path = str(getattr(self._registry.settings, "audit_log_path", "") or "")
             hw = HardwareTools(
                 self._registry,
                 gate=self._gate,
                 session_id=self._session_id,
+                audit_log=HardwareAuditLog(Path(audit_path)) if audit_path else None,
                 hardware_trust_gate=self._hardware_trust_gate,
             )
             self._hw_tools = hw
@@ -415,6 +446,7 @@ class HardwareContextPlugin:
 
     def _build_context_snapshot_tool(self) -> ToolMetadata:
         """Build the hw_context_snapshot tool backed by LHPGateway."""
+
         async def _hw_context_snapshot(**kwargs: Any) -> dict[str, Any]:
             level = kwargs.get("level", "task_relevant")
             if self._lhp_gateway is None:
@@ -465,6 +497,7 @@ class HardwareContextPlugin:
 
         try:
             from leapflow.hardware.fleet_tools import build_fleet_tools
+
             return build_fleet_tools(self._fleet_manager)
         except Exception:  # noqa: BLE001
             logger.debug("Failed to build fleet tools", exc_info=True)
@@ -472,6 +505,7 @@ class HardwareContextPlugin:
 
     def _build_health_tool(self) -> ToolMetadata:
         """Build the hw_health tool backed by HardwareHealthMonitor."""
+
         async def _hw_health(**kwargs: Any) -> dict[str, Any]:
             device_id = kwargs.get("device_id", "")
             if self._health_monitor is None:

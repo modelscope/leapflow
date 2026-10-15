@@ -34,6 +34,14 @@ _IR_RIGHT_CHANNEL = "camera.infrared_right.preview"
 _METADATA_CHANNEL = "camera.metadata"
 _FRAME_CHANNELS = {_COLOR_CHANNEL, _DEPTH_CHANNEL, _IR_LEFT_CHANNEL, _IR_RIGHT_CHANNEL}
 
+# Optional writable channels — sensor options exposed through the SDK.
+_EMITTER_CHANNEL = "camera.emitter_enabled"
+_LASER_POWER_CHANNEL = "camera.laser_power"
+_WRITABLE_OPTIONS: dict[str, str] = {
+    _EMITTER_CHANNEL: "emitter_enabled",
+    _LASER_POWER_CHANNEL: "laser_power",
+}
+
 
 @dataclass(frozen=True)
 class _StreamProfile:
@@ -182,13 +190,95 @@ class RealSenseTransport:
                 ) from exc
 
     async def write(self, channel_id: str, value: Any) -> WriteOutcome:
-        """Refuse writes: this driver exposes a passive observation device only."""
-        return WriteOutcome(
-            ok=False,
-            side_effect_state=SIDE_EFFECT_NONE,
-            error=f"RealSense channel {channel_id!r} is read-only",
-            failure_code="not_writable",
+        """Write optional sensor options (emitter, laser power); refuse others."""
+        if channel_id not in _WRITABLE_OPTIONS:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=f"RealSense channel {channel_id!r} is read-only",
+                failure_code="not_writable",
+            )
+        return await asyncio.to_thread(
+            self._write_option, channel_id, _WRITABLE_OPTIONS[channel_id], value
         )
+
+    def _write_option(
+        self, channel_id: str, option_name: str, value: Any
+    ) -> WriteOutcome:
+        """Set a sensor option on the active depth sensor (blocking).
+
+        ``emitter_enabled`` expects 0 or 1; ``laser_power`` expects a float
+        within the sensor's reported min/max range (typically 0–360 for D435).
+        """
+        from leapflow.hardware.transport import SIDE_EFFECT_COMMITTED
+
+        pipeline = self._pipeline
+        if pipeline is None:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error="RealSense pipeline is not open",
+                failure_code="transport_not_open",
+            )
+        sdk = self._sdk
+        if sdk is None:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error="RealSense SDK is unavailable",
+                failure_code="realsense_sdk_missing",
+            )
+        try:
+            profile = pipeline.get_active_profile()
+            device = profile.get_device()
+            depth_sensor = device.first_depth_sensor()
+            option_key = getattr(sdk.option, option_name, None)
+            if option_key is None:
+                return WriteOutcome(
+                    ok=False,
+                    side_effect_state=SIDE_EFFECT_NONE,
+                    error=f"SDK option {option_name!r} not available",
+                    failure_code="option_unavailable",
+                )
+            if not depth_sensor.supports(option_key):
+                return WriteOutcome(
+                    ok=False,
+                    side_effect_state=SIDE_EFFECT_NONE,
+                    error=f"Depth sensor does not support {option_name!r}",
+                    failure_code="option_not_supported",
+                )
+            # Validate range.
+            opt_range = depth_sensor.get_option_range(option_key)
+            numeric = float(value)
+            if numeric < opt_range.min or numeric > opt_range.max:
+                return WriteOutcome(
+                    ok=False,
+                    side_effect_state=SIDE_EFFECT_NONE,
+                    error=(
+                        f"{option_name} value {numeric} out of range "
+                        f"[{opt_range.min}, {opt_range.max}]"
+                    ),
+                    failure_code="value_out_of_range",
+                )
+            depth_sensor.set_option(option_key, numeric)
+            return WriteOutcome(
+                ok=True,
+                side_effect_state=SIDE_EFFECT_COMMITTED,
+            )
+        except (TypeError, ValueError) as exc:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=f"Invalid value for {option_name}: {exc}",
+                failure_code="invalid_value",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=f"Failed to set {option_name}: {exc}",
+                failure_code="realsense_option_write_failed",
+            )
 
     def _start_pipeline(self) -> None:
         sdk = self._sdk

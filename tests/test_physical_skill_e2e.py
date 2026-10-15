@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -33,6 +35,7 @@ from leapflow.hardware.transport import (
     Reading,
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_NONE,
+    TransportStatus,
     WriteOutcome,
 )
 from leapflow.hardware.verification import (
@@ -40,7 +43,6 @@ from leapflow.hardware.verification import (
     OperationVerdict,
     PositionVerifier,
     VerdictStatus,
-    collect_evidence,
 )
 from leapflow.plugins.tool_plugins.physical_skill import PhysicalSkillPlugin
 from leapflow.robot.inference.strategy import (
@@ -200,6 +202,13 @@ class MockRegistry:
     ) -> None:
         self._robot = robot
         self.verifiers: list[Any] = verifiers or []
+        self.settings = SimpleNamespace(
+            require_describe_before_write=False,
+            envelope_grant=True,
+            trust_skip_enabled=False,
+        )
+        self.outcome_recorder = None
+        self._last_commands: dict[tuple[str, str], tuple[float, float]] = {}
         # Writable channels matching MockRobotArm's 3 joints + gripper.
         self._writable_channels = [
             Channel(
@@ -248,6 +257,39 @@ class MockRegistry:
     def get_device(self, device_id: str) -> Any:
         return self._device
 
+    def context(self, device_id: str) -> HardwareContext | None:
+        return self._context if device_id == self._context.device_id else None
+
+    def contexts(self) -> tuple[HardwareContext, ...]:
+        return (self._context,)
+
+    def was_described(self, session_id: str, device_id: str) -> bool:
+        return True
+
+    def check_safety_policy(
+        self, context: HardwareContext, channel: Channel, value: Any
+    ) -> tuple[bool, str]:
+        return True, ""
+
+    def is_device_degraded(self, device_id: str) -> bool:
+        return False
+
+    @asynccontextmanager
+    async def device_io(self, device_id: str) -> Any:
+        yield
+
+    async def transport(self, device_id: str) -> Any:
+        return self._device.transport
+
+    async def drop_transport(self, device_id: str) -> None:
+        return None
+
+    def last_command(self, device_id: str, channel_id: str) -> tuple[float, float] | None:
+        return self._last_commands.get((device_id, channel_id))
+
+    def record_command(self, device_id: str, channel_id: str, value: float) -> None:
+        self._last_commands[(device_id, channel_id)] = (value, time.monotonic())
+
     async def read(self, device_id: str, channel_id: str) -> Reading:
         obs = self._robot.get_observation()
         # Map channel id back to robot observation key.
@@ -287,6 +329,13 @@ class _MockBatchTransport:
         self._robot = robot
         self._context = context
 
+    async def probe(self) -> TransportStatus:
+        return TransportStatus(connected=True, halt_supported=True)
+
+    async def read(self, channel_id: str) -> Reading:
+        batch = await self.read_batch((channel_id,))
+        return batch.readings[0]
+
     async def read_batch(self, channel_ids: tuple[str, ...]) -> BatchReading:
         obs = self._robot.get_observation()
         key_map = {
@@ -305,13 +354,13 @@ class _MockBatchTransport:
         return BatchReading(device_id="mock.arm", readings=tuple(readings))
 
     async def write_batch(
-        self, commands: tuple[tuple[str, Any], ...],
+        self,
+        commands: tuple[tuple[str, Any], ...],
     ) -> BatchWriteOutcome:
         action = [v for _, v in commands]
         self._robot.send_action(action)
         outcomes = tuple(
-            WriteOutcome(ok=True, side_effect_state=SIDE_EFFECT_COMMITTED)
-            for _ in commands
+            WriteOutcome(ok=True, side_effect_state=SIDE_EFFECT_COMMITTED) for _ in commands
         )
         return BatchWriteOutcome(
             ok=True,
@@ -362,7 +411,9 @@ class TestOODAVLoop:
 
     @pytest.mark.asyncio
     async def test_full_cycle_observe_infer_execute_verify(
-        self, plugin: PhysicalSkillPlugin, registry: MockRegistry,
+        self,
+        plugin: PhysicalSkillPlugin,
+        registry: MockRegistry,
     ) -> None:
         """Complete OODA+V: read observation -> policy inference ->
         write action -> verify position -> success."""
@@ -370,13 +421,15 @@ class TestOODAVLoop:
         mock_policy = MockPolicy(action_dim=4)
         plugin._policies["mock_policy"] = MockStrategy(mock_policy)
 
-        result = await plugin.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "mock_policy",
-            "task": "pick up cube",
-            "execute": True,
-            "verify": True,
-        })
+        result = await plugin.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "mock_policy",
+                "task": "pick up cube",
+                "execute": True,
+                "verify": True,
+            }
+        )
 
         assert result["ok"] is True
         assert "action" in result
@@ -386,7 +439,9 @@ class TestOODAVLoop:
 
     @pytest.mark.asyncio
     async def test_cycle_with_verification_failure(
-        self, plugin: PhysicalSkillPlugin, mock_robot: MockRobotArm,
+        self,
+        plugin: PhysicalSkillPlugin,
+        mock_robot: MockRobotArm,
     ) -> None:
         """OODA+V where verification detects position error."""
         mock_policy = MockPolicy(action_dim=4)
@@ -404,12 +459,14 @@ class TestOODAVLoop:
 
         mock_robot.send_action = _divergent_send  # type: ignore[assignment]
 
-        result = await plugin.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "mock_policy",
-            "execute": True,
-            "verify": True,
-        })
+        result = await plugin.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "mock_policy",
+                "execute": True,
+                "verify": True,
+            }
+        )
 
         assert result["ok"] is True
         # Verification should report failure or inconclusive due to deviation.
@@ -419,18 +476,22 @@ class TestOODAVLoop:
 
     @pytest.mark.asyncio
     async def test_cycle_without_execution(
-        self, plugin: PhysicalSkillPlugin, mock_robot: MockRobotArm,
+        self,
+        plugin: PhysicalSkillPlugin,
+        mock_robot: MockRobotArm,
     ) -> None:
         """Inference only (execute=False): no physical effect."""
         mock_policy = MockPolicy(action_dim=4)
         plugin._policies["mock_policy"] = MockStrategy(mock_policy)
         sent_before = len(mock_robot._actions_sent)
 
-        result = await plugin.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "mock_policy",
-            "execute": False,
-        })
+        result = await plugin.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "mock_policy",
+                "execute": False,
+            }
+        )
 
         assert result["ok"] is True
         assert "action" in result
@@ -439,19 +500,78 @@ class TestOODAVLoop:
         assert len(mock_robot._actions_sent) == sent_before
 
     @pytest.mark.asyncio
+    async def test_execution_defaults_to_inference_only(
+        self,
+        plugin: PhysicalSkillPlugin,
+        mock_robot: MockRobotArm,
+    ) -> None:
+        plugin._policies["mock_policy"] = MockStrategy(MockPolicy(action_dim=4))
+        sent_before = len(mock_robot._actions_sent)
+
+        result = await plugin.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "mock_policy",
+            }
+        )
+
+        assert result["ok"] is True
+        assert "execution" not in result
+        assert len(mock_robot._actions_sent) == sent_before
+
+    @pytest.mark.asyncio
+    async def test_multi_step_execution_fails_closed_before_approval(
+        self,
+        registry: MockRegistry,
+        mock_robot: MockRobotArm,
+    ) -> None:
+        class _ChunkPolicy:
+            def select_action(self, batch: dict) -> list[list[float]]:
+                return [[0.1, 0.1, 0.1, 0.0], [0.2, 0.2, 0.2, 1.0]]
+
+        gate = MockApprovalGate(auto_approve=True)
+        plugin = PhysicalSkillPlugin()
+        plugin.bind_runtime(
+            hardware_registry=registry,
+            hardware_approval_gate=gate,
+            hardware_trust_gate=MockTrustGate(),
+            session_id="test-session",
+        )
+        plugin._policies["chunk_policy"] = MockStrategy(_ChunkPolicy())
+        sent_before = len(mock_robot._actions_sent)
+
+        result = await plugin.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "chunk_policy",
+                "execute": True,
+            }
+        )
+
+        assert result["ok"] is False
+        assert result["execution"]["failure_code"] == "governed_control_session_required"
+        assert result["execution"]["side_effect_state"] == SIDE_EFFECT_NONE
+        assert gate.approval_requests == []
+        assert len(mock_robot._actions_sent) == sent_before
+
+    @pytest.mark.asyncio
     async def test_chunk_prediction(
-        self, plugin: PhysicalSkillPlugin, mock_robot: MockRobotArm,
+        self,
+        plugin: PhysicalSkillPlugin,
+        mock_robot: MockRobotArm,
     ) -> None:
         """Multi-step chunk: predict N actions, execute sequentially."""
         mock_policy = MockPolicy(action_dim=4)
         plugin._policies["mock_policy"] = MockStrategy(mock_policy)
 
-        result = await plugin.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "mock_policy",
-            "chunk_size": 3,
-            "execute": True,
-        })
+        result = await plugin.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "mock_policy",
+                "chunk_size": 3,
+                "execute": True,
+            }
+        )
 
         assert result["ok"] is True
         assert "action" in result
@@ -473,11 +593,13 @@ class TestPolicyManagement:
         mock_policy = MockPolicy(action_dim=4)
         plugin._policies["my_policy"] = MockStrategy(mock_policy)
 
-        result = await plugin.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "my_policy",
-            "execute": False,
-        })
+        result = await plugin.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "my_policy",
+                "execute": False,
+            }
+        )
         assert result["ok"] is True
         assert mock_policy._call_count == 1
 
@@ -531,12 +653,14 @@ class TestEpisodeLifecycle:
         mock_policy = MockPolicy()
         plugin._policies["ep_pol"] = MockStrategy(mock_policy)
 
-        start = await plugin.policy_episode({
-            "action": "start",
-            "device_id": "mock.arm",
-            "policy": "ep_pol",
-            "task": "stack blocks",
-        })
+        start = await plugin.policy_episode(
+            {
+                "action": "start",
+                "device_id": "mock.arm",
+                "policy": "ep_pol",
+                "task": "stack blocks",
+            }
+        )
         assert start["ok"] is True
         assert start["action"] == "started"
 
@@ -550,11 +674,13 @@ class TestEpisodeLifecycle:
     async def test_episode_status(self, plugin: PhysicalSkillPlugin) -> None:
         """Query episode status during active episode."""
         plugin._policies["ep_pol"] = MockStrategy(MockPolicy())
-        await plugin.policy_episode({
-            "action": "start",
-            "device_id": "mock.arm",
-            "policy": "ep_pol",
-        })
+        await plugin.policy_episode(
+            {
+                "action": "start",
+                "device_id": "mock.arm",
+                "policy": "ep_pol",
+            }
+        )
 
         status = await plugin.policy_episode({"action": "status"})
         assert status["ok"] is True
@@ -569,19 +695,23 @@ class TestEpisodeLifecycle:
         mock_policy = MockPolicy(action_dim=4)
         plugin._policies["ep_pol"] = MockStrategy(mock_policy)
 
-        await plugin.policy_episode({
-            "action": "start",
-            "device_id": "mock.arm",
-            "policy": "ep_pol",
-        })
+        await plugin.policy_episode(
+            {
+                "action": "start",
+                "device_id": "mock.arm",
+                "policy": "ep_pol",
+            }
+        )
 
         # Run two inferences.
         for _ in range(2):
-            await plugin.policy_infer({
-                "device_id": "mock.arm",
-                "policy": "ep_pol",
-                "execute": True,
-            })
+            await plugin.policy_infer(
+                {
+                    "device_id": "mock.arm",
+                    "policy": "ep_pol",
+                    "execute": True,
+                }
+            )
 
         stop = await plugin.policy_episode({"action": "stop"})
         assert stop["summary"]["steps"] == 2
@@ -724,6 +854,7 @@ class TestErrorHandling:
                 return [0.0]
 
         plugin._policies["slow"] = MockStrategy(SlowPolicy())
+
         # The plugin calls asyncio.to_thread(select) which is sync,
         # but a truly slow policy would be caught by broader timeout.
         # Here we test the error path with an exception.
@@ -732,17 +863,21 @@ class TestErrorHandling:
                 raise TimeoutError("inference timed out")
 
         plugin._policies["fail_timeout"] = MockStrategy(FailPolicy())
-        result = await plugin.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "fail_timeout",
-            "execute": True,
-        })
+        result = await plugin.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "fail_timeout",
+                "execute": True,
+            }
+        )
         assert result["ok"] is False
         assert "inference failed" in result["error"]
 
     @pytest.mark.asyncio
     async def test_robot_disconnected(
-        self, plugin: PhysicalSkillPlugin, mock_robot: MockRobotArm,
+        self,
+        plugin: PhysicalSkillPlugin,
+        mock_robot: MockRobotArm,
     ) -> None:
         """Operation on disconnected robot returns clear error."""
         mock_robot.disconnect()
@@ -756,11 +891,13 @@ class TestErrorHandling:
         plugin.bind_runtime(hardware_registry=FailReadRegistry())
         plugin._policies["pol"] = MockStrategy(MockPolicy(action_dim=4))
 
-        result = await plugin.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "pol",
-            "execute": True,
-        })
+        result = await plugin.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "pol",
+                "execute": True,
+            }
+        )
         assert result["ok"] is False
         assert "error" in result
 
@@ -773,28 +910,34 @@ class TestErrorHandling:
         inside ``VLALocalStrategy.infer``; the missing checkpoint therefore
         turns into an inference failure carrying the loader's own message.
         """
-        result = await plugin.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "nonexistent/path/to/model",
-        })
+        result = await plugin.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "nonexistent/path/to/model",
+            }
+        )
         assert result["ok"] is False
         assert "inference failed" in result["error"]
 
     @pytest.mark.asyncio
     async def test_missing_device_id(self, plugin: PhysicalSkillPlugin) -> None:
         """Missing device_id is rejected immediately."""
-        result = await plugin.policy_infer({
-            "policy": "some_policy",
-        })
+        result = await plugin.policy_infer(
+            {
+                "policy": "some_policy",
+            }
+        )
         assert result["ok"] is False
         assert "device_id" in result["error"]
 
     @pytest.mark.asyncio
     async def test_missing_policy_path(self, plugin: PhysicalSkillPlugin) -> None:
         """Missing policy path is rejected immediately."""
-        result = await plugin.policy_infer({
-            "device_id": "mock.arm",
-        })
+        result = await plugin.policy_infer(
+            {
+                "device_id": "mock.arm",
+            }
+        )
         assert result["ok"] is False
         assert "policy" in result["error"]
 
@@ -820,11 +963,13 @@ class TestApprovalIntegration:
         )
         p._policies["mock_policy"] = MockStrategy(MockPolicy(action_dim=4))
 
-        result = await p.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "mock_policy",
-            "execute": True,
-        })
+        result = await p.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "mock_policy",
+                "execute": True,
+            }
+        )
 
         assert result["ok"] is True
         assert len(gate.approval_requests) == 1
@@ -835,7 +980,9 @@ class TestApprovalIntegration:
 
     @pytest.mark.asyncio
     async def test_approval_rejected_blocks_execution(
-        self, registry: MockRegistry, mock_robot: MockRobotArm,
+        self,
+        registry: MockRegistry,
+        mock_robot: MockRobotArm,
     ) -> None:
         """When the gate rejects, no write_batch reaches the robot."""
         gate = MockApprovalGate(auto_approve=False)
@@ -849,11 +996,13 @@ class TestApprovalIntegration:
         p._policies["mock_policy"] = MockStrategy(MockPolicy(action_dim=4))
         sent_before = len(mock_robot._actions_sent)
 
-        result = await p.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "mock_policy",
-            "execute": True,
-        })
+        result = await p.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "mock_policy",
+                "execute": True,
+            }
+        )
 
         assert len(gate.approval_requests) == 1
         # Execution was refused and nothing was written to the robot.
@@ -864,7 +1013,9 @@ class TestApprovalIntegration:
 
     @pytest.mark.asyncio
     async def test_absent_gate_fails_closed(
-        self, registry: MockRegistry, mock_robot: MockRobotArm,
+        self,
+        registry: MockRegistry,
+        mock_robot: MockRobotArm,
     ) -> None:
         """With no gate bound, a physical write is refused (fail-closed)."""
         p = PhysicalSkillPlugin()
@@ -872,11 +1023,13 @@ class TestApprovalIntegration:
         p._policies["mock_policy"] = MockStrategy(MockPolicy(action_dim=4))
         sent_before = len(mock_robot._actions_sent)
 
-        result = await p.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "mock_policy",
-            "execute": True,
-        })
+        result = await p.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "mock_policy",
+                "execute": True,
+            }
+        )
 
         assert result["ok"] is False
         assert result["execution"]["ok"] is False
@@ -893,7 +1046,8 @@ class TestTrustIntegration:
 
     @pytest.mark.asyncio
     async def test_successful_verification_records_trust(
-        self, registry: MockRegistry,
+        self,
+        registry: MockRegistry,
     ) -> None:
         """After a successful verification, the trust gate records success."""
         trust = MockTrustGate()
@@ -904,23 +1058,60 @@ class TestTrustIntegration:
             hardware_trust_gate=trust,
             session_id="test-session",
         )
-        p._policies["mock_policy"] = MockStrategy(MockPolicy(action_dim=4))
+        # Use only the continuous joint channels. The mock robot discretizes its
+        # gripper, so commanding 0.1 there is correctly a verification mismatch.
+        p._policies["mock_policy"] = MockStrategy(MockPolicy(action_dim=3))
 
-        result = await p.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "mock_policy",
-            "execute": True,
-            "verify": True,
-        })
+        result = await p.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "mock_policy",
+                "execute": True,
+                "verify": True,
+            }
+        )
 
         assert result["ok"] is True
-        # The commanded position lands within tolerance -> success recorded.
+        assert result["verification"]["status"] == "success"
+        # Every commanded joint lands within tolerance -> success recorded.
         assert any(h[0] == "success" for h in trust.history)
         assert all(h[0] != "failure" for h in trust.history)
 
     @pytest.mark.asyncio
+    async def test_mixed_channel_verification_fails_the_batch(
+        self,
+        registry: MockRegistry,
+    ) -> None:
+        """One mismatched channel prevents a successful aggregate verdict."""
+        trust = MockTrustGate()
+        p = PhysicalSkillPlugin()
+        p.bind_runtime(
+            hardware_registry=registry,
+            hardware_approval_gate=MockApprovalGate(auto_approve=True),
+            hardware_trust_gate=trust,
+            session_id="test-session",
+        )
+        p._policies["mock_policy"] = MockStrategy(MockPolicy(action_dim=4))
+
+        result = await p.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "mock_policy",
+                "execute": True,
+                "verify": True,
+            }
+        )
+
+        assert result["ok"] is True
+        assert result["verification"]["status"] == "failure"
+        assert any(h[0] == "success" for h in trust.history)
+        assert any(h[0] == "failure" for h in trust.history)
+
+    @pytest.mark.asyncio
     async def test_failed_verification_records_failure(
-        self, registry: MockRegistry, mock_robot: MockRobotArm,
+        self,
+        registry: MockRegistry,
+        mock_robot: MockRobotArm,
     ) -> None:
         """After a failed verification, the trust gate records failure."""
         trust = MockTrustGate()
@@ -943,12 +1134,14 @@ class TestTrustIntegration:
 
         mock_robot.send_action = _divergent_send  # type: ignore[assignment]
 
-        result = await p.policy_infer({
-            "device_id": "mock.arm",
-            "policy": "mock_policy",
-            "execute": True,
-            "verify": True,
-        })
+        result = await p.policy_infer(
+            {
+                "device_id": "mock.arm",
+                "policy": "mock_policy",
+                "execute": True,
+                "verify": True,
+            }
+        )
 
         assert result["ok"] is True
         # A large deviation yields a failure verdict -> failure recorded.

@@ -24,6 +24,7 @@ ADAPTER_MODULES = (
     "calvin",
     "vlabench",
     "robojailbench",
+    "roboharm",
     "attackvla",
     "safety_gymnasium",
     "maniskill",
@@ -45,6 +46,7 @@ EXTERNAL_IMPORT_ROOTS = {
     "numpy",
     "omni",
     "robojailbench",
+    "roboharm",
     "safety_gymnasium",
     "sapien",
     "torch",
@@ -115,7 +117,7 @@ def test_all_external_adapter_modules_are_import_safe() -> None:
         if name.partition(".")[0] in EXTERNAL_IMPORT_ROOTS
     }
     assert newly_imported_roots == set()
-    assert len(loaded) == 14
+    assert len(loaded) == 15
 
 
 async def test_missing_dependencies_return_typed_unavailable_without_side_effects(
@@ -130,7 +132,7 @@ async def test_missing_dependencies_return_typed_unavailable_without_side_effect
     monkeypatch.setattr(socket, "create_connection", _forbid("a network connection"))
 
     adapters = tuple(adapters_package.builtin_adapters())
-    assert len(adapters) == 14
+    assert len(adapters) == 15
     assert {adapter.adapter_id for adapter in adapters} == set(ADAPTER_MODULES)
     assert all(isinstance(adapter, BenchmarkAdapter) for adapter in adapters)
 

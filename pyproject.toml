@@ -112,7 +112,7 @@ leap-bench = "benchmarks.cli:main"
 # SDK only when opened, so host-only installations stay dependency-free; the
 # Jetson installs the compatible pyrealsense2 binding alongside LeapFlow.
 [project.entry-points."leapflow.hardware.transports"]
-realsense = "leapflow.hardware.transports.realsense:build_transport"
+realsense = "leapflow.hardware.drivers.realsense:build_transport"
 
 [build-system]
 requires = ["setuptools>=68.0"]

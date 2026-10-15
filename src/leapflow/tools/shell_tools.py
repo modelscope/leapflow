@@ -125,7 +125,9 @@ def _shell_audit_metadata(
     command: str, *, stdout: str = "", stderr: str = "", returncode: int | None = None
 ) -> Dict[str, Any]:
     """Return safe shell audit fields without persisting command or output text."""
-    digest = lambda value: hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+    def digest(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
     return {
         "command_digest": digest(command),
         "stdout_sha256": digest(stdout),
@@ -464,12 +466,18 @@ async def shell_run(params: Dict[str, Any]) -> Dict[str, Any]:
                 stdout=stdout_text,
                 stderr=stderr_text,
                 cwd=cwd,
-                extra=_shell_audit_metadata(
-                    command,
-                    stdout=stdout_text,
-                    stderr=stderr_text,
-                    returncode=proc.returncode,
-                ),
+                extra={
+                    **_shell_audit_metadata(
+                        command,
+                        stdout=stdout_text,
+                        stderr=stderr_text,
+                        returncode=proc.returncode,
+                    ),
+                    "recovery_hint": (
+                        "Inspect the return code, stdout, and stderr, then change the command or use "
+                        "another diagnostic; do not repeat the identical failed action."
+                    ),
+                },
             )
         return result
     except asyncio.TimeoutError:
