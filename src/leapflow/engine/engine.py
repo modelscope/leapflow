@@ -1,5 +1,12 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Main ReAct-style engine with routing, skills, and audit logging."""
+"""Main ReAct-style engine with routing, skills, and audit logging.
+
+Size note (>800-line registered exception per AGENTS.md): this is the core
+orchestrator -- the agent loop, public entry points, and thin delegation
+wrappers. Behavior is progressively extracted into delegate components and
+sub-packages; the remaining length is loop-iteration state shared across
+those components, which resists further splitting without indirection that
+costs more than it saves."""
 
 from __future__ import annotations
 

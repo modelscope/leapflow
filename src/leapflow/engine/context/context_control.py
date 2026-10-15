@@ -4,6 +4,11 @@
 The module keeps context accounting, overflow prevention, exploration-ledger
 tracking, and tool-result compaction independent from AgentEngine so all normal
 interactions get long-task resilience without exposing a separate user mode.
+
+Size note (>800-line registered exception per AGENTS.md): context
+accounting, overflow prevention, exploration-ledger tracking, and
+tool-result compaction share the same budget ledger; separating them would
+duplicate accounting state the governance depends on.
 """
 from __future__ import annotations
 

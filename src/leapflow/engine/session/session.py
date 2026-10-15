@@ -3,6 +3,11 @@
 
 Manages the SessionMode state machine and coordinates between the imitation
 learning pipeline, skill registry, and user-facing I/O.
+
+Size note (>800-line registered exception per AGENTS.md): the SessionMode
+state machine, persistence, and skill-distillation coordination share
+session-lifecycle state; splitting them would strand that state across
+modules mid-lifecycle.
 """
 
 from __future__ import annotations

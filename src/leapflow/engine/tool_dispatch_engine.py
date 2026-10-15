@@ -5,6 +5,11 @@ Phase 5 refactor. This component owns all tool execution, dispatch, catalog
 assembly, and tool-failure/guardrail evaluation. It holds a back-reference to
 the owning engine so every access reads the engine's *live* mutable state,
 preserving exact runtime semantics.
+
+Size note (>800-line registered exception per AGENTS.md): dispatch, catalog
+assembly, side-effect batch gating, and guardrail evaluation share one
+dispatch state machine; splitting them would fork the failure path the
+gating exists to protect.
 """
 
 from __future__ import annotations
