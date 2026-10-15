@@ -3,6 +3,12 @@
 
 Every function here is a module-level free function with no dependency on
 AgentEngine state.  Extracted from ``engine.py`` to reduce file size.
+
+Size note (>800-line registered exception per AGENTS.md): long because
+message building, parsing, fallback-text selection, and interaction
+rendering are numerous small pure helpers, not because any concern is
+misplaced; each cluster is a candidate for extraction the day it grows
+state.
 """
 
 from __future__ import annotations

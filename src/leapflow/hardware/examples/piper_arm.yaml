@@ -1,0 +1,253 @@
+# AgileX Piper — 6-DOF CAN-controlled arm with a parallel gripper.
+#
+# hc.v1 declaration for the node-local Piper transport
+# (leapflow.hardware.drivers.piper). Envelope bounds are the Piper firmware
+# joint limits in degrees. Every writable numeric channel declares
+# `tolerance` explicitly: write verification defaults to an exact match
+# when tolerance is unset, and a servos' readback never matches a target
+# to the last bit.
+
+hc_version: "hc.v1"
+# Registry admission (V2) only admits [a-z0-9_]+ device ids -- no dots.
+device_id: "robot_piper_arm"
+display_name: "AgileX Piper Arm"
+device_class: "robot_arm"
+vendor: "AgileX"
+model: "Piper"
+location: "workbench_1"
+halt_supported: true
+
+kinematics:
+  chain_type: "serial"
+  dof: 6
+  # Firmware joint limits, converted to radians.
+  joint_limits:
+    - [-2.618, 2.618]    # j1: ±150 deg
+    - [0.0, 3.142]       # j2: 0..180 deg
+    - [-2.967, 0.0]      # j3: -170..0 deg
+    - [-1.745, 1.745]    # j4: ±100 deg
+    - [-1.222, 1.222]    # j5: ±70 deg
+    - [-2.094, 2.094]    # j6: ±120 deg
+  workspace_bounds: [-0.65, 0.65, -0.65, 0.65, -0.3, 0.9]
+
+capabilities:
+  affordances: ["grasp", "place", "push", "pull"]
+  payload_kg: 1.5
+  reach_m: 0.65
+  tool_slots: 1
+
+safety:
+  max_velocity_rad_s: 3.14
+  max_force_n: 30.0
+  emergency_decel_s: 0.2
+  notes: >-
+    halt() maps to the vendor hardware emergency stop (CAN 0x150).
+    Resume (0x02) is a separate governed write; DisableArm and ResetPiper
+    release torque and drop the arm, so neither is ever part of a halt.
+
+trust_config:
+  initial_level: "UNTRUSTED"
+  promotion_thresholds: [3, 8, 20]
+  demotion_threshold: 3
+
+degradation:
+  sensor_loss_policy: "halt"
+  comm_loss_policy: "halt"
+  max_comm_loss_s: 1.0
+
+transport:
+  kind: "piper"
+  config:
+    can_name: "can0"
+    sdk_interface: "v2"
+    default_speed_pct: 20
+    move_mode: 1
+    warmup_timeout_s: 5.0
+    stale_after_s: 1.0
+    default_effort_n_m: 0.5
+
+channels:
+  - channel_id: "joint.j1.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 1 (base yaw) position"
+    envelope:
+      declared: true
+      min_value: -150.0
+      max_value: 150.0
+      max_rate: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "joint.j2.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 2 (shoulder) position"
+    envelope:
+      declared: true
+      min_value: 0.0
+      max_value: 180.0
+      max_rate: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "joint.j3.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 3 (elbow) position"
+    envelope:
+      declared: true
+      min_value: -170.0
+      max_value: 0.0
+      max_rate: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "joint.j4.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 4 (wrist pitch) position"
+    envelope:
+      declared: true
+      min_value: -100.0
+      max_value: 100.0
+      max_rate: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "joint.j5.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 5 (wrist roll) position"
+    envelope:
+      declared: true
+      min_value: -70.0
+      max_value: 70.0
+      max_rate: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "joint.j6.position"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Joint 6 (flange rotation) position"
+    envelope:
+      declared: true
+      min_value: -120.0
+      max_value: 120.0
+      max_rate: 36.0
+      quantization: 0.001
+      settling_time_s: 0.5
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "gripper.position"
+    direction: "readwrite"
+    quantity: "linear_position"
+    unit: "mm"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "Gripper stroke"
+    envelope:
+      declared: true
+      min_value: 0.0
+      max_value: 100.0
+      quantization: 0.001
+      settling_time_s: 0.3
+      tolerance: 0.5
+      reversible: true
+
+  - channel_id: "gripper.effort"
+    direction: "readwrite"
+    quantity: "torque"
+    unit: "N_m"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: false
+    description: "Gripper holding effort; the vendor frame always carries stroke and effort together"
+    envelope:
+      declared: true
+      min_value: 0.0
+      max_value: 5.0
+      quantization: 0.001
+      tolerance: 0.05
+      reversible: true
+
+  - channel_id: "arm.enable"
+    direction: "write"
+    quantity: "state"
+    representation: "state"
+    effect: "configure"
+    description: >-
+      Energize (1) or release (0) all motors. Energize first resumes a latched
+      emergency stop (CAN 0x150/0x02) then enables all motors, under one
+      approval; this is the only resume path. Release drops torque and the
+      arm can fall; neither direction is ever part of a halt.
+    envelope:
+      declared: true
+      allowed_values: [0, 1]
+      reversible: true
+
+  - channel_id: "arm.enabled"
+    direction: "read"
+    quantity: "state"
+    representation: "state"
+    effect: "read"
+    description: "True when every motor reports enabled"
+
+  - channel_id: "arm.status"
+    direction: "read"
+    quantity: "state"
+    representation: "state"
+    effect: "read"
+    description: "Vendor feedback status: ctrl_mode, arm_status, motion_status"
+
+  - channel_id: "arm.motion"
+    direction: "read"
+    quantity: "state"
+    representation: "state"
+    effect: "read"
+    description: "True when the arm reports it arrived at the commanded target"

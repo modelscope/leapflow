@@ -113,6 +113,10 @@ leap-bench = "benchmarks.cli:main"
 # Jetson installs the compatible pyrealsense2 binding alongside LeapFlow.
 [project.entry-points."leapflow.hardware.transports"]
 realsense = "leapflow.hardware.drivers.realsense:build_transport"
+# Piper follows the same node-local placement: piper_sdk is imported only when
+# a declared arm is opened, so the CAN-owning node owns the vendor SDK while
+# host-only installations stay dependency-free.
+piper = "leapflow.hardware.drivers.piper:build_transport"
 
 [build-system]
 requires = ["setuptools>=68.0"]
