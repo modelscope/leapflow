@@ -1,7 +1,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 """LHP wire protocol: versions, frame codec, and the error taxonomy.
 
-The frozen v1 specification lives in ``temp/devices/plan/02-lhp-wire-protocol-v1.md``.
+This module is the frozen, executable specification of the wire contract.
 Version 2 is an additive, capability-negotiated extension for bounded media frame
 requests and explicit remote capture release. LHP remains a *hardware-domain*
 protocol rather than a general-purpose RPC: scalar and write semantics are unchanged,
