@@ -8,9 +8,12 @@ that a forged, expired, replayed, or misaddressed permit is rejected with
 
 Design invariants:
 
-- **Canonical digest**: ``action_digest`` is a deterministic sha256 of the
-  normalized command parameters. A permit for ``write(joint.shoulder, 1.5)``
-  does not authorize ``write(joint.shoulder, 2.0)`` or ``write_batch(...)``.
+- **Canonical digest**: ``request_digest`` is a deterministic sha256 of the
+  method and every request parameter except the permit itself, so host and
+  node derive it independently from what actually crosses the wire. A permit
+  for ``write(joint.shoulder, 1.5)`` does not authorize
+  ``write(joint.shoulder, 2.0)`` or ``write_batch(...)``. Whole-task methods
+  (``skill.execute``) bind a content digest of the approved plan instead.
 
 - **Single-use by default**: ``max_uses=1`` with nonce replay rejection.
   A captured permit cannot be replayed even within its TTL.
@@ -30,9 +33,9 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -66,57 +69,27 @@ MAX_NONCE_CACHE_SIZE = 4096
 """Upper bound for the replay-rejection LRU."""
 
 
-def action_digest(
-    *,
-    method: str,
-    device_id: str,
-    commands: Sequence[tuple[str, Any]] | None = None,
-    effect: str = "",
-    envelope_band: str = "",
-    mode: str = "",
-    frequency_hz: float = 0.0,
-    channels: Sequence[str] = (),
-    targets: Mapping[str, float] | None = None,
-    waypoints: Sequence[tuple[float, Mapping[str, float]]] | None = None,
-    lease_s: float = 0.0,
-    comm_loss_policy: str = "",
-) -> str:
-    """Return the sha256 hex digest of the canonical action representation.
+PERMIT_PARAM = "permit"
+"""The request parameter carrying the permit; never part of the digest it signs."""
 
-    The canonical form is compact JSON with sorted keys, so that two
-    independently constructed digests for the same physical command are
-    identical. Batch commands are ordered by their position in the sequence.
+
+def request_digest(method: str, params: Mapping[str, Any]) -> str:
+    """Return the sha256 hex digest of one request as it crosses the wire.
+
+    The parameters are normalized through a JSON round trip first (tuples become
+    lists, keys become strings), so the host hashing the Python mapping it is
+    about to send and the node hashing the decoded frame it received agree byte
+    for byte. Batch commands keep their order: a reordered batch is a different
+    action.
     """
-    obj: dict[str, Any] = {
-        "method": str(method),
-        "device_id": str(device_id),
-    }
-    if commands is not None:
-        obj["commands"] = [[str(ch), v] for ch, v in commands]
-    if effect:
-        obj["effect"] = str(effect)
-    if envelope_band:
-        obj["envelope_band"] = str(envelope_band)
-    # Control-specific fields
-    if mode:
-        obj["mode"] = str(mode)
-    if frequency_hz:
-        obj["frequency_hz"] = float(frequency_hz)
-    if channels:
-        obj["channels"] = [str(c) for c in channels]
-    if targets:
-        obj["targets"] = {str(k): float(v) for k, v in sorted(targets.items())}
-    if waypoints:
-        obj["waypoints"] = [
-            [float(t), {str(k): float(v) for k, v in sorted(wp.items())}]
-            for t, wp in waypoints
-        ]
-    if lease_s:
-        obj["lease_s"] = float(lease_s)
-    if comm_loss_policy:
-        obj["comm_loss_policy"] = str(comm_loss_policy)
-
-    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    body = {str(key): value for key, value in params.items() if key != PERMIT_PARAM}
+    normalized = json.loads(json.dumps(body, default=str))
+    canonical = json.dumps(
+        {"method": str(method), "params": normalized},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -301,8 +274,11 @@ class PermitIssuer:
         elif auto_generate:
             private, _ = generate_keypair()
             save_private_key(private, path)
-            logger.info("Generated new LHP permit issuer key at %s (key_id=%s)",
-                        path, key_id_from_public(private.public_key()))
+            logger.info(
+                "Generated new LHP permit issuer key at %s (key_id=%s)",
+                path,
+                key_id_from_public(private.public_key()),
+            )
         else:
             raise FileNotFoundError(f"permit issuer key not found at {path}")
         return cls(private, issuer_label=issuer_label, ttl_s=ttl_s)
@@ -343,6 +319,7 @@ class PermitIssuer:
 @dataclass
 class PermitRejection:
     """Structured rejection from the verifier; always side_effect=NONE."""
+
     code: str
     message: str
 
@@ -471,7 +448,8 @@ __all__ = [
     "REJECT_INVALID_SIGNATURE",
     "REJECT_PRE_BOOT",
     "REJECT_REPLAYED",
-    "action_digest",
+    "PERMIT_PARAM",
+    "request_digest",
     "generate_keypair",
     "key_id_from_public",
     "load_private_key",

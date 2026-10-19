@@ -31,8 +31,3 @@ scenarios:
     tags: [native, onboarding, tier1]
     timeout_seconds: 30.0
     required: true
-  - scenario_id: capability_tool_generation
-    name: "Generate tools from declared affordances"
-    tags: [native, onboarding, tier1]
-    timeout_seconds: 30.0
-    required: true

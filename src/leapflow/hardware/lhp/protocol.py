@@ -84,6 +84,9 @@ FAILURE_NOT_WRITABLE = "not_writable"
 FAILURE_BATCH_ABORTED = "batch_aborted"
 FAILURE_INTERLOCK_UNSATISFIED = "interlock_unsatisfied"
 FAILURE_DEVICE_DEGRADED = "device_degraded"
+FAILURE_RATE_LIMITED = "rate_limited"
+FAILURE_DEVICE_BUSY = "device_busy"
+"""A node-local skill run holds the device; wire writes wait until it ends."""
 
 # Permit-related failure codes (side_effect=NONE; command never attempted).
 FAILURE_PERMIT_REQUIRED = "permit_required"
@@ -110,6 +113,17 @@ LHP_V2_CAPABILITIES: tuple[str, ...] = (*LHP_V1_CAPABILITIES, "read_frame", "rel
 # v2 optional capability tokens negotiated at hello.
 CAP_PERMIT_V1 = "permit.v1"
 CAP_CONTROL_V1 = "control.v1"
+CAP_SKILL_V1 = "skill.v1"
+"""Node-local skills: the node plans and executes whole tasks under one run permit."""
+
+SKILL_METHODS: tuple[str, ...] = (
+    "skill.list",
+    "skill.plan",
+    "skill.execute",
+    "skill.status",
+    "skill.stop",
+    "skill.label",
+)
 
 LHP_METHODS: tuple[str, ...] = (
     "hello",
@@ -120,6 +134,7 @@ LHP_METHODS: tuple[str, ...] = (
     "control.update",
     "control.close",
     "control.status",
+    *SKILL_METHODS,
 )
 LHP_CAPABILITIES: tuple[str, ...] = LHP_V2_CAPABILITIES
 """Capabilities of the newest protocol; hello advertises the negotiated version's set."""
@@ -190,7 +205,9 @@ def decode_frame(line: bytes | str) -> dict[str, Any]:
     return payload
 
 
-def make_request(request_id: Any, method: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def make_request(
+    request_id: Any, method: str, params: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     """Build a request frame."""
     return {"id": request_id, "method": str(method), "params": dict(params or {})}
 
@@ -220,6 +237,7 @@ def response_error(response: Mapping[str, Any]) -> tuple[str, str] | None:
 
 __all__ = [
     "CAP_CONTROL_V1",
+    "CAP_SKILL_V1",
     "CAP_PERMIT_V1",
     "ERR_BAD_REQUEST",
     "ERR_CONNECTION_CLOSED",
@@ -233,6 +251,7 @@ __all__ = [
     "ERR_UNKNOWN_DEVICE",
     "ERR_UNSUPPORTED_CAPABILITY",
     "FAILURE_BATCH_ABORTED",
+    "FAILURE_DEVICE_BUSY",
     "FAILURE_DEVICE_DEGRADED",
     "FAILURE_INTERLOCK_UNSATISFIED",
     "FAILURE_NOT_WRITABLE",
@@ -242,6 +261,7 @@ __all__ = [
     "FAILURE_PERMIT_INVALID",
     "FAILURE_PERMIT_REPLAYED",
     "FAILURE_PERMIT_REQUIRED",
+    "FAILURE_RATE_LIMITED",
     "FAILURE_REMOTE_CONTROL_UNSUPPORTED",
     "FAILURE_SAFETY_DENIED",
     "FAILURE_WRITES_DISABLED",
@@ -257,6 +277,7 @@ __all__ = [
     "MAX_FRAME_RATE_HZ",
     "MAX_FRAME_WIDTH",
     "SAFE_FRAME_MEDIA_TYPES",
+    "SKILL_METHODS",
     "WRITE_EFFECT_UNKNOWN_CODES",
     "LhpProtocolError",
     "LhpRemoteError",

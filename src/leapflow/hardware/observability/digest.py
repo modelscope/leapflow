@@ -186,11 +186,13 @@ def _conformance_for(series: ChannelSeries) -> list[dict[str, Any]]:
     margin = span * NEAR_FRACTION if span > 0 else 0.0
     rows: list[dict[str, Any]] = []
     for point in series.points:
-        rows.append({
-            "channel_id": series.id,
-            "window_x": point.x,
-            "state": _conformance_state(point, band, margin),
-        })
+        rows.append(
+            {
+                "channel_id": series.id,
+                "window_x": point.x,
+                "state": _conformance_state(point, band, margin),
+            }
+        )
     return rows
 
 
@@ -225,18 +227,20 @@ def _events(registry: Any) -> tuple[dict[str, Any], ...]:
         kind = str(getattr(event, "kind", ""))
         device_id = str(getattr(event, "device_id", ""))
         channel_id = str(getattr(event, "channel_id", ""))
-        rows.append({
-            "title": f"{kind} · {device_id}.{channel_id}",
-            "summary": str(getattr(event, "detail", "")),
-            "severity": _event_severity(kind),
-            "kind": kind,
-            "device_id": device_id,
-            "channel_id": channel_id,
-            "detail": str(getattr(event, "detail", "")),
-            "value": getattr(event, "value", None),
-            "unit": str(getattr(event, "unit", "")),
-            "x": float(getattr(event, "observed_at", 0.0) or 0.0),
-        })
+        rows.append(
+            {
+                "title": f"{kind} · {device_id}.{channel_id}",
+                "summary": str(getattr(event, "detail", "")),
+                "severity": _event_severity(kind),
+                "kind": kind,
+                "device_id": device_id,
+                "channel_id": channel_id,
+                "detail": str(getattr(event, "detail", "")),
+                "value": getattr(event, "value", None),
+                "unit": str(getattr(event, "unit", "")),
+                "x": float(getattr(event, "observed_at", 0.0) or 0.0),
+            }
+        )
     rows.sort(key=lambda row: row["x"], reverse=True)
     return tuple(rows)
 
@@ -253,7 +257,9 @@ the row correctly and still declined to push it to anyone.
 a lost sample is already visible in the trace, so neither should interrupt anyone.
 """
 
-_NOTABLE_KINDS = frozenset({"quality_degraded", "sample_loss", "calibration_failed", "calibration_expired"})
+_NOTABLE_KINDS = frozenset(
+    {"quality_degraded", "sample_loss", "calibration_failed", "calibration_expired"}
+)
 
 
 def _event_severity(kind: str) -> str:
@@ -308,13 +314,15 @@ def _outcomes_for(registry: Any, context: Any) -> list[dict[str, Any]]:
         )
         if calibration is not None:
             bias, samples = calibration
-            rows.append({
-                "device_id": context.device_id,
-                "channel_id": channel.channel_id,
-                "command": f"learned correction ({samples} observation(s))",
-                "outcome": f"{bias:+g}{f' {channel.unit}' if channel.unit else ''}",
-                "delta": abs(bias),
-            })
+            rows.append(
+                {
+                    "device_id": context.device_id,
+                    "channel_id": channel.channel_id,
+                    "command": f"learned correction ({samples} observation(s))",
+                    "outcome": f"{bias:+g}{f' {channel.unit}' if channel.unit else ''}",
+                    "delta": abs(bias),
+                }
+            )
         try:
             recalled = recorder.recall(
                 device_id=context.device_id, channel=channel, limit=OUTCOME_LIMIT
@@ -323,14 +331,16 @@ def _outcomes_for(registry: Any, context: Any) -> list[dict[str, Any]]:
             logger.debug("hardware digest: recall failed for %s: %s", context.device_id, exc)
             continue
         for row in recalled:
-            rows.append({
-                "device_id": context.device_id,
-                "channel_id": channel.channel_id,
-                "command": str(row.get("command", "")),
-                "outcome": str(row.get("outcome", "")),
-                "delta": _as_float(row.get("delta")),
-                "unit": str(getattr(channel, "unit", "") or ""),
-            })
+            rows.append(
+                {
+                    "device_id": context.device_id,
+                    "channel_id": channel.channel_id,
+                    "command": str(row.get("command", "")),
+                    "outcome": str(row.get("outcome", "")),
+                    "delta": _as_float(row.get("delta")),
+                    "unit": str(getattr(channel, "unit", "") or ""),
+                }
+            )
     return rows
 
 
@@ -357,34 +367,38 @@ def _calibration(
     for context in contexts:
         record = _safely(lambda: store.latest(context.device_id), default=None)
         if record is None:
-            rows.append({
-                "device_id": context.device_id,
-                "channel_id": "--",
-                "state": "never",
-                "calibrated_at": "",
-                "days_since": "",
-                "residual": "",
-                "next_recal_due": "unknown",
-                "_rank": 0,
-            })
+            rows.append(
+                {
+                    "device_id": context.device_id,
+                    "channel_id": "--",
+                    "state": "never",
+                    "calibrated_at": "",
+                    "days_since": "",
+                    "residual": "",
+                    "next_recal_due": "unknown",
+                    "_rank": 0,
+                }
+            )
             continue
         age_days = max(0.0, (now - float(record.recorded_at)) / 86400.0)
         interval_days = _as_float(dict(record.parameters).get("recal_interval_days"))
         expired = interval_days is not None and age_days > interval_days
-        rows.append({
-            "device_id": context.device_id,
-            "channel_id": str(record.procedure_id or "--"),
-            "state": "expired" if expired else "valid",
-            "calibrated_at": _stamp(record.recorded_at),
-            "days_since": f"{age_days:.1f}",
-            "residual": _residual(record),
-            "next_recal_due": (
-                _stamp(record.recorded_at + interval_days * 86400.0)
-                if interval_days is not None
-                else "not declared"
-            ),
-            "_rank": 1 if expired else 2,
-        })
+        rows.append(
+            {
+                "device_id": context.device_id,
+                "channel_id": str(record.procedure_id or "--"),
+                "state": "expired" if expired else "valid",
+                "calibrated_at": _stamp(record.recorded_at),
+                "days_since": f"{age_days:.1f}",
+                "residual": _residual(record),
+                "next_recal_due": (
+                    _stamp(record.recorded_at + interval_days * 86400.0)
+                    if interval_days is not None
+                    else "not declared"
+                ),
+                "_rank": 1 if expired else 2,
+            }
+        )
     rows.sort(key=lambda row: (row["_rank"], str(row["device_id"])))
     return tuple({key: value for key, value in row.items() if key != "_rank"} for row in rows)
 

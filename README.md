@@ -136,20 +136,20 @@ LeapFlow bridges LLM intelligence and real-world hardware through a **three-laye
   HCP                 per-device contract
   ────────────────    6-method transport: open / close / read / write / probe / halt
   Southbound          transport plugins
-  ────────────────    ROS2 · Feetech · RealSense · VLA · MCP · media · simulated …
+  ────────────────    ROS2 · Piper · Feetech · RealSense · model service · MCP · media …
 ```
 
 ```
-  System-2  (LLM)     0.2–1 Hz     task planning → SubtaskGoal
+  System-2  (LLM)     0.2–1 Hz     task planning → node skill (plan → approve → run)
                           ↓
-  System-1.5 (VLA)    5–30 Hz      observation + goal → action chunks
+  System-1.5 (skills) 5–30 Hz      perceive · grasp · policy.run (VLA action chunks)
                           ↓
   System-1  (servo)   100–1000 Hz  PID / impedance — never crosses the fabric
                           ↓
                       actuators     escalation flows back up ↑
 ```
 
-The host sends **goals**; the node decomposes them locally. A 1 kHz servo loop stays safe regardless of network latency.
+The host sends **goals**; the node decomposes them locally. A skill is planned on the node, approved once by its plan digest, then executed next to the device with a run-scoped permit — so a 1 kHz servo loop and a 30 Hz policy stream stay safe regardless of network latency.
 
 **Protocol once, devices for free** — new device = one YAML on the node; new protocol = one transport plugin; new node = one fleet entry.
 
@@ -163,7 +163,8 @@ The host sends **goals**; the node decomposes them locally. A 1 kHz servo loop s
 | Safety | `hw_estop` | no approval — node-local |
 | Control | `hw_control_start` · `hw_control_stop` · `hw_control_status` | leased deadman |
 | Fleet | `hw_fleet_status` · `hw_fleet_discover` · `hw_fleet_halt_all` | multi-node |
-| Policy | `hw_policy_infer` · `hw_policy_episode` · `hw_policy_list` | VLA inference |
+| Skills | `hw_skill_list` · `hw_skill_run` · `hw_skill_status` · `hw_skill_stop` | plan-digest approval, node-local |
+| Data | `hw_skill_label` | labels a recorded episode's outcome |
 
 </details>
 
@@ -180,8 +181,9 @@ The host sends **goals**; the node decomposes them locally. A 1 kHz servo loop s
 <details>
 <summary>Bundled physical-AI stack</summary>
 
-- **Robot arms** (`leapflow.robot`) — LeRobot-derived: serial bus (Feetech), teleop, camera capture, episode export, policy registry (`vla_local` / `vla_remote` / `position_control`).
-- **VLA as a device** — policy server (gRPC or HTTP) appears as an HCP virtual device; inference is a CONFIGURE effect — physical motion happens only when the returned action is written to an actuator.
+- **Robot arms** (`leapflow.robot`) — LeRobot-derived: serial bus (Feetech), teleop, camera capture, episode export, policy registry (`vla_local` / `position_control`).
+- **Node skills** — calibration (`calib.*`), perception (`perceive.locate`), grasp proposals (`grasp.propose`), model-written motion programs (`motion.sequence`), and learned policies (`policy.run`) run on the node behind the same gate chain; with an episodes directory configured, every actuating run is recorded as a training episode.
+- **Models as devices** — a policy or perception server (`model_service` transport, HTTP) appears as an HCP device; inference never moves anything — only a skill's gated motion writes to actuators.
 - **Depth cameras** — RealSense integration; frames as governed binary channels.
 - **ROS2** — sidecar transport over Unix socket; topics/services/actions map into HCP.
 

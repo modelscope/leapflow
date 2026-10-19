@@ -170,12 +170,12 @@ class DegradationCoordinator:
         if completed:
             logger.warning("DegradationPolicy halted device %s (%s)", outcome.device_id, reason)
         else:
-            logger.error("DegradationPolicy halt could not be confirmed for %s: %s", outcome.device_id, error)
+            logger.error(
+                "DegradationPolicy halt could not be confirmed for %s: %s", outcome.device_id, error
+            )
         return outcome
 
-    async def _halt_fallback(
-        self, action: str, reason: str, error: str
-    ) -> DegradationOutcome:
+    async def _halt_fallback(self, action: str, reason: str, error: str) -> DegradationOutcome:
         halted = await self._halt(reason, action=action, error=error)
         outcome = DegradationOutcome(
             **{
@@ -235,7 +235,9 @@ class DegradationCoordinator:
             active_channel_id=target,
             verification="fallback channel readback is healthy",
         )
-        self._registry.clear_degradation(self._context.device_id, recovery="verified_sensor_fallback")
+        self._registry.clear_degradation(
+            self._context.device_id, recovery="verified_sensor_fallback"
+        )
         logger.warning(
             "DegradationPolicy switched device %s from %s to fallback sensor %s",
             self._context.device_id,
@@ -262,7 +264,10 @@ class DegradationCoordinator:
                 "safe_return requires declared home_joint_targets",
             )
         context_channels = {channel.channel_id: channel for channel in self._context.channels}
-        if any(channel_id not in context_channels or not context_channels[channel_id].is_writable for channel_id in targets):
+        if any(
+            channel_id not in context_channels or not context_channels[channel_id].is_writable
+            for channel_id in targets
+        ):
             return await self._halt_fallback(
                 DegradationAction.SAFE_RETURN.value,
                 reason,
@@ -277,8 +282,12 @@ class DegradationCoordinator:
             from leapflow.hardware.realtime import PIDJointController, TrajectoryTracker
 
             controller = PIDJointController(
-                tuple(targets), kp=1.0, ki=0.0, kd=0.0,
-                max_output=100.0, output_mode="position",
+                tuple(targets),
+                kp=1.0,
+                ki=0.0,
+                kd=0.0,
+                max_output=100.0,
+                output_mode="position",
             )
             tracker = TrajectoryTracker(
                 controller,
@@ -312,7 +321,9 @@ class DegradationCoordinator:
             side_effect_state=SIDE_EFFECT_COMMITTED,
         )
         self._registry.latch_degradation(outcome)
-        logger.warning("DegradationPolicy returned device %s to declared home pose", outcome.device_id)
+        logger.warning(
+            "DegradationPolicy returned device %s to declared home pose", outcome.device_id
+        )
         return outcome
 
 

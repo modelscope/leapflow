@@ -57,9 +57,7 @@ def build_fleet_tools(fleet_manager: "FleetManager") -> list["ToolMetadata"]:
         """Probe endpoints for new fleet nodes."""
         raw = kwargs.get("endpoints", "")
         if isinstance(raw, str):
-            endpoints = tuple(
-                ep.strip() for ep in raw.split(",") if ep.strip()
-            )
+            endpoints = tuple(ep.strip() for ep in raw.split(",") if ep.strip())
         elif isinstance(raw, (list, tuple)):
             endpoints = tuple(str(ep) for ep in raw)
         else:

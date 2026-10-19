@@ -29,6 +29,7 @@ import json
 import logging
 import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from leapflow.config import load_config
@@ -131,6 +132,10 @@ async def _dispatch(args: argparse.Namespace, action: str) -> int:
         return _run_offline(action, args, json_mode)
     if action == "serve":
         return await _run_serve(args)
+    if action == "validate" and getattr(args, "workcells", None) is not None:
+        from leapflow.cli.commands.hardware_workcells import run_workcell_validation
+
+        return run_workcell_validation(args, load_config(), json_mode)
     if action in _VERIFICATION_ACTIONS:
         return await _run_verification(action, args, json_mode)
     if action == "permit-key":
@@ -603,48 +608,39 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
 
 
 def _run_permit_key(args: argparse.Namespace, json_mode: bool) -> int:
-    """Show the permit issuer's public key and key_id."""
+    """Show the permit issuer's public key and key_id, generating the key on first use.
+
+    The issuer key is the host's own: the host mints permits with it, and the
+    operator installs the public half on each node started ``permit_required``.
+    """
     settings = load_config()
     from leapflow.layout import HardwareLayout
 
-    layout = HardwareLayout(settings.profile_dir / "hardware")
-    key_path = layout.root / "lhp_permit_issuer.key"
-    if not key_path.is_file():
-        result = {
-            "ok": False,
-            "error": f"No permit issuer key found at {key_path}. "
-            "Start a node with --write-mode permit_required to generate one.",
-        }
-        if not json_mode:
-            _fail(result["error"])
-        return 1
-
+    key_path = HardwareLayout(settings.profile_dir / "hardware").permit_issuer_key_path
     try:
-        from leapflow.hardware.lhp.permit import (
-            key_id_from_public,
-            load_private_key,
-            public_key_pem,
-        )
+        from leapflow.hardware.lhp.permit import PermitIssuer, public_key_pem
 
-        private_key = load_private_key(key_path)
-        pub = private_key.public_key()
-        kid = key_id_from_public(pub)
-        pem = public_key_pem(pub)
+        issuer = PermitIssuer.from_key_file(key_path)
+        kid = issuer.key_id
+        pem = public_key_pem(issuer.public_key).decode("ascii")
         result = {
             "ok": True,
             "key_id": kid,
             "public_key_pem": pem,
             "key_path": str(key_path),
         }
-        if not json_mode:
-            _ok(f"key_id: {kid}")
-            print(pem)
-            _info(f"Key file: {key_path}")
-        return 0
     except Exception as exc:  # noqa: BLE001
-        if not json_mode:
-            _fail(f"Could not load permit key: {exc}")
+        if json_mode:
+            return _emit_result("permit-key", {"ok": False, "error": str(exc)}, True)
+        _fail(f"Could not load permit key: {exc}")
         return 1
+    if json_mode:
+        return _emit_result("permit-key", result, True)
+    _ok(f"key_id: {kid}")
+    print(pem)
+    _info(f"Key file: {key_path}")
+    _info("Install the public key on each node: --permit-issuer-key <file with this PEM>")
+    return 0
 
 
 # ── Onboarding commands (init / probe / commission) ───────────────────────────────

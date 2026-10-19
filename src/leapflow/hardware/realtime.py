@@ -5,22 +5,18 @@ While :class:`HighFrequencyControlBus` provides the raw cycle machinery (thread,
 timing, transport I/O), this module adds:
 
 1. Built-in control policies: PID joint controller, impedance controller
-2. Policy chaining: System-1.5 neural policy → System-1 servo refiner
-3. Trajectory tracking: follow a pre-planned joint trajectory at Hz rate
-4. Watchdog: detect and recover from policy computation overruns
-5. Telemetry: publish cycle stats to EventBus for LeapBoard display
+2. Trajectory tracking: follow a pre-planned joint trajectory at Hz rate
+3. Watchdog: detect and recover from policy computation overruns
+4. Telemetry: publish cycle stats to EventBus for LeapBoard display
 
-This is the "System-1" layer in the System-1/1.5/2 hierarchy:
-
-- System-2 (LLM, 1–5 s): high-level planning and reasoning
-- System-1.5 (VLA, 5–30 Hz): learned policy inference
-- System-1 (this module, 100–1000 Hz): servo-level closed-loop control
+This is the "System-1" layer (servo-level closed-loop control, 100–1000 Hz).
+Learned policies (System-1.5) never run here: they stream through node-local
+skills (``policy.run``), which own chunk scheduling and the safety shield.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import threading
 import time
 import uuid
@@ -55,8 +51,7 @@ class PIDJointController:
     """PID controller for joint position tracking.
 
     Implements :class:`ControlPolicy` Protocol.  One PID loop per joint,
-    configurable gains.  Suitable for precise positioning tasks and as the
-    System-1 refiner under a System-1.5 neural policy.
+    configurable gains.  Suitable for precise positioning tasks.
     """
 
     def __init__(
@@ -364,76 +359,6 @@ class TrajectoryTracker:
 
 
 # ---------------------------------------------------------------------------
-# Policy chain (System-1.5 → System-1)
-# ---------------------------------------------------------------------------
-
-
-class PolicyChain:
-    """Chains a high-level policy with a low-level servo refiner.
-
-    The outer policy (e.g. VLA at 10 Hz) produces coarse commands.  The inner
-    policy (e.g. PID at 500 Hz) refines them into smooth servo-level control,
-    interpolating between the outer policy's sparse updates.
-
-    Implements :class:`ControlPolicy` Protocol.
-    """
-
-    def __init__(
-        self,
-        outer: ControlPolicy,
-        inner: ControlPolicy,
-        *,
-        outer_rate_hz: float = 10.0,
-    ) -> None:
-        if outer_rate_hz <= 0:
-            raise ValueError(f"outer_rate_hz must be positive, got {outer_rate_hz}")
-        self._outer = outer
-        self._inner = inner
-        self._outer_rate_hz = outer_rate_hz
-
-        # Cycle bookkeeping — only accessed from the RT thread.
-        self._cycles_since_outer: int = 0
-        self._outer_period_cycles: int = 1  # computed on first call
-        self._first_call = True
-        self._last_outer_command: ControlCommand | None = None
-
-    @property
-    def policy_id(self) -> str:
-        return f"chain:{self._outer.policy_id}+{self._inner.policy_id}"
-
-    def compute(self, state: ControlState) -> ControlCommand:
-        """Every N cycles call outer for new target; every cycle call inner for servo."""
-        if self._first_call:
-            bus_hz = 1.0 / state.cycle_dt_s if state.cycle_dt_s > 0 else 100.0
-            self._outer_period_cycles = max(1, round(bus_hz / self._outer_rate_hz))
-            self._first_call = False
-            self._cycles_since_outer = self._outer_period_cycles  # force first outer call
-
-        self._cycles_since_outer += 1
-        if self._cycles_since_outer >= self._outer_period_cycles:
-            self._cycles_since_outer = 0
-            outer_cmd = self._outer.compute(state)
-            self._last_outer_command = outer_cmd
-            if outer_cmd.halt:
-                return outer_cmd
-            # Feed outer targets to inner policy.
-            if hasattr(self._inner, "set_target"):
-                self._inner.set_target(outer_cmd.joint_commands)  # type: ignore[attr-defined]
-            elif hasattr(self._inner, "set_reference"):
-                self._inner.set_reference(outer_cmd.joint_commands)  # type: ignore[attr-defined]
-
-        return self._inner.compute(state)
-
-    def reset(self) -> None:
-        """Reset both outer and inner policies."""
-        self._outer.reset()
-        self._inner.reset()
-        self._cycles_since_outer = 0
-        self._first_call = True
-        self._last_outer_command = None
-
-
-# ---------------------------------------------------------------------------
 # Telemetry event
 # ---------------------------------------------------------------------------
 
@@ -513,8 +438,12 @@ class RealtimeControlLoop:
     ) -> str:
         """Start PID position tracking.  Returns session_id."""
         policy = PIDJointController(
-            joint_ids, kp=kp, ki=ki, kd=kd,
-            max_output=max_output, output_mode=output_mode,
+            joint_ids,
+            kp=kp,
+            ki=ki,
+            kd=kd,
+            max_output=max_output,
+            output_mode=output_mode,
         )
         policy.set_target(targets)
         return await self._start_session(device_id, policy, config)
@@ -535,7 +464,10 @@ class RealtimeControlLoop:
     ) -> str:
         """Start impedance control.  Returns session_id."""
         policy = ImpedanceController(
-            joint_ids, stiffness=stiffness, damping=damping, inertia=inertia,
+            joint_ids,
+            stiffness=stiffness,
+            damping=damping,
+            inertia=inertia,
         )
         policy.set_reference(position, velocity)
         return await self._start_session(device_id, policy, config)
@@ -567,34 +499,6 @@ class RealtimeControlLoop:
         policy = TrajectoryTracker(inner, trajectory, loop_mode=loop_mode)
         return await self._start_session(device_id, policy, config)
 
-    # -- Policy-chain session ----------------------------------------------
-
-    async def start_policy_chain(
-        self,
-        device_id: str,
-        outer_policy: ControlPolicy,
-        *,
-        inner_controller: str = "pid",
-        outer_rate_hz: float = 10.0,
-        config: ControlBusConfig | None = None,
-        joint_ids: tuple[str, ...] | None = None,
-        **inner_kwargs: Any,
-    ) -> str:
-        """Start a System-1.5 → System-1 policy chain.  Returns session_id."""
-        if joint_ids is None:
-            raise ValueError("joint_ids required for policy chain inner controller")
-
-        inner: ControlPolicy
-        if inner_controller == "pid":
-            inner = PIDJointController(joint_ids, **inner_kwargs)
-        elif inner_controller == "impedance":
-            inner = ImpedanceController(joint_ids, **inner_kwargs)
-        else:
-            raise ValueError(f"Unknown inner_controller type: {inner_controller!r}")
-
-        policy = PolicyChain(outer_policy, inner, outer_rate_hz=outer_rate_hz)
-        return await self._start_session(device_id, policy, config)
-
     # -- Lifecycle ---------------------------------------------------------
 
     async def stop(self) -> dict[str, Any]:
@@ -615,9 +519,7 @@ class RealtimeControlLoop:
                 "session_id": session.session_id,
                 "device_id": session.device_id,
                 "policy_id": session.policy.policy_id,
-                "duration_s": round(
-                    (session.stopped_at - session.started_at), 3
-                ),
+                "duration_s": round((session.stopped_at - session.started_at), 3),
                 "stats": stats,
             }
             self._session = None
@@ -661,17 +563,8 @@ class RealtimeControlLoop:
             policy.set_target(targets)
         elif isinstance(policy, ImpedanceController):
             policy.set_reference(targets)
-        elif isinstance(policy, PolicyChain):
-            # Update the inner policy of the chain.
-            inner = policy._inner
-            if isinstance(inner, PIDJointController):
-                inner.set_target(targets)
-            elif isinstance(inner, ImpedanceController):
-                inner.set_reference(targets)
         else:
-            raise TypeError(
-                f"Cannot update targets on policy {policy.policy_id!r}"
-            )
+            raise TypeError(f"Cannot update targets on policy {policy.policy_id!r}")
 
     # -- Internal helpers --------------------------------------------------
 
@@ -767,7 +660,6 @@ __all__ = [
     "ControlTelemetryEvent",
     "ImpedanceController",
     "PIDJointController",
-    "PolicyChain",
     "RealtimeControlLoop",
     "TrajectoryTracker",
 ]

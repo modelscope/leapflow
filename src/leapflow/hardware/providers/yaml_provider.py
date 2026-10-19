@@ -92,7 +92,8 @@ class YamlContextProvider:
             logger.warning(
                 "verified.json: device %r uses legacy string format (no digest binding); "
                 "run 'leap hw verify %s' to create a digest-bound entry",
-                context.device_id, context.device_id,
+                context.device_id,
+                context.device_id,
             )
             return replace(
                 context,
@@ -110,7 +111,9 @@ class YamlContextProvider:
                     logger.warning(
                         "verified.json: device %r declaration digest mismatch "
                         "(stored=%s, current=%s); verification demoted",
-                        context.device_id, stored_digest[:12], current_digest[:12],
+                        context.device_id,
+                        stored_digest[:12],
+                        current_digest[:12],
                     )
                     return context  # demoted: declaration changed since verification
             return replace(

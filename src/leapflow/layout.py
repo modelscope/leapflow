@@ -18,7 +18,6 @@ from typing import Any, Iterable
 
 import yaml
 
-
 _PROFILE_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 _CONFIG_NAMES = (
     "runtime.yaml",
@@ -195,7 +194,9 @@ class HardwareLayout:
     Device declarations are durable user assets: they encode physical operating
     limits a person is accountable for, so they live under the profile and are
     never regenerated. Raw samples do not live here -- they are session-scoped
-    sensitive artifacts and route through CacheLayout instead.
+    sensitive artifacts and route through CacheLayout instead. Recorded skill
+    episodes are the exception by intent: they are a dataset the operator curates
+    and trains on, not a session by-product.
     """
 
     root: Path
@@ -203,6 +204,16 @@ class HardwareLayout:
     @property
     def devices_dir(self) -> Path:
         return self.root / "devices"
+
+    @property
+    def workcells_dir(self) -> Path:
+        """Workcell declarations: which devices cooperate, frames, workspace, home."""
+        return self.root / "workcells"
+
+    @property
+    def episodes_dir(self) -> Path:
+        """Recorded skill runs (state, commands, camera frames) for offline training."""
+        return self.root / "episodes"
 
     @property
     def verified_path(self) -> Path:
@@ -214,8 +225,13 @@ class HardwareLayout:
         """Append-only NDJSON audit trail for hardware read/write/estop operations."""
         return self.root / "audit" / "hardware_audit.ndjson"
 
+    @property
+    def permit_issuer_key_path(self) -> Path:
+        """Host Ed25519 key that signs LHP execution permits (0600, never shared)."""
+        return self.root / "lhp_permit_issuer.key"
+
     def ensure(self) -> None:
-        for path in (self.root, self.devices_dir):
+        for path in (self.root, self.devices_dir, self.workcells_dir):
             path.mkdir(parents=True, exist_ok=True)
 
 

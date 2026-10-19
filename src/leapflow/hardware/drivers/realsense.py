@@ -4,6 +4,10 @@
 The SDK is imported only when a declared RealSense device is opened.  This
 keeps a host-only LeapFlow installation importable and lets the Jetson own the
 camera, while LHP forwards bounded preview frames to the host.
+
+Node-local perception gets more through ``FrameSource.capture_rgbd``: the raw
+colour image, depth aligned to it, and the colour stream's factory intrinsics.
+Those bytes never leave the node process.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from typing import Any, Mapping
 from PIL import Image
 
 from leapflow.hardware.context import HardwareContext, Quality
+from leapflow.hardware.rgbd import CameraIntrinsics, RgbdFrame
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
     FrameReading,
@@ -42,6 +47,14 @@ _WRITABLE_OPTIONS: dict[str, str] = {
     _LASER_POWER_CHANNEL: "laser_power",
 }
 
+# A manual colour setting only sticks once its auto loop is off; perception needs
+# stable exposure and white balance, or the same object segments differently
+# between the frame a skill planned on and the one it verifies with.
+_AUTO_OVERRIDES: dict[str, str] = {
+    "exposure": "enable_auto_exposure",
+    "white_balance": "enable_auto_white_balance",
+}
+
 
 @dataclass(frozen=True)
 class _StreamProfile:
@@ -55,7 +68,8 @@ class RealSenseTransport:
 
     The transport emits only bounded RGB, colorized-depth, and IR preview
     images.  Raw Z16 remains inside the Jetson process; its calibration and
-    depth-scale metadata are exposed through ``camera.metadata`` instead.
+    depth-scale metadata are exposed through ``camera.metadata`` instead, and
+    node-local skills read raw aligned frames through ``capture_rgbd``.
     """
 
     kind = "realsense"
@@ -69,6 +83,12 @@ class RealSenseTransport:
         self._color = _profile(config.get("color"), default=(1280, 720, 30))
         self._depth = _profile(config.get("depth"), default=(848, 480, 30))
         self._infrared = _profile(config.get("infrared"), default=(848, 480, 30))
+        options = config.get("color_options")
+        self._color_options: dict[str, Any] = (
+            {str(k): v for k, v in options.items()} if isinstance(options, Mapping) else {}
+        )
+        self._intrinsics: CameraIntrinsics | None = None
+        self._extrinsics: dict[str, Any] = {}
         self._pipeline: Any = None
         self._align: Any = None
         self._colorizer: Any = None
@@ -113,6 +133,7 @@ class RealSenseTransport:
             pipeline, self._pipeline = self._pipeline, None
             self._align = None
             self._colorizer = None
+            self._intrinsics = None
             self._connected = False
             if pipeline is not None:
                 try:
@@ -120,7 +141,9 @@ class RealSenseTransport:
                 except Exception:
                     # Closing must be idempotent even when a camera was unplugged.
                     pass
-        return TransportStatus(connected=False, halt_supported=False, detail="RealSense pipeline closed")
+        return TransportStatus(
+            connected=False, halt_supported=False, detail="RealSense pipeline closed"
+        )
 
     async def probe(self) -> TransportStatus:
         """Report the selected physical device and active capture profile."""
@@ -130,12 +153,15 @@ class RealSenseTransport:
             "minimum_usb": self._minimum_usb,
             "active_profile": dict(self._active_profile),
             "depth_scale_m": self._depth_scale,
+            "color_intrinsics": self._intrinsics.to_dict() if self._intrinsics else {},
             "capturing": self._pipeline is not None,
         }
         return TransportStatus(
             connected=self._connected,
             halt_supported=False,
-            detail=("RealSense pipeline active" if self._connected else "RealSense pipeline is closed"),
+            detail=(
+                "RealSense pipeline active" if self._connected else "RealSense pipeline is closed"
+            ),
             metadata=metadata,
         )
 
@@ -176,7 +202,9 @@ class RealSenseTransport:
         """Return one encoded preview frame for a declared camera channel."""
         self._require_open(channel_id)
         if channel_id not in _FRAME_CHANNELS:
-            raise TransportError(f"channel {channel_id!r} is not a preview channel", failure_code="unknown_channel")
+            raise TransportError(
+                f"channel {channel_id!r} is not a preview channel", failure_code="unknown_channel"
+            )
         async with self._capture_lock:
             try:
                 return await asyncio.to_thread(
@@ -186,7 +214,27 @@ class RealSenseTransport:
                 raise
             except Exception as exc:
                 raise TransportError(
-                    f"RealSense frame capture failed: {exc}", failure_code="realsense_capture_failed"
+                    f"RealSense frame capture failed: {exc}",
+                    failure_code="realsense_capture_failed",
+                ) from exc
+
+    async def capture_rgbd(self) -> RgbdFrame:
+        """Capture one colour frame with depth aligned to it, for node-local perception."""
+        self._require_open("rgbd")
+        if self._align is None:
+            raise TransportError(
+                "RGB-D capture needs align_depth_to_color: true in the declaration",
+                failure_code="realsense_not_aligned",
+            )
+        async with self._capture_lock:
+            try:
+                return await asyncio.to_thread(self._capture_rgbd)
+            except TransportError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - any SDK failure is one typed capture error
+                raise TransportError(
+                    f"RealSense RGB-D capture failed: {exc}",
+                    failure_code="realsense_capture_failed",
                 ) from exc
 
     async def write(self, channel_id: str, value: Any) -> WriteOutcome:
@@ -202,9 +250,7 @@ class RealSenseTransport:
             self._write_option, channel_id, _WRITABLE_OPTIONS[channel_id], value
         )
 
-    def _write_option(
-        self, channel_id: str, option_name: str, value: Any
-    ) -> WriteOutcome:
+    def _write_option(self, channel_id: str, option_name: str, value: Any) -> WriteOutcome:
         """Set a sensor option on the active depth sensor (blocking).
 
         ``emitter_enabled`` expects 0 or 1; ``laser_power`` expects a float
@@ -283,7 +329,9 @@ class RealSenseTransport:
     def _start_pipeline(self) -> None:
         sdk = self._sdk
         if sdk is None:
-            raise TransportError("RealSense SDK is unavailable", failure_code="realsense_sdk_missing")
+            raise TransportError(
+                "RealSense SDK is unavailable", failure_code="realsense_sdk_missing"
+            )
         device = _find_device(sdk, self._serial_number)
         name = _device_info(device, sdk.camera_info.name)
         if self._expected_product and self._expected_product.lower() not in name.lower():
@@ -302,25 +350,45 @@ class RealSenseTransport:
         config = sdk.config()
         config.enable_device(self._serial_number)
         config.enable_stream(
-            sdk.stream.color, self._color.width, self._color.height, sdk.format.bgr8, self._color.fps
+            sdk.stream.color,
+            self._color.width,
+            self._color.height,
+            sdk.format.bgr8,
+            self._color.fps,
         )
         config.enable_stream(
             sdk.stream.depth, self._depth.width, self._depth.height, sdk.format.z16, self._depth.fps
         )
         config.enable_stream(
-            sdk.stream.infrared, 1, self._infrared.width, self._infrared.height, sdk.format.y8,
+            sdk.stream.infrared,
+            1,
+            self._infrared.width,
+            self._infrared.height,
+            sdk.format.y8,
             self._infrared.fps,
         )
         config.enable_stream(
-            sdk.stream.infrared, 2, self._infrared.width, self._infrared.height, sdk.format.y8,
+            sdk.stream.infrared,
+            2,
+            self._infrared.width,
+            self._infrared.height,
+            sdk.format.y8,
             self._infrared.fps,
         )
         pipeline = sdk.pipeline()
         profile = pipeline.start(config)
+        try:
+            applied = _apply_color_options(sdk, profile.get_device(), self._color_options)
+            intrinsics = _color_intrinsics(sdk, profile)
+        except BaseException:
+            _stop_quietly(pipeline)
+            raise
         self._pipeline = pipeline
         self._align = sdk.align(sdk.stream.color) if self._align_depth_to_color else None
         self._colorizer = sdk.colorizer()
         self._depth_scale = _depth_scale(profile)
+        self._intrinsics = intrinsics
+        self._extrinsics = _depth_to_color_extrinsics(sdk, profile)
         self._active_profile = {
             "product": name,
             "usb_type": usb_type,
@@ -328,14 +396,63 @@ class RealSenseTransport:
             "depth": _profile_dict(self._depth),
             "infrared": _profile_dict(self._infrared),
             "depth_aligned_to_color": self._align_depth_to_color,
+            "color_options": applied,
         }
+
+    def _capture_rgbd(self) -> RgbdFrame:
+        pipeline, align, intrinsics = self._pipeline, self._align, self._intrinsics
+        if pipeline is None or align is None or intrinsics is None:
+            raise TransportError(
+                "RealSense pipeline is not open", failure_code="transport_not_open"
+            )
+        frames = align.process(pipeline.wait_for_frames())
+        color, depth = frames.get_color_frame(), frames.get_depth_frame()
+        if not color or not depth:
+            raise TransportError(
+                "RealSense delivered a frameset without colour and depth",
+                failure_code="realsense_frame_missing",
+            )
+        width, height = int(color.get_width()), int(color.get_height())
+        if (int(depth.get_width()), int(depth.get_height())) != (width, height):
+            raise TransportError(
+                "depth is not aligned to the colour image", failure_code="realsense_not_aligned"
+            )
+        self._sequence += 1
+        metadata = {
+            "sdk_frame_number": _safe_frame_number(color),
+            "sdk_timestamp_ms": _safe_timestamp(color),
+            "depth_scale_m": self._depth_scale,
+            "aligned_to_color": True,
+            "active_profile": dict(self._active_profile),
+        }
+        self._last_frame_metadata = metadata
+        try:
+            return RgbdFrame(
+                device_id=self._device_id,
+                width=width,
+                height=height,
+                color=bytes(color.get_data()),
+                depth=bytes(depth.get_data()),
+                depth_scale_m=self._depth_scale,
+                intrinsics=intrinsics,
+                observed_at=time.time(),
+                monotonic_at=time.monotonic(),
+                sequence=self._sequence,
+                metadata=metadata,
+            )
+        except ValueError as exc:
+            raise TransportError(
+                f"RealSense frame is inconsistent: {exc}", failure_code="realsense_frame_invalid"
+            ) from exc
 
     def _capture_frame(
         self, channel_id: str, *, max_width: int, quality: int, fps: float
     ) -> FrameReading:
         pipeline = self._pipeline
         if pipeline is None:
-            raise TransportError("RealSense pipeline is not open", failure_code="transport_not_open")
+            raise TransportError(
+                "RealSense pipeline is not open", failure_code="transport_not_open"
+            )
         frames = pipeline.wait_for_frames()
         if self._align is not None:
             frames = self._align.process(frames)
@@ -349,7 +466,9 @@ class RealSenseTransport:
         else:
             frame, mode = frames.get_infrared_frame(2), "L"
         if not frame:
-            raise TransportError("requested RealSense stream has no frame", failure_code="realsense_frame_missing")
+            raise TransportError(
+                "requested RealSense stream has no frame", failure_code="realsense_frame_missing"
+            )
         width, height = int(frame.get_width()), int(frame.get_height())
         raw = bytes(frame.get_data())
         if mode == "BGR":
@@ -398,13 +517,16 @@ class RealSenseTransport:
             "serial_number": self._serial_number,
             "depth_scale_m": self._depth_scale,
             "active_profile": dict(self._active_profile),
+            "color_intrinsics": self._intrinsics.to_dict() if self._intrinsics else {},
+            "depth_to_color_extrinsics": dict(self._extrinsics),
             "last_frame": dict(self._last_frame_metadata),
         }
 
     def _require_open(self, channel_id: str) -> None:
         if not self._connected or self._pipeline is None:
             raise TransportError(
-                f"RealSense transport for {channel_id!r} is not open", failure_code="transport_not_open"
+                f"RealSense transport for {channel_id!r} is not open",
+                failure_code="transport_not_open",
             )
 
 
@@ -446,6 +568,89 @@ def _depth_scale(profile: Any) -> float:
         return 0.0
 
 
+def _apply_color_options(sdk: Any, device: Any, options: Mapping[str, Any]) -> dict[str, float]:
+    """Set declared colour-sensor options, turning the matching auto loop off first.
+
+    Fail-closed: an unknown, unsupported, non-numeric, or out-of-range option
+    refuses the open, since a camera silently left on auto exposure would make
+    every downstream calibration and segmentation quietly unrepeatable.
+    """
+    if not options:
+        return {}
+    sensor = device.first_color_sensor()
+    steps: list[tuple[str, Any]] = [
+        (auto, 0)
+        for name, auto in _AUTO_OVERRIDES.items()
+        if name in options and auto not in options
+    ]
+    steps.extend(options.items())
+    applied: dict[str, float] = {}
+    for name, value in steps:
+        key = getattr(sdk.option, name, None)
+        if key is None or not sensor.supports(key):
+            raise TransportError(
+                f"RealSense colour sensor does not support option {name!r}",
+                failure_code="realsense_option_invalid",
+            )
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise TransportError(
+                f"colour option {name!r} needs a number, got {value!r}",
+                failure_code="realsense_option_invalid",
+            ) from exc
+        bounds = sensor.get_option_range(key)
+        if not bounds.min <= numeric <= bounds.max:
+            raise TransportError(
+                f"colour option {name}={numeric} is outside [{bounds.min}, {bounds.max}]",
+                failure_code="realsense_option_invalid",
+            )
+        sensor.set_option(key, numeric)
+        applied[name] = numeric
+    return applied
+
+
+def _color_intrinsics(sdk: Any, profile: Any) -> CameraIntrinsics:
+    """The colour stream's factory intrinsics -- what aligned depth is expressed in."""
+    raw = profile.get_stream(sdk.stream.color).as_video_stream_profile().get_intrinsics()
+    try:
+        return CameraIntrinsics(
+            width=int(raw.width),
+            height=int(raw.height),
+            fx=float(raw.fx),
+            fy=float(raw.fy),
+            ppx=float(raw.ppx),
+            ppy=float(raw.ppy),
+            model=str(raw.model).rsplit(".", 1)[-1].lower(),
+            coeffs=tuple(float(c) for c in raw.coeffs),
+        )
+    except ValueError as exc:
+        raise TransportError(
+            f"RealSense colour intrinsics are unusable: {exc}",
+            failure_code="realsense_intrinsics_unsupported",
+        ) from exc
+
+
+def _depth_to_color_extrinsics(sdk: Any, profile: Any) -> dict[str, Any]:
+    """Depth-to-colour extrinsics for the metadata channel; informational only."""
+    try:
+        depth = profile.get_stream(sdk.stream.depth)
+        raw = depth.get_extrinsics_to(profile.get_stream(sdk.stream.color))
+        return {
+            "rotation": [float(v) for v in raw.rotation],
+            "translation_m": [float(v) for v in raw.translation],
+        }
+    except Exception:  # noqa: BLE001 - metadata must not fail an otherwise healthy open
+        return {}
+
+
+def _stop_quietly(pipeline: Any) -> None:
+    try:
+        pipeline.stop()
+    except Exception:  # noqa: BLE001 - cleanup after a failed open must not mask its cause
+        pass
+
+
 def _safe_frame_number(frame: Any) -> int:
     try:
         return int(frame.get_frame_number())
@@ -462,6 +667,7 @@ def _safe_timestamp(frame: Any) -> float:
 
 def _meets_usb_minimum(actual: str, minimum: str) -> bool:
     """Compare RealSense USB descriptors without assuming a vendor string format."""
+
     def major(value: str) -> int:
         for token in value.replace("USB", "").replace(".", " ").split():
             if token.isdigit():

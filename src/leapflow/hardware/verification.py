@@ -275,8 +275,7 @@ class PositionVerifier:
             confidence=0.9,
             deviation=deviation,
             detail=(
-                f"Position outside tolerance: deviation={deviation:.6f}, "
-                f"tolerance={tolerance:.6f}."
+                f"Position outside tolerance: deviation={deviation:.6f}, tolerance={tolerance:.6f}."
             ),
             evidence=bundle,
         )
@@ -322,25 +321,18 @@ class GraspVerifier:
 
     async def verify(self, bundle: EvidenceBundle) -> OperationVerdict:
         """Check whether force/torque readings indicate a successful grasp."""
-        force_readings = [
-            r for r in bundle.post_settle_readings
-            if _is_force_quantity(r.quantity)
-        ]
+        force_readings = [r for r in bundle.post_settle_readings if _is_force_quantity(r.quantity)]
 
         if not force_readings:
             frame_note = ""
             if bundle.frames:
                 frame_note = (
-                    f" ({len(bundle.frames)} frame(s) available for future "
-                    "VLM-based verification.)"
+                    f" ({len(bundle.frames)} frame(s) available for future VLM-based verification.)"
                 )
             return OperationVerdict(
                 status=VerdictStatus.INCONCLUSIVE.value,
                 confidence=0.15,
-                detail=(
-                    f"No force/torque readings available for grasp verification."
-                    f"{frame_note}"
-                ),
+                detail=(f"No force/torque readings available for grasp verification.{frame_note}"),
                 evidence=bundle,
             )
 
@@ -352,9 +344,7 @@ class GraspVerifier:
             return OperationVerdict(
                 status=VerdictStatus.INCONCLUSIVE.value,
                 confidence=0.2,
-                detail=(
-                    f"Force reading is non-numeric: {max_force_reading.value!r}."
-                ),
+                detail=(f"Force reading is non-numeric: {max_force_reading.value!r}."),
                 evidence=bundle,
             )
 
@@ -478,6 +468,7 @@ def _as_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     import math
+
     if math.isnan(result) or math.isinf(result):
         return None
     return result
@@ -498,7 +489,8 @@ async def _safe_read(
     except Exception:
         logger.debug(
             "Evidence collection: failed to read %s/%s",
-            device_id, channel_id,
+            device_id,
+            channel_id,
             exc_info=True,
         )
         return None
@@ -518,7 +510,8 @@ async def _safe_read_frame(
     except Exception:
         logger.debug(
             "Evidence collection: failed to read frame %s/%s",
-            device_id, channel_id,
+            device_id,
+            channel_id,
             exc_info=True,
         )
         return None

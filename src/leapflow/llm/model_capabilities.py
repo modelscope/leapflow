@@ -89,6 +89,10 @@ _KNOWN_MODELS: List[tuple[str, ModelCapabilities]] = [
                                     authoritative=False)),
     (r"deepseek", ModelCapabilities(max_output_tokens=8_192, supports_tools=True,
                                      supports_thinking=True, authoritative=False)),
+    # Qwen's vision-language and omni lines see images; the family default does not.
+    (r"qwen[\w.\-]*-vl|qwen[\w.\-]*omni|qvq", ModelCapabilities(
+        max_output_tokens=8_192, supports_tools=True, supports_vision=True,
+        supports_thinking=True, authoritative=False)),
     (r"qwen", ModelCapabilities(max_output_tokens=8_192, supports_tools=True,
                                  supports_thinking=True, authoritative=False)),
 ]

@@ -17,7 +17,6 @@ location: "yahboom"
 halt_supported: false
 
 capabilities:
-  affordances: ["observe_rgb", "observe_depth", "observe_infrared"]
   notes: "Passive RealSense sensor; all observation channels require privacy approval."
 
 transport:
@@ -31,6 +30,9 @@ transport:
     color: {width: 1280, height: 720, fps: 30}
     depth: {width: 848, height: 480, fps: 30}
     infrared: {width: 848, height: 480, fps: 30}
+    # Lock colour exposure for perception: each listed option turns its auto loop
+    # off first and is range-checked at open (fail-closed). Tune on the bench.
+    # color_options: {exposure: 166, white_balance: 4600, gain: 64}
 
 channels:
   - channel_id: "camera.color.preview"

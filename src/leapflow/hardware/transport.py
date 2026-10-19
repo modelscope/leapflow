@@ -435,9 +435,7 @@ class BatchTransport(Protocol):
         """Read multiple channels in one atomic bus transaction."""
         ...
 
-    async def write_batch(
-        self, commands: tuple[tuple[str, Any], ...]
-    ) -> BatchWriteOutcome:
+    async def write_batch(self, commands: tuple[tuple[str, Any], ...]) -> BatchWriteOutcome:
         """Write multiple channels in one atomic bus transaction.
 
         ``commands`` is a tuple of ``(channel_id, value)`` pairs.  Order

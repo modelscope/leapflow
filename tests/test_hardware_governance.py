@@ -38,11 +38,11 @@ from leapflow.hardware.context import (
     Interlock,
     TransportRef,
 )
-from leapflow.hardware.transport import SIDE_EFFECT_NONE
-from leapflow.hardware.transports.mcp import set_mcp_client_provider
 from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
 from leapflow.hardware.risk import build_risk_classifier
 from leapflow.hardware.tools import HardwareTools, build_hardware_tools
+from leapflow.hardware.transport import SIDE_EFFECT_NONE
+from leapflow.hardware.transports.mcp import set_mcp_client_provider
 from leapflow.security.actions import ActionDescriptor, ActionKind
 from leapflow.security.approval import ApprovalDecision, SessionAwareGate
 from leapflow.security.grants import ApprovalScope, grant_key
@@ -1863,6 +1863,16 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.preview_idle_timeout_s",
         "hardware.fleet_nodes",
         "hardware.alert_policies",
+        "hardware.skills_enabled",
+        "hardware.skills_speed_pct_max",
+        "hardware.skills_max_duration_s",
+        "hardware.skills_plan_ttl_s",
+        "hardware.skills_halt_timeout_s",
+        "hardware.skills_stop_grace_s",
+        "hardware.skills_dispatch_settle_s",
+        "hardware.skills_episode_fps",
+        "hardware.skills_episode_min_free_mb",
+        "hardware.share_frames",
     }
     for key in keys:
         view = service.describe(key)

@@ -47,13 +47,15 @@ _HEALTH_DEGRADED = "degraded"
 _HEALTH_CRITICAL = "critical"
 _HEALTH_OFFLINE = "offline"
 
-_VALID_HEALTH_STATES = frozenset({
-    _HEALTH_OK,
-    _HEALTH_WARNING,
-    _HEALTH_DEGRADED,
-    _HEALTH_CRITICAL,
-    _HEALTH_OFFLINE,
-})
+_VALID_HEALTH_STATES = frozenset(
+    {
+        _HEALTH_OK,
+        _HEALTH_WARNING,
+        _HEALTH_DEGRADED,
+        _HEALTH_CRITICAL,
+        _HEALTH_OFFLINE,
+    }
+)
 
 
 @dataclass
@@ -146,9 +148,7 @@ class HardwareHealthMonitor:
         # Seed initial health records from the registry.
         self._seed_records()
 
-        self._poll_task = asyncio.create_task(
-            self._poll_loop(), name="hw-health-monitor"
-        )
+        self._poll_task = asyncio.create_task(self._poll_loop(), name="hw-health-monitor")
         self._started = True
         logger.info(
             "HardwareHealthMonitor started (poll_interval=%.1fs, devices=%d)",
@@ -256,9 +256,7 @@ class HardwareHealthMonitor:
             return _HEALTH_WARNING
         return _HEALTH_OK
 
-    async def _apply_degradation_policy(
-        self, device_id: str, record: DeviceHealthRecord
-    ) -> None:
+    async def _apply_degradation_policy(self, device_id: str, record: DeviceHealthRecord) -> None:
         """Look up and execute the DegradationPolicy for a device."""
         context = self._get_device_context(device_id)
         if context is None:
@@ -296,7 +294,9 @@ class HardwareHealthMonitor:
     async def _execute_halt(self, device_id: str, reason: str) -> None:
         """Halt a device immediately via the registry transport."""
         logger.warning(
-            "HealthMonitor: halting device %s (reason: %s)", device_id, reason,
+            "HealthMonitor: halting device %s (reason: %s)",
+            device_id,
+            reason,
         )
         try:
             transport = await self._registry.transport(device_id)
@@ -304,17 +304,23 @@ class HardwareHealthMonitor:
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "HealthMonitor: halt failed for %s: %s",
-                device_id, exc, exc_info=True,
+                device_id,
+                exc,
+                exc_info=True,
             )
-        self._emit_event("device.halted", {
-            "device_id": device_id,
-            "reason": reason,
-        })
+        self._emit_event(
+            "device.halted",
+            {
+                "device_id": device_id,
+                "reason": reason,
+            },
+        )
 
     async def _execute_hold_position(self, device_id: str) -> None:
         """Mark a device for hold-position (no new commands)."""
         logger.warning(
-            "HealthMonitor: hold_position on device %s", device_id,
+            "HealthMonitor: hold_position on device %s",
+            device_id,
         )
         # The hold_position behavior is enforced by the write path checking
         # is_device_degraded() — we only need to log and emit the event.
@@ -346,14 +352,15 @@ class HardwareHealthMonitor:
             device_id,
         )
         await self._execute_hold_position(device_id)
-        self._emit_event("device.safe_return_requested", {
-            "device_id": device_id,
-            "kinematics_available": True,
-        })
+        self._emit_event(
+            "device.safe_return_requested",
+            {
+                "device_id": device_id,
+                "kinematics_available": True,
+            },
+        )
 
-    async def _execute_switch_sensor(
-        self, device_id: str, channel_id: str
-    ) -> None:
+    async def _execute_switch_sensor(self, device_id: str, channel_id: str) -> None:
         """Attempt to use backup sensor channel if available.
 
         Looks for alternative readable channels on the device and logs the
@@ -362,7 +369,8 @@ class HardwareHealthMonitor:
         """
         logger.info(
             "HealthMonitor: switch_sensor requested for %s (channel=%s)",
-            device_id, channel_id or "(auto)",
+            device_id,
+            channel_id or "(auto)",
         )
         context = self._get_device_context(device_id)
         if context is None:
@@ -372,13 +380,15 @@ class HardwareHealthMonitor:
         backup_channels = [
             ch.channel_id
             for ch in context.channels
-            if ch.is_readable and ch.channel_id != channel_id
+            if ch.is_readable
+            and ch.channel_id != channel_id
             and getattr(ch, "representation", "") != "frame"
         ]
         if backup_channels:
             logger.info(
                 "HealthMonitor: available backup sensors for %s: %s",
-                device_id, backup_channels,
+                device_id,
+                backup_channels,
             )
         else:
             logger.warning(
@@ -387,11 +397,14 @@ class HardwareHealthMonitor:
                 device_id,
             )
 
-        self._emit_event("device.switch_sensor", {
-            "device_id": device_id,
-            "channel_id": channel_id,
-            "backup_channels": backup_channels,
-        })
+        self._emit_event(
+            "device.switch_sensor",
+            {
+                "device_id": device_id,
+                "channel_id": channel_id,
+                "backup_channels": backup_channels,
+            },
+        )
 
     # -- Event handling (EventBus subscribers) ------------------------------
 
@@ -464,9 +477,7 @@ class HardwareHealthMonitor:
                 if sub is not None:
                     self._subscriptions.append(sub)
             except Exception:  # noqa: BLE001 — subscription failure is non-fatal
-                logger.debug(
-                    "HealthMonitor: failed to subscribe to %s", topic, exc_info=True
-                )
+                logger.debug("HealthMonitor: failed to subscribe to %s", topic, exc_info=True)
 
     def _unsubscribe_events(self) -> None:
         """Clean up EventBus subscriptions."""
@@ -500,7 +511,8 @@ class HardwareHealthMonitor:
                 except Exception:  # noqa: BLE001 — poll must not crash
                     logger.debug(
                         "HealthMonitor: poll failed for %s",
-                        device_id, exc_info=True,
+                        device_id,
+                        exc_info=True,
                     )
 
             # Check fleet node health if a fleet manager is available.
@@ -508,9 +520,7 @@ class HardwareHealthMonitor:
                 await self._poll_fleet_nodes()
 
             try:
-                await asyncio.wait_for(
-                    self._stopped.wait(), timeout=self._poll_interval
-                )
+                await asyncio.wait_for(self._stopped.wait(), timeout=self._poll_interval)
                 break  # stopped
             except asyncio.TimeoutError:
                 pass

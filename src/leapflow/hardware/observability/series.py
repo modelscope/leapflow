@@ -194,12 +194,8 @@ class HardwareDigest:
                 "outcomes": len(self.outcomes),
                 "calibration": len(self.calibration),
                 "conformance_windows": len(self.conformance),
-                "media_channels": sum(
-                    int(row.get("media", 0) or 0) for row in self.devices
-                ),
-                "privacy_gated": sum(
-                    int(row.get("privacy_gated", 0) or 0) for row in self.devices
-                ),
+                "media_channels": sum(int(row.get("media", 0) or 0) for row in self.devices),
+                "privacy_gated": sum(int(row.get("privacy_gated", 0) or 0) for row in self.devices),
             },
             "devices": list(self.devices),
             "device_classes": _distribution(self.devices, "device_class"),
@@ -260,7 +256,10 @@ def _fit(payload: dict[str, Any]) -> dict[str, Any]:
             return payload
         limit //= 2
         payload["series"] = [
-            {**series, "points": [p.to_dict() for p in decimate(_as_points(series["points"]), limit)]}
+            {
+                **series,
+                "points": [p.to_dict() for p in decimate(_as_points(series["points"]), limit)],
+            }
             for series in payload["series"]
         ]
     size = _encoded_size(payload)

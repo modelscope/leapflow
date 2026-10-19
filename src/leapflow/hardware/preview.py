@@ -250,7 +250,9 @@ class PreviewBroker:
         """Register a scalar preview owner without opening/reading its transport."""
         context = self._registry.context(device_id)
         if context is None or context.channel(channel_id) is None:
-            raise TransportError(f"unknown channel {device_id}.{channel_id}", failure_code="unknown_channel")
+            raise TransportError(
+                f"unknown channel {device_id}.{channel_id}", failure_code="unknown_channel"
+            )
         key = (device_id, channel_id)
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
@@ -343,7 +345,9 @@ class PreviewBroker:
                 await asyncio.sleep(_SWEEP_INTERVAL_S)
                 cutoff = time.monotonic() - self._idle_timeout_s
                 for key, lease in list(self._leases.items()):
-                    stale = [viewer for viewer, seen_at in lease.viewers.items() if seen_at <= cutoff]
+                    stale = [
+                        viewer for viewer, seen_at in lease.viewers.items() if seen_at <= cutoff
+                    ]
                     for viewer in stale:
                         lease.viewers.pop(viewer, None)
                     if not lease.viewers:
