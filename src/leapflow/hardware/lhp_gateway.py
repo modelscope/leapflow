@@ -1,18 +1,13 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""LHP Gateway: LLM-Hardware Protocol intermediate representation.
+"""LHP Gateway: hardware state as LLM context (the uplink).
 
-The bridge between the LLM's semantic reasoning (System-2) and the
-physical hardware stack.  Two directions:
+Raw device state -> structured context snapshots at three PCD levels. The
+LLM never sees raw sensor readings; it sees a curated, resolution-appropriate
+summary that fits its context budget.
 
-UPLINK (Hardware -> LLM):
-  Raw device state -> structured context snapshots at three PCD levels.
-  The LLM never sees raw sensor readings; it sees a curated, resolution-
-  appropriate summary that fits its context budget.
-
-DOWNLINK (LLM -> Hardware):
-  Structured plan output -> typed SubtaskGoal sequences.
-  The LLM never emits raw joint commands; it produces semantic goals
-  that the ControlHierarchy decomposes into servo-level actions.
+There is no downlink here: the LLM acts through governed tools, and anything
+richer than a single write runs as a node-local skill (``hw_skill_run``), which
+plans, gates and executes next to the device.
 
 PCD integration: the uplink respects Progressive Context Disclosure --
   a simple positioning task gets Level 0 (device list + basic state),
@@ -24,7 +19,6 @@ from __future__ import annotations
 
 import logging
 import time
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
@@ -40,15 +34,43 @@ _CHARS_PER_TOKEN = 4
 _SNAPSHOT_FRESHNESS_S = 5.0
 
 # Complexity keywords used by recommend_level() heuristics.
-_COMPLEX_KEYWORDS = frozenset({
-    "assemble", "assembly", "insert", "thread", "screw", "solder",
-    "calibrate", "align", "complex", "multi-step", "coordinated",
-    "bimanual", "dual-arm", "force-controlled", "compliant",
-})
-_SIMPLE_KEYWORDS = frozenset({
-    "move", "go", "position", "home", "park", "stop", "halt", "wait",
-    "status", "check", "read", "observe", "look", "scan",
-})
+_COMPLEX_KEYWORDS = frozenset(
+    {
+        "assemble",
+        "assembly",
+        "insert",
+        "thread",
+        "screw",
+        "solder",
+        "calibrate",
+        "align",
+        "complex",
+        "multi-step",
+        "coordinated",
+        "bimanual",
+        "dual-arm",
+        "force-controlled",
+        "compliant",
+    }
+)
+_SIMPLE_KEYWORDS = frozenset(
+    {
+        "move",
+        "go",
+        "position",
+        "home",
+        "park",
+        "stop",
+        "halt",
+        "wait",
+        "status",
+        "check",
+        "read",
+        "observe",
+        "look",
+        "scan",
+    }
+)
 
 
 # ===================================================================
@@ -59,9 +81,9 @@ _SIMPLE_KEYWORDS = frozenset({
 class PCDLevel(str, Enum):
     """Progressive Context Disclosure level for hardware context."""
 
-    MINIMAL = "minimal"              # Level 0: device names, connection status
-    TASK_RELEVANT = "task_relevant"  # Level 1: + affordances, joint positions, health
-    RICH_CONTEXT = "rich_context"    # Level 2: + kinematics, safety, full readings, frames
+    MINIMAL = "minimal"  # Level 0: device names, connection status
+    TASK_RELEVANT = "task_relevant"  # Level 1: + joint positions, gripper, health
+    RICH_CONTEXT = "rich_context"  # Level 2: + kinematics, safety, full readings, frames
 
 
 # ===================================================================
@@ -75,7 +97,7 @@ class DeviceSnapshot:
 
     Fields are progressively populated according to the requested level:
     - Level 0 (minimal): device_id, device_class, display_name, status, connected, halt_supported
-    - Level 1 (task_relevant): + affordances, joint_positions, gripper_state, health
+    - Level 1 (task_relevant): + joint_positions, gripper_state, health
     - Level 2 (rich_context): + kinematics, safety_limits, full_readings, trust_level, degradation_status
     """
 
@@ -89,7 +111,6 @@ class DeviceSnapshot:
     halt_supported: bool = True
 
     # Level 1 (task_relevant+)
-    affordances: tuple[str, ...] = ()
     joint_positions: Mapping[str, float] = field(default_factory=dict)
     gripper_state: float | None = None
     health: str = ""
@@ -111,8 +132,6 @@ class DeviceSnapshot:
             "connected": self.connected,
             "halt_supported": self.halt_supported,
         }
-        if self.affordances:
-            result["affordances"] = list(self.affordances)
         if self.joint_positions:
             result["joint_positions"] = dict(self.joint_positions)
         if self.gripper_state is not None:
@@ -143,7 +162,6 @@ class HardwareContextSnapshot:
 
     level: str  # PCDLevel value
     devices: tuple[DeviceSnapshot, ...]
-    capability_summary: Mapping[str, Any]
     timestamp: float
     token_estimate: int  # rough estimate of tokens this will consume
 
@@ -163,12 +181,6 @@ class HardwareContextSnapshot:
         lines.append(f"**Detail level**: {level_label}  ")
         lines.append(f"**Devices**: {len(self.devices)}  ")
 
-        cap = self.capability_summary
-        if cap:
-            affordances = cap.get("available_affordances", [])
-            if affordances:
-                lines.append(f"**Affordances**: {', '.join(str(a) for a in affordances)}  ")
-
         lines.append("")
 
         for dev in self.devices:
@@ -179,12 +191,8 @@ class HardwareContextSnapshot:
                 lines.append("- **⚠ DISCONNECTED**")
 
             # Level 1+ details
-            if dev.affordances:
-                lines.append(f"- **Can do**: {', '.join(dev.affordances)}")
             if dev.joint_positions:
-                pos_str = ", ".join(
-                    f"{k}={v:.3f}" for k, v in dev.joint_positions.items()
-                )
+                pos_str = ", ".join(f"{k}={v:.3f}" for k, v in dev.joint_positions.items())
                 lines.append(f"- **Joints**: {pos_str}")
             if dev.gripper_state is not None:
                 lines.append(f"- **Gripper**: {dev.gripper_state:.2f}")
@@ -223,7 +231,6 @@ class HardwareContextSnapshot:
         return {
             "level": self.level,
             "devices": [d.to_dict() for d in self.devices],
-            "capability_summary": dict(self.capability_summary),
             "timestamp": self.timestamp,
             "token_estimate": self.token_estimate,
         }
@@ -238,7 +245,7 @@ class HardwareContextDelta:
     devices_added: tuple[str, ...] = ()
     devices_removed: tuple[str, ...] = ()
     state_changes: tuple[Mapping[str, Any], ...] = ()  # per-device diffs
-    is_structural: bool = False  # True if devices or affordances changed
+    is_structural: bool = False  # True if devices were added or removed
 
     def to_prompt_text(self) -> str:
         """Render delta as concise LLM-readable text."""
@@ -252,11 +259,13 @@ class HardwareContextDelta:
         if self.devices_removed:
             lines.append(f"**Removed**: {', '.join(self.devices_removed)}")
         if self.is_structural:
-            lines.append("**⚠ Structural change** (devices or affordances changed)")
+            lines.append("**⚠ Structural change** (devices added or removed)")
 
         for change in self.state_changes:
             dev_id = change.get("device_id", "?")
-            lines.append(f"- **{dev_id}**: ", )
+            lines.append(
+                f"- **{dev_id}**: ",
+            )
             for key, val in change.items():
                 if key != "device_id":
                     lines.append(f"  - {key}: {val}")
@@ -279,77 +288,28 @@ class HardwareContextDelta:
 
 
 # ===================================================================
-# Downlink IR: LLM -> Hardware
-# ===================================================================
-
-
-@dataclass(frozen=True)
-class PlanStep:
-    """One step in an LLM plan."""
-
-    step_type: str  # "reach_position", "grasp", "place", "wait", "verify", etc.
-    target: Mapping[str, Any]
-    device_id: str = ""  # empty = auto-select from CapabilityIndex
-    description: str = ""
-    verify: bool = True
-    timeout_s: float = 30.0
-
-
-@dataclass(frozen=True)
-class LLMPlanSegment:
-    """Structured plan output from LLM, ready for hardware execution.
-
-    The LLM produces this (typically as a tool call result or structured
-    output), and the gateway converts it to SubtaskGoal sequences for
-    the ControlHierarchy.
-    """
-
-    plan_id: str
-    task_description: str
-    steps: tuple[PlanStep, ...]
-    constraints: Mapping[str, Any] = field(default_factory=dict)
-    timeout_s: float = 120.0
-
-
-# ===================================================================
 # LHPGateway
 # ===================================================================
 
 
 class LHPGateway:
-    """Bidirectional LLM-Hardware Protocol gateway.
-
-    Uplink: hardware state -> LLM context (at requested PCD level)
-    Downlink: LLM plan -> SubtaskGoal sequence -> ControlHierarchy
+    """Hardware state -> LLM context at the requested PCD level.
 
     Dependencies:
     - registry: HardwareRegistry
-    - capability_index: CapabilityIndex (optional)
     - environment_source: PhysicalEnvironmentSource (optional, for snapshot reuse)
-    - control_hierarchy: ControlHierarchy (optional, for plan execution)
     """
 
-    def __init__(
-        self,
-        registry: Any,
-        *,
-        capability_index: Any = None,
-        environment_source: Any = None,
-        control_hierarchy: Any = None,
-    ) -> None:
+    def __init__(self, registry: Any, *, environment_source: Any = None) -> None:
         self._registry = registry
-        self._capability_index = capability_index
         self._environment_source = environment_source
-        self._control_hierarchy = control_hierarchy
         self._last_snapshot: HardwareContextSnapshot | None = None
 
     # ------------------------------------------------------------------
     # Uplink: Hardware -> LLM
     # ------------------------------------------------------------------
 
-    async def snapshot(
-        self, level: str = PCDLevel.TASK_RELEVANT.value
-    ) -> HardwareContextSnapshot:
+    async def snapshot(self, level: str = PCDLevel.TASK_RELEVANT.value) -> HardwareContextSnapshot:
         """Build a hardware context snapshot at the requested PCD level.
 
         Level 0 (minimal):       ~50 tokens per device
@@ -366,31 +326,14 @@ class LHPGateway:
                 logger.debug("Environment source snapshot failed, using direct scan", exc_info=True)
 
         device_snapshots: list[DeviceSnapshot] = []
-        all_affordances: set[str] = set()
-
         for context in self._registry.contexts():
             env_device = _find_env_device(env_data, context.device_id) if env_data else None
             ds = await self._build_device_snapshot(context, level, env_device=env_device)
             device_snapshots.append(ds)
-            all_affordances.update(ds.affordances)
-
-        # Merge capability_index affordances.
-        if self._capability_index is not None:
-            try:
-                all_affordances.update(self._capability_index.all_affordances())
-            except Exception:  # noqa: BLE001
-                pass
-
-        cap_summary: dict[str, Any] = {
-            "total_affordances": len(all_affordances),
-            "available_affordances": sorted(all_affordances),
-            "device_count": len(device_snapshots),
-        }
 
         snap = HardwareContextSnapshot(
             level=level,
             devices=tuple(device_snapshots),
-            capability_summary=cap_summary,
             timestamp=time.time(),
             token_estimate=0,
         )
@@ -399,7 +342,6 @@ class LHPGateway:
         snap = HardwareContextSnapshot(
             level=snap.level,
             devices=snap.devices,
-            capability_summary=snap.capability_summary,
             timestamp=snap.timestamp,
             token_estimate=token_est,
         )
@@ -435,19 +377,13 @@ class LHPGateway:
             if pd.health != cd.health and cd.health:
                 diff["health"] = f"{pd.health} → {cd.health}"
                 changed = True
-            if pd.affordances != cd.affordances:
-                diff["affordances_before"] = list(pd.affordances)
-                diff["affordances_after"] = list(cd.affordances)
-                changed = True
             if pd.connected != cd.connected:
                 diff["connected"] = cd.connected
                 changed = True
             if changed:
                 changes.append(diff)
 
-        is_structural = bool(added or removed) or any(
-            "affordances_before" in c for c in changes
-        )
+        is_structural = bool(added or removed)
 
         if not (added or removed or changes):
             return None
@@ -479,128 +415,6 @@ class LHPGateway:
         if snap is not None:
             return snap.to_prompt_text()
         return ""
-
-    # ------------------------------------------------------------------
-    # Downlink: LLM -> Hardware
-    # ------------------------------------------------------------------
-
-    async def execute_plan(self, plan: LLMPlanSegment) -> dict[str, Any]:
-        """Convert LLM plan to SubtaskGoals and execute via ControlHierarchy.
-
-        1. Parse PlanSteps -> SubtaskGoals
-        2. Resolve device_id for each step (via CapabilityIndex if auto)
-        3. Delegate to ControlHierarchy.execute_task()
-        4. Return aggregated results
-        """
-        if self._control_hierarchy is None:
-            return {
-                "ok": False,
-                "error": "no_control_hierarchy",
-                "plan_id": plan.plan_id,
-                "detail": "ControlHierarchy not configured; cannot execute hardware plans.",
-            }
-
-        goals = self.plan_to_goals(plan)
-        if not goals:
-            return {
-                "ok": False,
-                "error": "empty_plan",
-                "plan_id": plan.plan_id,
-                "detail": "Plan produced no executable goals.",
-            }
-
-        try:
-            result = await self._control_hierarchy.execute_task(goals)
-        except Exception as exc:  # noqa: BLE001 – surface as structured failure
-            logger.warning(
-                "LHP plan execution failed for %s: %s",
-                plan.plan_id,
-                exc,
-                exc_info=True,
-            )
-            return {
-                "ok": False,
-                "error": "execution_failed",
-                "plan_id": plan.plan_id,
-                "detail": str(exc),
-            }
-
-        result["plan_id"] = plan.plan_id
-        result["ok"] = result.get("failed", 1) == 0
-        return result
-
-    def parse_plan(self, raw: Mapping[str, Any]) -> LLMPlanSegment:
-        """Parse a raw dict (from LLM tool output) into a typed plan.
-
-        Tolerant of missing fields: each absent key uses a sensible default
-        so malformed LLM output does not crash the pipeline.
-        """
-        plan_id = str(raw.get("plan_id") or f"plan_{uuid.uuid4().hex[:8]}")
-        task_desc = str(raw.get("task_description") or raw.get("description") or "")
-        timeout = _safe_float(raw.get("timeout_s"), 120.0)
-        constraints = raw.get("constraints") or {}
-        if not isinstance(constraints, Mapping):
-            constraints = {}
-
-        raw_steps = raw.get("steps") or []
-        if not isinstance(raw_steps, (list, tuple)):
-            raw_steps = []
-
-        steps: list[PlanStep] = []
-        for idx, rs in enumerate(raw_steps):
-            if not isinstance(rs, Mapping):
-                logger.debug("LHP parse_plan: skipping non-mapping step at index %d", idx)
-                continue
-            step_type = str(rs.get("step_type") or rs.get("type") or "unknown")
-            target = rs.get("target") or {}
-            if not isinstance(target, Mapping):
-                target = {}
-            steps.append(PlanStep(
-                step_type=step_type,
-                target=target,
-                device_id=str(rs.get("device_id") or ""),
-                description=str(rs.get("description") or step_type),
-                verify=bool(rs.get("verify", True)),
-                timeout_s=_safe_float(rs.get("timeout_s"), 30.0),
-            ))
-
-        return LLMPlanSegment(
-            plan_id=plan_id,
-            task_description=task_desc,
-            steps=tuple(steps),
-            constraints=constraints,
-            timeout_s=timeout,
-        )
-
-    def plan_to_goals(self, plan: LLMPlanSegment) -> tuple[Any, ...]:
-        """Convert plan steps to SubtaskGoal sequence.
-
-        Bridges PlanStep -> SubtaskGoal, resolving device routing
-        and strategy hints.
-        """
-        from leapflow.hardware.control_hierarchy import SubtaskGoal
-
-        goals: list[SubtaskGoal] = []
-        for idx, step in enumerate(plan.steps):
-            device_id = step.device_id
-            # Auto-resolve device via CapabilityIndex when not specified.
-            if not device_id and self._capability_index is not None:
-                device_id = self._resolve_device_for_step(step)
-
-            goal_id = f"{plan.plan_id}_step{idx}_{uuid.uuid4().hex[:6]}"
-            strategy_hint = self._infer_strategy_hint(step)
-
-            goals.append(SubtaskGoal(
-                goal_id=goal_id,
-                description=step.description or step.step_type,
-                goal_type=step.step_type,
-                target=dict(step.target),
-                strategy_hint=strategy_hint,
-                timeout_s=step.timeout_s,
-                verify=step.verify,
-            ))
-
-        return tuple(goals)
 
     # ------------------------------------------------------------------
     # PCD Level Selection
@@ -679,12 +493,7 @@ class LHPGateway:
                 halt_supported=halt_supported,
             )
 
-        # Level 1+: affordances, joint positions, gripper state, health.
-        affordances: tuple[str, ...] = ()
-        cap = getattr(context, "capabilities", None)
-        if cap is not None:
-            affordances = tuple(getattr(cap, "affordances", ()) or ())
-
+        # Level 1+: joint positions, gripper state, health.
         # Collect joint positions from channel summaries.
         joint_positions: dict[str, float] = {}
         gripper_state: float | None = None
@@ -727,7 +536,6 @@ class LHPGateway:
                 status=status,
                 connected=connected,
                 halt_supported=halt_supported,
-                affordances=affordances,
                 joint_positions=joint_positions,
                 gripper_state=gripper_state,
                 health=health_str or "ok",
@@ -737,10 +545,14 @@ class LHPGateway:
         kin_dict: Mapping[str, Any] = {}
         kin = getattr(context, "kinematics", None)
         if kin is not None:
-            kin_dict = kin.to_dict() if hasattr(kin, "to_dict") else {
-                "dof": getattr(kin, "dof", 0),
-                "chain_type": getattr(kin, "chain_type", ""),
-            }
+            kin_dict = (
+                kin.to_dict()
+                if hasattr(kin, "to_dict")
+                else {
+                    "dof": getattr(kin, "dof", 0),
+                    "chain_type": getattr(kin, "chain_type", ""),
+                }
+            )
 
         safety_dict: Mapping[str, Any] = {}
         safety = getattr(context, "safety", None)
@@ -777,7 +589,6 @@ class LHPGateway:
             status=status,
             connected=connected,
             halt_supported=halt_supported,
-            affordances=affordances,
             joint_positions=joint_positions,
             gripper_state=gripper_state,
             health=health_str or "ok",
@@ -788,9 +599,7 @@ class LHPGateway:
             degradation_status=degradation_status,
         )
 
-    def _channel_summary(
-        self, device_id: str, channel_id: str
-    ) -> dict[str, Any] | None:
+    def _channel_summary(self, device_id: str, channel_id: str) -> dict[str, Any] | None:
         """Get channel reading summary from the registry's stream sources."""
         try:
             return self._registry.channel_summary(device_id, channel_id)
@@ -805,58 +614,13 @@ class LHPGateway:
         text = snapshot.to_prompt_text()
         return max(1, len(text) // _CHARS_PER_TOKEN)
 
-    # ------------------------------------------------------------------
-    # Internal: downlink helpers
-    # ------------------------------------------------------------------
-
-    def _resolve_device_for_step(self, step: PlanStep) -> str:
-        """Auto-select a device for a plan step via CapabilityIndex.
-
-        Maps step_type to an affordance and picks the sole provider or
-        the first one when multiple are available.
-        """
-        if self._capability_index is None:
-            return ""
-
-        # The step_type often maps directly to an affordance name.
-        affordance = step.step_type
-        entries = self._capability_index.resolve(affordance)
-        if entries and len(entries) == 1:
-            return entries[0].device_id
-
-        # If multiple, return the first (caller can refine).
-        if entries:
-            return entries[0].device_id
-
-        return ""
-
-    @staticmethod
-    def _infer_strategy_hint(step: PlanStep) -> str:
-        """Infer a strategy hint from the step type.
-
-        Maps well-known step types to InferenceStrategy identifiers
-        that the ControlHierarchy can consume.
-        """
-        _STRATEGY_MAP: dict[str, str] = {
-            "reach_position": "position_control",
-            "grasp": "grasp_policy",
-            "place": "place_policy",
-            "follow_trajectory": "trajectory_tracking",
-            "insert": "compliant_insertion",
-            "pour": "pour_policy",
-            "push": "push_policy",
-        }
-        return _STRATEGY_MAP.get(step.step_type, "")
-
 
 # ===================================================================
 # Module-private helpers
 # ===================================================================
 
 
-def _find_env_device(
-    env_data: dict[str, Any] | None, device_id: str
-) -> dict[str, Any] | None:
+def _find_env_device(env_data: dict[str, Any] | None, device_id: str) -> dict[str, Any] | None:
     """Find a device dict inside a PhysicalEnvironmentSource snapshot."""
     if env_data is None:
         return None
@@ -864,16 +628,6 @@ def _find_env_device(
         if isinstance(dev, dict) and dev.get("device_id") == device_id:
             return dev
     return None
-
-
-def _safe_float(value: Any, default: float) -> float:
-    """Coerce a value to float, returning *default* on failure."""
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _compact_safety(limits: Mapping[str, Any]) -> str:
@@ -893,7 +647,5 @@ __all__ = [
     "HardwareContextDelta",
     "HardwareContextSnapshot",
     "LHPGateway",
-    "LLMPlanSegment",
     "PCDLevel",
-    "PlanStep",
 ]

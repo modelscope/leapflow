@@ -83,7 +83,9 @@ class HardwareEffect(str, Enum):
     @classmethod
     def writable(cls) -> frozenset[str]:
         """Return the effect classes that change the physical world."""
-        return frozenset({cls.CONFIGURE.value, cls.ACTUATE.value, cls.DISPENSE.value, cls.EMIT.value})
+        return frozenset(
+            {cls.CONFIGURE.value, cls.ACTUATE.value, cls.DISPENSE.value, cls.EMIT.value}
+        )
 
 
 class Quality(str, Enum):
@@ -213,6 +215,12 @@ class Envelope:
     min_value: float | None = None
     max_value: float | None = None
     max_rate: float | None = None
+    max_accel: float | None = None
+    """Largest change of rate per second (units/s^2) a streamed command may ask for.
+
+    Only the streaming safety shield consumes it; a discrete move is paced by
+    the device's own planner. Absent, the shield bounds the rate alone.
+    """
     quantization: float | None = None
     settling_time_s: float = 0.0
     tolerance: float = 0.0
@@ -390,18 +398,23 @@ class Envelope:
         }
         if self.allowed_values:
             result["allowed_values"] = list(self.allowed_values)
+        if self.max_accel is not None:  # streamed channels only; absent elsewhere
+            result["max_accel"] = self.max_accel
         return result
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "Envelope":
         data = data or {}
         raw_allowed = data.get("allowed_values")
-        allowed: tuple[Any, ...] = tuple(raw_allowed) if isinstance(raw_allowed, (list, tuple)) else ()
+        allowed: tuple[Any, ...] = (
+            tuple(raw_allowed) if isinstance(raw_allowed, (list, tuple)) else ()
+        )
         return cls(
             declared=bool(data.get("declared", False)),
             min_value=_as_float(data.get("min_value")),
             max_value=_as_float(data.get("max_value")),
             max_rate=_as_float(data.get("max_rate")),
+            max_accel=_as_float(data.get("max_accel")),
             quantization=_as_float(data.get("quantization")),
             settling_time_s=_as_float(data.get("settling_time_s"), default=0.0) or 0.0,
             tolerance=_as_float(data.get("tolerance"), default=0.0) or 0.0,
@@ -647,9 +660,11 @@ class KinematicsDeclaration:
     tool_frame: str = ""  # end-effector frame name
     home_joint_targets: Mapping[str, float] = field(default_factory=dict)
     notes: str = ""
+    dh: Mapping[str, Any] = field(default_factory=dict)
+    """Raw Denavit-Hartenberg table; parsed by ``hardware.skills.kinematics.DhChain``."""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "chain_type": self.chain_type,
             "dof": self.dof,
             "joint_limits": [list(pair) for pair in self.joint_limits],
@@ -659,6 +674,9 @@ class KinematicsDeclaration:
             "home_joint_targets": dict(self.home_joint_targets),
             "notes": self.notes,
         }
+        if self.dh:
+            result["dh"] = dict(self.dh)
+        return result
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "KinematicsDeclaration":
@@ -681,22 +699,22 @@ class KinematicsDeclaration:
             home_joint_targets={
                 str(channel_id): float(target)
                 for channel_id, target in (data.get("home_joint_targets") or {}).items()
-            } if isinstance(data.get("home_joint_targets"), Mapping) else {},
+            }
+            if isinstance(data.get("home_joint_targets"), Mapping)
+            else {},
             notes=str(data.get("notes") or ""),
+            dh=dict(data["dh"]) if isinstance(data.get("dh"), Mapping) else {},
         )
 
 
 @dataclass(frozen=True)
 class CapabilityDeclaration:
-    """Declared capabilities and affordances of a device.
+    """Declared physical capabilities of a device (payload, reach, tooling).
 
-    Affordances are verbs that describe what the device can do in the
-    physical world: 'grasp', 'push', 'pour', 'inspect'.  They are the
-    bridge between LLM task decomposition and hardware capability
-    resolution.
+    What a device can *do* is not declared here: tasks are node skills, and the
+    skill cards (``hw_skill_list``) are the single source of that declaration.
     """
 
-    affordances: tuple[str, ...] = ()  # ("grasp", "push", "place", ...)
     tool_slots: int = 0  # number of tool change positions
     payload_kg: float = 0.0  # maximum payload in kilograms
     reach_m: float = 0.0  # maximum reach in meters
@@ -704,7 +722,6 @@ class CapabilityDeclaration:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "affordances": list(self.affordances),
             "tool_slots": self.tool_slots,
             "payload_kg": self.payload_kg,
             "reach_m": self.reach_m,
@@ -714,9 +731,7 @@ class CapabilityDeclaration:
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "CapabilityDeclaration":
         data = data or {}
-        raw_affordances = data.get("affordances") or ()
         return cls(
-            affordances=tuple(str(a) for a in raw_affordances),
             tool_slots=int(data.get("tool_slots") or 0),
             payload_kg=_as_float(data.get("payload_kg"), default=0.0) or 0.0,
             reach_m=_as_float(data.get("reach_m"), default=0.0) or 0.0,
@@ -736,7 +751,9 @@ class SafetyPolicy:
 
     max_velocity_rad_s: float = 0.0  # global joint velocity limit
     max_force_n: float = 0.0  # global force limit
-    collision_zones: tuple[tuple[float, ...], ...] = ()  # axis-aligned boxes (x_min,x_max,y_min,y_max,z_min,z_max)
+    collision_zones: tuple[
+        tuple[float, ...], ...
+    ] = ()  # axis-aligned boxes (x_min,x_max,y_min,y_max,z_min,z_max)
     emergency_decel_s: float = 0.0  # time to reach zero velocity on e-stop
     require_safety_interlock: bool = False
     notes: str = ""
@@ -756,9 +773,7 @@ class SafetyPolicy:
         data = data or {}
         raw_zones = data.get("collision_zones") or ()
         collision_zones = tuple(
-            tuple(float(v) for v in zone)
-            for zone in raw_zones
-            if isinstance(zone, (list, tuple))
+            tuple(float(v) for v in zone) for zone in raw_zones if isinstance(zone, (list, tuple))
         )
         return cls(
             max_velocity_rad_s=_as_float(data.get("max_velocity_rad_s"), default=0.0) or 0.0,
@@ -842,7 +857,9 @@ class DegradationPolicy:
             sensor_fallbacks={
                 str(source): str(target)
                 for source, target in (data.get("sensor_fallbacks") or {}).items()
-            } if isinstance(data.get("sensor_fallbacks"), Mapping) else {},
+            }
+            if isinstance(data.get("sensor_fallbacks"), Mapping)
+            else {},
             max_comm_loss_s=_as_float(data.get("max_comm_loss_s"), default=1.0) or 1.0,
             safe_return_timeout_s=_as_float(data.get("safe_return_timeout_s"), default=5.0) or 5.0,
             notes=str(data.get("notes") or ""),
@@ -1003,38 +1020,24 @@ class HardwareContext:
         # hc.v1 extensions — parse when present, leave None otherwise
         raw_kin = data.get("kinematics")
         kinematics = (
-            KinematicsDeclaration.from_mapping(raw_kin)
-            if isinstance(raw_kin, Mapping)
-            else None
+            KinematicsDeclaration.from_mapping(raw_kin) if isinstance(raw_kin, Mapping) else None
         )
         raw_cap = data.get("capabilities")
         capabilities = (
-            CapabilityDeclaration.from_mapping(raw_cap)
-            if isinstance(raw_cap, Mapping)
-            else None
+            CapabilityDeclaration.from_mapping(raw_cap) if isinstance(raw_cap, Mapping) else None
         )
         raw_safety = data.get("safety")
-        safety = (
-            SafetyPolicy.from_mapping(raw_safety)
-            if isinstance(raw_safety, Mapping)
-            else None
-        )
+        safety = SafetyPolicy.from_mapping(raw_safety) if isinstance(raw_safety, Mapping) else None
         raw_trust = data.get("trust_config")
         trust_config = (
-            TrustConfig.from_mapping(raw_trust)
-            if isinstance(raw_trust, Mapping)
-            else None
+            TrustConfig.from_mapping(raw_trust) if isinstance(raw_trust, Mapping) else None
         )
         raw_degrad = data.get("degradation")
         degradation = (
-            DegradationPolicy.from_mapping(raw_degrad)
-            if isinstance(raw_degrad, Mapping)
-            else None
+            DegradationPolicy.from_mapping(raw_degrad) if isinstance(raw_degrad, Mapping) else None
         )
         raw_bindings = data.get("control_bindings")
-        control_bindings = (
-            dict(raw_bindings) if isinstance(raw_bindings, Mapping) else None
-        )
+        control_bindings = dict(raw_bindings) if isinstance(raw_bindings, Mapping) else None
         return cls(
             device_id=str(data.get("device_id") or ""),
             hc_version=str(data.get("hc_version") or ""),

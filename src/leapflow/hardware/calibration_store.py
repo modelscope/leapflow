@@ -162,9 +162,7 @@ class CalibrationStore:
             )
             self._db_registered = True
         except Exception as exc:  # noqa: BLE001 - indexing must not break calibration
-            logger.warning(
-                "Could not index calibration database %s: %s", self._db_path, exc
-            )
+            logger.warning("Could not index calibration database %s: %s", self._db_path, exc)
 
     @staticmethod
     def _ensure_schema(connection: Any) -> None:
@@ -182,9 +180,7 @@ class CalibrationStore:
 
     # ── Query ──
 
-    def latest(
-        self, device_id: str, procedure_id: str | None = None
-    ) -> CalibrationRecord | None:
+    def latest(self, device_id: str, procedure_id: str | None = None) -> CalibrationRecord | None:
         """Return the most recent calibration for a device, or a specific procedure.
 
         With ``procedure_id`` omitted, returns the newest calibration of any procedure on

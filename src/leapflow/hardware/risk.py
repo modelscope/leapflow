@@ -75,6 +75,9 @@ class HardwareRiskClassifier:
         if kind == ActionKind.DEVICE_READ.value:
             return self._assess_read(action)
 
+        if kind == ActionKind.DEVICE_SKILL.value:
+            return self._assess_skill(action)
+
         metadata = action.metadata or {}
         device_id = str(metadata.get("device_id") or "")
         channel_id = str(metadata.get("channel_id") or "")
@@ -295,6 +298,43 @@ class HardwareRiskClassifier:
             # spares them a prompt per frame.
             allow_permanent=False,
             metadata={"privacy": channel.privacy, "quantity": channel.quantity},
+        )
+
+    def _assess_skill(self, action: ActionDescriptor) -> RiskAssessment:
+        """Assess one node skill run from the plan the node produced.
+
+        Channel envelopes do not apply here: the node validates every motion of
+        the run against the workcell's calibrated workspace and limits under its
+        own write gate, and the plan digest binds what the human is shown to
+        what the node executes. What remains for consent is *whether* this skill
+        may move this workcell -- always HIGH, never permanent (a standing grant
+        to sweep an arm through unreviewed motion is not consent). The session
+        scope the orchestrator still offers is narrowed by the descriptor's
+        resource: ``each_run`` skills bind it to a single plan.
+        """
+        metadata = action.metadata or {}
+        missing = [
+            name
+            for name in ("node_id", "workcell", "skill_id", "version", "plan_digest")
+            if not str(metadata.get(name) or "")
+        ]
+        if missing:
+            return self._hardline(
+                "unresolvable_skill_plan",
+                f"The skill run does not name its {', '.join(missing)}; a run that cannot be "
+                "bound to a planned workcell cannot be assessed, so it is refused.",
+            )
+        target = f"{metadata['node_id']}/{metadata['workcell']}"
+        return RiskAssessment(
+            level=RiskLevel.HIGH,
+            score=0.7,
+            reasons=("device_skill", f"consent_{metadata.get('consent') or 'session'}"),
+            explanation=(
+                f"This runs {metadata['skill_id']}@{metadata['version']} on {target}: the arm "
+                "moves under the node's workspace and speed limits shown in the plan."
+            ),
+            allow_permanent=False,
+            metadata={"plan_digest": str(metadata["plan_digest"])},
         )
 
     @staticmethod

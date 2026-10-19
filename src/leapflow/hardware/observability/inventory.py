@@ -190,9 +190,12 @@ def _channel_row(registry: Any, context: Any, channel: Any) -> dict[str, Any]:
     current value that anyone measured, and printing the last on-demand read as if it
     were live is how a board starts lying about a device.
     """
-    summary = _safely(
-        lambda: registry.channel_summary(context.device_id, channel.channel_id), default=None
-    ) or {}
+    summary = (
+        _safely(
+            lambda: registry.channel_summary(context.device_id, channel.channel_id), default=None
+        )
+        or {}
+    )
     envelope = channel.envelope
     return {
         "channel_id": channel.channel_id,
@@ -238,12 +241,16 @@ def _traces(registry: Any, context: Any, channels: Sequence[Any]) -> list[dict[s
         ]
         if not points:
             continue
-        series.append({
-            "id": f"{context.device_id}.{channel.channel_id}",
-            "label": f"{channel.channel_id} ({channel.unit})" if channel.unit else channel.channel_id,
-            "unit": channel.unit,
-            "points": points,
-        })
+        series.append(
+            {
+                "id": f"{context.device_id}.{channel.channel_id}",
+                "label": f"{channel.channel_id} ({channel.unit})"
+                if channel.unit
+                else channel.channel_id,
+                "unit": channel.unit,
+                "points": points,
+            }
+        )
     return series
 
 
@@ -364,16 +371,16 @@ def _device_events(registry: Any, device_id: str, limit: int = 20) -> list[dict[
     board coloured an event as an alert and the producer declined to push it.
     """
     rows: list[dict[str, Any]] = []
-    for event in _safely(
-        lambda: registry.recent_events(device_id, limit=limit), default=()
-    ):
+    for event in _safely(lambda: registry.recent_events(device_id, limit=limit), default=()):
         kind = str(getattr(event, "kind", ""))
-        rows.append({
-            "title": f"{kind} · {getattr(event, 'channel_id', '')}",
-            "summary": str(getattr(event, "detail", "")),
-            "severity": "alert" if kind in ALERT_KINDS else "info",
-            "x": float(getattr(event, "observed_at", 0.0) or 0.0),
-        })
+        rows.append(
+            {
+                "title": f"{kind} · {getattr(event, 'channel_id', '')}",
+                "summary": str(getattr(event, "detail", "")),
+                "severity": "alert" if kind in ALERT_KINDS else "info",
+                "x": float(getattr(event, "observed_at", 0.0) or 0.0),
+            }
+        )
     rows.sort(key=lambda row: row["x"], reverse=True)
     return rows
 

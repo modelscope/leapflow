@@ -566,7 +566,8 @@ class HighFrequencyControlBus:
                             numeric = as_numeric(value)
                             if numeric is not None:
                                 self._pending_tick_expectations[channel_id] = (
-                                    numeric, stats.cycles
+                                    numeric,
+                                    stats.cycles,
                                 )
 
                 # (f) Update stats ----------------------------------------
@@ -825,7 +826,11 @@ class HighFrequencyControlBus:
                 stats.mismatch_ticks += 1
                 logger.debug(
                     "Tick verification mismatch on %s: commanded=%.4f observed=%.4f deviation=%.4f tolerance=%.4f",
-                    channel_id, commanded, observed, deviation, tolerance,
+                    channel_id,
+                    commanded,
+                    observed,
+                    deviation,
+                    tolerance,
                 )
             consumed.append(channel_id)
         for ch in consumed:

@@ -31,7 +31,13 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Iterable, Iterator, Protocol, runtime_checkable
 
-from leapflow.hardware.context import Channel, DegradationPolicy, HardwareContext, Quality, as_numeric
+from leapflow.hardware.context import (
+    Channel,
+    DegradationPolicy,
+    HardwareContext,
+    Quality,
+    as_numeric,
+)
 from leapflow.hardware.degradation import DegradationCoordinator
 from leapflow.hardware.transport import Reading
 
@@ -199,7 +205,11 @@ class HardwareEvent:
     def to_detail(self) -> str:
         """Return a compact one-line description for the signal pipeline."""
         where = f"{self.device_id}.{self.channel_id}"
-        rendered = "" if self.value is None else f" value={self.value}{f' {self.unit}' if self.unit else ''}"
+        rendered = (
+            ""
+            if self.value is None
+            else f" value={self.value}{f' {self.unit}' if self.unit else ''}"
+        )
         return f"[{self.kind}] {where}{rendered}: {self.detail}"
 
     @property
@@ -397,9 +407,7 @@ class HardwareEventDetector:
                 device_id=self._context.device_id,
                 channel_id=channel.channel_id,
                 quantity=channel.quantity,
-                detail=(
-                    f"no sample for {elapsed:.2f}s on a {channel.sample_rate_hz:g} Hz channel"
-                ),
+                detail=(f"no sample for {elapsed:.2f}s on a {channel.sample_rate_hz:g} Hz channel"),
                 unit=channel.unit,
                 observed_at=time.time(),
             ),
@@ -428,11 +436,7 @@ class HardwareEventDetector:
             # Re-entering is worth one event too, so a watcher can see recovery
             # instead of inferring it from silence.
             self._breached = False
-            events.append(
-                self._event(
-                    EventKind.SETTLED, reading, "returned to the declared range"
-                )
-            )
+            events.append(self._event(EventKind.SETTLED, reading, "returned to the declared range"))
 
         if (
             envelope.max_rate is not None
@@ -448,8 +452,7 @@ class HardwareEventDetector:
                     self._event(
                         EventKind.RATE_EXCEEDED,
                         reading,
-                        f"changing at {observed:g}/s, above the declared "
-                        f"{envelope.max_rate:g}/s",
+                        f"changing at {observed:g}/s, above the declared {envelope.max_rate:g}/s",
                     )
                 )
         return events
@@ -768,9 +771,7 @@ class HardwareStreamSource:
                     # Reset consecutive counters on recovery so a new breach cycle
                     # starts fresh rather than carrying stale counts.
                     if event.kind == EventKind.SETTLED:
-                        self._alert_policy.reset_channel(
-                            event.device_id, event.channel_id
-                        )
+                        self._alert_policy.reset_channel(event.device_id, event.channel_id)
                 except Exception as exc:  # noqa: BLE001 - policy must not stop sampling
                     logger.warning("Hardware alert policy raised: %s", exc, exc_info=True)
 
@@ -910,16 +911,16 @@ class BatchStreamCoordinator:
 
         The sampling rate is the maximum declared rate across all channels.
         """
-        max_rate = max((ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0)
+        max_rate = max(
+            (ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0
+        )
         interval = 1.0 / max_rate if max_rate > 0 else 1.0
         consecutive_failures = 0
         self._started_monotonic = time.monotonic()
         next_at = self._started_monotonic
         while not self._stopping.is_set():
             try:
-                batch = await self._registry.read_batch(
-                    self._context.device_id, self._channel_ids
-                )
+                batch = await self._registry.read_batch(self._context.device_id, self._channel_ids)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - one device must not stop the rest
@@ -934,7 +935,7 @@ class BatchStreamCoordinator:
                 # Check staleness on all channels during failures.
                 for detector in self._detectors.values():
                     self._dispatch(detector.check_stale(), emit)
-                await self._sleep(min(interval * (2 ** consecutive_failures), 30.0))
+                await self._sleep(min(interval * (2**consecutive_failures), 30.0))
                 next_at = time.monotonic()
                 continue
 
@@ -1098,9 +1099,7 @@ class BatchStreamCoordinator:
                 try:
                     self._alert_policy.evaluate(event)
                     if event.kind == EventKind.SETTLED:
-                        self._alert_policy.reset_channel(
-                            event.device_id, event.channel_id
-                        )
+                        self._alert_policy.reset_channel(event.device_id, event.channel_id)
                 except Exception as exc:  # noqa: BLE001 - policy must not stop sampling
                     logger.warning("Hardware alert policy raised: %s", exc, exc_info=True)
 
@@ -1122,7 +1121,9 @@ class BatchStreamCoordinator:
     @property
     def health(self) -> dict[str, Any]:
         """Return batch sampling health metrics."""
-        max_rate = max((ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0)
+        max_rate = max(
+            (ch.sample_rate_hz for ch in self._channels if ch.sample_rate_hz > 0), default=0.0
+        )
         started = self._started_monotonic
         elapsed = (time.monotonic() - started) if started is not None else 0.0
         observed = (self._samples / elapsed) if elapsed > 0 else 0.0
@@ -1160,8 +1161,7 @@ def build_batch_coordinators(
     coordinators: list[BatchStreamCoordinator] = []
     for context in registry.contexts():
         channels = tuple(
-            ch for ch in context.streaming_channels
-            if ch.is_readable and not ch.is_media
+            ch for ch in context.streaming_channels if ch.is_readable and not ch.is_media
         )
         if not channels:
             continue

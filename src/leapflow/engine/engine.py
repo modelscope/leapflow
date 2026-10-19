@@ -72,6 +72,7 @@ from leapflow.engine.tools.tool_concurrency import (
     ToolConcurrencyPolicy,
 )
 from leapflow.engine.tools.action_executor import ActionExecutor, RecordedActionExecutor
+from leapflow.engine.tools.tool_attachments import retire_tool_images
 from leapflow.engine.tools.tool_execution import (
     ToolExecutionLedger,
 )
@@ -638,6 +639,9 @@ class AgentEngine:
         phase = dict(decision.audit_metadata).get("phase", "")
 
         if strategy_key == "context_compress":
+            # Old tool images are the cheapest context to lose: a tool can
+            # always be called again for a fresh view.
+            retire_tool_images(messages, keep=0)
             if phase == "multimodal_to_text":
                 self._strip_images_from_messages(messages)
             else:
@@ -688,6 +692,7 @@ class AgentEngine:
             "(estimated=%d tokens > new_window=%d)",
             estimated, new_window,
         )
+        retire_tool_images(messages, keep=0)
         messages[:] = self._compressor.force_compress(messages)
         self._usage_tracker.mark_compression()
 
@@ -2295,6 +2300,7 @@ class AgentEngine:
                     tool_name, tool_arguments, result
                 ),
             )
+            await self._tool_dispatch.append_tool_attachments(messages, [f"text-{budget.used}"])
             memory_evidence = self._tool_dispatch.working_memory_evidence([
                 {"name": tool_name, "evidence": result_payload}
             ])

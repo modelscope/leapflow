@@ -1,8 +1,11 @@
 # AgileX Piper — 6-DOF CAN-controlled arm with a parallel gripper.
 #
 # hc.v1 declaration for the node-local Piper transport
-# (leapflow.hardware.drivers.piper). Envelope bounds are the Piper firmware
-# joint limits in degrees. Every writable numeric channel declares
+# (leapflow.hardware.drivers.piper). Joint envelope bounds are the Piper
+# firmware joint limits in degrees; end-effector (ee.*) envelopes are the
+# reachable workspace box in the arm base frame (mm) and the full orientation
+# range (deg). A batch may command joint.* or ee.* targets, never both.
+# Every writable numeric channel declares
 # `tolerance` explicitly: write verification defaults to an exact match
 # when tolerance is unset, and a servos' readback never matches a target
 # to the last bit.
@@ -29,9 +32,22 @@ kinematics:
     - [-1.222, 1.222]    # j5: ±70 deg
     - [-2.094, 2.094]    # j6: ±120 deg
   workspace_bounds: [-0.65, 0.65, -0.65, 0.65, -0.3, 0.9]
+  # Modified (Craig) DH, base to flange, from piper_sdk C_PiperForwardKinematics
+  # with dh_is_offset=0x01 (current firmware). Older firmware uses theta
+  # offsets -174.22 / -100.78 on links 2 / 3. The node checks this table against
+  # the reported flange pose before predicting with it, so a mismatch fails closed.
+  # VERIFY ON BOARD: compare forward(joints) with ee.* at a few poses.
+  dh:
+    convention: modified
+    links:
+      - {a: 0.0, alpha: 0.0, d: 123.0, theta_offset: 0.0}
+      - {a: 0.0, alpha: -90.0, d: 0.0, theta_offset: -172.22}
+      - {a: 285.03, alpha: 0.0, d: 0.0, theta_offset: -102.78}
+      - {a: -21.98, alpha: 90.0, d: 250.75, theta_offset: 0.0}
+      - {a: 0.0, alpha: -90.0, d: 0.0, theta_offset: 0.0}
+      - {a: 0.0, alpha: 90.0, d: 91.0, theta_offset: 0.0}
 
 capabilities:
-  affordances: ["grasp", "place", "push", "pull"]
   payload_kg: 1.5
   reach_m: 0.65
   tool_slots: 1
@@ -61,7 +77,9 @@ transport:
     can_name: "can0"
     sdk_interface: "v2"
     default_speed_pct: 20
-    move_mode: 1
+    # ee.* targets until arm.pose_path selects otherwise: "linear" (MOVE L,
+    # straight-line) or "point" (MOVE P).
+    pose_move_mode: "linear"
     warmup_timeout_s: 5.0
     stale_after_s: 1.0
     default_effort_n_m: 0.5
@@ -181,6 +199,120 @@ channels:
       tolerance: 0.5
       reversible: true
 
+  - channel_id: "ee.x"
+    direction: "readwrite"
+    quantity: "linear_position"
+    unit: "mm"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector X in the arm base frame"
+    envelope:
+      declared: true
+      min_value: -650.0
+      max_value: 650.0
+      max_rate: 150.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 2.0
+      reversible: true
+
+  - channel_id: "ee.y"
+    direction: "readwrite"
+    quantity: "linear_position"
+    unit: "mm"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector Y in the arm base frame"
+    envelope:
+      declared: true
+      min_value: -650.0
+      max_value: 650.0
+      max_rate: 150.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 2.0
+      reversible: true
+
+  - channel_id: "ee.z"
+    direction: "readwrite"
+    quantity: "linear_position"
+    unit: "mm"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector Z in the arm base frame"
+    envelope:
+      declared: true
+      min_value: -300.0
+      max_value: 900.0
+      max_rate: 150.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 2.0
+      reversible: true
+
+  - channel_id: "ee.rx"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector roll (RX) in the arm base frame"
+    envelope:
+      declared: true
+      min_value: -180.0
+      max_value: 180.0
+      max_rate: 45.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 1.0
+      reversible: true
+
+  - channel_id: "ee.ry"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector pitch (RY) in the arm base frame"
+    envelope:
+      declared: true
+      min_value: -180.0
+      max_value: 180.0
+      max_rate: 45.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 1.0
+      reversible: true
+
+  - channel_id: "ee.rz"
+    direction: "readwrite"
+    quantity: "angular_position"
+    unit: "deg"
+    representation: "scalar"
+    effect: "actuate"
+    sample_rate_hz: 100.0
+    verify_after_write: true
+    description: "End-effector yaw (RZ) in the arm base frame"
+    envelope:
+      declared: true
+      min_value: -180.0
+      max_value: 180.0
+      max_rate: 45.0
+      quantization: 0.001
+      settling_time_s: 1.0
+      tolerance: 1.0
+      reversible: true
+
   - channel_id: "gripper.position"
     direction: "readwrite"
     quantity: "linear_position"
@@ -229,6 +361,37 @@ channels:
     envelope:
       declared: true
       allowed_values: [0, 1]
+      reversible: true
+
+  - channel_id: "arm.speed_pct"
+    direction: "readwrite"
+    quantity: "ratio"
+    unit: "percent"
+    representation: "scalar"
+    effect: "configure"
+    description: >-
+      Motion speed rate carried by the next mode selection (1-100 % of the
+      firmware maximum). Sends no frame on its own; the next motion applies it.
+    envelope:
+      declared: true
+      min_value: 1.0
+      max_value: 100.0
+      quantization: 1.0
+      reversible: true
+
+  - channel_id: "arm.pose_path"
+    direction: "readwrite"
+    quantity: "state"
+    representation: "state"
+    effect: "configure"
+    description: >-
+      Path shape of later end-effector pose targets: "linear" (MOVE L,
+      straight-line) or "point" (MOVE P, joint-interpolated). Sends no frame on
+      its own; the next pose move applies it. The first allowed value is the
+      path a move uses when it names none.
+    envelope:
+      declared: true
+      allowed_values: ["linear", "point"]
       reversible: true
 
   - channel_id: "arm.enabled"

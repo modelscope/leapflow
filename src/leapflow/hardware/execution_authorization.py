@@ -9,8 +9,11 @@ adding a parameter to every layer in between.
 
 Usage in tools::
 
-    async with execution_authorization(auth):
+    with execution_authorization(approved_authorization(descriptor, session_id=sid)):
         outcome = await transport.write(channel_id, value)
+
+Tasks created inside the block (a control loop, a lease renewer) inherit the
+authorization, because asyncio copies the context at task creation.
 
 The ``LhpTransport`` reads the current authorization with
 ``current_authorization()``; when no authorization is active, a remote
@@ -63,8 +66,33 @@ def current_authorization() -> ExecutionAuthorization | None:
     return _AUTHORIZATION.get()
 
 
+def approved_authorization(action: Any, *, session_id: str) -> ExecutionAuthorization:
+    """The authorization a just-approved *action* (an ``ActionDescriptor``) grants.
+
+    The approval id is the descriptor's ``action_id`` -- the key of the approval
+    audit record -- so a permit on the wire traces back to the consent behind
+    it. The workspace comes from the active tool call, never from shared state.
+    """
+    from leapflow.tools.execution_context import current_tool_context
+
+    context = current_tool_context()
+    workspace = getattr(context, "workspace_root", "") if context is not None else ""
+    metadata = getattr(action, "metadata", None) or {}
+    reversible = metadata.get("reversible")
+    effect = "unknown" if reversible is None else ("reversible" if reversible else "irreversible")
+    return ExecutionAuthorization(
+        session_id=str(session_id or ""),
+        workspace=str(workspace or ""),
+        approval_id=str(getattr(action, "action_id", "") or "")
+        or ExecutionAuthorization.generate_approval_id(),
+        effect=effect,
+        envelope_band=str(metadata.get("envelope_band") or ""),
+    )
+
+
 __all__ = [
     "ExecutionAuthorization",
+    "approved_authorization",
     "current_authorization",
     "execution_authorization",
 ]

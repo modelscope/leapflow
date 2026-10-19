@@ -36,8 +36,8 @@ _BUILTIN_TRANSPORTS: dict[str, str] = {
     "media": "leapflow.hardware.transports.media:build_transport",
     "robot_arm": "leapflow.hardware.transports.robot_arm:build_transport",
     "ros2": "leapflow.hardware.transports.ros2:build_transport",
-    "vla_inference": "leapflow.hardware.transports.vla_inference:build_transport",
     "lhp": "leapflow.hardware.transports.lhp:build_transport",
+    "model_service": "leapflow.hardware.transports.model_service:build_transport",
 }
 _TRANSPORTS: dict[str, str] = dict(_BUILTIN_TRANSPORTS)
 
@@ -77,9 +77,7 @@ def _discover_entry_points() -> None:
     for ep in eps:
         key = ep.name
         if key in _TRANSPORTS:
-            logger.debug(
-                "entry-point transport %r skipped: already registered", key
-            )
+            logger.debug("entry-point transport %r skipped: already registered", key)
             continue
         # Store as "module:attr" so the lazy import path in build_transport()
         # handles it identically to a built-in row.

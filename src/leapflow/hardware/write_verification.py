@@ -188,9 +188,7 @@ class WriteVerdict:
 
         return cls(
             status=(
-                WriteVerdictStatus.VERIFIED.value
-                if matched
-                else WriteVerdictStatus.MISMATCH.value
+                WriteVerdictStatus.VERIFIED.value if matched else WriteVerdictStatus.MISMATCH.value
             ),
             expectation=expectation,
             observed_value=reading.value,

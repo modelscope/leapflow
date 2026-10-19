@@ -118,9 +118,7 @@ class ControlBindingResolver:
         for key, value in raw.items():
             key_str = str(key).strip()
             if not key_str or key_str not in _BINDING_TO_TRANSPORT:
-                logger.debug(
-                    "control_bindings: ignoring unknown binding type %r", key_str
-                )
+                logger.debug("control_bindings: ignoring unknown binding type %r", key_str)
                 continue
             if not isinstance(value, Mapping):
                 logger.warning(
@@ -187,9 +185,9 @@ class ControlBindingResolver:
                 transport_ref=transport_ref,
                 binding=binding,
                 available=is_available,
-                reason="" if is_available else (
-                    f"transport kind {transport_kind!r} is not registered"
-                ),
+                reason=""
+                if is_available
+                else (f"transport kind {transport_kind!r} is not registered"),
             )
 
             if is_available:

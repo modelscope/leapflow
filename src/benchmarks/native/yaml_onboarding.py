@@ -5,16 +5,13 @@ from __future__ import annotations
 
 import importlib.util
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from benchmarks.evidence import EvidenceStore
 from benchmarks.metrics import unseen_success_rate
 from benchmarks.models import AvailabilityResult, MetricValue, Scenario, TrialResult, TrialStatus
-from benchmarks.native.harness import ScriptedApprovalGate, evidence_root, make_registry
-from leapflow.hardware.capability_router import CapabilityRouterPlugin
-from leapflow.hardware.context import TransportRef
+from benchmarks.native.harness import evidence_root
 from leapflow.hardware.control_binding_resolver import ControlBindingResolver
 
 _ADAPTER_ID = "native_yaml_onboarding"
@@ -24,13 +21,11 @@ _SCENARIOS = (
              adapter_id=_ADAPTER_ID, tags=("native", "onboarding", "tier1")),
     Scenario("control_binding_resolution", "Resolve YAML-derived control binding",
              adapter_id=_ADAPTER_ID, tags=("native", "onboarding", "tier1")),
-    Scenario("capability_tool_generation", "Generate tools from declared affordances",
-             adapter_id=_ADAPTER_ID, tags=("native", "onboarding", "tier1")),
 )
 
 
 class YAMLOnboardingAdapter:
-    """Verify YAML discovery, binding resolution, and capability tool generation."""
+    """Verify YAML discovery and control binding resolution."""
 
     @property
     def adapter_id(self) -> str:
@@ -71,11 +66,9 @@ class YAMLOnboardingAdapter:
                 adapter_version=_VERSION, seed=seed, started_at=started, ended_at=time.time(),
                 error=available.reason,
             )
-        registry = None
         try:
             contexts = self._load_contexts()
-            registry = make_registry(*self._runnable_contexts(contexts))
-            payload, passed = self._exercise(scenario.scenario_id, contexts, registry)
+            payload, passed = self._exercise(scenario.scenario_id, contexts)
             return self._result(scenario, seed, started, payload, passed)
         except Exception as exc:
             ended = time.time()
@@ -85,9 +78,6 @@ class YAMLOnboardingAdapter:
                 adapter_version=_VERSION, seed=seed, error=str(exc),
                 error_type=type(exc).__name__,
             )
-        finally:
-            if registry is not None:
-                await registry.close_all()
 
     @staticmethod
     def _examples_dir() -> Path:
@@ -99,20 +89,9 @@ class YAMLOnboardingAdapter:
         provider = YamlContextProvider({"devices_dir": str(self._examples_dir())})
         return provider.discover()
 
-    @staticmethod
-    def _runnable_contexts(contexts: tuple[Any, ...]) -> tuple[Any, ...]:
-        """Keep YAML semantics while replacing unavailable physical transports."""
-        return tuple(
-            replace(
-                context,
-                device_id=context.device_id.replace(".", "_"),
-                transport=TransportRef("simulated", {"values": {}}),
-            )
-            for context in contexts
-        )
-
-    def _exercise(self, scenario_id: str, contexts: tuple[Any, ...],
-                  registry: Any) -> tuple[dict[str, Any], bool]:
+    def _exercise(
+        self, scenario_id: str, contexts: tuple[Any, ...]
+    ) -> tuple[dict[str, Any], bool]:
         loaded_ids = sorted(context.device_id for context in contexts)
         if scenario_id == "yaml_context_load":
             # Every shipped example must load; a hard-coded count failed the moment a
@@ -120,17 +99,10 @@ class YAMLOnboardingAdapter:
             shipped = [*self._examples_dir().glob("*.yaml"), *self._examples_dir().glob("*.yml")]
             passed = len(contexts) == len(shipped) and "robot.so100_arm" in loaded_ids
             return {"loaded_device_ids": loaded_ids}, passed
+        if scenario_id != "control_binding_resolution":
+            raise ValueError(f"unknown scenario {scenario_id!r}")
         arm = next(context for context in contexts if context.device_id == "robot.so100_arm")
-        if scenario_id == "control_binding_resolution":
-            return self._resolve_binding(arm, loaded_ids)
-        plugin = CapabilityRouterPlugin()
-        plugin.bind_runtime(
-            hardware_registry=registry,
-            hardware_approval_gate=ScriptedApprovalGate(("allow_once",)),
-        )
-        tool_names = sorted(tool.name for tool in plugin.tools)
-        expected = {"hw_grasp", "hw_place", "hw_push", "hw_pour", "hw_orchestrate"}
-        return {"loaded_device_ids": loaded_ids, "tool_names": tool_names}, expected.issubset(tool_names)
+        return self._resolve_binding(arm, loaded_ids)
 
     @staticmethod
     def _resolve_binding(arm: Any, loaded_ids: list[str]) -> tuple[dict[str, Any], bool]:

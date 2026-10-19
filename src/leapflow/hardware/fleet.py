@@ -75,12 +75,14 @@ _NODE_STATUS_OFFLINE = "offline"
 _NODE_STATUS_DEGRADED = "degraded"
 _NODE_STATUS_UNKNOWN = "unknown"
 
-_VALID_STATUSES = frozenset({
-    _NODE_STATUS_ONLINE,
-    _NODE_STATUS_OFFLINE,
-    _NODE_STATUS_DEGRADED,
-    _NODE_STATUS_UNKNOWN,
-})
+_VALID_STATUSES = frozenset(
+    {
+        _NODE_STATUS_ONLINE,
+        _NODE_STATUS_OFFLINE,
+        _NODE_STATUS_DEGRADED,
+        _NODE_STATUS_UNKNOWN,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -187,14 +189,24 @@ class FleetManager:
         *,
         heartbeat_interval_s: float = 10.0,
         node_timeout_s: float = 30.0,
+        permit_issuer: Any | None = None,
     ) -> None:
         self._registry = registry
+        # Signs execution permits for nodes in ``permit_required`` mode. Shared
+        # by every remote device's transport and by the skill service; absent,
+        # such nodes refuse writes with a host-side message naming why.
+        self._permit_issuer = permit_issuer
         self._nodes: dict[str, FleetNode] = {}
         self._device_to_node: dict[str, str] = {}  # device_id → node_id
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._heartbeat_interval = max(1.0, float(heartbeat_interval_s))
         self._node_timeout = max(1.0, float(node_timeout_s))
         self._stopped = asyncio.Event()
+
+    @property
+    def permit_issuer(self) -> Any | None:
+        """The host's permit issuer, or ``None`` when permits cannot be minted."""
+        return self._permit_issuer
 
     # -- Node management -------------------------------------------------
 
@@ -233,8 +245,7 @@ class FleetManager:
             # Identity mismatch is never resolved automatically: adopting the
             # reported id could silently merge two boards into one namespace.
             raise FleetError(
-                f"node at {node.endpoint!r} reports itself as {reported!r}, "
-                f"not {node.node_id!r}",
+                f"node at {node.endpoint!r} reports itself as {reported!r}, not {node.node_id!r}",
                 failure_code="fleet_node_mismatch",
             )
 
@@ -251,7 +262,7 @@ class FleetManager:
 
         report = await self._registry.reconcile()
         admitted_local = tuple(
-            did[len(prefix):] for did in report.admitted if did.startswith(prefix)
+            did[len(prefix) :] for did in report.admitted if did.startswith(prefix)
         )
         dropped = tuple(did for did in report.rejected if did.startswith(prefix))
         if dropped:
@@ -307,7 +318,9 @@ class FleetManager:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Fleet: halt device %r on unregister failed: %s",
-                    local_did, exc, exc_info=True,
+                    local_did,
+                    exc,
+                    exc_info=True,
                 )
 
         # Remove routing entries.
@@ -321,9 +334,7 @@ class FleetManager:
 
         logger.info("Fleet: unregistered node %r", node_id)
 
-    async def discover_nodes(
-        self, endpoints: tuple[str, ...]
-    ) -> tuple[FleetNode, ...]:
+    async def discover_nodes(self, endpoints: tuple[str, ...]) -> tuple[FleetNode, ...]:
         """Probe multiple endpoints for fleet nodes.
 
         Returns discovered nodes (not yet registered).  Unreachable
@@ -376,9 +387,7 @@ class FleetManager:
         if self._heartbeat_task is not None:
             return
         self._stopped.clear()
-        self._heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(), name="fleet-heartbeat"
-        )
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="fleet-heartbeat")
 
     async def stop_heartbeat(self) -> None:
         """Stop heartbeat monitoring.  Idempotent."""
@@ -406,9 +415,7 @@ class FleetManager:
         while not self._stopped.is_set():
             await self._heartbeat_sweep()
             try:
-                await asyncio.wait_for(
-                    self._stopped.wait(), timeout=self._heartbeat_interval
-                )
+                await asyncio.wait_for(self._stopped.wait(), timeout=self._heartbeat_interval)
                 break  # stopped
             except asyncio.TimeoutError:
                 pass
@@ -453,13 +460,15 @@ class FleetManager:
                 if node.status != _NODE_STATUS_OFFLINE:
                     logger.warning(
                         "Fleet: node %r offline (%.1fs since last heartbeat)",
-                        node_id, elapsed,
+                        node_id,
+                        elapsed,
                     )
                     self._nodes[node_id] = node.with_status(_NODE_STATUS_OFFLINE)
             elif node.status == _NODE_STATUS_ONLINE:
                 logger.info(
                     "Fleet: node %r degraded (heartbeat missed, %.1fs since last)",
-                    node_id, elapsed,
+                    node_id,
+                    elapsed,
                 )
                 self._nodes[node_id] = node.with_status(_NODE_STATUS_DEGRADED)
         for node_id in changed:
@@ -494,9 +503,7 @@ class FleetManager:
         reachable = await self._probe_endpoint(node.endpoint, token=node.token) is not None
         now = time.monotonic()
         if reachable:
-            self._nodes[node_id] = node.with_status(
-                _NODE_STATUS_ONLINE, heartbeat=now
-            )
+            self._nodes[node_id] = node.with_status(_NODE_STATUS_ONLINE, heartbeat=now)
         return {
             "node_id": node_id,
             "display_name": node.display_name,
@@ -541,7 +548,9 @@ class FleetManager:
                     failures += 1
                     logger.warning(
                         "Fleet halt_all: device %r on node %r failed: %s",
-                        did, node.node_id, exc,
+                        did,
+                        node.node_id,
+                        exc,
                     )
             results["successes"] = successes
             results["failures"] = failures
@@ -593,9 +602,7 @@ class FleetManager:
         fleet_trust: dict[str, dict[str, Any]] = {}
 
         # Collect from the local registry's trust gate if available.
-        trust_gate: HardwareTrustGate | None = getattr(
-            self._registry, "_trust_gate", None
-        )
+        trust_gate: HardwareTrustGate | None = getattr(self._registry, "_trust_gate", None)
         if trust_gate is not None:
             for record in trust_gate.all_records():
                 key = f"{record.device_id}:{record.channel_id}"
@@ -612,9 +619,7 @@ class FleetManager:
 
         return {
             "strategy": "conservative_merge",
-            "description": (
-                "Lowest trust level across all nodes for each (device, channel) pair"
-            ),
+            "description": ("Lowest trust level across all nodes for each (device, channel) pair"),
             "trust": fleet_trust,
             "node_count": len(self._nodes),
             "timestamp": time.time(),
@@ -698,9 +703,7 @@ class FleetManager:
         reported = str(hello.get("node_id") or "")
         return reported, tuple(contexts), str(hello.get("declarations") or "")
 
-    async def _probe_endpoint(
-        self, endpoint: str, *, token: str = ""
-    ) -> Mapping[str, Any] | None:
+    async def _probe_endpoint(self, endpoint: str, *, token: str = "") -> Mapping[str, Any] | None:
         """Probe an LHP endpoint for liveness; return its hello, or None.
 
         One hello exchange with a short timeout: a lightweight connectivity
@@ -709,9 +712,7 @@ class FleetManager:
         declarations fingerprint is how a sweep notices changed devices.
         Never raises.
         """
-        client = SocketLhpClient(
-            endpoint, token=token, timeout_s=_HEARTBEAT_PROBE_TIMEOUT_S
-        )
+        client = SocketLhpClient(endpoint, token=token, timeout_s=_HEARTBEAT_PROBE_TIMEOUT_S)
         try:
             return await client.connect()
         except (LhpRemoteError, ValueError, OSError):
@@ -719,14 +720,14 @@ class FleetManager:
         finally:
             await client.close()
 
-    @staticmethod
-    def _transport_ref(node: FleetNode, remote_device_id: str) -> TransportRef:
+    def _transport_ref(self, node: FleetNode, remote_device_id: str) -> TransportRef:
         """Build the LHP binding for one remote device.
 
         ``remote_device_id`` is what the *node* calls the device; the host
         side calls it ``<node_id>__<device_id>``.  Both ids travel so the
         transport can address the right device on the node while every
-        host-side artifact carries the namespaced id.
+        host-side artifact carries the namespaced id. The permit issuer rides
+        along in-process only (declaration digests strip transport config).
         """
         return TransportRef(
             kind="lhp",
@@ -735,12 +736,11 @@ class FleetManager:
                 "token": node.token,
                 "node_id": node.node_id,
                 "remote_device_id": remote_device_id,
+                "permit_issuer": self._permit_issuer,
             },
         )
 
-    def _adjust_remote_provenance(
-        self, context: Any, node_id: str
-    ) -> Any:
+    def _adjust_remote_provenance(self, context: Any, node_id: str) -> Any:
         """Strip self-reported verified status from remote contexts (P2-J).
 
         A node cannot be trusted to assert its own verification. The host
@@ -762,7 +762,8 @@ class FleetManager:
         logger.info(
             "Fleet: stripping self-reported verification for %s from node %s; "
             "no local digest-bound entry exists",
-            context.device_id, node_id,
+            context.device_id,
+            node_id,
         )
         return replace(
             context,
@@ -777,8 +778,7 @@ class FleetManager:
         """Check if the host has a digest-bound verification for this remote device."""
         try:
             verified_path = getattr(
-                getattr(self._registry, "_settings", None),
-                "hardware_verified_path", None
+                getattr(self._registry, "_settings", None), "hardware_verified_path", None
             )
             if not verified_path:
                 layout = getattr(self._registry, "_layout", None)
@@ -826,8 +826,7 @@ class FleetManager:
         if status is not None and not getattr(status, "connected", True):
             detail = getattr(status, "detail", "")
             raise FleetError(
-                f"halt for {device_id!r} was not delivered: "
-                f"{detail or 'transport not connected'}",
+                f"halt for {device_id!r} was not delivered: {detail or 'transport not connected'}",
                 failure_code="fleet_halt_undelivered",
             )
 
@@ -844,7 +843,8 @@ class FleetManager:
             except Exception:  # noqa: BLE001 — teardown must not propagate
                 logger.warning(
                     "Fleet: unregister node %r during close failed",
-                    node_id, exc_info=True,
+                    node_id,
+                    exc_info=True,
                 )
 
 
@@ -868,9 +868,7 @@ class FleetSessionRouter:
     def __init__(self, fleet_manager: FleetManager) -> None:
         self._fleet = fleet_manager
 
-    async def route_write(
-        self, device_id: str, channel_id: str, value: Any
-    ) -> Any:
+    async def route_write(self, device_id: str, channel_id: str, value: Any) -> Any:
         """Route a write operation to the correct node.
 
         If the device is remote, the write goes through the ``lhp``
@@ -881,9 +879,7 @@ class FleetSessionRouter:
         transport = await registry.transport(device_id)
         return await transport.write(channel_id, value)
 
-    async def route_read(
-        self, device_id: str, channel_id: str
-    ) -> Any:
+    async def route_read(self, device_id: str, channel_id: str) -> Any:
         """Route a read operation to the correct node.
 
         Same delegation pattern as ``route_write``: the transport
@@ -935,7 +931,7 @@ def _endpoint_to_node_id(endpoint: str) -> str:
     cleaned = endpoint.lower()
     for prefix in ("tcp://", "unix://", "http://", "https://", "stdio:"):
         if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix):]
+            cleaned = cleaned[len(prefix) :]
     return "".join(c if c.isalnum() else "_" for c in cleaned).strip("_")
 
 

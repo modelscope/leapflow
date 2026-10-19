@@ -44,9 +44,7 @@ class HardwareVolatileContextProvider:
             writable = len(tuple(getattr(context, "writable_channels", ()) or ()))
             status = "degraded" if degraded else "available"
             control_text = self._control_text(control, disclosure_level)
-            lines.append(
-                f"- {device_id}: {status}; writable_channels={writable}{control_text}"
-            )
+            lines.append(f"- {device_id}: {status}; writable_channels={writable}{control_text}")
         omitted = len(contexts) - self._max_devices
         if omitted > 0:
             lines.append(f"- … {omitted} additional device(s) omitted")

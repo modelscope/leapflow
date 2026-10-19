@@ -286,16 +286,22 @@ class RobotChannelMapper:
         # Pass 1: observation features (read-only by default).
         for feat_name, feat_shape in observation_features.items():
             for ch in self._channels_for_feature(
-                feat_name, feat_shape, is_action=False,
-                motor_limits=limits, camera_configs=cam_cfgs,
+                feat_name,
+                feat_shape,
+                is_action=False,
+                motor_limits=limits,
+                camera_configs=cam_cfgs,
             ):
                 channels[ch.channel_id] = ch
 
         # Pass 2: action features override observations (promote to READWRITE).
         for feat_name, feat_shape in action_features.items():
             for ch in self._channels_for_feature(
-                feat_name, feat_shape, is_action=True,
-                motor_limits=limits, camera_configs=cam_cfgs,
+                feat_name,
+                feat_shape,
+                is_action=True,
+                motor_limits=limits,
+                camera_configs=cam_cfgs,
             ):
                 channels[ch.channel_id] = ch
 
@@ -338,7 +344,8 @@ class RobotChannelMapper:
             camera_configs = {str(k): dict(v) for k, v in raw_cams.items() if isinstance(v, dict)}
 
         return self.map_features(
-            obs, act,
+            obs,
+            act,
             motor_limits=motor_limits,
             camera_configs=camera_configs,
         )
@@ -396,7 +403,8 @@ class RobotChannelMapper:
         # Unknown feature type -- log and skip rather than crash.
         logger.debug(
             "Skipping unrecognised robot feature %r (shape=%r)",
-            feature_name, feature_shape,
+            feature_name,
+            feature_shape,
         )
         return []
 

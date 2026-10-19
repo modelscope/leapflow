@@ -38,13 +38,17 @@ import time
 from typing import Any, Mapping
 
 from leapflow.hardware.context import HardwareContext, Quality
+from leapflow.hardware.lhp.authority import WRITE_MODE_PERMIT_REQUIRED
 from leapflow.hardware.lhp.client import (
     DEFAULT_REQUEST_TIMEOUT_S,
     DirectLhpClient,
     SocketLhpClient,
 )
+from leapflow.hardware.lhp.permit import PERMIT_PARAM, request_digest
 from leapflow.hardware.lhp.protocol import (
+    CAP_PERMIT_V1,
     ERR_UNSUPPORTED_CAPABILITY,
+    FAILURE_PERMIT_REQUIRED,
     MAX_FRAME_DATA_BYTES,
     MAX_FRAME_RATE_HZ,
     MAX_FRAME_WIDTH,
@@ -110,11 +114,11 @@ class LhpTransport:
             client = self._build_client()
             hello = await client.connect()
         except LhpRemoteError as exc:
-            raise TransportError(
-                f"LHP open failed: {exc}", failure_code=f"lhp_{exc.code}"
-            ) from exc
+            raise TransportError(f"LHP open failed: {exc}", failure_code=f"lhp_{exc.code}") from exc
         except (OSError, ValueError) as exc:
-            raise TransportError(f"LHP open failed: {exc}", failure_code="lhp_connect_failed") from exc
+            raise TransportError(
+                f"LHP open failed: {exc}", failure_code="lhp_connect_failed"
+            ) from exc
         node_id = str((hello or {}).get("node_id") or "")
         if self._expected_node_id and node_id and node_id != self._expected_node_id:
             try:
@@ -129,7 +133,9 @@ class LhpTransport:
         self._capabilities = frozenset(
             str(item) for item in raw_capabilities if isinstance(item, str) and item
         )
-        self._remote_write_mode = str(hello.get("write_mode") or "") if isinstance(hello, Mapping) else ""
+        self._remote_write_mode = (
+            str(hello.get("write_mode") or "") if isinstance(hello, Mapping) else ""
+        )
         self._remote_node_id = node_id or self._expected_node_id
         self._client = client
         self._connected = True
@@ -200,11 +206,17 @@ class LhpTransport:
                 failure_code=ERR_UNSUPPORTED_CAPABILITY,
             )
         if max_width < 0 or max_width > MAX_FRAME_WIDTH:
-            raise TransportError("frame width is outside protocol bounds", failure_code="bad_request")
+            raise TransportError(
+                "frame width is outside protocol bounds", failure_code="bad_request"
+            )
         if quality < 0 or quality > 100:
-            raise TransportError("frame quality is outside protocol bounds", failure_code="bad_request")
+            raise TransportError(
+                "frame quality is outside protocol bounds", failure_code="bad_request"
+            )
         if not math.isfinite(float(fps)) or fps < 0 or fps > MAX_FRAME_RATE_HZ:
-            raise TransportError("frame rate is outside protocol bounds", failure_code="bad_request")
+            raise TransportError(
+                "frame rate is outside protocol bounds", failure_code="bad_request"
+            )
         try:
             result = await client.request(
                 "read_frame",
@@ -229,20 +241,16 @@ class LhpTransport:
             "channel_id": channel_id,
             "value": value,
         }
-        permit_dict = self._maybe_issue_permit(
-            method="write",
-            device_id=self._remote_device_id,
-            commands=[(channel_id, value)],
-        )
-        if isinstance(permit_dict, WriteOutcome):
-            return permit_dict  # local refusal
-        if permit_dict is not None:
-            params["permit"] = permit_dict
-        try:
-            result = await client.request(
-                "write",
-                params,
+        refusal = self._attach_permit("write", params)
+        if refusal:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=refusal,
+                failure_code=FAILURE_PERMIT_REQUIRED,
             )
+        try:
+            result = await client.request("write", params)
         except LhpRemoteError as exc:
             if exc.code in WRITE_EFFECT_UNKNOWN_CODES:
                 # The command may have reached the device; a raise would invite a retry.
@@ -297,18 +305,20 @@ class LhpTransport:
         """Emergency stop. Never raises and is never serialised by callers."""
         client = self._client
         if not self._connected or client is None:
-            return TransportStatus(connected=False, halt_supported=False, detail="lhp transport is not open")
+            return TransportStatus(
+                connected=False, halt_supported=False, detail="lhp transport is not open"
+            )
         try:
             result = await client.request("halt", {"device_id": self._remote_device_id})
         except LhpRemoteError as exc:
-            logger.error(
-                "LHP halt for %r failed: %s", self._remote_device_id, exc, exc_info=True
-            )
+            logger.error("LHP halt for %r failed: %s", self._remote_device_id, exc, exc_info=True)
             return TransportStatus(
                 connected=False, halt_supported=False, detail=f"{exc.code}: {exc}"
             )
         if not isinstance(result, Mapping):
-            return TransportStatus(connected=False, halt_supported=False, detail="malformed halt result")
+            return TransportStatus(
+                connected=False, halt_supported=False, detail="malformed halt result"
+            )
         return TransportStatus(
             connected=bool(result.get("connected", False)),
             halt_supported=bool(result.get("halt_supported", False)),
@@ -350,20 +360,26 @@ class LhpTransport:
             "device_id": self._remote_device_id,
             "commands": [[channel_id, value] for channel_id, value in commands],
         }
-        permit_dict = self._maybe_issue_permit(
-            method="write_batch",
-            device_id=self._remote_device_id,
-            commands=list(commands),
-        )
-        if isinstance(permit_dict, BatchWriteOutcome):
-            return permit_dict  # local refusal
-        if permit_dict is not None:
-            params["permit"] = permit_dict
+        refusal = self._attach_permit("write_batch", params)
+        if refusal:
+            outcome = WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error=refusal,
+                failure_code=FAILURE_PERMIT_REQUIRED,
+            )
+            return BatchWriteOutcome(
+                ok=False,
+                outcomes=tuple(outcome for _ in commands),
+                side_effect_state=SIDE_EFFECT_NONE,
+            )
         try:
             result = await client.request("write_batch", params)
         except LhpRemoteError as exc:
             if exc.code in WRITE_EFFECT_UNKNOWN_CODES:
-                return BatchWriteOutcome(ok=False, outcomes=(), side_effect_state=SIDE_EFFECT_UNKNOWN)
+                return BatchWriteOutcome(
+                    ok=False, outcomes=(), side_effect_state=SIDE_EFFECT_UNKNOWN
+                )
             raise TransportError(str(exc) or exc.code, failure_code=exc.code) from exc
         if not isinstance(result, Mapping):
             raise TransportError(
@@ -437,13 +453,23 @@ class LhpTransport:
             params["targets"] = targets
         if waypoints is not None:
             params["waypoints"] = waypoints
+        refusal = self._attach_permit("control.open", params)
+        if refusal:
+            raise TransportError(refusal, failure_code=FAILURE_PERMIT_REQUIRED)
         try:
             result = await client.request("control.open", params)
         except LhpRemoteError as exc:
             raise TransportError(str(exc) or exc.code, failure_code=exc.code) from exc
         if not isinstance(result, Mapping) or not result.get("ok"):
-            error_msg = result.get("error", "control.open refused") if isinstance(result, Mapping) else "malformed"
-            raise TransportError(str(error_msg), failure_code="control_open_failed")
+            if not isinstance(result, Mapping):
+                raise TransportError(
+                    "LHP control.open returned a malformed result",
+                    failure_code="lhp_malformed_result",
+                )
+            raise TransportError(
+                str(result.get("error") or "control.open refused"),
+                failure_code=str(result.get("failure_code") or "control_open_failed"),
+            )
 
         control_id = str(result.get("control_id") or "")
         actual_lease = float(result.get("lease_s") or lease_s)
@@ -470,6 +496,9 @@ class LhpTransport:
             params["targets"] = targets
         if waypoints is not None:
             params["waypoints"] = waypoints
+        refusal = self._attach_permit("control.update", params)
+        if refusal:
+            raise TransportError(refusal, failure_code=FAILURE_PERMIT_REQUIRED)
         try:
             result = await client.request("control.update", params)
         except LhpRemoteError as exc:
@@ -501,7 +530,8 @@ class LhpTransport:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "LHP control renewal failed for %s: %s",
-                        control_id[:8], exc,
+                        control_id[:8],
+                        exc,
                     )
                     return  # stop renewing; node will fire comm_loss_policy
 
@@ -522,54 +552,36 @@ class LhpTransport:
 
     # ── Permit integration ──
 
-    def _maybe_issue_permit(
-        self,
-        *,
-        method: str,
-        device_id: str,
-        commands: list[tuple[str, Any]] | None = None,
-    ) -> dict[str, Any] | WriteOutcome | BatchWriteOutcome | None:
-        """Issue a permit if the node requires one. Returns permit dict, local refusal, or None."""
-        if self._remote_write_mode != "permit_required":
-            return None
-        if "permit.v1" not in self._capabilities:
-            return None
-        # Read the execution authorization from the contextvar
+    def _attach_permit(self, method: str, params: dict[str, Any]) -> str:
+        """Sign *params* for *method* when the node requires a permit.
+
+        The permit binds ``request_digest(method, params)`` -- exactly what the
+        node will recompute from the request it receives -- so it must be
+        attached last, after every other parameter is final. Returns a host-side
+        refusal message (nothing is sent), or ``""`` when the request may go.
+        """
+        if self._remote_write_mode != WRITE_MODE_PERMIT_REQUIRED:
+            return ""
+        if CAP_PERMIT_V1 not in self._capabilities:
+            return ""  # the node refuses on its own; its message names the missing keys
         from leapflow.hardware.execution_authorization import current_authorization
-        from leapflow.hardware.lhp.permit import action_digest as _action_digest
 
         auth = current_authorization()
         issuer = self._permit_issuer
         if auth is None or issuer is None:
-            refusal_error = (
+            return (
                 "remote node requires a signed permit but no execution authorization "
                 "is active (host-side refusal; nothing was sent)"
             )
-            if method == "write_batch":
-                return BatchWriteOutcome(
-                    ok=False, outcomes=(), side_effect_state=SIDE_EFFECT_NONE,
-                )
-            return WriteOutcome(
-                ok=False,
-                side_effect_state=SIDE_EFFECT_NONE,
-                error=refusal_error,
-                failure_code="permit_required",
-            )
-        digest = _action_digest(
-            method=method,
-            device_id=device_id,
-            commands=commands if commands else None,
-            effect=auth.effect,
-            envelope_band=auth.envelope_band,
-        )
         permit = issuer.issue(
             audience=self._remote_node_id,
             session_id=auth.session_id,
             workspace=auth.workspace,
             approval_id=auth.approval_id,
-            digest=digest,
+            digest=request_digest(method, params),
         )
-        return permit.to_dict()
+        params[PERMIT_PARAM] = permit.to_dict()
+        return ""
 
     # ── Internals ──
 
@@ -648,7 +660,11 @@ class LhpTransport:
                 failure_code="lhp_malformed_result",
             )
         size_bytes = payload.get("size_bytes")
-        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes != len(data):
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes != len(data)
+        ):
             raise TransportError(
                 "LHP frame size metadata does not match its payload",
                 failure_code="lhp_result_mismatch",

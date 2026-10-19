@@ -1,0 +1,188 @@
+# Copyright (c) Alibaba, Inc. and its affiliates.
+"""Workcell declarations: parsing, fail-closed admission, frames, requirements."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from leapflow.hardware.skills.frames import (
+    FrameGraph,
+    unmet_requirements,
+)
+from leapflow.hardware.skills.workcell import (
+    SPEED_CHANNEL,
+    WorkcellError,
+    WorkcellSpec,
+    load_workcells,
+    role_kind,
+)
+from tests._harness.skill_stubs import (
+    ARM_ID,
+    WORKCELL_ID,
+    WORKCELL_YAML,
+    SkillNodeRegistry,
+    write_workcell,
+)
+
+
+def _with(**changes: Any) -> dict[str, Any]:
+    return {**WORKCELL_YAML, **changes}
+
+
+def test_shipped_shape_parses_and_reports_its_devices() -> None:
+    spec = WorkcellSpec.from_mapping(WORKCELL_YAML)
+    assert spec.device_ids == (ARM_ID,), "arm and gripper on one device count once"
+    assert spec.role("gripper") == ARM_ID and spec.role("camera") == ""
+    assert spec.frames["tcp"].parent == "flange"
+    assert spec.limits["move_timeout_s"] == 5.0
+    assert spec.bootstrap_box is not None and spec.bootstrap_box.z_min == 120
+
+
+@pytest.mark.parametrize(
+    ("data", "match"),
+    [
+        (_with(workcell="Piper Cell"), "identifier"),
+        (_with(roles={"gripper": ARM_ID}), "must bind an 'arm'"),
+        (_with(frames={"base": {"parent": "flange", "procedure": "p"}}), "reserved"),
+        (_with(frames={"tcp": {"parent": "camera", "procedure": "p"}}), "parent"),
+        (_with(frames={"tcp": {"parent": "flange"}}), "procedure"),
+        (_with(limits={"speed_pct_max": 150}), "speed_pct_max"),
+        (_with(home={"joint.j1.position": "zero"}), "must be a number"),
+        (_with(workspace={"tool_cone_deg": 0}), "tool_cone_deg"),
+        (_with(workspace={"bootstrap_box": {"x": [1, 0], "y": [0, 1], "z": [0, 1]}}), "bounds"),
+        (_with(arm=ARM_ID), "unknown fields \\['arm'\\]"),
+        (_with(limts={"speed_pct_max": 10}), "unknown fields"),
+        (_with(workspace={"procedure": "p", "cone_deg": 10}), "unknown fields"),
+        (_with(roles={"arm": ARM_ID, "Camera Wrist": "cam"}), "role name"),
+        (_with(roles={"arm": ARM_ID, "camera.wrist": ""}), "device id"),
+        (_with(roles=[ARM_ID]), "needs 'roles'"),
+    ],
+)
+def test_malformed_declarations_are_refused(data: dict[str, Any], match: str) -> None:
+    with pytest.raises(WorkcellError, match=match):
+        WorkcellSpec.from_mapping(data)
+
+
+def test_admission_is_fail_closed_against_the_live_registry(tmp_path: Path) -> None:
+    directory = tmp_path / "workcells"
+    write_workcell(directory)
+    write_workcell(directory, _with(workcell="ghost", roles={"arm": ARM_ID, "gripper": "missing_gripper"}))
+    write_workcell(directory, _with(workcell="far_home", home={"joint.j2.position": 500.0}))
+    write_workcell(directory, _with(workcell="bad_joint", home={"joint.j9.position": 0.0}))
+    write_workcell(directory, WORKCELL_YAML, name="duplicate")
+    (directory / "broken.yaml").write_text("workcell: [unclosed", encoding="utf-8")
+
+    admitted, report = load_workcells(directory, SkillNodeRegistry())
+
+    assert list(admitted) == [WORKCELL_ID]
+    reasons = {note.workcell or Path(note.source).stem: note.detail for note in report.rejected}
+    assert "not declared" in reasons["ghost"]
+    assert "outside its envelope" in reasons["far_home"]
+    assert "not a writable channel" in reasons["bad_joint"]
+    assert reasons["piper_cell"] == "duplicate workcell id"
+    assert "broken" in reasons
+
+
+def test_missing_directory_admits_nothing(tmp_path: Path) -> None:
+    admitted, report = load_workcells(tmp_path / "absent", SkillNodeRegistry())
+    assert admitted == {} and report.rejected == ()
+
+
+def test_frames_resolve_from_the_latest_calibration_preferring_a_matrix(tmp_path: Path) -> None:
+    registry = SkillNodeRegistry(store_path=tmp_path / "instrument.duckdb")
+    spec = WorkcellSpec.from_mapping(
+        _with(
+            roles={"arm": ARM_ID, "camera": ARM_ID},
+            frames={
+                "tcp": {"parent": "flange", "procedure": "tcp.offset"},
+                "camera": {"parent": "base", "procedure": "handeye.eye_to_hand"},
+            },
+        )
+    )
+    registry.calibrate("tcp.offset", pose={"x": 0, "y": 0, "z": 100}, recorded_at=1.0)
+    registry.calibrate("tcp.offset", pose={"x": 0, "y": 0, "z": 120}, recorded_at=2.0)
+    store = registry.calibration_store
+    assert store is not None
+    from leapflow.hardware.calibration_store import CalibrationRecord
+
+    matrix = [[1, 0, 0, 500], [0, 1, 0, 0], [0, 0, 1, 600], [0, 0, 0, 1]]
+    assert store.record(
+        CalibrationRecord(
+            device_id=WORKCELL_ID,
+            procedure_id="handeye.eye_to_hand",
+            recorded_at=3.0,
+            matrix=matrix,
+            pose={"x": 1, "y": 1, "z": 1},
+        )
+    )
+    frames = FrameGraph.snapshot(spec, store)
+    tcp, camera = frames.transform("tcp"), frames.transform("camera")
+    assert tcp is not None and tcp.to_pose().z == pytest.approx(120)
+    assert camera is not None and camera.to_pose().x == pytest.approx(500)
+    assert frames.versions == {"tcp": 2.0, "camera": 3.0}
+    assert frames.parent("camera") == "base" and frames.parent("nope") == ""
+    assert frames.workspace is None
+
+
+def test_a_malformed_calibration_is_ignored_not_trusted(tmp_path: Path) -> None:
+    registry = SkillNodeRegistry(store_path=tmp_path / "instrument.duckdb")
+    registry.calibrate("workspace.safe_box", parameters={"x": [1, 0]})
+    frames = FrameGraph.snapshot(WorkcellSpec.from_mapping(WORKCELL_YAML), registry.calibration_store)
+    assert frames.workspace is None and "workspace" not in frames.versions
+
+
+def test_unmet_requirements_name_the_procedure_to_run() -> None:
+    spec = WorkcellSpec.from_mapping(WORKCELL_YAML)
+    frames = FrameGraph(spec, {}, None, {})
+    reasons = unmet_requirements(
+        ("role:arm", "role:camera", "calib:tcp", "calib:camera", "bogus"), spec, frames
+    )
+    assert reasons == [
+        f"workcell {WORKCELL_ID!r} binds no camera",
+        "tcp is not calibrated (run calib.tcp)",
+        "camera is not calibrated (run calib.handeye)",
+        "unknown requirement 'bogus'",
+    ]
+
+
+def test_roles_are_open_and_every_bound_device_is_leased(tmp_path: Path) -> None:
+    spec = WorkcellSpec.from_mapping(
+        _with(roles={"arm": ARM_ID, "camera": "cam_top", "camera.wrist": "cam_wrist"})
+    )
+
+    assert spec.role("camera.wrist") == "cam_wrist"
+    assert spec.device_ids == (ARM_ID, "cam_top", "cam_wrist")
+    assert spec.actuator_ids == (ARM_ID,), "a camera-kind role is no actuator by kind"
+    assert role_kind("camera.wrist") == "camera"
+    assert unmet_requirements(("role:camera.wrist",), spec, FrameGraph(spec, {}, None, {})) == []
+
+
+def test_admission_halts_every_writable_device_and_checks_each_role_kind(tmp_path: Path) -> None:
+    directory = tmp_path / "workcells"
+    write_workcell(directory, _with(roles={"arm": ARM_ID, "gripper.aux": ARM_ID}))
+    write_workcell(
+        directory, _with(workcell="no_wrist", roles={"arm": ARM_ID, "camera.wrist": "absent"})
+    )
+
+    admitted, report = load_workcells(directory, SkillNodeRegistry())
+
+    assert admitted[WORKCELL_ID].actuator_ids == (ARM_ID,)
+    assert admitted[WORKCELL_ID].role("gripper.aux") == ARM_ID
+    (note,) = report.rejected
+    assert note.workcell == "no_wrist" and "camera.wrist device 'absent'" in note.detail
+
+
+def test_a_speed_cap_below_the_arms_lowest_speed_is_refused(tmp_path: Path) -> None:
+    directory = tmp_path / "workcells"
+    registry = SkillNodeRegistry()
+    floor = registry.context(ARM_ID).channel(SPEED_CHANNEL).envelope.min_value
+    assert floor is not None and floor > 0
+    write_workcell(directory, _with(limits={"speed_pct_max": floor / 2, "default_speed_pct": 0.1}))
+
+    admitted, report = load_workcells(directory, registry)
+
+    assert admitted == {}
+    assert "below the arm's lowest commandable speed" in report.rejected[0].detail

@@ -337,8 +337,7 @@ class ReadingStore:
         moment = now if now is not None else time.monotonic()
         interval = self._current_interval(moment)
         return any(
-            moment - self._window_start.get(key, moment) >= interval
-            for key in self._pending
+            moment - self._window_start.get(key, moment) >= interval for key in self._pending
         )
 
     def drain(self, *, force: bool = False, now: float | None = None) -> tuple[ReadingBatch, ...]:
@@ -564,9 +563,7 @@ class ReadingStore:
             )
             self._db_registered = True
         except Exception as exc:  # noqa: BLE001 - indexing must not break sampling
-            logger.warning(
-                "Could not index hardware history database %s: %s", self._db_path, exc
-            )
+            logger.warning("Could not index hardware history database %s: %s", self._db_path, exc)
 
     @staticmethod
     def _ensure_schema(connection: Any) -> None:

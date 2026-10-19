@@ -78,7 +78,9 @@ class EvidenceStore:
                 a ``LocalConnectionHolder`` from *db_path*.
         """
         self._db_path = Path(db_path)
-        self._frames_dir = Path(frames_dir) if frames_dir is not None else self._db_path.parent / "evidence_frames"
+        self._frames_dir = (
+            Path(frames_dir) if frames_dir is not None else self._db_path.parent / "evidence_frames"
+        )
         self._retention_days = max(0.0, float(retention_days))
         self._max_frames_mb = max(0.0, float(max_frames_mb))
 
@@ -396,9 +398,7 @@ class EvidenceStore:
         Returns a dict with total, success, failure, inconclusive counts
         and a success_rate in [0.0, 1.0].
         """
-        return await asyncio.to_thread(
-            self._success_rate_sync, device_id, channel_id, window_days
-        )
+        return await asyncio.to_thread(self._success_rate_sync, device_id, channel_id, window_days)
 
     def _success_rate_sync(
         self,
@@ -425,7 +425,11 @@ class EvidenceStore:
             return result
 
         cutoff = time.time() - window_days * 86400.0
-        conditions = ["device_id = ?", "timestamp >= ?", f"schema_version = {EVIDENCE_SCHEMA_VERSION}"]
+        conditions = [
+            "device_id = ?",
+            "timestamp >= ?",
+            f"schema_version = {EVIDENCE_SCHEMA_VERSION}",
+        ]
         params: list[Any] = [device_id, cutoff]
         if channel_id is not None:
             conditions.append("channel_id = ?")

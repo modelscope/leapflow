@@ -21,6 +21,8 @@ from typing import Any
 
 from leapflow.daemon._service_helpers import (
     ProducerServices as _ProducerServices,
+)
+from leapflow.daemon._service_helpers import (
     checkpoint_open_connection,
     engine_context_metadata,
     engine_runtime_extras,
@@ -574,7 +576,6 @@ class RuntimeLeapService:
                 physical_source = PhysicalEnvironmentSource(
                     hardware_registry,
                     evidence_store=getattr(hardware_registry, "evidence_store", None),
-                    capability_index=getattr(hardware_registry, "capability_index", None),
                 )
                 manager.register(physical_source)
                 registered_any = True

@@ -51,12 +51,8 @@ _BUILTIN_PLUGIN_MODULES = (
     # tool_describe).  Read-only CORE tools; appended after desktop_semantic so
     # existing tool-index ordering is preserved.
     "leapflow.plugins.tool_plugins.bridge",
-    # Hardware plugins contribute no tools until a hardware registry is bound.
-    # Physical skills precede capability routing so policy-backed affordances can
-    # resolve the skill plugin when runtime dependencies are assembled.
+    # Hardware contributes no tools until a hardware registry is bound.
     "leapflow.hardware.plugin",
-    "leapflow.plugins.tool_plugins.physical_skill",
-    "leapflow.hardware.capability_router",
 )
 
 

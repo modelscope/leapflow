@@ -31,6 +31,12 @@ from leapflow.engine.tools.tool_execution import (
     execution_policy_for,
 )
 from leapflow.engine.tools.tool_guardrails import FailureFingerprint
+from leapflow.engine.tools.tool_attachments import (
+    ToolAttachment,
+    model_sees_images,
+    present_attachments,
+    take_attachments,
+)
 from leapflow.engine.recovery.recovery_audit import create_audit_entry
 from leapflow.engine.recovery.recovery_decision import RecoveryAction, RecoveryDecision
 from leapflow.engine.recovery.failure_envelope import Recoverability
@@ -60,6 +66,9 @@ class ToolDispatchEngine:
 
     def __init__(self, engine: "AgentEngine") -> None:
         self._engine = engine
+        # Images popped from tool results, keyed by tool_call_id, until the
+        # batch that produced them shows them to the model.
+        self._attachments: Dict[str, tuple[ToolAttachment, ...]] = {}
 
     def _check_guardrail(
         self,
@@ -543,6 +552,49 @@ class ToolDispatchEngine:
         trace: ExecutionTrace,
         messages: List[Dict[str, Any]],
     ) -> list[Dict[str, Any]]:
+        """Execute a batch of native tool calls, then show the images they returned."""
+        executed = await self._execute_tool_batch(
+            native_calls, handlers, trace=trace, messages=messages
+        )
+        await self.append_tool_attachments(messages, [str(tc.id) for tc in native_calls])
+        return executed
+
+    async def append_tool_attachments(
+        self, messages: List[Dict[str, Any]], tool_call_ids: List[str]
+    ) -> None:
+        """Append the images these calls returned, after all their tool messages.
+
+        Attachments left over from calls outside a batch were never shown and
+        are dropped, so the store cannot grow across rounds.
+        """
+        attachments = [
+            item for call_id in tool_call_ids for item in self._attachments.pop(call_id, ())
+        ]
+        self._attachments.clear()
+        if not attachments:
+            return
+        engine = self._engine
+        model = getattr(getattr(engine, "_llm", None), "model", None) or getattr(
+            engine._settings, "llm_model", ""
+        )
+        await present_attachments(
+            messages,
+            attachments,
+            keep=int(getattr(engine._settings, "agent_tool_images_kept", 2)),
+            sees_images=model_sees_images(
+                getattr(engine, "_model_capabilities", None), str(model or "")
+            ),
+            vlm=getattr(engine, "_vlm", None),
+        )
+
+    async def _execute_tool_batch(
+        self,
+        native_calls: list,
+        handlers: Dict[str, Any],
+        *,
+        trace: ExecutionTrace,
+        messages: List[Dict[str, Any]],
+    ) -> list[Dict[str, Any]]:
         """Execute native tool calls respecting concurrency policy.
 
         Concurrent group runs via asyncio.gather; sequential group runs one-by-one.
@@ -912,15 +964,27 @@ class ToolDispatchEngine:
         self,
         tool_call: Dict[str, Any],
         handlers: Dict[str, Any],
+        *,
+        tool_call_id: str = "",
     ) -> Dict[str, Any]:
-        """Execute a tool with the current turn's workspace context installed."""
+        """Execute a tool with the current turn's workspace context installed.
+
+        Images the tool attached are popped here, before the ledger, trace or
+        transcript sees the result, and held until the batch shows them.
+        """
         from leapflow.tools.execution_context import reset_tool_context, set_tool_context
 
         token = set_tool_context(self._tool_execution_context())
         try:
-            return await self._execute_general_tool(tool_call, handlers)
+            result = await self._execute_general_tool(tool_call, handlers)
         finally:
             reset_tool_context(token)
+        attachments = take_attachments(
+            result, tool_call_id=tool_call_id, tool_name=str(tool_call.get("name", ""))
+        )
+        if attachments:
+            self._attachments[tool_call_id] = attachments
+        return result
     async def _execute_tool_with_ledger(
         self,
         tool_call: Dict[str, Any],
@@ -941,7 +1005,9 @@ class ToolDispatchEngine:
             execution_id = f"unresolved-{uuid.uuid4().hex}"
 
             async def _run_unresolved() -> Dict[str, Any]:
-                return await self._execute_tool_scoped(tool_call, handlers)
+                return await self._execute_tool_scoped(
+                    tool_call, handlers, tool_call_id=tool_call_id
+                )
 
             unresolved_result = await self._engine._skill_dispatcher._execute_action_boundary(
                 action_type="tool",
@@ -1018,7 +1084,9 @@ class ToolDispatchEngine:
 
         async def _execute_and_finalize() -> Dict[str, Any]:
             try:
-                result = await self._execute_tool_scoped(normalized_call, handlers)
+                result = await self._execute_tool_scoped(
+                    normalized_call, handlers, tool_call_id=tool_call_id
+                )
             except Exception as exc:
                 failed_result: Dict[str, Any] = {
                     "ok": False,
@@ -1273,6 +1341,8 @@ class ToolDispatchEngine:
         count = 0
         for msg in reversed(messages):
             role = msg.get("role", "")
+            if msg.get("_tool_attachment"):
+                continue  # images a tool returned, not a user turn boundary
             if role == "user":
                 # Reached the current turn boundary — stop scanning.
                 break

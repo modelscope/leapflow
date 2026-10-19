@@ -63,8 +63,7 @@ def configured_nodes_from_settings(raw: str = "") -> tuple[FleetNode, ...]:
         )
         if not node.node_id or not node.endpoint:
             logger.warning(
-                "Fleet: ignoring %s entry #%d without node_id/endpoint "
-                "(node_id=%r, endpoint=%r)",
+                "Fleet: ignoring %s entry #%d without node_id/endpoint (node_id=%r, endpoint=%r)",
                 source,
                 index,
                 node.node_id,
@@ -109,9 +108,7 @@ async def register_nodes_safely(
             # but not alarming.  P2 owns retry/backoff and re-registration.
             logger.warning("Fleet: node %r not registered: %s", node.node_id, result)
         elif isinstance(result, BaseException):
-            logger.warning(
-                "Fleet: node %r registration raised", node.node_id, exc_info=result
-            )
+            logger.warning("Fleet: node %r registration raised", node.node_id, exc_info=result)
         else:
             registered.append(result)
     return tuple(registered)

@@ -184,7 +184,9 @@ class McpTransport:
         except Exception as exc:  # noqa: BLE001 - best-effort capability check
             logger.debug(
                 "Could not enumerate MCP server tools for %s: %s",
-                self._server, exc, exc_info=True,
+                self._server,
+                exc,
+                exc_info=True,
             )
             return  # Cannot check — degrade gracefully, do not fail.
 

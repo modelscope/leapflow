@@ -563,6 +563,12 @@ class ToolEvidenceBuilder:
         for key in ("error_type", "retryable", "missing", "accepted_parameters", "required", "match_count", "failure_code"):
             if key in result:
                 compact[key] = self._compact_value(result[key])
+        # Classification markers decide whether the turn hard-stops and which
+        # deterministic recovery text the user receives; dropping them turns a
+        # fail-closed refusal (e.g. device readiness) into a generic failure.
+        for key in ("failure_class", "recoverability", "blocks_approval"):
+            if key in result:
+                compact[key] = self._compact_value(result[key])
         # Diagnostic output matters MOST on failure: preserve stdout/stderr
         # (head+tail so the tail traceback survives) and the exit code, so the
         # agent can see the actual error (e.g. a Python traceback from a failed

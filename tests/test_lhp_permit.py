@@ -2,8 +2,9 @@
 """Tests for the LHP v2 execution permit system.
 
 Covers: signing/verification, tamper rejection, unknown key, audience mismatch,
-digest mismatch, expiry, clock skew, nonce replay, pre-boot rejection, batch
-digest, observe-only/trusted_v1 node modes, permit-required local refusal.
+digest mismatch, expiry, clock skew, nonce replay, pre-boot rejection, request
+digest, observe-only/trusted_v1 node modes, permit-required local refusal, and
+the node binding a permit to the request it actually received.
 """
 
 from __future__ import annotations
@@ -14,27 +15,28 @@ import pytest
 
 from leapflow.hardware.lhp.permit import (
     DEFAULT_PERMIT_TTL_S,
-    MAX_CLOCK_SKEW_S,
     ExecutionPermit,
     PermitIssuer,
     PermitVerifier,
-    action_digest,
     generate_keypair,
     key_id_from_public,
-    public_key_pem,
     public_key_from_pem,
+    public_key_pem,
+    request_digest,
 )
 from leapflow.hardware.lhp.protocol import (
     FAILURE_PERMIT_REQUIRED,
     FAILURE_WRITES_DISABLED,
 )
 from leapflow.hardware.lhp.server import (
-    LhpNodeServer,
     WRITE_MODE_OBSERVE_ONLY,
     WRITE_MODE_PERMIT_REQUIRED,
     WRITE_MODE_TRUSTED_V1,
+    LhpNodeServer,
 )
 from leapflow.hardware.transport import SIDE_EFFECT_NONE
+
+_WRITE_PARAMS = {"device_id": "arm", "channel_id": "ch", "value": 1.0}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -57,42 +59,40 @@ def _issue(issuer: PermitIssuer, *, audience: str = "jetson01", digest: str = ""
         session_id="sess-1",
         workspace="/workspace",
         approval_id="appr-1",
-        digest=digest or action_digest(method="write", device_id="arm", commands=[("joint.shoulder.position", 1.5)]),
+        digest=digest or request_digest("write", _WRITE_PARAMS),
     )
 
 
-# ── action_digest ────────────────────────────────────────────────────────
+# ── request_digest ────────────────────────────────────────────────────────
 
 
-class TestActionDigest:
-    def test_deterministic(self) -> None:
-        d1 = action_digest(method="write", device_id="arm", commands=[("ch", 1.0)])
-        d2 = action_digest(method="write", device_id="arm", commands=[("ch", 1.0)])
+class TestRequestDigest:
+    def test_deterministic_and_key_order_free(self) -> None:
+        d1 = request_digest("write", {"device_id": "arm", "channel_id": "ch", "value": 1.0})
+        d2 = request_digest("write", {"value": 1.0, "channel_id": "ch", "device_id": "arm"})
         assert d1 == d2
+        assert len(d1) == 64  # sha256 hex
 
     def test_different_value_different_digest(self) -> None:
-        d1 = action_digest(method="write", device_id="arm", commands=[("ch", 1.0)])
-        d2 = action_digest(method="write", device_id="arm", commands=[("ch", 2.0)])
-        assert d1 != d2
+        assert request_digest("write", {"value": 1.0}) != request_digest("write", {"value": 2.0})
+
+    def test_method_is_bound(self) -> None:
+        assert request_digest("write", {"value": 1}) != request_digest("control.open", {"value": 1})
 
     def test_batch_order_matters(self) -> None:
-        d1 = action_digest(method="write_batch", device_id="arm", commands=[("a", 1), ("b", 2)])
-        d2 = action_digest(method="write_batch", device_id="arm", commands=[("b", 2), ("a", 1)])
+        d1 = request_digest("write_batch", {"commands": [["a", 1], ["b", 2]]})
+        d2 = request_digest("write_batch", {"commands": [["b", 2], ["a", 1]]})
         assert d1 != d2
 
-    def test_control_digest(self) -> None:
-        d = action_digest(
-            method="control.open",
-            device_id="arm",
-            mode="position",
-            frequency_hz=50.0,
-            channels=["j1", "j2"],
-            targets={"j1": 0.5, "j2": 1.0},
-            lease_s=1.0,
-            comm_loss_policy="halt",
-        )
-        assert isinstance(d, str)
-        assert len(d) == 64  # sha256 hex
+    def test_permit_param_is_excluded(self) -> None:
+        bare = request_digest("write", _WRITE_PARAMS)
+        assert request_digest("write", {**_WRITE_PARAMS, "permit": {"x": 1}}) == bare
+
+    def test_wire_round_trip_is_stable(self) -> None:
+        # Tuples (host, in-process) and lists (node, decoded JSON) hash alike.
+        host = request_digest("write_batch", {"commands": [("a", 1.5)]})
+        node = request_digest("write_batch", {"commands": [["a", 1.5]]})
+        assert host == node
 
 
 # ── PermitIssuer / PermitVerifier round-trip ─────────────────────────────
@@ -253,7 +253,7 @@ class _MockTransport:
         self.last_write: tuple[str, object] | None = None
 
     async def write(self, channel_id: str, value: object) -> object:
-        from leapflow.hardware.transport import WriteOutcome, SIDE_EFFECT_COMMITTED
+        from leapflow.hardware.transport import SIDE_EFFECT_COMMITTED, WriteOutcome
         self.last_write = (channel_id, value)
         return WriteOutcome(ok=True, side_effect_state=SIDE_EFFECT_COMMITTED)
 
@@ -337,27 +337,50 @@ async def test_trusted_v1_allows_writes_without_permit() -> None:
 @pytest.mark.asyncio
 async def test_permit_required_with_valid_permit_passes() -> None:
     issuer = _make_issuer()
-    verifier = _make_verifier(issuer, node_id="n")
-    server = LhpNodeServer(
-        _MockRegistry(), node_id="n",
-        write_mode=WRITE_MODE_PERMIT_REQUIRED,
-        permit_verifier=verifier,
-    )
+    server = _permit_server(issuer)
     await server.handle_request({"id": 1, "method": "hello", "params": {"protocol": 2}})
-    dig = action_digest(method="write", device_id="arm", commands=[("ch", 1.0)])
-    permit = issuer.issue(
-        audience="n", session_id="s", workspace="/w", approval_id="a", digest=dig,
+    permit = _issue(issuer, audience="n", digest=request_digest("write", _WRITE_PARAMS))
+    result = await server.handle_request(
+        {"id": 2, "method": "write", "params": {**_WRITE_PARAMS, "permit": permit.to_dict()}}
     )
-    result = await server.handle_request({
-        "id": 2,
-        "method": "write",
-        "params": {
-            "device_id": "arm",
-            "channel_id": "ch",
-            "value": 1.0,
-            "permit": permit.to_dict(),
-        },
-    })
     assert result["ok"]
     outcome = result["result"]
     assert outcome["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_valid_permit_for_another_request_is_refused() -> None:
+    """A validly signed permit binds one request: the node recomputes the digest itself."""
+    issuer = _make_issuer()
+    server = _permit_server(issuer)
+    registry = server._registry  # noqa: SLF001 - observe the device
+    await server.handle_request({"id": 1, "method": "hello", "params": {"protocol": 2}})
+    permit = _issue(issuer, audience="n", digest=request_digest("write", _WRITE_PARAMS))
+    tampered = {**_WRITE_PARAMS, "value": 99.0, "permit": permit.to_dict()}
+    result = await server.handle_request({"id": 2, "method": "write", "params": tampered})
+    outcome = result["result"]
+    assert outcome["ok"] is False
+    assert outcome["failure_code"] == "permit_digest_mismatch"
+    assert outcome["side_effect_state"] == SIDE_EFFECT_NONE
+    assert registry._transport.last_write is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_control_open_requires_permit() -> None:
+    issuer = _make_issuer()
+    server = _permit_server(issuer)
+    result = await server.handle_request(
+        {"id": 1, "method": "control.open", "params": {"device_id": "arm", "mode": "pid"}}
+    )
+    outcome = result["result"]
+    assert outcome["ok"] is False
+    assert outcome["failure_code"] == FAILURE_PERMIT_REQUIRED
+
+
+def _permit_server(issuer: PermitIssuer) -> LhpNodeServer:
+    return LhpNodeServer(
+        _MockRegistry(),
+        node_id="n",
+        write_mode=WRITE_MODE_PERMIT_REQUIRED,
+        permit_verifier=_make_verifier(issuer, node_id="n"),
+    )

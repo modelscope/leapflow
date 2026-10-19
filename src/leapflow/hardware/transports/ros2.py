@@ -101,10 +101,10 @@ class ROS2Transport:
 
         # ROS2 runtime state -- populated by open().
         self._node: Any = None
-        self._subscribers: dict[str, Any] = {}   # channel_id -> Subscription
-        self._publishers: dict[str, Any] = {}    # channel_id -> Publisher
+        self._subscribers: dict[str, Any] = {}  # channel_id -> Subscription
+        self._publishers: dict[str, Any] = {}  # channel_id -> Publisher
         self._service_clients: dict[str, Any] = {}  # channel_id -> Client
-        self._latest_msgs: dict[str, Any] = {}   # channel_id -> latest message
+        self._latest_msgs: dict[str, Any] = {}  # channel_id -> latest message
         self._msg_timestamps: dict[str, float] = {}  # channel_id -> monotonic
         self._spin_task: asyncio.Task[None] | None = None
         self._executor: Any = None
@@ -341,7 +341,10 @@ class ROS2Transport:
         received = self._msg_timestamps.get(channel_id, 0.0)
         try:
             preview = await asyncio.to_thread(
-                ros2_image.encode_preview, msg, max_width=int(max_width or 0), quality=int(quality or 0)
+                ros2_image.encode_preview,
+                msg,
+                max_width=int(max_width or 0),
+                quality=int(quality or 0),
             )
         except ros2_image.ImageConversionError as exc:
             raise TransportError(str(exc), failure_code="ros2_frame_unsupported") from exc
@@ -357,7 +360,11 @@ class ROS2Transport:
             monotonic_at=received,
             sequence=self._next_seq(channel_id),
             quality=Quality.OK.value if age < _STALE_THRESHOLD_S else Quality.STALE.value,
-            metadata={**preview.metadata, "topic": self._topics[channel_id], "age_s": round(age, 3)},
+            metadata={
+                **preview.metadata,
+                "topic": self._topics[channel_id],
+                "age_s": round(age, 3),
+            },
         )
 
     async def probe(self) -> TransportStatus:
@@ -510,6 +517,7 @@ class ROS2Transport:
         depth = self._qos_depth if depth is None else depth
         try:
             from rclpy.qos import QoSProfile, ReliabilityPolicy
+
             return QoSProfile(
                 depth=depth,
                 reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -549,7 +557,8 @@ class ROS2Transport:
         except Exception:
             logger.debug(
                 "Could not discover type for topic %r; using String",
-                topic_name, exc_info=True,
+                topic_name,
+                exc_info=True,
             )
 
         # Fallback: use std_msgs/msg/String as a generic carrier.
@@ -572,7 +581,8 @@ class ROS2Transport:
         except Exception:
             logger.debug(
                 "Could not discover type for service %r",
-                service_name, exc_info=True,
+                service_name,
+                exc_info=True,
             )
         return None
 
@@ -769,6 +779,7 @@ def _require_rclpy() -> Any:
     """Return the ``rclpy`` module or raise TransportError."""
     try:
         import rclpy  # type: ignore[import-untyped]
+
         return rclpy
     except ImportError as exc:
         raise TransportError(
@@ -841,13 +852,19 @@ def build_transport(config: Mapping[str, Any]) -> ROS2Transport:
     topic_types = config.get("topic_types")
     return ROS2Transport(
         topics=dict(config.get("topics", {})) if isinstance(config.get("topics"), Mapping) else {},
-        services=dict(config.get("services", {})) if isinstance(config.get("services"), Mapping) else {},
-        actions=dict(config.get("actions", {})) if isinstance(config.get("actions"), Mapping) else {},
+        services=dict(config.get("services", {}))
+        if isinstance(config.get("services"), Mapping)
+        else {},
+        actions=dict(config.get("actions", {}))
+        if isinstance(config.get("actions"), Mapping)
+        else {},
         node_name=str(config.get("node_name", "leapflow_bridge")),
         namespace=str(config.get("namespace", "")),
         qos_depth=int(config.get("qos_depth", 10)),
         spin_period_s=float(config.get("spin_period_s", 0.01)),
-        topic_types={str(k): str(v) for k, v in topic_types.items()} if isinstance(topic_types, Mapping) else {},
+        topic_types={str(k): str(v) for k, v in topic_types.items()}
+        if isinstance(topic_types, Mapping)
+        else {},
     )
 
 

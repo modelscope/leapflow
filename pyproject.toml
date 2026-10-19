@@ -118,6 +118,16 @@ realsense = "leapflow.hardware.drivers.realsense:build_transport"
 # host-only installations stay dependency-free.
 piper = "leapflow.hardware.drivers.piper:build_transport"
 
+# Node skills (S1.5). Built-ins register exactly like third-party skill packs.
+[project.entry-points."leapflow.hardware.skills"]
+builtin_motion = "leapflow.hardware.skills.builtin.motion:skills"
+builtin_calibration = "leapflow.hardware.skills.builtin.calibration:skills"
+builtin_camera_calibration = "leapflow.hardware.skills.builtin.camera_calibration:skills"
+builtin_scene = "leapflow.hardware.skills.builtin.scene:skills"
+builtin_sequence = "leapflow.hardware.skills.builtin.sequence:skills"
+builtin_policy = "leapflow.hardware.skills.builtin.policy:skills"
+builtin_episode = "leapflow.hardware.skills.builtin.episode:skills"
+
 [build-system]
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"

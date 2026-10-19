@@ -42,6 +42,9 @@ _BASE_CONFIG: dict[str, Any] = {"can_name": "can0", "sdk_interface": "v2"}
 _SEED_JOINTS_RAW = [10_000, 20_000, 30_000, 40_000, 50_000, 60_000]
 """Feedback the fake arm starts reporting after ConnectPort: 10..60 deg."""
 
+_SEED_POSE_RAW = [200_000, 0, 300_000, 180_000 - 1_000, 0, 90_000]
+"""End-pose feedback: (200, 0, 300) mm, (179, 0, 90) deg."""
+
 
 def _context() -> HardwareContext:
     payload = yaml.safe_load(_EXAMPLE.read_text(encoding="utf-8"))
@@ -81,6 +84,9 @@ class _FakeArm:
         self.connect_calls = 0
         self.disconnect_calls = 0
         self.joint_ctrl_calls: list[tuple[int, ...]] = []
+        self.pose: list[int] | None = list(_SEED_POSE_RAW)
+        self.end_pose_calls: list[tuple[int, ...]] = []
+        self.fail_end_pose_ctrl = False
         self.gripper_calls: list[tuple[int, int, int, int]] = []
         self.enable_calls: list[tuple[int, int]] = []
         self.disable_calls: list[tuple[int, int]] = []
@@ -132,6 +138,13 @@ class _FakeArm:
         state = SimpleNamespace(**{f"joint_{i}": self.joints[i - 1] for i in range(1, 7)})
         return SimpleNamespace(joint_state=state, time_stamp=self.joint_stamp)
 
+    def GetArmEndPoseMsgs(self) -> SimpleNamespace:
+        if self.pose is None:
+            return SimpleNamespace(end_pose=None)
+        fields = ("X_axis", "Y_axis", "Z_axis", "RX_axis", "RY_axis", "RZ_axis")
+        state = SimpleNamespace(**dict(zip(fields, self.pose)))
+        return SimpleNamespace(end_pose=state)
+
     def GetArmGripperMsgs(self) -> SimpleNamespace:
         if self.gripper_feedback_down:
             return SimpleNamespace(gripper_state=None)
@@ -154,6 +167,11 @@ class _FakeArm:
     def JointCtrl(self, *joints: int) -> None:
         self.joint_ctrl_calls.append(tuple(int(j) for j in joints))
         if self.fail_joint_ctrl:
+            raise RuntimeError("simulated CAN write failure")
+
+    def EndPoseCtrl(self, *pose: int) -> None:
+        self.end_pose_calls.append(tuple(int(p) for p in pose))
+        if self.fail_end_pose_ctrl:
             raise RuntimeError("simulated CAN write failure")
 
     def GripperCtrl(
@@ -254,12 +272,15 @@ def test_example_yaml_is_a_valid_declarative_context() -> None:
 
     expected = {
         *(f"joint.j{i}.position" for i in range(1, 7)),
+        *(f"ee.{axis}" for axis in ("x", "y", "z", "rx", "ry", "rz")),
         "gripper.position",
         "gripper.effort",
         "arm.enable",
         "arm.enabled",
         "arm.status",
         "arm.motion",
+        "arm.speed_pct",
+        "arm.pose_path",
     }
     assert {channel.channel_id for channel in context.channels} == expected
 
@@ -280,6 +301,11 @@ def test_example_yaml_is_a_valid_declarative_context() -> None:
     assert enable.envelope.allowed_values == (0, 1)
     assert context.channel("joint.j1.position").is_writable
     assert context.channel("arm.enabled").is_readable
+    ee_z = context.channel("ee.z")
+    assert ee_z is not None and ee_z.is_writable
+    assert ee_z.unit == "mm"
+    assert ee_z.envelope.tolerance == 2.0
+    assert context.transport.config["pose_move_mode"] == "linear"
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -395,6 +421,13 @@ def test_invalid_sdk_interface_is_rejected_at_construction() -> None:
     assert error.value.failure_code == "piper_invalid_config"
 
 
+def test_invalid_pose_move_mode_is_rejected_at_construction() -> None:
+    with pytest.raises(TransportError) as error:
+        PiperArmTransport({"pose_move_mode": "circular"})
+
+    assert error.value.failure_code == "piper_invalid_config"
+
+
 def test_invalid_crash_protection_levels_are_rejected_at_construction() -> None:
     with pytest.raises(TransportError) as error:
         PiperArmTransport({"crash_protection_levels": [1, 2, 3]})
@@ -455,6 +488,179 @@ def test_send_failure_reports_an_unknown_side_effect_and_persists_nothing(
     asyncio.run(transport.write("joint.j3.position", -35.0))
     # The failed command never became the hold vector: j1 stays at feedback.
     assert arm.joint_ctrl_calls[-1] == (10_000, 20_000, -35_000, 40_000, 50_000, 60_000)
+
+
+# ── End-effector pose ─────────────────────────────────────────────────────────
+
+
+def test_pose_reads_convert_sdk_units(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, _arm, _ = _open_transport(monkeypatch)
+
+    z = asyncio.run(transport.read("ee.z"))
+    batch = asyncio.run(transport.read_batch(("ee.x", "ee.rx", "joint.j1.position")))
+
+    assert z.value == pytest.approx(300.0)
+    assert z.unit == "mm"
+    values = [reading.value for reading in batch.readings]
+    assert values == [pytest.approx(200.0), pytest.approx(179.0), pytest.approx(10.0)]
+
+
+def test_pose_write_switches_to_move_l_and_holds_unnamed_axes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+
+    outcome = asyncio.run(transport.write("ee.z", 400.0))
+
+    assert outcome.ok is True
+    assert outcome.side_effect_state == SIDE_EFFECT_COMMITTED
+    assert arm.end_pose_calls == [(200_000, 0, 400_000, 179_000, 0, 90_000)]
+    assert arm.mode_calls[-1] == {"ctrl_mode": 1, "move_mode": 0x02, "move_spd_rate_ctrl": 20}
+    assert arm.joint_ctrl_calls == []
+
+
+def test_point_pose_mode_selects_move_p(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch, {"pose_move_mode": "point"})
+
+    asyncio.run(transport.write("ee.x", 250.0))
+
+    assert arm.mode_calls[-1]["move_mode"] == 0x00
+
+
+def test_mode_is_reselected_only_on_a_space_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+
+    asyncio.run(transport.write("ee.z", 400.0))
+    asyncio.run(transport.write("ee.z", 410.0))
+    asyncio.run(transport.write("joint.j1.position", 15.0))
+
+    assert [call["move_mode"] for call in arm.mode_calls] == [0x01, 0x02, 0x01]
+    # The second pose write held the first one's command, not stale feedback.
+    assert arm.end_pose_calls[1] == (200_000, 0, 410_000, 179_000, 0, 90_000)
+
+
+def test_pose_write_invalidates_the_joint_hold_vector(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After a pose move the old joint command no longer describes the arm."""
+    transport, arm, _ = _open_transport(monkeypatch)
+    asyncio.run(transport.write("joint.j1.position", 15.0))
+    asyncio.run(transport.write("ee.z", 400.0))
+    arm.joints = [11_000, 21_000, 31_000, 41_000, 51_000, 61_000]  # where IK put it
+
+    asyncio.run(transport.write("joint.j3.position", -35.0))
+
+    assert arm.joint_ctrl_calls[-1] == (11_000, 21_000, -35_000, 41_000, 51_000, 61_000)
+
+
+def test_mixed_motion_space_batch_is_refused_before_any_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+
+    batch = asyncio.run(
+        transport.write_batch(
+            (("joint.j1.position", 15.0), ("ee.z", 400.0), ("gripper.position", 30.0))
+        )
+    )
+
+    assert batch.ok is False
+    assert batch.side_effect_state == SIDE_EFFECT_NONE
+    assert {outcome.failure_code for outcome in batch.outcomes} == {"mixed_motion_space"}
+    assert arm.joint_ctrl_calls == [] and arm.end_pose_calls == [] and arm.gripper_calls == []
+
+
+def test_pose_batch_merges_into_one_end_pose_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+
+    batch = asyncio.run(
+        transport.write_batch((("ee.x", 250.0), ("ee.z", 350.0), ("gripper.position", 30.0)))
+    )
+
+    assert batch.ok is True
+    assert arm.end_pose_calls == [(250_000, 0, 350_000, 179_000, 0, 90_000)]
+    assert arm.gripper_calls == [(30_000, 500, 1, 0)]
+
+
+def test_pose_envelope_violation_refuses_before_any_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+
+    outcome = asyncio.run(transport.write("ee.z", 5_000.0))
+
+    assert outcome.failure_code == "value_out_of_range"
+    assert outcome.side_effect_state == SIDE_EFFECT_NONE
+    assert arm.end_pose_calls == []
+    assert len(arm.mode_calls) == 1  # no mode switch for a refused command
+
+
+def test_pose_send_failure_is_unknown_and_drops_both_hold_caches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+    asyncio.run(transport.write("joint.j1.position", 15.0))
+    arm.fail_end_pose_ctrl = True
+
+    outcome = asyncio.run(transport.write("ee.z", 400.0))
+
+    assert outcome.side_effect_state == SIDE_EFFECT_UNKNOWN
+    assert outcome.failure_code == "piper_send_failed"
+    arm.fail_end_pose_ctrl = False
+    asyncio.run(transport.write("joint.j3.position", -35.0))
+    # j1 re-seeds from feedback (10 deg), not from the pre-failure command.
+    assert arm.joint_ctrl_calls[-1] == (10_000, 20_000, -35_000, 40_000, 50_000, 60_000)
+
+
+def test_missing_pose_feedback_refuses_with_no_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.pose = None
+
+    outcome = asyncio.run(transport.write("ee.z", 400.0))
+
+    assert outcome.failure_code == "piper_no_feedback"
+    assert outcome.side_effect_state == SIDE_EFFECT_NONE
+    assert arm.end_pose_calls == []
+
+
+# ── Speed rate ────────────────────────────────────────────────────────────────
+
+
+def test_speed_write_sends_nothing_and_the_next_motion_carries_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+    asyncio.run(transport.write("ee.z", 400.0))
+    modes_before = len(arm.mode_calls)
+
+    outcome = asyncio.run(transport.write("arm.speed_pct", 10))
+
+    assert outcome.ok is True
+    assert outcome.side_effect_state == SIDE_EFFECT_COMMITTED
+    assert outcome.readback is not None and outcome.readback.value == 10.0
+    assert len(arm.mode_calls) == modes_before  # no frame until the next motion
+    asyncio.run(transport.write("ee.z", 410.0))
+    assert arm.mode_calls[-1] == {"ctrl_mode": 1, "move_mode": 0x02, "move_spd_rate_ctrl": 10}
+    assert asyncio.run(transport.read("arm.speed_pct")).value == 10.0
+
+
+def test_speed_in_a_batch_applies_before_the_motion(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+
+    batch = asyncio.run(transport.write_batch((("ee.z", 350.0), ("arm.speed_pct", 5))))
+
+    assert batch.ok is True
+    assert arm.mode_calls[-1]["move_spd_rate_ctrl"] == 5
+
+
+def test_speed_outside_the_envelope_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+
+    outcome = asyncio.run(transport.write("arm.speed_pct", 150))
+
+    assert outcome.failure_code == "value_out_of_range"
+    assert outcome.side_effect_state == SIDE_EFFECT_NONE
+    assert asyncio.run(transport.read("arm.speed_pct")).value == 20.0
 
 
 # ── Batch writes ──────────────────────────────────────────────────────────────

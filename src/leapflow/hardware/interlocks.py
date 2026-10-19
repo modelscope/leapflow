@@ -46,7 +46,9 @@ async def failed_interlocks(
         for ch in getattr(context, "channels", ()):
             ch_obj = ch if not isinstance(ch, str) else context.channel(ch)
             if ch_obj is not None:
-                for name in getattr(getattr(ch_obj, "envelope", None), "requires_interlocks", ()) or ():
+                for name in (
+                    getattr(getattr(ch_obj, "envelope", None), "requires_interlocks", ()) or ()
+                ):
                     if name not in required:
                         required.append(name)
 
