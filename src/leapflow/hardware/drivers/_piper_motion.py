@@ -17,6 +17,11 @@ side-effect verdicts, while this module owns the vendor-facing encoding:
   longer describes where the arm is, and holding it would jump the arm back.
   A send that raised leaves the arm in an unknown place, so both caches are
   dropped and the next command re-seeds from feedback.
+- **Control-mode entry.** The Piper X firmware drops a CAN selection issued
+  while the arm is in standby: the frame is sent, nothing reports a failure,
+  and ``ctrl_mode`` stays ``0x00``. The vendor manual therefore prescribes a
+  standby -> CAN handshake, which ``mode_switch="standby_then_can"`` performs
+  and verifies against feedback instead of trusting the send.
 - **Units.** Pose feedback and commands are 0.001 mm (X/Y/Z) and 0.001 deg
   (RX/RY/RZ): the same uniform 1e-3 scale as joints, gripper stroke and effort.
 """
@@ -24,16 +29,32 @@ side-effect verdicts, while this module owns the vendor-facing encoding:
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any, Iterable
+
+from leapflow.hardware.transport import TransportError
 
 SCALE = 1000.0
 """SDK-native quantization: declared unit value * 1000 == raw integer."""
 
+CTRL_MODE_STANDBY = 0x00
 CTRL_MODE_CAN = 0x01
+CTRL_MODE_TEACH = 0x02
+CTRL_MODE_NAMES: dict[int, str] = {
+    CTRL_MODE_STANDBY: "standby",
+    CTRL_MODE_CAN: "can",
+    CTRL_MODE_TEACH: "teach",
+}
+MODE_SWITCH_DIRECT = "direct"
+MODE_SWITCH_STANDBY_THEN_CAN = "standby_then_can"
+MODE_SWITCHES: tuple[str, ...] = (MODE_SWITCH_DIRECT, MODE_SWITCH_STANDBY_THEN_CAN)
 MOVE_P = 0x00
 MOVE_J = 0x01
 MOVE_L = 0x02
 POSE_MOVE_MODES: dict[str, int] = {"linear": MOVE_L, "point": MOVE_P}
+
+_MODE_POLL_S = 0.02
+_MODE_RETRY_S = 0.15
 
 SPACE_JOINT = "joint"
 SPACE_POSE = "pose"
@@ -146,6 +167,22 @@ def status_feedback(arm: Any) -> Any:
     return feedback
 
 
+def ctrl_mode(arm: Any) -> int | None:
+    """The control mode the firmware reports (0x00 standby, 0x01 CAN, ...), if any."""
+    feedback = status_feedback(arm)
+    if feedback is None:
+        return None
+    return as_int(attr(feedback, "ctrl_mode"))
+
+
+def ctrl_mode_name(value: Any) -> str | None:
+    """The declared name of a raw control mode, or None when there is no value."""
+    mode = as_int(value)
+    if mode is None:
+        return None
+    return CTRL_MODE_NAMES.get(mode, f"other(0x{mode:02X})")
+
+
 def enable_status(arm: Any) -> list[bool] | None:
     """Return the per-motor enable list, or None when unavailable."""
     try:
@@ -181,10 +218,23 @@ class PiperMotion:
     concurrent writers can neither interleave vectors nor race a mode switch.
     """
 
-    def __init__(self, *, speed_pct: int, pose_move_mode: int) -> None:
+    def __init__(
+        self,
+        *,
+        speed_pct: int,
+        pose_move_mode: int,
+        mode_switch: str = MODE_SWITCH_DIRECT,
+        mode_timeout_s: float = 0.6,
+    ) -> None:
+        if mode_switch not in MODE_SWITCHES:
+            raise ValueError(
+                f"mode_switch must be one of {list(MODE_SWITCHES)}, got {mode_switch!r}"
+            )
         self._lock = threading.Lock()
         self._speed_pct = speed_pct
         self._pose_move_mode = pose_move_mode
+        self._mode_switch = mode_switch
+        self._mode_timeout_s = max(0.1, float(mode_timeout_s))
         self._mode: int | None = None
         self._commanded: dict[str, list[int | None]] = {
             SPACE_JOINT: [None] * 6,
@@ -268,21 +318,95 @@ class PiperMotion:
             self._commanded[other] = [None] * 6
             return snapshot
 
+    def invalidate_mode(self) -> None:
+        """Force the next command to re-select, e.g. after an untracked mode change."""
+        with self._lock:
+            self._mode = None
+
+    def enter_can(self, arm: Any) -> None:
+        """Walk into CAN command mode through the verified handshake, unconditionally.
+
+        Needed after an event that resets the mode behind our back — a resume
+        from a latched emergency stop returns the firmware to standby, and an
+        ``EnableArm`` issued there is silently ignored.
+        """
+        with self._lock:
+            self._mode = None
+            self._enter_can(arm)
+
+    def ensure_can(self, arm: Any) -> None:
+        """Enter CAN mode only when the arm reports something else.
+
+        A gripper write does not go through the motion path, so it needs the
+        same guarantee ``_select`` gives a motion: in standby the firmware
+        drops commands while every later write still reports success. An arm
+        already in CAN is left untouched, so an energized arm is never disturbed.
+        """
+        with self._lock:
+            if self._mode_switch != MODE_SWITCH_STANDBY_THEN_CAN:
+                return
+            if ctrl_mode(arm) == CTRL_MODE_CAN:
+                return
+            self._mode = None
+            self._enter_can(arm)
+
     def _select(self, arm: Any, mode: int) -> None:
         # Unknown until the frame is accepted: a raising ModeCtrl must force a
         # re-select on the next command rather than trust a stale mode.
         self._mode = None
+        if self._mode_switch == MODE_SWITCH_STANDBY_THEN_CAN and ctrl_mode(arm) != CTRL_MODE_CAN:
+            self._enter_can(arm)
+        self._send_mode(arm, CTRL_MODE_CAN, mode)
+        self._mode = mode
+
+    def _enter_can(self, arm: Any) -> None:
+        """Walk the arm from standby/teach into CAN command mode, verified.
+
+        The firmware honours only the CAN selection that follows a standby
+        frame, and a selection issued while an emergency stop is latched (or
+        while the firmware is still settling from a resume) is dropped on the
+        floor without an error. So each attempt sends the pair and the outcome
+        is read back from feedback; attempts repeat until the deadline, which
+        turns a dropped frame into a retry and a real refusal into a typed
+        failure instead of a silent no-op.
+        """
+        deadline = time.monotonic() + self._mode_timeout_s
+        while True:
+            if ctrl_mode(arm) == CTRL_MODE_CAN:
+                return
+            self._send_mode(arm, CTRL_MODE_STANDBY, MOVE_J)
+            self._send_mode(arm, CTRL_MODE_CAN, MOVE_J)
+            window = min(deadline, time.monotonic() + _MODE_RETRY_S)
+            while time.monotonic() < window:
+                time.sleep(_MODE_POLL_S)
+                if ctrl_mode(arm) == CTRL_MODE_CAN:
+                    return
+            if time.monotonic() >= deadline:
+                seen = ctrl_mode_name(ctrl_mode(arm)) or "no feedback"
+                raise TransportError(
+                    f"the arm did not enter {ctrl_mode_name(CTRL_MODE_CAN)} mode within "
+                    f"{self._mode_timeout_s:.1f}s (it reports {seen}); check the teach "
+                    "switch, the pendant state, and whether an emergency stop is latched",
+                    failure_code="piper_mode_switch_refused",
+                )
+
+    def _send_mode(self, arm: Any, ctrl_mode_raw: int, move_mode: int) -> None:
         arm.ModeCtrl(
-            ctrl_mode=CTRL_MODE_CAN,
-            move_mode=mode,
+            ctrl_mode=ctrl_mode_raw,
+            move_mode=move_mode,
             move_spd_rate_ctrl=self._speed_pct,
         )
-        self._mode = mode
 
 
 __all__ = [
     "CTRL_MODE_CAN",
+    "CTRL_MODE_NAMES",
+    "CTRL_MODE_STANDBY",
+    "CTRL_MODE_TEACH",
     "JOINT_CHANNELS",
+    "MODE_SWITCHES",
+    "MODE_SWITCH_DIRECT",
+    "MODE_SWITCH_STANDBY_THEN_CAN",
     "MOVE_J",
     "MOVE_L",
     "MOVE_P",
@@ -292,6 +416,8 @@ __all__ = [
     "SPACE_JOINT",
     "SPACE_POSE",
     "PiperMotion",
+    "ctrl_mode",
+    "ctrl_mode_name",
     "motion_space",
     "motion_spaces",
     "parse_joints",

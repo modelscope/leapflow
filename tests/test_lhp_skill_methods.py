@@ -228,7 +228,7 @@ async def test_busy_refusal_does_not_burn_the_permit(tmp_path: Path) -> None:
     )
     await _until(lambda: node.sim.batches)
 
-    second = await node.plan("motion.home", {})
+    second = await node.plan(SEQUENCE, move_by(25))
     request = {
         "plan_digest": second["plan"]["digest"],
         "permit": node.permit(second["permit_digest"]),

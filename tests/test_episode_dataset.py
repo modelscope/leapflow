@@ -13,13 +13,22 @@ from __future__ import annotations
 
 import json
 import math
+import runpy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 import pytest
 
 from leapflow.hardware.skills.adapt import EpisodeEncoder
-from leapflow.hardware.skills.adapt.spec import stats_checksum
+from leapflow.hardware.skills.adapt.observe import fit_image
+from leapflow.hardware.skills.adapt.spec import (
+    FIT_CROP,
+    FIT_PAD,
+    FIT_STRETCH,
+    ImageSpec,
+    stats_checksum,
+)
 from leapflow.hardware.skills.episode_dataset import (
     SPACE_EE,
     SPACE_JOINT,
@@ -58,6 +67,7 @@ from tests._harness.skill_stubs import (
 
 TOL = 1e-6
 _ANGLES = {"ee.rx", "ee.ry", "ee.rz"}
+_CONVERTER = Path(__file__).parents[1] / "temp" / "devices" / "deployment" / "convert_to_lerobot.py"
 
 
 # ── A synthetic dataset ──────────────────────────────────────────────────────
@@ -239,6 +249,52 @@ def test_a_model_dataset_keys_images_by_the_policys_camera_names(tmp_path: Path)
     shown = RecordedEpisode({"episode_id": "b", "cameras": ["realsense"]}, (), True)
     assert camera_keys([shown], model=True) == {"realsense": "realsense"}  # no policy ran
     assert training_space(SPACE_EE, [shown]).fps is None
+
+
+def test_converter_keeps_model_fitting_when_a_camera_key_is_renamed(tmp_path: Path) -> None:
+    image_module = pytest.importorskip("PIL.Image")
+    (tmp_path / "frame.png").parent.mkdir(exist_ok=True)
+    image_module.new("RGB", (8, 4), "red").save(tmp_path / "frame.png")
+    policy = {"cameras": {"top": "realsense"}}
+    episode = RecordedEpisode(
+        {"episode_id": "a", "cameras": ["realsense"], "annotations": {"policy": policy}},
+        ({"camera_frames": {"realsense": "frame.png"}},),
+        True,
+    )
+    declared = ImageSpec(width=6, height=6, fit=FIT_CROP)
+    space = SimpleNamespace(action_names=(), state_names=(), image_specs={"top": declared})
+    converter = runpy.run_path(str(_CONVERTER))
+    streams = converter["_camera_streams"](
+        [episode], space, model=True, renames={"realsense": "front"}
+    )
+    assert [(stream.device, stream.key, stream.spec) for stream in streams] == [
+        ("realsense", "front", declared)
+    ]
+    spec = converter["features"](tmp_path, [episode], space, streams)
+    assert spec["observation.images.front"]["shape"] == (6, 6, 3)
+
+
+@pytest.mark.parametrize("fit", [FIT_STRETCH, FIT_CROP, FIT_PAD])
+def test_converter_reuses_inference_image_fitting(tmp_path: Path, fit: str) -> None:
+    image_module = pytest.importorskip("PIL.Image")
+    source = image_module.new("RGB", (4, 2))
+    source.putdata(
+        [(255, 0, 0), (0, 255, 0), (0, 255, 0), (0, 0, 255)] * source.height
+    )
+    path = tmp_path / "frame.png"
+    source.save(path)
+    image_spec = ImageSpec(width=4, height=4, fit=fit)
+    converter = runpy.run_path(str(_CONVERTER))
+    converted = converter["_training_image"](path, image_spec)
+    expected = fit_image(source, image_spec)
+    assert converted.size == (4, 4)
+    assert converted.tobytes() == expected.tobytes()
+    if fit == FIT_CROP:
+        pixels = {converted.getpixel((x, y)) for y in range(4) for x in range(4)}
+        assert pixels == {(0, 255, 0)}
+    elif fit == FIT_PAD:
+        assert converted.getpixel((0, 0)) == (0, 0, 0)
+        assert converted.getpixel((1, 1)) != (0, 0, 0)
 
 
 def test_a_dh_table_survives_its_record() -> None:

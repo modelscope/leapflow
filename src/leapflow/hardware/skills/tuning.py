@@ -36,14 +36,19 @@ DEFAULT_FRESHNESS: Mapping[str, float] = {
 }
 
 DEFAULT_CALIBRATION: Mapping[str, float] = {
+    "max_zero_error_deg": 0.5,
     "max_tool_length_mm": 400.0,
     "min_pivot_spread_deg": 20.0,
+    "max_pivot_residual_mm": 1.0,
     "max_table_residual_mm": 3.0,
     "start_drift_mm": 5.0,
     "start_drift_deg": 2.0,
     "min_hand_eye_poses": 6.0,
     "min_tilt_deg": 5.0,
+    "max_hand_eye_translation_rms_mm": 3.0,
+    "max_hand_eye_rotation_rms_deg": 0.5,
     "min_verify_points": 5.0,
+    "max_verify_p95_mm": 5.0,
 }
 
 GRIPPER_SPEC_KEYS = frozenset({"max_width_mm", "min_hold_width_mm"})

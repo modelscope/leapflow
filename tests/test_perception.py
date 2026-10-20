@@ -317,6 +317,19 @@ async def test_top_down_tuning_comes_from_the_declaration() -> None:
     assert len(await square.candidates(_object(), table=_TABLE, current=_HOME)) == 1
 
 
+async def test_top_down_closing_axis_follows_the_declared_gripper() -> None:
+    # The jaw axis is the mounted gripper's, so the cell declares it: jaws on tool
+    # X (the Piper cell's measured axis) put the grasp a quarter turn from the
+    # tool +Y default, which is exactly the difference between gripping an object
+    # across its short side and straddling its long one.
+    along_x = TopDownPlanner(
+        {"max_width_mm": 70.0}, TopDownSettings.from_mapping({"closing_axis_deg": 0.0})
+    )
+    (first, _) = await along_x.candidates(_object(), table=_TABLE, current=_HOME)
+    (default, _) = await _PLANNER.candidates(_object(), table=_TABLE, current=_HOME)
+    assert abs(angle_delta_deg(first.grasp.rz, default.grasp.rz)) == pytest.approx(90.0)
+
+
 # ── Lifting and locating ─────────────────────────────────────────────────────
 
 
@@ -434,20 +447,25 @@ async def test_low_scores_are_dropped_unless_the_caller_lowers_the_floor(tmp_pat
     assert seen.score == pytest.approx(0.1)
 
 
-async def test_relocate_tracks_a_nudge_and_loses_a_move(tmp_path: Path) -> None:
+async def test_relocate_remeasures_the_approved_candidate_without_grounding(tmp_path: Path) -> None:
     registry = _calibrated(tmp_path, CUP)
     camera = registry.devices[CAMERA_ID]
+    locator = registry.devices[LOCATOR_ID]
     scene = _scene(registry)
     (cup,) = await scene.locate(["cup"])
+    assert len(locator.requests) == 1
+    locator.fail = True  # freshness must not ask the model to select another candidate
     camera.boxes = [SimBox("cup", (320.0, 20.0), 60.0, 30.0, 50.0)]
     moved = await scene.relocate(cup)
-    assert moved.object_id == cup.object_id
-    assert moved.center[0] == pytest.approx(320.0, abs=3.0)
-    assert scene.object(cup.object_id) == moved  # memory follows the fresh observation
+    assert len(locator.requests) == 1
+    assert moved.object_id == cup.object_id and moved.source == cup.source
+    assert moved.center[0] > cup.center[0] + 8.0
+    assert scene.object(cup.object_id) == moved  # memory follows the fresh measurement
     camera.boxes = [SimBox("cup", (420.0, 20.0), 60.0, 30.0, 50.0)]
     with pytest.raises(SkillError) as error:
         await scene.relocate(moved)
     assert error.value.failure_code == FAILURE_TARGET_NOT_FOUND
+    assert len(locator.requests) == 1
 
 
 async def test_grasps_are_named_per_object_and_expire_with_a_new_locate(tmp_path: Path) -> None:

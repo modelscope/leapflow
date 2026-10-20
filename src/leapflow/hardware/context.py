@@ -221,6 +221,8 @@ class Envelope:
     Only the streaming safety shield consumes it; a discrete move is paced by
     the device's own planner. Absent, the shield bounds the rate alone.
     """
+    max_jump: float | None = None
+    """Largest discontinuity a streamed command may request, in channel units."""
     quantization: float | None = None
     settling_time_s: float = 0.0
     tolerance: float = 0.0
@@ -279,7 +281,14 @@ class Envelope:
         """
         return any(
             bound is not None
-            for bound in (self.min_value, self.max_value, self.max_rate, self.quantization)
+            for bound in (
+                self.min_value,
+                self.max_value,
+                self.max_rate,
+                self.max_accel,
+                self.max_jump,
+                self.quantization,
+            )
         )
 
     def contains(self, value: Any, *, margin: float = 0.0) -> bool:
@@ -377,6 +386,8 @@ class Envelope:
             _format_bound(self.min_value),
             _format_bound(self.max_value),
             _format_bound(self.max_rate),
+            _format_bound(self.max_accel),
+            _format_bound(self.max_jump),
             "rev" if self.reversible else "irrev",
         )
         return ":".join(parts)
@@ -400,6 +411,8 @@ class Envelope:
             result["allowed_values"] = list(self.allowed_values)
         if self.max_accel is not None:  # streamed channels only; absent elsewhere
             result["max_accel"] = self.max_accel
+        if self.max_jump is not None:
+            result["max_jump"] = self.max_jump
         return result
 
     @classmethod
@@ -415,6 +428,7 @@ class Envelope:
             max_value=_as_float(data.get("max_value")),
             max_rate=_as_float(data.get("max_rate")),
             max_accel=_as_float(data.get("max_accel")),
+            max_jump=_as_float(data.get("max_jump")),
             quantization=_as_float(data.get("quantization")),
             settling_time_s=_as_float(data.get("settling_time_s"), default=0.0) or 0.0,
             tolerance=_as_float(data.get("tolerance"), default=0.0) or 0.0,

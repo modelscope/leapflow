@@ -75,6 +75,7 @@ from leapflow.hardware.skills.protocol import (
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_PARTIAL,
     SIDE_EFFECT_UNKNOWN,
+    STATUS_FAILED,
     STATUS_HALTED,
     ArmState,
     GripperResult,
@@ -83,7 +84,9 @@ from leapflow.hardware.skills.protocol import (
 )
 from leapflow.hardware.skills.tuning import DEFAULT_LIMITS
 from leapflow.hardware.skills.workcell import (
+    ARM_STATUS_CHANNEL,
     ARRIVED_CHANNEL,
+    CTRL_MODE_CHANNEL,
     ENABLED_CHANNEL,
     GRIPPER_EFFORT,
     GRIPPER_POSITION,
@@ -98,6 +101,21 @@ from leapflow.hardware.skills.workcell import (
 from leapflow.hardware.transport import TransportError
 
 POLL_S = 0.05
+
+# Vendor ``arm_status`` codes that mean "this target was refused, nothing moved".
+# They are a planning verdict the firmware delivers late -- after the command has
+# been accepted -- so they must be read as a refusal, not as a slow arrival: the
+# timeout path halts, and a halt engages the emergency stop, which releases the
+# drives and drops the arm under gravity.
+_ARM_STATUS_REFUSALS = {
+    0x02: "no inverse-kinematics solution for the target",
+    0x03: "the target lies on a singularity",
+    0x04: "the target exceeds a joint limit",
+}
+# A refusing code can also be left over from an earlier target, so it only ends
+# the move once the arm is demonstrably still where the command found it for
+# long enough that a real move would have left the tolerance band.
+_REFUSAL_DWELL_S = 1.5
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -214,6 +232,10 @@ class GovernedMotion:
         readable = [ARRIVED_CHANNEL]
         if self._arm.channel(ENABLED_CHANNEL) is not None:
             readable.append(ENABLED_CHANNEL)
+        if self._arm.channel(CTRL_MODE_CHANNEL) is not None:
+            readable.append(CTRL_MODE_CHANNEL)
+        if self._arm.channel(ARM_STATUS_CHANNEL) is not None:
+            readable.append(ARM_STATUS_CHANNEL)
         gripper_id = self._spec.role(ROLE_GRIPPER)
         if gripper_id == self._arm_id:
             readable.append(GRIPPER_POSITION)
@@ -231,6 +253,11 @@ class GovernedMotion:
             gripper_mm = await self._gripper_width()
         enabled = values.get(ENABLED_CHANNEL)
         arrived = values.get(ARRIVED_CHANNEL)
+        ctrl_mode = values.get(CTRL_MODE_CHANNEL)
+        reported = values.get(ARM_STATUS_CHANNEL)
+        arm_status = (
+            as_numeric(reported.get("arm_status")) if isinstance(reported, Mapping) else None
+        )
         return ArmState(
             flange=flange,
             tcp=self.flange_to_tcp(flange),
@@ -243,6 +270,8 @@ class GovernedMotion:
             enabled=None if enabled is None else bool(enabled),
             arrived=None if arrived is None else bool(arrived),
             observed_at=time.time(),
+            ctrl_mode=None if ctrl_mode in (None, "") else str(ctrl_mode),
+            arm_status=None if arm_status is None else int(arm_status),
         )
 
     def flange_to_tcp(self, flange: Pose) -> Pose:
@@ -436,7 +465,7 @@ class GovernedMotion:
         if self._arm.channel(SPEED_CHANNEL) is not None:
             batch.insert(0, (SPEED_CHANNEL, self.speed_for(speed_pct)))
         await self._send(self._arm_id, batch)
-        state = await self._await_arrival(commands, flange_target)
+        state = await self._await_arrival(commands, flange_target, before=before)
         return MotionResult(state=state, elapsed_s=self._clock() - started)
 
     def speed_for(self, requested: float | None) -> float:
@@ -540,11 +569,22 @@ class GovernedMotion:
         await self._pause(wait_s)
 
     async def _await_arrival(
-        self, commands: Sequence[tuple[str, float]], flange_target: Pose | None
+        self,
+        commands: Sequence[tuple[str, float]],
+        flange_target: Pose | None,
+        before: ArmState | None = None,
     ) -> ArmState:
         expires = self._expiry()
         state = await self.state()
+        refused_since: float | None = None
         while not (state.arrived is not False and self._within(commands, flange_target, state)):
+            refusal = _ARM_STATUS_REFUSALS.get(state.arm_status or 0)
+            if refusal is None or not self._still_at(before, state):
+                refused_since = None
+            else:
+                refused_since = refused_since if refused_since is not None else self._clock()
+                if self._clock() - refused_since >= _REFUSAL_DWELL_S:
+                    raise self._target_refused(refusal, state)
             if self._clock() >= expires:
                 raise SkillError(
                     FAILURE_TIMEOUT,
@@ -556,6 +596,33 @@ class GovernedMotion:
             await self._pause(self._poll_s)
             state = await self.state()
         return state
+
+    def _still_at(self, before: ArmState | None, state: ArmState) -> bool:
+        """Whether *state* is still where *before* found the arm, within tolerance."""
+        if before is None:
+            return False
+        return state.flange.distance_mm(before.flange) <= self._tolerance(
+            POSE_CHANNELS[:3]
+        ) and state.flange.rotation_to_deg(before.flange) <= self._tolerance(POSE_CHANNELS[3:])
+
+    def _target_refused(self, refusal: str, state: ArmState) -> SkillError:
+        """The arm's own kinematics refused the target without executing anything.
+
+        A refusal is a planning verdict, not a late arrival: the arm is where the
+        command found it and nothing was commanded. The status is what matters --
+        a timeout halts the run, and a halt engages the emergency stop, which
+        releases the drives and drops the arm. The side effect stays conservative:
+        the frame did reach the transport, so reconciliation lifts the skill's
+        NONE to PARTIAL on its own.
+        """
+        return SkillError(
+            FAILURE_UNREACHABLE,
+            f"the arm refused the target before moving ({refusal}); "
+            "choose a target inside its reachable set",
+            side_effect_state=SIDE_EFFECT_NONE,
+            status=STATUS_FAILED,
+            result={"state": state.to_dict(), "refusal": refusal},
+        )
 
     def _within(
         self, commands: Sequence[tuple[str, float]], flange_target: Pose | None, state: ArmState

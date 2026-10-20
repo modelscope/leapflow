@@ -9,6 +9,7 @@ ends: arrival, stop, timeout, skill defect -- each with the right halt policy.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -36,6 +37,7 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_STOPPED,
     FAILURE_TIMEOUT,
     FAILURE_UNKNOWN_SKILL,
+    FAILURE_UNREACHABLE,
     FAILURE_UNKNOWN_WORKCELL,
     FAILURE_WRITE_REFUSED,
     SIDE_EFFECT_COMMITTED,
@@ -335,7 +337,7 @@ async def test_home_execute_rechecks_the_path_from_fresh_joints(tmp_path: Path) 
     assert isinstance(run, SkillRun), run
     finished = await runtime.wait(run.run_id, timeout_s=5.0)
     assert finished is not None and finished.outcome is not None
-    assert finished.outcome.failure_code in {FAILURE_OUT_OF_WORKSPACE, "unreachable"}
+    assert finished.outcome.failure_code in {FAILURE_OUT_OF_WORKSPACE, FAILURE_UNREACHABLE}
     assert registry.sim.batches == []
 
 
@@ -348,7 +350,35 @@ async def test_home_plan_refuses_a_joint_path_with_an_unsafe_middle(tmp_path: Pa
         WORKCELL_ID, "motion.home", {}
     )
     assert isinstance(outcome, SkillOutcome) and not outcome.ok
-    assert outcome.failure_code in {FAILURE_OUT_OF_WORKSPACE, "unreachable"}
+    assert outcome.failure_code in {FAILURE_OUT_OF_WORKSPACE, FAILURE_UNREACHABLE}
+    assert registry.sim.batches == []
+
+
+async def test_joint_move_predicts_the_tcp_for_a_following_relative_step(tmp_path: Path) -> None:
+    registry = _joint_registry(tmp_path)
+    runtime = _runtime(tmp_path, registry)
+    program = _steps(
+        {"op": "move_joints", "joints": {"joint.j1.position": 5.0}},
+        {"op": "move", "relative": {"dz": 10.0}},
+    )
+    plan = await runtime.plan(WORKCELL_ID, SEQUENCE, program)
+    assert isinstance(plan, SkillPlan), plan
+    assert len(plan.targets) == 2
+    assert plan.targets[1].z == pytest.approx(plan.targets[0].z + 10.0)
+    assert registry.sim.batches == []
+
+
+async def test_joint_move_without_a_dh_table_fails_closed(tmp_path: Path) -> None:
+    registry = _joint_registry(tmp_path)
+    assert registry._context.kinematics is not None
+    registry._context = replace(  # type: ignore[attr-defined] - test owns this registry
+        registry._context,
+        kinematics=replace(registry._context.kinematics, dh={}),
+    )
+    outcome = await _runtime(tmp_path, registry).plan(WORKCELL_ID, "motion.home", {})
+    assert isinstance(outcome, SkillOutcome) and not outcome.ok
+    assert outcome.failure_code == FAILURE_SKILL_UNAVAILABLE
+    assert "kinematics.dh" in outcome.message
     assert registry.sim.batches == []
 
 
@@ -499,7 +529,7 @@ async def test_busy_devices_refuse_a_second_run_and_stop_halts_once(tmp_path: Pa
     await _until(lambda: registry.sim.batches)
     assert runtime.holds_device("robot_piper_arm")
 
-    second = await runtime.plan(WORKCELL_ID, "motion.home", {})
+    second = await runtime.plan(WORKCELL_ID, SEQUENCE, move_by(25))
     assert isinstance(second, SkillPlan)
     busy = await runtime.execute(second.digest)
     assert isinstance(busy, SkillOutcome) and busy.failure_code == FAILURE_DEVICE_BUSY
@@ -527,6 +557,35 @@ async def test_arrival_timeout_halts_and_reports_partial(tmp_path: Path) -> None
         SIDE_EFFECT_PARTIAL,
     )
     assert registry.sim.halts == 1
+
+
+async def test_a_refused_target_is_unreachable_not_a_timeout(tmp_path: Path) -> None:
+    """The firmware's own refusal must not masquerade as a slow arrival.
+
+    ``arm_status`` 0x04 is the vendor's inverse kinematics rejecting the pose
+    before executing anything, so the arm is exactly where it started. Reporting
+    that as a timeout would halt the run, and a halt engages the emergency stop,
+    which releases the drives and drops the arm under gravity. The side effect
+    stays PARTIAL because the frame did reach the transport.
+    """
+    registry = _registry(tmp_path, stall=True, arm_status=0x04)
+    workcell = {**WORKCELL_YAML, "limits": {**WORKCELL_YAML["limits"], "move_timeout_s": 30.0}}
+    run = await _run(_runtime(tmp_path, registry, workcell=workcell), SEQUENCE, move_by(10))
+    assert run.outcome is not None
+    assert (run.outcome.failure_code, run.outcome.status, run.outcome.side_effect_state) == (
+        FAILURE_UNREACHABLE,
+        STATUS_FAILED,
+        SIDE_EFFECT_PARTIAL,
+    )
+    assert registry.sim.halts == 0, "a refused target must never engage the emergency stop"
+
+
+async def test_a_stale_refusal_code_does_not_block_a_valid_move(tmp_path: Path) -> None:
+    """A refusal code left over from an earlier target must not end the next move."""
+    registry = _registry(tmp_path, arm_status=0x04)
+    run = await _run(_runtime(tmp_path, registry), SEQUENCE, move_by(10))
+    assert run.outcome is not None
+    assert run.outcome.status == "succeeded", run.outcome.message
 
 
 async def test_stopping_a_run_that_never_moved_does_not_halt(tmp_path: Path) -> None:

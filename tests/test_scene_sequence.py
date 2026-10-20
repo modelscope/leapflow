@@ -10,6 +10,7 @@ failed guard with the step it stopped at.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -25,11 +26,13 @@ from leapflow.hardware.skill_results import next_step
 from leapflow.hardware.skills.builtin.motion import skills as motion_skills
 from leapflow.hardware.skills.builtin.scene import skills as scene_skills
 from leapflow.hardware.skills.builtin.sequence import skills as sequence_skills
+from leapflow.hardware.skills.geometry import Pose, Transform
 from leapflow.hardware.skills.protocol import (
     FAILURE_GUARD_FAILED,
     FAILURE_INVALID_ARGS,
     FAILURE_OUT_OF_WORKSPACE,
     FAILURE_PLAN_STALE,
+    FAILURE_SKILL_UNAVAILABLE,
     FAILURE_TARGET_NOT_FOUND,
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_NONE,
@@ -43,8 +46,10 @@ from leapflow.hardware.skills.protocol import (
 from leapflow.hardware.skills.runtime import SkillRun, SkillRuntime, SkillRuntimeSettings
 from tests._harness.skill_stubs import (
     CAMERA_ID,
+    CAMERA_POSE,
     PERCEPTION_WORKCELL_YAML,
     SEQUENCE,
+    SIM_INTRINSICS,
     TABLE_Z,
     TOOL_LENGTH_MM,
     WORKCELL_ID,
@@ -208,6 +213,40 @@ async def test_a_composed_place_releases_and_forgets_the_hold(tmp_path: Path) ->
     assert located.result["held"] is None
 
 
+async def test_release_guard_preserves_hold_until_width_confirms_release(tmp_path: Path) -> None:
+    runtime = _cell(tmp_path, CUP)
+    await _located_and_proposed(runtime)
+    await _execute(runtime, await _plan(runtime, PICK))
+    step = {
+        "op": "gripper",
+        "width_mm": CUP_WIDTH + 4.0,
+        "expect": "released",
+        "on_fail": "hold",
+    }
+
+    outcome = await _execute(runtime, await _plan(runtime, [step]))
+
+    assert outcome.failure_code == FAILURE_GUARD_FAILED
+    assert outcome.status == STATUS_FAILED
+    assert "release requires more than 35.0" in outcome.message
+    located = await _read(runtime, "perceive.locate", {"queries": ["cup"]})
+    assert located.result["held"]["object"]["object_id"] == "o1"
+
+
+async def test_a_move_may_name_a_path_the_arm_declares(tmp_path: Path) -> None:
+    runtime = _cell(tmp_path, CUP)
+    plan = await _plan(
+        runtime, [{"op": "move", "pose": {"x": 220.0, "y": -90.0, "z": 150.0}, "path": "point"}]
+    )
+    assert "move point" in plan.summary
+
+    outcome = await _execute(runtime, plan)
+
+    assert outcome.status == STATUS_SUCCEEDED, outcome
+    (move,) = _moves(_sim(runtime))
+    assert move["arm.pose_path"] == "point", "a named path reaches the arm's path channel"
+
+
 # ── Refusals before approval ─────────────────────────────────────────────────
 
 
@@ -215,6 +254,12 @@ async def test_a_composed_place_releases_and_forgets_the_hold(tmp_path: Path) ->
     ("steps", "code", "needle"),
     [
         ([{"op": "move", "pose": {"x": 300, "y": 0, "z": 500}}], FAILURE_OUT_OF_WORKSPACE, ""),
+        ([
+            {"op": "move", "pose": {"x": 220, "y": -90, "z": 150}, "path": "arc"},
+        ], FAILURE_INVALID_ARGS, "not declared by this arm"),
+        ([
+            {"op": "move_linear", "pose": {"x": 220, "y": -90, "z": 150}, "path": "point"},
+        ], FAILURE_INVALID_ARGS, "do(es) not apply to op move_linear"),
         ([{"op": "move", "ref": "grasp:g7.grasp"}], FAILURE_TARGET_NOT_FOUND, "g7"),
         ([{"op": "move", "ref": "object:cup"}], FAILURE_TARGET_NOT_FOUND, "cup"),
         ([{"op": "move", "ref": "grasp:g1.top"}], FAILURE_INVALID_ARGS, "must be object:"),
@@ -223,14 +268,6 @@ async def test_a_composed_place_releases_and_forgets_the_hold(tmp_path: Path) ->
         ([{"op": "wait", "seconds": 30}], FAILURE_INVALID_ARGS, "exceeds the workcell"),
         ([{"op": "wait", "seconds": 0}] * 17, FAILURE_INVALID_ARGS, "split the program"),
         ([{"op": "wait", "seconds": 0, "expect": "released"}], FAILURE_INVALID_ARGS, "expect"),
-        (
-            [
-                {"op": "move_joints", "joints": {"joint.j1.position": 5}},
-                {"op": "move", "relative": {"dx": 0, "dy": 0, "dz": 10, "frame": "base"}},
-            ],
-            FAILURE_INVALID_ARGS,
-            "cannot follow move_joints",
-        ),
     ],
 )
 async def test_plan_refuses_what_it_cannot_resolve_or_reach(
@@ -378,3 +415,62 @@ async def test_a_model_planner_maps_filters_and_ranks_proposed_grasps(tmp_path: 
 
     plan = await _plan(runtime, PICK[:2])  # the learned grasp feeds the same program
     assert plan.targets[0].z == pytest.approx(first["grasp"]["z"] + 50.0, abs=0.01)
+
+
+# ── A lifted object needs no locator ──────────────────────────────────────────
+
+NO_LOCATOR_YAML: dict[str, Any] = {
+    **{key: value for key, value in PERCEPTION_WORKCELL_YAML.items() if key != "models"},
+    "share_frames": True,
+}
+
+
+def _top_box(box: SimBox, z: float) -> list[float]:
+    """The pixel box the simulated camera sees around *box*'s top face at *z*."""
+    to_camera = Transform.from_pose(Pose(**CAMERA_POSE)).inverse()
+    yaw = math.radians(box.yaw_deg)
+    corners = []
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            dx, dy = sx * box.length / 2.0, sy * box.width / 2.0
+            x = box.center[0] + dx * math.cos(yaw) - dy * math.sin(yaw)
+            y = box.center[1] + dx * math.sin(yaw) + dy * math.cos(yaw)
+            corners.append(SIM_INTRINSICS.project(to_camera.apply((x, y, z))))
+    return [
+        min(u for u, _ in corners),
+        min(v for _, v in corners),
+        max(u for u, _ in corners),
+        max(v for _, v in corners) + 1.0,
+    ]
+
+
+async def test_grasp_propose_plans_for_a_lifted_object_without_a_locator(
+    tmp_path: Path,
+) -> None:
+    """S2's own grounding must reach the planner: locate needs a model, lift does not."""
+    runtime = _cell(tmp_path, CUP, workcell=NO_LOCATOR_YAML)
+    no_locator = await runtime.plan(WORKCELL_ID, "perceive.locate", {"queries": ["cup"]})
+    assert isinstance(no_locator, SkillOutcome) and not no_locator.ok
+    assert no_locator.failure_code == FAILURE_SKILL_UNAVAILABLE
+
+    shot = await runtime.plan(WORKCELL_ID, "perceive.snapshot", {}, share_frames=True)
+    assert isinstance(shot, SkillOutcome) and shot.ok, shot
+    lifted = await runtime.plan(
+        WORKCELL_ID,
+        "perceive.lift",
+        {
+            "frame": shot.result["frame"],
+            "targets": [{"label": "cup", "box": _top_box(CUP, TABLE_Z + CUP.height)}],
+        },
+        share_frames=True,
+    )
+    assert isinstance(lifted, SkillOutcome) and lifted.ok, lifted
+    (cup,) = lifted.result["objects"]
+
+    proposed = await _read(runtime, "grasp.propose", {"object": cup["object_id"]})
+    grasp, alongside = proposed.result["grasps"]  # the narrow side first, then the long one
+    assert grasp["object_id"] == cup["object_id"] and grasp["planner"] == "top_down"
+    assert grasp["width_mm"] == pytest.approx(CUP_WIDTH, abs=4.0)
+    assert grasp["open_mm"] == pytest.approx(min(70.0, CUP_WIDTH + 15.0), abs=4.0)
+    assert grasp["score"] == 1.0 and alongside["score"] == 0.5
+    assert grasp["grasp"]["z"] == pytest.approx(TABLE_Z + 25.0, abs=3.0)

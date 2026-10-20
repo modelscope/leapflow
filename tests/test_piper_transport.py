@@ -88,7 +88,13 @@ class _FakeArm:
         self.end_pose_calls: list[tuple[int, ...]] = []
         self.fail_end_pose_ctrl = False
         self.gripper_calls: list[tuple[int, int, int, int]] = []
+        # The mode reported when GripperCtrl arrived: in standby the firmware
+        # drops the frame, so tests assert the mode was CAN.
+        self.gripper_modes: list[int] = []
         self.enable_calls: list[tuple[int, int]] = []
+        # The mode the arm reported at the moment EnableArm arrived: firmware
+        # ignores an enable issued from standby, so tests assert on this.
+        self.enable_modes: list[int] = []
         self.disable_calls: list[tuple[int, int]] = []
         self.reset_calls = 0
         self.estop_calls: list[int] = []
@@ -99,6 +105,16 @@ class _FakeArm:
         self.joint_feedback_down = False
         self.gripper_feedback_down = False
         self.joint_stamp: float | None = None
+        # Piper X firmware rule: a CAN selection issued from standby is dropped
+        # unless a standby frame came first. Off by default, so the base fake
+        # models firmware that accepts a direct CAN selection.
+        self.strict_mode_handshake = False
+        self.ignore_mode_ctrl = False
+        self._standby_frame_seen = False
+        self.refuse_enable = False
+        # Frames the firmware drops on the floor, e.g. while still settling
+        # right after an emergency-stop resume.
+        self.drop_mode_frames = 0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -181,13 +197,18 @@ class _FakeArm:
         self.gripper_calls.append(
             (int(gripper_angle), int(gripper_effort), int(gripper_code), int(set_zero))
         )
+        self.gripper_modes.append(self.ctrl_mode)
         if self.fail_gripper_ctrl:
             raise RuntimeError("simulated CAN write failure")
         self.stroke_raw = int(gripper_angle)
 
     def EnableArm(self, motor_num: int = 7, enable_flag: int = 0x02) -> None:
         self.enable_calls.append((int(motor_num), int(enable_flag)))
-        self.enable_flags = [True] * 7
+        self.enable_modes.append(self.ctrl_mode)
+        # The firmware reports every motor's driver enable state either way; a
+        # command issued from standby is accepted and silently ignored.
+        refused = self.refuse_enable or self.ctrl_mode != 0x01
+        self.enable_flags = [False] * 7 if refused else [True] * 7
 
     def DisableArm(self, motor_num: int = 7, enable_flag: int = 0x01) -> None:
         self.disable_calls.append((int(motor_num), int(enable_flag)))
@@ -197,6 +218,12 @@ class _FakeArm:
         self.estop_calls.append(int(emergency_stop))
         if emergency_stop == 0x01:
             self.arm_status = 0x01
+        elif emergency_stop == 0x02:
+            # Real firmware answers a resume by dropping back to standby and
+            # dropping the drive; the resume is not a no-op when idle.
+            self.arm_status = 0x00
+            self.ctrl_mode = 0x00
+            self.enable_flags = [False] * 7
 
     def ModeCtrl(
         self, ctrl_mode: int = 0x01, move_mode: int = 0x01,
@@ -207,7 +234,16 @@ class _FakeArm:
             "move_mode": move_mode,
             "move_spd_rate_ctrl": move_spd_rate_ctrl,
         })
+        if self.ignore_mode_ctrl:
+            return
+        if ctrl_mode == 0x01 and self.drop_mode_frames > 0:
+            self.drop_mode_frames -= 1
+            return  # dropped on the floor, exactly like the real firmware
+        if self.strict_mode_handshake and ctrl_mode == 0x01 and self.ctrl_mode == 0x00:
+            if not self._standby_frame_seen:
+                return  # silently dropped, exactly like the real firmware
         self.ctrl_mode = ctrl_mode
+        self._standby_frame_seen = ctrl_mode == 0x00
 
     def CrashProtectionConfig(self, *levels: int) -> None:
         self.crash_calls.append(tuple(int(level) for level in levels))
@@ -217,12 +253,15 @@ class _FakeArm:
         self.reset_calls += 1
 
 
-def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch, silent: bool = False) -> list[_FakeArm]:
+def _install_fake_sdk(
+    monkeypatch: pytest.MonkeyPatch, silent: bool = False, piper_x: bool = False
+) -> list[_FakeArm]:
     """Patch ``importlib.import_module`` so ``piper_sdk`` resolves to the fake.
 
     Returns the arm instances the driver constructs, in creation order. With
     ``silent`` the arm connects but never produces feedback, which drives the
-    bring-up warm-up loop to its typed timeout.
+    bring-up warm-up loop to its typed timeout; ``piper_x`` makes the fake
+    enforce the Piper X mode rule that drops a CAN selection from standby.
     """
     created: list[_FakeArm] = []
     real_import = importlib.import_module
@@ -231,6 +270,7 @@ def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch, silent: bool = False) -> 
         def __init__(self, can_name: str, **kwargs: Any) -> None:
             super().__init__(can_name, **kwargs)
             self.joint_feedback_down = silent
+            self.strict_mode_handshake = piper_x
             created.append(self)
 
     def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
@@ -243,9 +283,12 @@ def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch, silent: bool = False) -> 
 
 
 def _open_transport(
-    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, Any] | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, Any] | None = None,
+    *,
+    piper_x: bool = False,
 ) -> tuple[PiperArmTransport, _FakeArm, Any]:
-    created = _install_fake_sdk(monkeypatch)
+    created = _install_fake_sdk(monkeypatch, piper_x=piper_x)
     transport = PiperArmTransport({**_BASE_CONFIG, **(overrides or {})})
     status = asyncio.run(transport.open(_context()))
     return transport, created[0], status
@@ -278,6 +321,7 @@ def test_example_yaml_is_a_valid_declarative_context() -> None:
         "arm.enable",
         "arm.enabled",
         "arm.status",
+        "arm.ctrl_mode",
         "arm.motion",
         "arm.speed_pct",
         "arm.pose_path",
@@ -306,6 +350,10 @@ def test_example_yaml_is_a_valid_declarative_context() -> None:
     assert ee_z.unit == "mm"
     assert ee_z.envelope.tolerance == 2.0
     assert context.transport.config["pose_move_mode"] == "linear"
+    # The Piper X firmware needs the standby -> CAN handshake before it will
+    # accept commands; the declaration must not fall back to a single frame.
+    assert context.transport.config["mode_switch"] == "standby_then_can"
+    assert context.channel("arm.ctrl_mode").is_readable
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -401,6 +449,37 @@ def test_governed_enable_resumes_the_emergency_stop_then_energizes(
     assert arm.estop_calls == [1, 2]
     assert arm.enable_calls == [(7, 2)]
     assert arm.disable_calls == []
+    # The resume pushed the arm back to standby, so the enable came after a
+    # verified re-entry into CAN mode. Energizing from standby would be ignored.
+    assert arm.enable_modes == [0x01]
+    assert [call["ctrl_mode"] for call in arm.mode_calls[-3:]] == [0x00, 0x01, 0x01]
+
+
+def test_idle_enable_skips_the_resume_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing is latched, so no resume may be sent: it would undo the CAN mode."""
+    transport, arm, _ = _open_transport(monkeypatch)
+
+    outcome = asyncio.run(transport.write("arm.enable", 1))
+
+    assert outcome.ok is True
+    assert arm.estop_calls == []
+    assert arm.enable_calls == [(7, 2)]
+    assert arm.enable_modes == [0x01]
+
+
+def test_mode_selection_survives_a_dropped_can_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CAN selection dropped while the firmware settles must be resent, not fatal."""
+    transport, arm, _ = _open_transport(monkeypatch, {"mode_switch": "standby_then_can"})
+    asyncio.run(transport.halt())
+    arm.drop_mode_frames = 2
+
+    outcome = asyncio.run(transport.write("arm.enable", 1))
+
+    assert outcome.ok is True
+    assert arm.drop_mode_frames == 0  # the retries were actually sent
+    assert arm.enable_modes == [0x01]
 
 
 def test_crash_protection_levels_are_configured_on_bring_up(
@@ -414,6 +493,66 @@ def test_crash_protection_levels_are_configured_on_bring_up(
     assert status.metadata["crash_protection_levels"] == [1, 2, 3, 1, 1, 1]
 
 
+# ── Control mode entry (Piper X) ──────────────────────────────────────────────
+
+
+def test_piper_x_bring_up_walks_standby_then_can(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A direct CAN frame from standby is dropped by the firmware, so handshake."""
+    _, arm, status = _open_transport(
+        monkeypatch, {"mode_switch": "standby_then_can"}, piper_x=True
+    )
+
+    assert [call["ctrl_mode"] for call in arm.mode_calls] == [0x00, 0x01, 0x01]
+    assert arm.ctrl_mode == 0x01
+    assert status.metadata["ctrl_mode_name"] == "can"
+
+
+def test_enable_enters_can_mode_before_energizing(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch, {"mode_switch": "standby_then_can"})
+    # The arm fell back to standby (e.g. the teach switch was toggled).
+    arm.strict_mode_handshake = True
+    arm.ctrl_mode = 0x00
+    arm.mode_calls.clear()
+
+    outcome = asyncio.run(transport.write("arm.enable", 1))
+
+    assert outcome.ok is True
+    assert [call["ctrl_mode"] for call in arm.mode_calls] == [0x00, 0x01, 0x01]
+    assert arm.enable_calls == [(7, 2)]
+    assert arm.enable_modes == [0x01]
+    assert arm.ctrl_mode == 0x01
+
+
+def test_enable_is_refused_when_no_motor_reports_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command the firmware accepted but no motor followed is not a success."""
+    transport, arm, _ = _open_transport(monkeypatch, {"enable_timeout_s": 0.12})
+    arm.refuse_enable = True
+
+    outcome = asyncio.run(transport.write("arm.enable", 1))
+
+    assert outcome.ok is False
+    assert outcome.side_effect_state == SIDE_EFFECT_COMMITTED
+    assert outcome.failure_code == "piper_enable_refused"
+    assert arm.enable_calls == [(7, 2)]
+
+
+def test_mode_switch_refusal_blocks_the_energize(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(
+        monkeypatch, {"mode_switch": "standby_then_can", "mode_switch_timeout_s": 0.12}
+    )
+    arm.ignore_mode_ctrl = True
+    arm.ctrl_mode = 0x00
+
+    outcome = asyncio.run(transport.write("arm.enable", 1))
+
+    assert outcome.ok is False
+    assert outcome.side_effect_state == SIDE_EFFECT_COMMITTED
+    assert outcome.failure_code == "piper_mode_switch_failed"
+    assert arm.enable_calls == []  # never energize an arm that cannot be driven
+
+
 def test_invalid_sdk_interface_is_rejected_at_construction() -> None:
     with pytest.raises(TransportError) as error:
         PiperArmTransport({"sdk_interface": "v9"})
@@ -424,6 +563,13 @@ def test_invalid_sdk_interface_is_rejected_at_construction() -> None:
 def test_invalid_pose_move_mode_is_rejected_at_construction() -> None:
     with pytest.raises(TransportError) as error:
         PiperArmTransport({"pose_move_mode": "circular"})
+
+    assert error.value.failure_code == "piper_invalid_config"
+
+
+def test_invalid_mode_switch_is_rejected_at_construction() -> None:
+    with pytest.raises(TransportError) as error:
+        PiperArmTransport({"mode_switch": "teleport"})
 
     assert error.value.failure_code == "piper_invalid_config"
 
@@ -781,7 +927,7 @@ def test_enable_write_round_trip_and_guards(monkeypatch: pytest.MonkeyPatch) -> 
     assert enabled.ok is True
     assert enabled.side_effect_state == SIDE_EFFECT_COMMITTED
     assert arm.enable_calls == [(7, 2)]
-    assert arm.estop_calls == [2]  # enable carries the resume frame
+    assert arm.estop_calls == []  # nothing latched: no resume frame
     assert asyncio.run(transport.read("arm.enabled")).value is True
 
     disabled = asyncio.run(transport.write("arm.enable", 0))
@@ -811,6 +957,16 @@ def test_status_and_motion_reads(monkeypatch: pytest.MonkeyPatch) -> None:
 
     arm.motion_status = 0x00
     assert asyncio.run(transport.read("arm.motion")).value is True
+
+
+def test_ctrl_mode_channel_names_the_reported_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+
+    assert asyncio.run(transport.read("arm.ctrl_mode")).value == "can"
+    arm.ctrl_mode = 0x02
+    assert asyncio.run(transport.read("arm.ctrl_mode")).value == "teach"
+    arm.ctrl_mode = 0x07
+    assert asyncio.run(transport.read("arm.ctrl_mode")).value == "other(0x07)"
 
 
 def test_read_batch_shares_one_timebase_and_degrades_to_stale(
@@ -918,6 +1074,34 @@ def test_gripper_writes_pair_stroke_and_effort(monkeypatch: pytest.MonkeyPatch) 
     assert stroke.ok is True
     assert stroke.readback is not None
     assert stroke.readback.value == pytest.approx(40.0)
+
+
+def test_gripper_write_enters_can_before_sending(monkeypatch: pytest.MonkeyPatch) -> None:
+    """In standby the firmware drops a gripper frame, so the write enters CAN first."""
+    transport, arm, _ = _open_transport(monkeypatch, {"mode_switch": "standby_then_can"})
+    arm.ctrl_mode = 0x00  # e.g. the adapter was reset by a halt
+    arm.mode_calls.clear()
+
+    outcome = asyncio.run(transport.write("gripper.position", 40.0))
+
+    assert outcome.ok is True
+    assert arm.ctrl_mode == 0x01
+    assert arm.gripper_modes == [0x01]  # never sent from standby
+    assert [call["ctrl_mode"] for call in arm.mode_calls][:2] == [0x00, 0x01]
+
+
+def test_gripper_write_leaves_an_already_can_arm_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No mode frame is sent when the arm already accepts CAN commands."""
+    transport, arm, _ = _open_transport(monkeypatch, {"mode_switch": "standby_then_can"})
+    arm.mode_calls.clear()
+
+    outcome = asyncio.run(transport.write("gripper.position", 40.0))
+
+    assert outcome.ok is True
+    assert arm.mode_calls == []
+    assert arm.gripper_modes == [0x01]
 
 
 def test_refused_effort_write_does_not_leak_into_the_next_pair(

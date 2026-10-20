@@ -186,7 +186,7 @@ class HandEye:
 
     spec = SkillSpec(
         skill_id="calib.handeye",
-        version="1.0.0",
+        version="1.1.0",
         card=(
             "Calibrate where the camera sits (hand-eye). The workcell's calibration board "
             "must be in view: held in the gripper or fixed to the flange for a fixed camera, "
@@ -205,8 +205,6 @@ class HandEye:
                 "lift_mm": _number(0, 50, 15.0),
                 "settle_s": _number(0, 5, 0.5),
                 "speed_pct": _number(1, 100, 10.0),
-                "max_translation_rms_mm": _number(0.1, 20, 3.0),
-                "max_rotation_rms_deg": _number(0.05, 5, 0.5),
             },
         },
         effect=EFFECT_ACTUATE,
@@ -235,7 +233,8 @@ class HandEye:
         count = int(args["poses"])
         ring = _ring(start, pivot, count, tilt=tilt, args=args)
         targets, reason = _reachable(ctx, ring)
-        required = max(int(ctx.workcell.calibration["min_hand_eye_poses"]), count // 2)
+        calibration = ctx.workcell.calibration
+        required = max(int(calibration["min_hand_eye_poses"]), count // 2)
         if len(targets) < required:
             raise SkillError(
                 FAILURE_OUT_OF_WORKSPACE,
@@ -262,6 +261,8 @@ class HandEye:
                 "settle_s": float(args["settle_s"]),
                 "samples": len(targets),
                 "required": required,
+                "max_translation_rms_mm": calibration["max_hand_eye_translation_rms_mm"],
+                "max_rotation_rms_deg": calibration["max_hand_eye_rotation_rms_deg"],
                 "seen": seen.to_dict(),
             },
         )
@@ -285,8 +286,8 @@ class HandEye:
             )
         mounting = plan.basis["mounting"]
         mount, target_mount, fit = _solve(mounting, seen)
-        limit_mm = float(plan.args["max_translation_rms_mm"])
-        limit_deg = float(plan.args["max_rotation_rms_deg"])
+        limit_mm = float(plan.basis["max_translation_rms_mm"])
+        limit_deg = float(plan.basis["max_rotation_rms_deg"])
         if fit.translation_rms_mm > limit_mm or fit.rotation_rms_deg > limit_deg:
             raise _check_failed(
                 f"the observations disagree by {fit.translation_rms_mm:.2f} mm / "
@@ -384,19 +385,18 @@ class VerifyCamera:
 
     spec = SkillSpec(
         skill_id="calib.verify",
-        version="1.0.0",
+        version="1.1.0",
         card=(
             "Measure camera accuracy after calib.handeye, with the calibration board "
             "mounted exactly as it was then. The arm moves over a 3 x 3 grid spacing_mm "
             "apart around the current pose; at each stop the arm predicts the board "
             "centre and the camera measures it through depth -- the chain perceive.locate "
-            "uses. Passes when the 95th-percentile error is within max_p95_mm."
+            "uses. The workcell's max_verify_p95_mm is the acceptance limit."
         ),
         args_schema={
             "type": "object",
             "properties": {
                 "spacing_mm": _number(10, 80, 40.0),
-                "max_p95_mm": _number(0.5, 20, 5.0),
                 "settle_s": _number(0, 5, 0.5),
                 "speed_pct": _number(1, 100, 10.0),
             },
@@ -445,6 +445,7 @@ class VerifyCamera:
                 "start": start.to_dict(),
                 "settle_s": float(args["settle_s"]),
                 "samples": len(targets),
+                "max_p95_mm": ctx.workcell.calibration["max_verify_p95_mm"],
                 "seen": seen.to_dict(),
                 "depends_on": {CAMERA_FRAME: ctx.frames.versions[CAMERA_FRAME]},
             },
@@ -475,7 +476,7 @@ class VerifyCamera:
                 problems=["too few measurements"],
                 **stats,
             )
-        limit = float(plan.args["max_p95_mm"])
+        limit = float(plan.basis["max_p95_mm"])
         if stats["p95_mm"] > limit:
             raise _check_failed(
                 f"the camera is off by {stats['p95_mm']:.1f} mm at p95 (limit {limit} mm, "

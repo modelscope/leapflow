@@ -354,12 +354,12 @@ async def test_a_plan_that_fails_verification_is_never_shown(tmp_path: Path, rig
 
 
 async def test_a_plan_for_another_skill_is_never_shown(tmp_path: Path, rigs: Any) -> None:
-    def swap(method: str, params: dict[str, Any]) -> dict[str, Any]:
+    def swap(method: str, reply: dict[str, Any]) -> dict[str, Any]:
         if method == "skill.plan":
-            params.update(skill="motion.home", args={})
-        return params
+            reply["plan"]["skill_id"] = "motion.home"
+        return reply
 
-    rig = rigs(tmp_path, wrap=lambda client: _Tampering(client, on_params=swap))
+    rig = rigs(tmp_path, wrap=lambda client: _Tampering(client, on_reply=swap))
     result = await rig.service.hw_skill_run(**MOVE)
     assert result["failure_code"] == FAILURE_PLAN_UNVERIFIED
     assert rig.gate.seen == []

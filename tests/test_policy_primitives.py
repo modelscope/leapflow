@@ -244,25 +244,31 @@ def test_acceleration_is_limited_from_the_previous_rate() -> None:
     assert second.clamped == 1
 
 
-def test_braking_never_reverses_past_the_target() -> None:
+def test_braking_refuses_when_holding_would_break_the_acceleration_limit() -> None:
     channel = ShieldChannel("ee.z", "arm", max_rate=100.0, max_accel=100.0)
     shield = SafetyShield([channel], rate_margin=1.0)
-    # Moving up at 50 mm/s, asked to go back down: brake to 40 mm/s would
-    # overshoot upward, so the command holds instead.
+    # Moving up at 50 mm/s, asked to go back down: the acceleration bound permits
+    # only 40..60 mm/s, while approaching without overshoot permits -50..0.
     verdict = shield.filter([0.0], [5.0], 0.1, [50.0])
-    assert verdict.values == pytest.approx((5.0,)) and verdict.rates == pytest.approx((0.0,))
+    assert not verdict.ok and "no command" in verdict.violation
+    assert verdict.values == () and verdict.rates == ()
 
 
-def test_jump_limits_scale_with_the_declared_rate() -> None:
+def test_jump_limits_come_from_the_device_and_can_be_tightened() -> None:
     envelope = SimpleNamespace(
-        min_value=-150.0, max_value=150.0, max_rate=36.0, tolerance=0.5, max_accel=None
+        min_value=-150.0,
+        max_value=150.0,
+        max_rate=36.0,
+        max_accel=None,
+        max_jump=18.0,
+        tolerance=0.5,
     )
     channel = SimpleNamespace(
         channel_id="joint.j1.position", envelope=envelope, quantity="", unit="deg"
     )
-    shield_channel = ShieldChannel.from_channel("arm", channel, jump_s=0.5)
-    assert shield_channel.max_jump == pytest.approx(18.0)
-    assert ShieldChannel.from_channel("arm", channel).max_jump is None
+    assert ShieldChannel.from_channel("arm", channel).max_jump == pytest.approx(18.0)
+    tightened = ShieldChannel.from_channel("arm", channel, max_jump=9.0)
+    assert tightened.max_jump == pytest.approx(9.0)
 
 
 # ── Contact ──────────────────────────────────────────────────────────────────

@@ -183,10 +183,10 @@ class ScenePort(Protocol):
         ...
 
     async def relocate(self, obj: LocatedObject) -> LocatedObject:
-        """Observe *obj* again near where it was seen; raises when it is gone.
+        """Measure *obj* again only where its approved geometry projects.
 
-        A located object is grounded again by its label; a lifted one is
-        re-measured where it projects into a fresh frame.
+        This never grounds by label or selects another candidate; it raises when
+        the approved candidate can no longer be measured in a fresh frame.
         """
         ...
 

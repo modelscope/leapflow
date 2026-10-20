@@ -63,18 +63,17 @@ class ShieldChannel:
 
     @classmethod
     def from_channel(
-        cls, device_id: str, channel: Any, *, jump_s: float | None = None
+        cls, device_id: str, channel: Any, *, max_jump: float | None = None
     ) -> "ShieldChannel":
-        """The channel's envelope; *jump_s* sets ``max_jump`` to that many seconds at full rate."""
+        """The channel's envelope, with an optional already-admitted tighter jump limit."""
         envelope = channel.envelope
-        rate = envelope.max_rate
-        jump = rate * jump_s if jump_s and rate and rate > 0 else None
+        jump = getattr(envelope, "max_jump", None) if max_jump is None else max_jump
         return cls(
             channel_id=channel.channel_id,
             device_id=device_id,
             low=envelope.min_value,
             high=envelope.max_value,
-            max_rate=rate,
+            max_rate=envelope.max_rate,
             tolerance=float(envelope.tolerance or 0.0),
             cyclic=is_cyclic(channel),
             max_accel=getattr(envelope, "max_accel", None),
@@ -152,7 +151,9 @@ class SafetyShield:
             if problem:
                 return ShieldVerdict(tuple(values), clamped, problem, tuple(new_rates))
             rate = None if rates is None else float(rates[index])
-            limited, commanded_rate = self._limit(channel, value, last, dt, rate)
+            limited, commanded_rate, problem = self._limit(channel, value, last, dt, rate)
+            if problem:
+                return ShieldVerdict(tuple(values), clamped, problem, tuple(new_rates))
             if abs(channel.delta(limited, float(wanted))) > max(channel.tolerance, _EXACT):
                 clamped += 1
             values.append(limited)
@@ -197,33 +198,66 @@ class SafetyShield:
         last: float | None,
         dt: float,
         rate: float | None,
-    ) -> tuple[float, float]:
-        """The command after the acceleration and rate limits, and its rate."""
+    ) -> tuple[float, float, str]:
+        """Solve acceleration, rate and no-overshoot constraints as one interval."""
         if last is None or dt <= 0.0:
-            return value, 0.0
+            return value, 0.0, ""
         delta = channel.delta(value, float(last))
         wanted_rate = delta / dt
-        commanded = wanted_rate
+        low, high = min(0.0, wanted_rate), max(0.0, wanted_rate)
         if channel.max_accel is not None and channel.max_accel > 0.0 and rate is not None:
+            if not math.isfinite(rate):
+                return value, rate, f"{channel.label} previous rate is not finite"
             reach = channel.max_accel * dt
-            commanded = min(max(commanded, rate - reach), rate + reach)
+            low, high = max(low, rate - reach), min(high, rate + reach)
         if channel.max_rate is not None and channel.max_rate > 0.0:
             cap = channel.max_rate * self._margin
-            commanded = min(max(commanded, -cap), cap)
+            low, high = max(low, -cap), min(high, cap)
+        if low > high + _EXACT:
+            return (
+                value,
+                0.0,
+                f"{channel.label} has no command that can approach its target without "
+                "breaking its acceleration or rate limit",
+            )
+        commanded = min(max(wanted_rate, low), high)
         step = commanded * dt
-        if delta * step <= 0.0 and delta != 0.0 and commanded != wanted_rate:
-            step = 0.0  # still braking the other way: hold rather than reverse past it
-        if abs(step) > abs(delta):
-            step = delta  # never overshoot the target
         limited = float(last) + step
         if channel.cyclic:
             limited = channel.wrap(limited)
-        else:
-            if channel.low is not None:
-                limited = max(limited, channel.low)
-            if channel.high is not None:
-                limited = min(limited, channel.high)
-        return limited, step / dt
+        problem = self._verify_limit(channel, delta, step, commanded, dt, rate, limited)
+        return limited, commanded, problem
+
+    def _verify_limit(
+        self,
+        channel: ShieldChannel,
+        delta: float,
+        step: float,
+        commanded: float,
+        dt: float,
+        rate: float | None,
+        limited: float,
+    ) -> str:
+        """Defend against any numeric or future clipping error that widens a limit."""
+        bad_accel = (
+            channel.max_accel is not None
+            and channel.max_accel > 0.0
+            and rate is not None
+            and abs(commanded - rate) > channel.max_accel * dt + _EXACT
+        )
+        cap = None if channel.max_rate is None else channel.max_rate * self._margin
+        bad_rate = cap is not None and cap > 0.0 and abs(commanded) > cap + _EXACT
+        bad_step = delta * step < -_EXACT or abs(step) > abs(delta) + _EXACT
+        bad_bound = (
+            not channel.cyclic
+            and (
+                (channel.low is not None and limited < channel.low - _EXACT)
+                or (channel.high is not None and limited > channel.high + _EXACT)
+            )
+        )
+        if bad_accel or bad_rate or bad_step or bad_bound or not math.isfinite(limited):
+            return f"{channel.label} has no finite command satisfying all declared limits"
+        return ""
 
 
 @dataclass(frozen=True)

@@ -44,11 +44,14 @@ _CAMERA_REQUIRES = (
 )
 _PERCEPTION_REQUIRES = (*_CAMERA_REQUIRES, f"{REQUIRE_MODEL}locator")
 _SHARED_REQUIRES = (*_CAMERA_REQUIRES, f"{REQUIRE_SHARE}{SHARE_FRAMES}")
+# No locator here: the object may be one S2 lifted out of a shared frame, and
+# bounding the planner on the locator made every lifted object ungraspable on a
+# workcell that runs no model service. Grounding is perceive.locate's gate.
 _GRASP_REQUIRES = (
     f"{REQUIRE_ROLE}arm",
     f"{REQUIRE_ROLE}gripper",
     f"{REQUIRE_CALIBRATION}tcp",
-    *_PERCEPTION_REQUIRES,
+    *_CAMERA_REQUIRES,
 )
 _COORD = {"type": "number", "minimum": 0}
 
