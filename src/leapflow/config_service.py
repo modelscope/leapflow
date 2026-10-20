@@ -274,6 +274,54 @@ _FIELD_DESCRIPTIONS = {
         "known to produce no sensitive data. Applied when the store is built, so a "
         "change needs a daemon restart."
     ),
+    "hardware.skills_enabled": (
+        "Comma-separated patterns (fnmatch) of node skills a hardware node offers; empty "
+        "offers every discovered skill. Read when the node starts, so a change needs a "
+        "node restart."
+    ),
+    "hardware.skills_speed_pct_max": (
+        "Upper bound on the speed rate (percent of firmware maximum) any skill plan may "
+        "request. Read when the node starts, so a change needs a node restart."
+    ),
+    "hardware.skills_max_duration_s": (
+        "Longest one skill execution may run before the node halts it and reports a "
+        "timeout. Read when the node starts, so a change needs a node restart."
+    ),
+    "hardware.skills_plan_ttl_s": (
+        "How long a skill plan the node computed stays executable; an older plan must be "
+        "planned (and approved) again. Read when the node starts, so a change needs a node "
+        "restart."
+    ),
+    "hardware.skills_halt_timeout_s": (
+        "Longest one actuator's halt call may take when a run is stopped or fails before "
+        "the node logs it as failed. Read when the node starts, so a change needs a node "
+        "restart."
+    ),
+    "hardware.skills_stop_grace_s": (
+        "How long a stopped skill may unwind on its own before the node cancels it. Read "
+        "when the node starts, so a change needs a node restart."
+    ),
+    "hardware.skills_dispatch_settle_s": (
+        "How long the node waits for a write still inside a transport when a run ends; "
+        "past it the run reports side effect UNKNOWN and keeps its devices held until the "
+        "write resolves. Read when the node starts, so a change needs a node restart."
+    ),
+    "hardware.skills_episode_fps": (
+        "Rate at which every executed skill run is recorded (arm state, commands, one "
+        "frame per workcell camera) under the profile's hardware/episodes for offline "
+        "training; 0 disables recording. Read when the node starts, so a change needs a "
+        "node restart."
+    ),
+    "hardware.skills_episode_min_free_mb": (
+        "Free disk space below which a run is not recorded (the run itself proceeds). "
+        "Read when the node starts, so a change needs a node restart."
+    ),
+    "hardware.share_frames": (
+        "Let the model look at workcell camera frames (perceive.snapshot). Off by default; "
+        "the workcell must also declare share_frames. Each shared frame is audited and "
+        "shown to the model only for the current turns, never persisted. Read when the "
+        "skill tools are built, so a change needs a daemon restart."
+    ),
     "llm.api_key": "Primary LLM API key stored in the local secret vault.",
     "llm.aux_api_key": "Auxiliary LLM provider API key stored in the local secret vault.",
     "llm.base_url": "OpenAI-compatible endpoint for the primary LLM provider.",
@@ -492,6 +540,7 @@ _VALUE_HINTS = {
     "hardware.providers": "comma-separated provider kinds (yaml, host, media)",
     "hardware.host_include": "comma-separated channel-id prefixes, or empty for all",
     "hardware.host_exclude": "comma-separated channel-id prefixes, or empty for none",
+    "hardware.skills_enabled": "comma-separated skill-id patterns, or empty for all",
     "recording.mode": "video|default|vision_only",
     "signal.channels": "all or comma-separated channel names",
     "signal.noise_path_fragments": "comma-separated path fragments",

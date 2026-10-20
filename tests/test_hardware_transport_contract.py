@@ -254,9 +254,6 @@ _EXTERNAL_ONLY_TRANSPORTS = frozenset(
         # Depends on torch/leapflow.robot -- optional heavy ML packages that are not installed
         # in the standard test environment.
         "robot_arm",
-        # Depends on torch and gRPC for VLA model serving; exercised in dedicated
-        # integration tests when the runtime is available.
-        "vla_inference",
         # Depends on rclpy (ROS2 Python client library), which is an optional
         # heavy dependency not installed in the standard test environment.
         "ros2",
@@ -271,6 +268,12 @@ _EXTERNAL_ONLY_TRANSPORTS = frozenset(
         # unit conversion, hold-position vectors, side-effect verdicts, halt
         # mapping) runs against a fake SDK in tests/test_piper_transport.py.
         "piper",
+        # Needs a running model server answering the v1 contract; the generic cases
+        # also assume declared sensor/setpoint channels a model cannot serve. Its
+        # contracts -- fail-closed identity at open, provable-NONE write refusal,
+        # bounded retries, typed failure codes -- run against a loopback aiohttp
+        # server in tests/test_model_service_transport.py.
+        "model_service",
     }
 )
 

@@ -18,15 +18,15 @@ import re
 import sys
 from typing import Any, Dict, List, Optional
 
-from leapflow.security.permission_failures import (
-    is_permission_failure_payload,
-    is_permission_hard_stop_payload,
-)
+from leapflow.engine._tool_helpers import _resolve_tool_name
 from leapflow.engine.tools.tool_execution import (
     effect_is_uncertain_on_failure,
     exit_code_from,
 )
-from leapflow.engine._tool_helpers import _resolve_tool_name
+from leapflow.security.permission_failures import (
+    is_permission_failure_payload,
+    is_permission_hard_stop_payload,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -718,6 +718,8 @@ def _latest_turn_tool_result(messages: List[Dict[str, Any]]) -> Dict[str, Any] |
     for msg in reversed(messages):
         role = msg.get("role", "")
         content = msg.get("content", "")
+        if msg.get("_tool_attachment"):
+            continue  # images a tool returned, not the turn's user message
         if role == "tool":
             if not isinstance(content, str):
                 return None
@@ -780,6 +782,10 @@ def _last_tool_failures_recovery_message(
     # Authorization / permission failures — deterministic, no retry via LLM
     if _is_permission_failure_payload(last):
         lines.append(_build_permission_recovery_text(last))
+    elif last.get("blocks_approval") and error:
+        # A fail-closed hard stop (e.g. device readiness) carries its own
+        # executable repair instruction; surface it verbatim, never via the LLM.
+        lines.append(error)
     elif failure_code == "unknown_platform_action":
         platform = str(last.get("platform") or "")
         action = str(last.get("requested_action") or "")

@@ -268,6 +268,29 @@ class Settings:
     # JSON array of event-to-action rules evaluated by hardware stream sources.
     # Empty keeps reflex actions disabled until an operator declares them.
     hardware_alert_policies: str = ""
+    # Node-local skills (S1.5). Comma-separated fnmatch patterns of enabled skill
+    # ids; empty enables every discovered skill. The speed cap bounds every
+    # skill plan; the duration cap bounds one skill execution end to end.
+    hardware_skills_enabled: str = ""
+    hardware_skills_speed_pct_max: float = 30.0
+    hardware_skills_max_duration_s: float = 120.0
+    # Skill-run timing: how long an unexecuted plan stays valid, how long one
+    # actuator's halt may take, how long a stopped skill may unwind before it is
+    # cancelled, and how long an in-flight write is awaited before the run ends
+    # with side effect UNKNOWN (its devices stay held until the write resolves).
+    hardware_skills_plan_ttl_s: float = 300.0
+    hardware_skills_halt_timeout_s: float = 2.0
+    hardware_skills_stop_grace_s: float = 1.0
+    hardware_skills_dispatch_settle_s: float = 2.0
+    # Every executed skill run is recorded as an episode under the profile's
+    # hardware/episodes at this rate (0 disables recording); recording is skipped
+    # when the disk has less than the free-space floor left.
+    hardware_skills_episode_fps: float = 30.0
+    hardware_skills_episode_min_free_mb: float = 2048.0
+    # Host consent to let the model look at workcell camera frames (perceive.snapshot).
+    # Both this and the workcell's own share_frames must be on; every frame shared
+    # is audited and none is persisted.
+    hardware_share_frames: bool = False
     runtime_dir: Path = field(default_factory=lambda: _bootstrap_profile_layout().runtime_dir)
 
     # Audit
@@ -562,6 +585,8 @@ class Settings:
     agent_subagent_max_concurrent: int = 3
     agent_subagent_max_iterations: int = 15
     agent_max_parallel_tools: int = 8  # Max tool calls run in parallel within one response's batch
+    # Newest tool-result images kept in the live conversation; older ones become text.
+    agent_tool_images_kept: int = 2
     agent_subagent_full_loop: bool = False
     agent_calibration_enabled: bool = False
     agent_calibration_min_confidence: float = 0.3
@@ -1291,6 +1316,7 @@ def _build_settings_from_env(
     agent_subagent_max_concurrent = int(os.getenv("LEAPFLOW_AGENT_SUBAGENT_MAX_CONCURRENT", "3"))
     agent_subagent_max_iterations = int(os.getenv("LEAPFLOW_AGENT_SUBAGENT_MAX_ITERATIONS", "15"))
     agent_max_parallel_tools = int(os.getenv("LEAPFLOW_AGENT_MAX_PARALLEL_TOOLS", "8"))
+    agent_tool_images_kept = max(0, int(os.getenv("LEAPFLOW_AGENT_TOOL_IMAGES_KEPT", "2")))
     agent_subagent_full_loop = os.getenv(
         "LEAPFLOW_AGENT_SUBAGENT_FULL_LOOP", "0"
     ).strip().lower() in ("1", "true", "yes")
@@ -1323,7 +1349,9 @@ def _build_settings_from_env(
         "true",
         "yes",
     )
-    agent_reentry_hardware_enabled = os.getenv("LEAPFLOW_AGENT_REENTRY_HARDWARE_ENABLED", "0").strip().lower() in (
+    agent_reentry_hardware_enabled = os.getenv(
+        "LEAPFLOW_AGENT_REENTRY_HARDWARE_ENABLED", "0"
+    ).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -1460,6 +1488,36 @@ def _build_settings_from_env(
     # LEAPFLOW_FLEET_NODES fallback is applied later, in fleet_config.
     hardware_fleet_nodes = os.getenv("LEAPFLOW_HARDWARE_FLEET_NODES", "").strip()
     hardware_alert_policies = os.getenv("LEAPFLOW_HARDWARE_ALERT_POLICIES", "").strip()
+    hardware_skills_enabled = os.getenv("LEAPFLOW_HARDWARE_SKILLS_ENABLED", "").strip()
+    hardware_skills_speed_pct_max = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_SPEED_PCT_MAX", "30") or 30.0
+    )
+    hardware_skills_max_duration_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_MAX_DURATION_S", "120") or 120.0
+    )
+    hardware_skills_plan_ttl_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_PLAN_TTL_S", "300") or 300.0
+    )
+    hardware_skills_halt_timeout_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_HALT_TIMEOUT_S", "2") or 2.0
+    )
+    hardware_skills_stop_grace_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_STOP_GRACE_S", "1") or 1.0
+    )
+    hardware_skills_dispatch_settle_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_DISPATCH_SETTLE_S", "2") or 2.0
+    )
+    hardware_skills_episode_fps = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_EPISODE_FPS", "30") or 30.0
+    )
+    hardware_skills_episode_min_free_mb = float(
+        os.getenv("LEAPFLOW_HARDWARE_SKILLS_EPISODE_MIN_FREE_MB", "2048") or 2048.0
+    )
+    hardware_share_frames = os.getenv("LEAPFLOW_HARDWARE_SHARE_FRAMES", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     web_transport = os.getenv("LEAPFLOW_WEB_TRANSPORT", "auto").strip().lower() or "auto"
     web_timeout_s = float(os.getenv("LEAPFLOW_WEB_TIMEOUT_S", "20"))
     web_max_bytes = int(os.getenv("LEAPFLOW_WEB_MAX_BYTES", "2000000"))
@@ -1900,6 +1958,7 @@ def _build_settings_from_env(
         agent_subagent_max_concurrent=agent_subagent_max_concurrent,
         agent_subagent_max_iterations=agent_subagent_max_iterations,
         agent_max_parallel_tools=agent_max_parallel_tools,
+        agent_tool_images_kept=agent_tool_images_kept,
         agent_subagent_full_loop=agent_subagent_full_loop,
         agent_calibration_enabled=agent_calibration_enabled,
         agent_calibration_min_confidence=agent_calibration_min_confidence,
@@ -1968,6 +2027,16 @@ def _build_settings_from_env(
         hardware_preview_idle_timeout_s=hardware_preview_idle_timeout_s,
         hardware_fleet_nodes=hardware_fleet_nodes,
         hardware_alert_policies=hardware_alert_policies,
+        hardware_skills_enabled=hardware_skills_enabled,
+        hardware_skills_speed_pct_max=hardware_skills_speed_pct_max,
+        hardware_skills_max_duration_s=hardware_skills_max_duration_s,
+        hardware_skills_plan_ttl_s=hardware_skills_plan_ttl_s,
+        hardware_skills_halt_timeout_s=hardware_skills_halt_timeout_s,
+        hardware_skills_stop_grace_s=hardware_skills_stop_grace_s,
+        hardware_skills_dispatch_settle_s=hardware_skills_dispatch_settle_s,
+        hardware_skills_episode_fps=hardware_skills_episode_fps,
+        hardware_skills_episode_min_free_mb=hardware_skills_episode_min_free_mb,
+        hardware_share_frames=hardware_share_frames,
         web_transport=web_transport,
         web_timeout_s=web_timeout_s,
         web_max_bytes=web_max_bytes,

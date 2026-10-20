@@ -91,9 +91,8 @@ class InferenceStrategy(Protocol):
     """Pluggable physical AI inference strategy.
 
     Any object satisfying this protocol can be registered with the
-    :class:`~leapflow.robot.inference.registry.InferenceStrategyRegistry` and
-    used by ``PhysicalSkillPlugin`` in place of the two hardcoded local/remote
-    paths.  Implementations are free to lazily load heavy resources (models,
+    :class:`~leapflow.robot.inference.registry.InferenceStrategyRegistry`.
+    Implementations are free to lazily load heavy resources (models,
     transports) inside :meth:`infer` so that construction stays cheap and
     dependency-free.
     """

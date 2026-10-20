@@ -14,8 +14,6 @@ changing the engine's single-turn internals.
 
 Phase P3-1: additive only. The factory is not yet used by the daemon (that is
 P3-2's SessionRegistry); this phase adds the mechanism and proves isolation.
-
-See ``temp/plan/concurrent_turns_stage3.md`` (Approach D, §4.1–4.3).
 """
 from __future__ import annotations
 

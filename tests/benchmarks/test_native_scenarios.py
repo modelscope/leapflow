@@ -43,7 +43,7 @@ async def test_all_native_adapters_execute_all_scenarios() -> None:
             assert result.metrics, f"{adapter.adapter_id}/{scenario.scenario_id} lacks metrics"
             assert result.evidence, f"{adapter.adapter_id}/{scenario.scenario_id} lacks evidence"
 
-    assert total == 41, scenario_counts
+    assert total == 40, scenario_counts
     assert failures == []
 
 

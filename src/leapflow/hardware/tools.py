@@ -36,14 +36,19 @@ import math
 import time
 from typing import Any, Mapping
 
+from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.context import (
     Channel,
     HardwareContext,
     HardwareEffect,
     as_numeric,
 )
+from leapflow.hardware.execution_authorization import (
+    ExecutionAuthorization,
+    approved_authorization,
+    execution_authorization,
+)
 from leapflow.hardware.reference import describe, summarize
-from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.transport import (
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_NONE,
@@ -52,11 +57,6 @@ from leapflow.hardware.transport import (
     TransportError,
     WriteOutcome,
 )
-from leapflow.hardware.write_verification import (
-    WriteExpectation,
-    WriteVerdict,
-    WriteVerificationCoordinator,
-)
 from leapflow.hardware.write_governor import (
     BatchFeasibilityResult,
     ControlFeasibilityResult,
@@ -64,6 +64,11 @@ from leapflow.hardware.write_governor import (
     WriteGovernanceRequest,
     WriteGovernor,
     execute_sequential_batch,
+)
+from leapflow.hardware.write_verification import (
+    WriteExpectation,
+    WriteVerdict,
+    WriteVerificationCoordinator,
 )
 from leapflow.plugins.protocol import ToolMetadata
 from leapflow.security.actions import ActionDescriptor, ActionKind
@@ -218,6 +223,10 @@ class HardwareTools:
         context = current_tool_context()
         active_session_id = getattr(context, "session_id", "") if context is not None else ""
         return str(active_session_id or self._fallback_session_id)
+
+    def _authorization(self, descriptor: ActionDescriptor) -> ExecutionAuthorization:
+        """What an approved *descriptor* authorizes downstream (permits on LHP nodes)."""
+        return approved_authorization(descriptor, session_id=self._session_identity())
 
     # ── Discovery ──
 
@@ -498,14 +507,13 @@ class HardwareTools:
         if not allowed:
             result = self._refusal(device_id, "", "approval_denied", denial)
             if no_gate:
-                result["interaction_request"] = _no_gate_interaction(device_id)
+                result["interaction_request"] = no_gate_interaction(device_id)
             return result
 
-        return await self._execute_batch_write(feasibility)
+        with execution_authorization(self._authorization(feasibility.descriptor)):
+            return await self._execute_batch_write(feasibility)
 
-    async def _check_batch_feasibility(
-        self, params: Mapping[str, Any]
-    ) -> BatchFeasibilityResult:
+    async def _check_batch_feasibility(self, params: Mapping[str, Any]) -> BatchFeasibilityResult:
         """Run the full pre-approval feasibility chain for a batch write.
 
         Validates every command in the batch sequentially: resolve, writable,
@@ -710,9 +718,7 @@ class HardwareTools:
             source=source,
         )
 
-    async def _execute_batch_write(
-        self, feasibility: BatchFeasibilityResult
-    ) -> dict[str, Any]:
+    async def _execute_batch_write(self, feasibility: BatchFeasibilityResult) -> dict[str, Any]:
         """Execute the approved batch write: transport, audit, trust, verification."""
         from leapflow.hardware.transport import BatchTransport
 
@@ -801,8 +807,10 @@ class HardwareTools:
             not_attempted = outcome is not None and outcome.failure_code == "batch_not_attempted"
             if self._trust_gate is not None and not ch_ok and not not_attempted:
                 self._trust_gate.record_failure(
-                    device_id, channel.channel_id,
-                    hard=outcome is not None and outcome.failure_code == "driver_contract_violation",
+                    device_id,
+                    channel.channel_id,
+                    hard=outcome is not None
+                    and outcome.failure_code == "driver_contract_violation",
                 )
 
             if ch_ok:
@@ -931,10 +939,11 @@ class HardwareTools:
         if not allowed:
             result = self._refusal(device_id, "", "approval_denied", denial)
             if no_gate:
-                result["interaction_request"] = _no_gate_interaction(device_id)
+                result["interaction_request"] = no_gate_interaction(device_id)
             return result
 
-        return await self._execute_control_start(feasibility, params)
+        with execution_authorization(self._authorization(feasibility.descriptor)):
+            return await self._execute_control_start(feasibility, params)
 
     async def _check_control_feasibility(
         self, params: Mapping[str, Any]
@@ -951,9 +960,7 @@ class HardwareTools:
 
         context = self._registry.context(device_id)
         if context is None:
-            return ControlFeasibilityResult(
-                ok=False, error=self._unknown_device(device_id)
-            )
+            return ControlFeasibilityResult(ok=False, error=self._unknown_device(device_id))
         if self._requires_describe(device_id):
             return ControlFeasibilityResult(
                 ok=False,
@@ -1028,7 +1035,11 @@ class HardwareTools:
 
         failed_interlocks = await self._control_interlocks(context, resolved)
         descriptor = self._control_descriptor(
-            context, mode, frequency_hz, resolved, failed_interlocks,
+            context,
+            mode,
+            frequency_hz,
+            resolved,
+            failed_interlocks,
         )
 
         return ControlFeasibilityResult(
@@ -1118,7 +1129,9 @@ class HardwareTools:
         transport = await self._registry.transport(device_id)
         if not isinstance(transport, RemoteControlTransport):
             return self._refusal(
-                device_id, "", "remote_control_unsupported",
+                device_id,
+                "",
+                "remote_control_unsupported",
                 "transport does not support remote control sessions",
             )
         lease_s = float(params.get("lease_s", 1.0) or 1.0)
@@ -1135,7 +1148,10 @@ class HardwareTools:
             )
         except Exception as exc:  # noqa: BLE001
             return self._refusal(
-                device_id, "", "control_start_failed", str(exc),
+                device_id,
+                "",
+                "control_start_failed",
+                str(exc),
                 side_effect_state=SIDE_EFFECT_UNKNOWN,
             )
         self._audit.record(
@@ -1232,14 +1248,6 @@ class HardwareTools:
                 "",
                 "no_actuation_channels",
                 f"Device {device_id!r} has no writable effect=actuate channels.",
-            )
-        if mode == "policy_chain":
-            return None, self._refusal(
-                device_id,
-                "",
-                "unsupported_control_mode",
-                "policy_chain cannot be opened through hw_control_start; use governed "
-                "single-step hw_policy_infer execution until node-local sessions exist.",
             )
         raw_points, point_error = self._control_points(device_id, mode, params)
         if point_error is not None:
@@ -1340,10 +1348,7 @@ class HardwareTools:
     ) -> ActionDescriptor:
         primary = resolved[0][0]
         # Per-channel band + mode/frequency superset forms the grant identity.
-        channel_bands = sorted(
-            f"{ch.channel_id}:{ch.envelope.band_key()}"
-            for ch, _ in resolved
-        )
+        channel_bands = sorted(f"{ch.channel_id}:{ch.envelope.band_key()}" for ch, _ in resolved)
         grant_id = f"control:{mode}@{frequency_hz:g}Hz|" + "|".join(channel_bands)
         return ActionDescriptor.device(
             kind=ActionKind.DEVICE_ACTUATE.value,
@@ -1470,12 +1475,11 @@ class HardwareTools:
                 denial,
             )
             if no_gate:
-                result["interaction_request"] = _no_gate_interaction(
-                    feasibility.context.device_id
-                )
+                result["interaction_request"] = no_gate_interaction(feasibility.context.device_id)
             return result
 
-        return await self._execute_single_write(feasibility)
+        with execution_authorization(self._authorization(feasibility.descriptor)):
+            return await self._execute_single_write(feasibility)
 
     async def _check_write_feasibility(
         self, tool_name: str, params: Mapping[str, Any]
@@ -1627,9 +1631,7 @@ class HardwareTools:
             conditions=conditions,
         )
 
-    async def _execute_single_write(
-        self, feasibility: WriteFeasibilityResult
-    ) -> dict[str, Any]:
+    async def _execute_single_write(self, feasibility: WriteFeasibilityResult) -> dict[str, Any]:
         """Execute a single-channel write after approval has been granted.
 
         Takes a passed WriteFeasibilityResult and performs the physical write via
@@ -2013,7 +2015,8 @@ class HardwareTools:
         if meta.get("batch") or meta.get("control_session"):
             channel_ids = (
                 tuple(str(command.get("channel_id") or "") for command in commands)
-                if commands else tuple(str(cid) for cid in meta.get("channels", ()))
+                if commands
+                else tuple(str(cid) for cid in meta.get("channels", ()))
             )
             request = WriteGovernanceRequest.batch(
                 device_id=str(meta.get("device_id") or ""),
@@ -2184,7 +2187,7 @@ def _batch_grant_identity(channel_summaries: tuple[dict[str, Any], ...]) -> str:
     return "batch:" + "|".join(parts) if parts else "batch:empty"
 
 
-def _no_gate_interaction(device_id: str) -> dict[str, Any]:
+def no_gate_interaction(device_id: str) -> dict[str, Any]:
     """Build a structured InteractionRequest payload for Mode 3 (no TUI).
 
     When no approval gate is installed the write is refused, and this request
@@ -2368,9 +2371,7 @@ def _control_preview_result(feasibility: ControlFeasibilityResult) -> dict[str, 
             "summary": descriptor.summary,
             "mode": feasibility.mode,
             "frequency_hz": feasibility.frequency_hz,
-            "channels": [
-                channel.channel_id for channel, _ in feasibility.resolved
-            ],
+            "channels": [channel.channel_id for channel, _ in feasibility.resolved],
             "interlocks_satisfied": not interlocks_failed,
             "interlocks_failed": list(interlocks_failed),
             "requires_approval": True,
@@ -2563,8 +2564,9 @@ def build_hardware_tools(tools: HardwareTools) -> list[ToolMetadata]:
             name="hw_control_start",
             description=(
                 "Start a real-time control loop on a robot device. "
-                "Supports PID position tracking, impedance control, "
-                "trajectory following, and neural policy chains."
+                "Supports PID position tracking, impedance control, and "
+                "trajectory following. Learned policies run as the node skill "
+                "policy.run (hw_skill_run), never through this loop."
             ),
             parameters_schema={
                 "type": "object",
@@ -2572,7 +2574,7 @@ def build_hardware_tools(tools: HardwareTools) -> list[ToolMetadata]:
                     "device_id": {"type": "string", "description": "Target device"},
                     "mode": {
                         "type": "string",
-                        "enum": ["pid", "impedance", "trajectory", "policy_chain"],
+                        "enum": ["pid", "impedance", "trajectory"],
                         "description": "Control mode",
                     },
                     "targets": {
@@ -2586,10 +2588,6 @@ def build_hardware_tools(tools: HardwareTools) -> list[ToolMetadata]:
                     "trajectory": {
                         "type": "array",
                         "description": "Time-indexed joint trajectory (for trajectory mode)",
-                    },
-                    "policy": {
-                        "type": "string",
-                        "description": "Policy path (for policy_chain mode)",
                     },
                     "gains": {
                         "type": "object",
@@ -2658,4 +2656,4 @@ def build_hardware_tools(tools: HardwareTools) -> list[ToolMetadata]:
     ]
 
 
-__all__ = ["HardwareTools", "build_hardware_tools"]
+__all__ = ["HardwareTools", "build_hardware_tools", "no_gate_interaction"]

@@ -75,7 +75,9 @@ class HostTransport:
                 "backends": list(self._metrics.backends),
                 "available_channels": len(known),
                 "unavailable_channels": missing,
-                "uptime_s": round(time.monotonic() - self._opened_at, 1) if self._connected else 0.0,
+                "uptime_s": round(time.monotonic() - self._opened_at, 1)
+                if self._connected
+                else 0.0,
             },
         )
 

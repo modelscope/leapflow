@@ -5,7 +5,6 @@ Covers:
 - PIDJointController convergence and clamping
 - ImpedanceController spring-damper behaviour
 - TrajectoryTracker interpolation and progress
-- PolicyChain outer/inner frequency separation
 - RealtimeControlLoop session lifecycle
 """
 
@@ -37,11 +36,9 @@ from leapflow.hardware.realtime import (
     ControlTelemetryEvent,
     ImpedanceController,
     PIDJointController,
-    PolicyChain,
     RealtimeControlLoop,
     TrajectoryTracker,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -65,24 +62,6 @@ def _make_state(
         cycle_number=cycle_number,
         cycle_dt_s=cycle_dt_s,
     )
-
-
-class _ConstantPolicy:
-    """Minimal ControlPolicy that always returns a fixed command."""
-
-    def __init__(self, commands: Mapping[str, float], *, pid: str = "const") -> None:
-        self._commands = dict(commands)
-        self._pid = pid
-
-    @property
-    def policy_id(self) -> str:
-        return self._pid
-
-    def compute(self, state: ControlState) -> ControlCommand:
-        return ControlCommand(joint_commands=self._commands)
-
-    def reset(self) -> None:
-        pass
 
 
 def test_control_bus_refuses_commands_when_device_is_degraded() -> None:
@@ -449,83 +428,6 @@ class TestTrajectoryTracker:
 
 
 # ---------------------------------------------------------------------------
-# PolicyChain
-# ---------------------------------------------------------------------------
-
-
-class TestPolicyChain:
-    """Policy chain unit tests."""
-
-    def test_protocol_conformance(self) -> None:
-        outer = _ConstantPolicy({"j1": 1.0}, pid="outer")
-        inner = PIDJointController(("j1",))
-        chain = PolicyChain(outer, inner, outer_rate_hz=10.0)
-        assert isinstance(chain, ControlPolicy)
-
-    def test_policy_id(self) -> None:
-        outer = _ConstantPolicy({"j1": 1.0}, pid="vla")
-        inner = PIDJointController(("j1",))
-        chain = PolicyChain(outer, inner)
-        assert chain.policy_id == "chain:vla+pid_joint"
-
-    def test_outer_called_at_lower_rate(self) -> None:
-        """Outer policy should be called less frequently than inner."""
-        outer_calls = {"count": 0}
-        inner_calls = {"count": 0}
-
-        class _CountingOuter:
-            policy_id = "counting_outer"
-
-            def compute(self, state: ControlState) -> ControlCommand:
-                outer_calls["count"] += 1
-                return ControlCommand(joint_commands={"j1": 1.0})
-
-            def reset(self) -> None:
-                pass
-
-        class _CountingInner:
-            policy_id = "counting_inner"
-
-            def compute(self, state: ControlState) -> ControlCommand:
-                inner_calls["count"] += 1
-                return ControlCommand(joint_commands={"j1": 0.5})
-
-            def reset(self) -> None:
-                pass
-
-            def set_target(self, targets: Mapping[str, float]) -> None:
-                pass
-
-        chain = PolicyChain(_CountingOuter(), _CountingInner(), outer_rate_hz=10.0)
-
-        # Simulate 100 cycles at 100 Hz (dt=0.01).
-        for i in range(100):
-            state = _make_state({"j1": 0.0}, cycle_dt_s=0.01, cycle_number=i)
-            chain.compute(state)
-
-        # Outer at 10 Hz on a 100 Hz bus → ~10 calls in 100 cycles.
-        assert 8 <= outer_calls["count"] <= 12
-        # Inner called every cycle.
-        assert inner_calls["count"] == 100
-
-    def test_invalid_rate(self) -> None:
-        outer = _ConstantPolicy({"j1": 0.0})
-        inner = PIDJointController(("j1",))
-        with pytest.raises(ValueError, match="outer_rate_hz"):
-            PolicyChain(outer, inner, outer_rate_hz=0.0)
-
-    def test_reset(self) -> None:
-        outer = _ConstantPolicy({"j1": 0.0})
-        inner = PIDJointController(("j1",))
-        chain = PolicyChain(outer, inner)
-        # Run once to initialize.
-        state = _make_state({"j1": 0.0})
-        chain.compute(state)
-        chain.reset()
-        assert chain._first_call is True
-
-
-# ---------------------------------------------------------------------------
 # RealtimeControlLoop
 # ---------------------------------------------------------------------------
 
@@ -569,22 +471,6 @@ class TestRealtimeControlLoop:
         call_args = bus.async_start.call_args
         policy = call_args.args[1] if len(call_args.args) > 1 else call_args[0][1]
         assert isinstance(policy, TrajectoryTracker)
-
-    @pytest.mark.asyncio
-    async def test_start_policy_chain(self) -> None:
-        bus = self._make_mock_bus()
-        loop = RealtimeControlLoop(bus)
-        outer = _ConstantPolicy({"j1": 1.0}, pid="outer")
-        sid = await loop.start_policy_chain(
-            "dev0",
-            outer,
-            joint_ids=("j1",),
-            outer_rate_hz=10.0,
-        )
-        assert isinstance(sid, str)
-        call_args = bus.async_start.call_args
-        policy = call_args.args[1] if len(call_args.args) > 1 else call_args[0][1]
-        assert isinstance(policy, PolicyChain)
 
     @pytest.mark.asyncio
     async def test_stop_returns_stats(self) -> None:

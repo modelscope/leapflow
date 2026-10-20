@@ -1,0 +1,56 @@
+# Open-vocabulary locator served as a model device (task ``grounding``).
+#
+# A model server is admitted like any other device: this declaration names
+# where it listens, which contract task it must serve, and which weights it
+# must report. The node verifies ``/v1/health``'s ``model_info`` at open and
+# compares the identity every ``/v1/infer`` response echoes, so a swapped or
+# restarted checkpoint is refused rather than silently used.
+#
+# The Jetson deployment ships a reference server (NanoOWL boxes refined by
+# NanoSAM masks); any server answering the ``grounding`` contract with masks,
+# boxes, or points works unchanged.
+# A workcell binds it as ``models: {locator: perception_locator}``.
+
+hc_version: "hc.v1"
+device_id: "perception_locator"
+display_name: "Open-vocabulary locator (NanoOWL + NanoSAM)"
+device_class: "model"
+location: "yahboom"
+# A model commands nothing; declaring no halt keeps admission honest.
+halt_supported: false
+
+transport:
+  kind: "model_service"
+  config:
+    # Camera frames are posted here: loopback only unless allow_remote: true.
+    url: "http://127.0.0.1:8010"
+    task: "grounding"
+    # Pin what the server must report; empty fields are not checked. Copy the
+    # values from `curl -s 127.0.0.1:8010/v1/health` once the weights are final.
+    expect:
+      name: "nanoowl-nanosam"
+      # version: "owlvit-b32+resnet18"
+      # checksum: "sha256:..."
+    timeout_s: 5.0
+    max_retries: 1
+    retry_backoff_s: 0.2
+
+channels:
+  - channel_id: "model.info"
+    direction: "read"
+    quantity: "model_metadata"
+    representation: "state"
+    effect: "read"
+    description: "The verified model_info: task, name, version, checksum, instance."
+  - channel_id: "model.health"
+    direction: "read"
+    quantity: "model_metadata"
+    representation: "state"
+    effect: "read"
+    description: "Reachable and still serving the verified identity."
+  - channel_id: "model.latency"
+    direction: "read"
+    quantity: "model_metadata"
+    representation: "state"
+    effect: "read"
+    description: "Round-trip and inference latency percentiles over recent calls."

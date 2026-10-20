@@ -9,7 +9,6 @@ guard for LHP transports.
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -17,12 +16,10 @@ from typing import Any
 import pytest
 
 from leapflow.hardware.lhp.control_sessions import (
-    DEFAULT_LEASE_S,
     MAX_LEASE_S,
     MIN_LEASE_S,
-    NodeControlSessions,
+    NodeSessions,
 )
-
 
 # ── Stubs ──────────────────────────────────────────────────────────────────
 
@@ -87,9 +84,9 @@ class _StubRegistry:
         return {"stats": {"cycle_count": 42}}
 
 
-def _make_sessions(*, degraded: bool = False) -> tuple[NodeControlSessions, _StubRegistry]:
+def _make_sessions(*, degraded: bool = False) -> tuple[NodeSessions, _StubRegistry]:
     reg = _StubRegistry(degraded=degraded)
-    sessions = NodeControlSessions(reg)
+    sessions = NodeSessions(reg)
     return sessions, reg
 
 
@@ -155,7 +152,7 @@ async def test_update_renews_lease():
 @pytest.mark.asyncio
 async def test_status_reports_active_session():
     sessions, _ = _make_sessions()
-    result = await sessions.open(
+    await sessions.open(
         {"device_id": "arm", "mode": "pid", "comm_loss_policy": "halt"},
         connection_id=CONN_A,
     )
@@ -230,7 +227,7 @@ async def test_lease_expiry_triggers_halt():
     assert reg._transport.halt_count == 1
     # Session should be halted
     session = sessions._sessions[cid]
-    assert session.halted is True
+    assert session.ended is True
 
 
 @pytest.mark.asyncio
@@ -248,13 +245,13 @@ async def test_hold_policy_does_not_halt():
     # Hold policy: loop stopped, but device NOT halted
     assert reg._transport.halt_count == 0
     session = sessions._sessions[cid]
-    assert session.halted is True
+    assert session.ended is True
 
 
 @pytest.mark.asyncio
 async def test_disconnect_triggers_comm_loss():
     sessions, reg = _make_sessions()
-    result = await sessions.open(
+    await sessions.open(
         {"device_id": "arm", "mode": "pid", "lease_s": 5.0,
          "comm_loss_policy": "halt"},
         connection_id=CONN_A,
@@ -313,7 +310,7 @@ async def test_duplicate_session_rejected():
         connection_id=CONN_B,
     )
     assert result["ok"] is False
-    assert result["failure_code"] == "control_session_exists"
+    assert result["failure_code"] == "device_busy"
 
 
 # ── Lease clamping ───────────────────────────────────────────────────────
@@ -375,7 +372,6 @@ async def test_renew_unknown_session_rejected():
 
 def test_registry_refuses_lhp_control_bus():
     """Host registry raises RuntimeError if start_control_loop is called for LHP transport."""
-    from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
     from leapflow.hardware.context import (
         HC_VERSION,
         Channel,
@@ -383,6 +379,7 @@ def test_registry_refuses_lhp_control_bus():
         HardwareContext,
         TransportRef,
     )
+    from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
 
     ctx = HardwareContext(
         device_id="remote",

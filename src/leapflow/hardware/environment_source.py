@@ -9,11 +9,14 @@ capability gap detector.  Three observation types:
   Emitted periodically (configurable interval, default 30s) and on demand.
 
 - **delta**: structural changes since last snapshot — devices that appeared
-  or disappeared, affordances gained or lost, channels that changed direction
-  or effect, health transitions (OK→STALE, connected→disconnected).
+  or disappeared, channels that were added or removed, health transitions
+  (OK→STALE, connected→disconnected).
 
 - **outcome**: operation result feedback — sourced from EvidenceStore's
-  recent verdicts, aggregated as success/failure rates per device/affordance.
+  recent verdicts, aggregated as success/failure rates per device.
+
+Devices declare no affordances: what a workcell can do is declared by the
+node's skill cards (``hw_skill_list``), never by per-device YAML.
 
 Unlike ``LeapSpaceEnvironmentSource`` which polls an external agent runner,
 this source observes LeapFlow's own hardware stack directly, making it
@@ -46,7 +49,6 @@ class PhysicalEnvironmentSource:
     Dependencies (injected via constructor):
     - registry: HardwareRegistry — device enumeration and health
     - evidence_store: EvidenceStore (optional) — operation success rates
-    - capability_index: CapabilityIndex (optional) — affordance inventory
     """
 
     def __init__(
@@ -54,13 +56,11 @@ class PhysicalEnvironmentSource:
         registry: Any,
         *,
         evidence_store: Any = None,
-        capability_index: Any = None,
         snapshot_interval_s: float = _DEFAULT_SNAPSHOT_INTERVAL_S,
         poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     ) -> None:
         self._registry = registry
         self._evidence_store = evidence_store
-        self._capability_index = capability_index
         self._snapshot_interval_s = max(1.0, float(snapshot_interval_s))
         self._poll_interval_s = max(0.1, float(poll_interval_s))
         self._task: asyncio.Task[None] | None = None
@@ -78,9 +78,7 @@ class PhysicalEnvironmentSource:
         if self._task is not None:
             return
         self._stopped.clear()
-        self._task = asyncio.create_task(
-            self._run(emit), name="physical-environment-source"
-        )
+        self._task = asyncio.create_task(self._run(emit), name="physical-environment-source")
 
     async def stop(self) -> None:
         """Stop observation. Idempotent."""
@@ -143,9 +141,7 @@ class PhysicalEnvironmentSource:
                     delta_dict = await self.compute_delta(self._last_snapshot, current)
                     if delta_dict is not None:
                         prev_wall = self._last_snapshot.get("timestamp", wall)
-                        prev_iface = self._to_interface_snapshot(
-                            self._last_snapshot, prev_wall
-                        )
+                        prev_iface = self._to_interface_snapshot(self._last_snapshot, prev_wall)
                         curr_iface = self._to_interface_snapshot(current, wall)
                         delta_obs = EnvironmentObservation.between(prev_iface, curr_iface)
                         if delta_obs is not None:
@@ -176,43 +172,20 @@ class PhysicalEnvironmentSource:
                     "device_class": "robot_arm",
                     "connected": true,
                     "health": "ok",
-                    "affordances": ["grasp", "place", "push"],
                     "channels": {"joint.shoulder.position": {"value": 0.5, ...}},
                     "kinematics": {"dof": 6, "chain_type": "serial"},
                 },
                 ...
             ],
-            "capability_summary": {
-                "total_affordances": 4,
-                "available_affordances": ["grasp", "place", "push", "pour"],
-                "device_count": 2,
-            },
+            "device_count": 2,
             "timestamp": 1695000000.0,
         }
         """
-        devices: list[dict[str, Any]] = []
-        all_affordances: set[str] = set()
-
-        for context in self._registry.contexts():
-            device_info = self._device_to_dict(context)
-            devices.append(device_info)
-            all_affordances.update(device_info.get("affordances", ()))
-
-        # Merge capability_index affordances when available.
-        if self._capability_index is not None:
-            try:
-                all_affordances.update(self._capability_index.all_affordances())
-            except Exception:  # noqa: BLE001 – observation must not fail
-                pass
-
+        devices = [self._device_to_dict(context) for context in self._registry.contexts()]
         return {
             "source": _SOURCE_ID,
             "devices": devices,
-            "capability_summary": {
-                "total_affordances": len(all_affordances),
-                "available_affordances": sorted(all_affordances),
-                "device_count": len(devices),
-            },
+            "device_count": len(devices),
             "timestamp": time.time(),
         }
 
@@ -223,9 +196,8 @@ class PhysicalEnvironmentSource:
 
         Detects:
         - device_added / device_removed
-        - affordance_gained / affordance_lost
         - health_changed (ok→stale, connected→disconnected)
-        - channel_changed (direction, effect, or representation changed)
+        - channel_changed (channels added or removed)
 
         Returns None when nothing structurally changed (value changes are
         not structural — they're handled by the streaming/event system).
@@ -240,8 +212,6 @@ class PhysicalEnvironmentSource:
         removed = sorted(set(prev_fps) - set(curr_fps))
 
         health_changed: list[dict[str, str]] = []
-        affordance_gained: list[str] = []
-        affordance_lost: list[str] = []
         channel_changed: list[dict[str, Any]] = []
 
         for did in sorted(set(prev_fps) & set(curr_fps)):
@@ -261,14 +231,6 @@ class PhysicalEnvironmentSource:
                     }
                 )
 
-            # Affordance changes.
-            prev_aff = set(pf.get("affordances", ()))
-            curr_aff = set(cf.get("affordances", ()))
-            for a in sorted(curr_aff - prev_aff):
-                affordance_gained.append(a)
-            for a in sorted(prev_aff - curr_aff):
-                affordance_lost.append(a)
-
             # Channel structural changes (added/removed channels).
             prev_ch = set(pf.get("channels", ()))
             curr_ch = set(cf.get("channels", ()))
@@ -281,10 +243,7 @@ class PhysicalEnvironmentSource:
                     }
                 )
 
-        if not any(
-            (added, removed, health_changed, affordance_gained,
-             affordance_lost, channel_changed)
-        ):
+        if not any((added, removed, health_changed, channel_changed)):
             return None
 
         return {
@@ -292,8 +251,6 @@ class PhysicalEnvironmentSource:
             "device_added": added,
             "device_removed": removed,
             "health_changed": health_changed,
-            "affordance_gained": affordance_gained,
-            "affordance_lost": affordance_lost,
             "channel_changed": channel_changed,
             "timestamp": time.time(),
         }
@@ -325,9 +282,7 @@ class PhysicalEnvironmentSource:
         for context in self._registry.contexts():
             did = context.device_id
             try:
-                rate = await self._evidence_store.success_rate(
-                    did, window_days=window_days
-                )
+                rate = await self._evidence_store.success_rate(did, window_days=window_days)
             except Exception:  # noqa: BLE001 – a query failure is diagnostic, not fatal
                 logger.debug("Evidence query failed for %s", did, exc_info=True)
                 continue
@@ -371,14 +326,9 @@ class PhysicalEnvironmentSource:
         """Extract structural fingerprint of a device for delta comparison.
 
         Only structural attributes (not values): device_id, channels list,
-        affordances, kinematics, transport kind, halt_supported.
+        kinematics, transport kind, halt_supported.
         """
         channels: list[str] = [ch.channel_id for ch in context.channels]
-
-        affordances: list[str] = []
-        cap = getattr(context, "capabilities", None)
-        if cap is not None:
-            affordances = list(getattr(cap, "affordances", ()) or ())
 
         kin = getattr(context, "kinematics", None)
         kin_key = ""
@@ -389,7 +339,6 @@ class PhysicalEnvironmentSource:
             "device_id": context.device_id,
             "device_class": getattr(context, "device_class", ""),
             "channels": sorted(channels),
-            "affordances": sorted(affordances),
             "kinematics": kin_key,
             "transport_kind": getattr(context.transport, "kind", ""),
             "halt_supported": bool(context.halt_supported),
@@ -413,11 +362,6 @@ class PhysicalEnvironmentSource:
                 entry["quality"] = summary.get("quality", "ok")
             channels[ch.channel_id] = entry
 
-        affordances: list[str] = []
-        cap = getattr(context, "capabilities", None)
-        if cap is not None:
-            affordances = list(getattr(cap, "affordances", ()) or ())
-
         kin_dict: dict[str, Any] | None = None
         kin = getattr(context, "kinematics", None)
         if kin is not None:
@@ -433,7 +377,6 @@ class PhysicalEnvironmentSource:
             "device_class": getattr(context, "device_class", ""),
             "connected": True,  # admitted by the registry ⇒ structurally present
             "health": health,
-            "affordances": sorted(affordances),
             "channels": channels,
             "kinematics": kin_dict,
         }
@@ -462,9 +405,7 @@ class PhysicalEnvironmentSource:
                 return "ok"
         return "ok"
 
-    def _channel_summary(
-        self, device_id: str, channel_id: str
-    ) -> dict[str, Any] | None:
+    def _channel_summary(self, device_id: str, channel_id: str) -> dict[str, Any] | None:
         """Get channel reading summary from the registry's stream sources."""
         try:
             return self._registry.channel_summary(device_id, channel_id)
@@ -480,39 +421,28 @@ class PhysicalEnvironmentSource:
             "device_id": device.get("device_id", ""),
             "device_class": device.get("device_class", ""),
             "channels": channels,
-            "affordances": sorted(device.get("affordances", ())),
             "connected": device.get("connected", True),
             "health": device.get("health", "ok"),
         }
 
-    def _to_interface_snapshot(
-        self, snapshot: dict[str, Any], observed_at: float
-    ) -> Any:
+    def _to_interface_snapshot(self, snapshot: dict[str, Any], observed_at: float) -> Any:
         """Convert a snapshot dict to an InterfaceSnapshot for domain observation.
 
         Each device becomes an InterfaceElement (name=device_id, role=device_class,
-        enabled=connected).  Affordances map directly to the snapshot's affordance
-        tuple.  The version encodes the structural composition so that
-        ``EnvironmentObservation.between()`` detects changes correctly.
+        enabled=connected).  The version encodes the structural composition so
+        that ``EnvironmentObservation.between()`` detects changes correctly.
         """
         from leapflow.domain.environment_signal import InterfaceElement, InterfaceSnapshot
 
         devices = snapshot.get("devices", ())
-        elements: list[InterfaceElement] = []
-        affordances: set[str] = set()
-
-        for dev in devices:
-            elements.append(
-                InterfaceElement(
-                    name=dev.get("device_id", ""),
-                    role=dev.get("device_class", "") or "device",
-                    enabled=bool(dev.get("connected", True)),
-                )
+        elements = [
+            InterfaceElement(
+                name=dev.get("device_id", ""),
+                role=dev.get("device_class", "") or "device",
+                enabled=bool(dev.get("connected", True)),
             )
-            affordances.update(dev.get("affordances", ()))
-
-        cap_summary = snapshot.get("capability_summary", {})
-        affordances.update(cap_summary.get("available_affordances", ()))
+            for dev in devices
+        ]
 
         # Encode the structural shape as a version so the domain delta catches
         # topology changes (device count, total channel count).
@@ -526,9 +456,8 @@ class PhysicalEnvironmentSource:
             source_id=_SOURCE_ID,
             app_id="physical_workspace",
             version=version,
-            affordances=tuple(sorted(affordances)),
             elements=tuple(elements),
-            data=cap_summary,
+            data={"device_count": len(devices)},
             observed_at=observed_at,
             provenance={
                 "kind": "hardware_registry",
@@ -577,9 +506,7 @@ class PhysicalEnvironmentSource:
         try:
             await emit(observation)
         except Exception:  # noqa: BLE001 – a sink failure must not kill the loop
-            logger.warning(
-                "Physical environment observation emit failed", exc_info=True
-            )
+            logger.warning("Physical environment observation emit failed", exc_info=True)
 
     async def _sleep(self, seconds: float) -> None:
         """Sleep respecting the stop event, matching HardwareStreamSource pattern."""

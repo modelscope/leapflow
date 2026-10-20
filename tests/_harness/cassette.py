@@ -51,6 +51,10 @@ _SCRUBBERS: tuple[tuple[re.Pattern[str], str], ...] = (
     # plus tool results embed those paths, so normalize like POSIX /tmp.
     (re.compile(r"[A-Za-z]:\\[^\s\"',)\]]*"), "<TMP>"),
     (re.compile(r"127\.0\.0\.1:\d+"), "127.0.0.1:<PORT>"),
+    # The truncation sentinel reports the pre-cut payload size, which inherits the
+    # run-varying width of whatever it summarised (a float timestamp's repr
+    # alone shifts it by a character or two).
+    (re.compile(r'(original_chars\\?"\s*:\s*)\d+'), r"\1<N>"),
     (re.compile(r"\b1[0-9]{9}(?:\.[0-9]+)?\b"), "<TS>"),
 )
 

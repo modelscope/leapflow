@@ -48,6 +48,7 @@ _PRODUCTION_AT = 20
 _DEMOTE_AFTER = 2
 """Consecutive failures to demote one level."""
 
+
 class HardwareTrustLevel(IntEnum):
     """Trust gradient for a (device, channel) pair."""
 
@@ -245,9 +246,7 @@ class HardwareTrustGate:
         True only for reversible channels at VERIFIED+, matching the platform
         rule that ``allow_permanent=True`` is reserved for undoable effects.
         """
-        return self.may_skip_approval(
-            device_id, channel_id, reversible=reversible
-        )
+        return self.may_skip_approval(device_id, channel_id, reversible=reversible)
 
     # ── Mutation ──
 
@@ -303,7 +302,9 @@ class HardwareTrustGate:
     # ── Introspection ──
 
     def trust_record(
-        self, device_id: str, channel_id: str,
+        self,
+        device_id: str,
+        channel_id: str,
     ) -> TrustRecord:
         """Return a snapshot of the trust state for one channel."""
         key = (device_id, channel_id)
@@ -319,9 +320,7 @@ class HardwareTrustGate:
     def all_records(self) -> list[TrustRecord]:
         """Return trust state for every tracked channel."""
         keys = set(self._levels.keys()) | set(self._frozen)
-        return [
-            self.trust_record(d, c) for d, c in sorted(keys)
-        ]
+        return [self.trust_record(d, c) for d, c in sorted(keys)]
 
     # ── Internal ──
 
@@ -362,7 +361,8 @@ class HardwareTrustGate:
                 self._plugin_trust.record_failure(plugin_id, hard=hard)
         except Exception:
             logger.debug(
-                "Failed to sync trust to plugin ledger for %s", plugin_id,
+                "Failed to sync trust to plugin ledger for %s",
+                plugin_id,
                 exc_info=True,
             )
 

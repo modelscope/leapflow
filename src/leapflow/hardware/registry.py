@@ -93,6 +93,12 @@ class HardwareSettings:
     hardware_alert_policies: Any = ""
     # Profile-owned append-only audit destination for HardwareTools.
     audit_log_path: str = ""
+    # Profile-owned Ed25519 key the host signs LHP execution permits with;
+    # empty disables permit minting (nodes in ``permit_required`` then refuse).
+    permit_issuer_key_path: str = ""
+    # Host consent to show workcell camera frames to the model (perceive.snapshot);
+    # the workcell must declare share_frames too.
+    share_frames: bool = False
 
     @property
     def denies_unverified_writes(self) -> bool:
@@ -158,6 +164,11 @@ class HardwareSettings:
             audit_log_path=(
                 str(profile_layout.hardware.audit_log_path) if profile_layout is not None else ""
             ),
+            permit_issuer_key_path=(
+                str(profile_layout.hardware.permit_issuer_key_path)
+                if profile_layout is not None
+                else ""
+            ),
             instrument_db_path=(
                 str(profile_layout.instrument_db_path) if profile_layout is not None else ""
             ),
@@ -170,6 +181,7 @@ class HardwareSettings:
             preview_max_fps=float(getattr(settings, "hardware_preview_max_fps", 30.0) or 30.0),
             preview_max_width=int(getattr(settings, "hardware_preview_max_width", 1280) or 1280),
             preview_quality=int(getattr(settings, "hardware_preview_quality", 85) or 85),
+            share_frames=bool(getattr(settings, "hardware_share_frames", False)),
         )
 
 
@@ -342,7 +354,6 @@ class HardwareRegistry:
         self._deliberative_observer: HardwareDeliberativeObserver | None = None
         self._control_buses: dict[str, Any] = {}
         self._evidence_store: Any = None
-        self._capability_index: Any = None
 
     # ── Loading ──
 
@@ -384,26 +395,6 @@ class HardwareRegistry:
     @evidence_store.setter
     def evidence_store(self, store: Any) -> None:
         self._evidence_store = store
-
-    @property
-    def capability_index(self) -> Any:
-        """Lazily constructed capability index from admitted devices.
-
-        Rebuilt on first access; callers may force a re-scan with
-        ``capability_index.rebuild()`` after the registry reloads.
-        """
-        if self._capability_index is None:
-            try:
-                from leapflow.hardware.capability_router import CapabilityIndex
-
-                self._capability_index = CapabilityIndex(self)
-            except Exception:  # noqa: BLE001
-                logger.debug("Failed to initialize CapabilityIndex", exc_info=True)
-        return self._capability_index
-
-    @capability_index.setter
-    def capability_index(self, index: Any) -> None:
-        self._capability_index = index
 
     @property
     def report(self) -> LoadReport:
@@ -1240,9 +1231,7 @@ class HardwareRegistry:
         """
         self._event_emitter = emit
 
-    def set_deliberative_observer(
-        self, observer: HardwareDeliberativeObserver | None
-    ) -> None:
+    def set_deliberative_observer(self, observer: HardwareDeliberativeObserver | None) -> None:
         """Install the observer notified when a deliberative hardware event occurs.
 
         The observer must implement ``HardwareDeliberativeObserver`` (Protocol).

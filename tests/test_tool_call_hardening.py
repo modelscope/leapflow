@@ -145,6 +145,30 @@ def test_compaction_preserves_anchor_not_unique_match_count() -> None:
     assert compact["error_type"] == "anchor_not_unique" and compact["match_count"] == 3
 
 
+def test_readiness_hard_stop_survives_compaction_as_deterministic_recovery() -> None:
+    """A fail-closed readiness refusal must keep its hard-stop markers through
+    compaction so the turn ends with the repair instruction, not an LLM paraphrase."""
+    from leapflow.engine._message_helpers import _last_tool_failures_recovery_message
+    from leapflow.engine.context.context_control import ToolEvidenceBuilder
+    from leapflow.security.permission_failures import (
+        build_readiness_failure,
+        is_permission_hard_stop_payload,
+    )
+
+    refusal = build_readiness_failure(
+        device_id="arm",
+        channel_id="joint1",
+        unmet=[{"interlock_id": "homed", "channel_id": "homed", "value": True}],
+    )
+    compact = ToolEvidenceBuilder().build("hw_actuate", {}, refusal)
+    assert compact["failure_class"] == "device_not_ready"
+    assert is_permission_hard_stop_payload(compact)
+
+    messages = [{"role": "tool", "content": json.dumps(compact)}]
+    recovery = _last_tool_failures_recovery_message(messages, include_generic=False)
+    assert recovery.startswith("arm.joint1 is not ready to command")
+
+
 # ── failure visibility: stdout/stderr survive compaction; shell_run sets error ──
 
 def test_compact_error_preserves_shell_output() -> None:
@@ -292,14 +316,14 @@ def test_shell_gate_blocks_expanded_and_relative_escapes(tmp_path, monkeypatch) 
     and ``../../..`` straight through, so the same file is reachable by choosing
     a different spelling and the workspace boundary stops being a boundary.
     """
+    import os
+
     from leapflow.tools.execution_context import (
         ToolExecutionContext,
         reset_tool_context,
         set_tool_context,
     )
     from leapflow.tools.shell_tools import shell_run
-
-    import os
 
     workspace = tmp_path / "work"
     other = tmp_path / "other"
@@ -391,6 +415,7 @@ def test_shell_gate_redirects_leapflow_config_targets(tmp_path) -> None:
     escaping path and the shared refusal builder carries the hint — so both are
     asserted here.
     """
+    from leapflow.config import get_settings
     from leapflow.tools.execution_context import (
         ToolExecutionContext,
         reset_tool_context,
@@ -398,7 +423,6 @@ def test_shell_gate_redirects_leapflow_config_targets(tmp_path) -> None:
         workspace_scope_refusal,
     )
     from leapflow.tools.shell_tools import _command_workspace_escape_path
-    from leapflow.config import get_settings
 
     workspace = tmp_path / "work"
     workspace.mkdir()

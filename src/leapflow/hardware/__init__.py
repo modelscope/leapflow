@@ -40,12 +40,47 @@ from leapflow.hardware.context import (
     Representation,
     TransportRef,
 )
-from leapflow.hardware.stream import (
-    EventKind,
-    HardwareDeliberativeObserver,
-    HardwareEvent,
-    HardwareEventClass,
-    classify_hardware_event,
+from leapflow.hardware.control_bus import (
+    ControlBusConfig,
+    ControlBusStats,
+    ControlCommand,
+    ControlPolicy,
+    ControlState,
+    HighFrequencyControlBus,
+)
+from leapflow.hardware.degradation import (
+    DegradationAction,
+    DegradationCoordinator,
+    DegradationOutcome,
+)
+from leapflow.hardware.evidence import (
+    EvidenceStore,
+)
+from leapflow.hardware.fleet import (
+    FleetError,
+    FleetManager,
+    FleetNode,
+    FleetSessionRouter,
+    FleetTopology,
+)
+from leapflow.hardware.fleet_tools import build_fleet_tools
+from leapflow.hardware.health_monitor import (
+    DeviceHealthRecord,
+    HardwareHealthMonitor,
+)
+from leapflow.hardware.lhp_gateway import (
+    DeviceSnapshot,
+    HardwareContextDelta,
+    HardwareContextSnapshot,
+    LHPGateway,
+    PCDLevel,
+)
+from leapflow.hardware.realtime import (
+    ControlTelemetryEvent,
+    ImpedanceController,
+    PIDJointController,
+    RealtimeControlLoop,
+    TrajectoryTracker,
 )
 from leapflow.hardware.registry import (
     AdmissionNote,
@@ -53,6 +88,13 @@ from leapflow.hardware.registry import (
     HardwareSettings,
     LoadReport,
     UnverifiedContextPolicy,
+)
+from leapflow.hardware.stream import (
+    EventKind,
+    HardwareDeliberativeObserver,
+    HardwareEvent,
+    HardwareEventClass,
+    classify_hardware_event,
 )
 from leapflow.hardware.transport import (
     SIDE_EFFECT_COMMITTED,
@@ -67,9 +109,6 @@ from leapflow.hardware.transport import (
     TransportStatus,
     WriteOutcome,
 )
-from leapflow.hardware.evidence import (
-    EvidenceStore,
-)
 from leapflow.hardware.verification import (
     EvidenceBundle,
     GraspVerifier,
@@ -80,14 +119,6 @@ from leapflow.hardware.verification import (
     VerificationMode,
     collect_evidence,
 )
-from leapflow.hardware.write_verification import (
-    WriteExpectation,
-    WriteVerdict,
-    WriteVerdictEvent,
-    WriteVerdictStatus,
-    WriteVerificationCoordinator,
-    aggregate_write_verdicts,
-)
 from leapflow.hardware.write_governor import (
     BatchFeasibilityResult,
     ControlFeasibilityResult,
@@ -96,55 +127,13 @@ from leapflow.hardware.write_governor import (
     WriteGovernanceRequest,
     WriteGovernor,
 )
-from leapflow.hardware.control_bus import (
-    ControlBusConfig,
-    ControlBusStats,
-    ControlCommand,
-    ControlPolicy,
-    ControlState,
-    HighFrequencyControlBus,
-)
-from leapflow.hardware.realtime import (
-    ControlTelemetryEvent,
-    ImpedanceController,
-    PIDJointController,
-    PolicyChain,
-    RealtimeControlLoop,
-    TrajectoryTracker,
-)
-from leapflow.hardware.fleet import (
-    FleetError,
-    FleetManager,
-    FleetNode,
-    FleetSessionRouter,
-    FleetTopology,
-)
-from leapflow.hardware.fleet_tools import build_fleet_tools
-from leapflow.hardware.control_hierarchy import (
-    ControlHierarchy,
-    ControlLayer,
-    EscalationEvent,
-    LayerState,
-    SubtaskGoal,
-    TaskDecomposer,
-)
-from leapflow.hardware.lhp_gateway import (
-    DeviceSnapshot,
-    HardwareContextDelta,
-    HardwareContextSnapshot,
-    LHPGateway,
-    LLMPlanSegment,
-    PCDLevel,
-    PlanStep,
-)
-from leapflow.hardware.health_monitor import (
-    DeviceHealthRecord,
-    HardwareHealthMonitor,
-)
-from leapflow.hardware.degradation import (
-    DegradationAction,
-    DegradationCoordinator,
-    DegradationOutcome,
+from leapflow.hardware.write_verification import (
+    WriteExpectation,
+    WriteVerdict,
+    WriteVerdictEvent,
+    WriteVerdictStatus,
+    WriteVerificationCoordinator,
+    aggregate_write_verdicts,
 )
 
 __all__ = [
@@ -213,24 +202,14 @@ __all__ = [
     "ControlTelemetryEvent",
     "ImpedanceController",
     "PIDJointController",
-    "PolicyChain",
     "RealtimeControlLoop",
     "TrajectoryTracker",
-    # control_hierarchy.py
-    "ControlHierarchy",
-    "ControlLayer",
-    "EscalationEvent",
-    "LayerState",
-    "SubtaskGoal",
-    "TaskDecomposer",
     # lhp_gateway.py
     "DeviceSnapshot",
     "HardwareContextDelta",
     "HardwareContextSnapshot",
     "LHPGateway",
-    "LLMPlanSegment",
     "PCDLevel",
-    "PlanStep",
     # fleet.py
     "FleetError",
     "FleetManager",

@@ -132,7 +132,8 @@ TransportFactory = Callable[[Mapping[str, Any]], HardwareTransport]
 
 
 def _conformance_context(
-    transport_kind: str, config: Mapping[str, Any],
+    transport_kind: str,
+    config: Mapping[str, Any],
 ) -> HardwareContext:
     """Build a two-channel device declaration for conformance checking."""
     return HardwareContext(
@@ -157,7 +158,10 @@ def _conformance_context(
                 effect=HardwareEffect.CONFIGURE.value,
                 verify_after_write=True,
                 envelope=Envelope(
-                    declared=True, min_value=0.0, max_value=100.0, reversible=True,
+                    declared=True,
+                    min_value=0.0,
+                    max_value=100.0,
+                    reversible=True,
                 ),
             ),
         ),
@@ -168,9 +172,7 @@ def _conformance_context(
 def _build_failing_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """Derive a config variant that injects a write failure on the first setpoint write."""
     failing = dict(config)
-    failing["failures"] = [
-        {"channel_id": "setpoint", "on_call": 1, "side_effect_state": "partial"}
-    ]
+    failing["failures"] = [{"channel_id": "setpoint", "on_call": 1, "side_effect_state": "partial"}]
     return failing
 
 
@@ -191,7 +193,9 @@ class _Collector:
         """Run one async check, capturing pass/fail without raising."""
         try:
             detail = await coro
-            self._results.append(ConformanceResult(name=name, passed=True, detail=str(detail or "")))
+            self._results.append(
+                ConformanceResult(name=name, passed=True, detail=str(detail or ""))
+            )
         except Exception as exc:  # noqa: BLE001
             tb = traceback.format_exception_only(type(exc), exc)
             self._results.append(
@@ -216,16 +220,20 @@ def _assert(condition: bool, message: str) -> None:
 
 
 async def _check_satisfies_protocol(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     _assert(isinstance(transport, HardwareTransport), "does not satisfy HardwareTransport")
-    _assert(isinstance(transport.kind, str) and len(transport.kind) > 0, "kind must be a non-empty str")
+    _assert(
+        isinstance(transport.kind, str) and len(transport.kind) > 0, "kind must be a non-empty str"
+    )
     return f"kind={transport.kind}"
 
 
 async def _check_open_is_idempotent(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     context = _conformance_context(transport.kind, config)
@@ -238,7 +246,8 @@ async def _check_open_is_idempotent(
 
 
 async def _check_close_is_idempotent(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     context = _conformance_context(transport.kind, config)
@@ -251,7 +260,8 @@ async def _check_close_is_idempotent(
 
 
 async def _check_probe_is_side_effect_free(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     context = _conformance_context(transport.kind, config)
@@ -260,13 +270,16 @@ async def _check_probe_is_side_effect_free(
     await transport.probe()
     await transport.probe()
     after = await transport.read("sensor")
-    _assert(before.value == after.value, f"probe changed the value: {before.value} -> {after.value}")
+    _assert(
+        before.value == after.value, f"probe changed the value: {before.value} -> {after.value}"
+    )
     await transport.close()
     return "probe side-effect free"
 
 
 async def _check_read_returns_reading_with_identity(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     context = _conformance_context(transport.kind, config)
@@ -280,7 +293,8 @@ async def _check_read_returns_reading_with_identity(
 
 
 async def _check_read_sequence_increases_monotonically(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     context = _conformance_context(transport.kind, config)
@@ -293,7 +307,8 @@ async def _check_read_sequence_increases_monotonically(
 
 
 async def _check_unknown_channel_raises(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     context = _conformance_context(transport.kind, config)
@@ -307,7 +322,8 @@ async def _check_unknown_channel_raises(
 
 
 async def _check_operating_before_open_raises(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     try:
@@ -318,13 +334,16 @@ async def _check_operating_before_open_raises(
 
 
 async def _check_successful_write_reports_definite_effect(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     context = _conformance_context(transport.kind, config)
     await transport.open(context)
     outcome = await transport.write("setpoint", 42.0)
-    _assert(isinstance(outcome, WriteOutcome), f"expected WriteOutcome, got {type(outcome).__name__}")
+    _assert(
+        isinstance(outcome, WriteOutcome), f"expected WriteOutcome, got {type(outcome).__name__}"
+    )
     _assert(outcome.ok is True, f"write failed: {outcome.error}")
     _assert(
         outcome.side_effect_state != SIDE_EFFECT_NONE,
@@ -335,7 +354,8 @@ async def _check_successful_write_reports_definite_effect(
 
 
 async def _check_read_only_refuses_writes(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     """A read-only transport must refuse every write and prove nothing happened.
 
@@ -349,7 +369,9 @@ async def _check_read_only_refuses_writes(
     context = _conformance_context(transport.kind, config)
     await transport.open(context)
     outcome = await transport.write("setpoint", 42.0)
-    _assert(isinstance(outcome, WriteOutcome), f"expected WriteOutcome, got {type(outcome).__name__}")
+    _assert(
+        isinstance(outcome, WriteOutcome), f"expected WriteOutcome, got {type(outcome).__name__}"
+    )
     _assert(outcome.ok is False, "a read-only transport reported a successful write")
     _assert(
         outcome.side_effect_state == SIDE_EFFECT_NONE,
@@ -362,7 +384,8 @@ async def _check_read_only_refuses_writes(
 
 
 async def _check_verified_channel_returns_readback(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     context = _conformance_context(transport.kind, config)
@@ -382,7 +405,11 @@ async def _check_failed_write_never_claims_no_effect(
     config: Mapping[str, Any],
     failing_write_config: Mapping[str, Any] | None = None,
 ) -> str:
-    failing_config = dict(failing_write_config) if failing_write_config is not None else _build_failing_config(config)
+    failing_config = (
+        dict(failing_write_config)
+        if failing_write_config is not None
+        else _build_failing_config(config)
+    )
     transport = factory(failing_config)
     context = _conformance_context(transport.kind, failing_config)
     await transport.open(context)
@@ -401,13 +428,17 @@ async def _check_failed_write_never_claims_no_effect(
 
 
 async def _check_halt_reports_capability(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     context = _conformance_context(transport.kind, config)
     await transport.open(context)
     status = await transport.halt()
-    _assert(isinstance(status, TransportStatus), f"expected TransportStatus, got {type(status).__name__}")
+    _assert(
+        isinstance(status, TransportStatus),
+        f"expected TransportStatus, got {type(status).__name__}",
+    )
     _assert(isinstance(status.halt_supported, bool), "halt_supported must be bool")
     await transport.close()
     return f"halt_supported={status.halt_supported}"
@@ -429,7 +460,8 @@ async def _check_transport_without_halt_declares_it(
 
 
 async def _check_reading_stamps_both_clocks(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     context = _conformance_context(transport.kind, config)
@@ -448,7 +480,8 @@ async def _check_reading_stamps_both_clocks(
 
 
 async def _check_reading_evidence_form(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     transport = factory(config)
     context = _conformance_context(transport.kind, config)
@@ -466,7 +499,8 @@ async def _check_reading_evidence_form(
 
 
 async def _check_init_required_read_refused(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     """With init_required on, reads are refused before init."""
     init_config = dict(config)
@@ -488,7 +522,8 @@ async def _check_init_required_read_refused(
 
 
 async def _check_init_required_write_refused(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     """With init_required on, ordinary writes are refused with no side effect."""
     init_config = dict(config)
@@ -516,7 +551,8 @@ async def _check_init_required_write_refused(
 
 
 async def _check_init_required_init_then_operates(
-    factory: TransportFactory, config: Mapping[str, Any],
+    factory: TransportFactory,
+    config: Mapping[str, Any],
 ) -> str:
     """After writing the init channel, reads and writes are unblocked."""
     init_config = dict(config)
@@ -606,38 +642,93 @@ def run_transport_conformance(
     core_checks: list[tuple[str, Any]] = [
         ("satisfies HardwareTransport", _check_satisfies_protocol(transport_factory, config)),
         ("open is idempotent", _check_open_is_idempotent(transport_factory, config)),
-        ("close is idempotent and never raises", _check_close_is_idempotent(transport_factory, config)),
+        (
+            "close is idempotent and never raises",
+            _check_close_is_idempotent(transport_factory, config),
+        ),
         ("probe is side-effect free", _check_probe_is_side_effect_free(transport_factory, config)),
-        ("read returns a Reading with identity", _check_read_returns_reading_with_identity(transport_factory, config)),
-        ("read sequence increases monotonically", _check_read_sequence_increases_monotonically(transport_factory, config)),
-        ("unknown channel raises TransportError", _check_unknown_channel_raises(transport_factory, config)),
-        ("operating before open raises", _check_operating_before_open_raises(transport_factory, config)),
+        (
+            "read returns a Reading with identity",
+            _check_read_returns_reading_with_identity(transport_factory, config),
+        ),
+        (
+            "read sequence increases monotonically",
+            _check_read_sequence_increases_monotonically(transport_factory, config),
+        ),
+        (
+            "unknown channel raises TransportError",
+            _check_unknown_channel_raises(transport_factory, config),
+        ),
+        (
+            "operating before open raises",
+            _check_operating_before_open_raises(transport_factory, config),
+        ),
     ]
 
     if writable:
-        core_checks.extend([
-            ("successful write reports a definite effect", _check_successful_write_reports_definite_effect(transport_factory, config)),
-            ("verified channel returns a readback", _check_verified_channel_returns_readback(transport_factory, config)),
-            ("failed write never claims no effect", _check_failed_write_never_claims_no_effect(transport_factory, config, failing_write_config)),
-        ])
+        core_checks.extend(
+            [
+                (
+                    "successful write reports a definite effect",
+                    _check_successful_write_reports_definite_effect(transport_factory, config),
+                ),
+                (
+                    "verified channel returns a readback",
+                    _check_verified_channel_returns_readback(transport_factory, config),
+                ),
+                (
+                    "failed write never claims no effect",
+                    _check_failed_write_never_claims_no_effect(
+                        transport_factory, config, failing_write_config
+                    ),
+                ),
+            ]
+        )
     else:
         core_checks.append(
-            ("read-only transport refuses writes cleanly", _check_read_only_refuses_writes(transport_factory, config))
+            (
+                "read-only transport refuses writes cleanly",
+                _check_read_only_refuses_writes(transport_factory, config),
+            )
         )
 
-    core_checks.extend([
-        ("halt reports capability", _check_halt_reports_capability(transport_factory, config)),
-        ("transport without halt declares it", _check_transport_without_halt_declares_it(transport_factory, config, no_halt_config)),
-        ("reading stamps both clocks", _check_reading_stamps_both_clocks(transport_factory, config)),
-        ("reading evidence form carries only wall clock", _check_reading_evidence_form(transport_factory, config)),
-    ])
+    core_checks.extend(
+        [
+            ("halt reports capability", _check_halt_reports_capability(transport_factory, config)),
+            (
+                "transport without halt declares it",
+                _check_transport_without_halt_declares_it(
+                    transport_factory, config, no_halt_config
+                ),
+            ),
+            (
+                "reading stamps both clocks",
+                _check_reading_stamps_both_clocks(transport_factory, config),
+            ),
+            (
+                "reading evidence form carries only wall clock",
+                _check_reading_evidence_form(transport_factory, config),
+            ),
+        ]
+    )
 
     if include_init:
-        core_checks.extend([
-            ("init_required: read refused before init", _check_init_required_read_refused(transport_factory, config)),
-            ("init_required: write refused before init", _check_init_required_write_refused(transport_factory, config)),
-            ("init_required: init then operates", _check_init_required_init_then_operates(transport_factory, config)),
-        ])
+        core_checks.extend(
+            [
+                (
+                    "init_required: read refused before init",
+                    _check_init_required_read_refused(transport_factory, config),
+                ),
+                (
+                    "init_required: write refused before init",
+                    _check_init_required_write_refused(transport_factory, config),
+                ),
+                (
+                    "init_required: init then operates",
+                    _check_init_required_init_then_operates(transport_factory, config),
+                ),
+            ]
+        )
 
     async def _run_all() -> ConformanceReport:
         for name, coro in core_checks:

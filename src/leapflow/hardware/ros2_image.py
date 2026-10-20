@@ -78,10 +78,20 @@ def encode_preview(msg: Any, *, max_width: int = 0, quality: int = 0) -> Encoded
             except (OSError, ValueError) as exc:
                 raise ImageConversionError(f"JPEG header could not be read: {exc}") from exc
             if max_width <= 0 or width <= max_width:
-                return EncodedPreview(data, width, height, _stamped(msg, {
-                    "format": str(msg.format), "passthrough": True,
-                    "source_width": width, "source_height": height,
-                }))
+                return EncodedPreview(
+                    data,
+                    width,
+                    height,
+                    _stamped(
+                        msg,
+                        {
+                            "format": str(msg.format),
+                            "passthrough": True,
+                            "source_width": width,
+                            "source_height": height,
+                        },
+                    ),
+                )
         image = _decode_compressed(data)
         source = {"format": str(msg.format), "passthrough": False}
     else:
@@ -150,7 +160,9 @@ def _stamped(msg: Any, metadata: dict[str, Any]) -> dict[str, Any]:
     header = getattr(msg, "header", None)
     stamp = getattr(header, "stamp", None)
     if stamp is not None:
-        metadata["source_stamp"] = float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) / 1e9
+        metadata["source_stamp"] = (
+            float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) / 1e9
+        )
     frame_id = str(getattr(header, "frame_id", "") or "")
     if frame_id:
         metadata["frame_id"] = frame_id

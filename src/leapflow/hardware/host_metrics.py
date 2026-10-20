@@ -176,7 +176,14 @@ class HostMetrics:
         startup latency a function of how many peripherals are attached.
         """
         probes: list[HostProbe] = []
-        for build in (self._cpu, self._memory, self._disk, self._network, self._battery, self._thermal):
+        for build in (
+            self._cpu,
+            self._memory,
+            self._disk,
+            self._network,
+            self._battery,
+            self._thermal,
+        ):
             try:
                 probes.extend(build())
             except Exception as exc:  # noqa: BLE001 - one absent subsystem is not a failure
@@ -511,7 +518,11 @@ def _sysfs_critical_trips(root: str = _THERMAL_ROOT) -> dict[str, tuple[float, .
         try:
             with open(os.path.join(base, "type"), encoding="ascii") as handle:
                 zone_type = handle.read().strip()
-            names = sorted(name for name in os.listdir(base) if name.endswith("_type") and name.startswith("trip_point_"))
+            names = sorted(
+                name
+                for name in os.listdir(base)
+                if name.endswith("_type") and name.startswith("trip_point_")
+            )
         except OSError:
             continue
         for name in names:
@@ -519,7 +530,9 @@ def _sysfs_critical_trips(root: str = _THERMAL_ROOT) -> dict[str, tuple[float, .
                 with open(os.path.join(base, name), encoding="ascii") as handle:
                     if handle.read().strip() != "critical":
                         continue
-                with open(os.path.join(base, name.removesuffix("_type") + "_temp"), encoding="ascii") as handle:
+                with open(
+                    os.path.join(base, name.removesuffix("_type") + "_temp"), encoding="ascii"
+                ) as handle:
                     trips.setdefault(zone_type, []).append(int(handle.read().strip()) / 1000.0)
                 break
             except (OSError, ValueError):
@@ -542,7 +555,9 @@ def _critical_threshold(entry: Any, zone_trips: tuple[float, ...]) -> float | No
     if not critical:
         return None
     if current is not None and float(critical) <= float(current):
-        logger.debug("host metrics: ignoring implausible critical %.6g <= current %.6g", critical, current)
+        logger.debug(
+            "host metrics: ignoring implausible critical %.6g <= current %.6g", critical, current
+        )
         return None
     return float(critical)
 
