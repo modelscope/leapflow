@@ -32,7 +32,7 @@ The run ends when the model reports ``done`` and its last chunk is spent, when
 violation, a model failure, starvation (holding longer than ``starve_s``,
 ``warmup_s`` before the first chunk) or a stop. Ending leaves the arm at its
 last shield-approved target, so a policy failure needs no halt; a stop, a
-timeout or a device fault is halted by the runtime as for every skill.
+timeout, shield refusal or device fault is halted by the runtime as for every skill.
 
 A recorded run's episode carries the full ``model_info``, the adapter
 declaration and its digest, and every chunk both as the model returned it and
@@ -79,6 +79,7 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_TIMEOUT,
     ArmState,
     PolicyCard,
+    STATUS_HALTED,
     PolicyReport,
     SkillError,
 )
@@ -91,6 +92,30 @@ ENDED_DURATION = "duration"
 ENDED_DONE = "done"
 _VERSION_TOLERANCE = 1e-6
 _LATENCY_GAIN = 0.5  # weight of the newest round trip in the latency estimate
+
+
+def _trusted_contact(reading: Any, device_id: str, channel_id: str) -> float:
+    """Return one trustworthy finite contact sample, or a typed device fault."""
+    label = f"{device_id}.{channel_id}"
+    if reading is None:
+        raise SkillError(FAILURE_DEVICE_FAULT, f"contact channel {label} returned no reading")
+    if not bool(getattr(reading, "is_trustworthy", False)):
+        quality = getattr(reading, "quality", "unknown")
+        raise SkillError(
+            FAILURE_DEVICE_FAULT,
+            f"contact channel {label} reported untrustworthy quality {quality!r}",
+        )
+    value = getattr(reading, "value", None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SkillError(
+            FAILURE_DEVICE_FAULT, f"contact channel {label} returned no numeric reading"
+        )
+    sample = float(value)
+    if not math.isfinite(sample):
+        raise SkillError(
+            FAILURE_DEVICE_FAULT, f"contact channel {label} returned a non-finite reading"
+        )
+    return sample
 
 
 @dataclass(frozen=True)
@@ -411,7 +436,7 @@ class WorkcellPolicies:
         return Observation(state, observed_at, images)
 
     async def _check_contact(self, binding: PolicyBinding) -> None:
-        """Stop on a declared force/torque channel outside its envelope."""
+        """Stop on an untrustworthy or out-of-envelope contact reading."""
         if not binding.contacts:
             return
         wanted: dict[str, list[str]] = {}
@@ -425,10 +450,18 @@ class WorkcellPolicies:
                 raise SkillError(
                     FAILURE_DEVICE_FAULT, f"{device_id!r} contact channels unreadable: {exc}"
                 ) from exc
-            readings[device_id] = {r.channel_id: r.value for r in batch.readings}
+            sampled = {reading.channel_id: reading for reading in batch.readings}
+            readings[device_id] = {
+                channel_id: _trusted_contact(sampled.get(channel_id), device_id, channel_id)
+                for channel_id in channel_ids
+            }
         problem = contact_violation(binding.contacts, readings)
         if problem:
-            raise SkillError(FAILURE_SHIELD_VIOLATION, f"contact limit: {problem}")
+            raise SkillError(
+                FAILURE_SHIELD_VIOLATION,
+                f"contact limit: {problem}",
+                status=STATUS_HALTED,
+            )
 
     async def _transport(self, device_id: str, capability: type, what: str, code: str) -> Any:
         try:
@@ -648,6 +681,7 @@ class PolicyStream:
             raise SkillError(
                 FAILURE_SHIELD_VIOLATION,
                 f"the safety shield refused the policy's next action: {verdict.violation}",
+                status=STATUS_HALTED,
             )
         for device_id, commands in self._batches(verdict.values):
             await self._motion.command(device_id, commands)

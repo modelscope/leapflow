@@ -28,16 +28,18 @@ def encode_image(frame: Any, spec: ImageSpec | None, *, quality: int = 90) -> by
 
     width, height = int(frame.width), int(frame.height)
     image = Image.frombytes("RGB", (width, height), frame.color, "raw", "BGR")
-    if spec is not None and (spec.width, spec.height) != (width, height):
-        image = _fit(image, spec)
+    image = fit_image(image, spec)
     output = io.BytesIO()
     image.save(output, format="JPEG", quality=min(100, max(1, int(quality))))
     return output.getvalue()
 
 
-def _fit(image: Any, spec: ImageSpec) -> Any:
+def fit_image(image: Any, spec: ImageSpec | None) -> Any:
+    """Fit a PIL image exactly as inference does; return it unchanged without a declaration."""
     from PIL import Image
 
+    if spec is None or image.size == (spec.width, spec.height):
+        return image
     width, height = image.size
     if spec.fit == FIT_CROP:
         target = spec.width / spec.height
@@ -60,4 +62,4 @@ def _fit(image: Any, spec: ImageSpec) -> Any:
     return image.resize((spec.width, spec.height), Image.BILINEAR)
 
 
-__all__ = ["encode_image"]
+__all__ = ["encode_image", "fit_image"]

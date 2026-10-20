@@ -94,6 +94,7 @@ class SimArmTransport:
         refuse_writes: bool = False,
         joints: Sequence[float] | None = None,
         forward: Callable[[Sequence[float]], Pose] | None = None,
+        arm_status: int | None = None,
     ) -> None:
         self.joints = dict(zip(JOINTS, joints or (0.0,) * len(JOINTS)))
         self.forward = forward  # when set, joint moves drive the flange pose
@@ -105,6 +106,7 @@ class SimArmTransport:
         self.stall = stall
         self.object_width_mm = object_width_mm
         self.refuse_writes = refuse_writes
+        self.arm_status = arm_status  # vendor verdict on the last target, 0x04 = refused
         self.halts = 0
         self.batches: list[tuple[tuple[str, Any], ...]] = []
         self._pending: dict[str, float] = {}
@@ -198,6 +200,10 @@ class SimArmTransport:
             return not self._pending
         if channel_id == "arm.enabled":
             return self.enabled
+        if channel_id == "arm.status":
+            if self.arm_status is None:
+                return None
+            return {"ctrl_mode": 0x01, "arm_status": self.arm_status, "motion_status": 0x00}
         return None
 
 

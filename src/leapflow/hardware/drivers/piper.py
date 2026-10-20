@@ -32,6 +32,13 @@ SDK facts this driver is built on (agilexrobotics/piper_sdk, interface V2 doc):
   ``DisableArm`` and ``ResetPiper`` release torque and drop the arm; neither is
   ever called by ``halt`` or by recovery: ``halt`` maps to the vendor hardware
   emergency stop ``EmergencyStop(0x01)`` (CAN 0x150).
+- ``ModeCtrl`` carries both the control mode and the move mode. The Piper X
+  firmware silently drops a CAN control-mode selection issued from standby, so
+  ``transport.config.mode_switch`` selects the strategy: ``direct`` (one frame,
+  the vendor default) or ``standby_then_can`` (the handshake the Piper X manual
+  prescribes, verified against ``ctrl_mode`` feedback). The governed enable
+  path re-asserts the mode before energizing for the same reason, and reports
+  ``piper_mode_switch_failed`` rather than a success no motor followed.
 - ``GetArmJointMsgs``/``GetArmEndPoseMsgs``/``GetArmGripperMsgs``/``GetArmStatus``
   return cached feedback from the SDK's own receive thread, so reads never
   touch the bus and a stalled thread is visible through ``isOk()``/
@@ -47,6 +54,8 @@ from typing import Any, Mapping
 
 from leapflow.hardware.context import HardwareContext, Quality
 from leapflow.hardware.drivers._piper_motion import (
+    MODE_SWITCHES,
+    MODE_SWITCH_DIRECT,
     POSE_MOVE_MODES,
     SCALE,
     SPACE_CHANNELS,
@@ -55,6 +64,7 @@ from leapflow.hardware.drivers._piper_motion import (
     PiperMotion,
     as_int,
     attr,
+    ctrl_mode_name,
     enable_flag,
     enable_status,
     firmware_version,
@@ -92,11 +102,19 @@ _ARM_ENABLE = "arm.enable"
 _ARM_ENABLED = "arm.enabled"
 _ARM_STATUS = "arm.status"
 _ARM_MOTION = "arm.motion"
+_ARM_CTRL_MODE = "arm.ctrl_mode"
 _ARM_SPEED = "arm.speed_pct"
 _ARM_POSE_PATH = "arm.pose_path"
 _SETTINGS = (_ARM_SPEED, _ARM_POSE_PATH)  # staged for the next ModeCtrl; no frame now
 _GRIPPER_CHANNELS = (_GRIPPER_POSITION, _GRIPPER_EFFORT)
-_STATE_CHANNELS = (_ARM_ENABLE, _ARM_ENABLED, _ARM_STATUS, _ARM_MOTION, *_SETTINGS)
+_STATE_CHANNELS = (
+    _ARM_ENABLE,
+    _ARM_ENABLED,
+    _ARM_STATUS,
+    _ARM_MOTION,
+    _ARM_CTRL_MODE,
+    *_SETTINGS,
+)
 
 
 def _refused(error: str, failure_code: str) -> WriteOutcome:
@@ -109,7 +127,12 @@ def _refused(error: str, failure_code: str) -> WriteOutcome:
 _NOT_WRITABLE = _refused("channel is not writable by the piper transport", "not_writable")
 _NOT_OPEN = _refused("Piper transport is not open", "transport_not_open")
 
-_STALE_PLACEHOLDERS: dict[str, Any] = {_ARM_ENABLED: False, _ARM_MOTION: False, _ARM_STATUS: {}}
+_STALE_PLACEHOLDERS: dict[str, Any] = {
+    _ARM_ENABLED: False,
+    _ARM_MOTION: False,
+    _ARM_STATUS: {},
+    _ARM_CTRL_MODE: "",
+}
 """Value a STALE batch reading carries when feedback is unavailable (default 0.0)."""
 
 _VENDOR_CALL = {SPACE_JOINT: "JointCtrl", SPACE_POSE: "EndPoseCtrl"}
@@ -123,6 +146,7 @@ _ESTOP_RESUME = 0x02
 _ALL_MOTORS = 7
 
 _WARMUP_POLL_S = 0.05
+_ENABLE_POLL_S = 0.02
 
 
 def _load_sdk() -> Any:
@@ -175,6 +199,16 @@ class PiperArmTransport:
                 failure_code="piper_invalid_config",
             )
         speed_pct = min(100, max(1, int(config.get("default_speed_pct") or 20)))
+        mode_switch = str(config.get("mode_switch") or MODE_SWITCH_DIRECT).strip().lower()
+        if mode_switch not in MODE_SWITCHES:
+            raise TransportError(
+                f"piper transport mode_switch must be one of {sorted(MODE_SWITCHES)}, "
+                f"got {mode_switch!r}",
+                failure_code="piper_invalid_config",
+            )
+        self._mode_switch = mode_switch
+        self._mode_timeout_s = max(0.1, float(config.get("mode_switch_timeout_s") or 0.6))
+        self._enable_timeout_s = max(0.1, float(config.get("enable_timeout_s") or 1.0))
         self._warmup_timeout_s = max(0.1, float(config.get("warmup_timeout_s") or 3.0))
         self._stale_after_s = max(0.0, float(config.get("stale_after_s") or 1.0))
         self._default_effort_raw = int(
@@ -200,7 +234,12 @@ class PiperArmTransport:
         # Mode tracking and both motion spaces' hold vectors. Seeded from joint
         # feedback at open so the first single-joint write holds the other five
         # joints at their current positions instead of jumping to zero.
-        self._motion = PiperMotion(speed_pct=speed_pct, pose_move_mode=POSE_MOVE_MODES[pose_mode])
+        self._motion = PiperMotion(
+            speed_pct=speed_pct,
+            pose_move_mode=POSE_MOVE_MODES[pose_mode],
+            mode_switch=mode_switch,
+            mode_timeout_s=self._mode_timeout_s,
+        )
         self._commanded_stroke_raw: int | None = None
         self._commanded_effort_raw = self._default_effort_raw
         self._last_feedback_mono = 0.0
@@ -325,6 +364,7 @@ class PiperArmTransport:
                 "firmware_version": self._firmware,
                 "can_fps": state["fps"],
                 "ctrl_mode": state["ctrl_mode"],
+                "ctrl_mode_name": ctrl_mode_name(state["ctrl_mode"]),
                 "move_mode": self._motion.mode,
                 "arm_status": state["arm_status"],
                 "motion_status": state["motion_status"],
@@ -450,11 +490,13 @@ class PiperArmTransport:
         if _ARM_ENABLED in wanted:
             enabled = enable_status(arm)
             values[_ARM_ENABLED] = all(enabled) if enabled is not None else None
-        if not wanted.isdisjoint((_ARM_STATUS, _ARM_MOTION)):
+        if not wanted.isdisjoint((_ARM_STATUS, _ARM_MOTION, _ARM_CTRL_MODE)):
             feedback = status_feedback(arm)
             motion = attr(feedback, "motion_status") if feedback is not None else None
             values[_ARM_MOTION] = motion == _MOTION_STATUS_ARRIVED if motion is not None else None
             values[_ARM_STATUS] = _status_value(feedback) if feedback is not None else None
+            reported = attr(feedback, "ctrl_mode") if feedback is not None else None
+            values[_ARM_CTRL_MODE] = ctrl_mode_name(reported)
         return values
 
     # ── Writes ───────────────────────────────────────────────────────────────
@@ -517,30 +559,116 @@ class PiperArmTransport:
         )
 
     async def _write_enable(self, value: Any) -> WriteOutcome:
-        """Guarded enable/disable: resume + energize, or release torque (arm can fall)."""
+        """Guarded enable/disable: enter CAN mode, resume, energize -- or release torque."""
         flag = enable_flag(value)
         if flag is None:
             return _refused(f"arm.enable expects 0 or 1, got {value!r}", "invalid_value")
         arm = self._arm
         if arm is None or not self._connected:
             return _NOT_OPEN
+        if flag:
+            return await self._energize(arm)
         try:
-            if flag:
-                # Resume (0x02) is the only vendor path out of a latched
-                # emergency stop and a no-op when none is latched, so enable
-                # always runs resume-then-energize under one governed write.
+            await asyncio.to_thread(arm.DisableArm, _ALL_MOTORS, _ENABLE_FLAG_OFF)
+        except Exception as exc:  # noqa: BLE001 - the 0x471 frame may have landed
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_UNKNOWN,
+                error=f"Disable command failed: {exc}",
+                failure_code="piper_send_failed",
+            )
+        return WriteOutcome(ok=True, side_effect_state=SIDE_EFFECT_COMMITTED)
+
+    async def _energize(self, arm: Any) -> WriteOutcome:
+        """Enter CAN mode, resume a latched stop, energize, and verify the result.
+
+        The Piper X firmware accepts an enable sent while the arm is in standby
+        and changes nothing, so the mode selection runs first and the motor
+        enable flags are confirmed from feedback before this write is called
+        successful.
+        """
+        joints = await asyncio.to_thread(self._poll_joints, arm)
+        if joints is None:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_NONE,
+                error="no joint feedback to seed the hold vector before enabling",
+                failure_code="piper_no_feedback",
+            )
+        try:
+            await asyncio.to_thread(self._motion.select_joint_mode, arm, joints)
+        except TransportError as exc:
+            # The handshake sends frames before it can refuse: the control mode
+            # may already have changed even though the arm cannot be driven.
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_COMMITTED,
+                error=str(exc),
+                failure_code="piper_mode_switch_failed",
+            )
+        except Exception as exc:  # noqa: BLE001 - a mode frame may have landed
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_UNKNOWN,
+                error=f"Mode selection failed: {exc}",
+                failure_code="piper_send_failed",
+            )
+        try:
+            # A resume is NOT a no-op when nothing is latched: the firmware
+            # answers 0x150/0x02 by dropping the control mode back to standby,
+            # and an EnableArm issued there is silently ignored. So resume only
+            # a latched stop, and walk back into CAN mode before energizing.
+            if await asyncio.to_thread(self._estop_latched, arm):
                 await asyncio.to_thread(arm.EmergencyStop, _ESTOP_RESUME)
-                await asyncio.to_thread(arm.EnableArm, _ALL_MOTORS, _ENABLE_FLAG_ON)
-            else:
-                await asyncio.to_thread(arm.DisableArm, _ALL_MOTORS, _ENABLE_FLAG_OFF)
+                await asyncio.to_thread(self._motion.enter_can, arm)
+                await asyncio.to_thread(self._motion.select_joint_mode, arm, joints)
+            await asyncio.to_thread(arm.EnableArm, _ALL_MOTORS, _ENABLE_FLAG_ON)
+        except TransportError as exc:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_COMMITTED,
+                error=str(exc),
+                failure_code="piper_mode_switch_failed",
+            )
         except Exception as exc:  # noqa: BLE001 - the 0x150/0x471 frame may have landed
             return WriteOutcome(
                 ok=False,
                 side_effect_state=SIDE_EFFECT_UNKNOWN,
-                error=f"Enable/disable command failed: {exc}",
+                error=f"Enable command failed: {exc}",
                 failure_code="piper_send_failed",
             )
+        if await asyncio.to_thread(self._await_enabled, arm) is False:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_COMMITTED,
+                error=(
+                    "the arm accepted the enable command but no motor reports enabled; "
+                    "check the emergency-stop button, the power switch, and that the "
+                    "arm reports CAN mode"
+                ),
+                failure_code="piper_enable_refused",
+            )
         return WriteOutcome(ok=True, side_effect_state=SIDE_EFFECT_COMMITTED)
+
+    def _estop_latched(self, arm: Any) -> bool:
+        """True when the arm reports a latched emergency stop in its status frame."""
+        feedback = status_feedback(arm)
+        if feedback is None:
+            return False
+        return as_int(attr(feedback, "arm_status")) == _ARM_STATUS_EMERGENCY_STOP
+
+    def _await_enabled(self, arm: Any) -> bool | None:
+        """Poll the motor enable flags; None when the firmware reports nothing."""
+        deadline = time.monotonic() + self._enable_timeout_s
+        while True:
+            enabled = enable_status(arm)
+            if enabled is None:
+                return None
+            if enabled and all(enabled):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_ENABLE_POLL_S)
 
     def _write_setting(self, channel_id: str, value: Any) -> WriteOutcome:
         """Stage the speed rate or pose path the next motion applies; nothing is sent now."""
@@ -647,6 +775,25 @@ class PiperArmTransport:
                         failure_code="piper_no_feedback",
                     )
                 staged_stroke = stroke_fb
+        try:
+            # The gripper bypasses the motion path, so the mode guard is this
+            # write's own: in standby the firmware drops the frame while the
+            # outcome would still read committed.
+            await asyncio.to_thread(self._motion.ensure_can, arm)
+        except TransportError as exc:
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_COMMITTED,
+                error=str(exc),
+                failure_code="piper_mode_switch_failed",
+            )
+        except Exception as exc:  # noqa: BLE001 - a mode frame may have landed
+            return WriteOutcome(
+                ok=False,
+                side_effect_state=SIDE_EFFECT_UNKNOWN,
+                error=f"Mode selection failed: {exc}",
+                failure_code="piper_send_failed",
+            )
         try:
             await asyncio.to_thread(
                 arm.GripperCtrl, staged_stroke, staged_effort, _GRIPPER_CODE_ENABLE, 0x00

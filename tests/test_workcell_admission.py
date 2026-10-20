@@ -38,6 +38,8 @@ def test_shipped_shape_parses_and_reports_its_devices() -> None:
     assert spec.role("gripper") == ARM_ID and spec.role("camera") == ""
     assert spec.frames["tcp"].parent == "flange"
     assert spec.limits["move_timeout_s"] == 5.0
+    assert spec.calibration["max_pivot_residual_mm"] == 1.0
+    assert spec.calibration["max_verify_p95_mm"] == 5.0
     assert spec.bootstrap_box is not None and spec.bootstrap_box.z_min == 120
 
 
@@ -56,6 +58,8 @@ def test_shipped_shape_parses_and_reports_its_devices() -> None:
         (_with(arm=ARM_ID), "unknown fields \\['arm'\\]"),
         (_with(limts={"speed_pct_max": 10}), "unknown fields"),
         (_with(workspace={"procedure": "p", "cone_deg": 10}), "unknown fields"),
+        (_with(calibration={"mystery": 1}), "calibration does not understand mystery"),
+        (_with(calibration={"max_zero_error_deg": 0}), "positive finite"),
         (_with(roles={"arm": ARM_ID, "Camera Wrist": "cam"}), "role name"),
         (_with(roles={"arm": ARM_ID, "camera.wrist": ""}), "device id"),
         (_with(roles=[ARM_ID]), "needs 'roles'"),

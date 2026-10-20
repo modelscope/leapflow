@@ -74,9 +74,19 @@ degradation:
 transport:
   kind: "piper"
   config:
+    # The node-local CAN interface the arm answers on: the native mttcan
+    # controller on some carriers, or the interface a USB-CAN adapter creates
+    # (``can1`` on JetPack, where gs_usb must be installed).
     can_name: "can0"
     sdk_interface: "v2"
     default_speed_pct: 20
+    # How a CAN command mode is entered. "standby_then_can" is the Piper X
+    # handshake from the vendor manual: the firmware silently drops a direct
+    # CAN selection issued from standby, so a single frame leaves the arm
+    # uncommandable while every write still reports success. "direct" keeps
+    # the single-frame behavior older firmware accepts.
+    mode_switch: "standby_then_can"
+    mode_switch_timeout_s: 0.6
     # ee.* targets until arm.pose_path selects otherwise: "linear" (MOVE L,
     # straight-line) or "point" (MOVE P).
     pose_move_mode: "linear"
@@ -99,6 +109,7 @@ channels:
       min_value: -150.0
       max_value: 150.0
       max_rate: 36.0
+      max_jump: 36.0
       quantization: 0.001
       settling_time_s: 0.5
       tolerance: 0.5
@@ -118,6 +129,7 @@ channels:
       min_value: 0.0
       max_value: 180.0
       max_rate: 36.0
+      max_jump: 36.0
       quantization: 0.001
       settling_time_s: 0.5
       tolerance: 0.5
@@ -137,6 +149,7 @@ channels:
       min_value: -170.0
       max_value: 0.0
       max_rate: 36.0
+      max_jump: 36.0
       quantization: 0.001
       settling_time_s: 0.5
       tolerance: 0.5
@@ -156,6 +169,7 @@ channels:
       min_value: -100.0
       max_value: 100.0
       max_rate: 36.0
+      max_jump: 36.0
       quantization: 0.001
       settling_time_s: 0.5
       tolerance: 0.5
@@ -175,6 +189,7 @@ channels:
       min_value: -70.0
       max_value: 70.0
       max_rate: 36.0
+      max_jump: 36.0
       quantization: 0.001
       settling_time_s: 0.5
       tolerance: 0.5
@@ -194,6 +209,7 @@ channels:
       min_value: -120.0
       max_value: 120.0
       max_rate: 36.0
+      max_jump: 36.0
       quantization: 0.001
       settling_time_s: 0.5
       tolerance: 0.5
@@ -213,6 +229,7 @@ channels:
       min_value: -650.0
       max_value: 650.0
       max_rate: 150.0
+      max_jump: 150.0
       quantization: 0.001
       settling_time_s: 1.0
       tolerance: 2.0
@@ -232,6 +249,7 @@ channels:
       min_value: -650.0
       max_value: 650.0
       max_rate: 150.0
+      max_jump: 150.0
       quantization: 0.001
       settling_time_s: 1.0
       tolerance: 2.0
@@ -251,6 +269,7 @@ channels:
       min_value: -300.0
       max_value: 900.0
       max_rate: 150.0
+      max_jump: 150.0
       quantization: 0.001
       settling_time_s: 1.0
       tolerance: 2.0
@@ -270,6 +289,7 @@ channels:
       min_value: -180.0
       max_value: 180.0
       max_rate: 45.0
+      max_jump: 45.0
       quantization: 0.001
       settling_time_s: 1.0
       tolerance: 1.0
@@ -289,6 +309,7 @@ channels:
       min_value: -180.0
       max_value: 180.0
       max_rate: 45.0
+      max_jump: 45.0
       quantization: 0.001
       settling_time_s: 1.0
       tolerance: 1.0
@@ -308,6 +329,7 @@ channels:
       min_value: -180.0
       max_value: 180.0
       max_rate: 45.0
+      max_jump: 45.0
       quantization: 0.001
       settling_time_s: 1.0
       tolerance: 1.0
@@ -326,6 +348,7 @@ channels:
       declared: true
       min_value: 0.0
       max_value: 100.0
+      max_jump: 70.0
       quantization: 0.001
       settling_time_s: 0.3
       tolerance: 0.5
@@ -407,6 +430,15 @@ channels:
     representation: "state"
     effect: "read"
     description: "Vendor feedback status: ctrl_mode, arm_status, motion_status"
+
+  - channel_id: "arm.ctrl_mode"
+    direction: "read"
+    quantity: "state"
+    representation: "state"
+    effect: "read"
+    description: >-
+      Control mode the firmware reports: "standby", "can" or "teach" (other
+      modes read as "other(0xNN)"). Host commands are only accepted in "can".
 
   - channel_id: "arm.motion"
     direction: "read"

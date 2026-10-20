@@ -88,9 +88,9 @@ _MILLIMETRES = frozenset({"mm", "millimeter", "millimetre", "millimeters", "mill
 class PolicySettings:
     """Streaming tuning; a workcell overrides any of it under ``policy``.
 
-    ``max_jump_s`` bounds discontinuities: an arm channel's command may not step,
-    and a chunk's first action may not start, further from the last command (or
-    the observed state) than that many seconds at the channel's ``max_rate``.
+    ``max_jump_s`` may tighten each device channel's authoritative ``max_jump``:
+    a command may not step further than that many seconds at ``max_rate``, and
+    admission rejects a value that would widen the device declaration.
     The tick rate is bounded by the action channels' declared ``sample_rate_hz``.
     """
 
@@ -161,6 +161,7 @@ class PolicyBinding:
     state_groups: tuple[BoundGroup, ...]
     cameras: Mapping[str, str]  # model camera name -> device id
     joint_order: tuple[str, ...]
+    settings: PolicySettings
     chain: DhChain | None = None
     gripper_mm: Mapping[str, tuple[float, float]] = field(default_factory=dict)
     contacts: tuple[ContactLimit, ...] = ()
@@ -436,6 +437,7 @@ def _warnings(spaces: ModelSpaces) -> tuple[str, ...]:
 
 
 def _summary(binding: PolicyBinding) -> dict[str, Any]:
+    """Canonical declared and resolved dependencies of this concrete adapter."""
     return {
         "steps": binding.actions.describe(),
         "state_steps": [] if binding.state is None else binding.state.describe(),
@@ -443,6 +445,16 @@ def _summary(binding: PolicyBinding) -> dict[str, Any]:
         "cameras": dict(binding.cameras),
         "decl": binding.decl.to_dict(),
         "spaces": binding.spaces.to_dict(),
+        "resolved": {
+            "actions": _bound_record(binding.action_groups),
+            "state": _bound_record(binding.state_groups),
+            "shield": [_dataclass_record(item) for item in binding.channels],
+            "contacts": [_dataclass_record(item) for item in binding.contacts],
+            "gripper_mm": {name: list(span) for name, span in binding.gripper_mm.items()},
+            "dh": None if binding.chain is None else binding.chain.to_dict(),
+            "joint_limits": _ik_limits(binding.actions),
+            "settings": _dataclass_record(binding.settings),
+        },
     }
 
 
@@ -514,6 +526,7 @@ def bind_policy(
         state_groups=state_groups,
         cameras=_cameras(spaces, decl, spec, registry),
         joint_order=body.joints,
+        settings=settings,
         chain=chain,
         gripper_mm=_gripper_spans(body, spec, spaces),
         contacts=contact_limits(body.devices),
@@ -524,6 +537,11 @@ def bind_policy(
 
 def _space_groups(space: VectorSpace | None) -> tuple[Group, ...]:
     return () if space is None else space.groups
+
+
+def _dataclass_record(value: Any) -> dict[str, Any]:
+    """JSON-ready values of a resolved frozen declaration object."""
+    return {item.name: getattr(value, item.name) for item in fields(value)}
 
 
 def _bound_record(bound: Sequence[BoundGroup]) -> list[dict[str, Any]]:
@@ -543,10 +561,27 @@ def _ordered(bound: Sequence[BoundGroup], names: Sequence[str]) -> tuple[BoundGr
     return tuple(sorted(bound, key=lambda item: rank[item.group.name]))
 
 
+def _jump_limit(channel: Any, settings: PolicySettings, where: str) -> float:
+    """The device's absolute jump limit, optionally tightened by workcell seconds."""
+    declared = channel.envelope.max_jump
+    if declared is None or not math.isfinite(declared) or declared <= 0.0:
+        raise ValueError(f"{where}: {channel.channel_id} needs a positive envelope.max_jump")
+    rate = channel.envelope.max_rate
+    if rate is None or rate <= 0.0:
+        return float(declared)
+    requested = float(rate) * settings.max_jump_s
+    if requested > declared + 1e-9:
+        raise ValueError(
+            f"policy.max_jump_s would widen {channel.channel_id}'s device max_jump "
+            f"{declared:g} to {requested:g}; it may only tighten it"
+        )
+    return min(float(declared), requested)
+
+
 def _shield_channels(
     body: _Embodiment, bound: Sequence[BoundGroup], settings: PolicySettings, where: str
 ) -> tuple[ShieldChannel, ...]:
-    """The action channels' limits in layout order; a gripper's open/close may jump."""
+    """The action channels' admitted device limits in layout order."""
     declared = [
         body.channel(channel_id, write=True, where=where)
         for item in bound
@@ -559,7 +594,7 @@ def _shield_channels(
         ShieldChannel.from_channel(
             owner,
             channel,
-            jump_s=None if channel.channel_id == GRIPPER_POSITION else settings.max_jump_s,
+            max_jump=_jump_limit(channel, settings, where),
         )
         for owner, channel in declared
     )

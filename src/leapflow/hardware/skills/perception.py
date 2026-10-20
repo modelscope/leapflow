@@ -105,8 +105,6 @@ class PerceptionSettings:
     top_quantile: float = 0.95
     min_score: float = 0.3
     memory_ttl_s: float = 30.0
-    relocate_radius_mm: float = 60.0
-    relocate_min_score: float = 0.2
     jpeg_quality: float = 90.0
     point_radius_px: float = 4.0
     snapshot_max_side: float = 640.0
@@ -123,7 +121,7 @@ class PerceptionSettings:
         settings = replace(cls(), **{name: float(value) for name, value in data.items()})
         if not all(getattr(settings, name) > 0 for name in known):
             raise ValueError("perception values must be positive")
-        if max(settings.top_quantile, settings.min_score, settings.relocate_min_score) > 1:
+        if max(settings.top_quantile, settings.min_score) > 1:
             raise ValueError("perception quantiles and scores must be in (0, 1]")
         if settings.min_depth_mm >= settings.max_depth_mm:
             raise ValueError("perception.min_depth_mm must be below max_depth_mm")
@@ -345,10 +343,6 @@ def _median(values: Sequence[float]) -> float:
     return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
-def _planar_mm(a: LocatedObject, b: LocatedObject) -> float:
-    return math.hypot(a.center[0] - b.center[0], a.center[1] - b.center[1])
-
-
 # ── Shared frames ────────────────────────────────────────────────────────────
 
 
@@ -527,37 +521,26 @@ class WorkcellScene:
         )
 
     async def relocate(self, obj: LocatedObject) -> LocatedObject:
-        if obj.source == SOURCE_LIFT:
-            return await self._remeasure(obj)
-        found = await self._detect([obj.label], self._settings.relocate_min_score)
-        nearest = min(found, key=lambda other: _planar_mm(obj, other), default=None)
-        radius = self._settings.relocate_radius_mm
-        if nearest is None or _planar_mm(obj, nearest) > radius:
-            raise SkillError(
-                FAILURE_TARGET_NOT_FOUND,
-                f"{obj.object_id} ({obj.label}) is no longer within {radius:.0f} mm of where it "
-                "was seen",
-            )
-        moved = replace(nearest, object_id=obj.object_id)
-        self._memory.update(moved, self._basis)
-        return moved
+        """Measure only *obj* where its approved geometry projects in a fresh frame.
+
+        Freshness must never run grounding again: another same-label detection is
+        not the candidate the operator approved. The caller's drift check catches
+        movement within the projected region; missing depth means the candidate left.
+        """
+        return await self._remeasure(obj)
 
     async def _remeasure(self, obj: LocatedObject) -> LocatedObject:
-        """*obj*, which S2 grounded, measured again where it projects into a fresh frame.
-
-        No model can find it by label, so this sees whether the surface is still
-        there: the caller's drift check catches an object that moved or left.
-        """
         capture = await self.capture()
         try:
             seen = lift_detection(reproject(obj, capture), capture, self._settings)
         except (LookupError, ValueError) as exc:
+            observe_again = "lift it again" if obj.source == SOURCE_LIFT else "locate it again"
             raise SkillError(
                 FAILURE_TARGET_NOT_FOUND,
                 f"{obj.object_id} ({obj.label}) cannot be measured again ({exc}); "
-                "take a new snapshot and lift it again",
+                f"{observe_again} and make a new plan",
             ) from exc
-        moved = replace(seen, object_id=obj.object_id, source=SOURCE_LIFT)
+        moved = replace(seen, object_id=obj.object_id, source=obj.source)
         self._memory.update(moved, self._basis)
         return moved
 

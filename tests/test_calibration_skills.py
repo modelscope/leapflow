@@ -70,9 +70,17 @@ def _registry(tmp_path: Path, **sim: Any) -> SkillNodeRegistry:
     return registry
 
 
-def _runtime(tmp_path: Path, registry: SkillNodeRegistry) -> SkillRuntime:
+def _runtime(
+    tmp_path: Path,
+    registry: SkillNodeRegistry,
+    *,
+    calibration: Mapping[str, float] | None = None,
+) -> SkillRuntime:
     directory = tmp_path / "workcells"
-    write_workcell(directory)
+    workcell = WORKCELL_YAML
+    if calibration is not None:
+        workcell = {**WORKCELL_YAML, "calibration": calibration}
+    write_workcell(directory, workcell)
     return SkillRuntime(
         registry,
         settings=SkillRuntimeSettings(workcells_dir=directory),
@@ -234,6 +242,16 @@ async def test_pivot_samples_that_disagree_fail_the_check_before_anything_runs(
     assert outcome.side_effect_state == SIDE_EFFECT_NONE
     assert outcome.result["residual_mm"] > 1.0
 
+    tolerant = _runtime(
+        tmp_path / "tolerant",
+        _registry(tmp_path / "tolerant"),
+        calibration={"max_pivot_residual_mm": 10.0},
+    )
+    accepted = await tolerant.plan(
+        WORKCELL_ID, "calib.tcp", {"method": "pivot", "samples": samples}
+    )
+    assert isinstance(accepted, SkillPlan), accepted
+
 
 async def test_pivot_needs_spread_orientations(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path, _registry(tmp_path))
@@ -367,6 +385,19 @@ async def test_bringup_refuses_an_arm_that_does_not_read_zero(tmp_path: Path) ->
     assert refused.side_effect_state == SIDE_EFFECT_NONE
     assert any("joint.j2.position" in problem for problem in refused.result["problems"])
     assert registry.sim.batches == []
+
+    tolerant = _runtime(
+        tmp_path / "tolerant",
+        _registry(tmp_path / "tolerant", joints=tuple(registry.sim.joints.values())),
+        calibration={"max_zero_error_deg": 4.0},
+    )
+    accepted = await tolerant.plan(
+        WORKCELL_ID,
+        "calib.bringup",
+        {"expect_zero": True, "gripper_travel": False},
+    )
+    assert isinstance(accepted, SkillPlan), accepted
+    assert accepted.basis["max_zero_error_deg"] == 4.0
 
 
 # ── arm.state and the host ───────────────────────────────────────────────────

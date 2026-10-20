@@ -5,21 +5,27 @@ The arm, camera and policy server are simulated; the runtime, write gate,
 binding, adapter, aggregator, shield and skill are the production ones. Pins
 what an approver sees (a preview that never moves), every pre-motion refusal
 (NONE), streaming in end-effector and joint space, and the run verdicts: a
-shield refusal or a model outage stops the stream without a halt, a stop
+a model outage stops the stream without a halt, while a shield refusal or stop
 halts it. ``test_policy_vla`` covers the declared VLA spaces.
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 
+from leapflow.hardware.context import HardwareContext, Quality
 from leapflow.hardware.skills.adapt.spec import stats_checksum
+from leapflow.hardware.skills.policy_stream import WorkcellPolicies
 from leapflow.hardware.skills.protocol import (
     FAILURE_CALIBRATION_STALE,
+    FAILURE_DEVICE_FAULT,
     FAILURE_INVALID_ARGS,
     FAILURE_MODEL_UNAVAILABLE,
     FAILURE_PLAN_STALE,
@@ -32,8 +38,11 @@ from leapflow.hardware.skills.protocol import (
     SIDE_EFFECT_PARTIAL,
     STATUS_FAILED,
     STATUS_HALTED,
+    SkillError,
 )
 from leapflow.hardware.skills.runtime import SkillRun
+from leapflow.hardware.skills.shield import ContactLimit
+from leapflow.hardware.transport import BatchReading, Reading
 from tests._harness.policy_cell import (
     EE,
     GRIPPER,
@@ -49,6 +58,7 @@ from tests._harness.policy_cell import (
 )
 from tests._harness.skill_stubs import (
     JOINTS,
+    PIPER_YAML,
     START_FLANGE,
     TOOL_LENGTH_MM,
     WORKCELL_ID,
@@ -65,6 +75,25 @@ def _ee_policy(step_z: float = 1.0, **kwargs: Any) -> SimPolicy:
 
 def _joint_policy(**kwargs: Any) -> SimPolicy:
     return SimPolicy(action_space("joints"), (1.0, 0, 0, 0, 0, 0), **kwargs)
+
+
+class _ContactRegistry:
+    def __init__(self, readings: tuple[Reading, ...]) -> None:
+        self._readings = readings
+
+    async def read_batch(self, device_id: str, channel_ids: tuple[str, ...]) -> BatchReading:
+        return BatchReading(device_id=device_id, readings=self._readings)
+
+
+def _contact_port(readings: tuple[Reading, ...]) -> WorkcellPolicies:
+    return WorkcellPolicies(
+        registry=_ContactRegistry(readings),
+        spec=None,
+        frames=None,
+        motion=None,
+        settings=None,
+        note=lambda _kind, _data: None,
+    )
 
 
 # ── Planning ─────────────────────────────────────────────────────────────────
@@ -211,6 +240,22 @@ async def test_a_model_without_a_workcell_embodiment_is_refused(tmp_path: Path) 
     assert "declares no policies.cube embodiment" in outcome.message
 
 
+async def test_workcell_jump_tuning_cannot_widen_the_device_limit(tmp_path: Path) -> None:
+    runtime = policy_cell(tmp_path, _ee_policy(), settings={"max_jump_s": 2.0})
+    outcome = await refuse_run(runtime)
+    assert outcome.failure_code == FAILURE_SKILL_UNAVAILABLE
+    assert "may only tighten" in outcome.message
+
+
+async def test_gripper_jump_is_not_exempt_from_the_device_limit(tmp_path: Path) -> None:
+    row = [*START_FLANGE, 0.0]
+    arm = SimArmTransport(gripper_mm=100.0)
+    outcome = await refuse_run(policy_cell(tmp_path, _ee_policy(rows=[row]), arm=arm))
+    assert outcome.failure_code == FAILURE_SHIELD_VIOLATION
+    assert "first 'gripper' action moves dim 0 by 100.00" in outcome.message
+    assert "more than the 70" in outcome.message
+
+
 async def test_plan_refuses_a_policy_trained_on_another_calibration(tmp_path: Path) -> None:
     policy = _ee_policy(details={"calibration": {"tcp": 1.0}})
     outcome = await refuse_run(policy_cell(tmp_path, policy))
@@ -245,6 +290,39 @@ async def test_plan_refuses_a_first_action_that_jumps_away_from_the_arm(tmp_path
 async def test_plan_refuses_a_chunk_of_the_wrong_width(tmp_path: Path) -> None:
     outcome = await refuse_run(policy_cell(tmp_path, _ee_policy(rows=[[1.0, 2.0]])))
     assert outcome.failure_code == FAILURE_MODEL_UNAVAILABLE and "unusable chunk" in outcome.message
+
+
+_CONTACT = ContactLimit("joint.j1.effort", "arm", -5.0, 5.0)
+
+
+@pytest.mark.parametrize(
+    ("readings", "message"),
+    [
+        (
+            (Reading("arm", _CONTACT.channel_id, 1.0, quality=Quality.STALE.value),),
+            "untrustworthy",
+        ),
+        ((Reading("arm", _CONTACT.channel_id, math.nan),), "non-finite"),
+        ((), "no reading"),
+    ],
+)
+async def test_contact_monitoring_rejects_untrustworthy_telemetry(
+    readings: tuple[Reading, ...], message: str
+) -> None:
+    binding = SimpleNamespace(contacts=(_CONTACT,))
+    with pytest.raises(SkillError) as raised:
+        await _contact_port(readings)._check_contact(binding)
+    assert raised.value.failure_code == FAILURE_DEVICE_FAULT
+    assert message in raised.value.message
+
+
+async def test_contact_limit_violation_has_a_halted_verdict() -> None:
+    reading = Reading("arm", _CONTACT.channel_id, 6.0)
+    binding = SimpleNamespace(contacts=(_CONTACT,))
+    with pytest.raises(SkillError) as raised:
+        await _contact_port((reading,))._check_contact(binding)
+    assert raised.value.failure_code == FAILURE_SHIELD_VIOLATION
+    assert raised.value.status == STATUS_HALTED
 
 
 # ── Streaming ────────────────────────────────────────────────────────────────
@@ -290,17 +368,17 @@ async def test_joint_policies_refuse_a_dh_table_the_arm_disagrees_with(tmp_path:
     assert outcome.failure_code == FAILURE_SKILL_UNAVAILABLE and "kinematics.dh" in outcome.message
 
 
-async def test_a_shield_refusal_mid_run_stops_without_a_halt(tmp_path: Path) -> None:
+async def test_a_shield_refusal_mid_run_halts_the_arm(tmp_path: Path) -> None:
     # TCP at z=120 descending 5 mm per action: the first chunk ends at 100,
     # the stream crosses the 80 mm floor shortly after.
     flange = (*START_FLANGE[:2], 120.0 + TOOL_LENGTH_MM, *START_FLANGE[3:])
     arm = SimArmTransport(travel_reads=1, flange=flange)
     runtime = policy_cell(tmp_path, _ee_policy(step_z=-5.0, horizon=4), arm=arm)
     outcome = await execute_run(runtime, await plan_run(runtime, duration_s=3.0))
-    assert outcome.status == STATUS_FAILED, outcome
+    assert outcome.status == STATUS_HALTED, outcome
     assert outcome.failure_code == FAILURE_SHIELD_VIOLATION
     assert outcome.side_effect_state == SIDE_EFFECT_PARTIAL
-    assert arm.halts == 0
+    assert arm.halts == 1
     assert "workspace" in outcome.result["policy"]["violation"]
     assert min(commanded(arm, "ee.z")) >= 80.0 + TOOL_LENGTH_MM - 1e-6
 
@@ -372,6 +450,23 @@ async def test_a_changed_adapter_invalidates_the_approval(tmp_path: Path) -> Non
         "images": {"top": {"width": 32, "height": 24}},
     }
     outcome = await execute_run(runtime, plan)
+    assert outcome.failure_code == FAILURE_PLAN_STALE and "embodiment" in outcome.message
+    assert not sim(runtime).batches
+
+
+async def test_resolved_device_limits_are_pinned_by_the_adapter_digest(tmp_path: Path) -> None:
+    runtime = policy_cell(tmp_path, _ee_policy())
+    plan = await plan_run(runtime)
+    declaration = yaml.safe_load(PIPER_YAML.read_text(encoding="utf-8"))
+    ee_z = next(
+        channel for channel in declaration["channels"] if channel["channel_id"] == "ee.z"
+    )
+    ee_z["envelope"]["tolerance"] = 1.0
+    registry = runtime._registry  # type: ignore[attr-defined]
+    registry._context = HardwareContext.from_mapping(declaration)
+
+    outcome = await execute_run(runtime, plan)
+
     assert outcome.failure_code == FAILURE_PLAN_STALE and "embodiment" in outcome.message
     assert not sim(runtime).batches
 

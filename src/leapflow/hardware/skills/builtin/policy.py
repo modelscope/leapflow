@@ -12,9 +12,9 @@ Execution streams the policy through its declared action adapter and the
 shield: every tick is bounded, jump-, acceleration- and slew-limited and
 pose-checked like a discrete move, then passes the node write gate. The run
 ends early when the model reports the instruction done; ``duration_s`` is a
-safety cap. A policy failure (model down, starvation, shield refusal) leaves
-the arm at its last approved target; a stop or a device fault halts it as for
-every skill. The approved plan pins the model identity and the adapter digest,
+safety cap. A model outage or starvation leaves the arm at its last approved
+target; a shield refusal, stop or device fault halts it as for every skill. The
+approved plan pins the model identity and the adapter digest,
 so a model or embodiment changed since approval is ``plan_stale``.
 """
 
@@ -57,8 +57,8 @@ class RunPolicy:
             "chunks; 'task' is the instruction for it. A model whose instruction_policy is "
             "'exact' accepts only the tasks it declares; 'open' takes free language. "
             "Planning previews the first chunk without moving; every action is checked by "
-            "the safety shield and the run stops at the first refusal, leaving the arm "
-            "where it is. The run ends when the model reports done or duration_s elapses "
+            "the safety shield and the run halts at the first refusal. The run ends when "
+            "the model reports done or duration_s elapses "
             "(result 'ended'); 'progress' is the model's own estimate when it reports one, "
             "not a verification. The run's duration cap bounds duration_s."
         ),

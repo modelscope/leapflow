@@ -367,6 +367,18 @@ async def test_handeye_fails_committed_when_the_board_slips(
     assert outcome.result["fit"]["translation_rms_mm"] > 3.0
     assert _frames(runtime).transform("camera") is None
 
+    calibration = {
+        "max_hand_eye_translation_rms_mm": 100.0,
+        "max_hand_eye_rotation_rms_deg": 100.0,
+    }
+    tolerant, camera = _cell(
+        tmp_path / "tolerant",
+        workcell=_workcell(EYE_TO_HAND, calibration=calibration),
+    )
+    camera.shift_after = (6, slipped)
+    accepted = await _run(tolerant, "calib.handeye", FAST)
+    assert accepted.ok, accepted
+
 
 async def test_handeye_fails_committed_when_the_board_is_rarely_seen(
     tmp_path: Path, analytic_detector: None
@@ -398,6 +410,15 @@ async def test_verify_catches_a_bumped_camera(tmp_path: Path, analytic_detector:
     assert outcome.side_effect_state == SIDE_EFFECT_COMMITTED
     assert outcome.result["p95_mm"] == pytest.approx(10.0, abs=0.5)
     assert _registry(runtime).calibration_store.latest(WORKCELL_ID, VERIFY_PROCEDURE) is None
+
+    tolerant, camera = _cell(
+        tmp_path / "tolerant",
+        workcell=_workcell(EYE_TO_HAND, calibration={"max_verify_p95_mm": 12.0}),
+    )
+    assert (await _run(tolerant, "calib.handeye", FAST)).ok
+    camera.camera = BASE_CAMERA.compose(Transform.from_pose(Pose(8.0, 6.0, 0.0)))
+    accepted = await _run(tolerant, "calib.verify", FAST)
+    assert accepted.ok and accepted.result["p95_mm"] == pytest.approx(10.0, abs=0.5)
 
 
 # ── Real ChArUco images ──────────────────────────────────────────────────────

@@ -59,9 +59,19 @@ freshness:
 
 # Acceptance thresholds of the calib.* skills.
 calibration:
+  max_zero_error_deg: 0.5
   max_tool_length_mm: 400
+  min_pivot_spread_deg: 20
+  max_pivot_residual_mm: 1
   max_table_residual_mm: 3
+  start_drift_mm: 5
+  start_drift_deg: 2
   min_hand_eye_poses: 6
+  min_tilt_deg: 5
+  max_hand_eye_translation_rms_mm: 3
+  max_hand_eye_rotation_rms_deg: 0.5
+  min_verify_points: 5
+  max_verify_p95_mm: 5
 
 # Model name -> model-service device id. ``locator`` serves perceive.locate;
 # every other name is a policy embodied under ``policies`` below.
@@ -73,6 +83,10 @@ models:
 # ``models: {grasp: <grasp_proposal device>}`` makes a learned one primary.
 grasp:
   planner: top_down
+  # The Piper jaw lies on tool X (calib.tcp measured it), so the tool yaw that
+  # puts the jaws across the object's short side is the across-yaw itself; a
+  # gripper closing along tool Y would need 90.
+  closing_axis_deg: 0
   approach_mm: 80
   retreat_mm: 80
 

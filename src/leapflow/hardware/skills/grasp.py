@@ -93,11 +93,16 @@ def max_width(gripper_spec: Mapping[str, float]) -> float:
 class TopDownSettings:
     """Tuning of the top-down planner (millimetres, degrees).
 
-    ``closing_axis_deg`` is the fingers' closing direction in the tool frame,
-    measured from the tool's +X toward its +Y; Piper's gripper closes along its
-    tool Y axis, hence the default of 90. An opening narrower than the object
-    plus ``min_slack_mm`` cannot pass around it; footprints within
-    ``round_tolerance_mm`` of square get one candidate.
+    ``closing_axis_deg`` is the tool yaw that turns the finger-closing axis onto
+    the footprint's short side. The jaws are symmetric, so only the axis line
+    matters and 0 and 180 are the same grasp. Which tool axis the jaws lie on
+    belongs to the mounted gripper, not to the planner: the default of 90 fits
+    jaws along tool +Y, while a gripper whose jaw axis is tool X -- measured on
+    the Piper cell by ``calib.tcp`` and declared in that cell's workcell --
+    needs 0. Getting it wrong makes the jaws span the object's long side and
+    close on air. An opening narrower than the object plus ``min_slack_mm``
+    cannot pass around it; footprints within ``round_tolerance_mm`` of square
+    get one candidate.
     """
 
     closing_axis_deg: float = 90.0

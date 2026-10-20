@@ -73,7 +73,7 @@ ON_FAIL_HOLD = "hold"
 _POSE_OPS = frozenset({OP_MOVE, OP_MOVE_LINEAR})
 _COMMON = frozenset({"op", "expect", "on_fail"})
 _FIELDS: Mapping[str, frozenset[str]] = {
-    OP_MOVE: frozenset({"pose", "relative", "ref", "offset", "speed_pct"}),
+    OP_MOVE: frozenset({"pose", "relative", "ref", "offset", "speed_pct", "path"}),
     OP_MOVE_LINEAR: frozenset({"pose", "relative", "ref", "offset", "speed_pct"}),
     OP_MOVE_JOINTS: frozenset({"joints", "speed_pct"}),
     OP_GRIPPER: frozenset({"width_mm", "grip", "ref", "effort"}),
@@ -124,6 +124,9 @@ _STEP_SCHEMA: Mapping[str, Any] = {
             },
         },
         "ref": {"type": "string", "minLength": 3, "maxLength": 40},
+        # A path name is checked against the arm's declared arm.pose_path in _path();
+        # the schema only has to let the key through.
+        "path": {"type": "string", "minLength": 1},
         "offset": {
             "type": "object",
             "properties": {"dx": _OFFSET, "dy": _OFFSET, "dz": _OFFSET},
@@ -153,7 +156,10 @@ _CARD = (
     "relative {dx, dy, dz, frame base|tool} from the previous target; or ref "
     "object:oN[.top|.bottom] / grasp:gN.pregrasp|grasp|retreat plus an optional "
     "offset {dx, dy, dz} in the base frame. Omitted angles keep the previous target's "
-    "orientation. A step may declare expect: held (the jaws hold something), "
+    "orientation. A move may name path: linear|point to ride that path when the arm "
+    "declares it (move_linear always rides linear); a target whose straight line is "
+    "infeasible from the current configuration, such as one starting on a wrist "
+    "singularity, needs point. A step may declare expect: held (the jaws hold something), "
     "released (the jaws opened freely), reached (the TCP is at the last target), or "
     "no_contact (the move arrived and the jaws were not pushed); on_fail stop halts "
     "the arm, hold leaves it in place. Plan uses the arm's declared FK to sample every "
@@ -236,14 +242,7 @@ class _Planner:
             raise _invalid(index, "a move needs exactly one of pose, relative, ref")
         if "offset" in step and "ref" not in step:
             raise _invalid(index, "offset only applies to a ref target")
-        path = PATH_DEFAULT
-        if step["op"] == OP_MOVE_LINEAR:
-            if PATH_LINEAR not in self._ctx.motion.paths:
-                raise SkillError(
-                    FAILURE_SKILL_UNAVAILABLE,
-                    f"step {index}: this arm declares no linear path (arm.pose_path)",
-                )
-            path = PATH_LINEAR
+        path = self._path(index, step)
         entry: dict[str, Any] = {"path": path}
         if "pose" in step:
             target = self._absolute(index, step["pose"])
@@ -262,8 +261,35 @@ class _Planner:
         self._previous = target
         self._joint_state = None
         self.targets.append(target)
-        verb = "move linear" if path == PATH_LINEAR else "move"
+        verb = "move" if path == PATH_DEFAULT else f"move {path}"
         return {**entry, "pose": target.to_dict(), "text": f"{verb} {text}"}
+
+    def _path(self, index: int, step: Mapping[str, Any]) -> str:
+        """The path this step rides: linear for move_linear, else the named or default one.
+
+        A caller that names a path is asking for a shape the arm itself declares, and
+        the shape decides whether the firmware can plan the move at all: a straight
+        line out of a degenerate configuration (a wrist at j5 = 0, an elbow on its
+        limit) has no resolved joint trajectory and is refused, while the same target
+        along ``point`` is well defined.
+        """
+        declared = self._ctx.motion.paths
+        if step["op"] == OP_MOVE_LINEAR:
+            if PATH_LINEAR not in declared:
+                raise SkillError(
+                    FAILURE_SKILL_UNAVAILABLE,
+                    f"step {index}: this arm declares no linear path (arm.pose_path)",
+                )
+            return PATH_LINEAR
+        named = step.get("path")
+        if named is None:
+            return PATH_DEFAULT
+        if named not in declared:
+            available = ", ".join(declared) or "none"
+            raise _invalid(
+                index, f"path {named!r} is not declared by this arm (declared: {available})"
+            )
+        return str(named)
 
     def _orientation(self, index: int, data: Mapping[str, Any]) -> tuple[float, float, float]:
         previous = self._previous
@@ -465,12 +491,16 @@ class _Run:
         self._grip = None if held is None else held.width_mm  # width the jaws closed at
         self._target: Pose | None = state.tcp
         self._gripped: GripperResult | None = None
+        self._released: bool | None = None
+        self._release_from: float | None = None
         self.log: list[dict[str, Any]] = []
 
     async def step(self, index: int, step: Mapping[str, Any]) -> None:
         op = step["op"]
         before = self.jaw
         self._gripped = None
+        self._released = None
+        self._release_from = None
         if op in _POSE_OPS:
             target = Pose.from_mapping(step["pose"])
             moved = await self._ctx.motion.move_tcp(
@@ -519,20 +549,28 @@ class _Run:
 
     async def _gripper(self, step: Mapping[str, Any]) -> None:
         effort = step.get("effort")
+        before = self.jaw
+        held_width = self._grip
         result = await self._ctx.motion.gripper(float(step["width_mm"]), effort=effort)
         self._gripped = result
         self.jaw = result.width_mm
+        self._release_from = held_width
+        released = held_width is not None and result.width_mm > held_width + self._tolerance
+        self._released = released or (held_width is None and not result.blocked)
         scene = self._ctx.scene
-        if result.blocked and result.width_mm >= self._min_hold:
+        if released:
+            self._grip = None
+            if scene.held is not None:
+                scene.release()
+            return
+        closing = before is None or result.target_mm < before - self._tolerance
+        grasped = held_width is None and closing and result.blocked
+        if grasped and result.width_mm >= self._min_hold:
             self._grip = result.width_mm
             obj = self._objects.get(step.get("object") or "")
             if obj is not None:
                 grasp = self._grasps.get(step.get("grasp") or "")
                 scene.hold(HeldObject(obj, result.width_mm, time.time(), grasp))
-        elif not result.blocked:
-            self._grip = None
-            if scene.held is not None:
-                scene.release()
 
     def _guard(self, index: int, step: Mapping[str, Any], before: float | None) -> None:
         expect = step["expect"]
@@ -565,9 +603,14 @@ class _Run:
             return None
         if expect == EXPECT_RELEASED:
             gripped = self._gripped
+            if self._released:
+                return None
+            if self._release_from is not None and jaw is not None:
+                needed = self._release_from + self._tolerance
+                return f"the jaws opened only to {jaw:.1f} mm; release requires more than {needed:.1f}"
             if gripped is not None and gripped.blocked:
                 return f"the jaws stopped at {gripped.width_mm:.1f} mm of {gripped.target_mm:.1f}"
-            return None
+            return "release was not confirmed"
         target = self._target
         if target is None or not self._ctx.motion.reached(target, self.state):
             where = "unknown" if target is None else f"{self.state.tcp.distance_mm(target):.1f} mm"

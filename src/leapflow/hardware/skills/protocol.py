@@ -305,6 +305,11 @@ class ArmState:
     enabled: bool | None = None
     arrived: bool | None = None
     observed_at: float = 0.0
+    ctrl_mode: str | None = None
+    # The vendor's verdict on the last commanded target (0 = normal). A refusing
+    # code means its inverse kinematics rejected the pose before moving: the arm
+    # is not late, it is never going to arrive.
+    arm_status: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -314,6 +319,8 @@ class ArmState:
             "gripper_mm": self.gripper_mm,
             "enabled": self.enabled,
             "arrived": self.arrived,
+            "ctrl_mode": self.ctrl_mode,
+            "arm_status": self.arm_status,
         }
 
 

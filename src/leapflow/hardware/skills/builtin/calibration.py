@@ -103,24 +103,19 @@ class Bringup:
 
     spec = SkillSpec(
         skill_id="calib.bringup",
-        version="1.0.0",
+        version="1.1.0",
         card=(
             "First-run check of the arm: it reports every joint and is enabled; with "
             "expect_zero=true (the user has put the arm at its mechanical zero) every "
-            "joint must read zero within zero_tol_deg; with gripper_travel=true the "
-            "gripper opens fully, closes fully, and returns to its width. The arm itself "
-            "does not move. Run it before calib.tcp on new or re-assembled hardware."
+            "joint must read zero within the workcell's declared max_zero_error_deg; with "
+            "gripper_travel=true the gripper opens fully, closes fully, and returns to its "
+            "width. The arm itself does not move. Run it before calib.tcp on new or "
+            "re-assembled hardware."
         ),
         args_schema={
             "type": "object",
             "properties": {
                 "expect_zero": {"type": "boolean", "default": False},
-                "zero_tol_deg": {
-                    "type": "number",
-                    "minimum": 0.05,
-                    "maximum": 5,
-                    "default": 0.5,
-                },
                 "gripper_travel": {"type": "boolean", "default": True},
             },
         },
@@ -133,12 +128,17 @@ class Bringup:
         state = await _ready_state(ctx)
         if not state.joints:
             raise _check_failed("the arm reported no joint positions", problems=["no joints"])
+        tolerance = float(ctx.workcell.calibration["max_zero_error_deg"])
         if args["expect_zero"]:
-            tol = float(args["zero_tol_deg"])
-            off = [f"{j} reads {v:.2f} deg" for j, v in state.joints.items() if abs(v) > tol]
+            off = [
+                f"{joint} reads {value:.2f} deg"
+                for joint, value in state.joints.items()
+                if abs(value) > tolerance
+            ]
             if off:
                 raise _check_failed(
-                    f"the arm is not at zero within {tol} deg ({'; '.join(off)}); re-zero it "
+                    f"the arm is not at zero within {tolerance} deg ({'; '.join(off)}); "
+                    "re-zero it "
                     "with the vendor zero calibration, or check it is at its mechanical zero",
                     problems=off,
                 )
@@ -150,7 +150,7 @@ class Bringup:
             )
         steps = [f"read {len(state.joints)} joints"]
         if args["expect_zero"]:
-            steps.append(f"check they read zero within {args['zero_tol_deg']} deg")
+            steps.append(f"check they read zero within {tolerance:g} deg")
         if travel:
             steps.append(
                 f"open the gripper to {float(max_width):.0f} mm, close it fully, and restore "
@@ -164,6 +164,7 @@ class Bringup:
                 "joints": {j: round(v, 3) for j, v in state.joints.items()},
                 "gripper_mm": state.gripper_mm,
                 "travel": travel,
+                "max_zero_error_deg": tolerance,
                 "max_width_mm": None if max_width is None else float(max_width),
             },
         )
@@ -184,7 +185,11 @@ class Bringup:
         recorded_at = ctx.record_calibration(
             BRINGUP_PROCEDURE,
             role="arm",
-            parameters={**measured, "zero_checked": bool(plan.args["expect_zero"])},
+            parameters={
+                **measured,
+                "zero_checked": bool(plan.args["expect_zero"]),
+                "max_zero_error_deg": plan.basis["max_zero_error_deg"],
+            },
         )
         return SkillOutcome.succeeded(
             {"measured": measured, "recorded_at": recorded_at}, message="The arm passed bring-up"
@@ -220,7 +225,7 @@ class ToolCentrePoint:
 
     spec = SkillSpec(
         skill_id="calib.tcp",
-        version="1.0.0",
+        version="1.1.0",
         card=(
             "Calibrate the tool centre point (TCP) on the flange. method=declared takes "
             "offset=[x, y, z] or [x, y, z, rx, ry, rz] (mm, deg; e.g. the gripper length "
@@ -239,12 +244,6 @@ class ToolCentrePoint:
                     "items": _numbers(6, "flange pose"),
                     "minItems": 4,
                     "maxItems": 12,
-                },
-                "max_residual_mm": {
-                    "type": "number",
-                    "minimum": 0.1,
-                    "maximum": 5,
-                    "default": 1.0,
                 },
             },
         },
@@ -334,7 +333,7 @@ def _pivot_fit(args: Mapping[str, Any], accept: Mapping[str, float]) -> tuple[Po
             f"the pivot is not observable from these samples ({exc}); tilt about different axes",
             problems=["degenerate samples"],
         ) from exc
-    limit = float(args["max_residual_mm"])
+    limit = float(accept["max_pivot_residual_mm"])
     if residual > limit:
         raise _check_failed(
             f"the samples disagree by {residual:.2f} mm rms (limit {limit} mm); the tip "

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from leapflow.hardware.skills.adapt.encode import EpisodeEncoder
+from leapflow.hardware.skills.adapt.spec import ImageSpec
 from leapflow.hardware.skills.episodes import (
     EPISODE_FORMAT,
     EPISODE_FORMAT_VERSION,
@@ -224,6 +225,11 @@ class TrainingSpace(Protocol):
         """The rate the space was declared at (``None``: any)."""
         ...
 
+    @property
+    def image_specs(self) -> Mapping[str, ImageSpec]:
+        """Model camera name to its inference-time fitting declaration."""
+        ...
+
     def state(self, frame: Frame) -> tuple[float, ...]: ...
 
     def action(self, frame: Frame) -> tuple[float, ...]: ...
@@ -246,6 +252,10 @@ class ChannelSpace:
     @property
     def fps(self) -> float | None:
         return None
+
+    @property
+    def image_specs(self) -> Mapping[str, ImageSpec]:
+        return {}
 
     def state(self, frame: Frame) -> tuple[float, ...]:
         return tuple(frame.sample[c] for c in self.channels)
@@ -275,6 +285,10 @@ class ModelSpace:
     @property
     def fps(self) -> float | None:
         return self.encoder.spaces.action.fps
+
+    @property
+    def image_specs(self) -> Mapping[str, ImageSpec]:
+        return self.encoder.spaces.observation.images
 
     def state(self, frame: Frame) -> tuple[float, ...]:
         return self.encoder.encode_state(frame.sample)
