@@ -262,9 +262,9 @@ _EXTERNAL_ONLY_TRANSPORTS = frozenset(
         # pyrealsense2 + a physical camera; read-only contracts are exercised
         # in tests/test_realsense_transport.py against a fake frame source.
         "realsense",
-        # Device-specific driver (AgileX Piper arm) that lives in
+        # Device-specific driver (AgileX Piper-family arm) that lives in
         # hardware/drivers/ and is discovered through entry points. Requires
-        # piper_sdk + a CAN interface; the full contract matrix (bring-up,
+        # pyAgxArm + a CAN interface; the full contract matrix (bring-up,
         # unit conversion, hold-position vectors, side-effect verdicts, halt
         # mapping) runs against a fake SDK in tests/test_piper_transport.py.
         "piper",

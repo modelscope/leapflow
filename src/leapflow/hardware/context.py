@@ -58,11 +58,13 @@ class ContextSource(str, Enum):
 
 
 class Direction(str, Enum):
-    """Whether a channel can be read, written, or both."""
+    """Available channel operations; demotion never grants a new operation."""
 
     READ = "read"
     WRITE = "write"
     READWRITE = "readwrite"
+    DISABLED = "disabled"
+    """A write-only channel whose write capability has been revoked."""
 
 
 class HardwareEffect(str, Enum):
@@ -552,11 +554,10 @@ class Channel:
         )
 
     def without_write(self) -> "Channel":
-        """Return this channel demoted to read-only.
+        """Revoke write capability, preserving only already-declared reads.
 
-        Used by admission checks that must revoke write capability while keeping the
-        channel readable, because reads remain valuable for diagnosis exactly when a
-        device is not trusted to be commanded.
+        Read/write channels remain readable for diagnosis. Write-only channels become
+        disabled: admission must not invent a getter that the transport never declared.
 
         ``effect`` is preserved rather than reset to ``read``. The declared effect is
         what the channel is *for*, and erasing it would make a demoted channel report
@@ -571,7 +572,7 @@ class Channel:
             return self
         return Channel(
             channel_id=self.channel_id,
-            direction=Direction.READ.value,
+            direction=Direction.READ.value if self.is_readable else Direction.DISABLED.value,
             quantity=self.quantity,
             unit=self.unit,
             effect=self.effect,

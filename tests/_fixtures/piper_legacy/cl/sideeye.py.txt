@@ -1,0 +1,328 @@
+"""The eye-level side camera behind the same interface as ``vision.RobotEye``.
+
+The camera now looks almost horizontally across the table, so a mask projected
+onto one plane is meaningless; the box pose comes from ``sidebox.fit`` -- a
+cuboid resting on the touch-measured table whose silhouette matches the mask.
+
+When the arm is over the box the black gripper sits in front of and above it in
+the view.  The arm's own pose answers where: the link skeleton (host FK on the
+live joints) and a conservative gripper volume are projected and blanked, the
+fit counts IoU only over what is left, and the box's dimensions are pinned to
+the unoccluded survey so only (x, y, yaw) remain free.  That turns the approach
+and pre-grasp looks into a closed-loop position measurement instead of a
+segmentation that would merge the gripper with the box.
+"""
+
+from __future__ import annotations
+
+import math
+import statistics
+import time
+from typing import Any
+
+import cv2
+import numpy as np
+
+from . import config, eye, kin, sidebox
+from .vision import Frame, VisionError
+
+TOOL_MM = 128.42
+FAR = 1.0e6  # depth (mm) of a pixel no arm part covers
+
+
+class SideEye:
+    def __init__(self, cfg: config.Cfg):
+        self.cfg = cfg
+        self.cam = eye.Camera()
+        self.table_z = float(cfg.get_path("geometry.declared_table_z_mm", -15.5))
+        self.arm: Any = None
+        self._last: Frame | None = None
+        self._last_arm: dict | None = None
+        self.prior: dict | None = None
+        dims = cfg.get_path("object.dims_mm") or []
+        self.dims = sorted((float(v) for v in dims), reverse=True) if len(dims) == 3 else []
+        if config.BOX_POSE.exists():
+            try:
+                observed = config.load_json(config.BOX_POSE)["observed"]
+                if observed.get("camera") == "side":
+                    self.prior = observed
+            except (OSError, ValueError, KeyError):
+                self.prior = None
+
+    def attach_arm(self, arm: Any) -> None:
+        self.arm = arm
+
+    # -- capture -----------------------------------------------------------
+    def snapshot(self, reuse_s: float | None = None) -> Frame:
+        limit = self.cfg.get_path("vision.reuse_frame_s", 1.2) if reuse_s is None else reuse_s
+        if self._last is not None and self._last.age_s <= limit:
+            return self._last
+        before = self._arm_state()
+        image, meta = eye.grab()
+        after = self._arm_state()
+        if before and after and math.dist([before[k] for k in "xyz"], [after[k] for k in "xyz"]) > 1.0:
+            raise VisionError("arm_moving", "the arm moved while the frame was taken")
+        frame = Frame(id=f"s{meta.get('sequence', int(time.time() * 1000))}", image=image,
+                      observed_at=time.monotonic(), width=image.shape[1], height=image.shape[0])
+        self._last, self._last_arm = frame, after
+        return frame
+
+    def _arm_state(self) -> dict | None:
+        if self.arm is None or not getattr(self.arm, "connected", False):
+            return None
+        try:
+            return dict(self.arm.latest(max_age_s=0.2))
+        except Exception as error:  # noqa: BLE001 -- the eye works without the arm
+            raise VisionError("arm_state", f"cannot read the arm pose for occlusion: {error}") from error
+
+    # -- occlusion ---------------------------------------------------------
+    def exclusion(self, shape: tuple[int, int], arm: dict | None) -> np.ndarray:
+        """Pixels the arm or gripper may cover, from the arm's own pose."""
+        return self.arm_depth(shape, arm) < FAR
+
+    def split(self, depth: np.ndarray, params: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+        """(front, behind): arm pixels that can hide the box, and those the box hides.
+
+        With no box estimate every arm pixel counts as in front, the safe side.
+        """
+        arm = depth < FAR
+        if params is None:
+            return arm, np.zeros_like(arm)
+        rotation, origin = self.cam.mount[:3, :3], self.cam.mount[:3, 3]
+        far = max(float((rotation.T @ (p - origin))[2]) for p in sidebox.corners(params, self.table_z))
+        front = arm & (depth <= far + float(self.cfg.get_path("vision.side_depth_margin_mm", 10.0)))
+        return front, arm & ~front
+
+    def arm_depth(self, shape: tuple[int, int], arm: dict | None) -> np.ndarray:
+        """Per-pixel camera depth (mm) of the nearest arm part; ``FAR`` where none.
+
+        Parts are painted far to near, so the nearest wins; a volume or capsule
+        sample takes its nearest depth, which errs towards "in front of the box".
+        """
+        out = np.full(shape, FAR, np.float32)
+        if not arm:
+            return out
+        rotation, origin = self.cam.mount[:3, :3], self.cam.mount[:3, 3]
+        fx = float(self.cam.k["fx"]) * shape[1] / self.cam.native_w
+        parts: list[tuple[float, Any]] = []
+        points = kin.skeleton(arm["joints"])
+        for a, b in zip(points[:-1], points[1:]):
+            parts.extend(self._capsule(np.array(a), np.array(b), 48.0, fx, shape[1]))
+        flange = np.array([arm["x"], arm["y"], arm["z"]], dtype=float)
+        rz = math.radians(float(arm["rz"]))
+        jaw = np.array([math.cos(rz), math.sin(rz), 0.0])
+        across = np.array([-math.sin(rz), math.cos(rz), 0.0])
+        down = np.array([0.0, 0.0, -1.0])
+        half = float(arm.get("gripper_mm") or 0.0) / 2.0
+        volumes = [((-58.0, 58.0), (-45.0, 45.0), (-20.0, 80.0))]  # housing
+        for sign in (1.0, -1.0):  # each finger, inner face at the jaw width
+            lo, hi = sorted((sign * (half - 5.0), sign * (half + 26.0)))
+            volumes.append(((lo, hi), (-26.0, 26.0), (55.0, TOOL_MM + 5.0)))
+        for (a0, a1), (b0, b1), (d0, d1) in volumes:
+            corners = [flange + a * jaw + b * across + d * down
+                       for a in (a0, a1) for b in (b0, b1) for d in (d0, d1)]
+            near = min(float((rotation.T @ (c - origin))[2]) for c in corners)
+            if near <= 30.0:
+                continue
+            pix = np.array([self.cam.pixel_of(*c, width=shape[1]) for c in corners], np.float32)
+            hull = np.round(cv2.convexHull(pix)).astype(np.int32)
+            parts.append((near, lambda img, d, h=hull: cv2.fillConvexPoly(img, h, d)))
+        for near, paint in sorted(parts, key=lambda part: -part[0]):
+            paint(out, float(near))
+        grow = int(self.cfg.get_path("vision.side_exclusion_grow_px", 7))
+        return cv2.erode(out, np.ones((2 * grow + 1, 2 * grow + 1), np.uint8))  # min filter
+
+    def _capsule(self, a: np.ndarray, b: np.ndarray, radius: float, fx: float,
+                 width: int) -> list[tuple[float, Any]]:
+        rotation, origin = self.cam.mount[:3, :3], self.cam.mount[:3, 3]
+        parts: list[tuple[float, Any]] = []
+        last = None
+        for t in np.linspace(0.0, 1.0, 16):
+            p = a + (b - a) * t
+            depth = float((rotation.T @ (p - origin))[2])
+            if depth <= 30.0:
+                last = None
+                continue
+            u, v = self.cam.pixel_of(*p, width=width)
+            r = int(math.ceil(fx * radius / depth))
+            centre = (int(round(u)), int(round(v)))
+            if abs(centre[0]) > 5000 or abs(centre[1]) > 5000:
+                last = None
+                continue
+            near = depth - radius
+            parts.append((near, lambda img, d, c=centre, r=r: cv2.circle(img, c, r, d, -1)))
+            if last is not None:
+                parts.append((min(near, last[1]), lambda img, d, a=last[0], c=centre, r=r:
+                              cv2.line(img, a, c, d, 2 * r)))
+            last = (centre, near)
+        return parts
+
+    # -- measurement -------------------------------------------------------
+    def _seed(self) -> np.ndarray | None:
+        if not self.prior:
+            return None
+        foot = self.prior["footprint"]
+        return np.array([foot["centre_mm"][0], foot["centre_mm"][1], foot["yaw_long_deg"],
+                         foot["long_mm"], foot["short_mm"], self.prior["height_mm"]], dtype=float)
+
+    def observe(self, z_hint: float | None = None) -> dict:
+        frame = self.snapshot(reuse_s=0.0)
+        arm = self._last_arm
+        shape = frame.image.shape[:2]
+        depth = self.arm_depth(shape, arm)
+        seed = self._seed()
+        where = seed if seed is not None else self._coarse(frame.image, depth)
+        excluded, behind = self.split(depth, where)
+        mask = sidebox.segment(frame.image, self.cam, self.table_z, exclude=excluded, behind=behind)
+        if mask is None:
+            raise VisionError("not_found", "no box-like blob on the table")
+        occluded = 0.0
+        if seed is not None:
+            silhouette = sidebox.render(self.cam, seed, self.table_z, shape)
+            occluded = float((silhouette & excluded).sum() / max(1, silhouette.sum()))
+        clean = occluded <= float(self.cfg.get_path("vision.side_pin_above", 0.03))
+        pin = seed is not None and (bool(self.dims) or not clean)
+        if occluded > float(self.cfg.get_path("vision.side_max_occluded", 0.7)):
+            raise VisionError("occluded", f"{occluded:.0%} of the box is behind the arm")
+        result = self._fit(mask, ~excluded, seed if pin else None)
+        floor = float(self.cfg.get_path("vision.side_iou_ok", 0.9 if clean else 0.85))
+        quality = "ok" if result["iou"] >= floor else "noisy"
+        params = np.array(result["params"])
+        bottom = sidebox.corners(params, self.table_z)[:4, :2]
+        centre = result["centre_mm"]
+        top_z = self.table_z + result["height_mm"]
+        pixel = self.cam.pixel_of(centre[0], centre[1], top_z, width=shape[1])
+        observation = {
+            "camera": "side", "frame": frame.id, "frame_age_s": frame.age_s,
+            "mask_pixels": int(mask.sum()), "mask_parts": 1,
+            "footprint": {"centre_mm": centre, "long_mm": result["long_mm"],
+                          "short_mm": result["short_mm"], "yaw_long_deg": result["yaw_long_deg"],
+                          "corners_mm": [[round(float(a), 2), round(float(b), 2)] for a, b in bottom],
+                          "fill": result["iou"]},
+            "height_mm": result["height_mm"], "height_quality": quality,
+            "iou": result["iou"], "occluded": round(occluded, 3), "pinned": pin,
+            "resting": result.get("resting"),
+            "table": {"z": self.table_z, "spread_mm": 0.0, "source": "touch model"},
+            "top": {"spread_mm": 0.0, "pixel": [round(float(pixel[0]), 1), round(float(pixel[1]), 1)]},
+            "projection_z": self.table_z, "top_z": round(top_z, 2),
+            "local_px": int(mask.sum()), "params": result["params"],
+            "arm": ({k: round(float(arm[k]), 2) for k in ("x", "y", "z", "rz", "gripper_mm")}
+                    if arm else None),
+        }
+        self._observation, self._mask, self._excluded = observation, mask, excluded
+        if clean and quality == "ok":
+            self.prior = observation
+        return observation
+
+    def _fit(self, mask: np.ndarray, valid: np.ndarray, seed: np.ndarray | None,
+             restarts: tuple[float, ...] = (0.0, 45.0, 90.0, 135.0)) -> dict:
+        """Cuboid fit; a known box only chooses its resting face and (x, y, yaw).
+
+        Seen from eye level the extent along the view ray is weakly constrained,
+        so a free (L, W, H) fit trades depth for width.  With ``object.dims_mm``
+        the three faces it can rest on are tried with the sizes pinned; a seed
+        (the previous look) pins its own sizes and starts at its pose.
+        """
+        if seed is not None:
+            pinned = {"long_mm": seed[3], "short_mm": seed[4], "height_mm": seed[5]}
+            result = sidebox.fit(self.cam, mask, self.table_z, pinned, restarts=(0.0,),
+                                 valid=valid, seed=seed)
+            result["resting"] = (self.prior or {}).get("resting")
+            return result
+        if not self.dims:
+            return sidebox.fit(self.cam, mask, self.table_z, None, restarts=restarts, valid=valid)
+        a, b, c = self.dims
+        best = None
+        for name, (length, width, height) in (("flat", (a, b, c)), ("edge", (a, c, b)),
+                                              ("end", (b, c, a))):
+            pinned = {"long_mm": length, "short_mm": width, "height_mm": height}
+            start = sidebox.initial_guess(self.cam, mask, self.table_z, height)
+            start[3:] = (length, width, height)
+            result = sidebox.fit(self.cam, mask, self.table_z, pinned, restarts=restarts,
+                                 valid=valid, seed=start)
+            result["resting"] = name
+            if best is None or result["iou"] > best["iou"]:
+                best = result
+        return best
+
+    def _coarse(self, image: np.ndarray, depth: np.ndarray) -> np.ndarray | None:
+        """Where the box roughly is, with every arm pixel blanked: only to tell
+        which arm parts are behind it."""
+        mask = sidebox.segment(image, self.cam, self.table_z, exclude=depth < FAR)
+        if mask is None:
+            return None
+        return np.array(self._fit(mask, depth >= FAR, None, restarts=(0.0, 90.0))["params"])
+
+    def observe_stable(self, looks: int = 3) -> dict:
+        runs = [self.observe() for _ in range(max(1, int(looks)))]
+        if len(runs) == 1:
+            return runs[0]
+        x = statistics.median(r["footprint"]["centre_mm"][0] for r in runs)
+        y = statistics.median(r["footprint"]["centre_mm"][1] for r in runs)
+        yaw = statistics.median(r["footprint"]["yaw_long_deg"] for r in runs)
+        best = dict(min(runs, key=lambda r: math.dist(r["footprint"]["centre_mm"], [x, y])))
+        foot = dict(best["footprint"])
+        for key in ("long_mm", "short_mm"):
+            foot[key] = round(statistics.median(r["footprint"][key] for r in runs), 2)
+        foot.update({"centre_mm": [round(x, 2), round(y, 2)], "yaw_long_deg": round(yaw, 2)})
+        best["footprint"] = foot
+        best["height_mm"] = round(statistics.median(r["height_mm"] for r in runs), 2)
+        best["top_z"] = round(self.table_z + best["height_mm"], 2)
+        best["looks"] = len(runs)
+        best["look_spread"] = {
+            "centre_mm": round(max(math.dist(r["footprint"]["centre_mm"], [x, y]) for r in runs), 2),
+            "yaw_deg": round(max(abs(r["footprint"]["yaw_long_deg"] - yaw) for r in runs), 2),
+            "height_mm": round(max(r["height_mm"] for r in runs) - min(r["height_mm"] for r in runs), 2),
+        }
+        if not best.get("pinned") and best["height_quality"] == "ok":
+            self.prior = best
+        return best
+
+    def presence(self, centre_xy: list[float], radius_mm: float = 45.0, lift_mm: float = 20.0) -> dict:
+        """Is the box still on the table where it was before the lift?
+
+        Only the band a lifted box uncovers is counted: its old silhouette at the
+        table minus where the same box ``lift_mm`` higher would be, minus the arm.
+        """
+        frame = self.snapshot(reuse_s=0.0)
+        shape = frame.image.shape[:2]
+        seed = self._seed()
+        if seed is None:
+            return {"frame": frame.id, "local_px": 0, "fill": None, "note": "no prior"}
+        seed[0], seed[1] = centre_xy
+        excluded, _ = self.split(self.arm_depth(shape, self._last_arm), seed)
+        old = sidebox.render(self.cam, seed, self.table_z, shape)
+        lifted = sidebox.render(self.cam, seed, self.table_z + lift_mm, shape)
+        region = old & ~lifted & ~excluded
+        rgb = frame.image.astype(np.float32)
+        high, low = rgb.max(axis=2), rgb.min(axis=2)
+        dark = (high < 140) | ((high - low) / np.maximum(high, 1.0) > 0.35)
+        count, size = int((dark & region).sum()), int(region.sum())
+        return {"frame": frame.id, "local_px": count, "region_px": size,
+                "fill": round(count / size, 3) if size else None, "radius_mm": radius_mm}
+
+    # -- evidence ----------------------------------------------------------
+    def annotate(self, frame: Frame, observation: dict, plane_z: float,
+                 extra: list[tuple[float, float, float]] | None = None) -> np.ndarray:
+        show = frame.image.copy()
+        params = observation.get("params")
+        excluded, behind = self.split(self.arm_depth(frame.image.shape[:2], self._last_arm),
+                                      np.array(params) if params else None)
+        show[excluded] = (0.6 * show[excluded] + 0.4 * np.array([255.0, 255.0, 0.0])).astype(np.uint8)
+        show[behind] = (0.7 * show[behind] + 0.3 * np.array([0.0, 200.0, 255.0])).astype(np.uint8)
+        mask = sidebox.segment(frame.image, self.cam, self.table_z, exclude=excluded, behind=behind)
+        if mask is not None and params:
+            result = {"params": params, "centre_mm": observation["footprint"]["centre_mm"],
+                      "height_mm": observation["height_mm"],
+                      "yaw_long_deg": observation["footprint"]["yaw_long_deg"],
+                      "long_mm": observation["footprint"]["long_mm"],
+                      "short_mm": observation["footprint"]["short_mm"],
+                      "iou": observation.get("iou", 0.0)}
+            show = sidebox.overlay(show, self.cam, mask, result, self.table_z)
+        for x, y, z in (extra or []):
+            u, v = self.cam.pixel_of(x, y, z - TOOL_MM)
+            cv2.drawMarker(show, (int(u), int(v)), (255, 0, 255), cv2.MARKER_TRIANGLE_UP, 14, 2)
+        cv2.putText(show, f"{observation.get('frame')} occ {observation.get('occluded', 0):.2f} "
+                          f"pin {observation.get('pinned')}", (8, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 160, 0), 1, cv2.LINE_AA)
+        return show

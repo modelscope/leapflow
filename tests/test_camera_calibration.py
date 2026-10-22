@@ -444,6 +444,31 @@ async def test_handeye_and_verify_on_rendered_charuco_images(tmp_path: Path) -> 
     assert verified.ok and verified.result["p95_mm"] < 2.0, verified
 
 
+@pytest.mark.parametrize("focal_length", [500., 900.])
+async def test_charuco_refinement_stays_clear_of_marker_ink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, focal_length: float,
+) -> None:
+    cv2 = pytest.importorskip("cv2")
+    if not hasattr(getattr(cv2, "aruco", None), "CharucoDetector"):
+        pytest.skip("this OpenCV build has no cv2.aruco.CharucoDetector")
+    original = cv2.cornerSubPix
+    windows = []
+
+    def refine(image: Any, corners: Any, window: tuple[int, int], zero_zone: Any, criteria: Any) -> Any:
+        windows.append(window)
+        return original(image, corners, window, zero_zone, criteria)
+    monkeypatch.setattr(cv2, "cornerSubPix", refine)
+    intrinsics = CameraIntrinsics(640, 480, focal_length, focal_length, 320., 240.)
+    _, camera = _cell(tmp_path, intrinsics=intrinsics, render=True)
+    frame = await camera.capture_rgbd()
+    found = vision_module.detect_board(frame, TARGET)
+    assert found is not None and found.corners == 12
+    a = intrinsics.project(camera.truth().apply((0., 0., 0.)))
+    b = intrinsics.project(camera.truth().apply((TARGET.square_mm, 0., 0.)))
+    margin = math.dist(a, b) * (TARGET.square_mm - TARGET.marker_mm) / (2 * TARGET.square_mm)
+    assert windows == [(max(1, min(3, int(margin) - 1)),) * 2]
+
+
 # ── Board declaration and admission ──────────────────────────────────────────
 
 

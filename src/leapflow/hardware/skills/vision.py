@@ -183,6 +183,23 @@ def detect_board(frame: RgbdFrame, target: CharucoTarget) -> BoardDetection | No
         return None
     if ids is None or len(ids) < target.min_corners:
         return None
+    # The detector's adaptive window can include nearby ArUco ink and bias a
+    # chess corner. Refine locally, bounded by the target's declared white margin.
+    pixels = corners.reshape(-1, 2)
+    distances = np.linalg.norm(pixels[:, None, :] - pixels[None, :, :], axis=2)
+    np.fill_diagonal(distances, np.inf)
+    margin_px = float(distances.min()) * (target.square_mm - target.marker_mm) / (2 * target.square_mm)
+    if not math.isfinite(margin_px) or margin_px <= 1.0:
+        return None  # too little white space to refine independently of marker ink
+    window = max(1, min(3, int(margin_px) - 1))
+    try:
+        corners = cv2.cornerSubPix(
+            cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), corners, (window, window), (-1, -1),
+            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001),
+        )
+    except cv2.error as exc:
+        logger.warning("ChArUco refinement failed on frame %s: %s", frame.sequence, exc)
+        return None
     pixels = corners.reshape(-1, 2).astype(np.float64).tolist()
     points = board.getChessboardCorners()[ids.reshape(-1)].astype(np.float64)
     if np.ptp(points[:, 0]) == 0.0 or np.ptp(points[:, 1]) == 0.0:

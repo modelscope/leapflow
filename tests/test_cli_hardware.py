@@ -250,6 +250,47 @@ def test_hw_read_unknown_device_is_nonzero(monkeypatch, tmp_path, capsys) -> Non
     assert payload["ok"] is False
 
 
+def test_hw_probe_uses_transport_contract_without_halting(monkeypatch, tmp_path, capsys) -> None:
+    from leapflow.cli.commands.hardware import cmd_hardware
+    from leapflow.hardware.transports.mock import MockTransport
+
+    registry = _loaded_registry()
+    _install_local_registry(monkeypatch, tmp_path, registry)
+
+    async def forbidden_halt(self) -> None:
+        pytest.fail("a read-only probe must never halt the device")
+
+    monkeypatch.setattr(MockTransport, "halt", forbidden_halt)
+    assert cmd_hardware(_ns("probe", device_id="rig")) == 0
+    payload = _json_out(capsys)
+    assert payload["ok"] is True
+    assert {check["check"] for check in payload["checks"]} == {
+        "transport", "read:temp", "halt_available",
+    }
+
+
+def test_hw_probe_skips_demoted_write_only_channels(monkeypatch, tmp_path, capsys) -> None:
+    from dataclasses import replace
+
+    from leapflow.cli.commands.hardware import cmd_hardware
+
+    context = _rig_context()
+    context = replace(
+        context,
+        provenance=ContextProvenance(),
+        channels=context.channels + (
+            Channel(channel_id="power", direction=Direction.WRITE.value,
+                    effect="actuate", envelope=Envelope(declared=True)),
+        ),
+    )
+    registry = HardwareRegistry(HardwareSettings(enabled=True), providers=[_StaticProvider(context)])
+    registry.load()
+    assert not registry.context("rig").channel("power").is_writable
+    _install_local_registry(monkeypatch, tmp_path, registry)
+    assert cmd_hardware(_ns("probe", device_id="rig")) == 0
+    assert all(check["check"] != "read:power" for check in _json_out(capsys)["checks"])
+
+
 def test_hw_disabled_hardware_fails_closed(monkeypatch, tmp_path, capsys) -> None:
     from leapflow.cli.commands.hardware import cmd_hardware
 

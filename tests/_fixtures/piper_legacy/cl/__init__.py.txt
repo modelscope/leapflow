@@ -1,0 +1,12 @@
+"""Closed-loop pick/flip/place for the blue gum box (host side).
+
+Board side lives in ``../cl_board`` and owns CAN at 200 Hz.  This package owns
+vision, planning, the staged mission, approval and evidence.
+
+Entry points::
+
+    python cl_doctor.py --dry-run          # zero-motion readiness report
+    python cl_mission.py --stage measure   # needs approval + --yes
+"""
+
+__all__ = ["config", "bridge", "vision", "plan", "policy_source", "journal", "mission"]

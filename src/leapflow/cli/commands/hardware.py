@@ -756,6 +756,7 @@ async def _run_probe(args: argparse.Namespace, json_mode: bool) -> int:
 
     device_id = str(getattr(args, "device_id", "") or getattr(args, "device", "") or "")
     if not device_id:
+        await registry.close_all()
         return _emit_result("probe", {"ok": False, "error": "device_id is required"}, json_mode)
 
     context = registry.context(device_id)
@@ -770,7 +771,7 @@ async def _run_probe(args: argparse.Namespace, json_mode: bool) -> int:
     transport_ok = False
     try:
         transport = await registry.transport(device_id)
-        status = await transport.status()
+        status = await transport.probe()
         transport_ok = getattr(status, "connected", False)
     except Exception as exc:  # noqa: BLE001
         probe_results.append({"check": "transport", "ok": False, "error": str(exc)})
@@ -805,7 +806,7 @@ async def _run_probe(args: argparse.Namespace, json_mode: bool) -> int:
     if transport_ok:
         try:
             transport = await registry.transport(device_id)
-            halt_status = await transport.status()
+            halt_status = await transport.probe()
             probe_results.append({
                 "check": "halt_available",
                 "ok": getattr(halt_status, "halt_supported", False),
@@ -820,7 +821,8 @@ async def _run_probe(args: argparse.Namespace, json_mode: bool) -> int:
         "ok": all_ok,
         "device_id": device_id,
         "checks": probe_results,
-        "hint": "All checks passed. Run `leap hw verify` then `leap hw commission` to complete onboarding."
+        "hint": "Read checks passed. Review the declaration, then record verification with "
+        "`leap hw verify <device>`; physical commissioning needs a separately approved bounded target."
         if all_ok else "Fix the failing checks and re-run `leap hw probe`.",
     }
     if not json_mode:

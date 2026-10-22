@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Collect measured checkerboard/flange pairs and solve a gated wrist hand-eye transform.
+
+A target manifest declares pattern_size (inner corners), square_size_mm,
+T_base_target (independently measured), mount_digest, calibration_poses (8-12),
+and heldout_poses (4-6). All poses are flange XYZ mm / roll-pitch-yaw degrees.
+No box symmetry, nominal wrist offset, or training residual qualifies a mount.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from cl import config, eye, plan as planning
+from leapflow.hardware.rgbd import CameraIntrinsics
+from cl.bridge import ArmBridge, BridgeError
+
+
+def require_solver() -> None:
+    """Refuse collection before motion if this OpenCV build lacks hand-eye calibration."""
+    if not callable(getattr(cv2, "calibrateHandEye", None)):
+        raise ValueError("OpenCV calibrateHandEye unavailable; install an OpenCV 4.x build (>=4.8)")
+
+
+def target_points(target: dict) -> np.ndarray:
+    cols, rows = target["pattern_size"]
+    square = float(target["square_size_mm"])
+    if (type(cols) is not int or type(rows) is not int or cols < 3 or rows < 3
+            or not math.isfinite(square) or square <= 0):
+        raise ValueError("measured checkerboard dimensions required")
+    points = np.zeros((cols * rows, 3), np.float32)
+    points[:, :2] = np.mgrid[:cols, :rows].T.reshape(-1, 2) * square
+    return points
+
+
+def detect_target(image: np.ndarray, intrinsics: dict, target: dict) -> dict:
+    native = (int(intrinsics["width"]), int(intrinsics["height"]))
+    if image.shape[1::-1] != native:
+        raise ValueError("calibration must use native color resolution, not a resized preview")
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    found, corners = cv2.findChessboardCornersSB(gray, tuple(target["pattern_size"]))
+    if not found:
+        raise ValueError("measured checkerboard not visible; no motion authorized")
+    camera = CameraIntrinsics.from_mapping(intrinsics)
+    # PnP operates on undistorted normalized rays; inverse-Brown coefficients
+    # must not be passed as OpenCV's forward-Brown coefficients.
+    rays = np.array([camera.deproject(float(u), float(v), 1.0)[:2]
+                     for u, v in corners.reshape(-1, 2)], dtype=float)
+    points = target_points(target)
+    ok, rotation, translation = cv2.solvePnP(points, rays, np.eye(3), None)
+    if not ok:
+        raise ValueError("target PnP failed")
+    transform = np.eye(4)
+    transform[:3, :3] = cv2.Rodrigues(rotation)[0]
+    transform[:3, 3] = translation[:, 0]
+    camera_points = points @ transform[:3, :3].T + transform[:3, 3]
+    if np.any(camera_points[:, 2] <= 0):
+        raise ValueError("target behind camera")
+    distance = float(np.linalg.norm(translation))
+    if not 70.0 <= distance <= 300.0:
+        raise ValueError(f"target range {distance:.1f} mm outside 70-300 mm")
+    projected = np.array([camera.project(point) for point in camera_points])
+    error = float(np.sqrt(np.mean(np.sum((projected - corners.reshape(-1, 2)) ** 2, axis=1))))
+    if not math.isfinite(error) or error > float(target.get("pnp_rms_limit_px", 0.5)):
+        raise ValueError(f"target reprojection RMS {error:.3f} px exceeds limit")
+    return {"T_camera_target": transform.tolist(), "pnp_rms_px": error, "distance_mm": distance}
+
+
+def validate_samples(samples: dict, target: dict) -> None:
+    """Offline evidence must retain the same source/mount identity as live collection."""
+    cfg = config.load_profile()
+    if (samples.get("geometry_revision") != 2 or not cfg.wrist.mount_digest
+            or target.get("mount_digest") != cfg.wrist.mount_digest
+            or samples.get("mount_digest") != target.get("mount_digest")
+            or samples.get("serial_number") != cfg.wrist.serial_number):
+        raise ValueError("sample mount/serial identity mismatch")
+    CameraIntrinsics.from_mapping(samples["intrinsics"])
+    rows = samples["calibration"] + samples["heldout"]
+    previous = None
+    session = None
+    for row in rows:
+        eye.require_frame_source(row["frame"])
+        if row.get("geometry_revision") != 2 or row["frame"]["device_id"] != config.D405_DEVICE_ID:
+            raise ValueError("calibration requires current-geometry wrist-camera samples")
+        camera = row["frame"]["camera_metadata"]
+        if (not row.get("arm_session_id") or session not in (None, row["arm_session_id"])
+                or camera["serial_number"] != samples["serial_number"]
+                or camera["color_intrinsics"] != samples["intrinsics"]
+                or not 70 <= row["distance_mm"] <= 300
+                or not 0 <= row["pnp_rms_px"] <= target.get("pnp_rms_limit_px", 0.5)):
+            raise ValueError("sample source/profile/range/reprojection mismatch")
+        session = row["arm_session_id"]
+        if previous is not None:
+            eye.require_new_frame(row["frame"], previous)
+        previous = row["frame"]
+
+
+def solve(samples: dict, target: dict) -> dict:
+    require_solver()
+    validate_samples(samples, target)
+    training, heldout = samples["calibration"], samples["heldout"]
+    if not 8 <= len(training) <= 12 or not 4 <= len(heldout) <= 6:
+        raise ValueError("8-12 training and 4-6 independent held-out samples required")
+    ids = [row["sample_id"] for row in training + heldout]
+    if len(set(ids)) != len(ids):
+        raise ValueError("training/held-out samples overlap")
+    intrinsics = samples["intrinsics"]
+    base_target = eye.rigid_matrix(target["T_base_target"])
+    base_flange = [eye.rigid_matrix(row["T_base_flange"]) for row in training]
+    camera_target = [eye.rigid_matrix(row["T_camera_target"]) for row in training]
+    vectors = np.array([cv2.Rodrigues(base_flange[0][:3, :3].T @ m[:3, :3])[0][:, 0]
+                        for m in base_flange[1:]])
+    singular = np.linalg.svd(vectors, compute_uv=False)
+    excitation = float(target.get("min_secondary_excitation_deg", 2.0))
+    if not math.isfinite(excitation) or excitation < 2.0:
+        raise ValueError("secondary rotation excitation must be at least two degrees")
+    if len(singular) < 2 or singular[1] < math.radians(excitation):
+        raise ValueError("degenerate hand-eye motion: need rotations about two independent axes")
+    rotation, translation = cv2.calibrateHandEye(
+        [m[:3, :3] for m in base_flange], [m[:3, 3] for m in base_flange],
+        [m[:3, :3] for m in camera_target], [m[:3, 3] for m in camera_target],
+        method=cv2.CALIB_HAND_EYE_PARK)
+    transform = np.eye(4)
+    transform[:3, :3], transform[:3, 3] = rotation, translation[:, 0]
+    eye.rigid_matrix(transform)
+    points = np.column_stack((target_points(target), np.ones(len(target_points(target)))))
+    expected = (base_target @ points.T).T[:, :3]
+    residuals = []
+    for row in heldout:
+        measured = eye.rigid_matrix(row["T_base_flange"]) @ transform @ eye.rigid_matrix(row["T_camera_target"])
+        residuals.extend(np.linalg.norm((measured @ points.T).T[:, :3] - expected, axis=1).tolist())
+    rms = float(np.sqrt(np.mean(np.square(residuals))))
+    cfg = config.load_profile()
+    distance_ok = all(abs(row["distance_mm"] - cfg.wrist.depth_target_mm)
+                      <= cfg.wrist.depth_target_tolerance_mm for row in heldout)
+    return {"schema": "wrist-handeye/v1", "geometry_revision": 2,
+            "units": "mm", "T_flange_camera": transform.tolist(),
+            "intrinsics": intrinsics, "serial_number": samples["serial_number"],
+            "mount_digest": target["mount_digest"], "created_at": time.time(),
+            "method": "opencv/PARK", "training_count": len(training),
+            "heldout": {"count": len(heldout), "rms_mm": rms, "max_mm": max(residuals),
+                        "working_distance_passed": distance_ok},
+            "qualified": bool(math.isfinite(rms) and rms < cfg.wrist.heldout_rms_mm and distance_ok),
+            "source_digest": hashlib.sha256(json.dumps(samples, sort_keys=True).encode()).hexdigest()}
+
+
+def capture_pair(arm: ArmBridge, target: dict, label: str) -> tuple[dict, dict]:
+    before = arm.latest(max_age_s=0.12)
+    image, metadata = eye.grab_wrist(width=640)
+    after = arm.latest(max_age_s=0.12)
+    cfg = config.load_profile()
+    a = [before[k] for k in ("x", "y", "z", "rx", "ry", "rz")]
+    b = [after[k] for k in ("x", "y", "z", "rx", "ry", "rz")]
+    if (not np.isfinite([*a, *b]).all()
+            or before["session_id"] != after["session_id"] or np.linalg.norm(np.array(a[:3]) - b[:3]) > cfg.wrist.pose_drift_mm
+            or max(abs((x-y+180) % 360-180) for x, y in zip(a[3:], b[3:])) > cfg.wrist.pose_drift_deg
+            or not 0 <= metadata["capture_duration_s"] <= cfg.wrist.max_capture_s):
+        raise ValueError("camera capture not bracketed by a stable flange pose")
+    eye.require_frame_source(metadata)
+    if metadata["device_id"] != config.D405_DEVICE_ID:
+        raise ValueError("calibration requires a wrist-camera frame")
+    camera = metadata["camera_metadata"]
+    if camera["serial_number"] != cfg.wrist.serial_number:
+        raise ValueError("wrist serial mismatch")
+    observation = detect_target(image, camera["color_intrinsics"], target)
+    image_path = config.DATA / "wrist_calibration" / f"{label}.png"
+    eye.save(image, image_path)
+    return {"sample_id": label, "geometry_revision": 2, "T_base_flange": eye.flange_matrix(b).tolist(),
+            "joints_deg": after["joints"], "arm_session_id": after["session_id"],
+            "frame": metadata, "image": str(image_path), **observation}, camera
+
+
+def collect(target: dict) -> dict:
+    require_solver()
+    cfg = config.load_profile()
+    target_points(target)
+    eye.rigid_matrix(target["T_base_target"])
+    if not cfg.wrist.mount_digest or cfg.wrist.mount_digest != target.get("mount_digest"):
+        raise ValueError("confirm and configure the current rigid mount identity before collection")
+    groups = [("calibration", target["calibration_poses"]), ("heldout", target["heldout_poses"])]
+    if not 8 <= len(groups[0][1]) <= 12 or not 4 <= len(groups[1][1]) <= 6:
+        raise ValueError("target manifest needs 8-12 training and 4-6 held-out poses")
+    samples: dict = {"geometry_revision": 2, "calibration": [], "heldout": [], "serial_number": cfg.wrist.serial_number,
+                     "mount_digest": cfg.wrist.mount_digest}
+    with ArmBridge(cfg.bridge.host, cfg.bridge.port) as arm:
+        check = arm.check()
+        if not check.get("ok") or not check.get("enabled") or check.get("halted"):
+            raise ValueError(f"arm not ready: {check}")
+        # Check visibility BEFORE issuing any trajectory, then IK-check all poses.
+        initial, camera = capture_pair(arm, target, "initial")
+        samples["intrinsics"] = camera["color_intrinsics"]
+        poses = [arm.pose(), *[list(p) for _, group in groups for p in group]]
+        trajectory = planning.interpolate_path(poses)
+        results = arm.ik(trajectory)["results"]
+        if len(results) != len(trajectory) or not all(row.get("feasible") is True for row in results):
+            raise ValueError("calibration trajectory IK refused")
+        try:
+            for name, group in groups:
+                for index, pose in enumerate(group):
+                    # Preserve the existing envelope and tilt guard; no implicit recovery.
+                    result = arm.move(*pose[:3], rpy=pose[3:], kind="linear", speed_pct=3.0)
+                    if result.get("why") != "arrived":
+                        raise ValueError("calibration pose not settled")
+                    row, camera = capture_pair(arm, target, f"{name}_{index:02d}")
+                    if camera["color_intrinsics"] != samples["intrinsics"]:
+                        raise ValueError("camera profile changed during calibration")
+                    previous = (samples["calibration"] + samples["heldout"])[-1:] or [initial]
+                    eye.require_new_frame(row["frame"], previous[0]["frame"])
+                    samples[name].append(row)
+                    config.dump_json(config.DATA / "wrist_calibration" / "samples.json", samples)
+        except (BridgeError, ValueError, OSError, KeyError, TypeError, cv2.error):
+            if arm.effects_attempted:
+                arm.stop()
+            raise
+    return samples
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", type=Path, required=True)
+    parser.add_argument("--samples", type=Path, help="Solve existing samples without moving the arm")
+    parser.add_argument("--execute", action="store_true", help="Collect the approved target trajectory")
+    args = parser.parse_args()
+    target = config.load_json(args.target)
+    if not args.samples and not args.execute:
+        parser.error("choose --samples for offline solve or --execute for collection")
+    samples = config.load_json(args.samples) if args.samples else collect(target)
+    record = solve(samples, target)
+    config.dump_json(config.DATA / "wrist_calibration" / "candidate.json", record)
+    if record["qualified"]:
+        config.dump_json(config.WRIST_HANDEYE, record)
+    print(json.dumps(record, indent=2))
+    return 0 if record["qualified"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
