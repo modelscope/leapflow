@@ -16,6 +16,9 @@ import asyncio
 import importlib
 import io
 import time
+import hashlib
+import json
+import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -23,6 +26,8 @@ from PIL import Image
 
 from leapflow.hardware.context import HardwareContext, Quality
 from leapflow.hardware.rgbd import CameraIntrinsics, RgbdFrame
+from leapflow.hardware.rgbd_quality import RegionDepthProcessor, RgbdProcessor
+from leapflow.hardware.rgbd_observation import ColorGeometryProcessor, GeometryProcessor
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
     FrameReading,
@@ -31,6 +36,24 @@ from leapflow.hardware.transport import (
     TransportStatus,
     WriteOutcome,
 )
+
+async def _worker(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Cancellation cannot release pipeline ownership while a worker is running."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if task.done() and not task.cancelled():
+            task.exception()
+        raise
+
 
 _COLOR_CHANNEL = "camera.color.preview"
 _DEPTH_CHANNEL = "camera.depth.preview"
@@ -74,8 +97,22 @@ class RealSenseTransport:
 
     kind = "realsense"
 
-    def __init__(self, config: Mapping[str, Any] | None = None) -> None:
+    def __init__(self, config: Mapping[str, Any] | None = None, *,
+                 processor: RgbdProcessor | None = None,
+                 geometry_processor: GeometryProcessor | None = None) -> None:
         config = dict(config or {})
+        self._session_id = uuid.uuid4().hex
+        self._frame_timeout_ms = max(1, int(config.get("frame_timeout_ms", 5000)))
+        self._mount_digest = str(config.get("mount_digest", ""))
+        self._calibration_digest = str(config.get("calibration_digest", ""))
+        self._uncertainty_mm = config.get("measurement_uncertainty_mm")
+        self._processor = processor
+        if processor is None and isinstance(config.get("measurement"), Mapping):
+            self._processor = RegionDepthProcessor(config["measurement"])
+        self._geometry_processor = geometry_processor
+        if geometry_processor is None and isinstance(config.get("geometry_measurement"), Mapping):
+            self._geometry_processor = ColorGeometryProcessor(config["geometry_measurement"])
+        self._measurement_lock = asyncio.Lock()
         self._serial_number = str(config.get("serial_number") or "").strip()
         self._expected_product = str(config.get("expected_product") or "").strip()
         self._minimum_usb = str(config.get("minimum_usb") or "3.0").strip()
@@ -102,6 +139,10 @@ class RealSenseTransport:
         self._capture_lock = asyncio.Lock()
 
     async def open(self, context: HardwareContext) -> TransportStatus:
+        async with self._measurement_lock, self._capture_lock:
+            return await self._open(context)
+
+    async def _open(self, context: HardwareContext) -> TransportStatus:
         """Validate the declared serial and start its SDK pipeline once."""
         if not self._serial_number:
             return TransportStatus(
@@ -112,14 +153,20 @@ class RealSenseTransport:
         if self._connected:
             return await self.probe()
         self._context = context
+        self._session_id = uuid.uuid4().hex
         try:
             self._sdk = _load_sdk()
-            await asyncio.to_thread(self._start_pipeline)
+            await _worker(self._start_pipeline)
+        except asyncio.CancelledError:
+            # _worker has drained startup. Release any completed pipeline while
+            # still holding both lifecycle locks before propagating cancellation.
+            await _worker(self._release_pipeline)
+            raise
         except TransportError:
-            self._connected = False
+            await _worker(self._release_pipeline)
             raise
         except Exception as exc:
-            self._connected = False
+            await _worker(self._release_pipeline)
             raise TransportError(
                 f"failed to open RealSense {self._serial_number!r}: {exc}",
                 failure_code="realsense_open_failed",
@@ -128,22 +175,24 @@ class RealSenseTransport:
         return await self.probe()
 
     async def close(self) -> TransportStatus:
+        async with self._measurement_lock:
+            return await self._close()
+
+    async def _close(self) -> TransportStatus:
         """Stop the node-local pipeline and release the camera claim."""
         async with self._capture_lock:
-            pipeline, self._pipeline = self._pipeline, None
-            self._align = None
-            self._colorizer = None
-            self._intrinsics = None
-            self._connected = False
-            if pipeline is not None:
-                try:
-                    await asyncio.to_thread(pipeline.stop)
-                except Exception:
-                    # Closing must be idempotent even when a camera was unplugged.
-                    pass
+            await _worker(self._release_pipeline)
         return TransportStatus(
             connected=False, halt_supported=False, detail="RealSense pipeline closed"
         )
+
+    def _release_pipeline(self) -> None:
+        pipeline, self._pipeline = self._pipeline, None
+        self._align = self._colorizer = self._intrinsics = None
+        self._connected = False
+        self._last_frame_metadata = {}
+        if pipeline is not None:
+            _stop_quietly(pipeline)
 
     async def probe(self) -> TransportStatus:
         """Report the selected physical device and active capture profile."""
@@ -177,6 +226,8 @@ class RealSenseTransport:
     async def read(self, channel_id: str) -> Reading:
         """Return bounded camera health/calibration metadata, never frame bytes."""
         self._require_open(channel_id)
+        if channel_id in ("camera.rgbd.quality", "camera.rgbd.geometry"):
+            return await self._read_measurement(channel_id)
         if channel_id not in {_METADATA_CHANNEL, *_FRAME_CHANNELS}:
             raise TransportError(f"unknown channel {channel_id!r}", failure_code="unknown_channel")
         if channel_id != _METADATA_CHANNEL:
@@ -196,6 +247,27 @@ class RealSenseTransport:
             quality=Quality.OK.value,
         )
 
+    async def _read_measurement(self, channel_id: str) -> Reading:
+        geometry = channel_id == "camera.rgbd.geometry"
+        processor = self._geometry_processor if geometry else self._processor
+        if processor is None:
+            raise TransportError("no node-local RGB-D processor configured",
+                                 failure_code="depth_processor_unavailable")
+        # Serialize temporal window mutation as well as capture; concurrent reads
+        # must not reorder source frames or count one bundle twice.
+        async with self._measurement_lock:
+            frame = await self.capture_rgbd()
+            try:
+                evidence = await _worker(processor.measure, frame)
+            except (ValueError, KeyError) as error:
+                raise TransportError(str(error), failure_code="depth_measurement_invalid") from error
+            qualified = evidence.depth.qualified if geometry else evidence.qualified
+            return Reading(device_id=self._device_id, channel_id=channel_id,
+                           value=evidence.to_dict(), quantity="geometry_proposal" if geometry else "depth_quality",
+                           observed_at=frame.observed_at, monotonic_at=frame.monotonic_at,
+                           sequence=frame.sequence,
+                           quality=Quality.OK.value if qualified else Quality.STALE.value)
+
     async def read_frame(
         self, channel_id: str, *, max_width: int = 0, quality: int = 0, fps: float = 0.0
     ) -> FrameReading:
@@ -207,7 +279,7 @@ class RealSenseTransport:
             )
         async with self._capture_lock:
             try:
-                return await asyncio.to_thread(
+                return await _worker(
                     self._capture_frame, channel_id, max_width=max_width, quality=quality, fps=fps
                 )
             except TransportError:
@@ -228,7 +300,7 @@ class RealSenseTransport:
             )
         async with self._capture_lock:
             try:
-                return await asyncio.to_thread(self._capture_rgbd)
+                return await _worker(self._capture_rgbd)
             except TransportError:
                 raise
             except Exception as exc:  # noqa: BLE001 - any SDK failure is one typed capture error
@@ -246,9 +318,10 @@ class RealSenseTransport:
                 error=f"RealSense channel {channel_id!r} is read-only",
                 failure_code="not_writable",
             )
-        return await asyncio.to_thread(
-            self._write_option, channel_id, _WRITABLE_OPTIONS[channel_id], value
-        )
+        async with self._capture_lock:
+            return await _worker(
+                self._write_option, channel_id, _WRITABLE_OPTIONS[channel_id], value
+            )
 
     def _write_option(self, channel_id: str, option_name: str, value: Any) -> WriteOutcome:
         """Set a sensor option on the active depth sensor (blocking).
@@ -380,15 +453,19 @@ class RealSenseTransport:
         try:
             applied = _apply_color_options(sdk, profile.get_device(), self._color_options)
             intrinsics = _color_intrinsics(sdk, profile)
+            align = sdk.align(sdk.stream.color) if self._align_depth_to_color else None
+            colorizer = sdk.colorizer()
+            depth_scale = _depth_scale(profile)
+            extrinsics = _depth_to_color_extrinsics(sdk, profile)
         except BaseException:
             _stop_quietly(pipeline)
             raise
         self._pipeline = pipeline
-        self._align = sdk.align(sdk.stream.color) if self._align_depth_to_color else None
-        self._colorizer = sdk.colorizer()
-        self._depth_scale = _depth_scale(profile)
+        self._align = align
+        self._colorizer = colorizer
+        self._depth_scale = depth_scale
         self._intrinsics = intrinsics
-        self._extrinsics = _depth_to_color_extrinsics(sdk, profile)
+        self._extrinsics = extrinsics
         self._active_profile = {
             "product": name,
             "usb_type": usb_type,
@@ -405,7 +482,10 @@ class RealSenseTransport:
             raise TransportError(
                 "RealSense pipeline is not open", failure_code="transport_not_open"
             )
-        frames = align.process(pipeline.wait_for_frames())
+        native = pipeline.wait_for_frames(self._frame_timeout_ms)
+        color_source = _source_metadata(native.get_color_frame())
+        depth_source = _source_metadata(native.get_depth_frame())
+        frames = align.process(native)
         color, depth = frames.get_color_frame(), frames.get_depth_frame()
         if not color or not depth:
             raise TransportError(
@@ -421,6 +501,17 @@ class RealSenseTransport:
         metadata = {
             "sdk_frame_number": _safe_frame_number(color),
             "sdk_timestamp_ms": _safe_timestamp(color),
+            "color_source": color_source,
+            "depth_source": depth_source,
+            "session_id": self._session_id,
+            "mount_digest": self._mount_digest,
+            "calibration_digest": self._calibration_digest,
+            "measurement_uncertainty_mm": self._uncertainty_mm,
+            "color_intrinsics": intrinsics.to_dict(),
+            "profile_digest": hashlib.sha256(json.dumps({
+                "serial": self._serial_number, "profile": self._active_profile,
+                "intrinsics": intrinsics.to_dict(), "depth_scale_m": self._depth_scale,
+            }, sort_keys=True).encode()).hexdigest(),
             "depth_scale_m": self._depth_scale,
             "aligned_to_color": True,
             "active_profile": dict(self._active_profile),
@@ -453,7 +544,7 @@ class RealSenseTransport:
             raise TransportError(
                 "RealSense pipeline is not open", failure_code="transport_not_open"
             )
-        frames = pipeline.wait_for_frames()
+        frames = pipeline.wait_for_frames(self._frame_timeout_ms)
         if self._align is not None:
             frames = self._align.process(frames)
         if channel_id == _COLOR_CHANNEL:
@@ -489,6 +580,7 @@ class RealSenseTransport:
         metadata = {
             "sdk_frame_number": _safe_frame_number(frame),
             "sdk_timestamp_ms": _safe_timestamp(frame),
+            "session_id": self._session_id,
             "depth_scale_m": self._depth_scale,
             "aligned_to_color": bool(channel_id == _DEPTH_CHANNEL and self._align is not None),
             "active_profile": dict(self._active_profile),
@@ -515,6 +607,7 @@ class RealSenseTransport:
     def _metadata(self) -> dict[str, Any]:
         return {
             "serial_number": self._serial_number,
+            "session_id": self._session_id,
             "depth_scale_m": self._depth_scale,
             "active_profile": dict(self._active_profile),
             "color_intrinsics": self._intrinsics.to_dict() if self._intrinsics else {},
@@ -528,6 +621,26 @@ class RealSenseTransport:
                 f"RealSense transport for {channel_id!r} is not open",
                 failure_code="transport_not_open",
             )
+
+
+def _source_metadata(frame: Any) -> dict[str, Any]:
+    """Retain native stream identity before alignment changes its image geometry."""
+    domain = None
+    native_intrinsics = {}
+    if frame:
+        try:
+            domain = str(frame.get_frame_timestamp_domain())
+        except (AttributeError, RuntimeError):
+            pass
+        try:
+            intrinsics = frame.get_profile().as_video_stream_profile().get_intrinsics()
+            native_intrinsics = {key: getattr(intrinsics, key) for key in
+                                 ("width", "height", "fx", "fy", "ppx", "ppy")}
+            native_intrinsics.update(model=str(intrinsics.model), coeffs=list(intrinsics.coeffs))
+        except (AttributeError, RuntimeError):
+            pass
+    return {"frame_number": _safe_frame_number(frame), "timestamp_ms": _safe_timestamp(frame),
+            "timestamp_domain": domain, "intrinsics": native_intrinsics}
 
 
 def _load_sdk() -> Any:

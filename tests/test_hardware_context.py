@@ -118,6 +118,28 @@ def _notes_for(registry: HardwareRegistry, rule: str) -> tuple[str, ...]:
 # ════════════════════════════════════════════════════════════════
 
 
+@pytest.mark.parametrize("direction", list(Direction))
+def test_write_demotion_never_grants_read_capability(direction: Direction) -> None:
+    channel = _channel(direction=direction.value, effect=HardwareEffect.ACTUATE.value)
+    demoted = channel.without_write()
+    assert not demoted.is_writable
+    assert demoted.is_readable == channel.is_readable
+    assert demoted.effect == channel.effect
+    assert demoted.without_write() == demoted
+    assert Channel.from_mapping(demoted.to_dict()) == demoted
+
+
+def test_unverified_admission_disables_write_only_channel() -> None:
+    registry = _load(_context(verified=False, channels=(
+        _channel("power", direction=Direction.WRITE.value, effect=HardwareEffect.ACTUATE.value),
+        _channel("state", direction=Direction.READ.value, effect=HardwareEffect.READ.value),
+    )))
+    context = registry.context("device_a")
+    assert context.channel("power").direction == Direction.DISABLED.value
+    assert context.channel("state").is_readable
+    assert context.read_only() == context
+
+
 def test_undeclared_envelope_admits_nothing() -> None:
     """An undeclared envelope is not an unbounded one."""
     envelope = Envelope()

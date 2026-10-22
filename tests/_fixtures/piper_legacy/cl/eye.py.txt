@@ -1,0 +1,268 @@
+"""Raw camera access over LHP ``read_frame`` plus the hand-eye geometry.
+
+``vision.RobotEye`` reaches the camera through ``skill.plan`` on a workcell, and
+the node currently rejects both workcells, so this module talks to the
+RealSense device directly with the same wire call LeapBoard uses for previews.
+Everything here is read-only on the board.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import math
+import sys
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+from PIL import Image
+
+from . import config
+
+REPO = config.ROOT.parents[2]
+if str(REPO / "src") not in sys.path:
+    sys.path.insert(0, str(REPO / "src"))
+
+from leapflow.hardware.rgbd import CameraIntrinsics  # noqa: E402
+
+DEVICE_ID = config.D435_DEVICE_ID
+TOKEN_FILE = config.ROOT.parent / "jetson" / ".lhp-token"
+
+
+def grab(channel: str = "camera.color.preview", width: int = 640, quality: int = 95,
+         timeout_s: float = 10.0, *, device_id: str = DEVICE_ID) -> tuple[np.ndarray, dict]:
+    """One RGB frame (H, W, 3 uint8) and its metadata."""
+    from leapflow.hardware.lhp.client import SocketLhpClient
+
+    cfg = config.load_profile()
+    endpoint = f"tcp://{cfg.lhp.host}:{cfg.lhp.port}"
+    token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+
+    async def run() -> dict:
+        client = SocketLhpClient(endpoint, token=token)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=timeout_s)
+            result = await asyncio.wait_for(client.request("read_frame", {
+                "device_id": device_id, "channel_id": channel,
+                "max_width": width, "quality": quality, "fps": 0.0}), timeout=timeout_s)
+            if device_id == config.D405_DEVICE_ID:
+                metadata = await asyncio.wait_for(client.request("read", {
+                    "device_id": device_id, "channel_id": "camera.metadata"}), timeout=timeout_s)
+                result["camera_metadata"] = metadata["value"]
+            return result
+        finally:
+            await client.close()
+
+    started = time.monotonic()
+    result = asyncio.run(run())
+    raw = base64.b64decode(result["data_b64"])
+    image = np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"), dtype=np.uint8)
+    meta = {k: v for k, v in result.items() if k != "data_b64"}
+    meta["grabbed_at"] = time.time()
+    meta["received_mono"] = time.monotonic()
+    meta["capture_duration_s"] = meta["received_mono"] - started
+    return image, meta
+
+
+def grab_wrist(**kwargs: object) -> tuple[np.ndarray, dict]:
+    """Read the serial-addressed wrist camera through the standard LHP preview path."""
+    return grab(device_id=config.D405_DEVICE_ID, **kwargs)
+
+
+def require_frame_source(frame: dict) -> None:
+    """Validate the first frame too, including separately read camera metadata."""
+    source = frame.get("metadata", {})
+    camera = frame.get("camera_metadata", {})
+    if not frame.get("device_id") or not isinstance(source, dict) or not isinstance(camera, dict):
+        raise ValueError("camera identity unavailable")
+    session = source.get("session_id")
+    if not isinstance(session, str) or not session or session != camera.get("session_id"):
+        raise ValueError("camera session changed or unavailable")
+    if any(not camera.get(key) for key in ("serial_number", "color_intrinsics", "active_profile")):
+        raise ValueError("camera serial/profile unavailable")
+    CameraIntrinsics.from_mapping(camera["color_intrinsics"])
+    for key in ("sdk_timestamp_ms", "sdk_frame_number"):
+        value = source.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            raise ValueError("camera source identity unavailable")
+
+
+def require_new_frame(current: dict, previous: dict) -> None:
+    """Reject reused SDK frames and camera/profile changes between verification stages."""
+    require_frame_source(current)
+    require_frame_source(previous)
+    if current["device_id"] != previous["device_id"]:
+        raise ValueError("camera identity changed")
+    if current["metadata"]["session_id"] != previous["metadata"]["session_id"]:
+        raise ValueError("camera session changed")
+    for key in ("serial_number", "color_intrinsics", "active_profile"):
+        if current["camera_metadata"][key] != previous["camera_metadata"][key]:
+            raise ValueError("camera serial/profile changed")
+    for key in ("sdk_timestamp_ms", "sdk_frame_number"):
+        if current["metadata"][key] <= previous["metadata"][key]:
+            raise ValueError("duplicate/regressed camera source frame")
+
+
+def flange_matrix(pose: list[float]) -> np.ndarray:
+    """Vendor flange XYZ in mm and roll/pitch/yaw in degrees, Rz @ Ry @ Rx."""
+    values = np.asarray(pose, dtype=float)
+    if values.shape != (6,) or not np.isfinite(values).all():
+        raise ValueError("finite six-component flange pose required")
+    rx, ry, rz = np.radians(values[3:])
+    cx, cy, cz = np.cos([rx, ry, rz])
+    sx, sy, sz = np.sin([rx, ry, rz])
+    out = np.eye(4)
+    out[:3, :3] = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]) @ np.array(
+        [[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]) @ np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    out[:3, 3] = values[:3]
+    return out
+
+
+def rigid_matrix(value: object) -> np.ndarray:
+    matrix = np.asarray(value, dtype=float)
+    if (matrix.shape != (4, 4) or not np.isfinite(matrix).all()
+            or not np.allclose(matrix[3], [0, 0, 0, 1])
+            or not np.allclose(matrix[:3, :3].T @ matrix[:3, :3], np.eye(3), atol=1e-6)
+            or not np.isclose(np.linalg.det(matrix[:3, :3]), 1.0)):
+        raise ValueError("proper rigid transform required")
+    return matrix
+
+
+class Camera:
+    """Pinhole + mount from handeye.json; pixels scale with the frame width."""
+
+    def __init__(self) -> None:
+        record = config.handeye()
+        self.k = record["intrinsics"]
+        self.mount = np.asarray(record["camera_in_base"]["matrix"], dtype=float)
+        self.native_w = int(self.k.get("width", 640))
+
+    def _k(self, width: int) -> tuple[float, float, float, float]:
+        s = width / self.native_w
+        return self.k["fx"] * s, self.k["fy"] * s, self.k["ppx"] * s, self.k["ppy"] * s
+
+    def ray_to_plane(self, u: float, v: float, z: float, width: int = 640) -> np.ndarray:
+        fx, fy, ppx, ppy = self._k(width)
+        ray = self.mount[:3, :3] @ np.array([(u - ppx) / fx, (v - ppy) / fy, 1.0])
+        origin = self.mount[:3, 3]
+        return origin + ray * ((z - origin[2]) / ray[2])
+
+    def pixel_of(self, x: float, y: float, z: float, width: int = 640) -> np.ndarray:
+        fx, fy, ppx, ppy = self._k(width)
+        cam = self.mount[:3, :3].T @ (np.array([x, y, z], dtype=float) - self.mount[:3, 3])
+        return np.array([fx * cam[0] / cam[2] + ppx, fy * cam[1] / cam[2] + ppy])
+
+    @property
+    def origin(self) -> np.ndarray:
+        return self.mount[:3, 3]
+
+
+class WristCamera(Camera):
+    """Camera-to-flange calibration composed with the measured current flange pose."""
+
+    def __init__(self, flange_pose: list[float], record: dict | None = None) -> None:
+        cfg = config.load_profile()
+        record = config.load_json(config.WRIST_HANDEYE) if record is None else record
+        if not isinstance(record, dict) or not isinstance(record.get("heldout"), dict):
+            raise ValueError("wrist calibration record malformed")
+        heldout = record["heldout"]
+        rms = float(heldout.get("rms_mm", float("inf")))
+        limit = cfg.wrist.heldout_rms_mm
+        if type(limit) not in (int, float) or not math.isfinite(limit) or not 0 < limit <= 2.0:
+            raise ValueError("wrist held-out RMS limit must be finite and at most two millimeters")
+        if (record.get("geometry_revision") != 2 or record.get("qualified") is not True or not math.isfinite(rms)
+                or type(record.get("training_count")) is not int or not 8 <= record["training_count"] <= 12
+                or type(heldout.get("count")) is not int or not 4 <= heldout["count"] <= 6
+                or heldout.get("working_distance_passed") is not True
+                or rms >= cfg.wrist.heldout_rms_mm or record.get("units") != "mm"
+                or record.get("serial_number") != cfg.wrist.serial_number
+                or not cfg.wrist.mount_digest or record.get("mount_digest") != cfg.wrist.mount_digest):
+            raise ValueError("wrist calibration missing, unqualified, or mount/serial mismatched")
+        CameraIntrinsics.from_mapping(record["intrinsics"])
+        self.record = record
+        self.k = record["intrinsics"]
+        self.native_w = int(self.k["width"])
+        self.mount = flange_matrix(flange_pose) @ rigid_matrix(record["T_flange_camera"])
+
+    def intrinsics_at(self, width: int) -> CameraIntrinsics:
+        fx, fy, cx, cy = self._k(width)
+        return CameraIntrinsics(width, round(self.k["height"] * width / self.native_w),
+                                fx, fy, cx, cy, self.k.get("model", "none").split(".")[-1],
+                                tuple(self.k.get("coeffs", [0.0] * 5)))
+
+    def _ray(self, u: float, v: float, width: int) -> np.ndarray:
+        return np.asarray(self.intrinsics_at(width).deproject(u, v, 1.0))
+
+    def ray_to_plane(self, u: float, v: float, z: float, width: int = 640) -> np.ndarray:
+        ray = self.mount[:3, :3] @ self._ray(u, v, width)
+        if abs(ray[2]) < 1e-8:
+            raise ValueError("ray parallel to target plane")
+        distance = (z - self.origin[2]) / ray[2]
+        if distance <= 0:
+            raise ValueError("target plane behind wrist camera")
+        return self.origin + ray * distance
+
+    def pixel_of(self, x: float, y: float, z: float, width: int = 640) -> np.ndarray:
+        point = self.mount[:3, :3].T @ (np.array([x, y, z]) - self.origin)
+        if point[2] <= 0:
+            raise ValueError("point behind wrist camera")
+        return np.asarray(self.intrinsics_at(width).project(point))
+
+
+def box_mask(image: np.ndarray, roi_px: tuple[int, int, int, int] | None = None,
+             max_value: int = 90, min_blue_cast: int = 5) -> np.ndarray:
+    """Dark pixels with a blue cast: the navy box, not the matte-black gripper."""
+    rgb = image.astype(np.int16)
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    mask = (rgb.max(axis=2) <= max_value) & ((b - r) >= min_blue_cast) & (b >= g)
+    if roi_px is not None:
+        u0, v0, u1, v1 = roi_px
+        keep = np.zeros_like(mask)
+        keep[v0:v1, u0:u1] = True
+        mask &= keep
+    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    return mask.astype(bool)
+
+
+def largest_blob(mask: np.ndarray, min_px: int = 300) -> np.ndarray | None:
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if count <= 1:
+        return None
+    index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[index, cv2.CC_STAT_AREA] < min_px:
+        return None
+    return labels == index
+
+
+def footprint(cam: Camera, blob: np.ndarray, z_top: float) -> dict:
+    """Box centre, sides and yaw from the blob's rectangle projected on the top face.
+
+    The jaw must close across the short side, so the yaw reported is that of the
+    long side in the base frame, in (-90, 90].
+    """
+    pts = np.column_stack(np.nonzero(blob))[:, ::-1].astype(np.float32)
+    rect = cv2.minAreaRect(pts)
+    corners_px = cv2.boxPoints(rect)
+    corners = np.array([cam.ray_to_plane(u, v, z_top, width=blob.shape[1])[:2] for u, v in corners_px])
+    sides = [np.linalg.norm(corners[(i + 1) % 4] - corners[i]) for i in range(4)]
+    i_long = int(np.argmax(sides))
+    d = corners[(i_long + 1) % 4] - corners[i_long]
+    yaw = math.degrees(math.atan2(d[1], d[0]))
+    yaw = (yaw + 90.0) % 180.0 - 90.0
+    return {"centre_mm": [round(float(v), 2) for v in corners.mean(axis=0)],
+            "long_mm": round(float(sides[i_long]), 2),
+            "short_mm": round(float(sides[(i_long + 1) % 4]), 2),
+            "yaw_long_deg": round(yaw, 2),
+            "corners_mm": [[round(float(a), 2), round(float(b), 2)] for a, b in corners],
+            "pixel": [round(float(rect[0][0]), 1), round(float(rect[0][1]), 1)],
+            "pixels": int(blob.sum())}
+
+
+def save(image: np.ndarray, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(image).save(path)
+    return path

@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+"""cl_armd -- the board's single CAN owner, speaking JSON Lines over TCP.
+
+Why a server instead of a library the mission imports: the 200 Hz sampler and the
+safety guard must keep running while the host plans, renders and takes vision
+snapshots, and exactly one process may write this CAN interface.  ``leap hw
+serve`` may coexist only with camera-only device declarations; this daemon is
+the sole arm/CAN owner.
+
+Protocol (one JSON object per line, both directions)::
+
+    {"id": 7, "cmd": "move", "args": {"x": 200, "y": 35, "z": 150, ...}}
+    {"id": 7, "ok": true, "result": {...}}
+    {"id": 7, "ok": false, "error": {"code": "refused", "message": "..."}}
+    {"stream": {"x": ..., "z": ..., "efforts": [...]}}      # unsolicited
+
+The first control command claims a connection-owned lease. Only that socket's
+heartbeat renews it; reads and observers never do. Expiry or owner disconnect
+halts an actuated arm, including between commands, without automatic recovery.
+
+``stop`` is handled inline in the reader thread so it works while another
+command is blocked; every other command runs in a worker and shares one motion
+lock.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import platform
+import socket
+import socketserver
+import sys
+import threading
+import time
+import traceback
+import uuid
+from dataclasses import asdict
+from enum import Enum
+from typing import Any
+
+from leapflow.engine.recovery.failure_envelope import (
+    FailureContext, FailureEnvelope, FailureSource, Recoverability, SideEffectState,
+)
+from concurrent.futures import ThreadPoolExecutor
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import cl_arm_core as core  # noqa: E402
+
+VERSION = "cl-armd/1.2"
+LEASE_TTL_S = 3.0
+STREAM_HZ = 50.0
+
+
+def wire_json(value: object) -> str:
+    """Keep unavailable diagnostics explicit without emitting invalid JSON numbers."""
+    def finite(item: object) -> object:
+        if isinstance(item, float) and not math.isfinite(item):
+            return None
+        if isinstance(item, Enum):
+            return item.value
+        if isinstance(item, dict):
+            return {key: finite(row) for key, row in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [finite(row) for row in item]
+        return item
+    return json.dumps(finite(value), separators=(",", ":"), allow_nan=False)
+
+
+class Lease:
+    def __init__(self, ttl: float = LEASE_TTL_S):
+        self.ttl = ttl
+        self.deadline = time.monotonic() + ttl
+        self._lock = threading.Lock()
+        self.owner: Conn | None = None
+
+    def claim(self, owner: Conn) -> None:
+        """Reserve control without allowing a different socket to steal an expired lease."""
+        with self._lock:
+            if owner.closed:
+                raise core.Refused("disconnected", "requesting connection is closed")
+            if self.owner is not None and self.owner is not owner:
+                raise core.Refused("control_owned", "another connection owns arm control")
+            if self.owner is None:
+                self.owner = owner
+                self.deadline = time.monotonic() + self.ttl
+
+    def renew(self, owner: Conn | None = None) -> bool:
+        with self._lock:
+            if self.owner is not owner or owner is not None and owner.closed:
+                return False
+            # An expired controller must not be resurrected before the watchdog observes it.
+            if owner is not None and time.monotonic() > self.deadline:
+                return False
+            self.deadline = time.monotonic() + self.ttl
+            return True
+
+    def owned_by(self, owner: Conn) -> bool:
+        with self._lock:
+            return self.owner is owner
+
+    def release(self, owner: Conn) -> None:
+        with self._lock:
+            if self.owner is owner:
+                self.owner = None
+                self.deadline = 0.0
+
+    def alive(self) -> bool:
+        with self._lock:
+            return time.monotonic() <= self.deadline
+
+
+class Conn:
+    """One client socket with a writer lock shared by replies and the stream."""
+
+    def __init__(self, sock: socket.socket, peer: str):
+        self.sock = sock
+        self.peer = peer
+        self.lock = threading.Lock()
+        self.streaming = False
+        self.closed = False
+
+    def send(self, payload: dict) -> None:
+        data = (wire_json(payload) + "\n").encode()
+        with self.lock:
+            if self.closed:
+                return
+            try:
+                self.sock.sendall(data)
+            except OSError:
+                self.closed = True
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+
+class CommandArm:
+    """Serialize SDK writes with cancellation; a stop cannot be followed by a stale write."""
+
+    def __init__(self, arm: Any, service: ArmService) -> None:
+        self._arm, self._service = arm, service
+
+    def __getattr__(self, name: str) -> Any:
+        method = getattr(self._arm, name)
+        if not callable(method):
+            return method
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            with self._service._control_lock:
+                if not (name == "EmergencyStop" and args == (0x01,)):
+                    self._service._check_request()
+                return method(*args, **kwargs)
+        return call
+
+
+class ArmService:
+    def __init__(self, arm, sampler: core.Sampler, guard: core.Guard):
+        self._control_lock = threading.RLock()
+        self._halt_epoch = 0
+        self.arm = CommandArm(arm, self)
+        self.session_id = uuid.uuid4().hex
+        self.sampler = sampler
+        self.guard = guard
+        self.lease = Lease()
+        self.motion = threading.Lock()
+        self.halted = False
+        self.motion_active = False
+        self.control_started = False
+        self._request = threading.local()
+        self.halt_reason = ""
+        self.commands = 0
+        self.last_command = ""
+        self.watchdog = threading.Thread(target=self._watch, name="cl-watchdog", daemon=True)
+        self.watchdog.start()
+
+    # -- lifecycle ---------------------------------------------------------
+    def _watch(self) -> None:
+        while True:
+            time.sleep(0.1)
+            self._watch_once()
+
+    def _watch_once(self) -> None:
+        if self.control_started and not self.lease.alive() and not self.halted:
+            self._guard_halt(core.Trip("lease_expired", self.sampler.latest(), "controller heartbeat lost"))
+
+    def disconnect(self, conn: Conn) -> None:
+        """Observers never stop the arm; losing the controller invalidates queued work."""
+        if not self.lease.owned_by(conn):
+            return
+        try:
+            if self.control_started and not self.halted:
+                self._guard_halt(core.Trip("controller_disconnected", self.sampler.latest(), "owner socket closed"))
+        finally:
+            self.lease.release(conn)
+
+    def _check_request(self) -> None:
+        conn = getattr(self._request, "conn", None)
+        if conn is not None and (conn.closed or not self.lease.owned_by(conn) or not self.lease.alive()):
+            raise core.Trip("lease_expired", self.sampler.latest(), "controller connection unavailable")
+        epoch = getattr(self._request, "halt_epoch", self._halt_epoch)
+        if epoch != self._halt_epoch:
+            raise core.Trip("operator_stop", self.sampler.latest(), "command cancelled by a stop")
+
+    def _enter(self) -> None:
+        if self.halted:
+            raise core.Refused("halted", f"arm halted ({self.halt_reason}); call recover")
+        if not self.motion.acquire(timeout=0.2):
+            raise core.Refused("busy", "another motion is running")
+        try:
+            self._check_request()
+            if self.halted:
+                raise core.Refused("halted", "arm stopped while waiting for the motion lock")
+        except (core.Refused, core.Trip):
+            self.motion.release()
+            raise
+        self.motion_active = True
+        self.control_started |= getattr(self._request, "effecting", True)
+
+    def _leave(self) -> None:
+        self.motion_active = False
+        if self.motion.locked():
+            self.motion.release()
+
+    def _guard_halt(self, error: core.Trip) -> bool:
+        with self._control_lock:
+            self.halted = True
+            self._halt_epoch += 1
+            self.halt_reason = error.reason
+            try:
+                self.arm.EmergencyStop(0x01)
+                return True
+            except Exception:  # noqa: BLE001 - report the original trip, not the brake
+                traceback.print_exc()
+                return False
+
+    # -- handlers ----------------------------------------------------------
+    def hello(self, args: dict) -> dict:
+        return {
+            "version": VERSION,
+            "session_id": self.session_id,
+            "receive_contract": "decoder-receipts/v1",
+            "host": socket.gethostname(),
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+            "sampler_hz": self.sampler.rate,
+            "envelope": core.ENVELOPE,
+            "model": "piper_x",
+            "model_joint_limits": core.MODEL_JOINT_LIMITS_DEG,
+            "joint_limits": core.JOINT_LIMITS_DEG,
+            "voltage_range_v": [core.VOLTAGE_MIN_V, core.VOLTAGE_MAX_V],
+            "sdk_joint_clamp": False,
+            "max_speed_pct": core.MAX_SPEED_PCT,
+            "grip_max_nm": core.GRIP_MAX_NM,
+            "lease_ttl_s": LEASE_TTL_S,
+            "lease_contract": "connection-owned/v1",
+            "commands": ["hello", "state", "check", "enable", "calibrate", "move", "transit",
+                         "hold", "grip", "open", "gripper_qualify", "descend", "ik", "chunk", "stop", "recover",
+                         "heartbeat", "shutdown"],
+        }
+
+    def state(self, args: dict) -> dict:
+        snap = self.sampler.latest()
+        snap["source_mono"] = snap.pop("mono", None)
+        snap["sent_mono"] = time.monotonic()
+        snap["session_id"] = self.session_id
+        snap["rate_hz"] = self.sampler.rate
+        snap["halted"] = self.halted
+        snap["halt_reason"] = self.halt_reason
+        snap["motion_active"] = self.motion_active
+        snap["tilt_deg"] = round(core.tilt_deg(snap), 2)
+        return snap
+
+    def check(self, args: dict) -> dict:
+        snap = self.sampler.latest()
+        try:
+            self.guard.check(snap, armed=False)
+            ok, reason = True, ""
+        except core.Trip as error:
+            ok, reason = False, error.reason
+        return {"ok": ok, "reason": reason, "enabled": snap["enabled"],
+                "ctrl_mode": snap["ctrl_mode"], "arm_status": snap["arm_status"],
+                "voltages": snap["voltages"], "temps": snap["temps"],
+                "faults": [f for row in snap["flags"] for f in row],
+                "frame_age_s": snap["frame_age_s"], "rate_hz": self.sampler.rate,
+                "halted": self.halted}
+
+    def enable(self, args: dict) -> dict:
+        """Enter CAN mode and energize without ResetPiper or DisableArm."""
+        if str(args.get("confirm", "")) != "ENABLE":
+            raise core.Refused("confirm_required", 'pass {"confirm": "ENABLE"}')
+        if not self.motion.acquire(timeout=0.2):
+            raise core.Refused("busy", "another command is using the arm")
+        self.motion_active = True
+        try:
+            self._check_request()
+            self.control_started = True
+            return self._enable_locked()
+        except core.Trip as error:
+            self._guard_halt(error)
+            raise
+        finally:
+            self._leave()
+
+    def _enable_locked(self) -> dict:
+        snap = self.sampler.latest()
+        if snap["ctrl_mode"] == 0x02:
+            raise core.Refused(
+                "teach_mode",
+                "physical teach mode is active; support the arm and turn teach off first",
+            )
+        try:
+            self.guard.preflight(snap)
+        except core.Trip as error:
+            raise core.Refused("preflight", f"{error.reason}: {error.detail}") from error
+        if snap["enabled"]:
+            self._verify_enabled(snap)
+            return self._enable_result(snap, already_enabled=True)
+        if snap["arm_status"] not in (0x00, 0x01):
+            raise core.Refused(
+                "arm_status",
+                f"refusing enable while arm status is 0x{snap['arm_status']:02X}",
+            )
+        if snap["arm_status"] == 0x01:
+            self._check_request()
+            self.arm.EmergencyStop(0x02)
+            time.sleep(0.2)
+
+        # Burst-style handshake: send multiple standby commands, then multiple
+        # CAN commands.  The PIPER X firmware needs the burst pattern; a single
+        # standby+CAN pair often does not latch.
+        for attempt in range(5):
+            for _ in range(10):
+                self._check_request()
+                self.arm.MotionCtrl_2(ctrl_mode=0x00, move_mode=0x00, move_spd_rate_ctrl=0,
+                                     is_mit_mode=0x00, residence_time=0, installation_pos=0)
+                time.sleep(0.02)
+            time.sleep(0.3)
+            for _ in range(10):
+                self._check_request()
+                self.arm.MotionCtrl_2(ctrl_mode=0x01, move_mode=0x00, move_spd_rate_ctrl=5,
+                                     is_mit_mode=0x00, residence_time=0, installation_pos=0)
+                time.sleep(0.02)
+            time.sleep(0.5)
+            if self.sampler.latest()["ctrl_mode"] == 0x01:
+                break
+        if self.sampler.latest()["ctrl_mode"] != 0x01:
+            raise core.Trip("mode_switch_refused", self.sampler.latest(), "firmware did not enter CAN mode")
+
+        self._check_request()
+        self.arm.EnableArm(7, 0x02)
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            self._check_request()
+            snap = self.sampler.latest()
+            if snap["enabled"]:
+                self._verify_enabled(snap)
+                self.halted = False
+                self.halt_reason = ""
+                self.guard.reset()
+                return self._enable_result(snap, already_enabled=False)
+            time.sleep(0.05)
+        snap = self.sampler.latest()
+        raise core.Trip(
+            "enable_refused", snap,
+            f"motors did not enable (mode={snap['ctrl_mode']}, flags={snap['enable_status']})",
+        )
+
+    def _verify_enabled(self, snap: dict) -> None:
+        try:
+            self.guard.check(snap, armed=False)
+        except core.Trip as error:
+            self._guard_halt(error)
+            raise
+
+    @staticmethod
+    def _enable_result(snap: dict, *, already_enabled: bool) -> dict:
+        return {
+            "enabled": True,
+            "already_enabled": already_enabled,
+            "ctrl_mode": snap["ctrl_mode"],
+            "enable_status": snap["enable_status"],
+            "voltages": snap["voltages"],
+            "temps": snap["temps"],
+        }
+
+    def calibrate(self, args: dict) -> dict:
+        self._enter()
+        try:
+            return self.guard.calibrate(self.sampler, float(args.get("seconds", 0.6)))
+        finally:
+            self._leave()
+
+    def move(self, args: dict) -> dict:
+        self._enter()
+        try:
+            return core.move(self.arm, self.sampler, self.guard,
+                             [args[k] for k in ("x", "y", "z", "rx", "ry", "rz")],
+                             kind=str(args.get("kind", "linear")),
+                             speed_pct=float(args.get("speed_pct", 3.0)),
+                             timeout_s=float(args.get("timeout_s", 40.0)),
+                             arrive_mm=float(args.get("arrive_mm", 1.2)),
+                             arrive_deg=float(args.get("arrive_deg", 1.5)),
+                             stable_s=float(args.get("stable_s", 0.3)),
+                             settle_s=float(args.get("settle_s", 0.15)),
+                             stall_s=args.get("stall_s"),
+                             armed_travel_mm=float(args.get("armed_travel_mm", 1.0)))
+        except core.Trip as error:
+            self._guard_halt(error)
+            raise
+        finally:
+            self._leave()
+
+    def transit(self, args: dict) -> dict:
+        self._enter()
+        try:
+            rpy = args.get("rpy") or [-180.0, 0.0, -90.0]
+            return core.transit(self.arm, self.sampler, self.guard,
+                                float(args["x"]), float(args["y"]), float(args["z"]),
+                                rpy, float(args.get("speed_pct", 10.0)))
+        except core.Trip as error:
+            self._guard_halt(error)
+            raise
+        finally:
+            self._leave()
+
+    def hold(self, args: dict) -> dict:
+        self._enter()
+        try:
+            snap = self.sampler.latest()
+            core.hold(self.arm, snap, float(args.get("seconds", 0.3)),
+                      sampler=self.sampler, guard=self.guard)
+            return {"held": [round(v, 2) for v in core.pose_list(self.sampler.latest())]}
+        except core.Trip as error:
+            self._guard_halt(error)
+            raise
+        finally:
+            self._leave()
+
+    def grip(self, args: dict) -> dict:
+        self._enter()
+        try:
+            return core.grip(self.arm, self.sampler, float(args["width_mm"]), guard=self.guard,
+                             effort_nm=float(args.get("effort_nm", 0.5)),
+                             timeout_s=float(args.get("timeout_s", 3.0)))
+        except core.Trip as error:
+            self._guard_halt(error)
+            raise
+        finally:
+            self._leave()
+
+    def _checked_snapshot(self) -> dict:
+        snap = self.sampler.latest()
+        if self.halted or not self.lease.alive():
+            raise core.Trip("halted", snap, "stop or lease expiry interrupted the command")
+        self.guard.check(snap, armed=True)
+        if (not all(type(snap.get(key)) in (int, float) and math.isfinite(snap[key])
+                    for key in ("gripper_mm", "gripper_nm"))
+                or not 0 <= snap["gripper_mm"] <= 71.5):
+            raise core.Trip("gripper_feedback", snap, "finite physical gripper feedback required")
+        return snap
+
+    def open(self, args: dict) -> dict:
+        self._enter()
+        try:
+            # Wake gripper driver if not yet enabled (first command after arm enable)
+            snap = self._checked_snapshot()
+            if not snap.get("gripper_enabled"):
+                self.arm.GripperCtrl(int(round(70.0 * core.SCALE)),
+                                     int(round(0.3 * core.SCALE)), 0x01, 0)
+                time.sleep(1.0)
+                self._checked_snapshot()
+            return core.open_gripper(self.arm, self.sampler, float(args.get("width_mm", 70.0)),
+                                     guard=self.guard)
+        except core.Trip as error:
+            self._guard_halt(error)
+            raise
+        finally:
+            self._leave()
+
+    def gripper_qualify(self, args: dict) -> dict:
+        """Determine gripper closing convention and set on guard."""
+        self._enter()
+        try:
+            self.guard.gripper_convention = None
+            snap = self._checked_snapshot()
+            # Wake gripper if needed
+            if not snap.get("gripper_enabled"):
+                self.arm.GripperCtrl(int(round(70.0 * core.SCALE)),
+                                     int(round(0.3 * core.SCALE)), 0x01, 0)
+                time.sleep(1.0)
+                snap = self._checked_snapshot()
+                if not snap.get("gripper_enabled"):
+                    raise core.Trip("gripper_not_responding", snap,
+                                    "gripper did not enable after command")
+            # Open fully
+            self.arm.GripperCtrl(int(round(70.0 * core.SCALE)),
+                                 int(round(0.5 * core.SCALE)), 0x01, 0)
+            time.sleep(1.5)
+            snap_open = self._checked_snapshot()
+            unloaded = snap_open["gripper_nm"]
+            open_mm = snap_open["gripper_mm"]
+            if abs(open_mm - 70.0) > 1.5:
+                raise core.Trip("gripper_inconclusive", snap_open, "initial open stroke not achieved")
+            # Close partially (20mm less)
+            close_target = max(5.0, open_mm - 20.0)
+            self.arm.GripperCtrl(int(round(close_target * core.SCALE)),
+                                 int(round(0.5 * core.SCALE)), 0x01, 0)
+            time.sleep(1.5)
+            snap_close = self._checked_snapshot()
+            loaded = snap_close["gripper_nm"]
+            closed_mm = snap_close["gripper_mm"]
+            if open_mm - closed_mm < 10.0 or abs(closed_mm - close_target) > 1.5:
+                raise core.Trip("gripper_inconclusive", snap_close, "empty-air closing stroke not achieved")
+            delta = loaded - unloaded
+            if abs(delta) < 0.005:
+                raise core.Trip("gripper_inconclusive", snap_close,
+                                f"effort delta {delta:.4f} too small")
+            closing_sign = 1 if delta > 0 else -1
+            # Re-open
+            self.arm.GripperCtrl(int(round(70.0 * core.SCALE)),
+                                 int(round(0.5 * core.SCALE)), 0x01, 0)
+            time.sleep(1.0)
+            reopened = self._checked_snapshot()
+            if abs(reopened["gripper_mm"] - 70.0) > 1.5:
+                raise core.Trip("gripper_inconclusive", reopened, "re-open stroke not achieved")
+            convention = {
+                "closing_sign": closing_sign,
+                "unloaded_nm": round(unloaded, 4),
+                "verified": True,
+                "evidence_ref": f"qualify_{int(time.time())}",
+                "open_mm": round(open_mm, 2),
+                "close_mm": round(closed_mm, 2),
+                "delta_nm": round(delta, 4),
+            }
+            self.guard.gripper_convention = convention
+            return convention
+        except core.Trip as error:
+            self._guard_halt(error)
+            raise
+        finally:
+            self._leave()
+
+    def descend(self, args: dict) -> dict:
+        self._enter()
+        try:
+            return core.descend_contact(
+                self.arm, self.sampler, self.guard,
+                x=float(args["x"]), y=float(args["y"]),
+                rpy=args.get("rpy") or [-180.0, 0.0, -90.0],
+                floor_z=float(args.get("floor_z", 40.0)),
+                speed_pct=float(args.get("speed_pct", 3.0)),
+                reach_mm=float(args.get("reach_mm", 90.0)),
+                stall_window_s=float(args.get("stall_window_s", 0.35)),
+                verify_step_mm=float(args.get("verify_step_mm", 0.4)),
+                press_budget_mm=float(args.get("press_budget_mm", 0.6)),
+                max_candidates=int(args.get("max_candidates", 2)))
+        except core.Trip as error:
+            self._guard_halt(error)
+            raise
+        finally:
+            self._leave()
+
+    def ik(self, args: dict) -> dict:
+        poses = args.get("poses") or []
+        seed = args.get("seed")
+        if not isinstance(poses, list) or not poses:
+            raise core.Refused("bad_args", "poses: [[x,y,z,rx,ry,rz], ...]")
+        if not seed:
+            seed = self.sampler.latest()["joints"]
+        out = []
+        for pose in poses:
+            if len(pose) < 6:
+                out.append({"feasible": False, "error": "pose needs 6 values"})
+                continue
+            problem = core.envelope_problem(*[float(v) for v in pose[:3]])
+            if problem:
+                out.append({"feasible": False, "error": problem})
+                continue
+            result = core.ik_solve([float(v) for v in pose[:6]], seed)
+            result["pose"] = [round(float(v), 2) for v in pose[:6]]
+            out.append(result)
+        return {"results": out, "seed": [round(v, 2) for v in seed]}
+
+    def chunk(self, args: dict) -> dict:
+        rows = args.get("rows") or []
+        self._enter()
+        try:
+            return core.run_chunk(self.arm, self.sampler, self.guard, rows,
+                                  kind=str(args.get("kind", "joint")),
+                                  fps=float(args.get("fps", 30.0)),
+                                  max_rate_deg_s=float(args.get("max_rate_deg_s", 45.0)),
+                                  max_rate_mm_s=float(args.get("max_rate_mm_s", 60.0)),
+                                  lease=self.lease)
+        except core.Trip as error:
+            self._guard_halt(error)
+            raise
+        finally:
+            self._leave()
+
+    def stop(self, args: dict) -> dict:
+        if not self._guard_halt(core.Trip("operator_stop", self.sampler.latest(), "operator requested stop")):
+            raise core.Trip("stop_failed", self.sampler.latest(), "Use the physical emergency stop immediately")
+        return {"stopped": True, "z": round(self.sampler.latest()["z"], 2)}
+
+    def recover(self, args: dict) -> dict:
+        if str(args.get("confirm", "")) != "RECOVER":
+            raise core.Refused("confirm_required", 'pass {"confirm": "RECOVER"}')
+        snap = self.sampler.latest()
+        if snap["z"] < 80.0 and not args.get("support"):
+            raise core.Refused("unsupported", f"z {snap['z']:.1f} < 80: support the arm first")
+        result = self.enable({"confirm": "ENABLE"})
+        result["z"] = round(self.sampler.latest()["z"], 2)
+        return result
+
+    def shutdown(self, args: dict) -> dict:
+        if str(args.get("confirm", "")) != "BYE":
+            raise core.Refused("confirm_required", 'pass {"confirm": "BYE"}')
+        threading.Thread(target=lambda: (time.sleep(0.2), os._exit(0)), daemon=True).start()
+        return {"bye": True}
+
+
+HANDLERS = {
+    "hello": "hello", "state": "state", "check": "check", "enable": "enable",
+    "calibrate": "calibrate",
+    "move": "move", "transit": "transit", "hold": "hold", "grip": "grip", "open": "open",
+    "descend": "descend", "ik": "ik", "chunk": "chunk", "stop": "stop",
+    "recover": "recover", "shutdown": "shutdown",
+    "gripper_qualify": "gripper_qualify",
+}
+
+
+def build_server(service: ArmService, host: str, port: int) -> socketserver.ThreadingTCPServer:
+    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cl-cmd")
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            conn = Conn(self.request, f"{self.client_address[0]}:{self.client_address[1]}")
+            streamer = threading.Thread(target=self._stream, args=(conn,), daemon=True)
+            streamer.start()
+            reader = self.request.makefile("rb")
+            try:
+                for raw in reader:
+                    if conn.closed:
+                        break
+                    try:
+                        message = json.loads(raw)
+                    except json.JSONDecodeError:
+                        conn.send({"ok": False, "error": {"code": "bad_json", "message": raw[:80].decode(errors="replace")}})
+                        continue
+                    ident = message.get("id")
+                    command = str(message.get("cmd", ""))
+                    args = message.get("args") or {}
+                    if command == "heartbeat":
+                        renewed = service.lease.renew(conn)
+                        conn.send({"id": ident, "ok": True, "result": {"lease": renewed}})
+                        continue
+                    if command == "stream":
+                        conn.streaming = bool(args.get("on", True))
+                        conn.send({"id": ident, "ok": True, "result": {"streaming": conn.streaming}})
+                        continue
+                    handler = HANDLERS.get(command)
+                    if handler is None:
+                        conn.send({"id": ident, "ok": False,
+                                   "error": {"code": "unknown", "message": command}})
+                        continue
+                    epoch = service._halt_epoch
+                    if command == "stop":
+                        conn.send(self._run(service, handler, args, ident, conn, epoch))
+                        continue
+                    pool.submit(lambda h=handler, a=args, i=ident, e=epoch: conn.send(
+                        self._run(service, h, a, i, conn, e)))
+            except OSError:
+                pass
+            finally:
+                conn.closed = True
+                service.disconnect(conn)
+                try:
+                    reader.close()
+                except OSError:
+                    pass
+
+        @staticmethod
+        def _run(service: ArmService, name: str, args: dict, ident, conn: Conn, epoch: int) -> dict:
+            service.commands += 1
+            service.last_command = name
+            try:
+                if name not in {"hello", "state", "check", "ik", "stop"}:
+                    service.lease.claim(conn)
+                    service._request.conn = conn
+                    service._request.halt_epoch = epoch
+                    service._request.effecting = name not in {"calibrate", "shutdown"}
+                    service._check_request()
+                result = getattr(service, name)(args)
+                return {"id": ident, "ok": True, "result": result}
+            except Exception as error:  # noqa: BLE001 - classify once at the wire boundary
+                refused = isinstance(error, core.Refused)
+                code = error.code if refused else error.reason if isinstance(error, core.Trip) else "internal_defect"
+                effect = SideEffectState.NONE if refused else SideEffectState.UNKNOWN
+                envelope = FailureEnvelope.create(
+                    source=FailureSource.TOOL, category="hardware_refusal" if refused else "hardware_checkpoint",
+                    failure_class=type(error).__name__, failure_code=code, message=str(error),
+                    recoverability=Recoverability.USER_FIXABLE, side_effect_state=effect,
+                    context=FailureContext(tool_name=name, execution_id=str(ident), session_id=service.session_id),
+                )
+                encoded = json.loads(json.dumps(asdict(envelope), default=lambda v: v.value if isinstance(v, Enum) else str(v)))
+                record = {"event": "failure", "envelope": encoded,
+                          "snapshot": getattr(error, "snapshot", None)}
+                print(wire_json(record), flush=True)
+                return {"id": ident, "ok": False, "error": {
+                    "code": code, "message": str(error), "envelope": encoded,
+                    "side_effect_state": effect.value, "detail": getattr(error, "detail", ""),
+                }}
+            finally:
+                service._request.conn = None
+                service._request.halt_epoch = service._halt_epoch
+                service._request.effecting = False
+
+        @staticmethod
+        def _stream(conn: Conn) -> None:
+            period = 1.0 / STREAM_HZ
+            while not conn.closed:
+                if conn.streaming:
+                    conn.send({"stream": service.state({})})
+                time.sleep(period)
+
+    class Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    return Server((host, port), Handler)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--can", default="can0")
+    parser.add_argument("--host", default="192.168.55.1")
+    parser.add_argument("--port", type=int, default=8771)
+    parser.add_argument("--once", action="store_true", help="print one state JSON and exit")
+    args = parser.parse_args()
+
+    from piper_sdk import C_PiperInterface_V2
+
+    # piper_sdk 0.6.2's built-in joint clamp is for standard Piper and corrupts
+    # PIPER X j5/j6 feedback and commands. Safety is enforced against the explicit
+    # PIPER X envelope in cl_arm_core instead.
+    from leapflow.hardware.drivers._piper_feedback import instrument_interface
+
+    interface = instrument_interface(C_PiperInterface_V2)
+    arm = interface(
+        args.can,
+        start_sdk_joint_limit=False,
+        start_sdk_gripper_limit=False,
+    )
+    arm.ConnectPort()  # returns None; never test its truthiness
+    deadline = time.monotonic() + 8.0
+    sampler = core.Sampler(arm).start()
+    while time.monotonic() < deadline:
+        snap = sampler.latest()
+        if snap["sample"] > 20 and (snap["x"] or snap["z"]):
+            break
+        time.sleep(0.1)
+    snap = sampler.latest()
+    banner = {"event": "started", "version": VERSION, "can": args.can,
+              "pose": [round(v, 2) for v in core.pose_list(snap)],
+              "enabled": snap["enabled"], "ctrl_mode": snap["ctrl_mode"],
+              "frame_age_s": snap["frame_age_s"], "rate_hz": sampler.rate}
+    print(wire_json(banner), flush=True)
+    if args.once:
+        snap.pop("mono", None)
+        print(wire_json(snap), flush=True)
+        sampler.stop()
+        return 0 if snap["z"] else 3
+
+    service = ArmService(arm, sampler, core.Guard(max_skew_s=0.30, max_age_s=0.25, stopped_speed_rad_s=0.5))
+    server = build_server(service, args.host, args.port)
+    print(json.dumps({"event": "listening", "host": args.host, "port": args.port}), flush=True)
+    try:
+        server.serve_forever(poll_interval=0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+        sampler.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

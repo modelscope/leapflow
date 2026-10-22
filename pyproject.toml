@@ -113,9 +113,10 @@ leap-bench = "benchmarks.cli:main"
 # Jetson installs the compatible pyrealsense2 binding alongside LeapFlow.
 [project.entry-points."leapflow.hardware.transports"]
 realsense = "leapflow.hardware.drivers.realsense:build_transport"
-# Piper follows the same node-local placement: piper_sdk is imported only when
-# a declared arm is opened, so the CAN-owning node owns the vendor SDK while
-# host-only installations stay dependency-free.
+# Piper follows the same node-local placement: pyAgxArm (the model/firmware-
+# aware AgileX SDK) is imported only when a declared arm is opened, so the
+# CAN-owning node owns the vendor SDK while host-only installations stay
+# dependency-free.
 piper = "leapflow.hardware.drivers.piper:build_transport"
 
 # Node skills (S1.5). Built-ins register exactly like third-party skill packs.
@@ -156,7 +157,7 @@ include = ["leapflow*", "leapspace*", "benchmarks*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = ["src", "tests"]
+pythonpath = ["src", "tests", "tools/piper"]
 testpaths = ["tests"]
 # Markers are applied by path in tests/conftest.py, so existing files need no
 # edit. Only files that do real local IO opt in explicitly with `pytestmark`.

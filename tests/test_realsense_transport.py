@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import threading
 from array import array
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,25 +28,32 @@ _EXAMPLE = (
 )
 
 
-def _context() -> HardwareContext:
-    payload = yaml.safe_load(_EXAMPLE.read_text(encoding="utf-8"))
+def _context(example: str = "realsense_435if.yaml") -> HardwareContext:
+    payload = yaml.safe_load(_EXAMPLE.with_name(example).read_text(encoding="utf-8"))
     payload["transport"]["config"]["serial_number"] = "123456789"
     return HardwareContext.from_mapping(payload)
 
 
-def test_realsense_example_is_a_valid_declarative_context() -> None:
-    context = _context()
+@pytest.mark.parametrize("example", ["realsense_435if.yaml", "realsense_d405.yaml"])
+def test_realsense_example_is_a_valid_declarative_context(example: str) -> None:
+    context = _context(example)
 
     assert context.transport.kind == "realsense"
     assert context.transport.config["serial_number"] == "123456789"
-    assert {channel.channel_id for channel in context.channels} == {
-        "camera.color.preview",
-        "camera.depth.preview",
-        "camera.infrared_left.preview",
-        "camera.infrared_right.preview",
-        "camera.metadata",
+    expected = {
+        "camera.color.preview", "camera.depth.preview",
+        "camera.infrared_left.preview", "camera.infrared_right.preview", "camera.metadata",
     }
+    if example == "realsense_435if.yaml":
+        expected.update({"camera.rgbd.quality", "camera.rgbd.geometry"})
+    else:
+        assert context.device_id == "sensor_realsense_d405"
+        assert context.transport.config["expected_product"] == "D405"
+        for stream in ("color", "depth", "infrared"):
+            assert context.transport.config[stream] == {"width": 640, "height": 480, "fps": 30}
+    assert {channel.channel_id for channel in context.channels} == expected
     assert all(channel.privacy == "environment" for channel in context.channels)
+    assert all(channel.direction == "read" for channel in context.channels)
 
 
 def test_realsense_requires_an_immutable_serial_without_importing_sdk() -> None:
@@ -94,7 +102,7 @@ class _Frames:
 
 
 class _Pipeline:
-    def wait_for_frames(self) -> _Frames:
+    def wait_for_frames(self, timeout_ms: int = 5000) -> _Frames:
         return _Frames()
 
 
@@ -114,6 +122,8 @@ def test_realsense_encodes_bgr_sdk_data_as_a_bounded_jpeg_preview() -> None:
     assert frame.height == 1
     assert frame.metadata["sdk_frame_number"] == 17
     assert frame.metadata["depth_scale_m"] == 0.001
+    assert frame.metadata["session_id"] == transport._metadata()["session_id"]
+    assert frame.metadata["session_id"]
 
 
 @pytest.mark.parametrize(
@@ -260,7 +270,7 @@ class _FakeSdk:
         return SimpleNamespace(
             start=lambda config: profile,
             stop=stop,
-            wait_for_frames=lambda: _RgbdFrames(self._depth_width),
+            wait_for_frames=lambda timeout_ms=5000: _RgbdFrames(self._depth_width),
         )
 
     def align(self, stream: str) -> SimpleNamespace:
@@ -297,6 +307,50 @@ def test_capture_rgbd_returns_aligned_raw_frame_with_factory_intrinsics(
     metadata = asyncio.run(transport.read("camera.metadata")).value
     assert metadata["color_intrinsics"]["ppx"] == 1.0
     assert metadata["depth_to_color_extrinsics"]["translation_m"] == [0.015, 0.0, 0.0]
+
+
+def test_preview_and_raw_capture_share_a_session_that_changes_on_reopen(monkeypatch: pytest.MonkeyPatch) -> None:
+    sdk = _FakeSdk()
+    transport = _open_with(monkeypatch, sdk)
+    try:
+        preview = asyncio.run(transport.read_frame("camera.color.preview"))
+        raw = asyncio.run(transport.capture_rgbd())
+        metadata = asyncio.run(transport.read("camera.metadata")).value
+        session = preview.metadata["session_id"]
+        assert session and session == raw.metadata["session_id"] == metadata["session_id"]
+        asyncio.run(transport.close())
+        asyncio.run(transport.open(_context()))
+        reopened = asyncio.run(transport.read_frame("camera.color.preview"))
+        assert reopened.metadata["session_id"] != session
+        assert reopened.metadata["session_id"] == asyncio.run(transport.read("camera.metadata")).value["session_id"]
+    finally:
+        asyncio.run(transport.close())
+
+
+def test_d405_uses_its_own_scale_and_raw_stereo_indices(monkeypatch: pytest.MonkeyPatch) -> None:
+    sdk = _FakeSdk()
+    info = {"name": "RealSense D405", "serial_number": "123456789", "usb_type_descriptor": "3.2"}
+    sdk.device.get_info = lambda key: info[key]
+    sdk.option.emitter_enabled = "emitter_enabled"
+    sdk.device.first_depth_sensor = lambda: SimpleNamespace(
+        get_depth_scale=lambda: 0.0001, supports=lambda key: False)
+    # D405 has no separate RGB sensor; opening without color options must work.
+    del sdk.device.first_color_sensor
+    streams = []
+    sdk.config = lambda: SimpleNamespace(enable_device=lambda serial: None,
+                                         enable_stream=lambda *args: streams.append(args))
+    transport = _open_with(monkeypatch, sdk, expected_product="D405")
+    transport._pipeline.get_active_profile = lambda: SimpleNamespace(get_device=lambda: sdk.device)
+    try:
+        frame = asyncio.run(transport.capture_rgbd())
+        assert frame.depth_mm(0, 0) == pytest.approx(50.0)
+        assert frame.metadata["depth_scale_m"] == 0.0001
+        assert [args[1] for args in streams if args[0] == "infrared"] == [1, 2]
+        outcome = asyncio.run(transport.write("camera.emitter_enabled", 1))
+        assert not outcome.ok
+        assert outcome.failure_code == "option_not_supported"
+    finally:
+        asyncio.run(transport.close())
 
 
 def test_capture_rgbd_refuses_when_depth_is_not_aligned(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -362,3 +416,131 @@ def test_invalid_color_options_refuse_the_open_and_release_the_camera(
     assert error.value.failure_code == "realsense_option_invalid"
     assert sdk.stopped
     assert not asyncio.run(transport.probe()).connected
+
+
+async def _wait_started(event: threading.Event) -> None:
+    assert await asyncio.to_thread(event.wait, 2.0), "fake worker did not start"
+
+
+def test_cancelled_open_drains_startup_and_releases_pipeline(monkeypatch) -> None:
+    sdk = _FakeSdk()
+    monkeypatch.setattr(realsense_module, "_load_sdk", lambda: sdk)
+    transport = RealSenseTransport({"serial_number": "123456789"})
+    started, release = threading.Event(), threading.Event()
+    original = transport._start_pipeline
+
+    def slow_start() -> None:
+        started.set()
+        assert release.wait(2.0)
+        original()
+
+    monkeypatch.setattr(transport, "_start_pipeline", slow_start)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(transport.open(_context()))
+        await _wait_started(started)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()  # Repeated cancellation cannot release ownership early.
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert transport._capture_lock.locked()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2.0)
+        assert sdk.stopped
+        assert transport._pipeline is None
+        assert not (await transport.probe()).connected
+        assert not transport._capture_lock.locked()
+        monkeypatch.setattr(transport, "_start_pipeline", original)
+        assert (await transport.open(_context())).connected
+        await transport.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_capture_keeps_close_waiting_until_worker_finishes(monkeypatch) -> None:
+    transport = _open_with(monkeypatch, _FakeSdk())
+    started, release = threading.Event(), threading.Event()
+    original = transport._capture_rgbd
+
+    def slow_capture() -> RgbdFrame:
+        started.set()
+        assert release.wait(2.0)
+        return original()
+
+    monkeypatch.setattr(transport, "_capture_rgbd", slow_capture)
+
+    async def scenario() -> None:
+        capture = asyncio.create_task(transport.capture_rgbd())
+        await _wait_started(started)
+        capture.cancel()
+        close = asyncio.create_task(transport.close())
+        await asyncio.sleep(0)
+        assert not capture.done() and not close.done()
+        assert transport._pipeline is not None
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(capture, 2.0)
+        await asyncio.wait_for(close, 2.0)
+        assert transport._pipeline is None
+
+    asyncio.run(scenario())
+
+
+def test_pipeline_is_released_when_post_start_setup_fails(monkeypatch) -> None:
+    sdk = _FakeSdk()
+    monkeypatch.setattr(realsense_module, "_load_sdk", lambda: sdk)
+
+    def fail_align(stream):
+        raise RuntimeError("fake alignment setup failure")
+
+    monkeypatch.setattr(sdk, "align", fail_align)
+    transport = RealSenseTransport({"serial_number": "123456789"})
+    with pytest.raises(TransportError) as error:
+        asyncio.run(transport.open(_context()))
+    assert error.value.failure_code == "realsense_open_failed"
+    assert sdk.stopped and transport._pipeline is None
+
+
+def test_measurement_read_is_typed_unavailable_without_processor(monkeypatch) -> None:
+    transport = _open_with(monkeypatch, _FakeSdk())
+    for channel in ("camera.rgbd.quality", "camera.rgbd.geometry"):
+        with pytest.raises(TransportError) as error:
+            asyncio.run(transport.read(channel))
+        assert error.value.failure_code == "depth_processor_unavailable"
+    asyncio.run(transport.close())
+
+
+def test_depth_measurement_read_without_arm_transport(monkeypatch) -> None:
+    """Camera-only quality read uses the injected processor; no arm transport is built."""
+    from leapflow.hardware.rgbd_quality import DepthLimits, RegionDepthProcessor
+    from leapflow.hardware.context import Quality
+    from dataclasses import asdict
+
+    # Build a processor with synthetic configuration.
+    # The fake SDK produces a 2x1 pixel frame, so use disjoint single-pixel ROIs.
+    limits = DepthLimits(3, .5, 10, 10, 1, 100, 2, 2, 0)
+    config = {
+        "limits": asdict(limits),
+        "roi": [0, 0, 1, 1],
+        "background_roi": [1, 0, 2, 1],
+        "calibration_digest": "test-cal",
+        "mount_digest": "test-mount",
+        "uncertainty_mm": .5,
+    }
+    processor = RegionDepthProcessor(config)
+
+    sdk = _FakeSdk()
+    monkeypatch.setattr(realsense_module, "_load_sdk", lambda: sdk)
+    transport = RealSenseTransport({"serial_number": "123456789"}, processor=processor)
+    asyncio.run(transport.open(_context()))
+    # Transport was built without any arm-related configuration.
+    reading = asyncio.run(transport.read("camera.rgbd.quality"))
+    assert reading.channel_id == "camera.rgbd.quality"
+    assert reading.quantity == "depth_quality"
+    assert reading.quality in (Quality.OK.value, Quality.STALE.value)
+    evidence = reading.value
+    assert isinstance(evidence, dict)
+    assert "qualified" in evidence and "distinct_frames" in evidence
+    asyncio.run(transport.close())

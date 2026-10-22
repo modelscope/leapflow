@@ -52,6 +52,8 @@ class CameraIntrinsics:
             raise ValueError("intrinsics need a positive image size")
         if not (self.fx > 0 and self.fy > 0 and math.isfinite(self.fx * self.fy)):
             raise ValueError("intrinsics need positive, finite focal lengths")
+        if not all(math.isfinite(v) for v in (self.ppx, self.ppy, *self.coeffs)):
+            raise ValueError("intrinsics and distortion coefficients must be finite")
         if self.model not in DISTORTION_MODELS and any(self.coeffs):
             raise ValueError(f"distortion model {self.model!r} is not supported")
 
@@ -70,7 +72,7 @@ class CameraIntrinsics:
         y = (v - self.ppy) / self.fy
         if any(self.coeffs):
             if self.model == DISTORTION_INVERSE_BROWN_CONRADY:
-                x, y = _distort(x, y, self._k)
+                x, y = _undistort(x, y, self._k, inverse_brown=True)
             elif self.model == DISTORTION_BROWN_CONRADY:
                 x, y = _undistort(x, y, self._k)
         return (depth_mm * x, depth_mm * y, depth_mm)
@@ -84,11 +86,15 @@ class CameraIntrinsics:
             if self.model == DISTORTION_BROWN_CONRADY:
                 x, y = _distort(x, y, self._k)
             elif self.model == DISTORTION_INVERSE_BROWN_CONRADY:
-                x, y = _undistort(x, y, self._k)
+                x, y = _distort(x, y, self._k, inverse_brown=True)
         return (x * self.fx + self.ppx, y * self.fy + self.ppy)
 
     def differs_from(self, other: "CameraIntrinsics", *, tolerance_px: float = 0.5) -> str:
         """Why *other* is not the same calibration (``""`` when it is)."""
+        if not math.isfinite(tolerance_px) or tolerance_px < 0:
+            raise ValueError("intrinsics tolerance must be finite and nonnegative")
+        if self.model != other.model or self.coeffs != other.coeffs:
+            return "distortion calibration differs"
         if (self.width, self.height) != (other.width, other.height):
             return f"resolution {other.width}x{other.height} != {self.width}x{self.height}"
         for name in ("fx", "fy", "ppx", "ppy"):
@@ -123,22 +129,28 @@ class CameraIntrinsics:
         )
 
 
-def _distort(x: float, y: float, k: Sequence[float]) -> tuple[float, float]:
+def _distort(
+    x: float, y: float, k: Sequence[float], *, inverse_brown: bool = False,
+) -> tuple[float, float]:
     r2 = x * x + y * y
     radial = 1.0 + k[0] * r2 + k[1] * r2 * r2 + k[4] * r2 * r2 * r2
-    dx = 2.0 * k[2] * x * y + k[3] * (r2 + 2.0 * x * x)
-    dy = 2.0 * k[3] * x * y + k[2] * (r2 + 2.0 * y * y)
+    qx, qy = (x * radial, y * radial) if inverse_brown else (x, y)
+    dx = 2.0 * k[2] * qx * qy + k[3] * (r2 + 2.0 * qx * qx)
+    dy = 2.0 * k[3] * qx * qy + k[2] * (r2 + 2.0 * qy * qy)
     return (x * radial + dx, y * radial + dy)
 
 
-def _undistort(x: float, y: float, k: Sequence[float]) -> tuple[float, float]:
+def _undistort(
+    x: float, y: float, k: Sequence[float], *, inverse_brown: bool = False,
+) -> tuple[float, float]:
     """Invert ``_distort`` by fixed-point iteration, as librealsense does."""
     ux, uy = x, y
     for _ in range(_UNDISTORT_ITERATIONS):
         r2 = ux * ux + uy * uy
         radial = 1.0 + k[0] * r2 + k[1] * r2 * r2 + k[4] * r2 * r2 * r2
-        dx = 2.0 * k[2] * ux * uy + k[3] * (r2 + 2.0 * ux * ux)
-        dy = 2.0 * k[3] * ux * uy + k[2] * (r2 + 2.0 * uy * uy)
+        qx, qy = (ux * radial, uy * radial) if inverse_brown else (ux, uy)
+        dx = 2.0 * k[2] * qx * qy + k[3] * (r2 + 2.0 * qx * qx)
+        dy = 2.0 * k[3] * qx * qy + k[2] * (r2 + 2.0 * qy * qy)
         ux, uy = (x - dx) / radial, (y - dy) / radial
     return (ux, uy)
 
@@ -172,8 +184,10 @@ class RgbdFrame:
             raise ValueError("depth buffer does not match the frame size (is it aligned?)")
         if (self.intrinsics.width, self.intrinsics.height) != (self.width, self.height):
             raise ValueError("intrinsics describe a different image size")
-        if not self.depth_scale_m > 0:
-            raise ValueError("depth scale must be positive")
+        if not math.isfinite(self.depth_scale_m) or self.depth_scale_m <= 0:
+            raise ValueError("depth scale must be positive and finite")
+        if not all(math.isfinite(v) for v in (self.observed_at, self.monotonic_at)):
+            raise ValueError("frame clocks must be finite")
 
     def depth_units(self) -> memoryview:
         """Zero-copy ``uint16`` view of the depth image, row-major."""

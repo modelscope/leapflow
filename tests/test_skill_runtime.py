@@ -67,7 +67,8 @@ from tests._harness.skill_stubs import (
 
 pytestmark = pytest.mark.asyncio
 
-_SAFE_JOINTS = (0.0, 30.0, -30.0, 0.0, 70.0, 0.0)
+# Piper X downward-facing fixture inside the existing calibrated box/cone.
+_SAFE_JOINTS = (0.0, 80.0, -55.0, 69.99, 10.0, 0.0)
 
 
 def _skills() -> tuple[Any, ...]:

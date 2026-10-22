@@ -1,0 +1,214 @@
+"""Box pose from the eye-level side camera: fit a cuboid to the silhouette.
+
+With the camera about 145 mm above the table and looking almost horizontally,
+a mask projected onto any single plane is badly sheared: the top face is
+foreshortened and the front faces dominate.  But the box rests on the table,
+whose height is known from touch, so a cuboid ``(x, y, yaw, L, W, H)`` whose
+projected silhouette matches the mask is fully determined by one view.  The
+fit maximises IoU between the rendered hull and the mask (Nelder-Mead; the
+objective is cheap at 640x480).
+"""
+
+from __future__ import annotations
+
+import math
+
+import cv2
+import numpy as np
+
+from .eye import Camera
+
+TABLE_ROI_MM = (60.0, 340.0, -80.0, 240.0)  # x0, x1, y0, y1 on the table plane
+ROI_HEIGHT_MM = 90.0  # tallest box pose the ROI must still contain
+CHROMA_MIN = 15.0  # max-min of RGB: navy box >= 16, black backdrop/arm ~5
+
+
+def segment(image: np.ndarray, cam: Camera, table_z: float, min_px: int = 800,
+            exclude: np.ndarray | None = None,
+            behind: np.ndarray | None = None) -> np.ndarray | None:
+    """Non-table pixels inside the projected table ROI, largest blob, holes filled.
+
+    The table is low-saturation and bright; the box is dark navy with a printed
+    red/white label, so "dark or saturated" separates it.  ``exclude`` is a pixel
+    mask blanked before the blob is chosen (the projected arm and gripper), so a
+    black gripper over the box can neither merge with it nor win the blob.
+    ``behind`` marks arm pixels farther from the camera than the box: there the
+    box, if present, is in front, so only its coloured navy/red counts -- the
+    black arm behind it must not merge, but the box must not be blanked either.
+    """
+    rgb = image.astype(np.float32)
+    high, low = rgb.max(axis=2), rgb.min(axis=2)
+    sat = (high - low) / np.maximum(high, 1.0)
+    mask = (high < 140) | (sat > 0.35)
+    # Off the table only colour separates the box from a black backdrop or arm;
+    # ratio saturation is noise on dark pixels, absolute chroma is not.
+    coloured = (high - low) >= CHROMA_MIN
+    if behind is not None:
+        mask = np.where(behind, coloured, mask)
+    x0, x1, y0, y1 = TABLE_ROI_MM
+    quad = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+    # The ROI is a volume, not a plane: a standing box's top ray lands on the
+    # table far behind it, beyond the ROI quad, so the hull of the quad at the
+    # table and at ``ROI_HEIGHT_MM`` above it bounds every box pixel.  Above the
+    # plane quad the view is the black backdrop, so only coloured pixels count.
+    poly = np.array([cam.pixel_of(x, y, z) for z in (table_z, table_z + ROI_HEIGHT_MM)
+                     for x, y in quad], np.float32)
+    roi = np.zeros(mask.shape, np.uint8)
+    cv2.fillConvexPoly(roi, np.round(cv2.convexHull(poly)).astype(np.int32), 1)
+    plane = np.zeros(mask.shape, np.uint8)
+    flat = np.array([cam.pixel_of(x, y, table_z) for x, y in quad], np.float32)
+    cv2.fillConvexPoly(plane, np.round(flat).astype(np.int32), 1)
+    mask = np.where(plane.astype(bool), mask, coloured)
+    mask &= roi.astype(bool)
+    if exclude is not None:
+        mask &= ~exclude
+    mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if count <= 1:
+        return None
+    index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[index, cv2.CC_STAT_AREA] < min_px:
+        return None
+    blob = (labels == index).astype(np.uint8)
+    contours, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    filled = np.zeros_like(blob)
+    cv2.drawContours(filled, contours, -1, 1, -1)
+    return filled.astype(bool)
+
+
+def corners(params: np.ndarray, table_z: float) -> np.ndarray:
+    x, y, yaw, length, width, height = params
+    c, s = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+    ax, ay = np.array([c, s]) * length / 2, np.array([-s, c]) * width / 2
+    out = []
+    for z in (table_z, table_z + height):
+        for sa, sb in ((1, 1), (1, -1), (-1, -1), (-1, 1)):
+            out.append([x + sa * ax[0] + sb * ay[0], y + sa * ax[1] + sb * ay[1], z])
+    return np.array(out)
+
+
+def render(cam: Camera, params: np.ndarray, table_z: float, shape: tuple[int, int]) -> np.ndarray:
+    pix = np.array([cam.pixel_of(*p) for p in corners(params, table_z)], dtype=np.float32)
+    hull = cv2.convexHull(pix)
+    out = np.zeros(shape, np.uint8)
+    cv2.fillConvexPoly(out, np.round(hull * 4).astype(np.int32), 1, lineType=cv2.LINE_8, shift=2)
+    return out.astype(bool)
+
+
+def iou(a: np.ndarray, b: np.ndarray, valid: np.ndarray | None = None) -> float:
+    """Intersection over union, counted only where ``valid`` (unoccluded) holds."""
+    both, either = np.logical_and(a, b), np.logical_or(a, b)
+    if valid is not None:
+        both, either = both & valid, either & valid
+    union = either.sum()
+    return float(both.sum() / union) if union else 0.0
+
+
+def nelder_mead(f, x0: np.ndarray, step: np.ndarray, iters: int = 400, tol: float = 1e-5) -> tuple[np.ndarray, float]:
+    n = len(x0)
+    simplex = [x0] + [x0 + np.eye(n)[i] * step[i] for i in range(n)]
+    values = [f(p) for p in simplex]
+    for _ in range(iters):
+        order = np.argsort(values)
+        simplex = [simplex[i] for i in order]
+        values = [values[i] for i in order]
+        if values[-1] - values[0] < tol:
+            break
+        centroid = np.mean(simplex[:-1], axis=0)
+        reflected = centroid + (centroid - simplex[-1])
+        fr = f(reflected)
+        if fr < values[0]:
+            expanded = centroid + 2 * (centroid - simplex[-1])
+            fe = f(expanded)
+            simplex[-1], values[-1] = (expanded, fe) if fe < fr else (reflected, fr)
+        elif fr < values[-2]:
+            simplex[-1], values[-1] = reflected, fr
+        else:
+            contracted = centroid + 0.5 * (simplex[-1] - centroid)
+            fc = f(contracted)
+            if fc < values[-1]:
+                simplex[-1], values[-1] = contracted, fc
+            else:
+                simplex = [simplex[0]] + [simplex[0] + 0.5 * (p - simplex[0]) for p in simplex[1:]]
+                values = [values[0]] + [f(p) for p in simplex[1:]]
+    best = int(np.argmin(values))
+    return simplex[best], values[best]
+
+
+def initial_guess(cam: Camera, mask: np.ndarray, table_z: float, height: float) -> np.ndarray:
+    """Lowest mask pixel per column is a bottom edge: project those onto the table."""
+    ys, xs = np.nonzero(mask)
+    bottom = {}
+    for u, v in zip(xs, ys):
+        bottom[u] = max(bottom.get(u, 0), v)
+    pts = np.array([cam.ray_to_plane(u, v, table_z)[:2] for u, v in bottom.items()])
+    centre_top = cam.ray_to_plane(float(xs.mean()), float(ys.mean()), table_z + height)[:2]
+    centre = 0.5 * (pts.mean(axis=0) + centre_top)
+    d = pts[-1] - pts[0]
+    yaw = math.degrees(math.atan2(d[1], d[0]))
+    return np.array([centre[0], centre[1], yaw, 90.0, 55.0, height])
+
+
+def fit(cam: Camera, mask: np.ndarray, table_z: float, prior: dict | None = None,
+        restarts: tuple[float, ...] = (0.0, 45.0, 90.0, 135.0),
+        valid: np.ndarray | None = None, seed: np.ndarray | None = None) -> dict:
+    """Best cuboid over several yaw seeds; ``prior`` may pin L/W/H (mm).
+
+    ``valid`` restricts the IoU to unoccluded pixels; ``seed`` (x, y, yaw, L, W, H)
+    replaces the bottom-edge guess, which an occluder can corrupt.
+    """
+    prior = prior or {}
+    height0 = float(prior.get("height_mm", 20.0))
+    if seed is None:
+        seed = initial_guess(cam, mask, table_z, height0)
+    seed = np.asarray(seed, dtype=float).copy()
+    fixed = {k: float(prior[k]) for k in ("long_mm", "short_mm", "height_mm") if k in prior}
+    names = ["x", "y", "yaw", "long_mm", "short_mm", "height_mm"]
+    free = [i for i, name in enumerate(names) if name not in fixed]
+
+    def full(p: np.ndarray, base: np.ndarray) -> np.ndarray:
+        out = base.copy()
+        out[free] = p
+        for i, name in enumerate(names):
+            if name in fixed:
+                out[i] = fixed[name]
+        return out
+
+    def cost(p: np.ndarray, base: np.ndarray) -> float:
+        q = full(p, base)
+        if q[3] < 10 or q[4] < 10 or q[5] < 4 or q[4] > q[3] + 1e-6:
+            return 2.0
+        return 1.0 - iou(render(cam, q, table_z, mask.shape), mask, valid)
+
+    best: tuple[float, np.ndarray] | None = None
+    steps = np.array([8.0, 8.0, 12.0, 10.0, 8.0, 4.0])
+    for offset in restarts:
+        base = seed.copy()
+        base[2] = seed[2] + offset
+        p, value = nelder_mead(lambda p: cost(p, base), base[free], steps[free])
+        p, value = nelder_mead(lambda p: cost(p, base), p, steps[free] / 4)
+        if best is None or value < best[0]:
+            best = (value, full(p, base))
+    value, q = best
+    yaw = (q[2] + 90.0) % 180.0 - 90.0
+    return {"centre_mm": [round(float(q[0]), 2), round(float(q[1]), 2)],
+            "yaw_long_deg": round(float(yaw), 2),
+            "long_mm": round(float(q[3]), 2), "short_mm": round(float(q[4]), 2),
+            "height_mm": round(float(q[5]), 2), "iou": round(1.0 - value, 4),
+            "params": [float(v) for v in q], "mask_px": int(mask.sum())}
+
+
+def overlay(image: np.ndarray, cam: Camera, mask: np.ndarray, result: dict, table_z: float) -> np.ndarray:
+    show = image.copy()
+    show[mask] = (0.5 * show[mask] + 0.5 * np.array([255, 60, 60])).astype(np.uint8)
+    pts = corners(np.array(result["params"]), table_z)
+    pix = [tuple(int(round(c)) for c in cam.pixel_of(*p)) for p in pts]
+    for a, b in [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]:
+        cv2.line(show, pix[a], pix[b], (0, 255, 0), 1, cv2.LINE_AA)
+    x, y = result["centre_mm"]
+    centre = cam.pixel_of(x, y, table_z + result["height_mm"])
+    cv2.drawMarker(show, (int(centre[0]), int(centre[1])), (255, 255, 0), cv2.MARKER_CROSS, 16, 2)
+    text = (f"({x:.0f},{y:.0f}) yaw {result['yaw_long_deg']:.1f}  {result['long_mm']:.0f}x"
+            f"{result['short_mm']:.0f}x{result['height_mm']:.0f}  iou {result['iou']:.3f}")
+    cv2.putText(show, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 160, 0), 1, cv2.LINE_AA)
+    return show

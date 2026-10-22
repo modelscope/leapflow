@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""Generate evidence-based C.7/D.4 reports without motion or service changes.
+
+--board collects read-only CAN/process status and known qualification JSONs over
+SSH. Missing, historical, or incomplete evidence never becomes a passing result.
+Raw camera images and credentials are never read or transferred by this script.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import re
+import shlex
+import subprocess
+import time
+from pathlib import Path
+
+from cl import config, eye
+from c5_jaw_test import qualified_report as qualified_jaw
+from dual_camera_qualify import qualified_depth
+from grasp_execute import preconditions, verify_proof
+
+ARTIFACTS = {
+    "trajectory": "cl_data/calibration/phase_c_report.json",
+    "observations": "cl_data/calibration/observations.json",
+    "jaw_latest": "cl_data/calibration/c5_jaw_latest.json",
+    "jaw_previous": "cl_data/calibration/c5_jaw.json",
+    "commission": "cl_data/d405_commission/commission.json",
+    "lhp_readback": "cl_data/d405_commission/lhp_readback.json",
+    "depth": "cl_data/d405_depth/commission.json",
+    "wrist": "wrist_handeye.json",
+    "wrist_candidate": "cl_data/wrist_calibration/candidate.json",
+}
+
+
+def bounded_evidence(value: object) -> object:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: bounded_evidence(v) for k, v in value.items()
+                if k not in ("frame_b64", "data_b64", "token", "password", "credentials")}
+    if isinstance(value, list):
+        return [bounded_evidence(v) for v in value]
+    return value
+
+
+def read_artifact(path: Path) -> dict:
+    try:
+        raw = path.read_bytes()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("expected an evidence object")
+        return {"source": str(path), "sha256": hashlib.sha256(raw).hexdigest(),
+                "data": bounded_evidence(data), "state": "recorded"}
+    except (OSError, ValueError) as error:
+        return {"source": str(path), "state": "unavailable", "reason": str(error)}
+
+
+def board_evidence(board: str, root: Path) -> dict:
+    """Bounded read-only inspection; no SDK construction, recovery, or CAN writes."""
+    if board.startswith("-"):
+        raise ValueError("invalid SSH destination")
+    script = '''import hashlib,json,subprocess,time
+from pathlib import Path
+root=Path(ROOT)
+artifacts={}
+for key,relative in ARTIFACTS.items():
+ p=root/relative
+ try:
+  raw=p.read_bytes(); data=json.loads(raw)
+  if not isinstance(data,dict): raise ValueError("expected an evidence object")
+  def redact(v):
+   if isinstance(v,dict): return {k:redact(x) for k,x in v.items() if k not in ("frame_b64","data_b64","token","password","credentials")}
+   if isinstance(v,list): return [redact(x) for x in v]
+   return v
+  artifacts[key]={"source":str(p),"sha256":hashlib.sha256(raw).hexdigest(),"state":"recorded","data":redact(data)}
+ except (OSError,ValueError) as e: artifacts[key]={"source":str(p),"state":"unavailable","reason":str(e)}
+def probe(command):
+ try:
+  r=subprocess.run(command,capture_output=True,text=True,timeout=8)
+  return {"returncode":r.returncode,"stdout":r.stdout,"stderr":r.stderr}
+ except (OSError,subprocess.SubprocessError) as e: return {"returncode":-1,"stderr":str(e)}
+health={"observed_at":time.time(),"can":probe(["ip","-j","-details","-statistics","link","show","can0"]),
+ "arm_daemon":probe(["pgrep","-af","[/]cl_armd.py"]),"camera_server":probe(["pgrep","-af","[/]leap hw serve"]),
+ "arm_feedback":probe(["timeout","3","candump","-L","-n","32","can0,2A1:7FF,261:7FF,262:7FF,263:7FF,264:7FF,265:7FF,266:7FF"])}
+print(json.dumps({"artifacts":artifacts,"health":health}))
+'''
+    script = f"ROOT={str(root)!r}\nARTIFACTS={ARTIFACTS!r}\n" + script
+    remote = "~/miniconda3/envs/leap/bin/python -c " + shlex.quote(script)
+    result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", board, remote],
+                            capture_output=True, text=True, timeout=30, check=True)
+    evidence = json.loads(result.stdout)
+    for artifact in evidence["artifacts"].values():
+        artifact["source"] = f"ssh://{board}{artifact['source']}"
+    return evidence
+
+
+def can_health(health: dict) -> dict:
+    try:
+        rows = json.loads(health["can"]["stdout"])
+        state = rows[0]["linkinfo"]["info_data"]["state"]
+        return {"qualified": state == "ERROR-ACTIVE", "state": state, "diagnostics": rows}
+    except (ValueError, KeyError, IndexError, TypeError):
+        return {"qualified": False, "state": "unknown"}
+
+
+def passive_arm_health(health: dict) -> dict:
+    """Decode receive-only SocketCAN evidence, never instantiate a command-capable SDK."""
+    probe = health.get("arm_feedback", {})
+    result: dict = {"qualified": False, "status": "unknown", "motor_enabled": {}, "motor_faults": {}}
+    if not isinstance(probe, dict) or probe.get("returncode") != 0 or not isinstance(probe.get("stdout"), str):
+        return result
+    statuses = []
+    fault_seen = False
+    try:
+        for line in probe["stdout"].splitlines():
+            match = re.fullmatch(r"\((\d+\.\d+)\)\s+can0\s+(2A1|26[1-6])#([0-9A-Fa-f]{16})", line)
+            if not match:
+                continue
+            ident, payload = match[2], bytes.fromhex(match[3])
+            if ident == "2A1":
+                statuses.append({"ctrl_mode": payload[0], "arm_status": payload[1],
+                                 "err_code": int.from_bytes(payload[6:], "big")})
+            else:
+                result["motor_enabled"][ident] = bool(payload[5] & 0x40)
+                result["motor_faults"][ident] = payload[5] & 0xBF
+                fault_seen |= payload[5] != 0x40
+        if statuses:
+            result.update(statuses[-1])
+            result["status"] = "normal" if result["arm_status"] == 0 else f"arm_status=0x{result['arm_status']:02X}"
+        result["qualified"] = bool(statuses and all(row == {"ctrl_mode": 1, "arm_status": 0, "err_code": 0}
+                                                    for row in statuses)
+                                   and len(result["motor_enabled"]) == 6 and all(result["motor_enabled"].values())
+                                   and not fault_seen)
+    except (ValueError, TypeError):
+        result["qualified"] = False
+    return result
+
+
+def preview_readback() -> dict:
+    """Read bounded LHP previews; record source metadata only, never raw RGB-D."""
+    cameras = {}
+    for device in (config.D435_DEVICE_ID, config.D405_DEVICE_ID):
+        previews = {}
+        for channel in ("color", "depth", "infrared_left", "infrared_right"):
+            name = f"camera.{channel}.preview"
+            try:
+                _, metadata = eye.grab(channel=name, device_id=device)
+                previews[name] = metadata
+            except (OSError, RuntimeError, ValueError, KeyError, TimeoutError) as error:
+                previews[name] = {"error": str(error)}
+        cameras[device] = {"previews": previews}
+    return {"cameras": cameras, "observed_at": time.time(),
+            "limitation": "Preview availability is not raw depth or calibration qualification."}
+
+
+def object_data(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def rows_data(value: object) -> list[dict]:
+    return value if isinstance(value, list) and all(isinstance(row, dict) for row in value) else []
+
+
+def finite_range(value: object, maximum: float) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= maximum
+
+
+def trajectory_complete(calibration: list[dict], heldout: list[dict], phase: dict) -> bool:
+    rows = calibration + heldout
+    if (len(calibration) != 12 or len(heldout) != 6 or phase.get("all_arrived") is not True
+            or phase.get("calibration_count") != 12 or phase.get("heldout_count") != 6):
+        return False
+    labels = [row.get("label") for row in rows]
+    if not all(isinstance(label, str) and label for label in labels) or len(set(labels)) != 18:
+        return False
+    for row in rows:
+        for key in ("pose", "joints"):
+            values = row.get(key)
+            if (not isinstance(values, list) or len(values) != 6
+                    or not all(type(v) in (int, float) and math.isfinite(v) for v in values)):
+                return False
+        frame = object_data(row.get("frame"))
+        if any(not finite_range(frame.get(key), 1e9) or frame[key] <= 0
+               for key in ("width", "height", "size_bytes")):
+            return False
+    return True
+
+
+def qualified_cycles(cycles: dict, cfg: config.Cfg, session_id: str) -> bool:
+    """Recheck proof displacement and source progression, not only success booleans."""
+    rows = rows_data(cycles.get("cycles"))
+    if (len(rows) != 3 or cycles.get("qualified") is not True or cycles.get("failure")
+            or cycles.get("consecutive_successes") != 3 or not session_id
+            or cycles.get("session_id") != session_id):
+        return False
+    previous = None
+    try:
+        for row in rows:
+            if row.get("success") is not True or not finite_range(row.get("post_place_error_mm"), cfg.qualification.post_place_error_mm):
+                return False
+            grasp, held = row["grasp"], row["held"]
+            stages = [row["pre"], held, *row["proof"], row["empty"]]
+            if (row["pre"]["verdict"]["verdict"] != "aligned"
+                    or held["verdict"]["verdict"] != "held"
+                    or len(row["proof"]) < cfg.qualification.proof_frames
+                    or row["empty"]["verdict"]["verdict"] != "empty"):
+                return False
+            for stage in stages:
+                eye.require_frame_source(stage["frame"])
+                if previous:
+                    eye.require_new_frame(stage["frame"], previous)
+                previous = stage["frame"]
+            for proof in row["proof"]:
+                if proof["verdict"]["verdict"] != "held":
+                    return False
+                verify_proof(held, proof, grasp, cfg)
+        return True
+    except (KeyError, ValueError, TypeError, OSError):
+        return False
+
+
+def summarize(artifacts: dict, health: dict, blockers: list[str], cycles: dict | None = None) -> dict:
+    def data(key: str) -> dict:
+        artifact = object_data(artifacts.get(key))
+        return object_data(artifact.get("data")) if artifact.get("state") == "recorded" else {}
+
+    cfg = config.load_profile()
+    phases = object_data(data("trajectory").get("phases"))
+    calibration = rows_data(data("observations").get("calibration"))
+    heldout = rows_data(data("observations").get("heldout"))
+    descents = rows_data(object_data(phases.get("c6")).get("repetitions"))
+    limits = {"planar_err_mm": cfg.qualification.descent_planar_max_mm,
+              "z_err_mm": cfg.qualification.descent_z_max_mm,
+              "rz_err_deg": cfg.qualification.descent_rz_max_deg}
+    valid_descents = [row for row in descents if row.get("arrived") is True
+                      and all(finite_range(row.get(key), limit) for key, limit in limits.items())]
+    jaw, depth, wrist = data("jaw_latest"), object_data(data("depth").get("depth")), data("wrist")
+    try:
+        eye.WristCamera([150, 130, 190, -180, 0, -90], wrist)
+        wrist_ok = True
+    except (ValueError, KeyError, TypeError, OSError):
+        wrist_ok = False
+    cameras = object_data(data("commission").get("cameras"))
+    preview_ok = data("commission").get("dual_camera_preview_passed") is True
+    for device in (config.D435_DEVICE_ID, config.D405_DEVICE_ID):
+        previews = object_data(object_data(cameras.get(device)).get("previews"))
+        for channel in ("color", "depth", "infrared_left", "infrared_right"):
+            frame = object_data(previews.get(f"camera.{channel}.preview"))
+            preview_ok = bool(preview_ok and finite_range(frame.get("width"), 1280) and frame["width"] > 0
+                              and finite_range(frame.get("height"), 720) and frame["height"] > 0
+                              and object_data(frame.get("metadata")).get("session_id"))
+    phase_c = {
+        "trajectory": {"training_recorded": len(calibration), "heldout_recorded": len(heldout),
+                       "qualified": trajectory_complete(calibration, heldout, object_data(phases.get("c4"))),
+                       "limitation": "Pose visitation is not independent spatial calibration accuracy."},
+        "jaw": {"qualified": qualified_jaw(jaw), "evidence": jaw},
+        "descent": {"recorded": len(descents), "settled": len(valid_descents), "limits": limits,
+                    "qualified": len(descents) == len(valid_descents) == 10
+                    and [row.get("rep") for row in descents] == list(range(1, 11)),
+                    "limitation": "Encoder repeatability is not independent absolute positioning accuracy."},
+        "dual_camera_preview": {"qualified": preview_ok},
+        "d405_depth": {"qualified": qualified_depth(depth), "evidence": depth},
+        "wrist": {"qualified": wrist_ok, "evidence": wrist},
+    }
+    incomplete = [key for key, value in phase_c.items() if not value["qualified"]]
+    phase_c.update(status="qualified" if not incomplete else "incomplete",
+                   qualified=not incomplete, blockers=incomplete)
+    can = can_health(health)
+    arm_health = passive_arm_health(health)
+    daemon = object_data(health.get("arm_daemon")).get("returncode") == 0
+    cycles = object_data(cycles)
+    cycle_passed = qualified_cycles(cycles, cfg, jaw.get("session_id", ""))
+    pending = [*blockers, *preconditions(cfg, artifacts)]
+    if incomplete:
+        pending.append("Phase C/commissioning evidence incomplete: " + ", ".join(incomplete))
+    if not cycle_passed:
+        pending.append("three consecutive independently evidenced grasp cycles unavailable or invalid")
+    if not can["qualified"]:
+        pending.append(f"CAN not ERROR-ACTIVE: {can['state']}")
+    if not daemon:
+        pending.append("arm daemon absent or not inspected")
+    if not arm_health["qualified"]:
+        pending.append("passive arm health not qualified: " + arm_health["status"])
+    pending = list(dict.fromkeys(pending))
+    phase_d = {"status": "qualified" if not pending else "blocked", "qualified": not pending,
+               "successful_cycles": sum(row.get("success") is True for row in rows_data(cycles.get("cycles"))),
+               "consecutive_required": 3, "evidence": cycles, "blockers": pending,
+               "can": can, "arm_feedback": arm_health, "arm_daemon_running": daemon}
+    return {"schema": "dual-camera-qualification/v1", "generated_at": time.time(),
+            "phase_c": phase_c, "phase_d": phase_d, "sources": artifacts,
+            "health": health, "qualified": phase_d["qualified"],
+            "limitations": ["Missing evidence remains unknown; no pass is inferred from plan progress.",
+                            "Hardware status is point-in-time; recheck before motion."]}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--board", help="Optional read-only SSH inspection, e.g. jetson@192.168.55.1")
+    parser.add_argument("--board-root", type=Path, default=Path("/home/jetson/leap_work/leapflow/temp/devices/piper"))
+    parser.add_argument("--cycles", type=Path, help="Explicit Phase D run report; never select old successes implicitly")
+    parser.add_argument("--cameras", action="store_true", help="Read current bounded LHP previews without changing services")
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    artifacts = {key: read_artifact(config.ROOT / relative) for key, relative in ARTIFACTS.items()}
+    health = {}
+    blockers = []
+    if args.board:
+        try:
+            remote = board_evidence(args.board, args.board_root)
+            health = remote["health"]
+            for key, artifact in remote["artifacts"].items():
+                if key in artifacts:
+                    artifacts[key] = artifact
+        except (subprocess.SubprocessError, OSError, ValueError) as error:
+            blockers.append(f"board inspection unavailable: {error}")
+    if args.cameras:
+        artifacts["lhp_readback"] = {"state": "recorded", "source": "current LHP read_frame",
+                                     "data": preview_readback()}
+    artifacts["cycles"] = read_artifact(args.cycles) if args.cycles else {"state": "unavailable", "reason": "no explicit run supplied"}
+    cycles = artifacts["cycles"].get("data")
+    report = bounded_evidence(summarize(artifacts, health, blockers, cycles))
+    output = args.output or config.DATA / "qualification_reports" / str(time.time_ns())
+    config.dump_json(output / "qualification_report.json", report)
+    config.dump_json(output / "phase_c_report.json", report["phase_c"])
+    config.dump_json(output / "phase_d_report.json", report["phase_d"])
+    print(json.dumps({"output": str(output), "qualified": report["qualified"],
+                      "phase_c": report["phase_c"]["status"], "phase_d": report["phase_d"]["status"],
+                      "blockers": report["phase_d"]["blockers"], "can_state": report["phase_d"]["can"]["state"]}, indent=2))
+    return 0 if report["qualified"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

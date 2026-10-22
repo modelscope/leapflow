@@ -1,15 +1,15 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Piper motion spaces, SDK feedback codec, and serialized command state.
+"""Piper motion spaces, pyAgxArm feedback codec, and serialized command state.
 
 Split out of ``piper.py`` so the transport keeps lifecycle, channel routing and
 side-effect verdicts, while this module owns the vendor-facing encoding:
 
-- **Two motion spaces.** Joint targets ride ``JointCtrl`` under MOVE J;
-  end-effector pose targets ride ``EndPoseCtrl`` under MOVE L (straight-line,
-  the default) or MOVE P (point-to-point). The firmware holds one move mode at
-  a time, so the command state tracks it and re-selects only on a change. A
-  batch that mixes both spaces has no single honest vendor command and is
-  refused before any send (``mixed_motion_space``).
+- **Two motion spaces.** Joint targets ride ``move_j``; end-effector pose
+  targets ride ``move_l`` (straight-line, the default) or ``move_p``
+  (point-to-point, the firmware solves IK). pyAgxArm selects the matching move
+  mode on every move, so no move-mode state is tracked here. A batch that mixes
+  both spaces has no single honest vendor command and is refused before any
+  send (``mixed_motion_space``).
 - **Hold semantics.** Every motion command is a full six-value vector; values
   the caller did not name are filled from the last command in the same space
   or, failing that, from current feedback. A command in one space invalidates
@@ -17,25 +17,25 @@ side-effect verdicts, while this module owns the vendor-facing encoding:
   longer describes where the arm is, and holding it would jump the arm back.
   A send that raised leaves the arm in an unknown place, so both caches are
   dropped and the next command re-seeds from feedback.
-- **Control-mode entry.** The Piper X firmware drops a CAN selection issued
-  while the arm is in standby: the frame is sent, nothing reports a failure,
-  and ``ctrl_mode`` stays ``0x00``. The vendor manual therefore prescribes a
-  standby -> CAN handshake, which ``mode_switch="standby_then_can"`` performs
-  and verifies against feedback instead of trusting the send.
-- **Units.** Pose feedback and commands are 0.001 mm (X/Y/Z) and 0.001 deg
-  (RX/RY/RZ): the same uniform 1e-3 scale as joints, gripper stroke and effort.
+- **Control-mode entry.** The firmware executes host commands only in CAN
+  control mode. ``set_speed_percent`` sends the mode frame that selects CAN
+  while keeping the move mode; ``enter_can`` repeats it until ``ctrl_mode``
+  feedback confirms, so a dropped frame becomes a retry and a refusal (teach
+  switch, latched stop) a typed failure instead of a silent no-op.
+- **Units.** Declared channels use deg / mm; pyAgxArm uses rad / m. Pose
+  orientation is fixed-axis X-Y-Z (roll, pitch, yaw); the SDK refuses roll/yaw
+  outside [-pi, pi] and pitch outside [-pi/2, pi/2], so held feedback is
+  wrapped/clamped onto those ranges before it is re-sent.
 """
 
 from __future__ import annotations
 
+import math
 import threading
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 from leapflow.hardware.transport import TransportError
-
-SCALE = 1000.0
-"""SDK-native quantization: declared unit value * 1000 == raw integer."""
 
 CTRL_MODE_STANDBY = 0x00
 CTRL_MODE_CAN = 0x01
@@ -45,16 +45,12 @@ CTRL_MODE_NAMES: dict[int, str] = {
     CTRL_MODE_CAN: "can",
     CTRL_MODE_TEACH: "teach",
 }
-MODE_SWITCH_DIRECT = "direct"
-MODE_SWITCH_STANDBY_THEN_CAN = "standby_then_can"
-MODE_SWITCHES: tuple[str, ...] = (MODE_SWITCH_DIRECT, MODE_SWITCH_STANDBY_THEN_CAN)
-MOVE_P = 0x00
-MOVE_J = 0x01
-MOVE_L = 0x02
-POSE_MOVE_MODES: dict[str, int] = {"linear": MOVE_L, "point": MOVE_P}
+POSE_PATH_LINEAR = "linear"
+POSE_PATH_POINT = "point"
+POSE_PATHS: tuple[str, ...] = (POSE_PATH_LINEAR, POSE_PATH_POINT)
 
 _MODE_POLL_S = 0.02
-_MODE_RETRY_S = 0.15
+_MODE_RETRY_S = 0.15  # longer than pyAgxArm's 0.1 s identical-mode-frame throttle
 
 SPACE_JOINT = "joint"
 SPACE_POSE = "pose"
@@ -72,10 +68,11 @@ SPACE_CHANNELS: dict[str, dict[str, int]] = {
     SPACE_JOINT: JOINT_CHANNELS,
     SPACE_POSE: POSE_CHANNELS,
 }
-_POSE_FIELDS = ("X_axis", "Y_axis", "Z_axis", "RX_axis", "RY_axis", "RZ_axis")
+
+_MM_PER_M = 1000.0
 
 
-# ── SDK struct codec ─────────────────────────────────────────────────────────
+# ── Value coercion ───────────────────────────────────────────────────────────
 
 
 def attr(obj: Any, name: str, default: Any = None) -> Any:
@@ -85,7 +82,7 @@ def attr(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def as_int(value: Any) -> int | None:
-    """Coerce a raw feedback field to int; booleans and garbage are not angles."""
+    """Coerce a raw feedback field (often an IntEnum) to int; booleans are not codes."""
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -95,14 +92,14 @@ def as_int(value: Any) -> int | None:
 
 
 def numeric(value: Any) -> float | None:
-    """Coerce a commanded value to a finite float, rejecting bools/NaN/inf."""
+    """Coerce a value to a finite float, rejecting bools/NaN/inf."""
     if value is None or isinstance(value, bool):
         return None
     try:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if number != number or number in (float("inf"), float("-inf")):
+    if not math.isfinite(number):
         return None
     return number
 
@@ -118,61 +115,80 @@ def enable_flag(value: Any) -> int | None:
     return None
 
 
-def parse_joints(msg: Any) -> list[int] | None:
-    """Six raw joint angles from ``GetArmJointMsgs``, or None when unusable."""
-    state = attr(msg, "joint_state", msg)
-    raw = [as_int(attr(state, f"joint_{i}")) for i in range(1, 7)]
-    if any(value is None for value in raw):
+# ── Unit conversion ──────────────────────────────────────────────────────────
+
+
+def _six(values: Any) -> list[float] | None:
+    if values is None:
         return None
-    return [int(value) for value in raw]  # type: ignore[arg-type]
-
-
-def parse_pose(msg: Any) -> list[int] | None:
-    """Six raw pose values from ``GetArmEndPoseMsgs``, or None when unusable."""
-    state = attr(msg, "end_pose", msg)
-    raw = [as_int(attr(state, name)) for name in _POSE_FIELDS]
-    if any(value is None for value in raw):
-        return None
-    return [int(value) for value in raw]  # type: ignore[arg-type]
-
-
-def firmware_version(arm: Any) -> str:
-    """Return the firmware string; ``-0x4AF`` means the query has no answer yet."""
     try:
-        raw = arm.GetPiperFirmwareVersion()
-    except Exception:  # noqa: BLE001 - probe metadata must never break on SDK quirks
-        return ""
-    if not isinstance(raw, str) or raw.startswith("-0x"):
-        return ""
-    return raw
-
-
-def interface_version(arm: Any) -> str:
-    try:
-        raw = arm.GetCurrentInterfaceVersion()
-    except Exception:  # noqa: BLE001
-        return ""
-    return str(raw) if raw is not None else ""
-
-
-def status_feedback(arm: Any) -> Any:
-    """Return the arm-status feedback struct, or None when unavailable."""
-    try:
-        msg = arm.GetArmStatus()
-    except Exception:  # noqa: BLE001
+        numbers = [numeric(v) for v in values]
+    except TypeError:
         return None
-    feedback = attr(msg, "arm_status", msg)
-    if attr(feedback, "arm_status") is None and attr(feedback, "motion_status") is None:
+    if len(numbers) != 6 or any(n is None for n in numbers):
         return None
-    return feedback
+    return [float(n) for n in numbers]  # type: ignore[arg-type]
 
 
-def ctrl_mode(arm: Any) -> int | None:
+def joints_from_sdk(radians: Any) -> list[float] | None:
+    """SDK joint angles (rad) -> declared degrees, or None when unusable."""
+    values = _six(radians)
+    return [math.degrees(v) for v in values] if values is not None else None
+
+
+def joints_to_sdk(degrees: Sequence[float]) -> list[float]:
+    return [math.radians(v) for v in degrees]
+
+
+def pose_from_sdk(pose: Any) -> list[float] | None:
+    """SDK flange pose (m, rad) -> declared (mm, deg), or None when unusable."""
+    values = _six(pose)
+    if values is None:
+        return None
+    return [v * _MM_PER_M for v in values[:3]] + [math.degrees(v) for v in values[3:]]
+
+
+def pose_to_sdk(pose: Sequence[float]) -> list[float]:
+    """Declared (mm, deg) -> SDK (m, rad) inside the ranges ``move_l``/``move_p`` accept."""
+    roll, pitch, yaw = (math.radians((v + 180.0) % 360.0 - 180.0) for v in pose[3:])
+    return [
+        *(v / _MM_PER_M for v in pose[:3]),
+        min(max(roll, -math.pi), math.pi),
+        min(max(pitch, -math.pi / 2), math.pi / 2),
+        min(max(yaw, -math.pi), math.pi),
+    ]
+
+
+# ── Feedback getters (cached by the SDK read thread; never touch the bus) ────
+
+
+def sdk_message(getter: Callable[..., Any], *args: Any) -> Any:
+    """The ``.msg`` body of a pyAgxArm feedback getter, or None when unavailable."""
+    try:
+        message = getter(*args)
+    except Exception:  # noqa: BLE001 - a dead receive path must read as unavailable
+        return None
+    return attr(message, "msg") if message is not None else None
+
+
+def read_joints(robot: Any) -> list[float] | None:
+    """Six joint angles in degrees, or None when feedback is unavailable."""
+    return joints_from_sdk(sdk_message(robot.get_joint_angles))
+
+
+def read_pose(robot: Any) -> list[float] | None:
+    """Flange pose (mm, deg) in the base frame, or None when unavailable."""
+    return pose_from_sdk(sdk_message(robot.get_flange_pose))
+
+
+def status_feedback(robot: Any) -> Any:
+    """The arm-status message body, or None when unavailable."""
+    return sdk_message(robot.get_arm_status)
+
+
+def ctrl_mode(robot: Any) -> int | None:
     """The control mode the firmware reports (0x00 standby, 0x01 CAN, ...), if any."""
-    feedback = status_feedback(arm)
-    if feedback is None:
-        return None
-    return as_int(attr(feedback, "ctrl_mode"))
+    return as_int(attr(status_feedback(robot), "ctrl_mode"))
 
 
 def ctrl_mode_name(value: Any) -> str | None:
@@ -183,15 +199,30 @@ def ctrl_mode_name(value: Any) -> str | None:
     return CTRL_MODE_NAMES.get(mode, f"other(0x{mode:02X})")
 
 
-def enable_status(arm: Any) -> list[bool] | None:
-    """Return the per-motor enable list, or None when unavailable."""
+def enable_status(robot: Any) -> list[bool] | None:
+    """Per-motor driver enable flags, or None when any driver state is unavailable.
+
+    Read from the driver states directly: the SDK's own list helper reports an
+    absent driver state as ``False``, which would turn "unknown" into "disabled".
+    """
+    flags: list[bool] = []
+    for joint in range(1, 7):
+        state = sdk_message(robot.get_driver_states, joint)
+        flag = attr(attr(state, "foc_status"), "driver_enable_status")
+        if not isinstance(flag, bool):
+            return None
+        flags.append(flag)
+    return flags
+
+
+def firmware_version(robot: Any, timeout_s: float) -> str:
+    """The main-controller software version (e.g. ``S-V1.9-0``); ``""`` when unanswered."""
     try:
-        raw = arm.GetArmEnableStatus()
-    except Exception:  # noqa: BLE001
-        return None
-    if not isinstance(raw, (list, tuple)):
-        return None
-    return [bool(item) for item in raw]
+        info = robot.get_firmware(timeout=timeout_s, min_interval=0.0)
+    except Exception:  # noqa: BLE001 - probe metadata must never break on SDK quirks
+        return ""
+    version = info.get("software_version") if isinstance(info, dict) else None
+    return version.strip() if isinstance(version, str) else ""
 
 
 # ── Motion spaces ────────────────────────────────────────────────────────────
@@ -214,79 +245,60 @@ class PiperMotion:
     """Serialized motion-command state for one arm.
 
     Every method that touches the arm is blocking and runs on a worker thread.
-    The lock spans mode selection, vector fill, send, and cache advance, so
+    The lock spans mode entry, vector fill, send, and cache advance, so
     concurrent writers can neither interleave vectors nor race a mode switch.
     """
 
-    def __init__(
-        self,
-        *,
-        speed_pct: int,
-        pose_move_mode: int,
-        mode_switch: str = MODE_SWITCH_DIRECT,
-        mode_timeout_s: float = 0.6,
-    ) -> None:
-        if mode_switch not in MODE_SWITCHES:
-            raise ValueError(
-                f"mode_switch must be one of {list(MODE_SWITCHES)}, got {mode_switch!r}"
-            )
+    def __init__(self, *, speed_pct: int, pose_path: str, mode_timeout_s: float = 0.6) -> None:
+        if pose_path not in POSE_PATHS:
+            raise ValueError(f"pose_path must be one of {list(POSE_PATHS)}, got {pose_path!r}")
         self._lock = threading.Lock()
-        self._speed_pct = speed_pct
-        self._pose_move_mode = pose_move_mode
-        self._mode_switch = mode_switch
+        self._speed_pct = min(100, max(1, int(speed_pct)))
+        self._speed_sent = False
+        self._pose_path = pose_path
         self._mode_timeout_s = max(0.1, float(mode_timeout_s))
-        self._mode: int | None = None
-        self._commanded: dict[str, list[int | None]] = {
+        self._commanded: dict[str, list[float | None]] = {
             SPACE_JOINT: [None] * 6,
             SPACE_POSE: [None] * 6,
         }
 
     @property
-    def mode(self) -> int | None:
-        """The move mode last selected on the arm; None when unknown."""
-        return self._mode
-
-    @property
     def speed_pct(self) -> int:
-        """The speed rate (1-100 %) every ``ModeCtrl`` carries."""
+        """The speed rate (1-100 %) the next mode frame carries."""
         return self._speed_pct
 
     def set_speed(self, pct: int) -> int:
-        """Change the speed rate; the next send re-selects the mode to apply it.
-
-        The vendor carries the rate only on ``ModeCtrl``, so clearing the cached
-        mode is what makes the change take effect without an extra frame now.
-        """
+        """Stage a speed rate; the next command sends it before moving."""
         with self._lock:
             self._speed_pct = min(100, max(1, int(pct)))
-            self._mode = None
+            self._speed_sent = False
             return self._speed_pct
 
     @property
     def pose_path(self) -> str:
         """The path name (``linear`` / ``point``) later pose targets ride."""
-        return next(n for n, mode in POSE_MOVE_MODES.items() if mode == self._pose_move_mode)
+        return self._pose_path
 
     def set_pose_path(self, name: str) -> str:
-        """Select MOVE L / MOVE P for later pose targets; the next pose send applies it."""
+        """Select ``move_l`` / ``move_p`` for later pose targets."""
         with self._lock:
-            self._pose_move_mode = POSE_MOVE_MODES[name]
+            self._pose_path = name
             return name
 
-    def select_joint_mode(self, arm: Any, joints: list[int]) -> None:
-        """Bring-up: select CAN command + MOVE J and seed the joint hold vector."""
+    def seed_joints(self, joints: list[float]) -> None:
+        """Hold the current joints for the first command; sends nothing."""
         with self._lock:
-            self._select(arm, MOVE_J)
             self._commanded[SPACE_JOINT] = list(joints)
             self._commanded[SPACE_POSE] = [None] * 6
 
     def send(
         self,
-        arm: Any,
+        robot: Any,
         space: str,
-        feedback: list[int] | None,
+        feedback: list[float] | None,
         targets: list[tuple[int, float]],
-    ) -> list[int] | None:
+        *, validate: Callable[[], None] | None = None,
+    ) -> list[float] | None:
         """Send one full hold vector in ``space``; None when nothing could be held.
 
         A ``None`` return is decided before anything is sent: neither a prior
@@ -297,105 +309,72 @@ class PiperMotion:
                 commanded if commanded is not None else (feedback[i] if feedback else None)
                 for i, commanded in enumerate(self._commanded[space])
             ]
-            if any(raw is None for raw in vector):
+            if any(value is None for value in vector):
                 return None
             for index, value in targets:
-                vector[index] = int(round(value * SCALE))
-            snapshot = [int(raw) for raw in vector]  # type: ignore[arg-type]
-            mode = MOVE_J if space == SPACE_JOINT else self._pose_move_mode
+                vector[index] = float(value)
+            snapshot = [float(value) for value in vector]  # type: ignore[arg-type]
             try:
-                if self._mode != mode:
-                    self._select(arm, mode)
+                if validate is not None:
+                    validate()
+                if ctrl_mode(robot) != CTRL_MODE_CAN:
+                    self._enter_can(robot)
+                elif not self._speed_sent:
+                    robot.set_speed_percent(self._speed_pct)
+                    self._speed_sent = True
+                if validate is not None:
+                    validate()
                 if space == SPACE_JOINT:
-                    arm.JointCtrl(*snapshot)
+                    robot.move_j(joints_to_sdk(snapshot))
+                elif self._pose_path == POSE_PATH_POINT:
+                    robot.move_p(pose_to_sdk(snapshot))
                 else:
-                    arm.EndPoseCtrl(*snapshot)
+                    robot.move_l(pose_to_sdk(snapshot))
             except BaseException:
                 self._commanded = {SPACE_JOINT: [None] * 6, SPACE_POSE: [None] * 6}
+                self._speed_sent = False
                 raise
             other = SPACE_POSE if space == SPACE_JOINT else SPACE_JOINT
             self._commanded[space] = list(snapshot)
             self._commanded[other] = [None] * 6
             return snapshot
 
-    def invalidate_mode(self) -> None:
-        """Force the next command to re-select, e.g. after an untracked mode change."""
+    def enter_can(self, robot: Any) -> None:
+        """Select CAN control (carrying the staged speed), verified, unconditionally."""
         with self._lock:
-            self._mode = None
+            self._enter_can(robot)
 
-    def enter_can(self, arm: Any) -> None:
-        """Walk into CAN command mode through the verified handshake, unconditionally.
-
-        Needed after an event that resets the mode behind our back — a resume
-        from a latched emergency stop returns the firmware to standby, and an
-        ``EnableArm`` issued there is silently ignored.
-        """
-        with self._lock:
-            self._mode = None
-            self._enter_can(arm)
-
-    def ensure_can(self, arm: Any) -> None:
-        """Enter CAN mode only when the arm reports something else.
+    def ensure_can(self, robot: Any) -> None:
+        """Enter CAN control only when the arm reports something else.
 
         A gripper write does not go through the motion path, so it needs the
-        same guarantee ``_select`` gives a motion: in standby the firmware
-        drops commands while every later write still reports success. An arm
-        already in CAN is left untouched, so an energized arm is never disturbed.
+        same guarantee: outside CAN control the firmware drops the frame while
+        the write would still report success. An arm already in CAN is left
+        untouched, so an energized arm is never disturbed.
         """
         with self._lock:
-            if self._mode_switch != MODE_SWITCH_STANDBY_THEN_CAN:
-                return
-            if ctrl_mode(arm) == CTRL_MODE_CAN:
-                return
-            self._mode = None
-            self._enter_can(arm)
+            if ctrl_mode(robot) != CTRL_MODE_CAN:
+                self._enter_can(robot)
 
-    def _select(self, arm: Any, mode: int) -> None:
-        # Unknown until the frame is accepted: a raising ModeCtrl must force a
-        # re-select on the next command rather than trust a stale mode.
-        self._mode = None
-        if self._mode_switch == MODE_SWITCH_STANDBY_THEN_CAN and ctrl_mode(arm) != CTRL_MODE_CAN:
-            self._enter_can(arm)
-        self._send_mode(arm, CTRL_MODE_CAN, mode)
-        self._mode = mode
-
-    def _enter_can(self, arm: Any) -> None:
-        """Walk the arm from standby/teach into CAN command mode, verified.
-
-        The firmware honours only the CAN selection that follows a standby
-        frame, and a selection issued while an emergency stop is latched (or
-        while the firmware is still settling from a resume) is dropped on the
-        floor without an error. So each attempt sends the pair and the outcome
-        is read back from feedback; attempts repeat until the deadline, which
-        turns a dropped frame into a retry and a real refusal into a typed
-        failure instead of a silent no-op.
-        """
+    def _enter_can(self, robot: Any) -> None:
         deadline = time.monotonic() + self._mode_timeout_s
         while True:
-            if ctrl_mode(arm) == CTRL_MODE_CAN:
-                return
-            self._send_mode(arm, CTRL_MODE_STANDBY, MOVE_J)
-            self._send_mode(arm, CTRL_MODE_CAN, MOVE_J)
+            self._speed_sent = False
+            robot.set_speed_percent(self._speed_pct)
+            self._speed_sent = True
             window = min(deadline, time.monotonic() + _MODE_RETRY_S)
             while time.monotonic() < window:
                 time.sleep(_MODE_POLL_S)
-                if ctrl_mode(arm) == CTRL_MODE_CAN:
+                if ctrl_mode(robot) == CTRL_MODE_CAN:
                     return
             if time.monotonic() >= deadline:
-                seen = ctrl_mode_name(ctrl_mode(arm)) or "no feedback"
+                seen = ctrl_mode_name(ctrl_mode(robot)) or "no feedback"
                 raise TransportError(
                     f"the arm did not enter {ctrl_mode_name(CTRL_MODE_CAN)} mode within "
                     f"{self._mode_timeout_s:.1f}s (it reports {seen}); check the teach "
                     "switch, the pendant state, and whether an emergency stop is latched",
                     failure_code="piper_mode_switch_refused",
                 )
-
-    def _send_mode(self, arm: Any, ctrl_mode_raw: int, move_mode: int) -> None:
-        arm.ModeCtrl(
-            ctrl_mode=ctrl_mode_raw,
-            move_mode=move_mode,
-            move_spd_rate_ctrl=self._speed_pct,
-        )
 
 
 __all__ = [
@@ -404,22 +383,26 @@ __all__ = [
     "CTRL_MODE_STANDBY",
     "CTRL_MODE_TEACH",
     "JOINT_CHANNELS",
-    "MODE_SWITCHES",
-    "MODE_SWITCH_DIRECT",
-    "MODE_SWITCH_STANDBY_THEN_CAN",
-    "MOVE_J",
-    "MOVE_L",
-    "MOVE_P",
     "POSE_CHANNELS",
-    "POSE_MOVE_MODES",
-    "SCALE",
+    "POSE_PATHS",
+    "SPACE_CHANNELS",
     "SPACE_JOINT",
     "SPACE_POSE",
     "PiperMotion",
+    "as_int",
+    "attr",
     "ctrl_mode",
     "ctrl_mode_name",
+    "enable_flag",
+    "enable_status",
+    "firmware_version",
     "motion_space",
     "motion_spaces",
-    "parse_joints",
-    "parse_pose",
+    "numeric",
+    "pose_from_sdk",
+    "pose_to_sdk",
+    "read_joints",
+    "read_pose",
+    "sdk_message",
+    "status_feedback",
 ]
