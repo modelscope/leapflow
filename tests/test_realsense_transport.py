@@ -44,9 +44,8 @@ def test_realsense_example_is_a_valid_declarative_context(example: str) -> None:
         "camera.color.preview", "camera.depth.preview",
         "camera.infrared_left.preview", "camera.infrared_right.preview", "camera.metadata",
     }
-    if example == "realsense_435if.yaml":
-        expected.update({"camera.rgbd.quality", "camera.rgbd.geometry"})
-    else:
+    expected.update({"camera.rgbd.quality", "camera.rgbd.geometry"})
+    if example == "realsense_d405.yaml":
         assert context.device_id == "sensor_realsense_d405"
         assert context.transport.config["expected_product"] == "D405"
         for stream in ("color", "depth", "infrared"):

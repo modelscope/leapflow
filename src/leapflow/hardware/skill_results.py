@@ -213,14 +213,9 @@ def workcell_view(node_id: str, cell: Mapping[str, Any]) -> dict[str, Any]:
 
 def plan_view(plan: Mapping[str, Any], consent: str) -> dict[str, Any]:
     """What the approver is shown, and what the digest covers."""
-    return {
-        "summary": plan.get("summary"),
-        "version": plan.get("version"),
-        "limits": plan.get("limits"),
-        "targets": plan.get("targets"),
-        "digest": plan.get("digest"),
-        "consent": consent,
-    }
+    # Preserve args and basis as well as targets: offline approvals must bind
+    # the complete cached node plan, not an abbreviated display of it.
+    return {**dict(plan), "consent": consent}
 
 
 def plan_mismatch(plan: Mapping[str, Any], workcell: str, skill: str) -> str:
@@ -241,6 +236,9 @@ def run_view(node_id: str, run: Mapping[str, Any]) -> dict[str, Any]:
         "run_id": run.get("run_id"),
         "skill_id": run.get("skill_id"),
         "version": run.get("version"),
+        "plan_digest": run.get("plan_digest"),
+        "started_at": run.get("started_at"),
+        "finished_at": run.get("finished_at"),
         "summary": run.get("summary"),
         "status": run.get("status"),
         "elapsed_s": run.get("elapsed_s"),

@@ -179,6 +179,60 @@ def test_admission_halts_every_writable_device_and_checks_each_role_kind(tmp_pat
     assert note.workcell == "no_wrist" and "camera.wrist device 'absent'" in note.detail
 
 
+@pytest.mark.parametrize("tuning", [
+    {"min_frames": 2}, {"min_frames": 3.5}, {"min_frames": 11},
+    {"min_proof_lift_mm": 11}, {"poll_s": 1}, {"alignment_mm": True},
+])
+def test_grasp_evidence_tuning_is_admitted_fail_closed(tuning: dict[str, Any]) -> None:
+    with pytest.raises(WorkcellError, match="grasp_verify"):
+        WorkcellSpec.from_mapping(_with(grasp_verify=tuning))
+
+
+def test_camera_frames_resolve_independent_mount_versions(tmp_path: Path) -> None:
+    registry = SkillNodeRegistry(store_path=tmp_path / "instrument.duckdb")
+    spec = WorkcellSpec.from_mapping(_with(
+        roles={"arm": ARM_ID, "camera": "overview", "camera.wrist": "wrist"}, frames={
+            "camera": {"parent": "base", "procedure": "handeye.eye_to_hand"},
+            "camera.wrist": {"parent": "flange", "procedure": "handeye.eye_in_hand"},
+        },
+    ))
+    registry.calibrate("handeye.eye_to_hand", pose={"x": 500., "y": 0., "z": 0.}, recorded_at=1.)
+    registry.calibrate("handeye.eye_in_hand", pose={"x": 60., "y": 0., "z": 0.}, recorded_at=2.)
+    frames = FrameGraph.snapshot(spec, registry.calibration_store)
+    assert frames.transform("camera").translation == (500., 0., 0.)
+    assert frames.transform("camera.wrist").translation == (60., 0., 0.)
+    assert frames.versions == {"camera": 1., "camera.wrist": 2.}
+    registry.calibrate("handeye.eye_in_hand", pose={"x": 61., "y": 0., "z": 0.}, recorded_at=3.)
+    assert FrameGraph.snapshot(spec, registry.calibration_store).versions == {
+        "camera": 1., "camera.wrist": 3.,
+    }
+
+
+def test_camera_frames_keep_distinct_calibration_procedures() -> None:
+    data = _with(roles={"arm": ARM_ID, "camera": "overview", "camera.wrist": "wrist"}, frames={
+        "camera": {"parent": "base", "procedure": "handeye.eye_to_hand"},
+        "camera.wrist": {"parent": "flange", "procedure": "handeye.eye_in_hand"},
+    })
+    spec = WorkcellSpec.from_mapping(data)
+    assert spec.frames["camera.wrist"].parent == "flange"
+    assert "calib.handeye" in unmet_requirements(
+        ("calib:camera.wrist",), spec, FrameGraph(spec, {}, None, {}),
+    )[0]
+    data["frames"]["camera.wrist"]["procedure"] = "handeye.eye_to_hand"
+    with pytest.raises(WorkcellError, match="unique"):
+        WorkcellSpec.from_mapping(data)
+
+
+@pytest.mark.parametrize("frames", [
+    {"camera.wrist": {"parent": "base", "procedure": "p"}},
+    {"camera": {"parent": "tcp", "procedure": "p"}},
+    {"camera": {"parent": "base", "procedure": "p", "ignored": True}},
+])
+def test_camera_frames_refuse_unbound_roles_and_invalid_mounts(frames: dict[str, Any]) -> None:
+    with pytest.raises(WorkcellError):
+        WorkcellSpec.from_mapping(_with(roles={"arm": ARM_ID, "camera": "overview"}, frames=frames))
+
+
 def test_a_speed_cap_below_the_arms_lowest_speed_is_refused(tmp_path: Path) -> None:
     directory = tmp_path / "workcells"
     registry = SkillNodeRegistry()

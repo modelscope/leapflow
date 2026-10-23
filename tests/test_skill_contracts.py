@@ -20,6 +20,8 @@ from leapflow.hardware.skills.args import validate_args
 from leapflow.hardware.skills.builtin.calibration import skills as calibration_skills
 from leapflow.hardware.skills.builtin.camera_calibration import skills as camera_skills
 from leapflow.hardware.skills.builtin.episode import skills as episode_skills
+from leapflow.hardware.skills.builtin.grasp_cycle import skills as cycle_skills
+from leapflow.hardware.skills.builtin.grasp_verify import skills as verify_skills
 from leapflow.hardware.skills.builtin.motion import skills as motion_skills
 from leapflow.hardware.skills.builtin.policy import skills as policy_skills
 from leapflow.hardware.skills.builtin.scene import skills as scene_skills
@@ -109,6 +111,8 @@ def _builtin_skills() -> tuple[NodeSkill, ...]:
         *scene_skills(),
         *policy_skills(),
         *episode_skills(),
+        *cycle_skills(),
+        *verify_skills(),
     )
 
 
@@ -125,6 +129,8 @@ def test_builtin_skills_satisfy_the_protocol_with_unique_ids() -> None:
         "perceive.lift",
         "grasp.propose",
         "episode.record",
+        "grasp.verify",
+        "grasp.inspect",
     }
     assert all(skill.spec.effect in (EFFECT_ACTUATE, EFFECT_READ) for skill in found)
 
@@ -246,7 +252,7 @@ def _example(schema: dict[str, object]) -> object:
     if kind == "array":
         item = _example(schema.get("items") or {})  # type: ignore[arg-type]
         return [item] * int(schema.get("minItems") or 1)  # type: ignore[call-overload]
-    return {"boolean": False, "string": "x", "integer": 0}.get(kind, 0.0)  # type: ignore[arg-type]
+    return {"boolean": False, "string": "x", "integer": schema.get("minimum", 0)}.get(kind, schema.get("minimum", 0.0))  # type: ignore[arg-type]
 
 
 def test_every_builtin_schema_validates_its_own_example_shape() -> None:

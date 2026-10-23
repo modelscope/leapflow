@@ -71,8 +71,9 @@ class RunContext:
         self._recording = recording
         self._grasp_planner: GraspPlanner | None = None
         self._scene: WorkcellScene | None = None
-        self._vision: WorkcellVision | None = None
+        self._visions: dict[str, WorkcellVision] = {}
         self._policies: WorkcellPolicies | None = None
+        self._grasp_verification: Any = None
         self._committed = False
         self.evidence: dict[str, Any] = {}
 
@@ -131,9 +132,20 @@ class RunContext:
 
     @property
     def vision(self) -> WorkcellVision:
-        if self._vision is None:
-            self._vision = WorkcellVision.for_workcell(self._registry, self._spec)
-        return self._vision
+        return self.camera_vision()
+
+    def camera_vision(self, role: str = "camera") -> WorkcellVision:
+        """Lazily resolve the exact camera role without borrowing another mount."""
+        if role not in self._visions:
+            self._visions[role] = WorkcellVision.for_workcell(self._registry, self._spec, role=role)
+        return self._visions[role]
+
+    @property
+    def grasp_verification(self) -> Any:
+        if self._grasp_verification is None:
+            from leapflow.hardware.skills.grasp_verification import WorkcellGraspVerification
+            self._grasp_verification = WorkcellGraspVerification(self, self._registry)
+        return self._grasp_verification
 
     @property
     def policies(self) -> WorkcellPolicies:

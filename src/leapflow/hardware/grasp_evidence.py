@@ -89,10 +89,12 @@ class GraspEvidence:
                   self.width_change_mm, self.uncertainty_mm)
         if any(not math.isfinite(v) for v in values) or self.relative_error_mm < 0:
             return GraspState.UNKNOWN
+        if (not self.synchronized or not self.independent_jaws
+                or not 0 <= self.uncertainty_mm <= limits.max_uncertainty_mm):
+            return GraspState.UNKNOWN
         if self.empty_closure:
             return GraspState.EMPTY
-        if (not self.visible or not self.synchronized or not self.independent_jaws
-                or not 0 <= self.uncertainty_mm <= limits.max_uncertainty_mm):
+        if not self.visible:
             return GraspState.UNKNOWN
         if (self.observation_times and (
                 any(not math.isfinite(t) or not 0 <= now - t <= limits.max_age_s
@@ -114,8 +116,7 @@ class GraspEvidence:
         lift_valid = limits.min_proof_lift_mm <= self.tool_rise_mm <= limits.max_proof_lift_mm
         if (count >= limits.min_frames and len(self.identity.frame_ids) >= count
                 and self.observation_times[-1] == self.identity.observed_mono
-                and (lift_valid or (proof_valid and self.tool_rise_mm >= limits.min_proof_lift_mm))
-                and self.object_rise_mm - self.uncertainty_mm > 0
+                and (proof_valid or (lift_valid and self.object_rise_mm - self.uncertainty_mm > 0))
                 and abs(self.object_rise_mm - self.tool_rise_mm) + self.uncertainty_mm
                 <= limits.max_relative_error_mm
                 and 0 <= self.relative_error_mm + self.uncertainty_mm <= limits.max_relative_error_mm):
@@ -217,20 +218,28 @@ class TemporalGraspObserver:
             rise = sample.jaws_mm[2] - baseline.jaws_mm[2]
             object_rise = sample.object_mm[2] - baseline.object_mm[2]
             uncertainty = sample.uncertainty_mm + baseline.uncertainty_mm
-            if rise < self.limits.min_proof_lift_mm or object_rise <= uncertainty:
-                self._history, self._proof = [], None
+            # Once proven, a continuous hold can descend toward another support.
+            # Its current relative geometry must still agree with the baseline;
+            # an actual support observation clears the proof above.
+            if self._proof is None and (rise < self.limits.min_proof_lift_mm or object_rise <= uncertainty):
+                self._history = []
             if self._proof is None and rise > self.limits.max_proof_lift_mm:
                 valid = False
                 self._invalidate()
                 baseline = None
             self._history = [r for r in self._history
                              if 0 <= now - r.identity.observed_mono <= self.limits.max_age_s]
-            if baseline and rise >= self.limits.min_proof_lift_mm and object_rise > uncertainty:
+            if baseline and (self._proof is not None or
+                             (rise >= self.limits.min_proof_lift_mm and object_rise > uncertainty)):
                 self._history.append(sample)
             self._history = self._history[-self.limits.min_frames:]
         if not sample.object_on_support and baseline is None:
             valid = False
         evidence = self._evidence(sample, baseline, valid)
+        if not (fresh and finite and distinct and all(type(flag) is bool for flag in flags)):
+            # Empty closure, like a hold, needs a fresh distinct admitted source.
+            from dataclasses import replace
+            evidence = replace(evidence, empty_closure=False, synchronized=False)
         state = evidence.state(current, now=now, limits=self.limits)
         if state == GraspState.HELD_VERIFIED and self._proof is None:
             self._proof = evidence

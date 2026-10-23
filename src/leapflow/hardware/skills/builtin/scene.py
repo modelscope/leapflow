@@ -171,6 +171,7 @@ class Lift:
             "type": "object",
             "properties": {
                 "frame": {"type": "string", "minLength": 1, "maxLength": 16},
+                "capture_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
                 "targets": {
                     "type": "array",
                     "minItems": 1,
@@ -212,8 +213,9 @@ class Lift:
         )
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
+        binding = {"capture_id": plan.args["capture_id"]} if "capture_id" in plan.args else {}
         lifted, dropped = await ctx.scene.lift(
-            plan.args["frame"], _targets(plan.args), coords=plan.args["coords"]
+            plan.args["frame"], _targets(plan.args), coords=plan.args["coords"], **binding
         )
         listed = "; ".join(f"{o.object_id} {o.label} at {_fmt(o.center)}" for o in lifted)
         result: dict[str, Any] = {"objects": [obj.to_dict() for obj in lifted]}

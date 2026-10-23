@@ -262,12 +262,14 @@ class WorkcellVision:
         self._target = target
 
     @classmethod
-    def for_workcell(cls, registry: Any, spec: WorkcellSpec) -> "WorkcellVision":
+    def for_workcell(cls, registry: Any, spec: WorkcellSpec, *, role: str = ROLE_CAMERA) -> "WorkcellVision":
         """The port for *spec*; raises ``skill_unavailable`` without a camera or target."""
-        camera = spec.role(ROLE_CAMERA)
+        if role.split(".", 1)[0] != ROLE_CAMERA:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"{role!r} is not a camera role")
+        camera = spec.role(role)
         if not camera:
             raise SkillError(
-                FAILURE_SKILL_UNAVAILABLE, f"workcell {spec.workcell_id!r} binds no camera"
+                FAILURE_SKILL_UNAVAILABLE, f"workcell {spec.workcell_id!r} binds no {role}"
             )
         if not spec.calibration_target:
             raise SkillError(

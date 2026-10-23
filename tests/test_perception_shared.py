@@ -479,3 +479,89 @@ async def test_the_host_sends_its_consent_and_audits_every_shared_frame(
         assert result["failure_code"] == FAILURE_SKILL_UNAVAILABLE
         assert "host has not consented" in result["error"]
         assert ATTACHMENTS_FIELD not in result and shared == []
+
+
+async def test_capture_identity_prevents_frame_alias_after_runtime_restart(tmp_path):
+    registry = _calibrated(tmp_path, CUP)
+    scene = _scene(registry)
+    shot = await scene.snapshot()
+    target = [PixelTarget("cup", box=tuple(_cup_box()))]
+    assert (await scene.lift(shot["frame"], target, coords=COORDS_PIXEL,
+                             capture_id=shot["capture_id"]))[0]
+    restarted = _scene(registry)
+    new = await restarted.snapshot()
+    assert new["frame"] == shot["frame"] and new["capture_id"] != shot["capture_id"]
+    with pytest.raises(SkillError, match="not a current frame"):
+        await restarted.lift(shot["frame"], target, coords=COORDS_PIXEL,
+                             capture_id=shot["capture_id"])
+
+
+async def test_capture_binding_crosses_read_skill_boundary(tmp_path):
+    runtime = _runtime(tmp_path, _calibrated(tmp_path, CUP), SHARED_YAML)
+    shot = (await _read(runtime, "perceive.snapshot", {})).result
+    args = {"frame": shot["frame"], "capture_id": shot["capture_id"],
+            "targets": [{"label": "cup", "box": _cup_box()}]}
+    assert (await _read(runtime, "perceive.lift", args)).ok
+    refused = await _read(runtime, "perceive.lift", {**args, "capture_id": "0" * 32})
+    assert refused.failure_code == FAILURE_TARGET_NOT_FOUND
+
+
+@pytest.mark.parametrize("fault", ["none", "unconfirmed", "hash", "image", "node", "workcell"])
+async def test_operations_preview_uses_only_the_confirmed_saved_capture(fault, tmp_path, monkeypatch):
+    import json
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock
+    from piper_ops import calibration, grasp, motion
+    from piper_ops.config import Settings
+    from piper_ops.evidence import Evidence, Refusal
+    from tests.test_piper_ops import context
+
+    shot = _shot()
+    shot["result"]["capture_id"] = "a" * 32
+    shot["side_effect_state"] = "none"
+    share_frame(shot, consent=True)
+    service = SimpleNamespace(hw_skill_run=AsyncMock(return_value=shot))
+
+    @asynccontextmanager
+    async def factory(*args, **kwargs):
+        yield service
+
+    monkeypatch.setattr(calibration, "service", factory)
+    session = SimpleNamespace(settings=Settings(root=tmp_path, node_id="node"), context=context(),
+                              evidence=Evidence(tmp_path / "attempt.json"))
+    saved = await grasp.snapshot(session, "cell", share_frames=True)
+    path = tmp_path / "snapshot.json"
+    path.write_text(json.dumps(saved))
+    arguments = {"snapshot_file": str(path), "confirmed_snapshot_hash": saved["snapshot_hash"],
+                 "target_confirmed": True, "target": {"label": "cup", "box": [0, 0, 10, 10]},
+                 "grasp_index": 0, "place": {"x": 0, "y": 0, "z": 10}}
+    if fault == "unconfirmed":
+        arguments["target_confirmed"] = False
+    elif fault == "hash":
+        arguments["confirmed_snapshot_hash"] = "other"
+    elif fault == "image":
+        saved["snapshot"]["image"]["data"] = "changed"
+        path.write_text(json.dumps(saved))
+    elif fault == "node":
+        session.settings = Settings(root=tmp_path, node_id="other")
+    elif fault == "workcell":
+        saved["workcell"] = "other"
+        path.write_text(json.dumps(saved))
+    cycle_plan = {"args": {"grasp_id": "g1", "place": arguments["place"]}, "digest": "test"}
+    service.hw_skill_run.reset_mock()
+    service.hw_skill_run.side_effect = [
+        {"ok": True, "side_effect_state": "none", "result": {"objects": [{"object_id": "o1"}]}},
+        {"ok": True, "side_effect_state": "none", "result": {"grasps": [{"grasp_id": "g1"}]}},
+        {"ok": True, "dry_run": True, "plan": cycle_plan},
+    ]
+    if fault != "none":
+        with pytest.raises(Refusal):
+            await grasp.prepare(session, "cell", arguments, share_frames=True)
+        service.hw_skill_run.assert_not_awaited()
+        return
+    result = await grasp.prepare(session, "cell", arguments, share_frames=True)
+    calls = service.hw_skill_run.await_args_list
+    assert [call.kwargs["skill"] for call in calls] == ["perceive.lift", "grasp.propose", "grasp.cycle"]
+    assert calls[0].kwargs["args"]["capture_id"] == saved["snapshot"]["capture_id"]
+    assert result["preview"]["operator_confirmation"]["snapshot_hash"] == saved["snapshot_hash"]
+    assert result["plan_hash"] == motion.digest_plan(result["preview"])

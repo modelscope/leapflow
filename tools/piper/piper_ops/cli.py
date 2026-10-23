@@ -13,7 +13,7 @@ from typing import Any
 
 from leapflow.engine.recovery.failure_envelope import SideEffectState
 
-from . import calibration, layout, lifecycle, motion, node
+from . import calibration, grasp, layout, lifecycle, motion, node, qualification
 from .config import Settings
 from .evidence import Evidence, Refusal, encode
 from .session import Session, complete_cleanup, unverified_digest
@@ -51,11 +51,33 @@ def parser() -> argparse.ArgumentParser:
             for axis in "xyz":
                 item.add_argument(f"--d{axis}-mm", type=float, default=0.0)
             item.add_argument("--frame", choices=("base",), required=True)
+    item = command(arm, "cycle", writing=True)
+    item.add_argument("--dz-mm", type=float, default=200.0)
+    item.add_argument("--cycles", type=int, default=5)
+    item.add_argument("--dwell-s", type=float, default=5.0)
+    item.add_argument("--frame", choices=("base",), required=True)
     grip = groups.add_parser("gripper").add_subparsers(dest="operation", required=True)
     item = command(grip, "open", writing=True)
     width = item.add_mutually_exclusive_group(required=True)
     width.add_argument("--max", action="store_true")
     width.add_argument("--width-mm", type=float)
+    item = command(grip, "qualify", writing=True)
+    item.add_argument("--workcell", default="piper_cell")
+    item.add_argument("--widths", default="10,40,68")
+    item.add_argument("--measurements", type=Path, help="Offline independent caliper train/holdout evidence")
+    picks = groups.add_parser("grasp").add_subparsers(dest="operation", required=True)
+    item = command(picks, "snapshot")
+    item.add_argument("--workcell", default="piper_cell")
+    item.add_argument("--share-frames", action="store_true")
+    item = command(picks, "preview")
+    item.add_argument("--workcell", default="piper_cell")
+    item.add_argument("--args-file", type=Path, required=True)
+    item.add_argument("--share-frames", action="store_true")
+    item = command(picks, "cycle", writing=True)
+    item.add_argument("--workcell", default="piper_cell")
+    reports = groups.add_parser("qualify").add_subparsers(dest="operation", required=True)
+    item = command(reports, "report")
+    item.add_argument("--workcell", default="piper_cell")
     verify = groups.add_parser("verify").add_subparsers(dest="operation", required=True)
     item = command(verify, "motion", writing=True)
     item.add_argument("--dz-mm", type=float, default=100.0)
@@ -98,7 +120,7 @@ def approved(args: argparse.Namespace, settings: Settings, operation: str) -> di
         raise Refusal("preview hash or command differs from operator approval")
     if motion.digest_plan(plan.get("settings", {})) != motion.digest_plan(asdict(settings)):
         raise Refusal("effective configuration differs from approved preview")
-    if args.group in ("arm", "gripper", "verify", "calibration"):
+    if args.group in ("arm", "gripper", "verify", "calibration", "grasp"):
         if not args.approved_digest or args.approved_digest != plan.get("declaration_digest"):
             raise Refusal("exact approved declaration digest required")
         if operation != "stop" and not args.clearance_confirmed:
@@ -118,13 +140,58 @@ def preview_result(plan: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "executed": False, "preview": plan, "plan_hash": motion.digest_plan(plan)}
 
 
+async def skill_execution(args: argparse.Namespace, settings: Settings, evidence: Evidence,
+                          plan: dict[str, Any], operation: str) -> dict[str, Any]:
+    """Verify settled state after both skill and operations clients close; never replay."""
+    async with Session(settings, evidence, execute=True, digest=args.approved_digest,
+                       approval_note=args.approval_note) as session:
+        result = await grasp.run(session, workcell=args.workcell, skill=plan["skill_id"],
+                                 arguments=plan["args"], operation=operation, approved=plan)
+        if result.get("ok") is not True:
+            return result
+        final = await session.snapshot(ready=True)
+        arrival = {"position": motion.tolerance(session.context, motion.POSE[:3], settings.position_mm),
+                   "orientation": motion.tolerance(session.context, motion.POSE[3:], settings.orientation_deg),
+                   "joint": motion.tolerance(session.context, motion.JOINTS, settings.joint_deg),
+                   "gripper": motion.tolerance(session.context, ("gripper.position",), settings.grip_mm)}
+    readback = await verify_after_exit(settings, evidence, {"arrival": arrival}, final)
+    return {**result, "post_exit_verified": readback["ok"], "post_exit_snapshot": readback["snapshot"]}
+
+
 async def hardware(args: argparse.Namespace, settings: Settings, evidence: Evidence) -> dict[str, Any]:
     executing = getattr(args, "execute", False)
-    operation = {"verify": "verify", "gripper": "gripper"}.get(args.group, args.operation)
+    operation = ("grasp_cycle" if args.group == "grasp" else
+                 "gripper_qualify" if args.group == "gripper" and args.operation == "qualify" else
+                 {"verify": "verify", "gripper": "gripper"}.get(args.group, args.operation))
     plan = approved(args, settings, operation) if executing else None
+    if plan is not None and operation in ("grasp_cycle", "gripper_qualify"):
+        expected_skill = "grasp.cycle" if operation == "grasp_cycle" else "gripper.qualify"
+        if plan.get("skill_id") != expected_skill or plan.get("workcell") != args.workcell:
+            raise Refusal("skill or workcell differs from approved preview")
+        if operation == "gripper_qualify":
+            widths = [float(value) for value in args.widths.split(",")]
+            if widths != plan.get("args", {}).get("widths"):
+                raise Refusal("gripper widths differ from approved preview")
+        return await skill_execution(args, settings, evidence, plan, operation)
     async with Session(settings, evidence, execute=executing, digest=getattr(args, "approved_digest", ""),
                        approval_note=getattr(args, "approval_note", "")) as session:
         assert session.context is not None
+        if args.group == "qualify":
+            return await qualification.report(session, args.workcell)
+        if args.group == "grasp":
+            if args.operation == "snapshot":
+                return await grasp.snapshot(session, args.workcell, share_frames=args.share_frames)
+            if args.operation == "preview":
+                return await grasp.prepare(session, args.workcell, qualification.load(args.args_file),
+                                           share_frames=args.share_frames)
+            if plan is None:
+                raise Refusal("grasp cycle requires a separate grasp preview; no implicit planning or motion")
+            return await grasp.run(session, workcell=args.workcell, skill="grasp.cycle",
+                                   arguments=plan["args"], operation=operation, approved=plan)
+        if args.group == "gripper" and args.operation == "qualify":
+            widths = [float(value) for value in args.widths.split(",")]
+            return await grasp.run(session, workcell=args.workcell, skill="gripper.qualify",
+                                   arguments={"widths": widths}, operation=operation, approved=plan)
         if args.group == "calibration":
             if args.operation == "inspect":
                 return await calibration.run(session)
@@ -136,7 +203,7 @@ async def hardware(args: argparse.Namespace, settings: Settings, evidence: Evide
             cal_plan = {"version": 1, "operation": "run", "settings": asdict(settings),
                         "declaration_digest": unverified_digest(session.context),
                         "node_id": settings.node_id, "workcell": args.workcell, "skill_id": args.skill,
-                        "args": arguments, "plan_digest": result["plan"]["digest"], "skill_plan": result["plan"]}
+                        "args": result["plan"]["args"], "plan_digest": result["plan"]["digest"], "skill_plan": result["plan"]}
             return preview_result(cal_plan)
         if args.operation == "status":
             return {"ok": True, "declaration_digest": unverified_digest(session.context),
@@ -150,13 +217,17 @@ async def hardware(args: argparse.Namespace, settings: Settings, evidence: Evide
             start = await session.snapshot(preflight=True)
             plan = motion.preview(session.context, start, settings, operation=operation,
                                   dx=getattr(args, "dx_mm", 0.0), dy=getattr(args, "dy_mm", 0.0),
-                                  dz=getattr(args, "dz_mm", 0.0), width=getattr(args, "width_mm", None))
+                                  dz=getattr(args, "dz_mm", 0.0), width=getattr(args, "width_mm", None),
+                                  cycles=getattr(args, "cycles", 0), dwell_s=getattr(args, "dwell_s", 0.0))
             return preview_result(plan)
         # The selected command arguments must still describe the approved artifact.
         delta = plan["delta_base_mm"]
         for axis in "xyz":
             if hasattr(args, f"d{axis}_mm") and getattr(args, f"d{axis}_mm") != delta[axis]:
                 raise Refusal("command displacement differs from approved preview")
+        if args.group == "arm" and args.operation == "cycle":
+            if args.cycles != plan.get("cycles") or args.dwell_s != plan.get("dwell_s"):
+                raise Refusal("cycle count or dwell differs from approved preview")
         if args.group == "gripper" and args.width_mm is not None and args.width_mm != plan["steps"][-1]["grip"]:
             raise Refusal("gripper width differs from approved preview")
         final = await motion.execute_plan(session, plan)
@@ -184,7 +255,8 @@ async def verify_after_exit(settings: Settings, evidence: Evidence,
         except (Exception, asyncio.CancelledError) as error:
             print("Post-exit halt unconfirmed: use the physical emergency stop and inspect.", file=sys.stderr)
             try:
-                evidence.record("post_exit_halt_failure", failure_class=type(error).__name__)
+                evidence.record("post_exit_halt_failure", failure_class=type(error).__name__,
+                                side_effect_state=SideEffectState.UNKNOWN)
             except OSError:
                 pass
         raise
@@ -193,6 +265,10 @@ async def verify_after_exit(settings: Settings, evidence: Evidence,
 
 def local(args: argparse.Namespace, settings: Settings, evidence: Evidence) -> dict[str, Any]:
     executing = getattr(args, "execute", False)
+    if args.group == "gripper" and args.operation == "qualify" and args.measurements:
+        if executing:
+            raise Refusal("--measurements is offline only; never combine it with --execute")
+        return qualification.jaw_certificate(args.measurements)
     if args.group == "calibration":
         return calibration.validate(args.package, settings.device_id)
     if args.group == "node":
@@ -233,7 +309,9 @@ def main(argv: list[str] | None = None) -> int:
                                   ("endpoint", "node_id", "device_id", "token_file", "issuer_key", "root")})
         path = args.json or settings.root / "data/runs" / f"{args.group}-{args.operation}-{uuid.uuid4().hex}.json"
         evidence = Evidence(path)
-        if args.group in ("node", "layout") or (args.group == "calibration" and args.operation == "validate"):
+        if (args.group in ("node", "layout")
+                or (args.group == "calibration" and args.operation == "validate")
+                or (args.group == "gripper" and args.operation == "qualify" and args.measurements)):
             result = local(args, settings, evidence)
         else:
             result = asyncio.run(asyncio.wait_for(hardware(args, settings, evidence), settings.run_timeout_s))
@@ -245,7 +323,8 @@ def main(argv: list[str] | None = None) -> int:
                           "inspect evidence and hardware before continuing",
                           code="internal_defect" if internal else "piper_operations_failed",
                           state=SideEffectState.UNKNOWN if getattr(args, "execute", False) else SideEffectState.NONE)
-        result = {"ok": False, "failure": asdict(exc.envelope)}
+        envelope = evidence.failure_envelope(exc) if evidence is not None else exc.envelope
+        result = {"ok": False, "failure": asdict(envelope)}
         if evidence is not None:
             try:
                 result = evidence.failure(exc)

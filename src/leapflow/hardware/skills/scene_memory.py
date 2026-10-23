@@ -9,7 +9,8 @@ calibration moves (the *basis*: the frame versions it was measured against).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import uuid
+from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Sequence
 
 from leapflow.hardware.rgbd import RgbdFrame
@@ -24,6 +25,7 @@ class SceneCapture:
     frame: RgbdFrame
     camera_to_base: Transform
     table: Plane
+    capture_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 class SceneMemory:

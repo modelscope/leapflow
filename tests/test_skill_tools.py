@@ -85,16 +85,21 @@ class _Node:
         *,
         node_id: str = NODE_ID,
         write_mode: str = WRITE_MODE_TRUSTED_V1,
+        cell: Mapping[str, Any] | None = None,
+        node_skills: tuple[Any, ...] | None = None,
+        devices: Mapping[str, Any] | None = None,
         **sim: Any,
     ) -> None:
         root = tmp_path / node_id
-        self.registry = SkillNodeRegistry(SimArmTransport(**sim), store_path=root / "cal.duckdb")
+        self.registry = SkillNodeRegistry(
+            SimArmTransport(**sim), store_path=root / "cal.duckdb", devices=devices
+        )
         self.registry.calibrate_cell()
-        write_workcell(root / "workcells")
+        write_workcell(root / "workcells", cell) if cell is not None else write_workcell(root / "workcells")
         self.runtime = SkillRuntime(
             self.registry,
             settings=SkillRuntimeSettings(workcells_dir=root / "workcells"),
-            skills=(*motion_skills(), *sequence_skills()),
+            skills=node_skills if node_skills is not None else (*motion_skills(), *sequence_skills()),
             poll_s=0.005,
         )
         self.server = LhpNodeServer(

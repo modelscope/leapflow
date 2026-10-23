@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import uuid
 from dataclasses import replace
 from typing import Any, Coroutine, TypeVar
@@ -22,7 +23,7 @@ from leapflow.security.orchestrator import ApprovalOrchestrator
 from leapflow.tools.execution_context import ToolExecutionContext, reset_tool_context, set_tool_context
 
 from .config import Settings
-from .evidence import Evidence, Refusal
+from .evidence import Evidence, Refusal, StaleFeedback
 from .health import Snapshot, read_snapshot
 
 
@@ -114,7 +115,7 @@ class Session:
         if self.touched or self._approved_steps:
             raise Refusal("steps are already bound or execution has begun")
         self._approved_steps = [(r["label"], tuple((c, v) for c, v in r["commands"]),
-                                 r["configure"]) for r in steps]
+                                 r["configure"]) for r in steps if r.get("dwell_s") is None]
 
     async def __aenter__(self) -> Session:
         try:
@@ -167,7 +168,7 @@ class Session:
         if described.get("ok") is not True:
             raise Refusal("persistent owner binding failed; inspect node status")
         self.evidence.record("connected", node_id=s.node_id, write_mode=hello["write_mode"],
-                             declaration_digest=unverified_digest(self.context))
+                             declaration_digest=unverified_digest(self.context), execute=self.execute)
 
     def _declaration(self, listing: dict[str, Any]) -> HardwareContext:
         if not isinstance(listing, dict) or listing.get("node_id") != self.settings.node_id:
@@ -183,9 +184,36 @@ class Session:
             raise Refusal("declared device is not Piper X")
         return context
 
-    async def snapshot(self, *, ready: bool = False, preflight: bool = False) -> Snapshot:
+    async def snapshot(self, *, ready: bool = False, preflight: bool = False,
+                       requalify: bool = False) -> Snapshot:
+        """Read one qualified snapshot; ``requalify`` re-samples only a receive gap.
+
+        A stale CAN sample describes the reception, not the arm, so an observation may
+        read again inside the configured request budget while the servo keeps following
+        its waypoint; a reception that never requalifies stops the run instead of
+        spinning. Every other refusal — fault, thermal, enable, mode — still aborts at
+        once, and without ``requalify`` the sample fails closed exactly as before.
+        """
         assert self.registry is not None
-        return await read_snapshot(self.registry, self.settings, ready=ready, preflight=preflight)
+        deadline, stale = time.monotonic() + self.settings.request_timeout_s, 0
+        while True:
+            try:
+                current = await read_snapshot(self.registry, self.settings,
+                                             ready=ready, preflight=preflight)
+            except StaleFeedback as exc:
+                if not requalify:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise Refusal("controller feedback did not requalify; halt and inspect",
+                                  state=SideEffectState.UNKNOWN) from exc
+                stale += 1
+                if stale == 1:
+                    self.evidence.record("stale_feedback", detail=str(exc))
+                await asyncio.sleep(self.settings.poll_s)
+                continue
+            if stale:
+                self.evidence.record("feedback_requalified", stale_samples=stale)
+            return current
 
     async def command(self, label: str, commands: tuple[tuple[str, Any], ...], *, configure: bool = False) -> None:
         """Send once through HardwareTools; a failed/uncertain result is never replayed."""
@@ -193,23 +221,31 @@ class Session:
         current = self._declaration(await self.client.request("list"))
         if self.execute and (unverified_digest(current) != self.digest or not current.provenance.is_verified):
             raise Refusal("declaration changed during execution")
-        await self.snapshot(ready=not configure, preflight=True)
+        await self.snapshot(ready=not configure, preflight=True, requalify=True)
         if self.execute:
             if not self._approved_steps or self._approved_steps[0] != (label, commands, configure):
                 raise Refusal("command differs from the complete approved preview")
             self._approved_steps.pop(0)  # consume before dispatch, never replay an uncertain send
         self.consent.expected = commands
         if self.execute:
+            self.evidence.record("command_attempt", label=label, commands=commands, configure=configure)
             self.touched = True  # set before dispatch, including cancellation/uncertain send
-        if len(commands) == 1 and configure:
-            channel, value = commands[0]
-            result = await asyncio.wait_for(self.tools.hw_configure(device_id=self.settings.device_id,
-                channel_id=channel, value=value, dry_run=not self.execute),
-                self.settings.request_timeout_s)
-        else:
-            result = await asyncio.wait_for(self.tools.batch_actuate({"device_id": self.settings.device_id,
-                "commands": [{"channel_id": c, "value": v} for c, v in commands],
-                "dry_run": not self.execute, "verify": False}), self.settings.request_timeout_s)
+        try:
+            if len(commands) == 1 and configure:
+                channel, value = commands[0]
+                result = await asyncio.wait_for(self.tools.hw_configure(device_id=self.settings.device_id,
+                    channel_id=channel, value=value, dry_run=not self.execute),
+                    self.settings.request_timeout_s)
+            else:
+                result = await asyncio.wait_for(self.tools.batch_actuate({"device_id": self.settings.device_id,
+                    "commands": [{"channel_id": c, "value": v} for c, v in commands],
+                    "dry_run": not self.execute, "verify": False}), self.settings.request_timeout_s)
+        except BaseException:
+            if self.execute:
+                self.evidence.observe_effect(SideEffectState.UNKNOWN)
+            raise
+        if self.execute:
+            self.evidence.observe_effect(result.get("side_effect_state"))
         self.evidence.record(label, commands=commands, result=result)
         if result.get("ok") is not True:
             raw_state = result.get("side_effect_state")
@@ -224,9 +260,14 @@ class Session:
         if self.tools is None:
             raise Refusal("halt connection unavailable; use the physical emergency stop",
                           state=SideEffectState.UNKNOWN)
-        result = await asyncio.wait_for(self.tools.hw_estop(device_id=self.settings.device_id),
-                                        self.settings.request_timeout_s)
-        self.evidence.record("damped_stop", result=result)
+        try:
+            result = await asyncio.wait_for(self.tools.hw_estop(device_id=self.settings.device_id),
+                                            self.settings.request_timeout_s)
+        except BaseException:
+            self.evidence.observe_effect(SideEffectState.UNKNOWN)
+            raise
+        state = SideEffectState.COMMITTED if result.get("ok") is True else SideEffectState.UNKNOWN
+        self.evidence.record("damped_stop", result=result, side_effect_state=state)
         if result.get("ok") is not True:
             raise Refusal("stop delivery unconfirmed; use the physical emergency stop",
                           state=SideEffectState.UNKNOWN)
@@ -256,10 +297,14 @@ class Session:
                         print("Close-failure halt unconfirmed: use the physical emergency stop and inspect.",
                               file=sys.stderr)
         if cleanup_error is not None:
+            if halt_required:
+                self.evidence.observe_effect(SideEffectState.UNKNOWN)
             self._record_cleanup_error(cleanup_error)
             if exc is None:
                 raise Refusal("cleanup unconfirmed; inspect hardware before continuing",
                               state=SideEffectState.UNKNOWN) from cleanup_error
+        if isinstance(exc, Refusal):
+            exc.envelope = self.evidence.failure_envelope(exc)
 
     async def _halt_with_fresh_client(self) -> None:
         """Request only a safety halt after disposal failure; never replay motion."""

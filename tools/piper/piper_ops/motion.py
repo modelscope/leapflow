@@ -143,7 +143,7 @@ def _segment(context: HardwareContext, chain: DhChain, origin: Pose, destination
 
 def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, operation: str,
             dx: float = 0.0, dy: float = 0.0, dz: float = 0.0,
-            width: float | None = None) -> dict[str, Any]:
+            width: float | None = None, cycles: int = 0, dwell_s: float = 0.0) -> dict[str, Any]:
     """A complete immutable-by-hash request, including return and safety configuration."""
     settings.validate()
     dx, dy, dz = number(dx), number(dy), number(dz)
@@ -199,6 +199,29 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
         path, seed = _segment(context, chain, origin_pose, origin_pose.translated(dx, dy, dz),
                               seed, settings, "move")
         rows.extend(path)
+    elif operation == "cycle":
+        # A vertical round trip repeated under one approval; every leg is segmented and
+        # monitored exactly like verify, and the dwell is a held, re-checked pause.
+        if dx != 0 or dy != 0 or dz <= 0:
+            raise Refusal("cycle is a vertical repeat with a positive Z distance and no X/Y")
+        if type(cycles) is not int or not 1 <= cycles <= settings.max_cycles:
+            raise Refusal(f"cycle count must be an integer between 1 and {settings.max_cycles}")
+        if not 0 <= dwell_s <= settings.max_dwell_s:
+            raise Refusal(f"dwell must be between 0 and {settings.max_dwell_s} seconds")
+        rows.append(step("linear_path", (("arm.pose_path", "linear"),), configure=True))
+        lifted = origin_pose.translated(dz=dz)
+        joint_tolerance = tolerance(context, JOINTS, settings.joint_deg)
+        for index in range(1, cycles + 1):
+            path, seed = _segment(context, chain, origin_pose, lifted, seed, settings, f"cycle{index}.up")
+            rows.extend(path)
+            path, seed = _segment(context, chain, lifted, origin_pose, seed, settings, f"cycle{index}.down")
+            rows.extend(path)
+            if max(abs(a - b) for a, b in zip(seed, origin_q)) > joint_tolerance:
+                raise Refusal("cycle return IK does not recover the origin joint branch")
+            paused = step(f"cycle{index}.dwell", (), joints=origin_q, pose=origin_pose,
+                          grip=start.gripper_mm)
+            paused["dwell_s"] = dwell_s
+            rows.append(paused)
     elif operation == "gripper":
         target = maximum if width is None else number(width)
         if not 0 <= target <= maximum:
@@ -215,9 +238,29 @@ def preview(context: HardwareContext, start: Snapshot, settings: Settings, *, op
             "settings": asdict(settings), "start": {"joints": start.joints, "pose": asdict(start.pose),
                                                     "gripper_mm": start.gripper_mm},
             "origin_joints": origin_q, "origin_pose": asdict(origin_pose), "gripper_max_mm": maximum,
-            "delta_base_mm": {"x": dx, "y": dy, "z": dz}, "finish": "enabled",
+            "delta_base_mm": {"x": dx, "y": dy, "z": dz}, "cycles": cycles, "dwell_s": dwell_s,
+            "finish": "enabled",
             "arrival": arrival, "initialization_sweep": swept, "steps": rows,
             "clearance": "Operator must confirm unobstructed swept volume, empty jaws and accessible physical emergency stop"}
+
+
+def check_return(plan: dict[str, Any], origin: Snapshot, current: Snapshot, settings: Settings) -> None:
+    """Verify the return by the commanded flange pose, not by redundant-joint equality.
+
+    A base-yaw waypoint of one millimetre is about one degree of joint motion, and the
+    servos settle with a following error of the same order, so demanding the predicted
+    joint vector at rest turns a normal residual into a failed run; that gate stalled a
+    verified sweep twice (0.48 deg short at +Y 10 mm, 0.32 deg short at the return).
+    The joint path is enforced in flight by the planned-segment envelope, so at the end
+    the flange pose and the opening carry the contract, with the envelope still bounding
+    a departure from the planned branch.
+    """
+    arrival = plan["arrival"]
+    if (origin.pose.distance_mm(current.pose) > arrival["position"] or
+            origin.pose.rotation_to_deg(current.pose) > arrival["orientation"] or
+            abs(current.gripper_mm - origin.gripper_mm) > arrival["gripper"] or
+            max(abs(a - b) for a, b in zip(origin.joints, current.joints)) > settings.deviation_deg):
+        raise Refusal("final state departed from the recorded return origin", state=SideEffectState.UNKNOWN)
 
 
 def check_start(plan: dict[str, Any], current: Snapshot) -> None:
@@ -238,7 +281,7 @@ async def wait_arrived(session: Session, row: dict[str, Any], before: Snapshot,
     target = Pose.from_mapping(row["pose"]) if row.get("pose") else None
     q = row.get("joints")
     while time.monotonic() < deadline:
-        current = await session.snapshot(ready=True)
+        current = await session.snapshot(ready=True, requalify=True)
         fresh = all(a > b for a, b in zip(current.receipts, last))
         if not fresh:
             stable = 0
@@ -261,7 +304,11 @@ async def wait_arrived(session: Session, row: dict[str, Any], before: Snapshot,
                 raise Refusal("flange departed the preflighted line", state=SideEffectState.UNKNOWN)
         arrived = current.status.get("motion_status") == 0
         if q is not None:
-            arrived &= max(abs(a - b) for a, b in zip(q, current.joints)) <= arrival["joint"]
+            # The planned joint vector is a prediction, not a contract: base yaw moves
+            # about one degree per millimetre, so an ordinary servo residual would read
+            # as a missed waypoint. The segment envelope above proves the planned branch
+            # was followed; the flange pose below proves arrival.
+            arrived &= max(abs(a - b) for a, b in zip(q, current.joints)) <= settings.deviation_deg
         if target is not None:
             arrived &= target.distance_mm(current.pose) <= arrival["position"]
             arrived &= target.rotation_to_deg(current.pose) <= arrival["orientation"]
@@ -276,16 +323,24 @@ async def wait_arrived(session: Session, row: dict[str, Any], before: Snapshot,
 
 
 async def execute_plan(session: Session, plan: dict[str, Any]) -> Snapshot:
-    check_start(plan, await session.snapshot(preflight=True))
+    check_start(plan, await session.snapshot(preflight=True, requalify=True))
     if not session.context or plan["declaration_digest"] != unverified_digest(session.context):
         raise Refusal("preview declaration changed")
     if digest_plan(plan["settings"]) != digest_plan(asdict(session.settings)):
         raise Refusal("effective settings differ from approved preview")
     session.bind_steps(plan["steps"])
     session.evidence.record("approved_plan", plan=plan, approval_note=session.approval_note)
-    before = await session.snapshot(preflight=True)
+    before = await session.snapshot(preflight=True, requalify=True)
+    initial = before
     origin = None
     for row in plan["steps"]:
+        if row.get("dwell_s") is not None:
+            # The dwell holds the previous target; re-check the return pose afterwards so a
+            # sag or drift during the pause is a failed run, not a silent continuation.
+            await asyncio.sleep(float(row["dwell_s"]))
+            before = await wait_arrived(session, row, before, plan["arrival"])
+            session.evidence.record(row["label"] + ".dwell_completed", snapshot=before.to_dict())
+            continue
         await session.command(row["label"], tuple((c, v) for c, v in row["commands"]), configure=row["configure"])
         if row["label"] == "enable":
             before = await wait_arrived(session, row, before, plan["arrival"])
@@ -294,12 +349,13 @@ async def execute_plan(session: Session, plan: dict[str, Any]) -> Snapshot:
             if row["label"] == "initialize":
                 origin = before
                 session.evidence.record("return_origin", snapshot=origin.to_dict())
-    final = await session.snapshot(ready=True)
+    final = await session.snapshot(ready=True, requalify=True)
     if plan["operation"] == "verify":
         if origin is None:
             raise Refusal("settled return origin not recorded", state=SideEffectState.UNKNOWN)
-        check_start({"arrival": plan["arrival"], "start": {"joints": origin.joints,
-                    "pose": asdict(origin.pose), "gripper_mm": origin.gripper_mm}}, final)
+        check_return(plan, origin, final, session.settings)
+    elif plan["operation"] == "cycle":
+        check_return(plan, initial, final, session.settings)
     session.evidence.record("final_enabled", snapshot=final.to_dict())
     session.success = True
     return final

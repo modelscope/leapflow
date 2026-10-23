@@ -49,6 +49,39 @@ DEFAULT_CALIBRATION: Mapping[str, float] = {
     "max_hand_eye_rotation_rms_deg": 0.5,
     "min_verify_points": 5.0,
     "max_verify_p95_mm": 5.0,
+    "max_verify_rms_mm": 5.0,
+}
+
+DEFAULT_GRASP_VERIFY: Mapping[str, float] = {
+    "alignment_mm": 3.0,
+    "max_age_s": 1.0,
+    "min_frames": 3.0,
+    "min_proof_lift_mm": 5.0,
+    "max_proof_lift_mm": 10.0,
+    "max_relative_error_mm": 2.0,
+    "max_slip_mm": 1.0,
+    "max_uncertainty_mm": 1.0,
+    "capture_drift_mm": 0.5,
+    "capture_drift_deg": 0.5,
+    "poll_s": 0.05,
+    "clearance_mm": 3.0,
+    "jaw_stroke_error_mm": 1.5,
+    "max_sync_skew_s": 0.1,
+    "pad_midpoint_mm": 2.0,
+    "empty_gap_mm": 1.0,
+    "contact_geometry_mm": 1.5,
+    "contact_contour_px": 2.0,
+    "contact_axis_deg": 2.0,
+    "support_mm": 1.0,
+    "effort_uncertainty_n": 0.2,
+    "effort_error_n": 0.5,
+    "effort_width_scope_mm": 1.0,
+    "effort_pose_scope_mm": 10.0,
+    "effort_pose_scope_deg": 1.0,
+    "cycle_path_step_mm": 5.0,
+    "cycle_max_waypoints": 128.0,
+    "placement_mm": 3.0,
+    "warmup_timeout_s": 5.0,
 }
 
 GRIPPER_SPEC_KEYS = frozenset({"max_width_mm", "min_hold_width_mm"})
@@ -94,6 +127,7 @@ def gripper_spec(raw: Any) -> dict[str, float]:
 __all__ = [
     "DEFAULT_CALIBRATION",
     "DEFAULT_FRESHNESS",
+    "DEFAULT_GRASP_VERIFY",
     "DEFAULT_LIMITS",
     "DEFAULT_MIN_HOLD_WIDTH_MM",
     "GRIPPER_SPEC_KEYS",

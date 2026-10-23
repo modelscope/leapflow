@@ -263,7 +263,7 @@ def unmet_requirements(
 
 
 def _calib_skill(frame: str) -> str:
-    return {"camera": "handeye"}.get(frame, frame)
+    return "handeye" if frame.split(".", 1)[0] == "camera" else frame
 
 
 __all__ = ["FrameGraph", "unmet_requirements"]

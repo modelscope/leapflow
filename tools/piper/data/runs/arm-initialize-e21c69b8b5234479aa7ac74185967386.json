@@ -1,0 +1,28 @@
+{
+  "ok": false,
+  "failure": {
+    "envelope_id": "d937f3f2783b4466b7d5a31417f6f6d5",
+    "source": "tool",
+    "category": "hardware",
+    "failure_class": "Refusal",
+    "failure_code": "piper_operations_failed",
+    "message": "Operation failed (LhpRemoteError); inspect evidence and hardware before continuing",
+    "recoverability": "user_fixable",
+    "side_effect_state": "none",
+    "context": {
+      "tool_name": "",
+      "arguments": [],
+      "execution_id": "",
+      "trace_id": "",
+      "turn_id": 0,
+      "session_id": "",
+      "provider": "",
+      "model": "",
+      "attempt_number": 0,
+      "elapsed_ms": 0.0
+    },
+    "timestamp": 1792738629.194954,
+    "provider_hint": null
+  },
+  "events": []
+}
