@@ -76,6 +76,7 @@ from leapflow.hardware.skills.geometry import WorkspaceBox
 from leapflow.hardware.skills.tuning import (
     DEFAULT_CALIBRATION,
     DEFAULT_FRESHNESS,
+    DEFAULT_GRASP_VERIFY,
     DEFAULT_LIMITS,
     gripper_spec,
     tuned,
@@ -101,6 +102,7 @@ WORKCELL_FIELDS = frozenset(
         "calibration",
         "models",
         "grasp",
+        "grasp_verify",
         "perception",
         "policy",
         "policies",
@@ -164,6 +166,7 @@ class WorkcellSpec:
     calibration: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_CALIBRATION))
     models: Mapping[str, str] = field(default_factory=dict)
     grasp: Mapping[str, Any] = field(default_factory=dict)
+    grasp_verify: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_GRASP_VERIFY))
     perception: Mapping[str, float] = field(default_factory=dict)
     policy: Mapping[str, float] = field(default_factory=dict)
     policies: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
@@ -224,6 +227,7 @@ class WorkcellSpec:
             "calibration": dict(self.calibration),
             "models": dict(self.models),
             "grasp": {**dict(self.grasp), "planner": self.grasp_planner},
+            "grasp_verify": dict(self.grasp_verify),
             "perception": dict(self.perception),
             "policy": dict(self.policy),
             "policies": {name: dict(decl) for name, decl in self.policies.items()},
@@ -254,10 +258,16 @@ class WorkcellSpec:
             raise WorkcellError(f"workspace has unknown fields {unknown}")
         try:
             bootstrap = workspace.get("bootstrap_box")
+            frames = _parse_frames(data.get("frames") or {}, roles=roles)
+            procedures = [decl.procedure for decl in frames.values()]
+            if workspace.get("procedure"):
+                procedures.append(str(workspace["procedure"]))
+            if len(set(procedures)) != len(procedures):
+                raise WorkcellError("calibration procedures must be unique within a workcell")
             return cls(
                 workcell_id=workcell_id,
                 roles=roles,
-                frames=_parse_frames(data.get("frames") or {}),
+                frames=frames,
                 workspace_procedure=str(workspace.get("procedure") or ""),
                 tool_cone_deg=_positive(workspace.get("tool_cone_deg", 30.0), "tool_cone_deg"),
                 bootstrap_box=WorkspaceBox.from_mapping(bootstrap) if bootstrap else None,
@@ -270,6 +280,7 @@ class WorkcellSpec:
                 ),
                 models=_parse_models(data.get("models") or {}),
                 grasp=_parse_grasp(data.get("grasp") or {}),
+                grasp_verify=_parse_grasp_verify(data.get("grasp_verify") or {}),
                 perception=_float_map(data.get("perception") or {}, "perception"),
                 policy=_float_map(data.get("policy") or {}, "policy"),
                 policies=_parse_policies(data.get("policies") or {}),
@@ -527,16 +538,22 @@ def _writable(context: Any, channel_id: str) -> bool:
 # ── Parsing helpers ──────────────────────────────────────────────────────────
 
 
-def _parse_frames(raw: Any) -> dict[str, FrameDecl]:
+def _parse_frames(raw: Any, *, roles: Mapping[str, str]) -> dict[str, FrameDecl]:
     if not isinstance(raw, Mapping):
         raise WorkcellError("'frames' must be a mapping")
     frames: dict[str, FrameDecl] = {}
     for name, decl in raw.items():
         name = str(name)
+        if not _ROLE_NAME.fullmatch(name):
+            raise WorkcellError(f"invalid frame name {name!r}")
+        if role_kind(name) == ROLE_CAMERA and name not in roles:
+            raise WorkcellError(f"camera frame {name!r} must bind a camera role")
         if name == WORKSPACE_FRAME or name in FRAME_PARENTS:
             raise WorkcellError(f"frame name {name!r} is reserved")
         if not isinstance(decl, Mapping):
             raise WorkcellError(f"frame {name!r} must be a mapping")
+        if set(decl) - {"parent", "procedure"}:
+            raise WorkcellError(f"frame {name!r} has unknown fields")
         parent = str(decl.get("parent") or "")
         if parent not in FRAME_PARENTS:
             raise WorkcellError(f"frame {name!r} parent must be one of {sorted(FRAME_PARENTS)}")
@@ -601,6 +618,21 @@ def _mapping(raw: Any, name: str) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise WorkcellError(f"{name!r} must be a mapping")
     return {str(key): value for key, value in raw.items()}
+
+
+def _parse_grasp_verify(raw: Any) -> dict[str, float]:
+    values = tuned(raw, "grasp_verify", DEFAULT_GRASP_VERIFY)
+    count = values["min_frames"]
+    if count != int(count) or not 3 <= count <= 10:
+        raise WorkcellError("grasp_verify.min_frames must be a whole number in [3, 10]")
+    if values["min_proof_lift_mm"] > values["max_proof_lift_mm"]:
+        raise WorkcellError("grasp_verify proof-lift bounds are reversed")
+    if values["poll_s"] * count >= values["max_age_s"]:
+        raise WorkcellError("grasp_verify sampling window must fit within max_age_s")
+    budget = values["cycle_max_waypoints"]
+    if budget != int(budget) or not 7 <= budget <= 4096:
+        raise WorkcellError("grasp_verify.cycle_max_waypoints must be a whole number in [7, 4096]")
+    return values
 
 
 def _parse_limits(raw: Any) -> dict[str, float]:

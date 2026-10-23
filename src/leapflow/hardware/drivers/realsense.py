@@ -261,7 +261,8 @@ class RealSenseTransport:
                 evidence = await _worker(processor.measure, frame)
             except (ValueError, KeyError) as error:
                 raise TransportError(str(error), failure_code="depth_measurement_invalid") from error
-            qualified = evidence.depth.qualified if geometry else evidence.qualified
+            qualified = (evidence.depth.qualified or
+                         (len(evidence.pad_depth) == 2 and all(p.qualified for p in evidence.pad_depth))) if geometry else evidence.qualified
             return Reading(device_id=self._device_id, channel_id=channel_id,
                            value=evidence.to_dict(), quantity="geometry_proposal" if geometry else "depth_quality",
                            observed_at=frame.observed_at, monotonic_at=frame.monotonic_at,

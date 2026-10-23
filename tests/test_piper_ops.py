@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,7 +24,7 @@ from leapflow.security.actions import ActionDescriptor
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest
 from piper_ops import cli, health, layout, lifecycle, motion, node, session as session_module
 from piper_ops.config import Settings
-from piper_ops.evidence import Evidence, Refusal
+from piper_ops.evidence import Evidence, Refusal, encode
 from piper_ops.session import ScopedConsent, Session, unverified_digest
 from leapflow.tools.execution_context import ToolExecutionContext, current_tool_context, set_tool_context
 
@@ -91,6 +91,8 @@ def test_modules_import(module):
 def test_cli_dispatch_and_frame():
     args = cli.parser().parse_args(["verify", "motion", "--return", "--finish", "enabled"])
     assert (args.dz_mm, args.dy_mm, args.execute) == (100, 50, False)
+    cycle = cli.parser().parse_args(["arm", "cycle", "--frame", "base"])
+    assert (cycle.dz_mm, cycle.cycles, cycle.dwell_s) == (200, 5, 5)
     with pytest.raises(SystemExit):
         cli.parser().parse_args(["arm", "move", "--dz-mm", "100", "--frame", "viewpoint"])
     for command in (["arm", "status"], ["node", "status"], ["layout", "inspect"], ["calibration", "inspect"]):
@@ -179,6 +181,39 @@ def test_full_return_is_preflighted(settings):
     assert plan["finish"] == "enabled"
 
 
+def test_cycle_repeats_vertical_round_trips(settings):
+    start = snapshot()
+    plan = motion.preview(context(), start, settings, operation="cycle", dz=50., cycles=3, dwell_s=2.)
+    up = [r for r in plan["steps"] if ".up." in r["label"]]
+    down = [r for r in plan["steps"] if ".down." in r["label"]]
+    dwells = [r for r in plan["steps"] if r["label"].endswith(".dwell")]
+    assert len(up) == len(down) > 0 and len(dwells) == 3
+    assert (plan["cycles"], plan["dwell_s"]) == (3, 2.)
+    assert all(r["dwell_s"] == 2. and r["pose"] == pytest.approx(plan["origin_pose"]) for r in dwells)
+    assert max(r["pose"]["z"] for r in up) == pytest.approx(start.pose.z + 50)
+    assert plan["steps"][-1]["pose"] == pytest.approx(plan["origin_pose"])
+
+
+@pytest.mark.parametrize("changes, match", [
+    ({"dz": 0.}, "positive Z"),
+    ({"dz": 50., "dx": 1.}, "positive Z"),
+    ({"dz": 50., "cycles": 0}, "cycle count"),
+    ({"dz": 50., "cycles": 21}, "cycle count"),
+    ({"dz": 50., "cycles": 1, "dwell_s": -1.}, "dwell"),
+    ({"dz": 50., "cycles": 1, "dwell_s": 61.}, "dwell"),
+])
+def test_cycle_refuses_unsafe_requests(settings, changes, match):
+    with pytest.raises(Refusal, match=match):
+        motion.preview(context(), snapshot(), settings, operation="cycle", **changes)
+
+
+def test_bind_steps_skips_dwell(settings, tmp_path):
+    plan = motion.preview(context(), snapshot(), settings, operation="cycle", dz=20., cycles=2, dwell_s=1.)
+    run = Session(settings, Evidence(tmp_path / "bind-cycle.json"))
+    run.bind_steps(plan["steps"])
+    assert len(run._approved_steps) == len([r for r in plan["steps"] if r.get("dwell_s") is None])
+
+
 def test_evidence_never_overwrites(tmp_path):
     path = tmp_path / "run.json"
     first = Evidence(path)
@@ -186,6 +221,41 @@ def test_evidence_never_overwrites(tmp_path):
     with pytest.raises(Refusal):
         Evidence(path)
     assert "original" in first.event_path.read_text()
+
+
+@pytest.mark.parametrize("states,initial,expected", [
+    ([], "none", "none"),
+    (["none"], "none", "none"),
+    (["committed", "none"], "none", "committed"),
+    (["committed", "partial", "committed"], "none", "partial"),
+    (["unknown", "committed"], "none", "unknown"),
+    (["committed"], "unknown", "unknown"),
+    (["committed"], "partial", "partial"),
+    ([None, "committed"], "none", "unknown"),
+    (["invalid", "none"], "none", "unknown"),
+    ([SideEffectState.COMMITTED], "none", "committed"),
+])
+def test_failure_preserves_recorded_effects(tmp_path, states, initial, expected):
+    evidence = Evidence(tmp_path / "effects.json")
+    for state in states:
+        evidence.record("qualification_result", result={"side_effect_state": state})
+    error = Refusal("original refusal", state=SideEffectState(initial))
+    report = evidence.failure(error)
+    failure = report["failure"]
+    assert failure["side_effect_state"] == SideEffectState(expected)
+    assert failure["envelope_id"] == error.envelope.envelope_id
+    assert failure["timestamp"] == error.envelope.timestamp
+    assert failure["message"] == "original refusal"
+    assert json.loads(evidence.path.read_text())["failure"]["side_effect_state"] == expected
+    assert [json.loads(line) for line in evidence.event_path.read_text().splitlines()] == json.loads(encode(report["events"]))
+
+
+def test_preview_and_consent_do_not_imply_physical_effects(tmp_path):
+    evidence = Evidence(tmp_path / "no-dispatch.json")
+    evidence.record("approved_plan", plan={"steps": [{"side_effect_state": "committed"}]})
+    evidence.record("operator_consent", approved=True)
+    evidence.record("preview", result={"dry_run": True, "side_effect_state": "none"})
+    assert evidence.failure(Refusal("preflight refused"))["failure"]["side_effect_state"] == SideEffectState.NONE
 
 
 def test_backup_hidden_symlink_and_safe_manifest(tmp_path):
@@ -246,6 +316,64 @@ async def test_fresh_consecutive_arrival(settings, tmp_path):
     row = motion.step("move", tuple(zip(health.JOINTS, before.joints)), joints=before.joints, pose=before.pose)
     result = await motion.wait_arrived(session, row, before, {"joint": .5, "position": 2., "orientation": 1., "gripper": .5})
     assert result.receipts[0] == 7 and len(calls) == 7
+
+
+async def test_arrival_accepts_pose_converged_servo_residual(settings, tmp_path):
+    """A base-yaw following error must not read as a missed waypoint."""
+    before = snapshot(seq=1)
+    prediction = tuple(q + .46 for q in before.joints)
+    sequence = iter([(2, True), (3, True), (4, True)])
+    async def sample(**kwargs):
+        seq, arrived = next(sequence)
+        return snapshot(seq=seq, arrived=arrived)
+    session = SimpleNamespace(settings=replace(settings, poll_s=.001), snapshot=sample,
+                              evidence=Evidence(tmp_path / "residual.json"))
+    row = motion.step("left.009", (), joints=prediction, pose=before.pose)
+    result = await motion.wait_arrived(session, row, before,
+                                       {"joint": .5, "position": 2., "orientation": 1., "gripper": .5})
+    assert result.receipts[0] == 4
+
+
+def test_return_check_uses_pose_and_envelope(settings):
+    """The return is judged by the flange pose, with the envelope bounding branch departure."""
+    origin = snapshot()
+    plan = {"arrival": {"joint": .5, "position": 2., "orientation": 1., "gripper": .5}}
+    motion.check_return(plan, origin, replace(origin, joints=tuple(q + 1.2 for q in origin.joints)), settings)
+    with pytest.raises(Refusal, match="departed"):
+        motion.check_return(plan, origin, replace(origin, pose=origin.pose.translated(dz=3.)), settings)
+    with pytest.raises(Refusal, match="departed"):
+        motion.check_return(plan, origin, replace(origin, joints=tuple(q + 4. for q in origin.joints)), settings)
+
+
+async def test_snapshot_requalifies_a_momentary_receive_gap(settings, tmp_path):
+    """A stale CAN sample is re-read, never reported as an arm state."""
+    state = snapshot()
+    values, calls = feedback_values(state), []
+    async def read_batch(device_id, channels):
+        calls.append(1)
+        quality = "stale" if len(calls) <= 2 else "ok"
+        return SimpleNamespace(readings=tuple(SimpleNamespace(device_id=device_id, channel_id=c,
+                               value=values[c], quality=quality) for c in channels))
+    run = Session(replace(settings, poll_s=.001), Evidence(tmp_path / "requalify.json"))
+    run.registry = SimpleNamespace(read_batch=read_batch)
+    with pytest.raises(Refusal, match="unqualified controller channels"):
+        await run.snapshot()
+    current = await run.snapshot(requalify=True)
+    assert len(calls) == 3 and current.joints == state.joints
+    assert [e["event"] for e in run.evidence.events] == ["stale_feedback", "feedback_requalified"]
+
+
+async def test_requalification_deadline_is_a_hard_stop(settings, tmp_path):
+    """Feedback that never requalifies stops the run instead of spinning."""
+    values = feedback_values(snapshot())
+    async def read_batch(device_id, channels):
+        return SimpleNamespace(readings=tuple(SimpleNamespace(device_id=device_id, channel_id=c,
+                               value=values[c], quality="stale") for c in channels))
+    run = Session(replace(settings, poll_s=.001, request_timeout_s=.001), Evidence(tmp_path / "never.json"))
+    run.registry = SimpleNamespace(read_batch=read_batch)
+    with pytest.raises(Refusal, match="did not requalify") as caught:
+        await run.snapshot(requalify=True)
+    assert caught.value.envelope.side_effect_state == SideEffectState.UNKNOWN
 
 
 async def test_session_failure_halts_once_success_stays_enabled(settings, tmp_path, monkeypatch):
@@ -578,9 +706,119 @@ async def test_real_governed_transport_failure_preserves_effect_and_halts(govern
         async with run:
             run.bind_steps([motion.step("speed", (("arm.speed_pct", 10.),), configure=True)])
             await run.command("speed", (("arm.speed_pct", 10.),), configure=True)
-    assert failure.value.envelope.side_effect_state == SideEffectState(fixture.effect)
+    command = next(row for row in run.evidence.events if row["event"] == "speed")
+    assert command["result"]["side_effect_state"] == fixture.effect
+    # A refused write stays NONE in its own result; the delivered safety halt is a run effect.
+    expected = "committed" if fixture.effect == "none" else fixture.effect
+    assert failure.value.envelope.side_effect_state == SideEffectState(expected)
     assert fixture.transport.write_attempts("arm.speed_pct") == 1
     assert sum(method == "halt" for method, _ in fixture.requests) == 1
+
+
+@pytest.mark.parametrize("summary,report_write_fails", [(False, False), (True, False), (True, True)])
+def test_cli_mode_loss_after_committed_writes_never_reports_none(
+        governed_node, tmp_path, monkeypatch, capsys, summary, report_write_fails):
+    """Drive the real CLI/governor/node; inject mode loss at the transport I/O boundary."""
+    fixture = governed_node
+    configured = fixture.settings
+    config_path, preview_path, report_path = (tmp_path / name for name in
+                                              ("config.json", "preview.json", "mode-loss.json"))
+    config_path.write_text(encode(asdict(configured)))
+    start = snapshot((0., -2., 0., 20., -40., -100.))
+    for channel_id, value in feedback_values(start).items():
+        fixture.transport.set_value(channel_id, value)
+    plan = motion.preview(fixture.declaration, start, configured, operation="initialize")
+    preview_path.write_text(encode(cli.preview_result(plan)))
+    real_read = fixture.transport.read
+    sequence = 1
+
+    async def read(channel_id):
+        nonlocal sequence
+        if channel_id == "arm.telemetry":
+            sequence += 1
+            fixture.transport.set_value(channel_id, snapshot(seq=sequence).telemetry)
+        if channel_id == "arm.status" and fixture.transport.write_attempts(health.JOINTS[-1]):
+            fixture.transport.set_value(channel_id, {**snapshot().status, "ctrl_mode": 0})
+        return await real_read(channel_id)
+
+    monkeypatch.setattr(fixture.transport, "read", read)
+    if report_write_fails:
+        real_open = Path.open
+
+        def open_boundary(path, mode="r", *args, **kwargs):
+            if path == report_path and mode == "w":
+                raise OSError("offline report storage unavailable")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", open_boundary)
+    argv = ["--config", str(config_path), "--json", str(report_path)]
+    if summary:
+        argv.append("--summary")
+    argv += ["arm", "initialize", "--execute", "--preview-file", str(preview_path),
+             "--approved-plan-hash", motion.digest_plan(plan), "--approval-note", "offline consent",
+             "--approved-digest", unverified_digest(fixture.declaration), "--clearance-confirmed"]
+    assert cli.main(argv) == 1
+    output = capsys.readouterr()
+    failure = json.loads(output.out)["failure"]
+    assert failure["side_effect_state"] == "committed"
+    assert failure["failure_code"] == "piper_operations_refused"
+    assert "ctrl_mode=0" in failure["message"]
+    expected = (("arm.speed_pct", configured.speed_pct), ("arm.enable", 1),
+                *tuple(zip(health.JOINTS, plan["origin_joints"])))
+    assert fixture.transport.write_log == expected
+    assert fixture.transport.halt_calls == 1
+    events = [json.loads(line) for line in report_path.with_suffix(".events.ndjson").read_text().splitlines()]
+    assert [row["result"]["side_effect_state"] for row in events
+            if row["event"] in ("speed", "enable", "initialize")] == ["committed"] * 3
+    assert events[-1]["event"] == "damped_stop" and events[-1]["result"]["ok"] is True
+    assert preview_path.with_suffix(".claimed").exists()
+    saved = json.loads(report_path.read_text())
+    if report_write_fails:
+        assert saved["status"] == "in_progress" and "Evidence write failed" in output.err
+    else:
+        assert saved["failure"] == failure and saved["events"] == events
+
+
+async def test_refusal_before_governed_dispatch_has_no_effect(governed_node, tmp_path):
+    fixture = governed_node
+    evidence = Evidence(tmp_path / "preflight.json")
+    run = Session(fixture.settings, evidence, execute=True,
+                  digest=unverified_digest(fixture.declaration), approval_note="offline exact consent")
+    with pytest.raises(Refusal) as failure:
+        async with run:
+            run.bind_steps([motion.step("speed", (("arm.speed_pct", 10.),), configure=True)])
+            await run.command("speed", (("arm.speed_pct", 11.),), configure=True)
+    assert evidence.failure(failure.value)["failure"]["side_effect_state"] == SideEffectState.NONE
+    assert fixture.transport.write_log == () and fixture.transport.halt_calls == 0
+
+
+async def test_uncertain_dispatch_is_not_erased_by_successful_halt(governed_node, tmp_path, monkeypatch):
+    fixture = governed_node
+    evidence = Evidence(tmp_path / "cancelled-write.json")
+    entered = asyncio.Event()
+
+    async def write(channel_id, value):
+        entered.set()
+        await asyncio.Future()  # External device never acknowledges this attempted dispatch.
+
+    monkeypatch.setattr(fixture.transport, "write", write)
+    run = Session(fixture.settings, evidence, execute=True,
+                  digest=unverified_digest(fixture.declaration), approval_note="offline exact consent")
+
+    async def execute():
+        async with run:
+            run.bind_steps([motion.step("speed", (("arm.speed_pct", 10.),), configure=True)])
+            await run.command("speed", (("arm.speed_pct", 10.),), configure=True)
+
+    task = asyncio.create_task(execute())
+    await asyncio.wait_for(entered.wait(), 1.)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1.)
+    report = evidence.failure(Refusal("run cancelled"))
+    assert report["failure"]["side_effect_state"] == SideEffectState.UNKNOWN
+    assert fixture.transport.halt_calls == 1 and fixture.transport.write_log == ()
+    assert evidence.events[-1]["event"] == "damped_stop"
 
 
 async def test_real_governed_batch_binds_every_ordered_target(governed_node, tmp_path):

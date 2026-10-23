@@ -54,7 +54,6 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_SKILL_UNAVAILABLE,
     FAILURE_TARGET_NOT_FOUND,
     FAILURE_UNREACHABLE,
-    REQUIRE_CALIBRATION,
     REQUIRE_ROLE,
     SIDE_EFFECT_COMMITTED,
     ArmState,
@@ -97,8 +96,22 @@ def _procedure(ctx: SkillContext, frame: str) -> str:
     return procedure
 
 
-def _mounting(ctx: SkillContext) -> str:
-    parent = ctx.frames.parent(CAMERA_FRAME)
+def _camera(ctx: SkillContext, args: Mapping[str, Any], *, calibrated: bool = False) -> str:
+    role = str(args.get("camera", CAMERA_FRAME))
+    if role.split(".", 1)[0] != CAMERA_FRAME or not ctx.workcell.role(role):
+        raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"no camera role {role!r} in this workcell")
+    _procedure(ctx, role)
+    if calibrated and ctx.frames.transform(role) is None:
+        raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"{role} is not calibrated; run calib.handeye camera={role}")
+    return role
+
+
+def _vision(ctx: SkillContext, role: str) -> Any:
+    return ctx.vision if role == CAMERA_FRAME else ctx.camera_vision(role)
+
+
+def _mounting(ctx: SkillContext, role: str = CAMERA_FRAME) -> str:
+    parent = ctx.frames.parent(role)
     if parent == "base":
         return EYE_TO_HAND
     if parent == "flange":
@@ -150,9 +163,9 @@ def _with_return(ctx: SkillContext, targets: list[Pose], start: Pose) -> tuple[P
     return (*targets, start)
 
 
-async def _observe(ctx: SkillContext) -> TargetObservation | None:
+async def _observe(ctx: SkillContext, role: str) -> TargetObservation | None:
     try:
-        return await ctx.vision.observe_target()
+        return await _vision(ctx, role).observe_target()
     except SkillError as error:
         if error.failure_code == FAILURE_TARGET_NOT_FOUND:
             return None
@@ -170,11 +183,17 @@ async def _sweep(ctx: SkillContext, plan: SkillPlan) -> tuple[list[Sample], int]
             continue
         if settle > 0:
             await asyncio.sleep(settle)
-        observation = await _observe(ctx)
+        before = (await ctx.motion.state()).flange
+        observation = await _observe(ctx, str(plan.basis.get("camera_role", CAMERA_FRAME)))
+        after = (await ctx.motion.state()).flange
+        accept = ctx.workcell.calibration
+        if (before.distance_mm(after) > accept["start_drift_mm"]
+                or before.rotation_to_deg(after) > accept["start_drift_deg"]):
+            raise _check_failed("the flange moved during camera capture", problems=["capture drift"])
         if observation is None:
             skipped += 1
             continue
-        seen.append(((await ctx.motion.state()).flange, observation))
+        seen.append((after, observation))
     return seen, skipped
 
 
@@ -186,7 +205,7 @@ class HandEye:
 
     spec = SkillSpec(
         skill_id="calib.handeye",
-        version="1.1.0",
+        version="1.2.0",
         card=(
             "Calibrate where the camera sits (hand-eye). The workcell's calibration board "
             "must be in view: held in the gripper or fixed to the flange for a fixed camera, "
@@ -203,20 +222,22 @@ class HandEye:
                 "yaw_deg": _number(0, 60, 30.0),
                 "spread_mm": _number(0, 80, 30.0),
                 "lift_mm": _number(0, 50, 15.0),
+                "camera": {"type": "string", "pattern": "^camera(\\.[a-z0-9_]+)*$", "default": CAMERA_FRAME},
                 "settle_s": _number(0, 5, 0.5),
                 "speed_pct": _number(1, 100, 10.0),
             },
         },
         effect=EFFECT_ACTUATE,
-        requires=(f"{REQUIRE_ROLE}arm", f"{REQUIRE_ROLE}camera"),
+        requires=(f"{REQUIRE_ROLE}arm",),
         consent=CONSENT_EACH_RUN,
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
-        procedure = _procedure(ctx, CAMERA_FRAME)
-        mounting = _mounting(ctx)
+        role = _camera(ctx, args)
+        procedure = _procedure(ctx, role)
+        mounting = _mounting(ctx, role)
         state = await _ready_state(ctx)
-        seen = await ctx.vision.observe_target()
+        seen = await _vision(ctx, role).observe_target()
         start = state.tcp
         if mounting == EYE_TO_HAND:
             pivot = start.position
@@ -256,6 +277,8 @@ class HandEye:
             limits={"speed_pct": float(args["speed_pct"])},
             basis={
                 "procedure": procedure,
+                "camera_role": role,
+                "camera_device": ctx.workcell.role(role),
                 "mounting": mounting,
                 "start": start.to_dict(),
                 "settle_s": float(args["settle_s"]),
@@ -303,6 +326,12 @@ class HandEye:
             matrix=mount.to_matrix(),
             parameters={
                 "mounting": mounting,
+                "camera_role": plan.basis.get("camera_role", CAMERA_FRAME),
+                "camera_device": plan.basis.get("camera_device", ctx.workcell.role(CAMERA_FRAME)),
+                "geometry_revision": 2,
+                "units": "mm",
+                "orientation_convention": "Rz@Ry@Rx;degrees",
+                "training_poses": [flange.to_dict() for flange, _ in seen],
                 "intrinsics": dict(intrinsics),
                 "target_mount": target_mount.to_matrix(),
                 "fit": fit.to_dict(),
@@ -385,7 +414,7 @@ class VerifyCamera:
 
     spec = SkillSpec(
         skill_id="calib.verify",
-        version="1.1.0",
+        version="1.2.0",
         card=(
             "Measure camera accuracy after calib.handeye, with the calibration board "
             "mounted exactly as it was then. The arm moves over a 3 x 3 grid spacing_mm "
@@ -397,32 +426,44 @@ class VerifyCamera:
             "type": "object",
             "properties": {
                 "spacing_mm": _number(10, 80, 40.0),
+                "poses": {"type": "integer", "minimum": 4, "maximum": 9, "default": 9},
+                "camera": {"type": "string", "pattern": "^camera(\\.[a-z0-9_]+)*$", "default": CAMERA_FRAME},
                 "settle_s": _number(0, 5, 0.5),
                 "speed_pct": _number(1, 100, 10.0),
             },
         },
         effect=EFFECT_ACTUATE,
-        requires=(f"{REQUIRE_ROLE}arm", f"{REQUIRE_ROLE}camera", f"{REQUIRE_CALIBRATION}camera"),
+        requires=(f"{REQUIRE_ROLE}arm",),
         consent=CONSENT_EACH_RUN,
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
-        mounting = _mounting(ctx)
-        if ctx.frames.parameters(CAMERA_FRAME).get("target_mount") is None:
+        role = _camera(ctx, args, calibrated=True)
+        mounting = _mounting(ctx, role)
+        if ctx.frames.parameters(role).get("target_mount") is None:
             raise SkillError(
                 FAILURE_SKILL_UNAVAILABLE,
                 "the camera mount was not measured with calib.handeye, so the board has no "
                 "known position; run calib.handeye first",
             )
         state = await _ready_state(ctx)
-        seen = await ctx.vision.observe_target()
+        seen = await _vision(ctx, role).observe_target()
         start, spacing = state.tcp, float(args["spacing_mm"])
         grid = [
             start.translated(dx * spacing * (1 if row % 2 == 0 else -1), dy * spacing)
             for row, dy in enumerate((-1, 0, 1))
             for dx in (-1, 0, 1)
         ]
-        targets, reason = _reachable(ctx, grid)
+        training = ctx.frames.parameters(role).get("training_poses", [])
+        tcp_to_flange = Transform.from_pose(state.tcp).inverse().compose(
+            Transform.from_pose(state.flange)
+        )
+        heldout = []
+        for pose in grid[:int(args.get("poses", 9))]:
+            flange = Transform.from_pose(pose).compose(tcp_to_flange).to_pose()
+            if not _overlaps_training(flange, training):
+                heldout.append(pose)
+        targets, reason = _reachable(ctx, heldout)
         needed = int(ctx.workcell.calibration["min_verify_points"])
         if len(targets) < needed:
             raise SkillError(
@@ -441,23 +482,29 @@ class VerifyCamera:
             targets=_with_return(ctx, targets, start),
             limits={"speed_pct": float(args["speed_pct"])},
             basis={
+                "camera_role": role,
                 "mounting": mounting,
                 "start": start.to_dict(),
                 "settle_s": float(args["settle_s"]),
                 "samples": len(targets),
                 "max_p95_mm": ctx.workcell.calibration["max_verify_p95_mm"],
+                "max_rms_mm": ctx.workcell.calibration["max_verify_rms_mm"],
                 "seen": seen.to_dict(),
-                "depends_on": {CAMERA_FRAME: ctx.frames.versions[CAMERA_FRAME]},
+                "depends_on": {role: ctx.frames.versions[role]},
             },
         )
 
     async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
         await _check_start(ctx, Pose.from_mapping(plan.basis["start"]))
-        mount = ctx.frames.transform(CAMERA_FRAME)
-        target_mount = ctx.frames.parameters(CAMERA_FRAME).get("target_mount")
+        role = str(plan.basis.get("camera_role", CAMERA_FRAME))
+        mount = ctx.frames.transform(role)
+        target_mount = ctx.frames.parameters(role).get("target_mount")
         if mount is None or target_mount is None:
             raise SkillError(FAILURE_PLAN_STALE, "the camera calibration changed; plan again")
         seen, skipped = await _sweep(ctx, plan)
+        training = ctx.frames.parameters(role).get("training_poses", [])
+        if any(_overlaps_training(flange, training) for flange, _ in seen):
+            raise _check_failed("verification repeated a training pose", problems=["not held-out"])
         depth, pnp = _errors(
             plan.basis["mounting"], mount, Transform.from_matrix(target_mount), seen
         )
@@ -477,16 +524,21 @@ class VerifyCamera:
                 **stats,
             )
         limit = float(plan.basis["max_p95_mm"])
-        if stats["p95_mm"] > limit:
+        rms_limit = float(plan.basis["max_rms_mm"])
+        if stats["p95_mm"] > limit or stats["rms_mm"] > rms_limit:
             raise _check_failed(
-                f"the camera is off by {stats['p95_mm']:.1f} mm at p95 (limit {limit} mm, "
+                f"the camera is off by {stats['p95_mm']:.1f} mm at p95 / "
+                f"{stats['rms_mm']:.1f} mm RMS (limits {limit} / {rms_limit} mm, "
                 f"PnP-only {stats['pnp_p95_mm']:.1f} mm); run calib.handeye again",
                 problems=["accuracy above limit"],
                 **stats,
             )
         recorded_at = ctx.record_calibration(
-            VERIFY_PROCEDURE,
-            parameters={**stats, "max_p95_mm": limit, "depends_on": plan.basis["depends_on"]},
+            f"{role}.verify",
+            parameters={**stats, "camera_role": role, "max_p95_mm": limit,
+                        "max_rms_mm": plan.basis["max_rms_mm"], "depends_on": plan.basis["depends_on"],
+                        "heldout_poses": [flange.to_dict() for flange, _ in seen],
+                        "errors_mm": depth, "training_disjoint": True},
         )
         return SkillOutcome.succeeded(
             {**stats, "recorded_at": recorded_at},
@@ -495,6 +547,14 @@ class VerifyCamera:
                 f"(max {stats['max_mm']:.1f} mm over {len(depth)} points)"
             ),
         )
+
+
+def _overlaps_training(flange: Pose, training: Sequence[Mapping[str, Any]]) -> bool:
+    for value in training:
+        pose = Pose.from_mapping(value)
+        if flange.distance_mm(pose) < 1e-6 and flange.rotation_to_deg(pose) < 1e-6:
+            return True
+    return False
 
 
 def _errors(
@@ -516,11 +576,12 @@ def _errors(
 
 def _stats(errors: Sequence[float], *, prefix: str) -> dict[str, float | None]:
     if not errors:
-        return {f"{prefix}{key}": None for key in ("mean_mm", "p95_mm", "max_mm")}
+        return {f"{prefix}{key}": None for key in ("mean_mm", "rms_mm", "p95_mm", "max_mm")}
     ordered = sorted(errors)
     p95 = ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
     return {
         f"{prefix}mean_mm": round(sum(ordered) / len(ordered), 3),
+        f"{prefix}rms_mm": round(math.sqrt(sum(v * v for v in ordered) / len(ordered)), 3),
         f"{prefix}p95_mm": round(p95, 3),
         f"{prefix}max_mm": round(ordered[-1], 3),
     }

@@ -71,7 +71,7 @@ from leapflow.hardware.skill_tool_defs import (
     MAX_RUN_TIMEOUT_S,
     build_skill_tools,
 )
-from leapflow.hardware.skills.digest import verify_wire_plan
+from leapflow.hardware.skills.digest import run_permit_digest, verify_wire_plan
 from leapflow.hardware.skills.episodes import MAX_INTENT_CHARS, MAX_LABEL_NOTE_CHARS
 from leapflow.hardware.skills.protocol import (
     FAILURE_INVALID_ARGS,
@@ -228,7 +228,12 @@ class SkillService:
         return result
 
     async def hw_skill_run(self, **kwargs: Any) -> dict[str, Any]:
-        """Plan, approve, and run one skill; wait for its outcome unless ``wait`` is false."""
+        """Plan, approve, and run one skill; wait unless ``wait`` is false.
+
+        ``approved_plan`` is a complete previously verified preview. It skips
+        re-planning but never approval, permit issuance or node cache/freshness
+        checks. An expired or consumed preview fails without replacing it.
+        """
         skill = str(kwargs.get("skill") or "").strip()
         try:
             args = kwargs.get("args") or {}
@@ -238,19 +243,35 @@ class SkillService:
                 raise SkillRefusal(FAILURE_INVALID_ARGS, "skill is required")
             timeout_s = _timeout(kwargs.get("timeout_s"))
             target = await self._resolve(str(kwargs.get("workcell") or "").strip())
-            planned = as_mapping(
-                await self._request(
-                    target.node_id,
-                    target.link,
-                    "skill.plan",
-                    {
-                        "workcell": target.workcell,
-                        "skill": skill,
-                        "args": dict(args),
-                        "share_frames": self._share_frames,
-                    },
+            approved = kwargs.get("approved_plan")
+            if approved is not None:
+                if not isinstance(approved, Mapping) or approved.get("args") != dict(args):
+                    raise SkillRefusal(FAILURE_PLAN_UNVERIFIED, "approved plan arguments differ from request")
+                saved = dict(approved)
+                planned = {
+                    "plan": saved, "consent": "each_run",
+                    "permit_digest": run_permit_digest(
+                        workcell=str(saved.get("workcell") or ""),
+                        skill_id=str(saved.get("skill_id") or ""),
+                        version=str(saved.get("version") or ""),
+                        plan_digest=str(saved.get("digest") or ""),
+                        limits=as_mapping(saved.get("limits")),
+                    ),
+                }
+            else:
+                planned = as_mapping(
+                    await self._request(
+                        target.node_id,
+                        target.link,
+                        "skill.plan",
+                        {
+                            "workcell": target.workcell,
+                            "skill": skill,
+                            "args": dict(args),
+                            "share_frames": self._share_frames,
+                        },
+                    )
                 )
-            )
         except SkillRefusal as refusal:
             return refusal_result(refusal.failure_code, refusal.message, skill=skill)
         if "outcome" in planned:  # a READ skill's result, or a refusal to plan
@@ -475,6 +496,13 @@ class SkillService:
             target, as_mapping(started.get("run")), as_mapping(started.get("lease"))
         )
         self._audit_record("skill_run", target.qualified, skill_ref, f"started {tracked.run_id}")
+        if self._audit is not None and PERMIT_PARAM in params:
+            self._audit.record(action="skill_permit", device=target.qualified, channel=skill_ref,
+                               identity=self._session_identity(), value={
+                                   "run_id": tracked.run_id, "plan_digest": params["plan_digest"],
+                                   "request_digest": permit_digest, "audience": target.node_id,
+                                   "approval_id": authorization.approval_id,
+                               })
         return tracked
 
     async def _finish(

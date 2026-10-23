@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -12,6 +12,7 @@ from typing import Any
 from leapflow.engine.recovery.failure_envelope import (
     FailureEnvelope, FailureSource, Recoverability, SideEffectState,
 )
+from leapflow.hardware.transport import worst_side_effect_state
 
 
 class Refusal(RuntimeError):
@@ -28,6 +29,19 @@ class Refusal(RuntimeError):
             recoverability=Recoverability.NON_RECOVERABLE if internal else Recoverability.USER_FIXABLE,
             side_effect_state=state,
         )
+
+
+class StaleFeedback(Refusal):
+    """A momentary receive-quality gap: re-sample it, never re-command the arm.
+
+    The receive contract certifies one sample, not the device: a CAN group that misses
+    its freshness window leaves the servo exactly where it was. An observation may
+    therefore read again inside a bounded window, and every decision still fails closed
+    because the unqualified sample never enters a check as a valid reading.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="piper_feedback_stale")
 
 
 def json_default(value: Any) -> Any:
@@ -49,6 +63,7 @@ class Evidence:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.events: list[dict[str, Any]] = []
+        self._side_effect_state = SideEffectState.NONE
         self.audit_path = path.with_suffix(".audit.ndjson")
         self.event_path = path.with_suffix(".events.ndjson")
         if any(p.exists() for p in (path, self.audit_path, self.event_path)):
@@ -59,8 +74,28 @@ class Evidence:
         self.event_path.open("x").close()
         self.audit_path.open("x").close()
 
+    def observe_effect(self, state: Any) -> None:
+        """Keep the worst observed verdict; a later halt is not a rollback."""
+        try:
+            observed = SideEffectState(state)
+        except (ValueError, TypeError):
+            observed = SideEffectState.UNKNOWN
+        self._side_effect_state = SideEffectState(worst_side_effect_state(
+            (self._side_effect_state.value, observed.value)))
+
+    def failure_envelope(self, exc: Refusal) -> FailureEnvelope:
+        """Preserve failure identity while adding this run's observed effects."""
+        state = SideEffectState(worst_side_effect_state(
+            (exc.envelope.side_effect_state.value, self._side_effect_state.value)))
+        return replace(exc.envelope, side_effect_state=state)
+
     def record(self, event: str, **details: Any) -> None:
         row = {"event": event, "monotonic": time.monotonic(), **details}
+        if "side_effect_state" in details:
+            self.observe_effect(details["side_effect_state"])
+        result = details.get("result")
+        if isinstance(result, dict) and "side_effect_state" in result:
+            self.observe_effect(result["side_effect_state"])
         self.events.append(row)
         with self.event_path.open("a") as stream:
             stream.write(json.dumps(row, default=json_default, allow_nan=False) + "\n")
@@ -76,4 +111,4 @@ class Evidence:
         return result
 
     def failure(self, exc: Refusal) -> dict[str, Any]:
-        return self.finish({"ok": False, "failure": asdict(exc.envelope)})
+        return self.finish({"ok": False, "failure": asdict(self.failure_envelope(exc))})

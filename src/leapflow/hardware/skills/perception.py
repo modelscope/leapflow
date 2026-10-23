@@ -464,6 +464,7 @@ class WorkcellScene:
         )
         return {
             "frame": frame_id,
+            "capture_id": capture.capture_id,
             "width": width,
             "height": height,
             "observed_at": frame.observed_at,
@@ -471,11 +472,12 @@ class WorkcellScene:
         }
 
     async def lift(
-        self, frame_id: str, targets: Sequence[PixelTarget], *, coords: str
+        self, frame_id: str, targets: Sequence[PixelTarget], *, coords: str,
+        capture_id: str | None = None,
     ) -> tuple[tuple[LocatedObject, ...], tuple[Mapping[str, str], ...]]:
         ttl = self._settings.memory_ttl_s
         capture = self._memory.recall_frame(frame_id, self._basis, ttl)
-        if capture is None:
+        if capture is None or (capture_id is not None and capture.capture_id != capture_id):
             raise SkillError(
                 FAILURE_TARGET_NOT_FOUND,
                 f"{frame_id} is not a current frame (frames last {ttl:.0f} s, only the "
@@ -556,8 +558,8 @@ class WorkcellScene:
 
     # ── GraspSensing ──
 
-    async def capture(self) -> SceneCapture:
-        frame, camera_to_base, table = await self._observe()
+    async def capture(self, role: str = ROLE_CAMERA) -> SceneCapture:
+        frame, camera_to_base, table = await self._observe(role)
         return SceneCapture(frame, camera_to_base, table)
 
     async def model(self, name: str, task: str) -> ModelService:
@@ -616,13 +618,15 @@ class WorkcellScene:
         )
         return kept
 
-    async def _observe(self) -> tuple[RgbdFrame, Transform, Plane]:
-        camera = self._spec.role(ROLE_CAMERA)
+    async def _observe(self, role: str = ROLE_CAMERA) -> tuple[RgbdFrame, Transform, Plane]:
+        if role.split(".", 1)[0] != ROLE_CAMERA:
+            raise SkillError(FAILURE_SKILL_UNAVAILABLE, f"{role!r} is not a camera role")
+        camera = self._spec.role(role)
         if not camera:
             raise SkillError(
-                FAILURE_SKILL_UNAVAILABLE, f"workcell {self._spec.workcell_id!r} binds no camera"
+                FAILURE_SKILL_UNAVAILABLE, f"workcell {self._spec.workcell_id!r} binds no {role}"
             )
-        mount = self._frames.transform(CAMERA_FRAME)
+        mount = self._frames.transform(role)
         if mount is None:
             raise SkillError(
                 FAILURE_CALIBRATION_MISSING, "the camera is not calibrated (run calib.handeye)"
@@ -635,7 +639,8 @@ class WorkcellScene:
                 "table_z or table_points",
             )
         source = await self._transport(camera, FrameSource, "an RGB-D camera")
-        if self._frames.parent(CAMERA_FRAME) == "flange":
+        flange = None
+        if self._frames.parent(role) == "flange":
             flange = (await self._motion.state()).flange
             mount = Transform.from_pose(flange).compose(mount)
         try:
@@ -645,11 +650,17 @@ class WorkcellScene:
             raise SkillError(
                 FAILURE_DEVICE_FAULT, f"camera {camera!r} capture failed: {exc}"
             ) from exc
-        self._check_intrinsics(frame.intrinsics)
+        if flange is not None:
+            after = (await self._motion.state()).flange
+            limits = self._spec.grasp_verify
+            if (flange.distance_mm(after) > limits["capture_drift_mm"]
+                    or flange.rotation_to_deg(after) > limits["capture_drift_deg"]):
+                raise SkillError(FAILURE_CALIBRATION_STALE, "the wrist moved during camera capture")
+        self._check_intrinsics(frame.intrinsics, role=role)
         return frame, mount, table
 
-    def _check_intrinsics(self, live: CameraIntrinsics) -> None:
-        recorded = self._frames.parameters(CAMERA_FRAME).get("intrinsics")
+    def _check_intrinsics(self, live: CameraIntrinsics, *, role: str = ROLE_CAMERA) -> None:
+        recorded = self._frames.parameters(role).get("intrinsics")
         if recorded is None:
             return  # a hand-entered mount; calib.handeye always records them
         try:

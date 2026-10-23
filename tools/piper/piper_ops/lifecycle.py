@@ -56,7 +56,7 @@ async def execute(session: Session, plan: dict[str, Any], *, torque_release: boo
     else:
         async def disabled() -> Any:
             while True:
-                state = await session.snapshot()
+                state = await session.snapshot(requalify=True)
                 if all(m["enabled"] is False for m in state.telemetry["motors"]):
                     return state
                 await asyncio.sleep(session.settings.poll_s)

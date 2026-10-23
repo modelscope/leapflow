@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Mapping
 
 import pytest
@@ -514,6 +515,38 @@ async def test_a_moved_camera_stream_is_stale_calibration(tmp_path: Path) -> Non
     error = await _refusal(_scene(_calibrated(tmp_path, CUP, intrinsics=other)))
     assert error.failure_code == FAILURE_CALIBRATION_STALE
     assert "calib.handeye" in error.message
+
+
+@pytest.mark.parametrize("drift", [0., 1.])
+async def test_wrist_capture_uses_its_mount_and_checks_capture_drift(
+    tmp_path: Path, drift: float,
+) -> None:
+    registry = _calibrated(tmp_path, CUP)
+    registry.devices["wrist_cam"] = registry.devices[CAMERA_ID]
+    spec = _spec(
+        roles={**PERCEPTION_WORKCELL_YAML["roles"], "camera.wrist": "wrist_cam"},
+        frames={**PERCEPTION_WORKCELL_YAML["frames"], "camera.wrist": {
+            "parent": "flange", "procedure": "wrist.handeye",
+        }},
+    )
+    registry.calibrate("wrist.handeye", pose={"x": 10., "y": 20., "z": 30.})
+    scene = _scene(registry, spec=spec)
+    reads = 0
+
+    async def state() -> Any:
+        nonlocal reads
+        reads += 1
+        return SimpleNamespace(flange=Pose(100. + (drift if reads > 1 else 0.), 200., 300.))
+
+    scene._motion = SimpleNamespace(state=state)
+    if drift:
+        with pytest.raises(SkillError) as error:
+            await scene.capture("camera.wrist")
+        assert error.value.failure_code == FAILURE_CALIBRATION_STALE
+    else:
+        capture = await scene.capture("camera.wrist")
+        assert capture.camera_to_base.translation == pytest.approx((110., 220., 330.))
+    assert reads == 2
 
 
 async def test_missing_table_or_mount_is_missing_calibration(tmp_path: Path) -> None:

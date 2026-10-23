@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
+from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.calibration_qualification import admit_package
 from leapflow.hardware.fleet import FleetNode, FleetTopology
 from leapflow.hardware.lhp.client import SocketLhpClient
@@ -15,7 +17,7 @@ from leapflow.security.approval import ApprovalDecision, ApprovalRequest, Sessio
 from leapflow.security.orchestrator import ApprovalOrchestrator
 
 from .evidence import Evidence, Refusal
-from .session import Session
+from .session import Session, complete_cleanup
 
 
 def validate(path: Path, device_id: str) -> dict[str, Any]:
@@ -46,13 +48,18 @@ class _Consent:
         self.plan = None
         allowed = bool(plan and all(meta.get(key) == plan[key] for key in
                                    ("node_id", "workcell", "skill_id", "plan_digest")))
-        self.evidence.record("calibration_consent", approved=allowed)
+        self.evidence.record("calibration_consent", approved=allowed,
+                                     binding={key: meta.get(key) for key in
+                                              ("node_id", "workcell", "skill_id", "plan_digest")})
         return ApprovalDecision.ALLOW_ONCE if allowed else ApprovalDecision.DENY
 
 
-async def run(session: Session, *, workcell: str = "", skill: str = "", args: dict[str, Any] | None = None,
-              approved: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Plan or acquire through production SkillService, its governor and leased permits."""
+@asynccontextmanager
+async def service(session: Session, approved: dict[str, Any] | None = None,
+                  *, share_frames: bool = False) -> AsyncIterator[SkillService]:
+    """Use the existing signing authority, audited one-shot consent and node owner."""
+    if approved is not None and not isinstance(approved.get("skill_plan"), dict):
+        raise Refusal("approved execution requires a complete cached skill plan; preview again")
     settings = session.settings
     token = settings.token_file.read_text().strip()
     issuer = PermitIssuer.from_key_file(settings.issuer_key, auto_generate=False) if approved else None
@@ -67,23 +74,36 @@ async def run(session: Session, *, workcell: str = "", skill: str = "", args: di
                 raise Refusal("calibration node identity/authority changed")
             return hello
 
-    service = SkillService(fleet, gate=gate, session_id="piper-calibration",
-                           client_factory=lambda node: ConfirmedClient(node.endpoint, token=node.token,
-                                                                      timeout_s=settings.request_timeout_s))
+    client = SkillService(fleet, gate=gate, session_id="piper-qualification",
+                          audit_log=HardwareAuditLog(session.evidence.audit_path),
+                          share_frames=share_frames,
+                          client_factory=lambda node: ConfirmedClient(node.endpoint, token=node.token,
+                                                                     timeout_s=settings.request_timeout_s))
     try:
+        yield client
+    finally:
+        await complete_cleanup(client.close())
+
+
+async def run(session: Session, *, workcell: str = "", skill: str = "", args: dict[str, Any] | None = None,
+              approved: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Plan or acquire through production SkillService, its governor and leased permits."""
+    settings = session.settings
+    async with service(session, approved) as client:
         if not skill:
-            return await service.hw_skill_list(node=settings.node_id)
+            return await client.hw_skill_list(node=settings.node_id)
         # Calibration skills only; no policy, contact or zeroing shortcut gets this interface.
         if not skill.startswith("calib."):
             raise Refusal("calibration run requires a production calib.* skill")
         if approved and (approved.get("skill_id") != skill or approved.get("workcell") != workcell or
                          approved.get("args") != args or approved.get("node_id") != settings.node_id):
             raise Refusal("calibration request differs from approved plan")
-        result = await service.hw_skill_run(workcell=f"{settings.node_id}/{workcell}", skill=skill,
-                                            args=args or {}, dry_run=approved is None,
-                                            timeout_s=settings.run_timeout_s)
+        result = await client.hw_skill_run(workcell=f"{settings.node_id}/{workcell}", skill=skill,
+                                           args=args or {}, dry_run=approved is None,
+                                           approved_plan=approved.get("skill_plan") if approved else None,
+                                           timeout_s=settings.run_timeout_s)
         session.evidence.record("calibration_result", result=result)
-        session.success = True
+        if approved is not None:
+            session.touched |= result.get("side_effect_state", "unknown") != "none"
+        session.success = result.get("ok") is True
         return result
-    finally:
-        await service.close()

@@ -168,11 +168,11 @@ def _perimeter_samples(np: Any, hull: Any, count: int) -> Any:
     return hull[index] + edges[index] * fractions[:, None]
 
 
-def inner_jaw_midpoint(frame: RgbdFrame, landmark_pixels: Sequence[Sequence[float]], *,
-                       independent: bool, radius_px: int, min_samples: int,
-                       support_masks: Sequence[Any] | None = None,
-                       max_dispersion_mm: float = 3.0) -> tuple[float, float, float] | None:
-    """Deproject two independently detected inner-pad landmarks; no tool-only fallback."""
+def inner_jaw_points(frame: RgbdFrame, landmark_pixels: Sequence[Sequence[float]], *,
+                     independent: bool, radius_px: int, min_samples: int,
+                     support_masks: Sequence[Any] | None = None,
+                     max_dispersion_mm: float = 3.0) -> tuple[tuple[float, float, float], ...] | None:
+    """Deproject both independently detected pad landmarks; no tool-only fallback."""
     np = _numpy()
     if not independent or len(landmark_pixels) != 2 or support_masks is None or len(support_masks) != 2:
         return None
@@ -196,4 +196,10 @@ def inner_jaw_midpoint(frame: RgbdFrame, landmark_pixels: Sequence[Sequence[floa
         if len(samples) < min_samples or any(abs(value - center_depth) > max_dispersion_mm for value in samples):
             return None
         points.append(frame.intrinsics.deproject(float(u), float(v), float(np.median(samples))))
-    return tuple(float(v) for v in np.mean(points, axis=0))
+    return tuple(tuple(float(v) for v in point) for point in points)
+
+
+def inner_jaw_midpoint(frame: RgbdFrame, landmark_pixels: Sequence[Sequence[float]], **kwargs: Any) -> tuple[float, float, float] | None:
+    """Compatibility surface: the mean of the same two checked pad observations."""
+    points = inner_jaw_points(frame, landmark_pixels, **kwargs)
+    return tuple((a + b) / 2 for a, b in zip(*points)) if points is not None else None

@@ -120,6 +120,18 @@ _REFUSAL_DWELL_S = 1.5
 Sleep = Callable[[float], Awaitable[None]]
 
 
+def _within_gripper_tolerance(actual: float, target: float, tolerance: float) -> bool:
+    """Honor the declared tolerance, accounting only for binary arithmetic roundoff."""
+    if not all(math.isfinite(v) for v in (actual, target, tolerance)) or tolerance < 0:
+        return False
+    if tolerance == 0:
+        return actual == target
+    # SI conversion/subtraction can put a boundary sample a few ULPs outside.
+    # This is a floating-point error budget, not sensor uncertainty or extra mm.
+    roundoff = math.ulp(actual) + math.ulp(target) + math.ulp(tolerance)
+    return abs(actual - target) <= tolerance + roundoff
+
+
 class GovernedMotion:
     """``MotionFacade`` for one run in one workcell."""
 
@@ -408,6 +420,10 @@ class GovernedMotion:
         assert target is not None
         return target
 
+    def check_cartesian_path(self, state: ArmState, targets: Sequence[Pose]) -> tuple[Mapping[str, Any], ...]:
+        from leapflow.hardware.skills.grasp_path import check_path
+        return check_path(self, state, targets)
+
     # ── Motion ──
 
     @property
@@ -672,7 +688,7 @@ class GovernedMotion:
         return GripperResult(
             width_mm=width,
             target_mm=float(width_mm),
-            blocked=abs(width - width_mm) > tolerance,
+            blocked=not _within_gripper_tolerance(width, width_mm, tolerance),
             elapsed_s=self._clock() - started,
         )
 
@@ -690,9 +706,9 @@ class GovernedMotion:
         while True:
             width = await self._gripper_width()
             now = self._clock()
-            if abs(width - target) <= tolerance:
+            if _within_gripper_tolerance(width, target, tolerance):
                 return width
-            if anchor is None or abs(width - anchor) > tolerance:
+            if anchor is None or not _within_gripper_tolerance(width, anchor, tolerance):
                 anchor, anchored_at = width, now
             elif now - anchored_at >= settle_s:
                 return width

@@ -56,6 +56,9 @@ class WorkcellView(Protocol):
         ...
 
     @property
+    def grasp_verify(self) -> Mapping[str, float]: ...
+
+    @property
     def home(self) -> Mapping[str, float]: ...
 
     @property
@@ -124,6 +127,10 @@ class MotionFacade(Protocol):
         """Check a joint endpoint and path with FK; return its predicted TCP."""
         ...
 
+    def check_cartesian_path(self, state: ArmState, targets: Sequence[Pose]) -> tuple[Mapping[str, Any], ...]:
+        """Bounded IK waypoints whose actual joint-space paths pass workspace checks."""
+        ...
+
     @property
     def paths(self) -> tuple[str, ...]:
         """The pose path modes this arm declares (``linear``, ``point``); may be empty."""
@@ -172,7 +179,8 @@ class ScenePort(Protocol):
         ...
 
     async def lift(
-        self, frame_id: str, targets: Sequence[PixelTarget], *, coords: str
+        self, frame_id: str, targets: Sequence[PixelTarget], *, coords: str,
+        capture_id: str | None = None,
     ) -> tuple[tuple[LocatedObject, ...], tuple[Mapping[str, str], ...]]:
         """The base-frame objects under *targets* in a remembered frame, each under a new
         id, and the targets that lifted to nothing (``label``, ``reason``)."""
@@ -269,6 +277,20 @@ class PolicyPort(Protocol):
 
 
 @runtime_checkable
+class GraspVerificationPort(Protocol):
+    """A run's continuous qualified observer; read-only and no transport ownership."""
+
+    def admit(self, data: Mapping[str, Any]) -> Mapping[str, Any]: ...
+
+    def qualification(self) -> Mapping[str, Any]: ...
+
+    async def inspect(self) -> Mapping[str, Any]: ...
+
+    async def verify(self, stage: str, *, samples: int,
+                     grasp: Mapping[str, Any] | None = None) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
 class SkillContext(Protocol):
     """Everything a skill may touch. Nothing else is reachable from a skill."""
 
@@ -295,6 +317,13 @@ class SkillContext(Protocol):
     def vision(self) -> VisionPort:
         """Calibration-target measurement; raises ``SkillError`` when there is no camera."""
         ...
+
+    def camera_vision(self, role: str = "camera") -> VisionPort:
+        """Target observation through the named camera role and its mount."""
+        ...
+
+    @property
+    def grasp_verification(self) -> GraspVerificationPort: ...
 
     @property
     def policies(self) -> PolicyPort: ...
@@ -350,6 +379,7 @@ __all__ = [
     "PATH_POINT",
     "FrameView",
     "GraspPlanner",
+    "GraspVerificationPort",
     "MotionFacade",
     "NodeSkill",
     "PolicyPort",

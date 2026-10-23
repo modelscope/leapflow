@@ -16,6 +16,7 @@ class Settings:
     device_id: str = "robot_piper_arm"
     token_file: Path = Path.home() / ".leapflow/.lhp-token"
     issuer_key: Path = Path.home() / ".leapflow/profiles/default/hardware/lhp_permit_issuer.key"
+    node_devices: Path = Path.home() / ".leapflow/profiles/default/hardware/devices"
     root: Path = Path(__file__).resolve().parents[1]
     speed_pct: float = 10.0
     waypoint_mm: float = 10.0
@@ -36,6 +37,8 @@ class Settings:
     joint_step_deg: float = 10.0
     init_max_deg: float = 10.0
     deviation_deg: float = 3.0
+    max_cycles: int = 20
+    max_dwell_s: float = 60.0
     preflight_temp_c: float = 45.0
     max_temp_c: float = 50.0
     voltage_min_v: float = 21.6
@@ -62,8 +65,8 @@ class Settings:
         if unknown:
             raise ValueError(f"unknown settings: {sorted(unknown)}")
         data.update({k: v for k, v in overrides.items() if v is not None})
-        for key in ("token_file", "issuer_key", "root", "node_python", "node_leap", "node_workspace",
-                    "node_control_python"):
+        for key in ("token_file", "issuer_key", "node_devices", "root", "node_python", "node_leap",
+                    "node_workspace", "node_control_python"):
             if key in data and data[key] is not None:
                 data[key] = Path(data[key]).expanduser()
         if "manual_joint_limits_deg" in data:
@@ -86,14 +89,16 @@ class Settings:
         numeric = ("speed_pct", "waypoint_mm", "position_mm", "orientation_deg", "joint_deg",
                    "grip_mm", "poll_s", "settled_samples", "move_timeout_s", "run_timeout_s",
                    "request_timeout_s", "joint_margin_deg", "joint_step_deg", "init_max_deg",
-                   "deviation_deg", "preflight_temp_c", "max_temp_c", "voltage_min_v", "voltage_max_v")
+                   "deviation_deg", "max_cycles", "max_dwell_s", "preflight_temp_c", "max_temp_c",
+                   "voltage_min_v", "voltage_max_v")
         for name in numeric:
             if not isinstance(getattr(self, name), (int, float)):
                 raise ValueError(f"{name} must be numeric")
         for name in ("endpoint", "node_id", "device_id", "gripper_max_evidence", "node_host"):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"{name} must be a string")
-        for name in ("token_file", "issuer_key", "root", "node_python", "node_leap", "node_workspace"):
+        for name in ("token_file", "issuer_key", "node_devices", "root", "node_python", "node_leap",
+                     "node_workspace"):
             if not isinstance(getattr(self, name), Path):
                 raise ValueError(f"{name} must be a Path; use Settings.load for JSON conversion")
         if self.node_control_python is not None and not isinstance(self.node_control_python, Path):
@@ -120,6 +125,8 @@ class Settings:
             raise ValueError("waypoints must be <=10 mm; require >=3 consecutive arrivals")
         if not isinstance(self.settled_samples, int):
             raise ValueError("settled_samples must be an integer")
+        if type(self.max_cycles) is not int or self.max_cycles < 1:
+            raise ValueError("max_cycles must be a positive integer")
         if self.voltage_min_v >= self.voltage_max_v:
             raise ValueError("voltage limits are reversed")
         if self.gripper_max_mm is not None and not self.gripper_max_evidence.strip():

@@ -27,6 +27,13 @@ transport:
     # No qualification is implied by these placeholders.
     mount_digest: ""
     calibration_digest: ""
+    # Optional measurement: {roi, background_roi, limits, mount_digest,
+    # calibration_digest, uncertainty_mm}. Configure from independent metrology;
+    # there is no default ROI or assumed accuracy.
+    # Optional geometry_measurement adds object/jaws BGR selectors, cuboid_seeds,
+    # surface_sigma_mm, contour_sigma_px, jaw_radius_px, jaw_min_samples,
+    # jaw_dispersion_mm and scene_id. Color selectors are segmentation priors,
+    # not contact or holding certificates. All raw metric processing stays local.
     # Read depth_scale per device: D405 typically reports 0.0001 m/unit.
     # All four profiles verified on a D405; bandwidth includes both IR streams.
     color: {width: 640, height: 480, fps: 30}
@@ -73,3 +80,17 @@ channels:
     effect: "read"
     privacy: "environment"
     description: "Per-device scale, factory intrinsics, extrinsics, and capture profile."
+  - channel_id: "camera.rgbd.quality"
+    direction: "read"
+    quantity: "depth_quality"
+    representation: "state"
+    effect: "read"
+    privacy: "environment"
+    description: "Node-local lossless depth qualification; unavailable until measurement is configured."
+  - channel_id: "camera.rgbd.geometry"
+    direction: "read"
+    quantity: "geometry_proposal"
+    representation: "state"
+    effect: "read"
+    privacy: "environment"
+    description: "Metric cuboid alternatives and observed inner-pad midpoint; not a holding certificate."

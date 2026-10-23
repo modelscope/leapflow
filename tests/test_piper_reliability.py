@@ -444,7 +444,7 @@ async def test_commissioning_wrong_health_channels_refuse(commissioning):
 
     from piper_ops.config import Settings
     from piper_ops.evidence import Refusal
-    with pytest.raises(Refusal, match="unqualified controller"):
+    with pytest.raises(Refusal, match="missing, duplicate or foreign controller"):
         await commissioning.read_snapshot(SimpleNamespace(read_batch=read_batch), Settings())
 
 
