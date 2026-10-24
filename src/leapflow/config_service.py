@@ -234,6 +234,13 @@ _FIELD_DESCRIPTIONS = {
         "Off by default; irreversible channels always require approval regardless. "
         "Read at startup, so a change needs a daemon restart."
     ),
+    "hardware.write_verification_follow_s": (
+        "How long a post-write verdict may follow a value that is still travelling "
+        "toward its command before reporting 'pending'. A declared settling time says "
+        "when an observation becomes meaningful, not when a servo has arrived, so a "
+        "slow move judged by it alone looks contradicted. Read when the verification "
+        "coordinator is built, so a change needs a daemon restart."
+    ),
     "hardware.stream_enabled": (
         "Sample channels that declare a sample rate. Sampling loops start during "
         "initialization, so a change needs a daemon restart."

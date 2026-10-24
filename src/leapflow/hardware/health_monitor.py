@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from leapflow.hardware.degradation import DegradationCoordinator
@@ -292,15 +292,17 @@ class HardwareHealthMonitor:
             record.degradation_reason = f"{reason}: {outcome.error}"
 
     async def _execute_halt(self, device_id: str, reason: str) -> None:
-        """Halt a device immediately via the registry transport."""
+        """Halt a device immediately through the registry, which owns the link cache."""
         logger.warning(
             "HealthMonitor: halting device %s (reason: %s)",
             device_id,
             reason,
         )
         try:
-            transport = await self._registry.transport(device_id)
-            await transport.halt()
+            # The halt must reach the device, so a link is opened when none is open;
+            # the registry owns the cache and retires a link the stop closed.
+            await self._registry.transport(device_id)
+            await self._registry.halt(device_id)
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "HealthMonitor: halt failed for %s: %s",

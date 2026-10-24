@@ -7,19 +7,15 @@ stop-on-first-failure with partial/NONE results.
 
 from __future__ import annotations
 
-import asyncio
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from leapflow.hardware.lhp.server import (
     LhpNodeServer,
-    WRITE_MODE_TRUSTED_V1,
 )
 from leapflow.hardware.lhp.protocol import (
     FAILURE_DEVICE_DEGRADED,
-    FAILURE_INTERLOCK_UNSATISFIED,
 )
 from leapflow.hardware.transport import SIDE_EFFECT_NONE
 from tests._harness.hardware_stubs import (

@@ -73,6 +73,10 @@ TABLE_Z = 60.0
 # A camera 540 mm above the table looking straight down (camera +Z = base -Z).
 CAMERA_POSE = {"x": 300.0, "y": 0.0, "z": 600.0, "rx": 180.0, "ry": 0.0, "rz": 0.0}
 SIM_INTRINSICS = CameraIntrinsics(width=200, height=150, fx=250.0, fy=250.0, ppx=100.0, ppy=75.0)
+# The target mount a hand-eye record must carry: which frame the board was fixed
+# to when the mount was measured (``calib.handeye`` writes the real one).
+IDENTITY_MATRIX = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0],
+                   [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
 
 
 def piper_context() -> HardwareContext:
@@ -95,6 +99,7 @@ class SimArmTransport:
         joints: Sequence[float] | None = None,
         forward: Callable[[Sequence[float]], Pose] | None = None,
         arm_status: int | None = None,
+        joint_communication_errors: Sequence[int] = (),
     ) -> None:
         self.joints = dict(zip(JOINTS, joints or (0.0,) * len(JOINTS)))
         self.forward = forward  # when set, joint moves drive the flange pose
@@ -107,6 +112,7 @@ class SimArmTransport:
         self.object_width_mm = object_width_mm
         self.refuse_writes = refuse_writes
         self.arm_status = arm_status  # vendor verdict on the last target, 0x04 = refused
+        self.joint_communication_errors = tuple(joint_communication_errors)
         self.halts = 0
         self.batches: list[tuple[tuple[str, Any], ...]] = []
         self._pending: dict[str, float] = {}
@@ -203,7 +209,8 @@ class SimArmTransport:
         if channel_id == "arm.status":
             if self.arm_status is None:
                 return None
-            return {"ctrl_mode": 0x01, "arm_status": self.arm_status, "motion_status": 0x00}
+            return {"ctrl_mode": 0x01, "arm_status": self.arm_status, "motion_status": 0x00,
+                    "joint_communication_errors": list(self.joint_communication_errors)}
         return None
 
 
@@ -247,6 +254,29 @@ class SkillNodeRegistry:
         if device_id in self.devices:
             return self.devices[device_id]
         raise TransportError(f"unknown device {device_id!r}", failure_code="unknown_device")
+
+    def get_open_transport(self, device_id: str) -> Any:
+        """The live link only; never opens one (matches ``HardwareRegistry``).
+
+        This harness opens nothing lazily: a declared device is live from the
+        moment the registry is built, which is what makes a halt reach it.
+        """
+        if device_id == ARM_ID:
+            return self.sim
+        if device_id in self.devices:
+            return self.devices[device_id]
+        raise TransportError(
+            f"No open transport for device {device_id!r}.",
+            failure_code="transport_not_open",
+        )
+
+    async def halt(self, device_id: str) -> Any:
+        """Stop a declared device, matching ``HardwareRegistry.halt``.
+
+        This harness caches nothing lazily -- a declared device is live from the
+        moment the registry is built -- so there is always a link to stop over.
+        """
+        return await (await self.transport(device_id)).halt()
 
     async def read_batch(self, device_id: str, channel_ids: tuple[str, ...]) -> BatchReading:
         transport = await self.transport(device_id)
@@ -315,7 +345,10 @@ class SkillNodeRegistry:
         self.calibrate(
             "camera.handeye",
             pose=camera_pose,
-            parameters={} if intrinsics is None else {"intrinsics": intrinsics.to_dict()},
+            parameters={
+                "target_mount": IDENTITY_MATRIX,
+                **({"intrinsics": intrinsics.to_dict()} if intrinsics is not None else {}),
+            },
         )
 
 

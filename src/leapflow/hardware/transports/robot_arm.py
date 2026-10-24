@@ -247,7 +247,8 @@ class RobotArmTransport:
             return TransportStatus(
                 connected=False,
                 halt_supported=True,
-                detail="halt: not connected",
+                halt_delivered=False,
+                detail="halt: not connected; the stop was not sent",
             )
         try:
             zero_commands: dict[str, Any] = {}
@@ -264,6 +265,7 @@ class RobotArmTransport:
             return TransportStatus(
                 connected=self._connected,
                 halt_supported=True,
+                halt_delivered=False,
                 detail=f"halt attempted with error: {exc}",
             )
         return TransportStatus(

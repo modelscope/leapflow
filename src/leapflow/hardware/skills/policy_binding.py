@@ -670,14 +670,20 @@ def policy_problems(spec: WorkcellSpec, registry: Any) -> list[str]:
 
 
 class PosePredictor:
-    """Where a robot-side row puts the TCP; axes it does not name hold their observed value."""
+    """Where a robot-side row puts the TCP; axes it does not name hold their observed value.
+
+    It is also the shield's pose check, so it carries the run's starting pose and
+    the space of the row it judges: a joint row follows the joint-move rule, a
+    cartesian row the workcell's cone.
+    """
 
     def __init__(self, binding: PolicyBinding, state: ArmState, motion: GovernedMotion) -> None:
         self._motion = motion
         self._chain = binding.chain
         self._tcp = state.tcp
         self._base: Action = ()
-        space = binding.card.space
+        self._space = binding.card.space
+        space = self._space
         order: Sequence[str] = ()
         if space == SPACE_EE:
             order, self._base = POSE_CHANNELS, state.flange.as_tuple()
@@ -699,11 +705,24 @@ class PosePredictor:
         return self._motion.flange_to_tcp(flange)
 
     def check(self, action: Action) -> str:
-        """The shield's pose check: the discrete-move region rules, as a reason or ``""``."""
+        """The shield's pose check: the move's region rules, as a reason or ``""``.
+
+        The rule is the one for the space the command is expressed in, which is
+        why the dispatch is on the row rather than on the model's intent.  A joint
+        row -- whether the model emitted joints or a pose the adapter solved to
+        joints -- may hold or reduce the tilt the run started from, never add to
+        it; that is what lets a run start on an arm a halt or a hand left tilted.
+        A cartesian row names the attitude it wants instead, so the tool has to
+        point within the workcell's cone.
+        """
         if not self._slots:
             return ""
+        pose = self.tcp(action)
         try:
-            self._motion.check_target(self.tcp(action))
+            if self._space == SPACE_JOINT:
+                self._motion.check_joint_target(pose, start=self._tcp)
+            else:
+                self._motion.check_target(pose)
         except SkillError as error:
             return error.message
         return ""

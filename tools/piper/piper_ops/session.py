@@ -13,7 +13,7 @@ from leapflow.hardware.audit import HardwareAuditLog
 from leapflow.hardware.context import HardwareContext, TransportRef
 from leapflow.hardware.lhp.client import SocketLhpClient
 from leapflow.hardware.lhp.permit import PermitIssuer
-from leapflow.hardware.providers.yaml_provider import declaration_digest
+from leapflow.hardware.attestation import declaration_digest
 from leapflow.hardware.registry import HardwareRegistry, HardwareSettings
 from leapflow.hardware.risk import build_risk_classifier
 from leapflow.hardware.tools import HardwareTools

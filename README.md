@@ -319,7 +319,7 @@ Inside the TUI: `/config list`, `/config set …` — hot-reloads the active ses
 |-----|---------|-------------|
 | `llm.model` | — | Primary model |
 | `llm.base_url` | — | OpenAI-compatible endpoint |
-| `llm.context_length` | `1000000` | Context budget |
+| `llm.context_length` | `1000000` | Runtime context budget shown in the TUI status bar |
 | `memory.working_max_tokens` | `12000` | Working memory budget |
 | `tools.terminal_session_enabled` | `false` | Persistent terminal sessions |
 | `dashboard.enabled` | `true` | LeapBoard |

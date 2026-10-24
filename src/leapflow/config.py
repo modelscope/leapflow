@@ -204,6 +204,11 @@ class Settings:
     # operator decision, and the safety invariant (irreversible channels always
     # require approval) holds regardless.
     hardware_trust_skip_enabled: bool = False
+    # How long a post-write verdict may follow a value that is still travelling
+    # toward its command before it reports "pending". A declared settling time
+    # says when an observation becomes meaningful, not when a servo has arrived:
+    # judging a slow move by it alone reports a correct write as contradicted.
+    hardware_write_verification_follow_s: float = 10.0
     # Continuous sampling for channels that declare a sample rate.
     hardware_stream_enabled: bool = True
     # Per-channel ring buffer depth for raw samples. Raw readings never enter the
@@ -1443,6 +1448,9 @@ def _build_settings_from_env(
     hardware_trust_skip_enabled = os.getenv(
         "LEAPFLOW_HARDWARE_TRUST_SKIP_ENABLED", "0"
     ).strip().lower() in ("1", "true", "yes")
+    hardware_write_verification_follow_s = float(
+        os.getenv("LEAPFLOW_HARDWARE_WRITE_VERIFICATION_FOLLOW_S", "10") or 10.0
+    )
     hardware_stream_enabled = os.getenv(
         "LEAPFLOW_HARDWARE_STREAM_ENABLED", "1"
     ).strip().lower() in ("1", "true", "yes")
@@ -1969,6 +1977,7 @@ def _build_settings_from_env(
         agent_calibration_finalizing_max_ratio=agent_calibration_finalizing_max_ratio,
         agent_compression_writeback=agent_compression_writeback,
         agent_reentry_enabled=agent_reentry_enabled,
+        agent_reentry_hardware_enabled=agent_reentry_hardware_enabled,
         agent_reentry_tick_seconds=agent_reentry_tick_seconds,
         agent_reentry_global_budget=agent_reentry_global_budget,
         agent_reentry_send_enabled=agent_reentry_send_enabled,
@@ -2007,6 +2016,7 @@ def _build_settings_from_env(
         hardware_require_describe=hardware_require_describe,
         hardware_envelope_grant=hardware_envelope_grant,
         hardware_trust_skip_enabled=hardware_trust_skip_enabled,
+        hardware_write_verification_follow_s=hardware_write_verification_follow_s,
         hardware_stream_enabled=hardware_stream_enabled,
         hardware_stream_ring_capacity=hardware_stream_ring_capacity,
         hardware_persist_readings=hardware_persist_readings,

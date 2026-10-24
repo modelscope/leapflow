@@ -177,8 +177,9 @@ async def test_a_pose_policy_bound_to_joints_is_solved_by_ik(tmp_path: Path) -> 
 
 
 async def test_ik_refuses_a_pose_outside_the_joint_limits(tmp_path: Path) -> None:
-    # Climbing 40 mm straight up from the start needs j5 past its 70 deg limit.
-    policy = _ee_policy(step_z=4.0)
+    # A 30 mm climb per action is 270 mm by the ninth: the wrist can no longer
+    # hold the attitude, so the pose has no joint solution inside the limits.
+    policy = _ee_policy(step_z=30.0)
     runtime = policy_cell(tmp_path, policy, arm=_joint_arm(), decl=_IK_DECL)
     outcome = await refuse_run(runtime)
     assert outcome.failure_code == FAILURE_SHIELD_VIOLATION

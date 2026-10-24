@@ -24,6 +24,7 @@ from leapflow.hardware.skills.workcell import DEPENDS_ON, WORKSPACE_FRAME, Workc
 logger = logging.getLogger(__name__)
 
 _VERSION_TOLERANCE = 1e-6
+HANDEYE_PROCEDURE = "handeye"  # every camera-mount procedure name carries this word
 
 
 # ── Frames ───────────────────────────────────────────────────────────────────
@@ -79,6 +80,15 @@ class FrameGraph:
                 resolved = workspace is not None
                 table = _record_table(record) if resolved else None
             else:
+                reason = _provenance_problem(_procedure(spec, name), record)
+                if reason:
+                    # A frame that cannot prove how it was measured is not a
+                    # calibration. Resolving it anyway is how a hand-entered
+                    # matrix outlives the camera being moved: the geometry stays
+                    # plausible, nothing downstream can detect it, and the arm
+                    # is aimed at where the object used to appear.
+                    stale[name] = reason
+                    continue
                 transform = _record_transform(record)
                 resolved = transform is not None
                 if transform is not None:
@@ -142,6 +152,21 @@ def _stale_records(records: Mapping[str, Any]) -> dict[str, str]:
                 stale[name] = reason
                 changed = True
     return stale
+
+
+def _provenance_problem(procedure: str, record: Any) -> str:
+    """Why *record* cannot stand as this procedure's result; empty when it can.
+
+    Only hand-eye is checkable so far: the calibrated target mount is the part
+    of the measurement that proves a camera was actually observed from the
+    poses it was fitted on. A record without it was written by something other
+    than ``calib.handeye`` -- an import or an edit -- and describes a camera
+    that may no longer be there.
+    """
+    if HANDEYE_PROCEDURE in procedure:
+        if (record.parameters or {}).get("target_mount") is None:
+            return "the record carries no measured target mount"
+    return ""
 
 
 def _dependency_problem(record: Any, records: Mapping[str, Any], stale: Mapping[str, str]) -> str:

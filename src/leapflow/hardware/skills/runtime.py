@@ -743,7 +743,12 @@ class SkillRuntime:
             del self._plans[digest]
 
     async def _halt_run(self, run: SkillRun) -> None:
-        """Halt a run's devices exactly once; preempts I/O (halt never takes the lock)."""
+        """Halt a run's devices exactly once; preempts I/O (halt never takes the lock).
+
+        Through the registry, not the transport: a stop that ends the link would
+        otherwise leave a closed instance cached and the device would answer "is not
+        open" until the node restarted.
+        """
         if run.halted:
             return
         run.halted = True
@@ -751,8 +756,9 @@ class SkillRuntime:
             run.halt_mark = run.motion.landed
         for device_id in run.actuators:
             try:
-                transport = await self._registry.transport(device_id)
-                await asyncio.wait_for(transport.halt(), timeout=self._settings.halt_timeout_s)
+                await asyncio.wait_for(
+                    self._registry.halt(device_id), timeout=self._settings.halt_timeout_s
+                )
             except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
                 logger.error("halting %s failed: %s", device_id, exc, exc_info=True)
 

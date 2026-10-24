@@ -33,7 +33,7 @@ from leapflow.hardware.providers import (
     ProviderError,
     build_provider,
 )
-from leapflow.hardware.transport import HardwareTransport, TransportError
+from leapflow.hardware.transport import HardwareTransport, TransportError, TransportStatus
 from leapflow.hardware.transports import available_transports, build_transport
 
 if TYPE_CHECKING:
@@ -81,6 +81,12 @@ class HardwareSettings:
     instrument_db_path: str = ""
     workspace_id: str = ""
     rediscover_interval_s: float = 0.0
+    # How long a post-write verdict may follow a value that is still travelling
+    # toward its command. A slow servo legitimately needs seconds to arrive, and
+    # judging it by the declared settling time alone reports a correct move as
+    # contradicted; a value still moving when this budget ends is reported as
+    # pending instead of failed.
+    write_verification_follow_s: float = 10.0
     preview_idle_timeout_s: float = 5.0
     # Detail uses 1280px / 30fps / JPEG 85; Balanced stays 960px / 8fps / JPEG 75.
     preview_max_fps: float = 30.0
@@ -93,6 +99,10 @@ class HardwareSettings:
     hardware_alert_policies: Any = ""
     # Profile-owned append-only audit destination for HardwareTools.
     audit_log_path: str = ""
+    # Profile-owned record of which declarations an operator has reviewed, and
+    # the digest of what they reviewed.  Exposed here because the fleet needs to
+    # consult it for remote devices too: an edge node cannot vouch for itself.
+    verified_path: str = ""
     # Profile-owned Ed25519 key the host signs LHP execution permits with;
     # empty disables permit minting (nodes in ``permit_required`` then refuse).
     permit_issuer_key_path: str = ""
@@ -133,6 +143,7 @@ class HardwareSettings:
             providers=_provider_rows(
                 settings, devices_dir=devices_dir, verified_path=verified_path
             ),
+            verified_path=str(verified_path),
             max_devices=int(getattr(settings, "hardware_max_devices", 16) or 16),
             unverified_context_policy=str(
                 getattr(settings, "hardware_unverified_policy", UnverifiedContextPolicy.DENY_WRITE)
@@ -174,6 +185,9 @@ class HardwareSettings:
             ),
             rediscover_interval_s=float(
                 getattr(settings, "hardware_rediscover_interval_s", 0.0) or 0.0
+            ),
+            write_verification_follow_s=float(
+                getattr(settings, "hardware_write_verification_follow_s", 10.0) or 10.0
             ),
             preview_idle_timeout_s=float(
                 getattr(settings, "hardware_preview_idle_timeout_s", 5.0) or 5.0
@@ -329,6 +343,9 @@ class HardwareRegistry:
         self._transports: dict[str, HardwareTransport] = {}
         self._open_locks: dict[str, asyncio.Lock] = {}
         self._io_locks: dict[str, asyncio.Lock] = {}
+        # Links whose halt was interrupted before their state could be settled;
+        # closed on the device's next open (see ``halt``).
+        self._orphans: dict[str, HardwareTransport] = {}
         self._report = LoadReport()
         self._described: set[tuple[str, str]] = set()
         self._last_command: dict[tuple[str, str], tuple[float, float]] = {}
@@ -906,6 +923,7 @@ class HardwareRegistry:
             existing = self._transports.get(device_id)
             if existing is not None:
                 return existing
+            await self._release_orphan(device_id)
             transport = build_transport(context.transport.kind, context.transport.config)
             status = await transport.open(context)
             if not status.connected:
@@ -915,6 +933,97 @@ class HardwareRegistry:
                 )
             self._transports[device_id] = transport
             return transport
+
+    async def halt(self, device_id: str) -> TransportStatus | None:
+        """Stop a device now, leaving the cache holding only open links.
+
+        A halt is the one operation that may legitimately end a link: a camera
+        releases its device when it stops and reports ``connected=False``. If
+        that instance stayed cached, ``transport()`` would keep handing it out
+        and ``open()`` would never run again -- the camera then answers "is not
+        open" for the life of the process, which is what a fleet-wide halt did to
+        every camera on the node. A link that survives the stop (an arm) stays
+        cached, so the next command reuses it instead of paying a bring-up.
+
+        Returns ``None`` when this process holds no link for the device: nothing
+        is being driven from here, so there is neither motion to stop nor a device
+        to wake. The per-device *open* lock is held across the transition so a
+        concurrent first use cannot open a second link to the same hardware while
+        this one is still being released. It is deliberately not the *I/O* lock: a
+        halt must preempt the very operation it exists to stop.
+
+        A retired instance is *closed*, not merely dropped. A driver whose halt is
+        its close has nothing left to release, but a remote link is still an open
+        socket holding frame claims -- and an instance dropped while unclosed kept
+        that socket until the process exited.
+        """
+        lock = self._open_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            transport = self._transports.pop(device_id, None)
+            if transport is None:
+                return None
+            try:
+                status = await transport.halt()
+            except asyncio.CancelledError:
+                # The link's state is unknown, so it may neither be cached nor be
+                # forgotten while it still holds its device: the next open
+                # releases it first.
+                self._orphans[device_id] = transport
+                raise
+            except Exception:
+                await self._cache_if_still_open(device_id, transport)
+                raise
+            if status.connected:
+                self._transports[device_id] = transport
+            else:
+                await self._retire(device_id, transport)
+            return status
+
+    async def _cache_if_still_open(
+        self, device_id: str, transport: HardwareTransport
+    ) -> None:
+        """Re-cache *transport* only if its driver still reports an open link.
+
+        Used when a halt failed. The cache may hold only open links, so an
+        instance whose driver reports a closed link is retired instead; one whose
+        link survived keeps its connection rather than paying a bring-up for a
+        stop that never ran.
+        """
+        try:
+            status = await transport.probe()
+        except Exception as exc:  # noqa: BLE001 - liveness is unknown, so do not cache
+            logger.debug(
+                "re-caching %r after a failed halt: probe failed: %s", device_id, exc
+            )
+            await self._retire(device_id, transport)
+            return
+        if status.connected:
+            self._transports.setdefault(device_id, transport)
+        else:
+            await self._retire(device_id, transport)
+
+    async def _retire(self, device_id: str, transport: HardwareTransport) -> None:
+        """Close a link that has left the cache, and never let teardown mask it.
+
+        Idempotent by the transport contract, so a driver that already released
+        its device when it stopped simply has nothing left to do here.
+        """
+        try:
+            await transport.close()
+        except Exception as exc:  # noqa: BLE001 - teardown must not become the failure
+            logger.warning("closing the retired link to %r failed: %s", device_id, exc)
+
+    async def _release_orphan(self, device_id: str) -> None:
+        """Close a link left behind by an interrupted halt, before opening another.
+
+        Nothing else would ever close it, and a forgotten RealSense keeps its USB
+        device claimed -- so the replacement open fails. Idempotent: closing a
+        link the driver already released is allowed by the transport contract.
+        """
+        orphan = self._orphans.pop(device_id, None)
+        if orphan is None:
+            return
+        await self._retire(device_id, orphan)
 
     def opened_devices(self) -> tuple[str, ...]:
         return tuple(sorted(self._transports))
@@ -1679,6 +1788,8 @@ class HardwareRegistry:
                     "Hardware transport %r close failed: %s", device_id, exc, exc_info=True
                 )
         self._transports.clear()
+        for device_id in list(self._orphans):
+            await self._release_orphan(device_id)
 
 
 __all__ = [

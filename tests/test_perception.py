@@ -69,6 +69,7 @@ from tests._harness.skill_stubs import (
     ARM_ID,
     CAMERA_ID,
     CAMERA_POSE,
+    IDENTITY_MATRIX,
     LOCATOR_ID,
     PERCEPTION_WORKCELL_YAML,
     TABLE_Z,
@@ -529,7 +530,11 @@ async def test_wrist_capture_uses_its_mount_and_checks_capture_drift(
             "parent": "flange", "procedure": "wrist.handeye",
         }},
     )
-    registry.calibrate("wrist.handeye", pose={"x": 10., "y": 20., "z": 30.})
+    registry.calibrate(
+        "wrist.handeye",
+        pose={"x": 10., "y": 20., "z": 30.},
+        parameters={"target_mount": IDENTITY_MATRIX},
+    )
     scene = _scene(registry, spec=spec)
     reads = 0
 

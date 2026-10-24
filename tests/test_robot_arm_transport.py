@@ -18,7 +18,6 @@ from leapflow.hardware.context import (
     ContextProvenance,
     ContextSource,
     Direction,
-    Envelope,
     HardwareContext,
     HardwareEffect,
     PrivacyTier,
@@ -33,15 +32,10 @@ from leapflow.hardware.transport import (
     SIDE_EFFECT_COMMITTED,
     SIDE_EFFECT_UNKNOWN,
     TransportError,
-    TransportStatus,
 )
 from leapflow.hardware.transports.robot_arm import RobotArmTransport
 from leapflow.hardware.transports.robot_channels import (
     RobotChannelMapper,
-    camera_channel,
-    gripper_channel,
-    infer_channel_type,
-    motor_channel_pair,
 )
 from leapflow.hardware.providers.robot_arm import RobotArmContextProvider
 

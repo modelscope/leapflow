@@ -52,6 +52,26 @@ _pin_loopback_out_of_proxies()
 
 
 # ════════════════════════════════════════════════════════════════
+# Ambient fleet neutrality
+# ════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture(autouse=True)
+def _isolate_configured_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A developer's configured board never changes what the suite sees.
+
+    ``LEAPFLOW_FLEET_NODES`` is read whenever a registry carries no typed
+    ``fleet_nodes`` setting -- which is every test that builds
+    ``HardwareSettings(enabled=True)``. On a machine with a node configured the
+    same code then discovers the real board's devices, so a device count or a
+    tool index measured here depends on the shell the suite was started from,
+    and a unit test quietly talks to hardware. Tests that want nodes set the
+    variable themselves.
+    """
+    monkeypatch.delenv("LEAPFLOW_FLEET_NODES", raising=False)
+
+
+# ════════════════════════════════════════════════════════════════
 # Headless prompt_toolkit output
 # ════════════════════════════════════════════════════════════════
 

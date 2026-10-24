@@ -13,9 +13,10 @@ from urllib.parse import urlparse
 
 from leapflow.hardware.drivers._piper_feedback import CAN_GROUPS, _FAULT_FLAGS
 from leapflow.hardware.providers import ProviderError
-from leapflow.hardware.providers.yaml_provider import YamlContextProvider, declaration_digest
+from leapflow.hardware.providers.yaml_provider import YamlContextProvider
 from leapflow.hardware.registry import HardwareRegistry
 from leapflow.hardware.skills.geometry import Pose
+from leapflow.hardware.attestation import declaration_digest
 
 from .config import Settings
 from .evidence import Refusal, StaleFeedback

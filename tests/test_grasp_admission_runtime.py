@@ -23,7 +23,6 @@ from leapflow.hardware.calibration_qualification import (
 from leapflow.hardware.context import HardwareContext
 from leapflow.hardware.grasp_measurement import digest
 from leapflow.hardware.lhp.server import WRITE_MODE_PERMIT_REQUIRED
-from leapflow.hardware.providers.yaml_provider import declaration_digest
 from leapflow.hardware.skills.builtin.grasp_verify import (
     GraspInspect,
     GraspVerify,
@@ -34,9 +33,11 @@ from leapflow.hardware.skills.geometry import Pose
 from leapflow.hardware.skills.grasp_verification import PROCEDURE, WorkcellGraspVerification
 from leapflow.hardware.skills.protocol import SkillError
 from leapflow.hardware.transport import BatchReading, Reading
+from leapflow.hardware.attestation import declaration_digest
 from tests._harness.skill_stubs import (
     ARM_ID,
     CAMERA_ID,
+    IDENTITY_MATRIX,
     SAFE_BOX,
     WORKCELL_ID,
     WORKCELL_YAML,
@@ -118,8 +119,14 @@ async def admission_rig(tmp_path: Path, rigs: Any, monkeypatch: Any) -> Any:
     monkeypatch.setattr(
         registry, "context", lambda device: declarations.get(device) or original_context(device)
     )
-    registry.calibrate("camera.handeye", pose=Pose(0, 0, 0).to_dict())
-    registry.calibrate("wrist.handeye", pose=Pose(0, 0, 120).to_dict())
+    registry.calibrate(
+        "camera.handeye", pose=Pose(0, 0, 0).to_dict(),
+        parameters={"target_mount": IDENTITY_MATRIX},
+    )
+    registry.calibrate(
+        "wrist.handeye", pose=Pose(0, 0, 120).to_dict(),
+        parameters={"target_mount": IDENTITY_MATRIX},
+    )
     registry.calibrate(
         "workspace.safe_box",
         parameters={**SAFE_BOX, "floor": {"method": "table_z", "table_z": 140}},

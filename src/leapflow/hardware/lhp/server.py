@@ -108,6 +108,7 @@ from leapflow.hardware.transport import (
     TransportStatus,
     WriteOutcome,
 )
+from leapflow.hardware.attestation import declaration_payload
 
 logger = logging.getLogger(__name__)
 
@@ -465,15 +466,46 @@ class LhpNodeServer:
         return status.to_dict()
 
     async def _handle_halt(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """Stop a device now, over the link that is already open.
+
+        A halt never brings a device up. Opening one runs the whole bring-up
+        (warm-up, firmware-profile verification), so a profile the arm could not
+        report would refuse the stop itself -- a routine shutdown sweep logged
+        ``cannot verify the arm firmware profile`` at ERROR for an arm this node
+        had never opened, and a successful open would have woken a device purely
+        to put it down. A device with no open link here is not being driven by
+        this process and holds no motion this call could stop.
+
+        ``halt_supported`` stays as the device declared it: the device can be
+        stopped and this node simply has nothing to send the stop over, which is
+        not the same as a device declaring that it cannot halt.
+
+        The registry owns the link cache, so the stop goes through it: a stop that
+        ends the link (a camera releases its device) must take the instance out of
+        the cache, or every later frame read on this node fails with "is not open".
+        """
         device_id = require_str(params, "device_id")
-        if self._registry.context(device_id) is None:
+        context = self._registry.context(device_id)
+        if context is None:
             raise LhpProtocolError(f"unknown device {device_id!r}", code=ERR_UNKNOWN_DEVICE)
         try:
-            transport = await self._registry.transport(device_id)
-            status = await transport.halt()
+            status = await self._registry.halt(device_id)
         except TransportError as exc:
             logger.error("LHP halt for %r failed: %s", device_id, exc, exc_info=True)
-            return TransportStatus(connected=False, halt_supported=False, detail=str(exc)).to_dict()
+            return TransportStatus(
+                connected=False,
+                halt_supported=getattr(context, "halt_supported", None) is not False,
+                halt_delivered=False,
+                detail=str(exc),
+            ).to_dict()
+        if status is None:
+            logger.info("LHP halt for %r: no open link on this node, nothing to stop", device_id)
+            return TransportStatus(
+                connected=False,
+                halt_supported=getattr(context, "halt_supported", None) is not False,
+                detail="no link is open to this device on the node, so nothing is being driven "
+                       "from here",
+            ).to_dict()
         return status.to_dict()
 
     # ── Control session handlers ──
@@ -690,11 +722,13 @@ def _declarations_digest(contexts: Sequence[HardwareContext]) -> str:
     Carried in ``hello`` because a heartbeat is the only conversation a host keeps
     with an idle node. A node restarted inside one heartbeat interval never looks
     offline, so liveness alone cannot reveal that it now declares a corrected
-    envelope or a camera plugged in since. Hashing the wire form, not the full
-    context, keeps node-private bindings out of the fingerprint too.
+    envelope or a camera plugged in since. Hashing the same canonical form the
+    host uses to bind a review (``verification.declaration_payload``) keeps
+    node-private bindings out of the fingerprint and keeps the two sides'
+    digests comparable.
     """
-    wire = [_wire_context(context) for context in contexts]
-    encoded = json.dumps(wire, sort_keys=True, separators=(",", ":"), default=str)
+    payloads = [declaration_payload(context) for context in contexts]
+    encoded = json.dumps(payloads, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
 
 

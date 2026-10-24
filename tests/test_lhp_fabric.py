@@ -587,6 +587,69 @@ async def test_a_batch_whose_fate_is_unknown_refuses_to_claim_none() -> None:
     assert batch.outcomes == ()
 
 
+async def test_a_halt_never_brings_a_device_up_just_to_put_it_down() -> None:
+    """A halt acts on a live link; it never opens one.
+
+    Opening a device runs the full bring-up, so a profile the arm could not
+    report refused the stop itself and a successful open would have woken
+    hardware at shutdown. A device this node never opened holds no motion to
+    stop, and it must still answer as haltable rather than as a failed stop.
+    """
+    registry = StubNodeRegistry()
+    server = LhpNodeServer(registry, node_id="stub_node", write_mode="trusted_v1")
+    reply = await server.handle_request(
+        {"id": 1, "method": "halt", "params": {"device_id": "conformance_device"}}
+    )
+    assert reply["ok"] is True, reply
+    assert reply["result"]["halt_supported"] is True
+    assert reply["result"]["connected"] is False
+    assert "nothing is being driven" in reply["result"]["detail"]
+    assert registry.opened is False, "a halt must never open the device"
+
+
+async def test_a_halt_still_stops_a_device_whose_link_is_open() -> None:
+    registry = StubNodeRegistry()
+    server = LhpNodeServer(registry, node_id="stub_node", write_mode="trusted_v1")
+    await server.handle_request(
+        {"id": 1, "method": "read", "params": {"device_id": "conformance_device",
+                                                 "channel_id": "sensor"}}
+    )
+    assert registry.opened is True
+    reply = await server.handle_request(
+        {"id": 2, "method": "halt", "params": {"device_id": "conformance_device"}}
+    )
+    assert reply["ok"] is True, reply
+    assert reply["result"]["halt_supported"] is True
+
+
+async def test_a_halt_that_releases_the_link_lets_the_next_read_reopen_it() -> None:
+    """A stop that powers the device down must leave nothing cached.
+
+    A RealSense halt releases its device; the closed instance then stayed cached,
+    so ``open()`` never ran again and every later frame read answered "is not
+    open" for the life of the node.
+    """
+    registry = StubNodeRegistry(halt_closes=True)
+    server = LhpNodeServer(registry, node_id="stub_node", write_mode="trusted_v1")
+    await server.handle_request(
+        {"id": 1, "method": "read", "params": {"device_id": "conformance_device",
+                                                 "channel_id": "sensor"}}
+    )
+    assert registry.opens == 1
+    reply = await server.handle_request(
+        {"id": 2, "method": "halt", "params": {"device_id": "conformance_device"}}
+    )
+    assert reply["ok"] is True, reply
+    assert reply["result"]["connected"] is False
+    assert registry.opened is False, "a released link must not stay in the cache"
+    again = await server.handle_request(
+        {"id": 3, "method": "read", "params": {"device_id": "conformance_device",
+                                                 "channel_id": "sensor"}}
+    )
+    assert again["ok"] is True, again
+    assert registry.opens == 2, "the next read must open a fresh link"
+
+
 # ════════════════════════════════════════════════════════════════
 # Listeners: TCP and Unix
 # ════════════════════════════════════════════════════════════════
@@ -938,16 +1001,17 @@ def _node_registry(
     return registry
 
 
-def _node_device(device_id: str, *, display_name: str = "") -> HardwareContext:
+def _node_device(device_id: str, *, display_name: str = "", halt_supported: bool = True) -> HardwareContext:
     """One node-side device declaration served over LHP."""
     return HardwareContext(
         device_id=device_id,
         display_name=display_name or f"Node device {device_id}",
         transport=TransportRef(
             kind="mock",
-            config={"values": {"sensor": 21.5, "setpoint": 50.0}, "halt_supported": True},
+            config={"values": {"sensor": 21.5, "setpoint": 50.0},
+                    "halt_supported": halt_supported},
         ),
-        halt_supported=True,
+        halt_supported=halt_supported,
         channels=stub_node_context().channels,
     )
 
@@ -1068,6 +1132,53 @@ async def test_discover_nodes_uses_reported_identity_and_skips_unreachable() -> 
         await node_server.stop()
 
 
+async def test_halt_all_does_not_mistake_a_released_device_for_an_undelivered_stop() -> None:
+    """A device that stops by letting go reports the same shape as a dead link.
+
+    A camera releases its capture and answers ``connected=False,
+    halt_supported=False``; before the delivery verdict was stated explicitly the
+    fleet read that as an undelivered stop and reported its own backstop as failed
+    on every node that carries a passive device.
+    """
+    node_server, endpoint = await _start_node(
+        _node_registry(_node_device("camera", halt_supported=False)), "jetson01"
+    )
+    manager = FleetManager(_node_registry())
+    try:
+        await manager.register_node(FleetNode("jetson01", "J", endpoint))
+        halted = await manager.halt_all()
+        assert halted["jetson01"]["failures"] == 0
+        assert halted["jetson01"]["halted"] is True
+    finally:
+        await manager.close()
+        await node_server.stop()
+
+
+async def test_a_halt_over_a_closed_lhp_link_is_undelivered_not_halted() -> None:
+    """A stop that never left the host must not read as an idle device.
+
+    ``halt_supported`` belongs to the device and survives the link: an arm whose
+    connection dropped may still be travelling, and the caller has to be able to
+    tell that apart from a device nobody was driving.
+    """
+    node_server, endpoint = await _start_node(_node_registry(_node_device("arm")), "jetson01")
+    host_registry = _node_registry()
+    manager = FleetManager(host_registry)
+    try:
+        await manager.register_node(FleetNode("jetson01", "J", endpoint))
+        transport = await host_registry.transport("jetson01__arm")
+        await transport.close()
+
+        status = await transport.halt()
+
+        assert status.connected is False
+        assert status.halt_supported is True
+        assert status.halt_delivered is False
+    finally:
+        await manager.close()
+        await node_server.stop()
+
+
 async def test_halt_all_reports_an_undelivered_halt_instead_of_claiming_it() -> None:
     node_server, endpoint = await _start_node(_node_registry(_node_device("arm")), "jetson01")
     host_registry = _node_registry()
@@ -1080,6 +1191,25 @@ async def test_halt_all_reports_an_undelivered_halt_instead_of_claiming_it() -> 
         assert halted["jetson01"]["halted"] is False
     finally:
         await manager.close()
+
+
+async def test_halt_all_counts_an_idle_node_as_stopped_not_as_a_failure() -> None:
+    """An emergency stop over devices the node never opened did stop everything.
+
+    Nothing was being driven there, so reporting the stop as undelivered would
+    make the fleet's own backstop cry wolf -- and would send it looking for a
+    failure in hardware that was simply idle.
+    """
+    node_server, endpoint = await _start_node(_node_registry(_node_device("arm")), "jetson01")
+    manager = FleetManager(_node_registry())
+    try:
+        await manager.register_node(FleetNode("jetson01", "J", endpoint))
+        halted = await manager.halt_all()
+        assert halted["jetson01"]["failures"] == 0
+        assert halted["jetson01"]["halted"] is True
+    finally:
+        await manager.close()
+        await node_server.stop()
 
 
 # ── Registry: external sources (fabric nodes) ──

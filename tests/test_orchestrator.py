@@ -261,18 +261,17 @@ class TestBarrierExecution:
         assert not result.halted
 
     @pytest.mark.asyncio
-    async def test_barrier_timeout_triggers_halt(self, transports):
+    async def test_barrier_timeout_triggers_halt(self, transports, monkeypatch):
         """Barrier timeout triggers halt_all when a device never reaches target."""
         # Override arm_b read to always return 0.0, simulating a device
         # that never reaches the commanded 999.0 target.
-        original_read = transports["arm_b"].read
 
         async def _stuck_read(channel_id: str) -> _MockReading:
             return _MockReading(
                 device_id="arm_b", channel_id=channel_id, value=0.0
             )
 
-        transports["arm_b"].read = _stuck_read
+        monkeypatch.setattr(transports["arm_b"], "read", _stuck_read)
         # Override registry.read for arm_b too.
         registry = MockRegistry(transports)
         orch = MultiDeviceOrchestrator(registry)

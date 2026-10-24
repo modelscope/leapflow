@@ -9,12 +9,12 @@ from typing import Any, Mapping
 
 from leapflow.hardware.grasp_evidence import GraspLimits, GraspState, TemporalGraspObserver
 from leapflow.hardware.grasp_measurement import GraspQualification, digest, number
-from leapflow.hardware.providers.yaml_provider import declaration_digest
 from leapflow.hardware.skills.protocol import (
     FAILURE_GUARD_FAILED,
     FAILURE_SKILL_UNAVAILABLE,
     SkillError,
 )
+from leapflow.hardware.attestation import declaration_digest
 
 PROCEDURE = "grasp.qualification"
 

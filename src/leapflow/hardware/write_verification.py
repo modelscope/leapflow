@@ -25,6 +25,40 @@ from leapflow.hardware.verification import OperationVerdict, VerdictStatus
 
 logger = logging.getLogger(__name__)
 
+# How long an observation that contradicts its command is followed before the
+# contradiction is reported: a servo commanded far from where it stands keeps
+# moving past its declared settling time, and a value in motion is not evidence.
+# Progress toward the target means the command is being carried out, so the
+# follow continues; a value that stops progressing -- at rest, or moving away --
+# for ``_CONVERGENCE_STALL_S`` is a contradiction. The overall budget is
+# deployment policy (``HardwareSettings.write_verification_follow_s``): a slow
+# arm legitimately travels for seconds, and a value still travelling when the
+# budget ends is reported as pending, never as a failure.
+_CONVERGENCE_POLL_S = 0.2
+_CONVERGENCE_STALL_S = 0.6
+_DEFAULT_CONVERGENCE_S = 10.0
+
+
+def _moved(previous: Any, current: Any, tolerance: float) -> bool:
+    """Whether an observation changed by more than half the declared tolerance."""
+    left, right = as_numeric(previous), as_numeric(current)
+    if left is None or right is None:
+        return previous != current
+    return abs(right - left) > max(tolerance / 2.0, 0.0)
+
+
+def _converging(
+    previous: Any,
+    current: Any,
+    previous_deviation: float,
+    deviation: float,
+    tolerance: float,
+) -> bool:
+    """Whether the observation is still closing the gap to its commanded value."""
+    if not _moved(previous, current, tolerance):
+        return False
+    return deviation < previous_deviation
+
 
 class WriteVerdictStatus(str, Enum):
     """Observable result of one commanded channel."""
@@ -331,11 +365,13 @@ class WriteVerificationCoordinator:
         audit_log: Any,
         trust_gate: Any,
         identity_provider: Callable[[], str],
+        follow_s: float = _DEFAULT_CONVERGENCE_S,
     ) -> None:
         self._registry = registry
         self._audit = audit_log
         self._trust_gate = trust_gate
         self._identity_provider = identity_provider
+        self._follow_s = max(float(follow_s), 0.0)
         pending = getattr(registry, "pending_write_expectations", None)
         if pending is None:
             pending = getattr(registry, "_leapflow_pending_write_expectations", None)
@@ -496,6 +532,21 @@ class WriteVerificationCoordinator:
                 expectation,
                 "The verification channel requires separate read consent.",
             )
+        verdict, detail = await self._observe(transport, channel, expectation)
+        if verdict is None:
+            return self._unobservable(expectation, detail)
+        if verdict.is_mismatch:
+            verdict = await self._follow_convergence(transport, channel, expectation, verdict)
+        self.record_verdict(verdict)
+        return verdict
+
+    async def _observe(
+        self,
+        transport: Any,
+        channel: Channel,
+        expectation: WriteExpectation,
+    ) -> tuple[WriteVerdict | None, str]:
+        """Read and judge the verification channel once; ``None`` when unreadable."""
         try:
             reading = await transport.read(expectation.observation_channel_id)
         except Exception as exc:  # noqa: BLE001 - verification must stay contained
@@ -507,12 +558,8 @@ class WriteVerificationCoordinator:
                 exc,
                 exc_info=True,
             )
-            return self._unobservable(
-                expectation,
-                f"Post-write observation failed: {type(exc).__name__}.",
-            )
+            return None, f"Post-write observation failed: {type(exc).__name__}."
 
-        learned_outcome = None
         recorder = self._registry.outcome_recorder
         if recorder is not None and expectation.observation_channel_id == channel.channel_id:
             learned_outcome = recorder.observe(
@@ -520,19 +567,75 @@ class WriteVerificationCoordinator:
                 channel_id=channel.channel_id,
                 value=reading.value,
             )
+            if learned_outcome is not None:
+                return WriteVerdict.from_physical_outcome(
+                    learned_outcome, expectation=expectation
+                ), ""
         elif expectation.observation_channel_id != channel.channel_id:
             self.drop_pending_outcome(expectation.device_id, channel.channel_id)
+        return WriteVerdict.from_reading(expectation, reading), ""
 
-        if learned_outcome is not None:
-            verdict = WriteVerdict.from_physical_outcome(
-                learned_outcome,
-                expectation=expectation,
-            )
-            self.record_verdict(verdict)
-        else:
-            verdict = WriteVerdict.from_reading(expectation, reading)
-            self.record_verdict(verdict)
-        return verdict
+    async def _follow_convergence(
+        self,
+        transport: Any,
+        channel: Channel,
+        expectation: WriteExpectation,
+        verdict: WriteVerdict,
+    ) -> WriteVerdict:
+        """Follow a contradicting value while it is still closing the gap.
+
+        The declared settling time says when an observation becomes meaningful,
+        not when a servo has arrived. A pose channel commanded 100 mm from where
+        it stands is still moving well past a fixed wait, and a single read then
+        reports a contradiction of an expectation that is being met -- charging
+        the plugin a trust failure for a move that is correct.
+
+        So the value is followed instead of judged once: progress toward the
+        command keeps the follow alive, arrival settles it as verified, and a
+        value that stops progressing -- at rest, or moving away -- for
+        ``_CONVERGENCE_STALL_S`` is the contradiction. A value still travelling
+        when the follow budget ends is reported as pending, which is exactly
+        what "not observable yet" means and costs no trust.
+        """
+        started = time.monotonic()
+        deadline = started + self._follow_s
+        progressing_since = started
+        latest = verdict
+        previous_value = verdict.observed_value
+        previous_deviation = abs(verdict.deviation or 0.0)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(_CONVERGENCE_POLL_S)
+            observed, _detail = await self._observe(transport, channel, expectation)
+            if observed is None:
+                return latest
+            if not observed.is_mismatch:
+                return observed
+            deviation = abs(observed.deviation or 0.0)
+            now = time.monotonic()
+            if _converging(
+                previous_value,
+                observed.observed_value,
+                previous_deviation,
+                deviation,
+                expectation.tolerance,
+            ):
+                progressing_since = now
+            elif now - progressing_since >= _CONVERGENCE_STALL_S:
+                return observed
+            latest = observed
+            previous_value = observed.observed_value
+            previous_deviation = deviation
+        return WriteVerdict(
+            status=WriteVerdictStatus.PENDING.value,
+            expectation=expectation,
+            observed_value=latest.observed_value,
+            deviation=latest.deviation,
+            detail=(
+                "The observed value was still travelling when the follow budget "
+                "ended; read the channel again before drawing a conclusion."
+            ),
+            observed_at=time.time(),
+        )
 
     def _unobservable(self, expectation: WriteExpectation, detail: str) -> WriteVerdict:
         self.drop_pending_outcome(

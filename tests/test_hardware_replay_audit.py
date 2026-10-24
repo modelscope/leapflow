@@ -25,7 +25,7 @@ from leapflow.hardware.replay import (
     run_replay,
 )
 from leapflow.hardware.stream import HardwareEvent
-from leapflow.hardware.transport import Reading
+from leapflow.hardware.transport import Reading, TransportStatus
 
 
 # ════════════════════════════════════════════════════════════════
@@ -246,10 +246,10 @@ class _FakeTransport:
     kind = "fake"
 
     async def open(self, context: Any) -> Any:
-        return SimpleNamespace(connected=True, halt_supported=True, detail="", latency_ms=0)
+        return TransportStatus(connected=True, halt_supported=True, detail="")
 
     async def close(self) -> Any:
-        return SimpleNamespace(connected=False, halt_supported=True, detail="", latency_ms=0)
+        return TransportStatus(connected=False, halt_supported=True, detail="")
 
     async def read(self, channel_id: str) -> Reading:
         return Reading(
@@ -265,10 +265,10 @@ class _FakeTransport:
         return WriteOutcome(ok=True, side_effect_state=SIDE_EFFECT_COMMITTED, settled=True)
 
     async def probe(self) -> Any:
-        return SimpleNamespace(connected=True, halt_supported=True, detail="", latency_ms=0, to_dict=lambda: {})
+        return TransportStatus(connected=True, halt_supported=True, detail="")
 
     async def halt(self) -> Any:
-        return SimpleNamespace(connected=True, halt_supported=True, detail="stopped", latency_ms=0, to_dict=lambda: {})
+        return TransportStatus(connected=True, halt_supported=True, detail="stopped")
 
 
 class _FakeRegistry:
@@ -297,6 +297,10 @@ class _FakeRegistry:
 
     async def transport(self, device_id: str) -> _FakeTransport:
         return self._transport
+
+    async def halt(self, device_id: str) -> Any:
+        """Stop the device over the link this stand-in holds (registry contract)."""
+        return await (await self.transport(device_id)).halt()
 
     def device_io(self, device_id: str) -> Any:
         import contextlib

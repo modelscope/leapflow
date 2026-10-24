@@ -302,28 +302,49 @@ class LhpTransport:
         )
 
     async def halt(self) -> TransportStatus:
-        """Emergency stop. Never raises and is never serialised by callers."""
+        """Emergency stop. Never raises and is never serialised by callers.
+
+        Every branch that could not put the stop on the wire answers
+        ``halt_delivered=False`` while still reporting the device's *declared*
+        halt capability: a remote arm whose link is gone may still be travelling,
+        and the fleet has to be able to tell that apart from a camera that
+        released its own capture.
+        """
         client = self._client
         if not self._connected or client is None:
             return TransportStatus(
-                connected=False, halt_supported=False, detail="lhp transport is not open"
+                connected=False,
+                halt_supported=self._declared_halt_support(),
+                halt_delivered=False,
+                detail="lhp transport is not open; the stop was not sent",
             )
         try:
             result = await client.request("halt", {"device_id": self._remote_device_id})
         except LhpRemoteError as exc:
             logger.error("LHP halt for %r failed: %s", self._remote_device_id, exc, exc_info=True)
             return TransportStatus(
-                connected=False, halt_supported=False, detail=f"{exc.code}: {exc}"
+                connected=False,
+                halt_supported=self._declared_halt_support(),
+                halt_delivered=False,
+                detail=f"{exc.code}: {exc}",
             )
         if not isinstance(result, Mapping):
             return TransportStatus(
-                connected=False, halt_supported=False, detail="malformed halt result"
+                connected=False,
+                halt_supported=self._declared_halt_support(),
+                halt_delivered=False,
+                detail="malformed halt result",
             )
         return TransportStatus(
             connected=bool(result.get("connected", False)),
             halt_supported=bool(result.get("halt_supported", False)),
+            halt_delivered=bool(result.get("halt_delivered", True)),
             detail=str(result.get("detail") or ""),
         )
+
+    def _declared_halt_support(self) -> bool:
+        """The device's declared stop capability, independent of the link state."""
+        return bool(getattr(self._context, "halt_supported", False))
 
     # ── Batch side-protocol ──
 

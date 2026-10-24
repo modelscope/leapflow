@@ -9,7 +9,6 @@ is importable without it, but ``OpenCVCamera`` requires it at runtime.
 from __future__ import annotations
 
 import logging
-import math
 import platform
 import time
 from threading import Event, Lock, Thread

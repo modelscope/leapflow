@@ -488,13 +488,33 @@ def _load_raw_yaml_context(devices_dir: Path, device_id: str) -> Any:
     return None
 
 
+def _fleet_node_for(device_id: str, settings: Any) -> tuple[Any, str] | None:
+    """Resolve ``<node>__<device>`` to its configured node and node-local id.
+
+    Returns ``None`` for a local device.  Only a *configured* node matches: a
+    prefix that merely looks like one must not turn a typo into a network
+    exchange.
+    """
+    from leapflow.hardware.fleet_config import configured_nodes_from_settings
+
+    raw = str(getattr(settings, "hardware_fleet_nodes", "") or "")
+    for node in configured_nodes_from_settings(raw):
+        prefix = f"{node.node_id}__"
+        if device_id.startswith(prefix) and len(device_id) > len(prefix):
+            return node, device_id[len(prefix) :]
+    return None
+
+
 async def _run_verification(action: str, args: argparse.Namespace, json_mode: bool) -> int:
     """Handle verify/validate subcommands."""
-    import time as _time
+    import getpass
 
-    import yaml
-
-    from leapflow.hardware.providers.yaml_provider import declaration_digest
+    from leapflow.hardware.attestation import (
+        bound_digest,
+        declaration_digest,
+        read_verified,
+        store_verification,
+    )
 
     settings = load_config()
     registry = _build_local_registry(settings)
@@ -510,6 +530,41 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
     if action == "verify":
         if not device_id:
             return _emit_result("verify", {"ok": False, "error": "device_id is required"}, json_mode)
+        verifier = str(getattr(args, "verifier", "") or "") or getpass.getuser()
+        remote = _fleet_node_for(device_id, settings)
+        if remote is not None:
+            # A fleet device is declared by its node, and only the node's own
+            # words are available here: read the declaration as it stands now
+            # and bind the review to that digest.
+            from leapflow.hardware.fleet_config import confirm_node_device
+
+            node, local_device_id = remote
+            try:
+                entry = await confirm_node_device(
+                    node, local_device_id, verifier=verifier, verified_path=verified_path
+                )
+            except Exception as exc:  # noqa: BLE001 - the operator sees why
+                return _emit_result(
+                    "verify",
+                    {"ok": False, "device_id": device_id, "error": f"{type(exc).__name__}: {exc}"},
+                    json_mode,
+                )
+            result = {
+                "ok": True,
+                "device_id": device_id,
+                "node_id": entry["node_id"],
+                "verifier": verifier,
+                "declaration_digest": entry["declaration_digest"],
+                "verified_path": str(verified_path),
+            }
+            if not json_mode:
+                _ok(
+                    f"Verified {device_id} (digest={entry['declaration_digest'][:12]}...) "
+                    f"by {verifier}"
+                )
+                _info(f"Written to {verified_path}")
+            return _emit_result("verify", result, json_mode) if json_mode else 0
+
         # Load the raw (pre-admission) context from the YAML file so the
         # digest matches what the YAML provider will compute on next load.
         # registry.context() returns the post-admission copy whose channels
@@ -520,29 +575,7 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
             return _emit_result("verify", {"ok": False, "error": f"unknown device {device_id!r}"}, json_mode)
 
         digest = declaration_digest(raw_context)
-        # Read existing verified.json
-        existing: dict[str, Any] = {}
-        if verified_path.is_file():
-            try:
-                raw = yaml.safe_load(verified_path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    existing = raw
-            except (OSError, yaml.YAMLError):
-                pass
-
-        import getpass
-
-        verifier = str(getattr(args, "verifier", "") or "") or getpass.getuser()
-        existing[device_id] = {
-            "verifier": verifier,
-            "declaration_digest": digest,
-            "verified_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-        }
-        verified_path.parent.mkdir(parents=True, exist_ok=True)
-        verified_path.write_text(
-            yaml.dump(existing, default_flow_style=False, sort_keys=True),
-            encoding="utf-8",
-        )
+        store_verification(verified_path, device_id, verifier=verifier, digest=digest)
         result = {
             "ok": True,
             "device_id": device_id,
@@ -557,15 +590,7 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
 
     if action == "validate":
         contexts = registry.contexts()
-        # Load verified.json
-        verified: dict[str, Any] = {}
-        if verified_path.is_file():
-            try:
-                raw = yaml.safe_load(verified_path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    verified = raw
-            except (OSError, yaml.YAMLError):
-                pass
+        verified = read_verified(verified_path)
 
         results: list[dict[str, Any]] = []
         for ctx in contexts:
@@ -573,12 +598,8 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
                 continue
             entry = verified.get(ctx.device_id)
             status = "unverified"
-            if entry is None:
-                status = "unverified"
-            elif isinstance(entry, str):
-                status = "legacy_unbound"
-            elif isinstance(entry, dict):
-                stored = str(entry.get("declaration_digest") or "")
+            if entry is not None:
+                stored = bound_digest(verified, ctx.device_id)
                 if not stored:
                     status = "unbound"
                 else:
@@ -594,7 +615,7 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
             }
             results.append(item)
             if not json_mode:
-                icon = _ok if status == "valid" else (_warn if status in ("legacy_unbound", "unbound") else _fail)
+                icon = _ok if status == "valid" else (_warn if status == "unbound" else _fail)
                 icon(f"{ctx.device_id}: {status}")
 
         all_ok = all(r["status"] == "valid" for r in results)

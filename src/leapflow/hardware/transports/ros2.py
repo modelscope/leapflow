@@ -407,8 +407,9 @@ class ROS2Transport:
         if not self._connected or self._node is None:
             return TransportStatus(
                 connected=False,
-                halt_supported=False,
-                detail="halt: not connected",
+                halt_supported=True,
+                halt_delivered=False,
+                detail="halt: not connected; the stop was not sent",
             )
 
         if not self._cmd_channels:
@@ -434,6 +435,7 @@ class ROS2Transport:
         return TransportStatus(
             connected=self._connected,
             halt_supported=True,
+            halt_delivered=not errors,
             detail=detail,
         )
 

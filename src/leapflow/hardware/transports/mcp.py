@@ -260,6 +260,7 @@ class McpTransport:
         return TransportStatus(
             connected=self._connected,
             halt_supported=True,
+            halt_delivered=failure is None,
             detail=failure or "halted",
         )
 

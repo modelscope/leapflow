@@ -11,7 +11,7 @@ all remove the ability to command it, rather than being treated as permissive.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 import yaml
@@ -42,6 +42,7 @@ from leapflow.hardware.transports import (
     build_transport,
     register_transport,
 )
+from leapflow.hardware.attestation import declaration_digest
 
 
 # ════════════════════════════════════════════════════════════════
@@ -412,6 +413,155 @@ async def test_transport_is_opened_lazily_on_first_use() -> None:
     assert registry.opened_devices() == ("device_a",)
 
 
+class _HaltClosesTransport:
+    """A passive sensor: stopping it releases the device, as a RealSense does."""
+
+    kind = "halt_closes_test"
+
+    def __init__(self) -> None:
+        self.connected = False
+        self.opens = 0
+
+    async def open(self, context: HardwareContext) -> Any:
+        from leapflow.hardware.transport import TransportStatus
+
+        self.connected = True
+        self.opens += 1
+        return TransportStatus(connected=True, halt_supported=False)
+
+    async def close(self) -> Any:
+        from leapflow.hardware.transport import TransportStatus
+
+        self.connected = False
+        return TransportStatus(connected=False, halt_supported=False, detail="released")
+
+    async def read(self, channel_id: str) -> Any:  # pragma: no cover - not exercised
+        raise TransportError("unused")
+
+    async def write(self, channel_id: str, value: Any) -> Any:  # pragma: no cover
+        raise TransportError("unused")
+
+    async def probe(self) -> Any:
+        from leapflow.hardware.transport import TransportStatus
+
+        return TransportStatus(connected=self.connected, halt_supported=False)
+
+    async def halt(self) -> Any:
+        return await self.close()
+
+
+def _build_halt_closing(config: Mapping[str, Any] | None = None) -> _HaltClosesTransport:
+    """Factory for the self-releasing sensor, resolved by import path."""
+    return _HaltClosesTransport()
+
+
+class _HaltReleasesWithoutClosing:
+    """A remote link: the stop is a message, so the socket outlives it."""
+
+    kind = "halt_remote_test"
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def open(self, context: HardwareContext) -> Any:
+        from leapflow.hardware.transport import TransportStatus
+
+        return TransportStatus(connected=True, halt_supported=False)
+
+    async def close(self) -> Any:
+        from leapflow.hardware.transport import TransportStatus
+
+        self.close_calls += 1
+        return TransportStatus(connected=False, halt_supported=False, detail="closed")
+
+    async def read(self, channel_id: str) -> Any:  # pragma: no cover - not exercised
+        raise TransportError("unused")
+
+    async def write(self, channel_id: str, value: Any) -> Any:  # pragma: no cover
+        raise TransportError("unused")
+
+    async def probe(self) -> Any:
+        from leapflow.hardware.transport import TransportStatus
+
+        return TransportStatus(connected=True, halt_supported=False)
+
+    async def halt(self) -> Any:
+        from leapflow.hardware.transport import TransportStatus
+
+        return TransportStatus(
+            connected=False, halt_supported=False, halt_delivered=True, detail="released remotely"
+        )
+
+
+def _build_halt_remote(config: Mapping[str, Any] | None = None) -> _HaltReleasesWithoutClosing:
+    return _HaltReleasesWithoutClosing()
+
+
+@pytest.mark.asyncio
+async def test_a_halt_that_closes_the_link_leaves_nothing_cached() -> None:
+    """A stop that releases its device must take the instance out of the cache.
+
+    Keeping the closed instance cached meant ``open()`` never ran again: every
+    later read answered "is not open" until the process restarted, which is what
+    one fleet-wide halt did to every camera on the node.
+    """
+    undo = register_transport("halt_closes_test", f"{__name__}:_build_halt_closing")
+    try:
+        registry = _load(_context(halt=False, transport_kind="halt_closes_test"))
+        first = await registry.transport("device_a")
+        status = await registry.halt("device_a")
+        assert status is not None and status.connected is False
+        assert registry.opened_devices() == (), "a released link must not stay cached"
+        second = await registry.transport("device_a")
+        assert second is not first, "the next use must open a fresh link"
+        assert second.opens == 1
+    finally:
+        undo()
+
+
+@pytest.mark.asyncio
+async def test_a_retired_remote_link_is_closed_not_just_forgotten() -> None:
+    """A dropped remote instance still holds a socket until it is closed.
+
+    A driver whose halt is its close releases everything by itself, but a remote
+    link only sent a message: forgetting the instance leaked the socket -- and any
+    frame claim on it -- for the life of the process.
+    """
+    undo = register_transport("halt_remote_test", f"{__name__}:_build_halt_remote")
+    try:
+        registry = _load(_context(halt=False, transport_kind="halt_remote_test"))
+        first = await registry.transport("device_a")
+        status = await registry.halt("device_a")
+
+        assert status is not None and status.halt_delivered is True
+        assert registry.opened_devices() == ()
+        assert first.close_calls == 1, "a retired link must not be dropped unclosed"
+    finally:
+        undo()
+
+
+@pytest.mark.asyncio
+async def test_a_halt_that_keeps_its_link_reuses_the_connection() -> None:
+    """An arm's stop does not disconnect it, so the next command must not re-open.
+
+    Opening runs a bring-up, which for an arm wakes the controller -- a cost worth
+    skipping when the stop never closed the link.
+    """
+    registry = _load(_context())
+    first = await registry.transport("device_a")
+    await registry.halt("device_a")
+    assert registry.opened_devices() == ("device_a",)
+    assert await registry.transport("device_a") is first
+
+
+@pytest.mark.asyncio
+async def test_a_halt_opens_nothing() -> None:
+    """No link means nothing is being driven here: no motion, no device to wake."""
+    registry = _load(_context())
+    assert await registry.halt("device_a") is None
+    assert registry.opened_devices() == ()
+
+
 @pytest.mark.asyncio
 async def test_unknown_device_transport_raises_structured_error() -> None:
     registry = _load(_context())
@@ -563,8 +713,68 @@ def test_yaml_provider_skips_unparseable_files_without_losing_the_rest(tmp_path:
     assert [c.device_id for c in contexts] == ["fine"]
 
 
-def test_yaml_provider_applies_out_of_band_verification(tmp_path: Path) -> None:
+def test_yaml_provider_applies_an_out_of_band_confirmation(tmp_path: Path) -> None:
     """Confirmation lives outside the declaration so it is not self-attested."""
+    devices = tmp_path / "devices"
+    devices.mkdir()
+    declaration = {
+        "hc_version": HC_VERSION,
+        "device_id": "node",
+        "transport": {"kind": "mock"},
+        "channels": [{"channel_id": "value", "direction": "read"}],
+    }
+    _write_declaration(devices, "node", declaration)
+    reviewed = YamlContextProvider({"devices_dir": devices}).discover()[0]
+    verified = tmp_path / "verified.json"
+    verified.write_text(
+        yaml.safe_dump(
+            {"node": {"verifier": "jason", "declaration_digest": declaration_digest(reviewed)}}
+        ),
+        encoding="utf-8",
+    )
+
+    contexts = YamlContextProvider(
+        {"devices_dir": devices, "verified_path": verified}
+    ).discover()
+
+    assert contexts[0].provenance.verified_by == "jason"
+    assert contexts[0].provenance.is_verified is True
+
+
+def test_a_confirmation_does_not_survive_a_changed_declaration(tmp_path: Path) -> None:
+    """The confirmation is bound to what was reviewed, not to the device id."""
+    devices = tmp_path / "devices"
+    devices.mkdir()
+    declaration = {
+        "hc_version": HC_VERSION,
+        "device_id": "node",
+        "transport": {"kind": "mock"},
+        "channels": [{"channel_id": "value", "direction": "read"}],
+    }
+    _write_declaration(devices, "node", declaration)
+    reviewed = YamlContextProvider({"devices_dir": devices}).discover()[0]
+    verified = tmp_path / "verified.json"
+    verified.write_text(
+        yaml.safe_dump(
+            {"node": {"verifier": "jason", "declaration_digest": declaration_digest(reviewed)}}
+        ),
+        encoding="utf-8",
+    )
+    _write_declaration(
+        devices,
+        "node",
+        {**declaration, "channels": [{"channel_id": "value", "direction": "readwrite"}]},
+    )
+
+    contexts = YamlContextProvider(
+        {"devices_dir": devices, "verified_path": verified}
+    ).discover()
+
+    assert contexts[0].provenance.verified_by == ""
+
+
+def test_a_verifier_name_without_a_digest_confirms_nothing(tmp_path: Path) -> None:
+    """An unbound record cannot be checked, so it must not grant authority."""
     devices = tmp_path / "devices"
     devices.mkdir()
     _write_declaration(
@@ -579,11 +789,12 @@ def test_yaml_provider_applies_out_of_band_verification(tmp_path: Path) -> None:
     )
     verified = tmp_path / "verified.json"
     verified.write_text(yaml.safe_dump({"node": "jason"}), encoding="utf-8")
+
     contexts = YamlContextProvider(
         {"devices_dir": devices, "verified_path": verified}
     ).discover()
-    assert contexts[0].provenance.verified_by == "jason"
-    assert contexts[0].provenance.is_verified is True
+
+    assert contexts[0].provenance.verified_by == ""
 
 
 def test_yaml_provider_tolerates_a_missing_directory(tmp_path: Path) -> None:
