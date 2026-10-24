@@ -32,6 +32,7 @@ from tests.test_piper_ops import snapshot as controller_snapshot
 from tests._harness.policy_cell import piper_chain
 from tests._harness.skill_stubs import (
     CAMERA_ID,
+    IDENTITY_MATRIX,
     JOINTS,
     WORKCELL_ID,
     WORKCELL_YAML,
@@ -200,8 +201,14 @@ async def cycle_rig(tmp_path, rigs, monkeypatch):
         wrap=wrap,
     )
     registry = rig.nodes[0].registry
-    registry.calibrate("camera.handeye", pose=Pose(0, 0, 0).to_dict())
-    registry.calibrate("wrist.handeye", pose=Pose(0, 0, 0).to_dict())
+    registry.calibrate(
+        "camera.handeye", pose=Pose(0, 0, 0).to_dict(),
+        parameters={"target_mount": IDENTITY_MATRIX},
+    )
+    registry.calibrate(
+        "wrist.handeye", pose=Pose(0, 0, 0).to_dict(),
+        parameters={"target_mount": IDENTITY_MATRIX},
+    )
     request = {
         "workcell": QUALIFIED,
         "skill": "grasp.cycle",

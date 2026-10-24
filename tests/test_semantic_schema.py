@@ -298,7 +298,6 @@ def test_execution_toolset_register_is_open_for_extension() -> None:
 
 
 async def test_execution_toolset_unknown_tool_fails_cleanly() -> None:
-    from leapflow.skills.tool_types import ToolCall
 
     toolset = build_execution_toolset(object(), perception=object())
     result = await toolset.dispatch(ToolCall(name="nope", params={}))

@@ -27,6 +27,7 @@ from leapflow.hardware.skills.protocol import (
     EFFECT_READ,
     FAILURE_ARM_NOT_READY,
     FAILURE_DEVICE_BUSY,
+    FAILURE_DEVICE_FAULT,
     FAILURE_GUARD_FAILED,
     FAILURE_INTERNAL_DEFECT,
     FAILURE_INVALID_ARGS,
@@ -326,19 +327,26 @@ async def test_home_moves_in_joint_space_after_fk_path_checks(tmp_path: Path) ->
 
 
 async def test_home_execute_rechecks_the_path_from_fresh_joints(tmp_path: Path) -> None:
+    """Execution derives the path from where the arm is, not from where it was planned.
+
+    The wrist was turned by hand between planning and execution and left the TCP
+    outside the cell: reusing the plan's start would have driven the arm home
+    along a path nobody checked, so the run has to refuse and send nothing.
+    """
     registry = _joint_registry(tmp_path)
     workcell = {**WORKCELL_YAML, "home": {"joint.j1.position": 5.0}}
     runtime = _runtime(tmp_path, registry, workcell=workcell)
     plan = await runtime.plan(WORKCELL_ID, "motion.home", {})
     assert isinstance(plan, SkillPlan), plan
-    registry.sim.joints = dict(zip(JOINTS, (0.0,) * len(JOINTS)))
+    registry.sim.joints = dict(zip(JOINTS, (0.0, 80.0, -55.0, 0.0, 10.0, 0.0)))
     registry.sim.pose = list(registry.sim._forward_pose())
 
     run = await runtime.execute(plan.digest)
     assert isinstance(run, SkillRun), run
     finished = await runtime.wait(run.run_id, timeout_s=5.0)
     assert finished is not None and finished.outcome is not None
-    assert finished.outcome.failure_code in {FAILURE_OUT_OF_WORKSPACE, FAILURE_UNREACHABLE}
+    assert finished.outcome.failure_code == FAILURE_OUT_OF_WORKSPACE
+    assert "x=" in finished.outcome.message
     assert registry.sim.batches == []
 
 
@@ -352,6 +360,58 @@ async def test_home_plan_refuses_a_joint_path_with_an_unsafe_middle(tmp_path: Pa
     )
     assert isinstance(outcome, SkillOutcome) and not outcome.ok
     assert outcome.failure_code in {FAILURE_OUT_OF_WORKSPACE, FAILURE_UNREACHABLE}
+    assert registry.sim.batches == []
+
+
+# Where a halt or a hand leaves the arm: 55 deg off vertical against a 30 deg cone.
+# It is inside the workspace box and inside every joint envelope, so only the
+# tilt rule can refuse it.
+_OFF_CONE_JOINTS = (0.0, 20.0, -40.0, 60.0, 0.0, 0.0)
+
+
+def _joint_step(name: str, value: float) -> dict[str, Any]:
+    return _steps({"op": "move_joints", "joints": {name: value}})
+
+
+async def test_a_joint_move_may_hold_a_tilt_the_cone_forbids(tmp_path: Path) -> None:
+    """The arm has to be able to leave a posture the cone refuses.
+
+    A halted arm sits wherever gravity left it, so demanding the destination of
+    a joint move be inside the cone made that posture impossible to leave from
+    inside the skill path -- the recovery it needs was the one thing refused.
+    """
+    registry = _joint_registry(tmp_path, _OFF_CONE_JOINTS)
+    program = _joint_step("joint.j1.position", 30.0)
+    run = await _run(_runtime(tmp_path, registry), SEQUENCE, program)
+
+    assert run.outcome is not None and run.outcome.ok, run.outcome
+    assert registry.sim.joints["joint.j1.position"] == pytest.approx(30.0)
+    assert registry.sim.joints["joint.j4.position"] == pytest.approx(60.0), "the tilt is unchanged"
+
+
+async def test_a_joint_move_may_reduce_the_tilt_within_one_step(tmp_path: Path) -> None:
+    """Getting back under the cone comes before being under it.
+
+    The destination here still sits outside the cone, but every sample of the
+    path is no worse than where the move started, so the arm is allowed to head
+    back in -- the ceiling tracks the path, not the destination alone.
+    """
+    registry = _joint_registry(tmp_path, _OFF_CONE_JOINTS)
+    program = _joint_step("joint.j4.position", 70.0)
+    run = await _run(_runtime(tmp_path, registry), SEQUENCE, program)
+
+    assert run.outcome is not None and run.outcome.ok, run.outcome
+    assert registry.sim.joints["joint.j4.position"] == pytest.approx(70.0)
+
+
+async def test_a_joint_move_may_not_add_to_the_tilt_it_started_with(tmp_path: Path) -> None:
+    registry = _joint_registry(tmp_path, _OFF_CONE_JOINTS)
+    program = _joint_step("joint.j4.position", 50.0)
+    outcome = await _runtime(tmp_path, registry).plan(WORKCELL_ID, SEQUENCE, program)
+
+    assert isinstance(outcome, SkillOutcome) and not outcome.ok
+    assert outcome.failure_code == FAILURE_UNREACHABLE
+    assert "tilt" in outcome.message
     assert registry.sim.batches == []
 
 
@@ -587,6 +647,29 @@ async def test_a_stale_refusal_code_does_not_block_a_valid_move(tmp_path: Path) 
     run = await _run(_runtime(tmp_path, registry), SEQUENCE, move_by(10))
     assert run.outcome is not None
     assert run.outcome.status == "succeeded", run.outcome.message
+
+
+async def test_a_device_fault_ends_the_move_at_once_instead_of_timing_out(tmp_path: Path) -> None:
+    """``arm_status`` 0x05 is the arm giving up, not the target arriving late.
+
+    The controller has already dropped out of CAN control and released the
+    drives, so the arm is collapsing while a timeout would still be counting.
+    The move budget is left generous to prove the verdict comes from the fault
+    rather than from running out of time, and the named joints are what tells an
+    operator whether to re-enable or to check a motor cable.
+    """
+    registry = _registry(tmp_path, stall=True, arm_status=0x05,
+                         joint_communication_errors=(2, 3, 5))
+    workcell = {**WORKCELL_YAML, "limits": {**WORKCELL_YAML["limits"], "move_timeout_s": 30.0}}
+    run = await _run(_runtime(tmp_path, registry, workcell=workcell), SEQUENCE, move_by(10))
+    assert run.outcome is not None
+    assert (run.outcome.failure_code, run.outcome.status) == (
+        FAILURE_DEVICE_FAULT,
+        STATUS_HALTED,
+    )
+    assert "lost communication with the controller" in run.outcome.message
+    assert "joints 2, 3, 5" in run.outcome.message
+    assert registry.sim.halts == 1
 
 
 async def test_stopping_a_run_that_never_moved_does_not_halt(tmp_path: Path) -> None:

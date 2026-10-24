@@ -21,6 +21,7 @@ from leapflow.hardware.skills.workcell import (
 )
 from tests._harness.skill_stubs import (
     ARM_ID,
+    IDENTITY_MATRIX,
     WORKCELL_ID,
     WORKCELL_YAML,
     SkillNodeRegistry,
@@ -95,6 +96,35 @@ def test_missing_directory_admits_nothing(tmp_path: Path) -> None:
     assert admitted == {} and report.rejected == ()
 
 
+def test_a_camera_frame_without_a_measured_target_mount_is_not_a_calibration(
+    tmp_path: Path,
+) -> None:
+    """A hand-eye record that never measured a target mount is an assertion.
+
+    Such a record is what an import or a hand-edited matrix leaves behind, and
+    it survives the camera being remounted: the transform stays plausible, no
+    downstream consumer can tell it apart from a measurement, and perception
+    keeps reporting geometry for a view that no longer exists.
+    """
+    registry = SkillNodeRegistry(store_path=tmp_path / "instrument.duckdb")
+    spec = WorkcellSpec.from_mapping(_with(
+        roles={"arm": ARM_ID, "camera": ARM_ID},
+        frames={
+            "tcp": {"parent": "flange", "procedure": "tcp.offset"},
+            "camera": {"parent": "base", "procedure": "handeye.eye_to_hand"},
+        },
+    ))
+    registry.calibrate("handeye.eye_to_hand", pose={"x": 500., "y": 0., "z": 0.})
+    frames = FrameGraph.snapshot(spec, registry.calibration_store)
+    assert frames.transform("camera") is None
+    assert frames.parameters("camera") == {}
+    assert "target mount" in frames.stale["camera"]
+    assert unmet_requirements(("calib:camera",), spec, frames) == [
+        "camera calibration is stale (the record carries no measured target mount); "
+        "run calib.handeye again"
+    ]
+
+
 def test_frames_resolve_from_the_latest_calibration_preferring_a_matrix(tmp_path: Path) -> None:
     registry = SkillNodeRegistry(store_path=tmp_path / "instrument.duckdb")
     spec = WorkcellSpec.from_mapping(
@@ -120,6 +150,7 @@ def test_frames_resolve_from_the_latest_calibration_preferring_a_matrix(tmp_path
             recorded_at=3.0,
             matrix=matrix,
             pose={"x": 1, "y": 1, "z": 1},
+            parameters={"target_mount": IDENTITY_MATRIX},
         )
     )
     frames = FrameGraph.snapshot(spec, store)
@@ -196,13 +227,17 @@ def test_camera_frames_resolve_independent_mount_versions(tmp_path: Path) -> Non
             "camera.wrist": {"parent": "flange", "procedure": "handeye.eye_in_hand"},
         },
     ))
-    registry.calibrate("handeye.eye_to_hand", pose={"x": 500., "y": 0., "z": 0.}, recorded_at=1.)
-    registry.calibrate("handeye.eye_in_hand", pose={"x": 60., "y": 0., "z": 0.}, recorded_at=2.)
+    mount = {"target_mount": IDENTITY_MATRIX}
+    registry.calibrate("handeye.eye_to_hand", parameters=mount,
+                       pose={"x": 500., "y": 0., "z": 0.}, recorded_at=1.)
+    registry.calibrate("handeye.eye_in_hand", parameters=mount,
+                       pose={"x": 60., "y": 0., "z": 0.}, recorded_at=2.)
     frames = FrameGraph.snapshot(spec, registry.calibration_store)
     assert frames.transform("camera").translation == (500., 0., 0.)
     assert frames.transform("camera.wrist").translation == (60., 0., 0.)
     assert frames.versions == {"camera": 1., "camera.wrist": 2.}
-    registry.calibrate("handeye.eye_in_hand", pose={"x": 61., "y": 0., "z": 0.}, recorded_at=3.)
+    registry.calibrate("handeye.eye_in_hand", parameters=mount,
+                       pose={"x": 61., "y": 0., "z": 0.}, recorded_at=3.)
     assert FrameGraph.snapshot(spec, registry.calibration_store).versions == {
         "camera": 1., "camera.wrist": 3.,
     }

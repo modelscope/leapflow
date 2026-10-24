@@ -33,6 +33,34 @@ async def test_unknown_degradation_action_halts_and_latches() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_device_that_stops_by_letting_go_counts_as_halted() -> None:
+    """A passive device has no emergency stop, and its halt still happened.
+
+    A camera releases its capture and reports ``halt_supported=False`` with the
+    link closed -- indistinguishable, before the delivery verdict existed, from a
+    stop that never reached the device. Reading capability as the outcome made
+    every policy halt of such a device record an unconfirmed stop.
+    """
+    context = make_context(
+        channels=(make_channel("sensor", writable=False),),
+        degradation=DegradationPolicy(),
+        transport_kind="simulated",
+        transport_config={"values": {"sensor": 1.0}, "halt_supported": False},
+    )
+    registry = make_registry(context)
+    coordinator = DegradationCoordinator(registry, context)
+
+    try:
+        outcome = await coordinator.execute("unsupported", reason="sensor_loss")
+
+        assert outcome.completed is True
+        assert outcome.fallback_action == "halt"
+        assert registry.is_device_degraded(context.device_id) is True
+    finally:
+        await registry.close_all()
+
+
+@pytest.mark.asyncio
 async def test_continue_blind_requires_manual_clear() -> None:
     context = make_context(
         channels=(make_channel("sensor", writable=False),),

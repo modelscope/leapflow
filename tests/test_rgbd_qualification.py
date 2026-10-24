@@ -133,11 +133,12 @@ def depth_processor_config(**changes):
 
 
 def geometry_processor_config(**changes):
-    selector = lambda roi, bgr, lo=1, hi=200: {
-        "roi": roi, "lower_bgr": [max(0, b - 1) for b in bgr],
-        "upper_bgr": [min(255, b + 1) for b in bgr],
-        "min_area_px": lo, "max_area_px": hi,
-    }
+    def selector(roi, bgr, lo=1, hi=200):
+        return {
+            "roi": roi, "lower_bgr": [max(0, b - 1) for b in bgr],
+            "upper_bgr": [min(255, b + 1) for b in bgr],
+            "min_area_px": lo, "max_area_px": hi,
+        }
     config = {
         "limits": asdict(LIMITS),
         "calibration_digest": "cal",
@@ -187,7 +188,10 @@ def test_region_processor_refuses_untyped_or_unbound_configuration(field, value)
 
 def test_region_processor_resets_on_source_identity_and_enforces_byte_budget():
     items = frames()
-    clock = lambda: items[-1].monotonic_at + .1
+
+    def clock():
+        return items[-1].monotonic_at + .1
+
     processor = RegionDepthProcessor(depth_processor_config(), clock=clock)
     assert processor.measure(items[0]).distinct_frames == 1
     assert not processor.measure(items[1]).qualified

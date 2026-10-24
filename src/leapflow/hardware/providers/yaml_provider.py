@@ -9,9 +9,8 @@ never writes them and never rewrites them.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -19,6 +18,7 @@ import yaml
 
 from leapflow.hardware.context import ContextSource, HardwareContext
 from leapflow.hardware.providers import ProviderError
+from leapflow.hardware.attestation import confirmed_by, read_verified
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ class YamlContextProvider:
                 failure_code="devices_dir_missing",
             )
         self._root = Path(str(root)).expanduser()
-        self._verified: dict[str, str] = _load_verified(config.get("verified_path"))
+        self._verified: Mapping[str, Any] = read_verified(config.get("verified_path"))
 
     def discover(self) -> tuple[HardwareContext, ...]:
         """Return every parseable declaration under the configured directory.
@@ -69,59 +69,21 @@ class YamlContextProvider:
         """Attach an out-of-band human confirmation, if one exists.
 
         Verification is stored separately from the declaration on purpose: the
-        person who confirms a context must not have to edit the file they are
-        confirming, or the confirmation would be self-attested.
-
-        New format (digest-bound): ``{device_id: {verifier, declaration_digest, verified_at}}``.
-        Old format (legacy): ``{device_id: verifier_string}``.
-
-        Digest-bound entries whose digest does not match the current declaration
-        are treated as unbound: the context is demoted (V7) with a warning.
-        Old string entries are treated as unbound (no digest) with a warning.
+        person confirming a context must not have to edit the file they are
+        confirming, or the confirmation would be self-attested.  Which
+        confirmations apply -- and what makes one apply -- is decided once, in
+        ``hardware.attestation``, so a device cannot be admitted here under a
+        weaker rule than the fleet applies to the same declaration.
         """
-        entry = self._verified.get(context.device_id)
-        if entry is None or context.provenance.is_verified:
+        if context.provenance.is_verified:
             return context
-
-        from dataclasses import replace
-
-        if isinstance(entry, str):
-            # Legacy format: plain verifier string, no digest binding
-            if not entry:
-                return context
-            logger.warning(
-                "verified.json: device %r uses legacy string format (no digest binding); "
-                "run 'leap hw verify %s' to create a digest-bound entry",
-                context.device_id,
-                context.device_id,
-            )
-            return replace(
-                context,
-                provenance=replace(context.provenance, verified_by=entry),
-            )
-
-        if isinstance(entry, Mapping):
-            verifier = str(entry.get("verifier") or "")
-            if not verifier:
-                return context
-            stored_digest = str(entry.get("declaration_digest") or "")
-            if stored_digest:
-                current_digest = _declaration_digest(context)
-                if current_digest != stored_digest:
-                    logger.warning(
-                        "verified.json: device %r declaration digest mismatch "
-                        "(stored=%s, current=%s); verification demoted",
-                        context.device_id,
-                        stored_digest[:12],
-                        current_digest[:12],
-                    )
-                    return context  # demoted: declaration changed since verification
-            return replace(
-                context,
-                provenance=replace(context.provenance, verified_by=verifier),
-            )
-
-        return context
+        verifier = confirmed_by(self._verified, context.device_id, context)
+        if not verifier:
+            return context
+        return replace(
+            context,
+            provenance=replace(context.provenance, verified_by=verifier),
+        )
 
 
 def _read_yaml(path: Path) -> dict[str, Any] | None:
@@ -137,61 +99,6 @@ def _read_yaml(path: Path) -> dict[str, Any] | None:
     payload.setdefault("device_id", path.stem)
     payload.setdefault("provenance", {}).setdefault("source", ContextSource.DECLARED.value)
     return payload
-
-
-def _load_verified(path: Any) -> dict[str, Any]:
-    """Read verification confirmations, tolerating absence.
-
-    Supports two formats:
-    - New (digest-bound): ``{device_id: {verifier, declaration_digest, verified_at}}``
-    - Legacy: ``{device_id: verifier_string}``
-
-    Returns a dict of ``{device_id: entry}`` where entry is either a string
-    (legacy) or a dict (new format).
-    """
-    if not path:
-        return {}
-    target = Path(str(path)).expanduser()
-    if not target.is_file():
-        return {}
-    try:
-        raw = yaml.safe_load(target.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
-        logger.warning("Ignoring unreadable hardware verification file %s: %s", target, exc)
-        return {}
-    if not isinstance(raw, Mapping):
-        return {}
-    result: dict[str, Any] = {}
-    for key, value in raw.items():
-        if not value:
-            continue
-        if isinstance(value, str):
-            result[str(key)] = value  # legacy format
-        elif isinstance(value, Mapping):
-            result[str(key)] = dict(value)  # new digest-bound format
-        else:
-            result[str(key)] = str(value)
-    return result
-
-
-def _declaration_digest(context: HardwareContext) -> str:
-    """Compute a sha256 digest of the context's wire form for verification binding.
-
-    Uses the same canonical form as the LHP server's _declarations_digest,
-    ensuring consistency between local and remote verification.
-    """
-    payload = context.to_dict()
-    # Remove transport config (node-private) and control_bindings
-    if "transport" in payload:
-        payload["transport"] = {"kind": payload.get("transport", {}).get("kind", ""), "config": {}}
-    payload.pop("control_bindings", None)
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def declaration_digest(context: HardwareContext) -> str:
-    """Public API for computing a context's declaration digest."""
-    return _declaration_digest(context)
 
 
 def build_provider(config: Mapping[str, Any] | None = None) -> YamlContextProvider:

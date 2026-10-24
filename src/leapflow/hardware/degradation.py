@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable
 
-from leapflow.hardware.context import HardwareContext, Quality
+from leapflow.hardware.context import HardwareContext
 from leapflow.hardware.transport import SIDE_EFFECT_COMMITTED, SIDE_EFFECT_NONE
 
 logger = logging.getLogger(__name__)
@@ -147,13 +147,18 @@ class DegradationCoordinator:
 
     async def _halt(self, reason: str, *, action: str, error: str = "") -> DegradationOutcome:
         try:
-            transport = await self._registry.transport(self._context.device_id)
-            status = await transport.halt()
-            completed = bool(getattr(status, "connected", False)) and bool(
-                getattr(status, "halt_supported", True)
-            )
+            # A policy stop has to reach the device, so a link is opened when none
+            # is open; the stop itself goes through the registry, which retires the
+            # link if the driver closed it.
+            await self._registry.transport(self._context.device_id)
+            status = await self._registry.halt(self._context.device_id)
+            # Delivery, not capability, is what a policy stop has to confirm: a
+            # camera that releases its capture reports halt_supported=False and it
+            # is still stopped, while a stop that never reached the device is the
+            # one case this outcome exists to record.
+            completed = bool(status is not None and status.halt_delivered)
             if not completed:
-                error = error or "transport did not confirm emergency halt"
+                error = error or "the emergency halt did not reach the device"
         except Exception as exc:  # noqa: BLE001 - failure must remain auditable
             completed = False
             error = error or f"halt failed: {exc}"

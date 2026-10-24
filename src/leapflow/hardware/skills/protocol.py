@@ -308,8 +308,12 @@ class ArmState:
     ctrl_mode: str | None = None
     # The vendor's verdict on the last commanded target (0 = normal). A refusing
     # code means its inverse kinematics rejected the pose before moving: the arm
-    # is not late, it is never going to arrive.
+    # is not late, it is never going to arrive. A faulting code means the arm
+    # stopped carrying the command out.
     arm_status: int | None = None
+    # Joints the firmware's fault word implicates as having lost communication
+    # with the controller; empty when the status word implicates none.
+    joint_communication_errors: tuple[int, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -321,6 +325,7 @@ class ArmState:
             "arrived": self.arrived,
             "ctrl_mode": self.ctrl_mode,
             "arm_status": self.arm_status,
+            "joint_communication_errors": list(self.joint_communication_errors),
         }
 
 

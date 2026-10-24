@@ -6,6 +6,11 @@ configuration is an input boundary with its own concerns: tolerant parsing,
 secret hygiene, and best-effort startup.  P2 grows this module with the
 Settings-based double track and registration backoff; ``FleetManager`` stays
 unaware of where its nodes were configured.
+
+It also owns the one thing an operator -- not the fleet -- writes: the
+confirmation that a node's declaration is the one a human reviewed.  A node
+cannot vouch for itself, so this record lives on the host, keyed by the
+host-qualified device id and bound to the digest of what the node declared.
 """
 
 from __future__ import annotations
@@ -14,9 +19,11 @@ import asyncio
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, Iterable, Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
-from leapflow.hardware.fleet import FleetError, FleetNode
+from leapflow.hardware.fleet import FleetError, FleetNode, fetch_node_declarations
+from leapflow.hardware.attestation import declaration_digest, store_verification
 
 if TYPE_CHECKING:
     from leapflow.hardware.fleet import FleetManager
@@ -114,8 +121,56 @@ async def register_nodes_safely(
     return tuple(registered)
 
 
+# ---------------------------------------------------------------------------
+# Operator confirmation of node declarations
+# ---------------------------------------------------------------------------
+
+
+async def confirm_node_device(
+    node: FleetNode,
+    device_id: str,
+    *,
+    verifier: str,
+    verified_path: Path | str,
+) -> dict[str, Any]:
+    """Record an operator's review of one device as the node now declares it.
+
+    The node's own ``verified.json`` cannot stand in for this: a machine able
+    to rewrite its declaration is also able to rewrite its claim that a human
+    read it.  So the host fetches what the node declares *now*, binds that
+    digest to the reviewing operator, and records it under the host-qualified
+    id -- the exact entry ``FleetManager`` requires before it lets a remote
+    device's own verification claim through.
+
+    A read-only exchange on purpose: no fleet is started, so confirming a
+    declaration cannot halt the node's hardware as a side effect.
+
+    Raises ``FleetError`` when the node is unreachable or does not declare
+    ``device_id``.
+    """
+    _, contexts, _ = await fetch_node_declarations(node.endpoint, token=node.token)
+    declared = {context.device_id: context for context in contexts}
+    context = declared.get(device_id)
+    if context is None:
+        raise FleetError(
+            f"node {node.node_id!r} declares no device {device_id!r}",
+            failure_code="fleet_unknown_device",
+        )
+    digest = declaration_digest(context)
+    host_device_id = node.host_device_id(device_id)
+    entry = store_verification(verified_path, host_device_id, verifier=verifier, digest=digest)
+    return {
+        "node_id": node.node_id,
+        "device_id": device_id,
+        "host_device_id": host_device_id,
+        "declaration_digest": digest,
+        **entry,
+    }
+
+
 __all__ = [
     "FLEET_NODES_ENV",
+    "confirm_node_device",
     "configured_nodes_from_env",
     "configured_nodes_from_settings",
     "register_nodes_safely",

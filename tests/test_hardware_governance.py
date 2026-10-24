@@ -1842,6 +1842,7 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.require_describe",
         "hardware.envelope_grant",
         "hardware.trust_skip_enabled",
+        "hardware.write_verification_follow_s",
         "hardware.stream_enabled",
         "hardware.stream_ring_capacity",
         "hardware.persist_readings",
@@ -1940,7 +1941,18 @@ async def test_enabled_profile_drives_the_whole_chain_from_declarations(tmp_path
         ),
         encoding="utf-8",
     )
-    (tmp_path / "verified.json").write_text(yaml.safe_dump({"rig": "jason"}), encoding="utf-8")
+    # The confirmation is bound to the declaration an operator reviewed, so it
+    # is recorded the way the real command records it -- not as a bare name.
+    from leapflow.hardware.attestation import declaration_digest, store_verification
+    from leapflow.hardware.providers.yaml_provider import YamlContextProvider
+
+    reviewed = YamlContextProvider({"devices_dir": devices}).discover()[0]
+    store_verification(
+        tmp_path / "verified.json",
+        "rig",
+        verifier="jason",
+        digest=declaration_digest(reviewed),
+    )
 
     class _Settings:
         hardware_enabled = True

@@ -16,6 +16,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any, ContextManager, Mapping, Protocol, runtime_checkable
 
+from leapflow.hardware.arm_status import COMM_FAULT_SHIFT, LIMIT_FAULT_SHIFT, joint_faults
 from leapflow.hardware.drivers._piper_motion import (
     SPACE_CHANNELS,
     SPACE_JOINT,
@@ -182,12 +183,24 @@ def receive_groups(channel_id: str) -> tuple[str, ...]:
     return _GRIPPER_GROUPS if channel_id in GRIPPER_CHANNELS else _STATUS_GROUPS
 
 
-def status_value(feedback: Any) -> dict[str, int | None]:
-    """The arm-status codes LeapFlow reports, from one status message body."""
-    return {
+def status_value(feedback: Any) -> dict[str, Any]:
+    """The arm-status codes LeapFlow reports, from one status message body.
+
+    ``err_code`` is the firmware's 16-bit fault word: the high byte marks the
+    joints whose angle is out of limit, the low byte the joints whose motor
+    stopped answering. Reporting it decoded is what makes ``arm_status`` 0x05 --
+    "joint communication error" -- name the joints that went silent instead of
+    leaving an operator to decode a number the arm already knows.
+    """
+    status: dict[str, Any] = {
         key: as_int(attr(feedback, key))
         for key in ("ctrl_mode", "arm_status", "mode_feedback", "motion_status")
     }
+    code = as_int(attr(feedback, "err_code"))
+    status["error_code"] = code
+    status["joint_limit_errors"] = joint_faults(code, LIMIT_FAULT_SHIFT)
+    status["joint_communication_errors"] = joint_faults(code, COMM_FAULT_SHIFT)
+    return status
 
 
 class PiperFeedback:

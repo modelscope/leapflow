@@ -19,7 +19,9 @@ import yaml
 
 from leapflow.hardware.context import HardwareContext
 from leapflow.hardware.drivers._piper_feedback import CAN_GROUPS
-from leapflow.hardware.drivers._piper_motion import joints_to_sdk, pose_to_sdk
+from leapflow.hardware.drivers._piper_motion import (
+    SPACE_JOINT, PiperMotion, firmware_version, joints_to_sdk, pose_to_sdk,
+)
 from leapflow.hardware.drivers.piper import PiperArmTransport
 from leapflow.hardware.registry import _DEVICE_ID_ALLOWED
 from leapflow.hardware.transport import (
@@ -28,7 +30,7 @@ from leapflow.hardware.transport import (
 
 _EXAMPLE = Path(__file__).parents[1] / "src/leapflow/hardware/examples/piper_arm.yaml"
 _BASE_CONFIG = {"can_name": "can0", "robot": "piper_x", "firmware_profile": "v189",
-                "enable_timeout_s": .12, "mode_switch_timeout_s": .12}
+                "enable_timeout_s": .12, "enable_settle_s": .02, "mode_switch_timeout_s": .12}
 _SEED_JOINTS = [10., 20., -30., 40., 50., -160.]
 _SEED_POSE = [200., 0., 300., 179., 0., 90.]
 
@@ -80,12 +82,25 @@ class _FakeArm:
         self.ctrl_mode = self.arm_status = 0
         self.motion_status = 1
         self.mode_feedback = 1
+        self.err_code = 0
+        # A controller that accepts CAN control and then faults: after one clean
+        # status read it answers with this fault, then clears itself and leaves the
+        # arm in standby with the drives released -- what a bad enable looks like.
+        self.fault_on_can = False
+        self.fault_delay = 0
+        self.fault_reads = 0
+        self.fault_code = 0x05
+        self.fault_err_code = 0x16
         self.flags: Any = [False] * 6
         self.refuse_enable = self.refuse_reset = self.ignore_mode = False
+        self.ignore_move_mode = False
         self.drop_mode_frames = 0
+        # pyAgxArm discards a firmware answer that beats its own fps estimate.
+        self.drop_firmware_replies = 0
         self.fail_joint = self.fail_pose = False
         self.joint_calls: list[list[float]] = []
         self.pose_calls: list[tuple[str, list[float]]] = []
+        self.mode_calls: list[str] = []
         self.speed_calls: list[int] = []
         self.enable_calls = self.disable_calls = self.reset_calls = self.estop_calls = 0
         self.events: list[str] = []
@@ -133,8 +148,11 @@ class _FakeArm:
     def get_fps(self) -> float:
         return 250.
 
-    def get_firmware(self, *, timeout: float, min_interval: float) -> dict:
+    def get_firmware(self, *, timeout: float, min_interval: float) -> Any:
         self.events.append("firmware")
+        if self.drop_firmware_replies:
+            self.drop_firmware_replies -= 1
+            return None
         return {"software_version": self.firmware}
 
     def get_joint_angles(self) -> Any:
@@ -144,8 +162,21 @@ class _FakeArm:
         return _message(self.pose)
 
     def get_arm_status(self) -> Any:
+        if self.fault_delay:
+            self.fault_delay -= 1
+        elif self.fault_reads:
+            self.fault_reads -= 1
+            if self.fault_reads:
+                return _message(SimpleNamespace(ctrl_mode=0, arm_status=self.fault_code,
+                                                mode_feedback=self.mode_feedback,
+                                                motion_status=self.motion_status,
+                                                err_code=self.fault_err_code))
+            # The controller cleared it by itself and stayed in standby.
+            self.arm_status = self.ctrl_mode = 0
         return _message(SimpleNamespace(ctrl_mode=self.ctrl_mode, arm_status=self.arm_status,
-                                        mode_feedback=self.mode_feedback, motion_status=self.motion_status))
+                                        mode_feedback=self.mode_feedback,
+                                        motion_status=self.motion_status,
+                                        err_code=self.err_code))
 
     def get_driver_states(self, index: int) -> Any:
         if self.flags is None or len(self.flags) < index:
@@ -181,6 +212,15 @@ class _FakeArm:
             self.arm_status = self.ctrl_mode = 0
             self.flags = [False] * 6
 
+    def set_motion_mode(self, mode: str) -> None:
+        self.events.append(f"mode:{mode}")
+        self.mode_calls.append(mode)
+        if self.drop_mode_frames:
+            self.drop_mode_frames -= 1
+        elif not (self.ignore_mode or self.ignore_move_mode):
+            self.mode_feedback = {"p": 0, "j": 1, "l": 2}[mode]
+            self.ctrl_mode = 1
+
     def set_speed_percent(self, speed: int) -> None:
         self.events.append("speed")
         self.speed_calls.append(speed)
@@ -188,6 +228,9 @@ class _FakeArm:
             self.drop_mode_frames -= 1
         elif not self.ignore_mode:
             self.ctrl_mode = 1
+            if self.fault_on_can:
+                self.fault_on_can = False
+                self.fault_delay, self.fault_reads = 1, 2
 
     def move_j(self, joints: list[float]) -> None:
         self.events.append("joint")
@@ -209,12 +252,13 @@ class _FakeArm:
 
 
 def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch, *, silent: bool = False,
-                      firmware: str = "S-V1.9-0") -> list[_FakeArm]:
+                      firmware: str = "S-V1.9-0", drop_firmware: int = 0) -> list[_FakeArm]:
     created: list[_FakeArm] = []
     real_import = importlib.import_module
 
     def create(config: dict) -> _FakeArm:
         arm = _FakeArm(config, silent=silent, firmware=firmware)
+        arm.drop_firmware_replies = drop_firmware
         created.append(arm)
         return arm
 
@@ -255,7 +299,9 @@ def test_example_yaml_pins_model_limits_units_and_dh() -> None:
     assert context.transport.config["robot"] == "piper_x"
     assert context.transport.config["firmware_profile"] == "v189"
     assert context.kinematics.dof == 6
-    for i, bound in ((4, 89), (5, 89), (6, 170)):
+    # j6 is the one axis where the manual (±165) is narrower than the pyAgxArm
+    # preset (±170); the declaration must follow the manual.
+    for i, bound in ((4, 89), (5, 89), (6, 165)):
         channel = context.channel(f"joint.j{i}.position")
         assert channel.envelope.min_value == -bound and channel.envelope.max_value == bound
         assert channel.envelope.tolerance == .5
@@ -303,6 +349,39 @@ def test_wrong_firmware_disconnects(monkeypatch: pytest.MonkeyPatch, firmware: s
     assert created[0].disconnect_calls == 1 and not created[0].enable_calls
 
 
+def test_open_survives_the_first_firmware_reply_being_dropped(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A discarded first answer must not read as an unverifiable arm.
+
+    pyAgxArm's readiness predicate throws away a reply that arrives while its
+    own fps estimate is still zero and then waits out the window instead of
+    asking again, so the very first request after connect is routinely lost.
+    """
+    created = _install_fake_sdk(monkeypatch, drop_firmware=1)
+    status = asyncio.run(PiperArmTransport(_BASE_CONFIG).open(_context()))
+    assert status.connected and status.metadata["firmware_version"] == "S-V1.9-0"
+    assert created[0].events.count("firmware") == 2
+
+
+def test_firmware_version_spends_its_budget_then_reports_unanswered() -> None:
+    """Re-asking is bounded by the configured budget and never spins."""
+
+    class _Mute:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_firmware(self, *, timeout: float, min_interval: float) -> Any:
+            self.calls += 1
+            time.sleep(timeout)  # the vendor waits out the window it was given
+            return None
+
+    robot = _Mute()
+    assert firmware_version(robot, 0.0) == "" and robot.calls == 0
+    started = time.monotonic()
+    assert firmware_version(robot, 0.6) == ""
+    assert robot.calls >= 2 and time.monotonic() - started < 1.5
+
+
 def test_warmup_timeout_disconnects(monkeypatch: pytest.MonkeyPatch) -> None:
     created = _install_fake_sdk(monkeypatch, silent=True)
     transport = PiperArmTransport({**_BASE_CONFIG, "warmup_timeout_s": .1})
@@ -345,7 +424,7 @@ def test_idle_enable_never_resets(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("fault,code", [("refuse_enable", "piper_enable_refused"),
-    ("refuse_reset", "piper_resume_refused"), ("ignore_mode", "piper_mode_switch_failed")])
+    ("refuse_reset", "piper_resume_refused"), ("ignore_mode", "piper_mode_switch_refused")])
 def test_enable_confirmation_failure_is_committed(monkeypatch: pytest.MonkeyPatch, fault: str, code: str) -> None:
     transport, arm, _ = _open_transport(monkeypatch)
     if fault == "refuse_reset":
@@ -373,6 +452,100 @@ def test_can_mode_retry_survives_dropped_frame(monkeypatch: pytest.MonkeyPatch) 
     assert len(arm.speed_calls) == 2
 
 
+def test_arm_status_names_the_joints_the_fault_word_implicates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A joint communication fault must name the joints, not just a number.
+
+    0x16 is the firmware's own answer to *which* motors went silent; decoding it
+    here is what turns ``arm_status`` 0x05 into an instruction (check those motor
+    cables) instead of a hex code. The high byte is the angle-over-limit mask.
+    """
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.arm_status, arm.err_code = 0x05, 0x16
+    status = asyncio.run(transport.read("arm.status")).value
+    assert status["error_code"] == 0x16
+    assert status["joint_communication_errors"] == [2, 3, 5]
+    assert status["joint_limit_errors"] == []
+    arm.err_code = 0x0100
+    assert asyncio.run(transport.read("arm.status")).value["joint_limit_errors"] == [1]
+
+
+def test_an_enable_that_drops_is_retried_within_the_same_budget(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A controller that faults after entering CAN is re-enabled, not believed.
+
+    The motor flags keep reading enabled across a fault, so the first enable
+    alone reports success; the arm then drops to standby and sags. Observing the
+    settle window catches it, and one retry inside the same budget recovers.
+    """
+    transport, arm, _ = _open_transport(monkeypatch,
+                                        {"enable_timeout_s": .6, "enable_settle_s": .05})
+    arm.fault_on_can = True
+    result = _write(transport, "arm.enable", 1)
+    assert result.ok and result.side_effect_state == SIDE_EFFECT_COMMITTED
+    assert arm.enable_calls == 2
+    assert arm.ctrl_mode == 1
+
+
+def test_an_enable_that_keeps_dropping_is_refused_with_the_fault_named(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """When every attempt faults, the caller is refused with the fault and joints.
+
+    Succeeding here would hand back an arm in standby with its drives released --
+    the exact state that lets a later move collapse and be reported as stale.
+    """
+    transport, arm, _ = _open_transport(monkeypatch,
+                                        {"enable_timeout_s": .3, "enable_settle_s": .05})
+    arm.fault_reads = 10 ** 9
+    result = _write(transport, "arm.enable", 1)
+    assert not result.ok and result.failure_code == "piper_enable_unstable"
+    assert result.side_effect_state == SIDE_EFFECT_COMMITTED
+    assert "joint communication error" in result.error
+    assert "joints 2, 3, 5" in result.error
+    assert arm.enable_calls > 1
+
+
+def test_a_target_the_firmware_refuses_is_refused_not_committed(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The arm's own answer outranks delivery: a planning refusal moved nothing.
+
+    Observed on a real cell: the arm stood a couple of degrees outside two joint
+    limits, every target was refused, and each write still reported committed --
+    so a caller built on a posture the arm had never taken.
+    """
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.arm_status, arm.err_code = 0x04, 0x0600  # joints 2 and 3 past their limit
+    result = _write(transport, "joint.j1.position", 12.5)
+    assert not result.ok and result.side_effect_state == SIDE_EFFECT_NONE
+    assert result.failure_code == "piper_target_refused"
+    assert "joints 2, 3 out of limit" in (result.error or "")
+
+
+def test_a_refused_target_is_never_held_as_a_command(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refused posture is not where the arm is, so it may not fill a later hold."""
+    transport, arm, _ = _open_transport(monkeypatch)
+    assert _write(transport, "joint.j1.position", 12.5).ok
+    arm.arm_status = 0x04
+    assert not _write(transport, "joint.j1.position", 15).ok
+    arm.arm_status = 0
+    arm.joints = joints_to_sdk([11., 21., -31., 41., 51., -161.])
+    assert _write(transport, "joint.j3.position", -35).ok
+    assert arm.joint_calls[-1] == pytest.approx(
+        joints_to_sdk([11., 21., -35., 41., 51., -161.])), (
+        "the unnamed axes must follow feedback, never the refused vector")
+
+
+def test_a_fault_after_the_target_is_unknown_not_committed(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fault is not a refusal: the arm may have moved before it stopped."""
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.arm_status = 0x07
+    result = _write(transport, "ee.z", 400)
+    assert not result.ok and result.side_effect_state == SIDE_EFFECT_UNKNOWN
+    assert result.failure_code == "piper_arm_fault"
+    assert "collision" in (result.error or "")
+
+
 def test_joint_units_and_hold_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     transport, arm, _ = _open_transport(monkeypatch)
     result = _write(transport, "joint.j1.position", 12.5)
@@ -380,6 +553,71 @@ def test_joint_units_and_hold_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     assert arm.joint_calls[0] == pytest.approx(joints_to_sdk([12.5, 20, -30, 40, 50, -160]))
     assert _write(transport, "joint.j3.position", -35).ok
     assert arm.joint_calls[-1] == pytest.approx(joints_to_sdk([12.5, 20, -35, 40, 50, -160]))
+
+
+def test_a_disowned_hold_is_never_replayed() -> None:
+    """A hold is a commitment, and ending ownership voids it.
+
+    Only a vector this driver sent may fill an unnamed axis. Once an enable,
+    stop or disable has ended that ownership the arm may be anywhere, so the
+    next command holds from feedback rather than from the old target.
+    """
+    motion = PiperMotion(speed_pct=10, pose_path="linear")
+    arm = _FakeArm({})
+    sent = [10., 20., -30., 40., 50., -160.]
+    assert motion.send(arm, SPACE_JOINT, sent, [(0, 12.5)]) == pytest.approx(
+        [12.5, *sent[1:]])
+    later = [3., 2.5, -.4, 44., 2., 120.]
+    motion.disown("an emergency stop")
+    assert motion.send(arm, SPACE_JOINT, later, [(5, 100.)]) == pytest.approx([*later[:5], 100.])
+
+
+def test_enable_never_turns_a_transitional_frame_into_a_held_axis(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Energising republishes postures the arm was never in; none may be held.
+
+    The joint frame read while the arm is being energized is a measurement of a
+    transition, not a command. Holding it filled an unnamed j2 with 0.0 while
+    the arm had settled at 2.2 degrees, so a one-axis step moved an axis nobody
+    named and still verified as reached.
+    """
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.joints = joints_to_sdk([0., 0., 0., 0., 0., 0.])
+    assert _write(transport, "arm.enable", 1).ok
+    settled = [.7, 2.2, -.5, 44.6, 2.6, 120.6]
+    arm.joints = joints_to_sdk(settled)
+    assert _write(transport, "joint.j1.position", 2.7).ok
+    assert arm.joint_calls[-1] == pytest.approx(joints_to_sdk([2.7, *settled[1:]])), (
+        "the unnamed axes must follow feedback, not the enable-time frame")
+
+
+def test_a_held_axis_outside_its_envelope_refuses_the_whole_vector(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The vendor clamps silently, so a held axis outside the envelope must be refused.
+
+    The SDK rewrites an out-of-limit joint to the limit before it reaches the
+    arm, so holding j2 where it stands would travel an axis the caller never
+    named while the write reported success. Nothing may be sent instead.
+    """
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.joints = joints_to_sdk([10., -2.2, -30., 40., 50., -160.])
+    before = list(arm.joint_calls)
+    result = _write(transport, "joint.j1.position", 12.5)
+    assert not result.ok and result.side_effect_state == SIDE_EFFECT_NONE
+    assert result.failure_code == "piper_hold_outside_envelope"
+    assert arm.joint_calls == before
+    assert "joint.j2.position" in (result.error or ""), "the refusal must name the axis"
+
+
+def test_a_held_axis_inside_the_declared_tolerance_is_clamped_by_the_driver(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Within measurement precision the driver clamps itself, so sent equals executed."""
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.joints = joints_to_sdk([10., -0.2, -30., 40., 50., -160.])
+    assert _write(transport, "joint.j1.position", 12.5).ok
+    assert arm.joint_calls[-1] == pytest.approx(
+        joints_to_sdk([12.5, 0., -30., 40., 50., -160.])), (
+        "a hold a hair outside the limit is clamped to it, never handed to the vendor")
 
 
 @pytest.mark.parametrize("channel,value", [("joint.j4.position", 90), ("joint.j5.position", -90),
@@ -464,7 +702,7 @@ def test_batch_order_and_atomic_motion_vector(monkeypatch: pytest.MonkeyPatch) -
         ("arm.enable", 1), ("arm.speed_pct", 5), ("joint.j3.position", -35))))
     assert batch.ok and len(batch.outcomes) == 5
     assert arm.joint_calls == [pytest.approx(joints_to_sdk([15, 20, -35, 40, 50, -160]))]
-    assert arm.events[-3:] == ["speed", "joint", "gripper"]
+    assert arm.events[-4:] == ["speed", "mode:j", "joint", "gripper"]
     assert arm.gripper.calls == [(pytest.approx(.03), 1)]
 
 
@@ -505,7 +743,9 @@ def test_cached_reads_units_status_telemetry_and_unknown_channels(monkeypatch: p
     arm.ctrl_mode = 2
     assert asyncio.run(transport.read("arm.ctrl_mode")).value == "teach"
     status = asyncio.run(transport.read("arm.status"))
-    assert status.value == {"ctrl_mode": 2, "arm_status": 0, "mode_feedback": 1, "motion_status": 1}
+    assert status.value == {"ctrl_mode": 2, "arm_status": 0, "mode_feedback": 1, "motion_status": 1,
+                            "error_code": 0, "joint_limit_errors": [],
+                            "joint_communication_errors": []}
     assert asyncio.run(transport.read("arm.motion")).value is False
     arm.motion_status = 0
     assert asyncio.run(transport.read("arm.motion")).value is True
@@ -583,6 +823,64 @@ def test_gripper_failed_pair_does_not_advance_cache(monkeypatch: pytest.MonkeyPa
     arm.gripper.down = arm.gripper.fail = False
     assert _write(transport, "gripper.position", 40).ok
     assert arm.gripper.calls[-1] == (pytest.approx(.04), 1)
+
+
+def test_a_joint_move_asserts_its_move_mode_after_the_speed_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The targets ride a mode the firmware acknowledged, not one it may adopt.
+
+    The speed frame parks the firmware's move mode at UNKNOWN and restores the
+    previous mode only in the SDK's own cache, so the first target after a speed
+    change would be evaluated in a mode the firmware cannot execute -- and
+    dropped without an error. The mode frame carries the mode those targets
+    belong to and is confirmed from feedback before any target goes out.
+    """
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.mode_feedback = 0xFF  # parked by the frame that also selected CAN control
+    assert _write(transport, "joint.j1.position", 12.5).ok
+    assert arm.mode_calls == ["j"] and arm.mode_feedback == 1
+    assert arm.events.index("speed") < arm.events.index("mode:j") < arm.events.index("joint")
+
+
+def test_a_speed_change_is_applied_before_the_move_mode_is_reasserted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+    assert _write(transport, "joint.j1.position", 12.5).ok
+    arm.events.clear()
+    batch = asyncio.run(transport.write_batch((("arm.speed_pct", 20), ("joint.j2.position", 12))))
+    assert batch.ok and arm.speed_calls[-1] == 20
+    assert arm.events == ["speed", "mode:j", "joint"]
+
+
+def test_a_firmware_that_never_latches_the_mode_sends_no_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mode the firmware never adopts is a typed refusal, not a settle timeout.
+
+    No target frame goes out, so the arm was never asked to move and the caller
+    learns why instead of watching a deadline expire on an arm that could not
+    have arrived.
+    """
+    transport, arm, _ = _open_transport(monkeypatch)
+    arm.ignore_move_mode = True
+    arm.mode_feedback = 0xFF
+    result = _write(transport, "joint.j1.position", 12.5)
+    assert not result.ok and result.side_effect_state == SIDE_EFFECT_UNKNOWN
+    assert result.failure_code == "piper_move_mode_refused"
+    assert "unknown(0xFF)" in (result.error or "") and "no target was sent" in (result.error or "")
+    assert not arm.joint_calls
+
+
+@pytest.mark.parametrize("path,mode", [("linear", "l"), ("point", "p")])
+def test_a_pose_move_asserts_the_mode_of_its_own_path(
+    monkeypatch: pytest.MonkeyPatch, path: str, mode: str,
+) -> None:
+    transport, arm, _ = _open_transport(monkeypatch)
+    assert _write(transport, "arm.pose_path", path).ok
+    assert _write(transport, "ee.x", 210).ok
+    assert arm.mode_calls == [mode]
 
 
 def test_slow_vendor_send_does_not_block_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:

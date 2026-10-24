@@ -3,18 +3,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from leapflow.learning.physical_episode import (
-    EPISODE_SCHEMA_VERSION,
     PhysicalEpisode,
     PhysicalEpisodeRecorder,
     make_episode_id,
@@ -23,7 +21,6 @@ from leapflow.robot.episode_export import EpisodeExporter
 from leapflow.robot.trajectory import (
     PhysicalTrajectory,
     PhysicalTrajectoryStep,
-    make_trajectory_id,
 )
 
 
@@ -531,7 +528,7 @@ class TestEpisodeExporter:
 
         with patch("leapflow.robot.episode_export._PYARROW_AVAILABLE", False), \
              patch("leapflow.robot.episode_export._CV2_AVAILABLE", False):
-            result = await exporter.export_episode(episode)
+            await exporter.export_episode(episode)
 
         # Check frame refs file was written.
         refs_file = tmp_path / "videos" / "episode_ep-cam" / "cam0_refs.json"

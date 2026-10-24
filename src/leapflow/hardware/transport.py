@@ -214,10 +214,26 @@ class FrameReading:
 
 @dataclass(frozen=True)
 class TransportStatus:
-    """Transport health and declared capabilities."""
+    """Transport health, declared capabilities, and the outcome of the last verb.
+
+    ``connected`` and ``halt_supported`` are *declarations* about the device: is
+    the link up, and can this device be stopped at all. Neither answers "did the
+    stop I just asked for reach it", and inferring that from them produces false
+    verdicts in both directions: a passive camera releases its capture and
+    answers ``connected=False, halt_supported=False`` -- a successful stop that
+    reads exactly like a dead link -- while a closed link to an arm that may
+    still be travelling reads like an idle device.
+
+    ``halt_delivered`` therefore states the delivery verdict explicitly: the stop
+    command reached the device, so "it may still be moving" is not a question the
+    caller has to guess at. A driver that returns a status at all has attempted
+    the stop, so the default is ``True``; only a transport that could not put the
+    command on the wire answers ``False``.
+    """
 
     connected: bool = False
     halt_supported: bool = False
+    halt_delivered: bool = True
     detail: str = ""
     latency_ms: float = 0.0
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -226,6 +242,7 @@ class TransportStatus:
         return {
             "connected": self.connected,
             "halt_supported": self.halt_supported,
+            "halt_delivered": self.halt_delivered,
             "detail": self.detail,
             "latency_ms": self.latency_ms,
         }
@@ -296,6 +313,12 @@ class HardwareTransport(Protocol):
         that device while keeping its readable channels available. "Cannot stop"
         becomes a discoverable capability degradation instead of a silent
         assumption.
+
+        A transport that could not send the stop -- no link, or the send failed --
+        answers ``halt_delivered=False``. That flag is the only honest way to say
+        "this device may still be moving": ``connected`` describes the link after
+        the call, which a stop that released the device sets to ``False``, and
+        ``halt_supported`` describes the device, not this attempt.
 
         Lock-free for a stronger reason than ``probe``: waiting for a lock in order to
         stop a moving machine is physically wrong. Whatever holds the device's I/O lock is

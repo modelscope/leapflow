@@ -11,15 +11,22 @@ that.
 """
 from __future__ import annotations
 
+import logging
 import time
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Mapping, NamedTuple
 
+from leapflow.hardware.arm_status import (
+    ARM_STATUS_EMERGENCY_STOP,
+    ARM_STATUS_NAMES,
+    ARM_STATUS_NORMAL,
+)
 from leapflow.hardware.drivers._piper_feedback import (
     PiperFeedback,
     attach_receive_ledger,
     status_value,
 )
 from leapflow.hardware.drivers._piper_motion import (
+    CTRL_MODE_CAN,
     PiperMotion,
     as_int,
     attr,
@@ -39,20 +46,30 @@ from leapflow.hardware.transport import (
     WriteOutcome,
 )
 
+logger = logging.getLogger(__name__)
+
 GRIPPER_EFFECTOR = "agx_gripper"
-ARM_STATUS_EMERGENCY_STOP = 0x01
 POLL_S = 0.02
 _ENABLE_RETRY_S = 0.1
+ENABLE_SETTLE_S = 1.0
+"""How long an enable must hold before it counts as one.
+
+A controller that has just been reset accepts CAN control and then, about half
+one second later, reports a joint communication error and drops back to standby
+with the drives released -- the arm sags away and every later command finds a
+posture nobody commanded. That window is what this observation must outlast.
+"""
+_ENABLE_RESTART_S = 0.25
+"""Pause before retrying an enable the controller dropped, so it can settle."""
 
 
 class PiperLink(NamedTuple):
-    """One connected arm: SDK handles, certified feedback, firmware and seed joints."""
+    """One connected arm: SDK handles, certified feedback and firmware."""
 
     robot: Any
     gripper: Any
     feedback: PiperFeedback
     firmware: str
-    joints: list[float]
 
 
 class LinkSpec(NamedTuple):
@@ -97,10 +114,10 @@ def open_link(sdk: Any, spec: LinkSpec) -> PiperLink:
                                  max_age_s=spec.max_age_s, max_skew_s=spec.max_skew_s)
         robot.set_joint_limits_enabled(True)
         robot.connect()
-        joints = _warm_up(robot, spec)
+        _warm_up(robot, spec)
         firmware = firmware_version(robot, spec.firmware_timeout_s)
         _check_firmware(sdk, spec, firmware)
-        return PiperLink(robot, gripper, feedback, firmware, joints)
+        return PiperLink(robot, gripper, feedback, firmware)
     except BaseException:
         # A half-open CAN link must not outlive a failed open: disconnect
         # best-effort and surface the real failure.
@@ -112,14 +129,15 @@ def open_link(sdk: Any, spec: LinkSpec) -> PiperLink:
         raise
 
 
-def _warm_up(robot: Any, spec: LinkSpec) -> list[float]:
+def _warm_up(robot: Any, spec: LinkSpec) -> None:
+    """Wait until every feedback group has produced a value; joins nothing."""
     deadline = time.monotonic() + spec.warmup_timeout_s
     while True:
         joints = read_joints(robot)
         if (joints is not None and read_pose(robot) is not None
                 and status_feedback(robot) is not None
                 and robot.is_connected() and robot.is_ok()):
-            return joints
+            return
         if time.monotonic() >= deadline:
             raise TransportError(
                 f"Piper arm on {spec.can_name!r} produced no joint/pose/status feedback within "
@@ -175,59 +193,128 @@ def link_state(robot: Any) -> dict[str, Any]:
 
 
 def energize(robot: Any, feedback: PiperFeedback, motion: PiperMotion,
-             timeout_s: float) -> WriteOutcome:
-    """Blocking: resume a latched stop, energize, enter CAN control, verify each step.
+             timeout_s: float, settle_s: float = ENABLE_SETTLE_S) -> WriteOutcome:
+    """Blocking: resume a latched stop, energize, enter CAN control, and prove it holds.
 
     ``reset()`` clears a latched stop (and drops to standby), ``enable()`` is
     repeated until every driver reports enabled, then CAN control is selected
     and confirmed. Any step refused after a frame was sent reports COMMITTED:
     the arm state may already have changed.
+
+    Those three steps are not the whole contract. A controller that has just
+    been reset can accept CAN control and then, half a second later, report a
+    joint communication error and drop back to standby with its drives released:
+    the arm sags away from the posture the caller believes it holds. The motor
+    enable flags do not catch this -- they keep reading enabled across an
+    emergency stop -- so the only trustworthy evidence is the arm's own status.
+    The enable is therefore *observed* for ``settle_s`` and counts only if the
+    arm holds CAN control in a normal state throughout. A fault is transient
+    (the controller clears it by itself), so the sequence is retried within the
+    same ``timeout_s``; if it keeps faulting the caller is refused with the
+    fault and the joints named, instead of an arm quietly falling over.
+
+    The posture the arm held before this call is deliberately not carried over
+    as a hold vector: while the arm is energized its frame jumps through states
+    it was never in, so commanding one back would move axes nobody named.
     """
     problem = feedback.problem()
     if problem:
         return _outcome(SIDE_EFFECT_NONE, "fresh per-group CAN reception is required before "
                         f"enabling: {problem}", "piper_unqualified_feedback")
-    joints = read_joints(robot)
-    if joints is None:
-        return _outcome(SIDE_EFFECT_NONE, "no joint feedback to seed the hold vector before "
-                        "enabling", "piper_no_feedback")
+    motion.disown("a governed enable")
+    deadline = time.monotonic() + timeout_s
     sent = False
+    unstable = ""
     try:
-        if _latched(robot):
-            sent = True
-            robot.reset()
-            if not wait_for(lambda: not _latched(robot), time.monotonic() + timeout_s):
-                return _outcome(SIDE_EFFECT_COMMITTED,
-                                "the arm still reports a latched emergency stop after reset(); "
-                                "release the physical stop button and retry",
-                                "piper_resume_refused")
-        feedback.require()
-        deadline = time.monotonic() + timeout_s
         while True:
             sent = True
-            robot.enable()
-            window = min(deadline, time.monotonic() + _ENABLE_RETRY_S)
-            if wait_for(lambda: all(enable_status(robot) or [False]), window):
-                break
-            if time.monotonic() >= deadline:
-                return _outcome(SIDE_EFFECT_COMMITTED,
-                                "the arm accepted the enable command but not every motor reports "
-                                "enabled; check the emergency-stop button and the power switch",
-                                "piper_enable_refused")
-        motion.seed_joints(joints)
-        feedback.require()
-        motion.enter_can(robot)
-        feedback.require()
+            if latched(robot):
+                robot.reset()
+                if not wait_for(lambda: not latched(robot), deadline):
+                    return _outcome(SIDE_EFFECT_COMMITTED,
+                                    "the arm still reports a latched emergency stop after reset(); "
+                                    "release the physical stop button and retry",
+                                    "piper_resume_refused")
+            _enable_drivers(robot, feedback, deadline)
+            # A fault left over from an earlier attempt makes the mode frame
+            # pointless and the failure message misleading, so it is read first.
+            unstable = _fault_reason(robot)
+            if not unstable:
+                motion.enter_can(robot)
+                unstable = _unstable_reason(robot, settle_s)
+            if not unstable:
+                feedback.require()
+                return WriteOutcome(ok=True, side_effect_state=SIDE_EFFECT_COMMITTED)
+            if time.monotonic() + settle_s >= deadline:
+                return _outcome(
+                    SIDE_EFFECT_COMMITTED,
+                    f"the arm would not stay energized: {unstable}; power-cycle the arm and check "
+                    "the motor cable before retrying",
+                    "piper_enable_unstable",
+                )
+            logger.warning("piper: enable did not hold (%s); retrying", unstable)
+            time.sleep(_ENABLE_RESTART_S)
     except TransportError as exc:
-        code = exc.failure_code
+        # Each step refuses with its own code -- resume, enable, mode switch,
+        # feedback -- so the caller learns which one refused instead of a
+        # blanket verdict that hides where the arm stopped cooperating.
         return _outcome(SIDE_EFFECT_COMMITTED if sent else SIDE_EFFECT_NONE, str(exc),
-                        code if code == "piper_unqualified_feedback" else "piper_mode_switch_failed")
+                        exc.failure_code)
     except Exception as exc:  # noqa: BLE001 - the reset/enable/mode frame may have landed
         return _outcome(SIDE_EFFECT_UNKNOWN, f"enable sequence failed: {exc}", "piper_send_failed")
-    return WriteOutcome(ok=True, side_effect_state=SIDE_EFFECT_COMMITTED)
 
 
-def _latched(robot: Any) -> bool:
+def _enable_drivers(robot: Any, feedback: PiperFeedback, deadline: float) -> None:
+    """Enable every motor, resending until the arm reports all six on."""
+    while True:
+        robot.enable()
+        window = min(deadline, time.monotonic() + _ENABLE_RETRY_S)
+        if wait_for(lambda: all(enable_status(robot) or [False]), window):
+            feedback.require()
+            return
+        if time.monotonic() >= deadline:
+            raise TransportError(
+                "the arm accepted the enable command but not every motor reports enabled; "
+                "check the emergency-stop button and the power switch",
+                failure_code="piper_enable_refused",
+            )
+
+
+def _unstable_reason(robot: Any, settle_s: float) -> str:
+    """Why the arm did not hold healthy CAN control for ``settle_s``; "" when it did."""
+    deadline = time.monotonic() + max(settle_s, 0.0)
+    while True:
+        status = status_value(status_feedback(robot))
+        # The fault word is read first: leaving CAN control is how a fault presents
+        # itself, and naming the cause is what tells an operator what to look at.
+        fault = _status_fault(status)
+        if fault:
+            return fault
+        if status["ctrl_mode"] != CTRL_MODE_CAN:
+            return ("it left CAN control ("
+                    f"{ctrl_mode_name(status['ctrl_mode']) or 'no feedback'})")
+        if time.monotonic() >= deadline:
+            return ""
+        time.sleep(POLL_S)
+
+
+def _fault_reason(robot: Any) -> str:
+    """The arm's own fault, named from its status word; "" when it reports none."""
+    return _status_fault(status_value(status_feedback(robot)))
+
+
+def _status_fault(status: Mapping[str, Any]) -> str:
+    """Render one status word's fault, naming the joints it implicates."""
+    code = status.get("arm_status")
+    if not isinstance(code, int) or code == ARM_STATUS_NORMAL:
+        return ""
+    joints = status.get("joint_communication_errors")
+    affected = f" (joints {', '.join(str(j) for j in joints)})" if joints else ""
+    return f"the arm reports {ARM_STATUS_NAMES.get(code, f'fault 0x{code:02X}')}{affected}"
+
+
+def latched(robot: Any) -> bool:
+    """True while the firmware reports an emergency stop it has not been released from."""
     return as_int(attr(status_feedback(robot), "arm_status")) == ARM_STATUS_EMERGENCY_STOP
 
 
@@ -237,10 +324,12 @@ def _outcome(state: str, error: str, failure_code: str) -> WriteOutcome:
 
 __all__ = [
     "ARM_STATUS_EMERGENCY_STOP",
+    "ENABLE_SETTLE_S",
     "GRIPPER_EFFECTOR",
     "LinkSpec",
     "PiperLink",
     "energize",
+    "latched",
     "link_state",
     "open_link",
     "wait_for",

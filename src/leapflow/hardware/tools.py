@@ -197,6 +197,11 @@ class HardwareTools:
             audit_log=self._audit,
             trust_gate=hardware_trust_gate,
             identity_provider=self._session_identity,
+            follow_s=getattr(
+                getattr(registry, "settings", None),
+                "write_verification_follow_s",
+                10.0,
+            ),
         )
         self._governor = WriteGovernor(
             gate=gate,
@@ -430,8 +435,10 @@ class HardwareTools:
         if context is None:
             return self._unknown_device(device_id)
         try:
-            transport = await self._registry.transport(device_id)
-            status = await transport.halt()
+            # The stop has to reach the device, so a link is opened when none is
+            # open; the registry then retires it if the driver closed it.
+            await self._registry.transport(device_id)
+            status = await self._registry.halt(device_id)
         except TransportError as exc:
             logger.error("Emergency stop for %r failed: %s", device_id, exc, exc_info=True)
             return {
@@ -440,16 +447,26 @@ class HardwareTools:
                 "error": str(exc),
                 "failure_code": exc.failure_code,
             }
+        if status is None:  # the link was dropped between the two calls
+            return {
+                "ok": False,
+                "device_id": device_id,
+                "error": f"no link is open to {device_id!r}",
+                "failure_code": "transport_not_open",
+            }
         logger.warning(
-            "Emergency stop issued device=%s supported=%s detail=%s",
+            "Emergency stop issued device=%s supported=%s delivered=%s detail=%s",
             device_id,
             status.halt_supported,
+            status.halt_delivered,
             status.detail,
         )
+        outcome = ("undelivered" if not status.halt_delivered
+                   else "ok" if status.halt_supported else "unsupported")
         self._audit.record(
             action="estop",
             device=device_id,
-            outcome="ok" if status.halt_supported else "unsupported",
+            outcome=outcome,
             identity=self._session_identity(),
         )
         # When the device declares an emergency deceleration time, report it so
@@ -459,9 +476,9 @@ class HardwareTools:
         # lets the agent or the operator decide whether to wait before
         # re-commanding the device.
         result: dict[str, Any] = {
-            "ok": status.halt_supported,
+            "ok": status.halt_supported and status.halt_delivered,
             "device_id": device_id,
-            "halted": status.halt_supported,
+            "halted": status.halt_supported and status.halt_delivered,
             "status": status.to_dict(),
         }
         safety = context.safety
