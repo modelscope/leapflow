@@ -119,6 +119,9 @@ CAN_GROUPS = tuple(f"0x{i:03x}" for i in (
     *range(0x2A1, 0x2A9), *range(0x251, 0x257), *range(0x261, 0x267)
 ))
 
+_REQUALIFY_POLL_S = 0.02
+"""How often a bounded reception wait re-reads the ledger."""
+
 
 def receipt_problem(rows: Mapping[str, Mapping], required: tuple[str, ...], *,
                     now: float, max_age_s: float, max_skew_s: float) -> str:
@@ -225,6 +228,25 @@ class PiperFeedback:
             receipts = self.receipts()
         return receipt_problem(receipts, groups, now=time.monotonic(),
                                max_age_s=self._max_age_s, max_skew_s=self._max_skew_s)
+
+    def wait_qualified(self, timeout_s: float) -> str:
+        """Poll for a coherent ledger for at most ``timeout_s``; ``""`` once it is.
+
+        Reception is a state, not an instant. A capture that holds the
+        interpreter -- a depth frame decoded and converted in the same process --
+        delays the SDK's read thread long enough for one decoder group's last
+        frame to sit a few hundred milliseconds behind the others, and the next
+        single sample then reads that as a bus that is not carrying feedback. It
+        is carrying it; it had not delivered all of it yet. Writes therefore
+        establish freshness the same way reads do, within a bounded budget, and
+        only a ledger that stays incoherent for the whole budget is a refusal.
+        """
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            problem = self.problem()
+            if not problem or time.monotonic() >= deadline:
+                return problem
+            time.sleep(min(_REQUALIFY_POLL_S, max(0.0, deadline - time.monotonic())))
 
     def require(self) -> None:
         """Raise unless every monitored group is freshly received."""

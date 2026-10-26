@@ -203,7 +203,8 @@ async def hardware(args: argparse.Namespace, settings: Settings, evidence: Evide
             cal_plan = {"version": 1, "operation": "run", "settings": asdict(settings),
                         "declaration_digest": unverified_digest(session.context),
                         "node_id": settings.node_id, "workcell": args.workcell, "skill_id": args.skill,
-                        "args": result["plan"]["args"], "plan_digest": result["plan"]["digest"], "skill_plan": result["plan"]}
+                        "request_args": arguments, "args": result["plan"]["args"],
+                        "plan_digest": result["plan"]["digest"], "skill_plan": result["plan"]}
             return preview_result(cal_plan)
         if args.operation == "status":
             return {"ok": True, "declaration_digest": unverified_digest(session.context),

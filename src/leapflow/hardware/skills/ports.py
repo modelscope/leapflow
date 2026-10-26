@@ -20,6 +20,7 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 from leapflow.hardware.skills.geometry import Plane, Pose, Transform, WorkspaceBox
 from leapflow.hardware.skills.protocol import (
     ArmState,
+    CloudObservation,
     GraspCandidate,
     GripperResult,
     HeldObject,
@@ -218,13 +219,24 @@ class ScenePort(Protocol):
 
 @runtime_checkable
 class VisionPort(Protocol):
-    """Node-local camera measurement of the workcell's declared calibration target.
+    """Node-local camera measurements a calibration may take.
 
-    Images never leave the node. Not seeing the target is ``target_not_found``
-    (NONE); a missing target declaration or vision library is ``skill_unavailable``.
+    Two of them: the declared target's pose, and the raw measured surface. Both
+    stay on the node. Not seeing the target is ``target_not_found`` (NONE); a
+    missing target declaration or vision library is ``skill_unavailable``.
     """
 
     async def observe_target(self) -> TargetObservation: ...
+
+    async def observe_cloud(
+        self, *, near_mm: float | None = None, far_mm: float | None = None
+    ) -> CloudObservation:
+        """A fresh frame's valid depth points, in the camera frame.
+
+        The depth window is applied before the cloud is thinned, so a caller that
+        names the region it cares about gets its whole point budget there.
+        """
+        ...
 
 
 @runtime_checkable

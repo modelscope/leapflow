@@ -179,7 +179,11 @@ async def test_a_confirmation_of_another_declaration_does_not_transfer(tmp_path)
     manager = None
     try:
         manager, host = await _registered(endpoint, verified_path=verified_path)
-        assert host.context(HOST_DEVICE_ID).provenance.verified_by == "jason"
+        context = host.context(HOST_DEVICE_ID)
+        assert context.provenance.verified_by == "jason"
+        # The moment of review travels with the verifier, or an operator reading
+        # `hw describe` cannot tell a fresh review from a stale claim.
+        assert context.provenance.verified_at > 0
 
         # The node redeclares, adding a channel: the reviewed declaration is gone.
         provider.contexts = (_declared_device(extra=True),)
@@ -187,6 +191,7 @@ async def test_a_confirmation_of_another_declaration_does_not_transfer(tmp_path)
         await manager.register_node(FleetNode(NODE_ID, "Jetson", endpoint))
 
         assert host.context(HOST_DEVICE_ID).provenance.verified_by == ""
+        assert host.context(HOST_DEVICE_ID).provenance.verified_at == 0.0
     finally:
         if manager is not None:
             await manager.close()

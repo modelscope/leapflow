@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ from leapflow.hardware.drivers._piper_feedback import CAN_GROUPS, _FAULT_FLAGS
 from leapflow.hardware.skills.kinematics import DhChain
 from leapflow.security.actions import ActionDescriptor
 from leapflow.security.approval import ApprovalDecision, ApprovalRequest
-from piper_ops import cli, health, layout, lifecycle, motion, node, session as session_module
+from piper_ops import calibration, cli, health, layout, lifecycle, motion, node, session as session_module
 from piper_ops.config import Settings
 from piper_ops.evidence import Evidence, Refusal, encode
 from piper_ops.session import ScopedConsent, Session, unverified_digest
@@ -102,6 +103,60 @@ def test_cli_dispatch_and_frame():
 async def test_healthy_six_motor_feedback(settings):
     result = await health.read_snapshot(registry(snapshot()), settings, ready=True)
     assert result.enabled and len(result.receipts) == len(CAN_GROUPS)
+
+
+class _CalibrationSession:
+    """The session fields calibration.run touches; no node, no credentials."""
+
+    def __init__(self, settings: Settings, evidence: Evidence) -> None:
+        self.settings = settings
+        self.evidence = evidence
+        self.touched = False
+        self.success = False
+
+
+@pytest.fixture
+def skill_owner(monkeypatch):
+    """A stand-in node owner that records each request and answers success."""
+    requests: list[dict[str, object]] = []
+
+    class Client:
+        async def hw_skill_run(self, **request: object) -> dict[str, object]:
+            requests.append(request)
+            return {"ok": True, "side_effect_state": "none"}
+
+    @asynccontextmanager
+    async def service(session, approved=None, *, share_frames=False):
+        yield Client()
+
+    monkeypatch.setattr(calibration, "service", service)
+    return requests
+
+
+async def test_calibration_execution_binds_the_declared_request_not_the_plan_defaults(
+    settings, tmp_path, skill_owner
+):
+    declared = {"joints": ["j1", "j4", "j5"], "stand": {"j2": 74.0}, "excursion_deg": 15}
+    approved = {
+        "node_id": settings.node_id, "workcell": "piper_cell", "skill_id": "calib.screws",
+        "request_args": declared, "plan_digest": "digest", "skill_plan": {"skill_id": "calib.screws"},
+        # what the node echoes back is the plan, with every schema default filled in
+        "args": {**declared, "excursion_deg": 15.0, "near_mm": 200.0, "far_mm": 750.0,
+                 "camera": "camera", "frames": 3.0, "settle_s": 0.5, "speed_pct": 10.0},
+    }
+    run = _CalibrationSession(settings, Evidence(tmp_path / "run.json"))
+    result = await calibration.run(run, workcell="piper_cell", skill="calib.screws",
+                                   args=declared, approved=approved)
+    assert result["ok"] is True and run.success
+    assert skill_owner[-1]["dry_run"] is False
+    assert skill_owner[-1]["approved_plan"] == approved["skill_plan"]
+    assert skill_owner[-1]["args"] == approved["args"], (
+        "the node re-plans what it receives, so the approved defaults travel with the request")
+
+    with pytest.raises(Refusal, match="differs from approved plan"):
+        await calibration.run(run, workcell="piper_cell", skill="calib.screws",
+                              args={**declared, "excursion_deg": 20}, approved=approved)
+    assert len(skill_owner) == 1, "a request the operator did not approve never reaches the node"
 
 
 @pytest.mark.parametrize("fault", ["nonboolean", "fault", "missing", "duplicate", "id_list", "enable", "thermal", "voltage", "receipt"])
@@ -576,6 +631,132 @@ def test_node_lifecycle_is_serialized(settings):
                 pytest.fail("concurrent lifecycle must not acquire the same inode")
     with node.lifecycle_lock(settings):
         pass
+
+
+def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(stdout=stdout, stderr=stderr, returncode=returncode)
+
+
+def test_supervisor_absent_is_unsupervised_but_a_failing_query_is_not(settings, monkeypatch):
+    """Only a missing ``systemctl`` may be read as "nobody supervises this".
+
+    A failing query on a host that has systemd is exactly the state in which
+    spawning a rival to a supervised node looks safe: the supervisor would then
+    restart its child into a second CAN owner and a second video owner.
+    """
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("systemctl")
+
+    monkeypatch.setattr(node.subprocess, "run", missing)
+    assert node.supervisor(settings) == ""
+
+    def failing(*args, **kwargs):
+        raise OSError("bus unavailable")
+
+    monkeypatch.setattr(node.subprocess, "run", failing)
+    with pytest.raises(Refusal, match="supervisor state could not be inspected"):
+        node.supervisor(settings)
+
+
+@pytest.mark.parametrize("stdout,expected", [("active\n", node.SYSTEMD_UNIT), ("inactive\n", ""), ("", "")])
+def test_supervisor_names_the_unit_that_owns_the_process(settings, monkeypatch, stdout, expected):
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append(argv)
+        return _completed(stdout=stdout)
+
+    monkeypatch.setattr(node.subprocess, "run", run)
+    assert node.supervisor(settings) == expected
+    assert seen == [["systemctl", "--user", "is-active", node.SYSTEMD_UNIT]]
+
+
+def test_preview_binds_supervisor_state_into_the_approved_plan(settings, monkeypatch):
+    """An approval granted under one owner must not execute under the other.
+
+    Start means "spawn" when unsupervised and "ask systemd" when supervised, so
+    the plan digest has to move with that fact or a stale approval would silently
+    cross the boundary.
+    """
+    monkeypatch.setattr(node, "processes", lambda settings: [])
+    monkeypatch.setattr(node, "supervisor", lambda settings: node.SYSTEMD_UNIT)
+    supervised = node.preview(settings, "status")
+    assert supervised["supervisor"] == node.SYSTEMD_UNIT
+
+    monkeypatch.setattr(node, "supervisor", lambda settings: "")
+    unsupervised = node.preview(settings, "status")
+    assert unsupervised["supervisor"] == ""
+    assert node.digest_plan(unsupervised) != node.digest_plan(supervised)
+
+
+def test_supervised_start_reports_running_without_asking_systemd(settings, tmp_path, monkeypatch):
+    """An already healthy node needs no service action at all."""
+    evidence = Evidence(tmp_path / "supervised-start.json")
+    calls = []
+    monkeypatch.setattr(node, "processes", lambda settings: [4242])
+    monkeypatch.setattr(node, "ready", lambda settings: True)
+    monkeypatch.setattr(node.subprocess, "run", lambda argv, **kwargs: calls.append(argv))
+
+    result = node._execute_supervised(settings, "start", node.SYSTEMD_UNIT,
+                                      {"log": str(tmp_path / "serve.log")}, evidence)
+
+    assert result == {"ok": True, "status": "already_running", "pids": [4242],
+                      "supervisor": node.SYSTEMD_UNIT, "lhp_ready": True}
+    assert calls == []
+    assert all(event["event"] != "node_supervised_action" for event in evidence.events)
+
+
+def test_supervised_start_delegates_and_waits_for_readiness(settings, tmp_path, monkeypatch):
+    evidence = Evidence(tmp_path / "supervised-delegate.json")
+    calls = []
+    running = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        running.append(5150)
+        return _completed()
+
+    monkeypatch.setattr(node, "processes", lambda settings: list(running))
+    monkeypatch.setattr(node, "ready", lambda settings: bool(running))
+    monkeypatch.setattr(node.subprocess, "run", run)
+
+    result = node._execute_supervised(settings, "restart", node.SYSTEMD_UNIT,
+                                      {"log": str(tmp_path / "serve.log")}, evidence)
+
+    assert calls == [["systemctl", "--user", "restart", node.SYSTEMD_UNIT]]
+    assert result["status"] == "running"
+    assert result["pids"] == [5150]
+    assert result["supervisor"] == node.SYSTEMD_UNIT
+    assert [event["event"] for event in evidence.events] == ["node_supervised_action", "node_ready"]
+
+
+def test_supervised_start_fails_closed_on_a_refused_service_action(settings, tmp_path, monkeypatch):
+    evidence = Evidence(tmp_path / "supervised-refused.json")
+    monkeypatch.setattr(node, "processes", lambda settings: [])
+    monkeypatch.setattr(node.subprocess, "run",
+                        lambda argv, **kwargs: _completed(stderr="Unit not found.", returncode=5))
+
+    with pytest.raises(Refusal, match="systemd could not start"):
+        node._execute_supervised(settings, "start", node.SYSTEMD_UNIT,
+                                 {"log": str(tmp_path / "serve.log")}, evidence)
+
+
+def test_supervised_start_refuses_a_second_owner(settings, tmp_path, monkeypatch):
+    """A supervised start that yields two owners is the race, not a slow start."""
+    evidence = Evidence(tmp_path / "supervised-race.json")
+    owners = []
+
+    def run(argv, **kwargs):
+        owners.extend([5150, 5151])
+        return _completed()
+
+    monkeypatch.setattr(node, "processes", lambda settings: list(owners))
+    monkeypatch.setattr(node, "ready", lambda settings: True)
+    monkeypatch.setattr(node.subprocess, "run", run)
+
+    with pytest.raises(Refusal, match="multiple owners detected"):
+        node._execute_supervised(settings, "start", node.SYSTEMD_UNIT,
+                                 {"log": str(tmp_path / "serve.log")}, evidence)
 
 
 @pytest.mark.parametrize("value", [None, 2, [1] * 6, [None] * 6])

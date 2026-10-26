@@ -420,11 +420,13 @@ class WorkcellPolicies:
         fitted = binding.spaces.observation.images
         images: dict[str, bytes] = {}
         for name, device_id in binding.cameras.items():
-            source = await self._transport(
-                device_id, FrameSource, "an RGB-D camera", FAILURE_SKILL_UNAVAILABLE
-            )
             try:
+                # Resolved under the device lock so a preview release cannot close the
+                # camera between the lookup and the capture.
                 async with self._registry.device_io(device_id):
+                    source = await self._transport(
+                        device_id, FrameSource, "an RGB-D camera", FAILURE_SKILL_UNAVAILABLE
+                    )
                     frame = await source.capture_rgbd()
             except TransportError as exc:
                 raise SkillError(

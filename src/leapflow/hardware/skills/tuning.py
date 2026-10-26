@@ -50,6 +50,28 @@ DEFAULT_CALIBRATION: Mapping[str, float] = {
     "min_verify_points": 5.0,
     "max_verify_p95_mm": 5.0,
     "max_verify_rms_mm": 5.0,
+    # calib.screws: three joints are the minimum that fixes the camera's height as
+    # well as its heading, so fewer cannot produce a mount at all. The gap is what
+    # each joint's own screw shift disagrees with the mount's prediction by; the
+    # agreement is the fraction of moved points that land on the measured surface.
+    #
+    # Both limits come from the archived P-B capture, replayed through the skill's
+    # own code path: an honest capture of that cell scores 0.48-0.51 with a worst
+    # gap of 11.6-13.3 mm (always the wrist, whose 25 deg motion carries the least
+    # surface). A 20 mm ceiling leaves that measured case a third of its value in
+    # handroom while still refusing a mount that explains no joint at all. It is
+    # not a fine discriminator -- a mis-paired sample scores *lower* on it, which
+    # is why the joint-by-joint drift check, not this number, is what refuses one.
+    #
+    # The vertical is measured from the base joint, whose axis *is* the base's +z:
+    # a pair turning about a line 2 deg off z reports a direction 2 deg off, and
+    # the mount inherits it. So the pair that supplies the vertical has to be that
+    # joint, within this bound; a run that names three horizontal joints is refused
+    # with a message naming the base joint rather than measured from a tilted line.
+    "min_screw_pairs": 3.0,
+    "max_screw_shift_gap_mm": 20.0,
+    "min_screw_agreement": 0.35,
+    "max_vertical_axis_deg": 1.0,
 }
 
 DEFAULT_GRASP_VERIFY: Mapping[str, float] = {

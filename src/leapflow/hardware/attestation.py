@@ -36,7 +36,7 @@ from typing import Any, Mapping
 
 import yaml
 
-from leapflow.hardware.context import HardwareContext
+from leapflow.hardware.context import HardwareContext, epoch_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +156,28 @@ def confirmed_by(
     return verifier
 
 
+def verification_stamp(
+    source: Mapping[str, Any] | Path | str | None,
+    device_id: str,
+    context: HardwareContext,
+) -> tuple[str, float]:
+    """Return who confirmed *this* declaration, and when they did it.
+
+    Both halves are answered together because they come from one record: a
+    caller that read the verifier through one path and the timestamp through
+    another could attach a name while dropping the moment of review, which is
+    how ``hw describe`` reported ``verified_at: 0.0`` for a device that had just
+    been re-attested.  Whether the confirmation applies at all is still decided
+    by ``confirmed_by``, so this cannot become a weaker second predicate.
+    """
+    verifier = confirmed_by(source, device_id, context)
+    if not verifier:
+        return "", 0.0
+    entry = read_verified(source).get(device_id)
+    recorded = entry.get("verified_at") if isinstance(entry, Mapping) else None
+    return verifier, epoch_seconds(recorded)
+
+
 def store_verification(
     verified_path: Path | str,
     device_id: str,
@@ -196,4 +218,5 @@ __all__ = [
     "declaration_payload",
     "read_verified",
     "store_verification",
+    "verification_stamp",
 ]

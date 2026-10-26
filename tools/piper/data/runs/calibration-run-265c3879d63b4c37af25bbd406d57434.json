@@ -1,0 +1,584 @@
+{
+  "ok": true,
+  "executed": false,
+  "preview": {
+    "version": 1,
+    "operation": "run",
+    "settings": {
+      "endpoint": "tcp://192.168.55.1:8767",
+      "node_id": "yahboom",
+      "device_id": "robot_piper_arm",
+      "token_file": "temp/devices/jetson/.lhp-token",
+      "issuer_key": "/Users/jason/.leapflow/profiles/default/hardware/lhp_permit_issuer.key",
+      "node_devices": "/Users/jason/.leapflow/profiles/default/hardware/devices",
+      "root": "/Users/jason/work/leap_work/leapflow/tools/piper",
+      "speed_pct": 10.0,
+      "waypoint_mm": 1.0,
+      "position_mm": 2.0,
+      "orientation_deg": 1.0,
+      "joint_deg": 0.5,
+      "grip_mm": 0.5,
+      "poll_s": 0.2,
+      "settled_samples": 6,
+      "move_timeout_s": 20.0,
+      "run_timeout_s": 600.0,
+      "request_timeout_s": 10.0,
+      "joint_margin_deg": 1.0,
+      "manual_joint_limits_deg": [
+        [
+          -150.0,
+          150.0
+        ],
+        [
+          0.0,
+          180.0
+        ],
+        [
+          -170.0,
+          0.0
+        ],
+        [
+          -89.0,
+          89.0
+        ],
+        [
+          -89.0,
+          89.0
+        ],
+        [
+          -165.0,
+          165.0
+        ]
+      ],
+      "joint_step_deg": 10.0,
+      "init_max_deg": 10.0,
+      "deviation_deg": 3.0,
+      "max_cycles": 20,
+      "max_dwell_s": 60.0,
+      "preflight_temp_c": 45.0,
+      "max_temp_c": 50.0,
+      "voltage_min_v": 21.6,
+      "voltage_max_v": 26.0,
+      "gripper_max_mm": 69.5,
+      "gripper_max_evidence": "Operator confirmed unchanged fitted gripper/jaws and validity of the previously measured 69.5 mm usable maximum on 2026-10-22. Fitted Piper X gripper vendor specification is nominal 0-100 mm, indexed in temp/devices/device_info/arm/PIPER_X.md. This confirmation is not a new mechanical-stop test or full-motion qualification.",
+      "gripper_spec_max_mm": 100.0,
+      "gripper_usable_max_mm": 69.5,
+      "node_python": "/Users/jason/miniconda3/envs/leap/bin/python",
+      "node_leap": "/Users/jason/miniconda3/envs/leap/bin/leap",
+      "node_control_python": null,
+      "node_workspace": "/Users/jason/leap_work",
+      "node_host": "0.0.0.0",
+      "node_port": 8767
+    },
+    "declaration_digest": "4061e3ce917749911c479896da49fc10c334042cd2751a0a9ad36fb8750852ba",
+    "node_id": "yahboom",
+    "workcell": "piper_cell",
+    "skill_id": "calib.screws",
+    "request_args": {
+      "joints": [
+        "j1",
+        "j4",
+        "j5"
+      ],
+      "stand": {
+        "j1": 0.0,
+        "j2": 74.0,
+        "j3": -42.0,
+        "j4": 65.0,
+        "j5": 5.0,
+        "j6": 0.977
+      },
+      "excursion_deg": 15.0,
+      "frames": 3,
+      "settle_s": 0.5
+    },
+    "args": {
+      "joints": [
+        "j1",
+        "j4",
+        "j5"
+      ],
+      "stand": {
+        "j4": 65.0,
+        "j5": 5.0,
+        "j3": -42.0,
+        "j2": 74.0,
+        "j1": 0.0,
+        "j6": 0.977
+      },
+      "excursion_deg": 15.0,
+      "near_mm": 200.0,
+      "far_mm": 750.0,
+      "camera": "camera",
+      "frames": 3.0,
+      "settle_s": 0.5,
+      "speed_pct": 10.0
+    },
+    "plan_digest": "e9debec54ce598c732d035b0b71626ecf7199b617e60a613bfbc5530da9ab299",
+    "skill_plan": {
+      "workcell": "piper_cell",
+      "skill_id": "calib.screws",
+      "version": "1.1.0",
+      "args": {
+        "joints": [
+          "j1",
+          "j4",
+          "j5"
+        ],
+        "stand": {
+          "j4": 65.0,
+          "j5": 5.0,
+          "j3": -42.0,
+          "j2": 74.0,
+          "j1": 0.0,
+          "j6": 0.977
+        },
+        "excursion_deg": 15.0,
+        "near_mm": 200.0,
+        "far_mm": 750.0,
+        "camera": "camera",
+        "frames": 3.0,
+        "settle_s": 0.5,
+        "speed_pct": 10.0
+      },
+      "summary": "Screw-calibrate the fixed camera without a board: swing j1, j4, j5 one at a time by 15 deg each way after moving to the stand posture (j1 0, j2 74, j3 -42, j4 65, j5 5, j6 0.977) from (204.0, -14.1, 65.2) mm, capturing 7 stills of 3 depth frame(s) each and returning between swings -- keep the arm's sweep clear and unobstructed in the camera's view",
+      "targets": [
+        {
+          "x": 200.687,
+          "y": 39.178,
+          "z": 65.21,
+          "rx": 178.068,
+          "ry": -5.031,
+          "rz": -75.804
+        },
+        {
+          "x": 193.389,
+          "y": -66.414,
+          "z": 65.21,
+          "rx": 178.068,
+          "ry": -5.031,
+          "rz": -105.804
+        },
+        {
+          "x": 143.277,
+          "y": -14.098,
+          "z": 75.381,
+          "rx": 163.009,
+          "ry": -5.067,
+          "rz": -89.472
+        },
+        {
+          "x": 265.263,
+          "y": -14.098,
+          "z": 71.1,
+          "rx": -166.883,
+          "ry": -4.651,
+          "rz": -92.082
+        },
+        {
+          "x": 204.309,
+          "y": -55.325,
+          "z": 74.345,
+          "rx": 178.217,
+          "ry": -20.021,
+          "rz": -90.308
+        },
+        {
+          "x": 204.053,
+          "y": 28.089,
+          "z": 67.051,
+          "rx": 177.787,
+          "ry": 9.958,
+          "rz": -91.346
+        },
+        {
+          "x": 203.988,
+          "y": -14.098,
+          "z": 65.21,
+          "rx": 178.068,
+          "ry": -5.031,
+          "rz": -90.804
+        }
+      ],
+      "limits": {
+        "speed_pct": 10.0,
+        "speed_pct_max": 30.0,
+        "move_timeout_s": 20.0,
+        "fk_tolerance_mm": 5.0,
+        "fk_tolerance_deg": 2.0,
+        "joint_path_step_deg": 2.0,
+        "max_duration_s": 120.0,
+        "max_steps": 16.0,
+        "max_wait_s": 10.0
+      },
+      "basis": {
+        "procedure": "handeye.eye_to_hand",
+        "camera_role": "camera",
+        "camera_device": "sensor_realsense_435if",
+        "mounting": "eye_to_hand",
+        "start": {
+          "x": 188.241,
+          "y": 2.723,
+          "z": 72.189,
+          "rx": -121.407,
+          "ry": 6.15,
+          "rz": -91.711
+        },
+        "start_joints": {
+          "joint.j1.position": -2.499,
+          "joint.j2.position": -2.334,
+          "joint.j3.position": 2.538,
+          "joint.j4.position": 36.072,
+          "joint.j5.position": -3.873,
+          "joint.j6.position": 4.844
+        },
+        "stand": {
+          "joint.j4.position": 65.0,
+          "joint.j5.position": 5.0,
+          "joint.j3.position": -42.0,
+          "joint.j2.position": 74.0,
+          "joint.j1.position": 0.0,
+          "joint.j6.position": 0.977
+        },
+        "stand_tcp": {
+          "x": 203.988,
+          "y": -14.098,
+          "z": 65.21,
+          "rx": 178.068,
+          "ry": -5.031,
+          "rz": -90.804
+        },
+        "settle_s": 0.5,
+        "near_mm": 200.0,
+        "far_mm": 750.0,
+        "frames": 3,
+        "moves": [
+          {
+            "joint": "j1",
+            "channel": "joint.j1.position",
+            "start_deg": 0.0,
+            "plus_deg": 15.0,
+            "minus_deg": -15.0,
+            "plus_tcp": {
+              "x": 200.687,
+              "y": 39.178,
+              "z": 65.21,
+              "rx": 178.068,
+              "ry": -5.031,
+              "rz": -75.804
+            },
+            "minus_tcp": {
+              "x": 193.389,
+              "y": -66.414,
+              "z": 65.21,
+              "rx": 178.068,
+              "ry": -5.031,
+              "rz": -105.804
+            }
+          },
+          {
+            "joint": "j4",
+            "channel": "joint.j4.position",
+            "start_deg": 65.0,
+            "plus_deg": 80.0,
+            "minus_deg": 50.0,
+            "plus_tcp": {
+              "x": 143.277,
+              "y": -14.098,
+              "z": 75.381,
+              "rx": 163.009,
+              "ry": -5.067,
+              "rz": -89.472
+            },
+            "minus_tcp": {
+              "x": 265.263,
+              "y": -14.098,
+              "z": 71.1,
+              "rx": -166.883,
+              "ry": -4.651,
+              "rz": -92.082
+            }
+          },
+          {
+            "joint": "j5",
+            "channel": "joint.j5.position",
+            "start_deg": 5.0,
+            "plus_deg": 20.0,
+            "minus_deg": -10.0,
+            "plus_tcp": {
+              "x": 204.309,
+              "y": -55.325,
+              "z": 74.345,
+              "rx": 178.217,
+              "ry": -20.021,
+              "rz": -90.308
+            },
+            "minus_tcp": {
+              "x": 204.053,
+              "y": 28.089,
+              "z": 67.051,
+              "rx": 177.787,
+              "ry": 9.958,
+              "rz": -91.346
+            }
+          }
+        ],
+        "min_pairs": 3,
+        "max_shift_gap_mm": 20.0,
+        "min_agreement": 0.35,
+        "max_vertical_axis_deg": 1.0,
+        "calibration": {
+          "tcp": 1792466846.5792692,
+          "workspace": 1792470598.2829092
+        }
+      },
+      "digest": "e9debec54ce598c732d035b0b71626ecf7199b617e60a613bfbc5530da9ab299",
+      "created_at": 1793007112.9363282,
+      "consent": "each_run"
+    }
+  },
+  "plan_hash": "0af9607d1ee08cdb471b7cd326ca13a9fa5e4c0bb37b8c4bdd272801d41caedf",
+  "events": [
+    {
+      "event": "connected",
+      "monotonic": 506888.696721458,
+      "node_id": "yahboom",
+      "write_mode": "permit_required",
+      "declaration_digest": "4061e3ce917749911c479896da49fc10c334042cd2751a0a9ad36fb8750852ba",
+      "execute": false
+    },
+    {
+      "event": "calibration_result",
+      "monotonic": 506888.843294375,
+      "result": {
+        "ok": true,
+        "dry_run": true,
+        "workcell": "yahboom/piper_cell",
+        "skill": "calib.screws",
+        "plan": {
+          "workcell": "piper_cell",
+          "skill_id": "calib.screws",
+          "version": "1.1.0",
+          "args": {
+            "joints": [
+              "j1",
+              "j4",
+              "j5"
+            ],
+            "stand": {
+              "j4": 65.0,
+              "j5": 5.0,
+              "j3": -42.0,
+              "j2": 74.0,
+              "j1": 0.0,
+              "j6": 0.977
+            },
+            "excursion_deg": 15.0,
+            "near_mm": 200.0,
+            "far_mm": 750.0,
+            "camera": "camera",
+            "frames": 3.0,
+            "settle_s": 0.5,
+            "speed_pct": 10.0
+          },
+          "summary": "Screw-calibrate the fixed camera without a board: swing j1, j4, j5 one at a time by 15 deg each way after moving to the stand posture (j1 0, j2 74, j3 -42, j4 65, j5 5, j6 0.977) from (204.0, -14.1, 65.2) mm, capturing 7 stills of 3 depth frame(s) each and returning between swings -- keep the arm's sweep clear and unobstructed in the camera's view",
+          "targets": [
+            {
+              "x": 200.687,
+              "y": 39.178,
+              "z": 65.21,
+              "rx": 178.068,
+              "ry": -5.031,
+              "rz": -75.804
+            },
+            {
+              "x": 193.389,
+              "y": -66.414,
+              "z": 65.21,
+              "rx": 178.068,
+              "ry": -5.031,
+              "rz": -105.804
+            },
+            {
+              "x": 143.277,
+              "y": -14.098,
+              "z": 75.381,
+              "rx": 163.009,
+              "ry": -5.067,
+              "rz": -89.472
+            },
+            {
+              "x": 265.263,
+              "y": -14.098,
+              "z": 71.1,
+              "rx": -166.883,
+              "ry": -4.651,
+              "rz": -92.082
+            },
+            {
+              "x": 204.309,
+              "y": -55.325,
+              "z": 74.345,
+              "rx": 178.217,
+              "ry": -20.021,
+              "rz": -90.308
+            },
+            {
+              "x": 204.053,
+              "y": 28.089,
+              "z": 67.051,
+              "rx": 177.787,
+              "ry": 9.958,
+              "rz": -91.346
+            },
+            {
+              "x": 203.988,
+              "y": -14.098,
+              "z": 65.21,
+              "rx": 178.068,
+              "ry": -5.031,
+              "rz": -90.804
+            }
+          ],
+          "limits": {
+            "speed_pct": 10.0,
+            "speed_pct_max": 30.0,
+            "move_timeout_s": 20.0,
+            "fk_tolerance_mm": 5.0,
+            "fk_tolerance_deg": 2.0,
+            "joint_path_step_deg": 2.0,
+            "max_duration_s": 120.0,
+            "max_steps": 16.0,
+            "max_wait_s": 10.0
+          },
+          "basis": {
+            "procedure": "handeye.eye_to_hand",
+            "camera_role": "camera",
+            "camera_device": "sensor_realsense_435if",
+            "mounting": "eye_to_hand",
+            "start": {
+              "x": 188.241,
+              "y": 2.723,
+              "z": 72.189,
+              "rx": -121.407,
+              "ry": 6.15,
+              "rz": -91.711
+            },
+            "start_joints": {
+              "joint.j1.position": -2.499,
+              "joint.j2.position": -2.334,
+              "joint.j3.position": 2.538,
+              "joint.j4.position": 36.072,
+              "joint.j5.position": -3.873,
+              "joint.j6.position": 4.844
+            },
+            "stand": {
+              "joint.j4.position": 65.0,
+              "joint.j5.position": 5.0,
+              "joint.j3.position": -42.0,
+              "joint.j2.position": 74.0,
+              "joint.j1.position": 0.0,
+              "joint.j6.position": 0.977
+            },
+            "stand_tcp": {
+              "x": 203.988,
+              "y": -14.098,
+              "z": 65.21,
+              "rx": 178.068,
+              "ry": -5.031,
+              "rz": -90.804
+            },
+            "settle_s": 0.5,
+            "near_mm": 200.0,
+            "far_mm": 750.0,
+            "frames": 3,
+            "moves": [
+              {
+                "joint": "j1",
+                "channel": "joint.j1.position",
+                "start_deg": 0.0,
+                "plus_deg": 15.0,
+                "minus_deg": -15.0,
+                "plus_tcp": {
+                  "x": 200.687,
+                  "y": 39.178,
+                  "z": 65.21,
+                  "rx": 178.068,
+                  "ry": -5.031,
+                  "rz": -75.804
+                },
+                "minus_tcp": {
+                  "x": 193.389,
+                  "y": -66.414,
+                  "z": 65.21,
+                  "rx": 178.068,
+                  "ry": -5.031,
+                  "rz": -105.804
+                }
+              },
+              {
+                "joint": "j4",
+                "channel": "joint.j4.position",
+                "start_deg": 65.0,
+                "plus_deg": 80.0,
+                "minus_deg": 50.0,
+                "plus_tcp": {
+                  "x": 143.277,
+                  "y": -14.098,
+                  "z": 75.381,
+                  "rx": 163.009,
+                  "ry": -5.067,
+                  "rz": -89.472
+                },
+                "minus_tcp": {
+                  "x": 265.263,
+                  "y": -14.098,
+                  "z": 71.1,
+                  "rx": -166.883,
+                  "ry": -4.651,
+                  "rz": -92.082
+                }
+              },
+              {
+                "joint": "j5",
+                "channel": "joint.j5.position",
+                "start_deg": 5.0,
+                "plus_deg": 20.0,
+                "minus_deg": -10.0,
+                "plus_tcp": {
+                  "x": 204.309,
+                  "y": -55.325,
+                  "z": 74.345,
+                  "rx": 178.217,
+                  "ry": -20.021,
+                  "rz": -90.308
+                },
+                "minus_tcp": {
+                  "x": 204.053,
+                  "y": 28.089,
+                  "z": 67.051,
+                  "rx": 177.787,
+                  "ry": 9.958,
+                  "rz": -91.346
+                }
+              }
+            ],
+            "min_pairs": 3,
+            "max_shift_gap_mm": 20.0,
+            "min_agreement": 0.35,
+            "max_vertical_axis_deg": 1.0,
+            "calibration": {
+              "tcp": 1792466846.5792692,
+              "workspace": 1792470598.2829092
+            }
+          },
+          "digest": "e9debec54ce598c732d035b0b71626ecf7199b617e60a613bfbc5530da9ab299",
+          "created_at": 1793007112.9363282,
+          "consent": "each_run"
+        },
+        "side_effect_state": "none",
+        "next_step": "Call hw_skill_run again without dry_run to run it (needs approval)."
+      }
+    }
+  ]
+}

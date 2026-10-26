@@ -343,6 +343,9 @@ class HardwareRegistry:
         self._transports: dict[str, HardwareTransport] = {}
         self._open_locks: dict[str, asyncio.Lock] = {}
         self._io_locks: dict[str, asyncio.Lock] = {}
+        # Named parties keeping a device open across operations (preview leases, remote
+        # LHP frame consumers). The last one leaving is what closes the transport.
+        self._holds: dict[str, set[str]] = {}
         # Links whose halt was interrupted before their state could be settled;
         # closed on the device's next open (see ``halt``).
         self._orphans: dict[str, HardwareTransport] = {}
@@ -1723,19 +1726,62 @@ class HardwareRegistry:
 
         Never raises. It is called from failure paths, where an exception would
         replace the original diagnosis with a teardown error.
+
+        Runs under the device's open lock, so a concurrent ``transport()`` waits for
+        the close to finish instead of opening a second link beside the closing one --
+        a camera answers that second open with "device busy".
         """
-        transport = self._transports.pop(device_id, None)
-        if transport is None:
+        if device_id not in self._transports:
             return
-        try:
-            await transport.close()
-        except Exception as exc:  # noqa: BLE001 - as above
-            logger.warning(
-                "Hardware transport %r close failed while dropping it: %s",
-                device_id,
-                exc,
-                exc_info=True,
-            )
+        async with self._open_locks.setdefault(device_id, asyncio.Lock()):
+            transport = self._transports.pop(device_id, None)
+            if transport is None:
+                return
+            try:
+                await transport.close()
+            except Exception as exc:  # noqa: BLE001 - as above
+                logger.warning(
+                    "Hardware transport %r close failed while dropping it: %s",
+                    device_id,
+                    exc,
+                    exc_info=True,
+                )
+
+    def hold(self, device_id: str, holder: str) -> None:
+        """Record that *holder* keeps *device_id* open beyond a single operation.
+
+        Idempotent per holder name: a preview lease or a remote frame consumer holds
+        once however many frames it reads. Holding does not open anything; the
+        transport still opens lazily on first use.
+        """
+        self._holds.setdefault(str(device_id), set()).add(str(holder))
+
+    def holders(self, device_id: str) -> tuple[str, ...]:
+        """Return the parties currently holding *device_id* open, sorted."""
+        return tuple(sorted(self._holds.get(str(device_id), ())))
+
+    async def release_hold(self, device_id: str, holder: str) -> bool:
+        """Drop *holder*'s claim; close the transport when nobody holds it any more.
+
+        Returns whether the device was released. Closing happens under ``device_io``,
+        so an in-flight capture finishes first, and the holder set is checked again
+        after the wait: someone may have started holding while this one queued.
+        Without the ledger the first party to stop watching powered the camera down
+        under everybody else still using it.
+        """
+        key = str(device_id)
+        holders = self._holds.get(key)
+        if holders is not None:
+            holders.discard(str(holder))
+            if not holders:
+                self._holds.pop(key, None)
+        if self._holds.get(key):
+            return False
+        async with self.device_io(key):
+            if self._holds.get(key):
+                return False
+            await self.drop_transport(key)
+        return True
 
     async def close_all(self) -> None:
         """Stop sampling, then close every open transport, isolating failures.
@@ -1788,6 +1834,7 @@ class HardwareRegistry:
                     "Hardware transport %r close failed: %s", device_id, exc, exc_info=True
                 )
         self._transports.clear()
+        self._holds.clear()
         for device_id in list(self._orphans):
             await self._release_orphan(device_id)
 

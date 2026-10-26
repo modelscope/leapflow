@@ -18,7 +18,7 @@ import yaml
 
 from leapflow.hardware.context import ContextSource, HardwareContext
 from leapflow.hardware.providers import ProviderError
-from leapflow.hardware.attestation import confirmed_by, read_verified
+from leapflow.hardware.attestation import read_verified, verification_stamp
 
 logger = logging.getLogger(__name__)
 
@@ -77,12 +77,16 @@ class YamlContextProvider:
         """
         if context.provenance.is_verified:
             return context
-        verifier = confirmed_by(self._verified, context.device_id, context)
+        verifier, verified_at = verification_stamp(self._verified, context.device_id, context)
         if not verifier:
             return context
         return replace(
             context,
-            provenance=replace(context.provenance, verified_by=verifier),
+            provenance=replace(
+                context.provenance,
+                verified_by=verifier,
+                verified_at=verified_at,
+            ),
         )
 
 

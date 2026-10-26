@@ -230,9 +230,13 @@ class UnixRpcServer:
                     except AttributeError:
                         pass
         response = RpcResponse.success(request.id, result)
-        await _write_json(writer, response.to_json())
-        if request.method == "daemon.shutdown" and self._on_shutdown is not None:
-            self._on_shutdown()
+        try:
+            await _write_json(writer, response.to_json())
+        finally:
+            # The services are already torn down; a caller that hung up before the
+            # reply must not leave the process listening without them.
+            if request.method == "daemon.shutdown" and self._on_shutdown is not None:
+                self._on_shutdown()
 
     async def _await_with_heartbeat(
         self,

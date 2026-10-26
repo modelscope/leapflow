@@ -1896,6 +1896,65 @@ def test_explicitly_disabled_hardware_leaves_the_classifier_untouched() -> None:
     assert isinstance(build_risk_classifier(registry), DefaultRiskClassifier)
 
 
+def test_a_confirmed_declaration_reports_when_it_was_confirmed(tmp_path) -> None:
+    """A re-attested device reports the review time, not ``0.0``.
+
+    The confirmation record and the context speak different dialects for one
+    fact -- an ISO-8601 stamp on disk, Unix seconds in provenance -- and a reader
+    that understood only numbers turned every real stamp into 0.0.  ``hw
+    describe`` then told an operator that a device re-attested minutes earlier
+    carried no timestamp, which is exactly the field that answers "have I
+    already reviewed this declaration?".
+    """
+    import yaml
+
+    from leapflow.hardware.attestation import declaration_digest, store_verification
+    from leapflow.hardware.providers.yaml_provider import YamlContextProvider
+
+    devices = tmp_path / "devices"
+    devices.mkdir()
+    (devices / "bench.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "hc_version": HC_VERSION,
+                "device_id": "bench",
+                "halt_supported": True,
+                "transport": {"kind": "mock", "config": {"values": {"level": 1.0}}},
+                "channels": [
+                    {
+                        "channel_id": "level",
+                        "direction": "readwrite",
+                        "quantity": "ratio.level",
+                        "unit": "percent",
+                        "effect": "actuate",
+                        "envelope": {"declared": True, "min_value": 0.0, "max_value": 50.0},
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    reviewed = YamlContextProvider({"devices_dir": devices}).discover()[0]
+    verified_path = tmp_path / "verified.json"
+    entry = store_verification(
+        verified_path,
+        "bench",
+        verifier="jason",
+        digest=declaration_digest(reviewed),
+    )
+
+    stamped = YamlContextProvider(
+        {"devices_dir": devices, "verified_path": str(verified_path)}
+    ).discover()[0]
+
+    assert stamped.provenance.verified_by == "jason"
+    assert stamped.provenance.verified_at > 0
+    # Reported in the same dialect the record is written in, so the operator can
+    # compare what describe prints with what verified.json stores.
+    assert stamped.provenance.to_dict()["verified_at"] == entry["verified_at"]
+
+
 @pytest.mark.asyncio
 async def test_enabled_profile_drives_the_whole_chain_from_declarations(tmp_path) -> None:
     """End to end from a declaration file to a gated physical command.

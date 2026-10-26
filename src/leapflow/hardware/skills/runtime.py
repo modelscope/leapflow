@@ -303,7 +303,7 @@ class SkillRuntime:
                 frames,
                 limits,
                 asyncio.Event(),
-                skill_id,
+                skill.spec.region,
                 writes=False,
                 recording=lambda: self._settings.episodes.enabled,
             )
@@ -388,7 +388,7 @@ class SkillRuntime:
         arguments: Mapping[str, Any],
     ) -> SkillOutcome:
         ctx = self._context(
-            spec, frames, limits, asyncio.Event(), skill.spec.skill_id, writes=False
+            spec, frames, limits, asyncio.Event(), skill.spec.region, writes=False
         )
         planned = await skill.plan(ctx, arguments)
         if isinstance(planned, SkillOutcome):
@@ -438,7 +438,7 @@ class SkillRuntime:
             frames,
             plan.limits,
             run.cancel,
-            plan.skill_id,
+            skill.spec.region,
             writes=skill.spec.is_actuating,
             tap=tap,
             recording=lambda: tap.recording,
@@ -673,7 +673,7 @@ class SkillRuntime:
         frames: FrameGraph,
         limits: Mapping[str, float],
         cancel: asyncio.Event,
-        skill_id: str,
+        region: str,
         *,
         writes: bool,
         tap: EpisodeTap = NULL_TAP,
@@ -686,7 +686,7 @@ class SkillRuntime:
             limits=limits,
             cancel=cancel,
             deadline=self._clock() + float(limits["max_duration_s"]),
-            allow_bootstrap=skill_id.startswith("calib."),
+            region=region,
             allow_writes=writes,
             clock=self._clock,
             sleep=self._sleep,
@@ -700,13 +700,13 @@ class SkillRuntime:
         frames: FrameGraph,
         limits: Mapping[str, float],
         cancel: asyncio.Event,
-        skill_id: str,
+        region: str,
         *,
         writes: bool,
         tap: EpisodeTap = NULL_TAP,
         recording: Callable[[], bool] = lambda: False,
     ) -> RunContext:
-        motion = self._motion(spec, frames, limits, cancel, skill_id, writes=writes, tap=tap)
+        motion = self._motion(spec, frames, limits, cancel, region, writes=writes, tap=tap)
         return RunContext(
             registry=self._registry,
             spec=spec,

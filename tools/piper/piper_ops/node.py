@@ -36,6 +36,36 @@ def processes(settings: Settings) -> list[int]:
     return [int(value) for value in result.stdout.split()]
 
 
+SYSTEMD_UNIT = "leap-lhp-node.service"
+"""User unit that owns the node when the board is set up for supervision.
+
+Installed from ``tools/piper/deploy/``.  While it is active *it* owns the
+process: this module must then ask the supervisor for a transition instead of
+signalling the child and spawning a rival.  The supervisor restarts a killed
+child on its own, so a self-spawned second process would race that restart and
+could leave two owners on the CAN bus and the video devices -- exactly the
+failure this module exists to prevent.
+"""
+
+
+def supervisor(settings: Settings) -> str:
+    """Return the active supervising unit name, or ``""`` when unsupervised.
+
+    A missing ``systemctl`` (containers, minimal images) means unsupervised.  A
+    failing query on a host that has it is surfaced rather than read as
+    "unsupervised": guessing wrong here is what creates the second owner.
+    """
+    try:
+        completed = subprocess.run(
+            ["systemctl", "--user", "is-active", SYSTEMD_UNIT],
+            capture_output=True, text=True, timeout=settings.request_timeout_s, check=False)
+    except FileNotFoundError:
+        return ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise Refusal("node supervisor state could not be inspected; no service action") from exc
+    return SYSTEMD_UNIT if completed.stdout.strip() == "active" else ""
+
+
 def process_start(pid: int) -> str:
     """Linux process creation identity; a PID alone is not a safe stop target."""
     try:
@@ -53,6 +83,7 @@ def preview(settings: Settings, operation: str) -> dict[str, Any]:
     return {"version": 1, "operation": operation, "settings": asdict(settings),
             "argv": argv(settings), "pids": found,
             "process_starts": {str(pid): process_start(pid) for pid in found},
+            "supervisor": supervisor(settings),
             "log": str(settings.root / "data/logs/leap-serve.log"),
             "impact": "Node restart disconnects peripherals and may halt active hardware"}
 
@@ -189,12 +220,43 @@ def execute(settings: Settings, plan: dict[str, Any], evidence: Evidence) -> dic
         return _execute_locked(settings, plan, evidence)
 
 
+def _execute_supervised(settings: Settings, operation: str, unit: str, plan: dict[str, Any],
+                        evidence: Evidence) -> dict[str, Any]:
+    """Drive the transition through the single supervisor that owns the process."""
+    found = processes(settings)
+    if operation == "start" and found:
+        if not ready(settings):
+            raise Refusal("existing node is not LHP-ready; no service action")
+        return {"ok": True, "status": "already_running", "pids": found, "supervisor": unit,
+                "lhp_ready": True}
+    action = "restart" if operation == "restart" else "start"
+    evidence.record("node_supervised_action", unit=unit, action=action)
+    completed = subprocess.run(["systemctl", "--user", action, unit], capture_output=True,
+                               text=True, timeout=settings.move_timeout_s, check=False)
+    if completed.returncode != 0:
+        raise Refusal(f"systemd could not {action} {unit}: {(completed.stderr or '').strip()[:200]}")
+    deadline = time.monotonic() + settings.move_timeout_s
+    while time.monotonic() < deadline:
+        running = processes(settings)
+        if len(running) > 1:
+            raise Refusal("multiple owners detected after supervised start; inspect immediately")
+        if running and ready(settings):
+            evidence.record("node_ready", pids=running, unit=unit)
+            return {"ok": True, "status": "running", "pids": running, "supervisor": unit,
+                    "log": plan["log"], "lhp_ready": True}
+        time.sleep(settings.poll_s)
+    raise Refusal("supervised node start could not be verified; do not blindly repeat")
+
+
 def _execute_locked(settings: Settings, plan: dict[str, Any], evidence: Evidence) -> dict[str, Any]:
     operation = plan["operation"]
     if operation not in ("start", "restart"):
         raise Refusal("only start/restart may execute a node plan")
     if digest_plan(preview(settings, operation)) != digest_plan(plan):
         raise Refusal("node process/settings changed since approval; no service action")
+    supervised = supervisor(settings)
+    if supervised:
+        return _execute_supervised(settings, operation, supervised, plan, evidence)
     environment = _environment(settings)
     found = processes(settings)
     if operation == "start" and found:

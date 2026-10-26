@@ -80,6 +80,7 @@ class LinkSpec(NamedTuple):
     can_name: str
     max_age_s: float
     max_skew_s: float
+    requalify_s: float
     warmup_timeout_s: float
     firmware_timeout_s: float
 
@@ -193,7 +194,8 @@ def link_state(robot: Any) -> dict[str, Any]:
 
 
 def energize(robot: Any, feedback: PiperFeedback, motion: PiperMotion,
-             timeout_s: float, settle_s: float = ENABLE_SETTLE_S) -> WriteOutcome:
+             timeout_s: float, settle_s: float = ENABLE_SETTLE_S,
+             requalify_s: float = 0.0) -> WriteOutcome:
     """Blocking: resume a latched stop, energize, enter CAN control, and prove it holds.
 
     ``reset()`` clears a latched stop (and drops to standby), ``enable()`` is
@@ -217,7 +219,7 @@ def energize(robot: Any, feedback: PiperFeedback, motion: PiperMotion,
     as a hold vector: while the arm is energized its frame jumps through states
     it was never in, so commanding one back would move axes nobody named.
     """
-    problem = feedback.problem()
+    problem = feedback.wait_qualified(requalify_s)
     if problem:
         return _outcome(SIDE_EFFECT_NONE, "fresh per-group CAN reception is required before "
                         f"enabling: {problem}", "piper_unqualified_feedback")

@@ -589,12 +589,23 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
         return _emit_result("verify", result, json_mode) if json_mode else 0
 
     if action == "validate":
-        contexts = registry.contexts()
+        from leapflow.hardware.context import ContextSource
+
         verified = read_verified(verified_path)
 
         results: list[dict[str, Any]] = []
-        for ctx in contexts:
+        skipped: list[dict[str, str]] = []
+        for ctx in registry.contexts():
             if device_id and ctx.device_id != device_id:
+                continue
+            if ctx.provenance.source != ContextSource.DECLARED.value:
+                # Host resources and media streams are enumerated at startup: there
+                # is no declaration for a human to review, and their digest follows
+                # the machine rather than a file.  Counting them as unverified kept
+                # this command permanently red on any host with a camera, which
+                # buried the real question -- whether an edited declaration drifted
+                # from the one an operator signed off on.
+                skipped.append({"device_id": ctx.device_id, "source": ctx.provenance.source})
                 continue
             entry = verified.get(ctx.device_id)
             status = "unverified"
@@ -619,9 +630,11 @@ async def _run_verification(action: str, args: argparse.Namespace, json_mode: bo
                 icon(f"{ctx.device_id}: {status}")
 
         all_ok = all(r["status"] == "valid" for r in results)
+        if skipped and not json_mode:
+            _info(f"skipped {len(skipped)} discovered context(s) with no declaration to review")
         return _emit_result(
             "validate",
-            {"ok": all_ok, "devices": results},
+            {"ok": all_ok, "devices": results, "skipped": skipped},
             json_mode,
         )
 

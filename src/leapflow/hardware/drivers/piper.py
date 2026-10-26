@@ -222,6 +222,7 @@ class PiperArmTransport:
             can_name=can_name,
             max_age_s=_seconds(config, "stale_after_s", 1.0, 0.01),
             max_skew_s=_seconds(config, "receive_max_skew_s", 0.15, 0.0),
+            requalify_s=_seconds(config, "receive_requalify_s", 1.0, 0.0),
             warmup_timeout_s=_seconds(config, "warmup_timeout_s", 3.0, 0.1),
             firmware_timeout_s=_seconds(config, "firmware_timeout_s", 1.0, 0.0),
         )
@@ -470,7 +471,8 @@ class PiperArmTransport:
             return _NOT_OPEN
         if flag:
             return await asyncio.to_thread(energize, robot, feedback, self._motion,
-                                           self._enable_timeout_s, self._enable_settle_s)
+                                           self._enable_timeout_s, self._enable_settle_s,
+                                           self._spec.requalify_s)
         # Torque is about to drop, so the arm may end up anywhere -- including
         # by hand. Whatever vector was held stops describing it now.
         self._motion.disown("a governed disable")
@@ -512,7 +514,7 @@ class PiperArmTransport:
         robot = self._robot
         if robot is None or not self._connected:
             return [_NOT_OPEN] * len(commands)
-        problem = self._receive_problem()
+        problem = await self._wait_receive()
         if problem:
             return [_refused(f"fresh per-group CAN reception is required before motion: {problem}",
                              "piper_unqualified_feedback")] * len(commands)
@@ -595,7 +597,7 @@ class PiperArmTransport:
         refusal = self._refusal(channel_id, value)
         if refusal is not None:
             return refusal
-        problem = self._receive_problem()
+        problem = await self._wait_receive()
         if problem:
             return _refused(f"fresh per-group CAN reception is required before gripper commands: "
                             f"{problem}", "piper_unqualified_feedback")
@@ -620,7 +622,7 @@ class PiperArmTransport:
             return _failed(SIDE_EFFECT_COMMITTED, str(exc), "piper_mode_switch_failed")
         except Exception as exc:  # noqa: BLE001 - a mode frame may have landed
             return _failed(SIDE_EFFECT_UNKNOWN, f"mode selection failed: {exc}", "piper_send_failed")
-        problem = self._receive_problem()
+        problem = await self._wait_receive()
         if problem:
             return _failed(SIDE_EFFECT_COMMITTED,
                            f"feedback lost during gripper mode selection; target not sent: {problem}",
@@ -644,6 +646,27 @@ class PiperArmTransport:
     def _receive_problem(self) -> str:
         feedback = self._feedback
         return feedback.problem() if feedback is not None else "Piper transport is not open"
+
+    async def _wait_receive(self) -> str:
+        """Establish fresh reception for a bounded time; ``""`` when the ledger coheres.
+
+        A write is gated on feedback from the very groups it is about to command,
+        and the gate used to be one sample. That sample is taken in an event loop
+        that also decodes camera captures, and a capture starves the SDK's read
+        thread long enough for one group to lag the others by half a second --
+        which is a measurement of the capture, not of the bus. Nothing has been
+        sent when this waits, so the wait costs only latency; a ledger that stays
+        incoherent for the whole budget is still refused, unchanged.
+        """
+        feedback = self._feedback
+        if feedback is None:
+            return "Piper transport is not open"
+        deadline = time.monotonic() + self._spec.requalify_s
+        while True:
+            problem = feedback.problem()
+            if not problem or time.monotonic() >= deadline:
+                return problem
+            await asyncio.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
 
     def _require_receive(self) -> None:
         problem = self._receive_problem()

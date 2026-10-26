@@ -316,8 +316,8 @@ class EpisodeRecorder:
     async def _capture(self, device_id: str, name: str, sequence: int) -> str:
         relative = self._frames_rel / name / f"{sequence:06d}.jpg"
         try:
-            source = await self._registry.transport(device_id)
             async with self._registry.device_io(device_id):
+                source = await self._registry.transport(device_id)
                 frame = await source.capture_rgbd()
             await asyncio.to_thread(
                 _write_jpeg, frame, self._root / relative, self._settings.jpeg_quality
