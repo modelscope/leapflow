@@ -163,6 +163,11 @@ class LhpNodeServer:
         self._unix_path = ""
         self._writers: set[asyncio.StreamWriter] = set()
         self._connection_states: dict[str, _ConnectionState] = {}
+        # Frame channels each connection is consuming, as (device_id, holder) pairs. The
+        # registry closes a node camera only when its last holder leaves, and a dropped
+        # connection releases everything it held -- a host that vanished cannot keep a
+        # camera on.
+        self._frame_holds: dict[str, set[tuple[str, str]]] = {}
         self._handlers: dict[str, Any] = {
             "hello": self._handle_hello,
             "list": self._handle_list,
@@ -375,6 +380,7 @@ class LhpNodeServer:
             if _accepts_keyword(transport.read_frame, "fps"):
                 frame_kwargs["fps"] = fps
             frame = await transport.read_frame(channel_id, **frame_kwargs)
+            self._hold_frame(device_id, channel_id)
         verify_reading_identity(frame, device_id, channel_id)
         data = getattr(frame, "data", None)
         if not isinstance(data, (bytes, bytearray)) or not data:
@@ -403,7 +409,12 @@ class LhpNodeServer:
         return payload
 
     async def _handle_release_frame(self, params: Mapping[str, Any]) -> dict[str, Any]:
-        """Release node-local capture when the host's last preview lease closes."""
+        """Release this connection's claim on a node-local frame channel.
+
+        The camera itself closes only when nobody else holds it: another connection's
+        preview, or a node-local consumer, must not lose its device because one host
+        closed a panel.
+        """
         device_id = require_str(params, "device_id")
         channel_id = require_str(params, "channel_id")
         _, channel = self._resolve_channel(device_id, channel_id)
@@ -412,6 +423,17 @@ class LhpNodeServer:
                 f"channel {channel_id!r} on {device_id!r} is not a frame channel",
                 code=ERR_UNKNOWN_CHANNEL,
             )
+        if callable(getattr(self._registry, "release_hold", None)):
+            holder = _frame_holder(_CONNECTION_ID.get(), channel_id)
+            self._frame_holds.get(_CONNECTION_ID.get(), set()).discard((device_id, holder))
+            closed = await self._registry.release_hold(device_id, holder)
+            return {
+                "device_id": device_id,
+                "channel_id": channel_id,
+                "released": True,
+                "device_closed": bool(closed),
+            }
+        # A registry without a holder ledger: the pre-ledger behaviour, last caller wins.
         drop_transport = getattr(self._registry, "drop_transport", None)
         if not callable(drop_transport):
             raise LhpProtocolError(
@@ -421,6 +443,40 @@ class LhpNodeServer:
         async with self._registry.device_io(device_id):
             await drop_transport(device_id)
         return {"device_id": device_id, "channel_id": channel_id, "released": True}
+
+    def _hold_frame(self, device_id: str, channel_id: str) -> None:
+        """Record that the requesting connection now consumes *channel_id*."""
+        hold = getattr(self._registry, "hold", None)
+        if not callable(hold):
+            return
+        connection_id = _CONNECTION_ID.get()
+        if connection_id and connection_id not in self._connection_states:
+            # The request outlived its connection, whose holds are already released;
+            # recording one now would keep the camera on with nobody left to drop it.
+            return
+        holder = _frame_holder(connection_id, channel_id)
+        hold(device_id, holder)
+        self._frame_holds.setdefault(connection_id, set()).add((device_id, holder))
+
+    async def _release_connection_frames(self, connection_id: str) -> None:
+        """Release every frame channel a closed connection still held. Never raises."""
+        for device_id, holder in sorted(self._frame_holds.pop(connection_id, set())):
+            try:
+                closed = await self._registry.release_hold(device_id, holder)
+            except Exception as exc:  # noqa: BLE001 - one device must not strand the rest
+                logger.error(
+                    "LHP frame release for %r after disconnect failed: %s",
+                    device_id,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            logger.info(
+                "LHP connection closed; released %s on %s (device closed: %s)",
+                holder,
+                device_id,
+                closed,
+            )
 
     async def _handle_write(self, params: Mapping[str, Any]) -> dict[str, Any]:
         device_id = require_str(params, "device_id")
@@ -635,6 +691,7 @@ class LhpNodeServer:
         state = _ConnectionState()
         connection_id = str(uuid.uuid4())
         state.connection_id = connection_id
+        self._connection_states[connection_id] = state
         semaphore = asyncio.Semaphore(self._max_concurrent_requests)
         write_lock = asyncio.Lock()
         handlers: set[asyncio.Task[None]] = set()
@@ -697,6 +754,8 @@ class LhpNodeServer:
                 await self._sessions.on_disconnect(state.connection_id)
             except Exception as exc:  # noqa: BLE001 - a fail-safe fault must not leak the writer
                 logger.error("LHP disconnect fail-safe failed: %s", exc, exc_info=True)
+            self._connection_states.pop(connection_id, None)
+            await self._release_connection_frames(state.connection_id)
             self._writers.discard(writer)
             with suppress(Exception):
                 writer.close()
@@ -714,6 +773,11 @@ class LhpNodeServer:
             _CONNECTION_ID.set(connection_id)  # task-local: concurrent requests cannot mix
             response = await self.handle_request(request, via="socket")
             await _send_frame(writer, write_lock, response)
+
+
+def _frame_holder(connection_id: str, channel_id: str) -> str:
+    """Name one connection's claim on one frame channel in the registry's holder ledger."""
+    return f"lhp:{connection_id or 'direct'}:{channel_id}"
 
 
 def _declarations_digest(contexts: Sequence[HardwareContext]) -> str:

@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import importlib
 import threading
+import time
 from array import array
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Iterator
 
 import pytest
 import yaml
@@ -26,6 +28,17 @@ _EXAMPLE = (
     / "examples"
     / "realsense_435if.yaml"
 )
+_FRAME_INTERVAL_S = 0.005
+"""Fake SDKs block like a camera does; an instant one would spin the frame pump."""
+_OPENED: list[RealSenseTransport] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_opened_transports() -> Iterator[None]:
+    """Every opened transport runs a frame pump thread; stop it after each test."""
+    yield
+    while _OPENED:
+        asyncio.run(_OPENED.pop().close())
 
 
 def _context(example: str = "realsense_435if.yaml") -> HardwareContext:
@@ -102,11 +115,13 @@ class _Frames:
 
 class _Pipeline:
     def wait_for_frames(self, timeout_ms: int = 5000) -> _Frames:
+        time.sleep(_FRAME_INTERVAL_S)
         return _Frames()
 
 
 def test_realsense_encodes_bgr_sdk_data_as_a_bounded_jpeg_preview() -> None:
     transport = RealSenseTransport({"serial_number": "123456789"})
+    _OPENED.append(transport)
     transport._context = _context()
     transport._pipeline = _Pipeline()
     transport._connected = True
@@ -241,6 +256,9 @@ class _FakeSdk:
         )
         self.sensor = _ColorSensor()
         self.stopped = False
+        self.framesets = 0
+        self.aligned = 0
+        self.frame_interval_s = _FRAME_INTERVAL_S
         self._depth_width = depth_width
         info = {
             "name": "Intel RealSense D435IF",
@@ -266,14 +284,19 @@ class _FakeSdk:
         def stop() -> None:
             self.stopped = True
 
-        return SimpleNamespace(
-            start=lambda config: profile,
-            stop=stop,
-            wait_for_frames=lambda timeout_ms=5000: _RgbdFrames(self._depth_width),
-        )
+        def wait_for_frames(timeout_ms: int = 5000) -> _RgbdFrames:
+            time.sleep(self.frame_interval_s)
+            self.framesets += 1
+            return _RgbdFrames(self._depth_width)
+
+        return SimpleNamespace(start=lambda config: profile, stop=stop, wait_for_frames=wait_for_frames)
 
     def align(self, stream: str) -> SimpleNamespace:
-        return SimpleNamespace(process=lambda frames: frames)
+        def process(frames: object) -> object:
+            self.aligned += 1
+            return frames
+
+        return SimpleNamespace(process=process)
 
     def colorizer(self) -> object:
         return object()
@@ -284,6 +307,7 @@ def _open_with(
 ) -> RealSenseTransport:
     monkeypatch.setattr(realsense_module, "_load_sdk", lambda: sdk)
     transport = RealSenseTransport({"serial_number": "123456789", **config})
+    _OPENED.append(transport)
     asyncio.run(transport.open(_context()))
     return transport
 
@@ -302,7 +326,7 @@ def test_capture_rgbd_returns_aligned_raw_frame_with_factory_intrinsics(
     assert frame.depth_mm(0, 0) == pytest.approx(500.0)
     assert frame.intrinsics.model == "inverse_brown_conrady"
     assert frame.intrinsics.fx == 600.0
-    assert frame.sequence == 1
+    assert frame.sequence >= 1
     metadata = asyncio.run(transport.read("camera.metadata")).value
     assert metadata["color_intrinsics"]["ppx"] == 1.0
     assert metadata["depth_to_color_extrinsics"]["translation_m"] == [0.015, 0.0, 0.0]
@@ -463,10 +487,10 @@ def test_cancelled_capture_keeps_close_waiting_until_worker_finishes(monkeypatch
     started, release = threading.Event(), threading.Event()
     original = transport._capture_rgbd
 
-    def slow_capture() -> RgbdFrame:
+    def slow_capture(*args: object) -> RgbdFrame:
         started.set()
         assert release.wait(2.0)
-        return original()
+        return original(*args)
 
     monkeypatch.setattr(transport, "_capture_rgbd", slow_capture)
 
@@ -475,8 +499,10 @@ def test_cancelled_capture_keeps_close_waiting_until_worker_finishes(monkeypatch
         await _wait_started(started)
         capture.cancel()
         close = asyncio.create_task(transport.close())
-        await asyncio.sleep(0)
-        assert not capture.done() and not close.done()
+        await asyncio.sleep(0.05)
+        # The cancelled caller may return at once; the device may not be released
+        # until the work it started on the pipeline has finished.
+        assert not close.done()
         assert transport._pipeline is not None
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -543,3 +569,114 @@ def test_depth_measurement_read_without_arm_transport(monkeypatch) -> None:
     assert isinstance(evidence, dict)
     assert "qualified" in evidence and "distinct_frames" in evidence
     asyncio.run(transport.close())
+
+
+# ── Shared framesets (FrameHub) ──────────────────────────────────────────────
+
+
+class _Colorized(_RawFrame):
+    """What the SDK colouriser returns: an RGB8 frame that says so in its profile."""
+
+    def get_profile(self) -> SimpleNamespace:
+        return SimpleNamespace(format=lambda: "format.rgb8")
+
+
+class _Colorizer:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def colorize(self, depth: object) -> _Colorized:
+        self.calls += 1
+        return _Colorized(2, 1, bytes((255, 0, 0, 255, 0, 0)))  # pure red in RGB order
+
+
+def _hub_sdk() -> _FakeSdk:
+    sdk = _FakeSdk()
+    colorizer = _Colorizer()
+    sdk.colorizer = lambda: colorizer  # type: ignore[method-assign]
+    sdk.colorizer_instance = colorizer  # type: ignore[attr-defined]
+    return sdk
+
+
+def test_concurrent_previews_share_one_frameset_and_one_alignment(monkeypatch) -> None:
+    sdk = _hub_sdk()
+    sdk.frame_interval_s = 0.1  # all six readers must wake before the next frameset
+    transport = _open_with(monkeypatch, sdk)
+
+    async def scenario() -> list[object]:
+        first = await transport.read_frame("camera.color.preview")
+        target = first.sequence + 1
+        reads = [
+            transport.read_frame(channel, min_sequence=target)
+            for channel in ("camera.color.preview", "camera.depth.preview") * 3
+        ]
+        return list(await asyncio.gather(*reads))
+
+    readings = asyncio.run(scenario())
+
+    assert len({reading.sequence for reading in readings}) == 1
+    # Six readers of one frameset: alignment and colourising ran once, not per reader.
+    assert sdk.aligned == 1
+    assert sdk.colorizer_instance.calls == 1
+    assert {r.metadata["aligned_to_color"] for r in readings if "depth" in r.channel_id} == {True}
+
+
+def test_colour_and_infrared_previews_never_align(monkeypatch) -> None:
+    sdk = _hub_sdk()
+    transport = _open_with(monkeypatch, sdk)
+
+    for _ in range(3):
+        asyncio.run(transport.read_frame("camera.color.preview"))
+
+    assert sdk.aligned == 0
+
+
+def test_colourised_depth_is_decoded_in_the_format_the_sdk_reports(monkeypatch) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    transport = _open_with(monkeypatch, _hub_sdk())
+
+    frame = asyncio.run(transport.read_frame("camera.depth.preview", quality=100))
+
+    red, green, blue = Image.open(BytesIO(frame.data)).convert("RGB").getpixel((0, 0))
+    assert red > 200 and blue < 60, "RGB8 colourised depth must not be read as BGR"
+
+
+def test_rgbd_capture_waits_for_a_frameset_that_arrived_after_the_call(monkeypatch) -> None:
+    transport = _open_with(monkeypatch, _FakeSdk())
+    preview = asyncio.run(transport.read_frame("camera.color.preview"))
+    called_at = time.monotonic()
+
+    frame = asyncio.run(transport.capture_rgbd())
+
+    assert frame.monotonic_at > called_at
+    assert frame.sequence > preview.sequence
+
+
+def test_sequence_keeps_increasing_across_a_reopen(monkeypatch) -> None:
+    transport = _open_with(monkeypatch, _FakeSdk())
+    before = asyncio.run(transport.read_frame("camera.color.preview")).sequence
+    asyncio.run(transport.close())
+    asyncio.run(transport.open(_context()))
+
+    after = asyncio.run(transport.read_frame("camera.color.preview")).sequence
+
+    assert after > before
+
+
+def test_close_stops_the_frame_pump_and_reports_its_health(monkeypatch) -> None:
+    sdk = _FakeSdk()
+    transport = _open_with(monkeypatch, sdk)
+    asyncio.run(transport.read_frame("camera.color.preview"))
+    health = asyncio.run(transport.read("camera.metadata")).value
+    assert health["frame_hub"]["running"] is True
+    assert health["frame_capabilities"]["alignment"] == "software"
+
+    asyncio.run(transport.close())
+    pulled = sdk.framesets
+    time.sleep(0.05)
+
+    assert sdk.framesets == pulled, "no frameset may be pulled after close"
+    assert sdk.stopped

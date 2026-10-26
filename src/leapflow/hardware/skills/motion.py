@@ -7,11 +7,11 @@ width); this module owns *how*, in one place:
 
 - **Frames.** A TCP target becomes a flange target through the calibrated
   ``T_flange_tcp``: ``T_base_flange = T_base_tcp · inv(T_flange_tcp)``.
-- **Region.** Every TCP target must lie inside the calibrated workspace box --
-  or, for ``calib.*`` runs, inside the human-declared bootstrap box when there
-  is one (calibration never trusts the geometry it is about to re-measure) --
-  with the tool inside the declared cone around straight down, and the flange
-  target inside the arm's own declared envelopes.
+- **Region.** Every TCP target must lie inside the box the skill declares it
+  plans in: the calibrated workspace, or -- for the skills that have to move
+  before that box exists -- the human-declared bootstrap box standing in for it.
+  The tool also has to stay inside the declared cone around straight down, and
+  the flange target inside the arm's own declared envelopes.
 - **Speed.** The commanded speed rides in the same batch as the target when the
   arm declares ``arm.speed_pct``, capped by the run's effective limit and
   quantized *down* to the channel's declared step, so it never exceeds the cap.
@@ -73,6 +73,9 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_TIMEOUT,
     FAILURE_UNREACHABLE,
     FAILURE_WRITE_REFUSED,
+    REGION_BOOTSTRAP,
+    REGION_BOOTSTRAP_UNTIL_MEASURED,
+    REGION_WORKSPACE,
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_PARTIAL,
     SIDE_EFFECT_UNKNOWN,
@@ -151,7 +154,7 @@ class GovernedMotion:
         limits: Mapping[str, float],
         cancel: asyncio.Event,
         deadline: float,
-        allow_bootstrap: bool = False,
+        region: str = REGION_WORKSPACE,
         allow_writes: bool = True,
         clock: Callable[[], float] = time.monotonic,
         sleep: Sleep = asyncio.sleep,
@@ -165,7 +168,7 @@ class GovernedMotion:
         self._limits = dict(limits)
         self._cancel = cancel
         self._deadline = float(deadline)
-        self._allow_bootstrap = allow_bootstrap
+        self._region_mode = region
         self._allow_writes = allow_writes
         self._clock = clock
         self._sleep = sleep
@@ -352,14 +355,31 @@ class GovernedMotion:
             )
 
     def _region(self) -> WorkspaceBox:
-        box = self._frames.workspace
-        if self._allow_bootstrap and self._spec.bootstrap_box is not None:
-            box = self._spec.bootstrap_box
+        """The box this skill's tool positions must stay inside.
+
+        The measured workspace is the geometry the cell is run in, so it is what
+        a skill plans against whenever it exists. Calibration is the exception it
+        has to be: a skill that has to move before that box is known plans in the
+        cell's conservative bootstrap box instead (``bootstrap_until_measured``),
+        and the skill that measures the workspace plans in it always, because the
+        box it is about to write is not evidence it may move inside yet.
+        """
+        measured = self._frames.workspace
+        bootstrap = self._spec.bootstrap_box
+        box = measured
+        if self._region_mode == REGION_BOOTSTRAP or (
+            self._region_mode == REGION_BOOTSTRAP_UNTIL_MEASURED and measured is None
+        ):
+            box = bootstrap
         if box is None:
-            raise SkillError(
-                FAILURE_CALIBRATION_MISSING,
-                "the workspace is not calibrated (run calib.workspace)",
-            )
+            if self._region_mode == REGION_BOOTSTRAP:
+                detail = (
+                    f"workcell {self._spec.workcell_id!r} declares no bootstrap_box, so this "
+                    "skill has no region to plan in before the workspace is measured"
+                )
+            else:
+                detail = "the workspace is not calibrated (run calib.workspace)"
+            raise SkillError(FAILURE_CALIBRATION_MISSING, detail)
         return box
 
     def _chain(self) -> DhChain:

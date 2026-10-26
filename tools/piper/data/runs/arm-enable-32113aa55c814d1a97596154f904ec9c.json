@@ -1,0 +1,37 @@
+{
+  "ok": false,
+  "failure": {
+    "envelope_id": "72626d585079417cbea201061ff7fd7a",
+    "source": "tool",
+    "category": "hardware",
+    "failure_class": "Refusal",
+    "failure_code": "piper_operations_refused",
+    "message": "starting state drifted since preview; obtain a new preview and approval",
+    "recoverability": "user_fixable",
+    "side_effect_state": "none",
+    "context": {
+      "tool_name": "",
+      "arguments": [],
+      "execution_id": "",
+      "trace_id": "",
+      "turn_id": 0,
+      "session_id": "",
+      "provider": "",
+      "model": "",
+      "attempt_number": 0,
+      "elapsed_ms": 0.0
+    },
+    "timestamp": 1793007068.742838,
+    "provider_hint": null
+  },
+  "events": [
+    {
+      "event": "connected",
+      "monotonic": 506844.839723416,
+      "node_id": "yahboom",
+      "write_mode": "permit_required",
+      "declaration_digest": "4061e3ce917749911c479896da49fc10c334042cd2751a0a9ad36fb8750852ba",
+      "execute": true
+    }
+  ]
+}

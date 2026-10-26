@@ -45,6 +45,7 @@ from leapflow.hardware.skills.protocol import (
     FAILURE_INVALID_ARGS,
     FAILURE_PLAN_STALE,
     FAILURE_SKILL_UNAVAILABLE,
+    REGION_BOOTSTRAP,
     REQUIRE_CALIBRATION,
     REQUIRE_ROLE,
     SIDE_EFFECT_COMMITTED,
@@ -406,6 +407,7 @@ class Workspace:
         effect=EFFECT_ACTUATE,
         requires=(f"{REQUIRE_ROLE}arm", f"{REQUIRE_CALIBRATION}tcp"),
         consent=CONSENT_EACH_RUN,
+        region=REGION_BOOTSTRAP,
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:

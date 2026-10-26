@@ -54,6 +54,9 @@ _ALLOWED = {
     "leapflow.hardware.skills.protocol",
     "leapflow.hardware.skills.ports",
     "leapflow.hardware.skills.geometry",
+    # Measurement maths only -- clouds and screws in, a camera mount out -- and the
+    # same rule as geometry: no transport, no device, no registry.
+    "leapflow.hardware.skills.screw",
 }
 # The adapter is pure embodiment math: declarations in, vectors out. It knows no
 # workcell, transport, or binding, so training-side converters can import it alone.

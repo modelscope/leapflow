@@ -11,7 +11,10 @@ frame, so a camera is usable only once that frame is measured:
    lying still in the cell. The record carries the live intrinsics (perception
    refuses a stream that no longer matches them) and the board's mount, which
    ``calib.verify`` uses as ground truth.
-2. ``calib.verify`` -- the arm moves over a small grid; at every stop the arm
+2. ``calib.screws`` -- the same mount with no board at all: the arm moves one
+   joint at a time, and the surfaces that joint carries must land where the
+   firmware's own rotation says they went. See ``screw`` for why that is enough.
+3. ``calib.verify`` -- the arm moves over a small grid; at every stop the arm
    predicts where the board centre is, and the camera measures it through the
    depth image and the hand-eye mount -- the same chain ``perceive.locate``
    uses. The 95th-percentile disagreement is the accuracy perception has.
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from leapflow.hardware.skills.geometry import (
@@ -49,11 +53,14 @@ from leapflow.hardware.skills.protocol import (
     EFFECT_ACTUATE,
     FAILURE_ARM_NOT_READY,
     FAILURE_CHECK_FAILED,
+    FAILURE_INVALID_ARGS,
     FAILURE_OUT_OF_WORKSPACE,
     FAILURE_PLAN_STALE,
     FAILURE_SKILL_UNAVAILABLE,
     FAILURE_TARGET_NOT_FOUND,
     FAILURE_UNREACHABLE,
+    METHOD_MARKERLESS_SCREW,
+    REGION_BOOTSTRAP_UNTIL_MEASURED,
     REQUIRE_ROLE,
     SIDE_EFFECT_COMMITTED,
     ArmState,
@@ -63,11 +70,26 @@ from leapflow.hardware.skills.protocol import (
     SkillSpec,
     TargetObservation,
 )
+from leapflow.hardware.skills.screw import (
+    JointEvidence,
+    ScrewConfig,
+    screw_from_poses,
+    solve_mount,
+    solve_vertical,
+)
 
 CAMERA_FRAME = "camera"
 VERIFY_PROCEDURE = "camera.verify"
 EYE_TO_HAND = "eye_to_hand"
 EYE_IN_HAND = "eye_in_hand"
+METHOD_SCREW = METHOD_MARKERLESS_SCREW
+
+# A capture whose flange drifted more than this between the two reads inside it
+# is not a still image of the arm.
+CAPTURE_DRIFT_MM = 2.0
+CAPTURE_DRIFT_DEG = 1.0
+# Joints the arm was not told to move, and did not move, differ by less than this.
+JOINT_MATCH_DEG = 0.5
 
 Sample = tuple[Pose, TargetObservation]
 
@@ -230,6 +252,7 @@ class HandEye:
         effect=EFFECT_ACTUATE,
         requires=(f"{REQUIRE_ROLE}arm",),
         consent=CONSENT_EACH_RUN,
+        region=REGION_BOOTSTRAP_UNTIL_MEASURED,
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
@@ -406,6 +429,454 @@ def _solve(mounting: str, seen: Sequence[Sample]) -> tuple[Transform, Transform,
     return fit.x, fit.z, fit  # T_flange_camera, T_base_board
 
 
+# ── calib.screws ─────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _Still:
+    """One still: where the arm was, and the surface the camera measured."""
+
+    flange: Pose
+    joints: Mapping[str, float]
+    cloud: Any
+    intrinsics: Mapping[str, Any]
+
+
+async def _still(
+    ctx: SkillContext,
+    vision: Any,
+    purpose: str,
+    *,
+    near_mm: float,
+    far_mm: float,
+    frames: int,
+) -> _Still:
+    """Capture one still -- *frames* clouds -- and refuse a frame the arm moved in.
+
+    One frame carries a millimetre of depth noise, and the mount's weak direction
+    is the camera's height, which only one joint constrains; stacking the frames
+    of a still the arm is holding costs a few milliseconds and averages that
+    noise out before any grid sees it. The depth window goes to the camera so the
+    stride spends its budget on the arm rather than on the room behind it.
+    """
+    accept = ctx.workcell.calibration
+    before = await ctx.motion.state()
+    points: list[Any] = []
+    intrinsics: Mapping[str, Any] = {}
+    for _ in range(max(1, int(frames))):
+        observation = await vision.observe_cloud(near_mm=near_mm, far_mm=far_mm)
+        intrinsics = observation.intrinsics
+        points.extend(observation.points)
+    after = await ctx.motion.state()
+    if (before.flange.distance_mm(after.flange) > accept["start_drift_mm"]
+            or before.flange.rotation_to_deg(after.flange) > accept["start_drift_deg"]):
+        raise _check_failed(f"the flange moved during the {purpose} capture", problems=["capture drift"])
+    return _Still(
+        flange=after.flange,
+        joints=after.joints,
+        cloud=tuple(points),
+        intrinsics=intrinsics,
+    )
+
+
+def _other_joints_moved(
+    first: Mapping[str, float], second: Mapping[str, float], channel: str
+) -> list[str]:
+    """Joints that differ between two stills other than the one being swung.
+
+    A screw fit assumes the pair differs in exactly one joint. Anything else that
+    moved -- a halt that let a joint sag, a hand on the arm -- would be folded
+    into that joint's axis and would land in the mount as a plausible error.
+    """
+    return [
+        name
+        for name, value in first.items()
+        if name != channel and abs(float(second.get(name, value)) - float(value)) > JOINT_MATCH_DEG
+    ]
+
+
+def _joint_channels(joints: Mapping[str, float]) -> dict[str, str]:
+    """Label (``j1``) to the channel id this arm reports that joint under."""
+    return {channel.split(".")[-2]: channel for channel in joints}
+
+
+def _named_joint(joints: Mapping[str, float], label: str) -> str:
+    """The channel id *label* names (label or id), or a refusal listing the arm's joints."""
+    if label in joints:
+        return label
+    available = _joint_channels(joints)
+    if label not in available:
+        raise SkillError(
+            FAILURE_INVALID_ARGS,
+            f"{label!r} is not a joint of this arm; it reports {', '.join(sorted(available))}",
+        )
+    return available[label]
+
+
+def _stand(
+    ctx: SkillContext, state: ArmState, requested: Mapping[str, Any]
+) -> tuple[dict[str, float], Pose, dict[str, float]]:
+    """The joints the swings start from, the tool pose once there, and the transit.
+
+    A measurement posture is part of the measurement. The arm may be resting
+    wherever the previous job, a halt, or a hand left it, and a swing from there
+    can leave the cell or add tilt the cone forbids -- which leaves the mount
+    unmeasurable through no fault of the camera. Naming a stand posture moves
+    that decision into the plan a human approves, and the transit is checked by
+    the very joint-move policy that will execute it.
+    """
+    targets: dict[str, float] = {}
+    for label, value in requested.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise SkillError(
+                FAILURE_INVALID_ARGS,
+                f"stand joint {label!r} must be a number of degrees",
+            )
+        targets[_named_joint(state.joints, str(label))] = float(value)
+    if not targets:
+        return dict(state.joints), state.tcp, {}
+    try:
+        tcp = ctx.motion.check_joints(targets, state.joints)
+    except SkillError as error:
+        raise SkillError(
+            error.failure_code, f"the arm cannot stand where the plan asks: {error.message}"
+        ) from error
+    return {**state.joints, **targets}, tcp, {
+        channel: round(value, 3) for channel, value in targets.items()
+    }
+
+
+def _excursions(
+    ctx: SkillContext, joints: Mapping[str, float], names: Sequence[str], excursion_deg: float
+) -> tuple[list[dict[str, Any]], str]:
+    """One +-excursion pair per named joint that the workspace check allows from *joints*."""
+    moves: list[dict[str, Any]] = []
+    reason = ""
+    for label in names:
+        channel = _named_joint(joints, label)
+        start = float(joints[channel])
+        try:
+            plus = ctx.motion.check_joints({channel: start + excursion_deg}, joints)
+            minus = ctx.motion.check_joints({channel: start - excursion_deg}, joints)
+        except SkillError as error:
+            reason = reason or error.message
+            continue
+        moves.append(
+            {
+                "joint": channel.split(".")[-2],
+                "channel": channel,
+                "start_deg": round(start, 3),
+                "plus_deg": round(start + excursion_deg, 3),
+                "minus_deg": round(start - excursion_deg, 3),
+                "plus_tcp": plus.to_dict(),
+                "minus_tcp": minus.to_dict(),
+            }
+        )
+    return moves, reason
+
+
+class Screws:
+    """Measure a fixed camera's mount from single-joint motions, with no board."""
+
+    spec = SkillSpec(
+        skill_id="calib.screws",
+        version="1.1.0",
+        card=(
+            "Calibrate where a fixed camera sits without a calibration board. The arm "
+            "swings `joints` one at a time, `excursion_deg` each way from `stand` -- a "
+            "joint posture it transits to first when one is given, checked like any "
+            "joint move -- or from where it is now. The camera watches the surfaces "
+            "that joint carries: at the right mount the firmware's own rotation lands "
+            "them on the surface it saw, and the residual is reported per joint in "
+            "millimetres. The base joint's swing is what measures the vertical, so "
+            "neither a table nor a board has to be in view; the arm does have to be "
+            "unobstructed. Needs at least three joints with different axes: the base "
+            "joint, plus one horizontal."
+        ),
+        args_schema={
+            "type": "object",
+            "properties": {
+                "joints": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 3,
+                    "maxItems": 4,
+                    "default": ["j1", "j4", "j5"],
+                },
+                "stand": {
+                    "type": "object",
+                    "additionalProperties": {"type": "number"},
+                    "description": (
+                        "Joint posture to swing from, as {j1: deg, ...} (labels or channel "
+                        "ids); the arm transits there before the first still and stays "
+                        "there between swings"
+                    ),
+                },
+                "excursion_deg": _number(5, 30, 15.0),
+                "near_mm": _number(100, 600, 200.0),
+                "far_mm": _number(300, 2000, 750.0),
+                "camera": {"type": "string", "pattern": "^camera(\\.[a-z0-9_]+)*$", "default": CAMERA_FRAME},
+                "frames": _number(1, 6, 3),
+                "settle_s": _number(0, 5, 0.5),
+                "speed_pct": _number(1, 100, 10.0),
+            },
+        },
+        effect=EFFECT_ACTUATE,
+        requires=(f"{REQUIRE_ROLE}arm",),
+        consent=CONSENT_EACH_RUN,
+        region=REGION_BOOTSTRAP_UNTIL_MEASURED,
+    )
+
+    async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
+        role = _camera(ctx, args)
+        if _mounting(ctx, role) != EYE_TO_HAND:
+            raise SkillError(
+                FAILURE_SKILL_UNAVAILABLE,
+                "calib.screws measures a camera fixed to the cell; a wrist camera moves "
+                "with the arm it would be watching",
+            )
+        procedure = _procedure(ctx, role)
+        state = await _ready_state(ctx)
+        posture, stand_tcp, transit = _stand(ctx, state, args.get("stand") or {})
+        excursion = float(args["excursion_deg"])
+        names = [str(name) for name in args["joints"]]
+        moves, reason = _excursions(ctx, posture, names, excursion)
+        needed = int(ctx.workcell.calibration["min_screw_pairs"])
+        if len(moves) < needed:
+            where = "the stand posture" if transit else "where the arm is now"
+            raise SkillError(
+                FAILURE_OUT_OF_WORKSPACE,
+                f"only {len(moves)} of {len(names)} joints can swing {excursion:.0f} deg from "
+                f"{where} (need {needed}): {reason}. Name a stand posture to measure from "
+                "(stand: {j2: 74, j3: -42, ...}), move nearer the middle of the workspace, "
+                "or lower excursion_deg",
+            )
+        start = state.tcp
+        targets = [
+            Pose.from_mapping(move[key])
+            for move in moves
+            for key in ("plus_tcp", "minus_tcp")
+        ]
+        calibration = ctx.workcell.calibration
+        frames = int(args["frames"])
+        stills = 2 * len(moves) + 1
+        moving_to = (
+            " after moving to the stand posture ("
+            + ", ".join(
+                f"{label} {float(value):g}" for label, value in sorted(args["stand"].items())
+            )
+            + ")"
+            if transit
+            else ""
+        )
+        return SkillPlan(
+            skill_id=self.spec.skill_id,
+            args=args,
+            summary=(
+                f"Screw-calibrate the fixed camera without a board: swing "
+                f"{', '.join(move['joint'] for move in moves)} one at a time by "
+                f"{excursion:.0f} deg each way{moving_to} from {_fmt(stand_tcp.position)} mm, "
+                f"capturing {stills} stills of {frames} depth frame(s) each and returning "
+                f"between swings -- keep the arm's sweep clear and unobstructed in the "
+                f"camera's view"
+            ),
+            targets=_with_return(ctx, targets, stand_tcp),
+            limits={"speed_pct": float(args["speed_pct"])},
+            basis={
+                "procedure": procedure,
+                "camera_role": role,
+                "camera_device": ctx.workcell.role(role),
+                "mounting": EYE_TO_HAND,
+                "start": start.to_dict(),
+                "start_joints": {name: round(float(v), 3) for name, v in state.joints.items()},
+                "stand": transit,
+                "stand_tcp": stand_tcp.to_dict(),
+                "settle_s": float(args["settle_s"]),
+                "near_mm": float(args["near_mm"]),
+                "far_mm": float(args["far_mm"]),
+                "frames": int(args["frames"]),
+                "moves": moves,
+                "min_pairs": needed,
+                "max_shift_gap_mm": calibration["max_screw_shift_gap_mm"],
+                "min_agreement": calibration["min_screw_agreement"],
+                "max_vertical_axis_deg": calibration["max_vertical_axis_deg"],
+            },
+        )
+
+    async def execute(self, ctx: SkillContext, plan: SkillPlan) -> SkillOutcome:
+        await _check_start(ctx, Pose.from_mapping(plan.basis["start"]))
+        role = str(plan.basis.get("camera_role", CAMERA_FRAME))
+        vision = _vision(ctx, role)
+        settle = float(plan.basis["settle_s"])
+        speed = plan.limits.get("speed_pct")
+        near, far = float(plan.basis["near_mm"]), float(plan.basis["far_mm"])
+        frames = int(plan.basis["frames"])
+        moves = list(plan.basis["moves"])
+        await self._transit(ctx, plan, settle=settle, speed=speed)
+        shots: dict[Any, _Still] = {
+            "reference": await _still(
+                ctx, vision, "reference", near_mm=near, far_mm=far, frames=frames
+            )
+        }
+        for move in moves:
+            for key in ("plus", "minus"):
+                await ctx.motion.move_joints(
+                    {move["channel"]: float(move[f"{key}_deg"])}, speed_pct=speed
+                )
+                if settle > 0:
+                    await asyncio.sleep(settle)
+                shots[(move["joint"], key)] = await _still(
+                    ctx, vision, f"{move['joint']} {key}",
+                    near_mm=near, far_mm=far, frames=frames,
+                )
+                await ctx.motion.move_joints(
+                    {move["channel"]: float(move["start_deg"])}, speed_pct=speed
+                )
+        fit, evidence = self._measure(plan, shots, moves)
+        return self._record(ctx, plan, role, fit, evidence)
+
+    async def _transit(
+        self, ctx: SkillContext, plan: SkillPlan, *, settle: float, speed: float | None
+    ) -> None:
+        """Move to the planned stand posture, or refuse to measure from the wrong one.
+
+        The swings are absolute joint targets computed from the stand posture, so
+        an arm that stopped short of it would be swung from a place the plan never
+        checked. The comparison uses the workcell's own drift tolerances -- the same
+        ones every start check in this file uses.
+        """
+        transit = dict(plan.basis.get("stand") or {})
+        if not transit:
+            return
+        await ctx.motion.move_joints(transit, speed_pct=speed)
+        expected = Pose.from_mapping(plan.basis["stand_tcp"])
+        here = (await ctx.motion.state()).tcp
+        moved_mm, moved_deg = here.distance_mm(expected), here.rotation_to_deg(expected)
+        accept = ctx.workcell.calibration
+        if moved_mm > accept["start_drift_mm"] or moved_deg > accept["start_drift_deg"]:
+            raise _check_failed(
+                f"the arm stopped {moved_mm:.1f} mm / {moved_deg:.1f} deg from the stand "
+                "posture the plan measured from; clear the way and plan again",
+                problems=["stand posture not reached"],
+            )
+        if settle > 0:
+            await asyncio.sleep(settle)
+
+    def _measure(
+        self,
+        plan: SkillPlan,
+        shots: Mapping[Any, _Still],
+        moves: Sequence[Mapping[str, Any]],
+    ) -> tuple[Any, dict[str, Any]]:
+        """Solve the mount from the stills, or explain why they cannot determine it."""
+        intrinsics = shots["reference"].intrinsics
+        if any(still.intrinsics != intrinsics for still in shots.values()):
+            raise _check_failed(
+                "the camera stream changed during calibration; run it again",
+                problems=["intrinsics changed"],
+            )
+        evidence: list[JointEvidence] = []
+        for move in moves:
+            first = shots[(move["joint"], "plus")]
+            second = shots[(move["joint"], "minus")]
+            stray = _other_joints_moved(first.joints, second.joints, move["channel"])
+            if stray:
+                raise _check_failed(
+                    f"{move['joint']} was the joint being swung, but "
+                    f"{', '.join(name.split('.')[-2] for name in stray)} moved too; "
+                    "hold the arm clear and run it again",
+                    problems=["more than one joint moved between a pair"],
+                )
+            try:
+                screw = screw_from_poses(first.flange, second.flange)
+                evidence.append(
+                    JointEvidence(move["joint"], screw, first.cloud, second.cloud, ScrewConfig())
+                )
+            except ValueError as exc:
+                raise _check_failed(
+                    f"{move['joint']}: {exc}",
+                    problems=["that joint's pair carries no usable motion"],
+                ) from exc
+        try:
+            up = solve_vertical(
+                evidence, max_axis_deg=float(plan.basis["max_vertical_axis_deg"])
+            )
+        except ValueError as exc:
+            raise _check_failed(
+                str(exc), problems=["no joint measures the vertical"]
+            ) from exc
+        try:
+            fit = solve_mount(evidence, up=up)
+        except ValueError as exc:
+            raise _check_failed(str(exc), problems=["degenerate joints"]) from exc
+        limit_gap = float(plan.basis["max_shift_gap_mm"])
+        min_agreement = float(plan.basis["min_agreement"])
+        if fit.max_shift_gap_mm > limit_gap or fit.score < min_agreement:
+            raise _check_failed(
+                f"no single mount explains the joints: the worst joint is "
+                f"{fit.max_shift_gap_mm:.1f} mm off (limit {limit_gap}) and the mean "
+                f"agreement is {fit.score:.3f} (minimum {min_agreement}); check nothing "
+                "else in the cell moved between captures and the arm stays fully in view",
+                problems=["joints disagree with one mount"],
+                fit=fit.to_dict(),
+            )
+        summary = {
+            "method": METHOD_SCREW,
+            "intrinsics": dict(intrinsics),
+            "vertical": [round(value, 6) for value in up],
+            **fit.to_dict(),
+        }
+        return fit, summary
+
+    def _record(
+        self,
+        ctx: SkillContext,
+        plan: SkillPlan,
+        role: str,
+        fit: Any,
+        evidence: dict[str, Any],
+    ) -> SkillOutcome:
+        camera = fit.camera.to_pose()
+        recorded_at = ctx.record_calibration(
+            str(plan.basis["procedure"]),
+            matrix=fit.camera.to_matrix(),
+            parameters={
+                "mounting": EYE_TO_HAND,
+                "camera_role": role,
+                "camera_device": plan.basis.get("camera_device", ctx.workcell.role(role)),
+                "method": METHOD_SCREW,
+                "geometry_revision": 2,
+                "units": "mm",
+                "orientation_convention": "Rz@Ry@Rx;degrees",
+                "intrinsics": evidence["intrinsics"],
+                "screw_evidence": {key: value for key, value in evidence.items() if key != "intrinsics"},
+                "captures": len(plan.basis["moves"]) * 2 + 1,
+                "near_mm": plan.basis["near_mm"],
+                "far_mm": plan.basis["far_mm"],
+            },
+        )
+        worst = max(fit.joints, key=lambda joint: joint.shift_gap_mm)
+        return SkillOutcome.succeeded(
+            {
+                "camera": camera.to_dict(),
+                "mounting": EYE_TO_HAND,
+                "method": METHOD_SCREW,
+                "vertical": evidence["vertical"],
+                "score": evidence["score"],
+                "max_shift_gap_mm": evidence["max_shift_gap_mm"],
+                "pairs": evidence["pairs"],
+                "captures": len(plan.basis["moves"]) * 2 + 1,
+                "frames": int(plan.basis["frames"]),
+                "recorded_at": recorded_at,
+            },
+            message=(
+                f"The camera sits at {_fmt(camera.position)} mm in the base frame, measured "
+                f"without a board from {len(fit.joints)} joints; the worst of them "
+                f"({worst.label}) leaves {worst.shift_gap_mm:.1f} mm unexplained"
+            ),
+        )
+
+
 # ── calib.verify ─────────────────────────────────────────────────────────────
 
 
@@ -435,6 +906,7 @@ class VerifyCamera:
         effect=EFFECT_ACTUATE,
         requires=(f"{REQUIRE_ROLE}arm",),
         consent=CONSENT_EACH_RUN,
+        region=REGION_BOOTSTRAP_UNTIL_MEASURED,
     )
 
     async def plan(self, ctx: SkillContext, args: Mapping[str, Any]) -> SkillPlan:
@@ -587,16 +1059,18 @@ def _stats(errors: Sequence[float], *, prefix: str) -> dict[str, float | None]:
     }
 
 
-def skills() -> tuple[HandEye, VerifyCamera]:
+def skills() -> tuple[HandEye, Screws, VerifyCamera]:
     """Entry point for ``leapflow.hardware.skills``."""
-    return (HandEye(), VerifyCamera())
+    return (HandEye(), Screws(), VerifyCamera())
 
 
 __all__ = [
     "EYE_IN_HAND",
     "EYE_TO_HAND",
+    "METHOD_SCREW",
     "VERIFY_PROCEDURE",
     "HandEye",
+    "Screws",
     "VerifyCamera",
     "skills",
 ]

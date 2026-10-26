@@ -142,8 +142,7 @@ class PreviewBroker:
         async with lock:
             lease = self._leases.get(key)
             if lease is None:
-                lease = _Lease(device_id=device_id, channel_id=channel_id)
-                self._leases[key] = lease
+                lease = self._open_lease(device_id, channel_id)
                 logger.info("Preview opened: %s.%s", device_id, channel_id)
             self._touch(lease, viewer_id)
             self._ensure_sweeper()
@@ -258,8 +257,7 @@ class PreviewBroker:
         async with lock:
             lease = self._leases.get(key)
             if lease is None:
-                lease = _Lease(device_id=device_id, channel_id=channel_id)
-                self._leases[key] = lease
+                lease = self._open_lease(device_id, channel_id)
             self._touch(lease, viewer_id)
             self._ensure_sweeper()
 
@@ -284,6 +282,17 @@ class PreviewBroker:
     def _viewer(viewer_id: str) -> str:
         value = str(viewer_id or "").strip()
         return value[:128] if value else _LEGACY_VIEWER_ID
+
+    @staticmethod
+    def _holder(channel_id: str) -> str:
+        return f"preview:{channel_id}"
+
+    def _open_lease(self, device_id: str, channel_id: str) -> _Lease:
+        """Create a lease and hold its device, so another party's release cannot close it."""
+        lease = _Lease(device_id=device_id, channel_id=channel_id)
+        self._leases[(device_id, channel_id)] = lease
+        self._registry.hold(device_id, self._holder(channel_id))
+        return lease
 
     def _touch(self, lease: _Lease, viewer_id: str) -> None:
         now = time.monotonic()
@@ -372,13 +381,11 @@ class PreviewBroker:
         )
         # Dropping the transport is what actually powers the device down: the registry
         # caches it, so without this the camera stays claimed for the life of the
-        # process even though nothing is watching.
-        if not any(existing == lease.device_id for existing, _ in self._leases):
-            # Scalar previews (microphone level) read through the registry's device-I/O
-            # lock. Taking that same lock before close prevents Stop from tearing down a
-            # level reader in the middle of its analysis-window read.
-            async with self._registry.device_io(lease.device_id):
-                await self._registry.drop_transport(lease.device_id)
+        # process even though nothing is watching. The registry closes it only when
+        # this lease was the last holder -- another channel's preview or a remote frame
+        # consumer keeps it open -- and does so under the device-I/O lock, so Stop
+        # cannot tear down a level reader in the middle of its analysis-window read.
+        await self._registry.release_hold(lease.device_id, self._holder(lease.channel_id))
 
     async def close(self) -> None:
         """Release every preview. Registered as a teardown effect; never raises."""

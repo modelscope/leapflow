@@ -141,6 +141,13 @@ transport:
     warmup_timeout_s: 5.0
     stale_after_s: 1.0
     receive_max_skew_s: 0.15
+    # How long a write waits for every decoder group to be freshly received
+    # before it refuses. Reception is a state: a camera capture decoded in the
+    # same process holds the interpreter long enough for one group to lag the
+    # others by a few hundred milliseconds, which one sample reads as a dead
+    # bus. Nothing has been sent while this waits, so only a ledger that stays
+    # incoherent for the whole budget is a refusal.
+    receive_requalify_s: 1.0
     default_gripper_force_n: 1.0
     # Bound on one governed enable. Resuming a latched stop, energizing and
     # confirming the arm holds CAN control may have to be retried, so the

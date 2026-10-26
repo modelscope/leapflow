@@ -17,7 +17,7 @@ import leapflow
 from leapflow.daemon._transport import get_transport
 from leapflow.daemon.client import DaemonClient, DaemonUnavailableError, ensure_daemon_client
 from leapflow.daemon.lifecycle import DaemonInfo
-from leapflow.daemon.protocol import StreamChunk
+from leapflow.daemon.protocol import RpcRequest, StreamChunk
 from leapflow.daemon.server import UnixRpcServer
 
 
@@ -1538,6 +1538,37 @@ async def test_daemon_shutdown_rpc_triggers_server_stop() -> None:
                 pass
 
     assert service.shutdown_called is True
+
+
+@pytest.mark.asyncio
+async def test_daemon_shutdown_stops_server_when_caller_hung_up_before_reply() -> None:
+    """A restart client that timed out must not leave leapd serving with torn-down services."""
+
+    class ShutdownService(_FakeService):
+        async def shutdown(self) -> None:
+            return None
+
+    class GoneWriter:
+        def write(self, data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            raise ConnectionResetError("Connection lost")
+
+    stopped = asyncio.Event()
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        runtime_dir = Path(root) / "runtime"
+        server = UnixRpcServer(
+            ShutdownService(),
+            sock_path=get_transport().readiness_path(runtime_dir),
+            runtime_dir=runtime_dir,
+            on_shutdown=stopped.set,
+        )
+        request = RpcRequest(id="r1", method="daemon.shutdown", params={})
+        with pytest.raises(ConnectionResetError):
+            await server._dispatch(request, GoneWriter())  # type: ignore[arg-type]
+
+    assert stopped.is_set()
 
 
 @pytest.mark.asyncio

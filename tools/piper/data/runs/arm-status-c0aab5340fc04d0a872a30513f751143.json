@@ -1,0 +1,326 @@
+{
+  "ok": true,
+  "declaration_digest": "4061e3ce917749911c479896da49fc10c334042cd2751a0a9ad36fb8750852ba",
+  "snapshot": {
+    "joints": [
+      0.0,
+      109.686,
+      -50.974000000000004,
+      83.177,
+      5.557,
+      0.975
+    ],
+    "pose": {
+      "x": 230.483,
+      "y": -3.414,
+      "z": 94.069,
+      "rx": 133.013,
+      "ry": -4.507,
+      "rz": -86.60300000000001
+    },
+    "gripper_mm": 1.0999999999999999,
+    "enabled": true,
+    "status": {
+      "ctrl_mode": 1,
+      "arm_status": 0,
+      "mode_feedback": 255,
+      "motion_status": 0,
+      "error_code": 0,
+      "joint_limit_errors": [],
+      "joint_communication_errors": []
+    },
+    "telemetry": {
+      "schema_version": 1,
+      "motors": [
+        {
+          "motor": 1,
+          "current_a": 0.055,
+          "estimated_effort_nm": 0.25987499999999997,
+          "speed_rad_s": 0.0,
+          "voltage_v": 23.0,
+          "motor_temperature_c": 28.0,
+          "driver_temperature_c": 35.0,
+          "enabled": true,
+          "faults": {
+            "driver_overcurrent": false,
+            "driver_overheating": false,
+            "driver_error_status": false,
+            "collision_status": false,
+            "stall_status": false,
+            "motor_overheating": false,
+            "voltage_too_low": false
+          }
+        },
+        {
+          "motor": 2,
+          "current_a": 0.003,
+          "estimated_effort_nm": 0.012403125000000001,
+          "speed_rad_s": 0.0,
+          "voltage_v": 23.0,
+          "motor_temperature_c": 29.0,
+          "driver_temperature_c": 34.0,
+          "enabled": true,
+          "faults": {
+            "driver_overcurrent": false,
+            "driver_overheating": false,
+            "driver_error_status": false,
+            "collision_status": false,
+            "stall_status": false,
+            "motor_overheating": false,
+            "voltage_too_low": false
+          }
+        },
+        {
+          "motor": 3,
+          "current_a": 0.0,
+          "estimated_effort_nm": 0.0,
+          "speed_rad_s": 0.0,
+          "voltage_v": 24.0,
+          "motor_temperature_c": 28.0,
+          "driver_temperature_c": 35.0,
+          "enabled": true,
+          "faults": {
+            "driver_overcurrent": false,
+            "driver_overheating": false,
+            "driver_error_status": false,
+            "collision_status": false,
+            "stall_status": false,
+            "motor_overheating": false,
+            "voltage_too_low": false
+          }
+        },
+        {
+          "motor": 4,
+          "current_a": -0.002,
+          "estimated_effort_nm": -0.0024644027519999997,
+          "speed_rad_s": 0.0,
+          "voltage_v": 23.0,
+          "motor_temperature_c": 30.0,
+          "driver_temperature_c": 37.0,
+          "enabled": true,
+          "faults": {
+            "driver_overcurrent": false,
+            "driver_overheating": false,
+            "driver_error_status": false,
+            "collision_status": false,
+            "stall_status": false,
+            "motor_overheating": false,
+            "voltage_too_low": false
+          }
+        },
+        {
+          "motor": 5,
+          "current_a": -0.004,
+          "estimated_effort_nm": -0.0031150804608000003,
+          "speed_rad_s": 0.0,
+          "voltage_v": 23.0,
+          "motor_temperature_c": 32.0,
+          "driver_temperature_c": 38.0,
+          "enabled": true,
+          "faults": {
+            "driver_overcurrent": false,
+            "driver_overheating": false,
+            "driver_error_status": false,
+            "collision_status": false,
+            "stall_status": false,
+            "motor_overheating": false,
+            "voltage_too_low": false
+          }
+        },
+        {
+          "motor": 6,
+          "current_a": 0.001,
+          "estimated_effort_nm": 0.0007787701152,
+          "speed_rad_s": 0.0,
+          "voltage_v": 24.0,
+          "motor_temperature_c": 32.0,
+          "driver_temperature_c": 38.0,
+          "enabled": true,
+          "faults": {
+            "driver_overcurrent": false,
+            "driver_overheating": false,
+            "driver_error_status": false,
+            "collision_status": false,
+            "stall_status": false,
+            "motor_overheating": false,
+            "voltage_too_low": false
+          }
+        }
+      ],
+      "receive": {
+        "0x2a1": {
+          "group": "0x2a1",
+          "sequence": 5303,
+          "received_mono": 22084.451488996,
+          "received_wall": 1793007719.4128468,
+          "interval_s": 0.007181404002039926,
+          "valid": true
+        },
+        "0x2a2": {
+          "group": "0x2a2",
+          "sequence": 5299,
+          "received_mono": 22084.451608136,
+          "received_wall": 1793007719.4129658,
+          "interval_s": 0.007195674999820767,
+          "valid": true
+        },
+        "0x2a3": {
+          "group": "0x2a3",
+          "sequence": 5298,
+          "received_mono": 22084.451918037,
+          "received_wall": 1793007719.4132757,
+          "interval_s": 0.007386276000033831,
+          "valid": true
+        },
+        "0x2a4": {
+          "group": "0x2a4",
+          "sequence": 5296,
+          "received_mono": 22084.452135517,
+          "received_wall": 1793007719.413493,
+          "interval_s": 0.007515495999541599,
+          "valid": true
+        },
+        "0x2a5": {
+          "group": "0x2a5",
+          "sequence": 5296,
+          "received_mono": 22084.452228481,
+          "received_wall": 1793007719.4135861,
+          "interval_s": 0.0075292889996489976,
+          "valid": true
+        },
+        "0x2a6": {
+          "group": "0x2a6",
+          "sequence": 5297,
+          "received_mono": 22084.452313348,
+          "received_wall": 1793007719.413671,
+          "interval_s": 0.00749232700036373,
+          "valid": true
+        },
+        "0x2a7": {
+          "group": "0x2a7",
+          "sequence": 5296,
+          "received_mono": 22084.452394375,
+          "received_wall": 1793007719.413752,
+          "interval_s": 0.0074436850009078626,
+          "valid": true
+        },
+        "0x2a8": {
+          "group": "0x2a8",
+          "sequence": 5297,
+          "received_mono": 22084.452483499,
+          "received_wall": 1793007719.413841,
+          "interval_s": 0.00741293300234247,
+          "valid": true
+        },
+        "0x251": {
+          "group": "0x251",
+          "sequence": 2649,
+          "received_mono": 22084.445199916,
+          "received_wall": 1793007719.4065573,
+          "interval_s": 0.004308138002670603,
+          "valid": true
+        },
+        "0x252": {
+          "group": "0x252",
+          "sequence": 2647,
+          "received_mono": 22084.445295375,
+          "received_wall": 1793007719.406653,
+          "interval_s": 0.004270471999916481,
+          "valid": true
+        },
+        "0x253": {
+          "group": "0x253",
+          "sequence": 2648,
+          "received_mono": 22084.445544409,
+          "received_wall": 1793007719.406902,
+          "interval_s": 0.004074785003467696,
+          "valid": true
+        },
+        "0x254": {
+          "group": "0x254",
+          "sequence": 2648,
+          "received_mono": 22084.445682047,
+          "received_wall": 1793007719.4070396,
+          "interval_s": 0.0032908499997574836,
+          "valid": true
+        },
+        "0x255": {
+          "group": "0x255",
+          "sequence": 2647,
+          "received_mono": 22084.445798051,
+          "received_wall": 1793007719.4071558,
+          "interval_s": 0.0032631370013405103,
+          "valid": true
+        },
+        "0x265": {
+          "group": "0x265",
+          "sequence": 530,
+          "received_mono": 22084.41733008,
+          "received_wall": 1793007719.3786879,
+          "interval_s": 0.05069371100034914,
+          "valid": true
+        },
+        "0x256": {
+          "group": "0x256",
+          "sequence": 2647,
+          "received_mono": 22084.445929352,
+          "received_wall": 1793007719.407287,
+          "interval_s": 0.0032747210025263485,
+          "valid": true
+        },
+        "0x264": {
+          "group": "0x264",
+          "sequence": 530,
+          "received_mono": 22084.426318179,
+          "received_wall": 1793007719.387676,
+          "interval_s": 0.05012264900142327,
+          "valid": true
+        },
+        "0x263": {
+          "group": "0x263",
+          "sequence": 530,
+          "received_mono": 22084.442072656,
+          "received_wall": 1793007719.4034307,
+          "interval_s": 0.05619603999730316,
+          "valid": true
+        },
+        "0x262": {
+          "group": "0x262",
+          "sequence": 530,
+          "received_mono": 22084.445450421,
+          "received_wall": 1793007719.4068081,
+          "interval_s": 0.04760258100213832,
+          "valid": true
+        },
+        "0x261": {
+          "group": "0x261",
+          "sequence": 529,
+          "received_mono": 22084.40561013,
+          "received_wall": 1793007719.366968,
+          "interval_s": 0.049946674000239,
+          "valid": true
+        },
+        "0x266": {
+          "group": "0x266",
+          "sequence": 528,
+          "received_mono": 22084.406339279,
+          "received_wall": 1793007719.3676965,
+          "interval_s": 0.049922353002330055,
+          "valid": true
+        }
+      },
+      "receive_qualified": true,
+      "effort_source": "sdk_current_estimate"
+    }
+  },
+  "events": [
+    {
+      "event": "connected",
+      "monotonic": 507495.301877875,
+      "node_id": "yahboom",
+      "write_mode": "permit_required",
+      "declaration_digest": "4061e3ce917749911c479896da49fc10c334042cd2751a0a9ad36fb8750852ba",
+      "execute": false
+    }
+  ]
+}

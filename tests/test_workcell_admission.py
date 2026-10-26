@@ -120,9 +120,46 @@ def test_a_camera_frame_without_a_measured_target_mount_is_not_a_calibration(
     assert frames.parameters("camera") == {}
     assert "target mount" in frames.stale["camera"]
     assert unmet_requirements(("calib:camera",), spec, frames) == [
-        "camera calibration is stale (the record carries no measured target mount); "
-        "run calib.handeye again"
+        "camera calibration is stale (the record carries no measured target mount and "
+        "no screw-motion evidence); run calib.handeye again"
     ]
+
+
+def test_a_record_naming_a_method_without_its_evidence_is_not_a_calibration(
+    tmp_path: Path,
+) -> None:
+    """Naming a board-free method does not stand in for having used one.
+
+    The gate asks each method for the evidence that method produces. Declaring
+    ``markerless_screw`` with no joint list, or with two joints, is the same
+    assertion as a bare matrix: two rotations share the vertical, so no mount can
+    come out of them.
+    """
+    registry = SkillNodeRegistry(store_path=tmp_path / "instrument.duckdb")
+    spec = WorkcellSpec.from_mapping(_with(
+        roles={"arm": ARM_ID, "camera": ARM_ID},
+        frames={
+            "tcp": {"parent": "flange", "procedure": "tcp.offset"},
+            "camera": {"parent": "base", "procedure": "handeye.eye_to_hand"},
+        },
+    ))
+    pair = {"joint": "j1", "angle_deg": 30.0, "agreement": 0.6, "shift_gap_mm": 4.0}
+    for evidence, reason in (
+        ({"method": "markerless_screw"}, "lists no joints"),
+        ({"method": "markerless_screw", "pairs": [pair]}, "covers 1 joints"),
+        ({"method": "guess"}, "names no measurement method"),
+        ({"method": "markerless_screw", "pairs": [pair] * 3}, ""),
+    ):
+        record = registry.calibrate(
+            "handeye.eye_to_hand",
+            matrix=[[1, 0, 0, 500], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+            parameters={"screw_evidence": evidence},
+        )
+        frames = FrameGraph.snapshot(spec, registry.calibration_store)
+        stale = frames.stale.get("camera", "")
+        assert reason in stale, (evidence, stale)
+        assert (frames.transform("camera") is not None) is (reason == "")
+        assert record
 
 
 def test_frames_resolve_from_the_latest_calibration_preferring_a_matrix(tmp_path: Path) -> None:

@@ -9,10 +9,12 @@ explains why a skill's ``requires`` tokens do not hold in one snapshot.
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Mapping
+import math
+from typing import Any, Iterable, Mapping, Sequence
 
 from leapflow.hardware.skills.geometry import Plane, Pose, Transform, WorkspaceBox
 from leapflow.hardware.skills.protocol import (
+    METHOD_MARKERLESS_SCREW,
     REQUIRE_CALIBRATION,
     REQUIRE_MODEL,
     REQUIRE_ROLE,
@@ -25,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 _VERSION_TOLERANCE = 1e-6
 HANDEYE_PROCEDURE = "handeye"  # every camera-mount procedure name carries this word
+# A camera mount can be measured two ways, and each has to prove itself with the
+# evidence its own method produces. Naming the method is not enough: the numbers
+# below are what makes a record a measurement rather than a hand-typed matrix.
+MIN_SCREW_PAIRS = 3
 
 
 # ── Frames ───────────────────────────────────────────────────────────────────
@@ -157,16 +163,51 @@ def _stale_records(records: Mapping[str, Any]) -> dict[str, str]:
 def _provenance_problem(procedure: str, record: Any) -> str:
     """Why *record* cannot stand as this procedure's result; empty when it can.
 
-    Only hand-eye is checkable so far: the calibrated target mount is the part
-    of the measurement that proves a camera was actually observed from the
-    poses it was fitted on. A record without it was written by something other
-    than ``calib.handeye`` -- an import or an edit -- and describes a camera
-    that may no longer be there.
+    A camera mount is the one frame whose record is checkable, because the camera
+    was observed from the poses it was fitted on and that observation leaves
+    evidence behind. Which evidence depends on the procedure: the board path must
+    name the target mount it solved for, and the board-free path must carry at
+    least three joints' screw agreement -- two rotations cannot separate the
+    camera's height from its heading, so a shorter list describes a mount nobody
+    measured. A record with neither was written by something other than a
+    calibration skill -- an import or an edit -- and describes a camera that may
+    no longer be there.
     """
-    if HANDEYE_PROCEDURE in procedure:
-        if (record.parameters or {}).get("target_mount") is None:
-            return "the record carries no measured target mount"
+    if HANDEYE_PROCEDURE not in procedure:
+        return ""
+    parameters = record.parameters or {}
+    if parameters.get("target_mount") is not None:
+        return ""
+    return _screw_evidence_problem(parameters.get("screw_evidence"))
+
+
+def _screw_evidence_problem(evidence: Any) -> str:
+    """Why a board-free record's own screw evidence is not a measurement."""
+    if not isinstance(evidence, Mapping):
+        return "the record carries no measured target mount and no screw-motion evidence"
+    if evidence.get("method") != METHOD_MARKERLESS_SCREW:
+        return "the record names no measurement method its evidence can be checked against"
+    pairs = evidence.get("pairs")
+    if not isinstance(pairs, Sequence) or isinstance(pairs, (str, bytes)):
+        return "the record's screw-motion evidence lists no joints"
+    if len(pairs) < MIN_SCREW_PAIRS:
+        return (
+            f"the record's screw-motion evidence covers {len(pairs)} joints "
+            f"(need {MIN_SCREW_PAIRS})"
+        )
+    for pair in pairs:
+        if not isinstance(pair, Mapping):
+            return "the record's screw-motion evidence is malformed"
+        values = [pair.get(key) for key in ("agreement", "shift_gap_mm", "angle_deg")]
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+            return "the record's screw-motion evidence is missing a joint's residuals"
+        if not all(_finite(value) for value in values):
+            return "the record's screw-motion evidence is not finite"
     return ""
+
+
+def _finite(value: float) -> bool:
+    return math.isfinite(value)
 
 
 def _dependency_problem(record: Any, records: Mapping[str, Any], stale: Mapping[str, str]) -> str:

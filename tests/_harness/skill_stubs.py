@@ -308,6 +308,7 @@ class SkillNodeRegistry:
         *,
         device_id: str = WORKCELL_ID,
         parameters: Mapping[str, Any] | None = None,
+        matrix: Sequence[Sequence[float]] | None = None,
         pose: Mapping[str, Any] | None = None,
         recorded_at: float | None = None,
     ) -> float:
@@ -319,15 +320,21 @@ class SkillNodeRegistry:
                 procedure_id=procedure_id,
                 recorded_at=at,
                 parameters=dict(parameters or {}),
+                matrix=None if matrix is None else [list(row) for row in matrix],
                 pose=None if pose is None else dict(pose),
             )
         )
         return at
 
-    def calibrate_cell(self) -> None:
-        """TCP offset straight out of the flange plus the safe box."""
+    def calibrate_cell(self, box: Mapping[str, Any] | None = SAFE_BOX) -> None:
+        """TCP offset straight out of the flange plus the safe box.
+
+        *box* replaces the measured workspace; ``None`` leaves the workspace
+        unmeasured, so skills have to plan in the cell's bootstrap box.
+        """
         self.calibrate("tcp.offset", pose={"x": 0, "y": 0, "z": TOOL_LENGTH_MM})
-        self.calibrate("workspace.safe_box", parameters=SAFE_BOX)
+        if box is not None:
+            self.calibrate("workspace.safe_box", parameters=dict(box))
 
     def calibrate_perception(
         self,

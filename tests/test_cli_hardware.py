@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -30,6 +31,7 @@ from leapflow.hardware.context import (
     HC_VERSION,
     Channel,
     ContextProvenance,
+    ContextSource,
     Direction,
     Envelope,
     HardwareContext,
@@ -169,6 +171,49 @@ def test_hw_read_reads_one_channel_on_demand(monkeypatch, tmp_path, capsys) -> N
     payload = _json_out(capsys)
     assert payload["ok"] is True
     assert payload["reading"]["value"] == 21.5
+
+
+def test_validate_checks_declarations_not_enumerated_resources(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A camera or a microphone must not be able to fail the declaration check.
+
+    Only a declaration can be reviewed by a human, and only a declaration has a
+    digest that stays put between machines.  Counting enumerated host resources
+    as "unverified" kept this command red on every host with a camera, so the one
+    signal it exists to give -- an edited declaration drifting away from the
+    reviewed one -- was buried under noise an operator could never clear.
+    """
+    from leapflow.cli.commands.hardware import cmd_hardware
+    from leapflow.hardware.attestation import declaration_digest, store_verification
+    from leapflow.layout import HardwareLayout
+
+    declared = _rig_context()
+    discovered = replace(
+        declared,
+        device_id="cam",
+        provenance=replace(declared.provenance, source=ContextSource.DISCOVERED.value),
+    )
+    registry = HardwareRegistry(
+        HardwareSettings(enabled=True, require_describe_before_write=False),
+        providers=[_StaticProvider(declared, discovered)],
+    )
+    registry.load()
+    layout = HardwareLayout(make_settings(str(tmp_path)).profile_dir / "hardware")
+    store_verification(
+        layout.verified_path,
+        "rig",
+        verifier="jason",
+        digest=declaration_digest(registry.context("rig")),
+    )
+    _install_local_registry(monkeypatch, tmp_path, registry)
+
+    assert cmd_hardware(_ns("validate")) == 0
+    payload = _json_out(capsys)
+    assert payload["ok"] is True
+    assert [item["device_id"] for item in payload["devices"]] == ["rig"]
+    assert payload["devices"][0]["status"] == "valid"
+    assert payload["skipped"] == [{"device_id": "cam", "source": "discovered"}]
 
 
 def test_the_read_plane_releases_every_device_before_it_exits(

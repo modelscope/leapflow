@@ -638,13 +638,15 @@ class WorkcellScene:
                 "the workspace was calibrated without the table; run calib.workspace with "
                 "table_z or table_points",
             )
-        source = await self._transport(camera, FrameSource, "an RGB-D camera")
         flange = None
         if self._frames.parent(role) == "flange":
             flange = (await self._motion.state()).flange
             mount = Transform.from_pose(flange).compose(mount)
         try:
+            # Resolved under the device lock, not before it: a preview release waiting on
+            # the same lock may otherwise close the camera between lookup and capture.
             async with self._registry.device_io(camera):
+                source = await self._transport(camera, FrameSource, "an RGB-D camera")
                 frame = await source.capture_rgbd()
         except TransportError as exc:
             raise SkillError(

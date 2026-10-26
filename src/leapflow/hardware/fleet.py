@@ -58,7 +58,7 @@ from typing import Any, Mapping
 
 from leapflow.hardware.context import HardwareContext, TransportRef
 from leapflow.hardware.lhp import LhpRemoteError, SocketLhpClient, is_valid_device_id
-from leapflow.hardware.attestation import confirmed_by
+from leapflow.hardware.attestation import verification_stamp
 
 logger = logging.getLogger(__name__)
 
@@ -768,11 +768,17 @@ class FleetManager:
         if provenance is None or not getattr(provenance, "is_verified", False):
             return context
         host_device_id = f"{node_id}__{context.device_id}"
-        verifier = confirmed_by(self._verified_path(), host_device_id, context)
+        verifier, verified_at = verification_stamp(
+            self._verified_path(), host_device_id, context
+        )
         if verifier:
             return replace(
                 context,
-                provenance=replace(provenance, verified_by=verifier),
+                provenance=replace(
+                    provenance,
+                    verified_by=verifier,
+                    verified_at=verified_at,
+                ),
             )
         logger.info(
             "Fleet: stripping self-reported verification for %s from node %s; "
@@ -785,6 +791,7 @@ class FleetManager:
             provenance=replace(
                 provenance,
                 verified_by="",
+                verified_at=0.0,
                 source=f"remote:{node_id}",
             ),
         )

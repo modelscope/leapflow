@@ -44,8 +44,10 @@ re-calibration invalidates every plan made before it. A record may also name
 the versions it was measured against (``parameters.depends_on``, e.g. a
 workspace measured with one TCP); when one of those is superseded the record
 is stale and resolves as uncalibrated. ``bootstrap_box`` is the one exception
-to "never inline" -- a conservative box only ``calib.*`` skills may move in, so
-the workspace can be calibrated at all.
+to "never inline" -- a conservative box a skill declaring
+``region: bootstrap_until_measured`` may plan in while no workspace record
+exists, and the only box ``calib.workspace`` itself verifies against, so the
+workspace can be calibrated at all.
 
 Models are devices too: ``models`` names the model-service devices a skill may
 query (``model:<name>`` in its requirements), so swapping a detector or a

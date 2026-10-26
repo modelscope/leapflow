@@ -1,0 +1,42 @@
+# LeapFlow LHP node for the yahboom Jetson -- owned by systemd, not by a shell.
+#
+# Install:  mkdir -p ~/.config/systemd/user
+#           cp leap-lhp-node.service ~/.config/systemd/user/
+#           systemctl --user daemon-reload
+#           systemctl --user enable --now leap-lhp-node.service
+# Requires: loginctl enable-linger <user>, or the unit stops when the last session
+#           closes (already enabled on this board).
+#
+# Why a supervisor: nothing on this board restarted a vanished node, so a crash
+# silently removed the arm and the cameras from the fleet until a human noticed.
+#
+# Why this does not weaken the clearance gate: `leap hw serve` opens devices for
+# read-only observation and every write still needs a node-side execution permit,
+# so a restart cannot actuate anything.  A restart that must be previewed and
+# approved still goes through `piper.py node start|restart`, which detects this
+# unit and asks systemd to act rather than spawning a second owner.
+
+[Unit]
+Description=LeapFlow LHP node (yahboom: Piper X arm + RealSense D435if/D405)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jetson/leap_work
+Environment=PYTHONUNBUFFERED=1
+# The shared secret stays in its 0600 file: a systemd EnvironmentFile cannot read a
+# file into a variable, and copying the token into this unit would put the secret on
+# disk a second time with wider permissions.
+ExecStart=/bin/sh -c 'export LEAPFLOW_LHP_TOKEN="$(cat /home/jetson/.leapflow/.lhp-token)"; export LEAPFLOW_LHP_PERMIT_ISSUER_KEYS=/home/jetson/.leapflow/profiles/default/hardware/lhp_permit_issuer.pub; exec /home/jetson/miniconda3/envs/leap/bin/python /home/jetson/miniconda3/envs/leap/bin/leap hw serve --node-id yahboom --host 0.0.0.0 --port 8767'
+Restart=on-failure
+RestartSec=5
+# Never leave a half-dead child holding the CAN bus or the video devices.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=20
+# Keep the operational evidence file every runbook already points at.
+StandardOutput=append:/home/jetson/leap_work/piper/data/logs/leap-serve.log
+StandardError=append:/home/jetson/leap_work/piper/data/logs/leap-serve.log
+
+[Install]
+WantedBy=default.target

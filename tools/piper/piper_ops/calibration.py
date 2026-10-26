@@ -96,8 +96,15 @@ async def run(session: Session, *, workcell: str = "", skill: str = "", args: di
         if not skill.startswith("calib."):
             raise Refusal("calibration run requires a production calib.* skill")
         if approved and (approved.get("skill_id") != skill or approved.get("workcell") != workcell or
-                         approved.get("args") != args or approved.get("node_id") != settings.node_id):
+                         approved.get("request_args") != args or approved.get("node_id") != settings.node_id):
+            # The request the operator declared is what approval binds; the plan's own
+            # ``args`` carry the schema defaults the node filled in, so comparing those
+            # against a hand-written request would refuse every run that omits a default.
             raise Refusal("calibration request differs from approved plan")
+        if approved:
+            # The node re-plans exactly what it receives and compares digests, so what it
+            # receives has to be the arguments the operator approved, defaults included.
+            args = dict(approved["args"])
         result = await client.hw_skill_run(workcell=f"{settings.node_id}/{workcell}", skill=skill,
                                            args=args or {}, dry_run=approved is None,
                                            approved_plan=approved.get("skill_plan") if approved else None,

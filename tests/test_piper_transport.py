@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import math
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -758,11 +759,51 @@ def test_cached_reads_units_status_telemetry_and_unknown_channels(monkeypatch: p
 @pytest.mark.parametrize("channel,value", [("ee.x", 210), ("joint.j1.position", 15),
                                           ("gripper.position", 30), ("arm.enable", 1)])
 def test_writes_refuse_missing_receipts_before_any_send(monkeypatch: pytest.MonkeyPatch, channel: str, value: int) -> None:
-    transport, arm, _ = _open_transport(monkeypatch, receive=False)
+    transport, arm, _ = _open_transport(monkeypatch, {"receive_requalify_s": 0.0}, receive=False)
     before = list(arm.events)
     result = _write(transport, channel, value)
     assert result.failure_code == "piper_unqualified_feedback"
     assert result.side_effect_state == SIDE_EFFECT_NONE and arm.events == before
+
+
+def _skewed(arm: _FakeArm, lag_s: float = .08) -> None:
+    """One decoder group behind the others: what a camera capture leaves behind.
+
+    A capture decoded in the same process starves the SDK read thread, so the
+    groups that were parsed before it are stamped later than the ones after it.
+    """
+    time.sleep(lag_s)
+    arm.receive(("0x2a1",))
+
+
+def test_a_write_waits_for_a_skewed_ledger_instead_of_refusing_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reception is a state: a lagging group is waited for, not called a dead bus."""
+    transport, arm, _ = _open_transport(monkeypatch, {"receive_max_skew_s": .05,
+                                                     "receive_requalify_s": .5})
+    _skewed(arm)
+    threading.Timer(.05, arm.receive).start()
+    result = _write(transport, "ee.x", 210)
+    assert result.ok and result.side_effect_state == SIDE_EFFECT_COMMITTED
+    assert arm.pose_calls[-1][1][0] == pytest.approx(.21, abs=.001)
+
+
+def test_a_write_still_refuses_a_ledger_that_never_coheres(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch, {"receive_max_skew_s": .05,
+                                                     "receive_requalify_s": .1})
+    _skewed(arm)
+    before = list(arm.events)
+    result = _write(transport, "joint.j1.position", 15)
+    assert result.failure_code == "piper_unqualified_feedback"
+    assert result.side_effect_state == SIDE_EFFECT_NONE and arm.events == before
+
+
+def test_an_enable_waits_for_a_skewed_ledger_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, arm, _ = _open_transport(monkeypatch, {"receive_max_skew_s": .05,
+                                                     "receive_requalify_s": .5})
+    _skewed(arm)
+    threading.Timer(.05, arm.receive).start()
+    result = _write(transport, "arm.enable", 1)
+    assert result.ok and arm.enable_calls == 1
 
 
 def test_getters_cannot_refresh_frozen_receipts(monkeypatch: pytest.MonkeyPatch) -> None:
