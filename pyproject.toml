@@ -84,6 +84,12 @@ leapspace = [
     "cua-sandbox; python_version >= '3.11' and python_version < '3.14'",
     "pydantic>=2",
 ]
+# LeapCalib (src/leapcalib) — target-free software calibration — ships through
+# the same root package finder as LeapSpace but has no extra yet: what it
+# delivers today (typed contracts, SI geometry, error budgets, evidence replay)
+# is stdlib-only. The numerical backend its solvers will need (numpy/scipy)
+# becomes a `leapcalib` extra when a solver imports it; declaring it now would
+# add a large wheel to every `--all-extras` sync for code nobody imports.
 # Lightweight opt-in preview encoder; no policy-learning or ROS dependencies.
 vision = ["numpy>=1.24", "opencv-python>=4.8"]
 robot = [
@@ -109,6 +115,7 @@ benchmark = [
 [project.scripts]
 leap = "leapflow.__main__:main"
 leap-bench = "benchmarks.cli:main"
+leap-calib = "leapcalib.cli:main"
 
 # RealSense is a node-local optional transport.  Its module imports the Intel
 # SDK only when opened, so host-only installations stay dependency-free; the
@@ -142,7 +149,7 @@ version = {attr = "leapflow.version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["leapflow*", "leapspace*", "benchmarks*"]
+include = ["leapflow*", "leapspace*", "leapcalib*", "benchmarks*"]
 
 [tool.setuptools.package-data]
 "leapflow.gateway.action_packs" = ["*.yaml"]
