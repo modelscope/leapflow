@@ -9,9 +9,10 @@ cannot parse never reaches a device.
 from __future__ import annotations
 
 import math
+import time
 from typing import Any, Mapping
 
-from leapflow.hardware.lhp.protocol import LhpProtocolError
+from leapflow.hardware.lhp.protocol import MAX_FRAME_AGE_MS, MAX_FRAME_SEQUENCE, LhpProtocolError
 
 
 def require_str(params: Mapping[str, Any], key: str) -> str:
@@ -101,7 +102,25 @@ def require_commands(params: Mapping[str, Any]) -> list[tuple[str, Any]]:
     return commands
 
 
+def freshness_bounds(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Parse ``min_sequence`` / ``max_age_ms`` into node-local ``read_frame`` keywords.
+
+    ``max_age_ms`` becomes an ``after_monotonic`` on *this* node's clock. Absence
+    and ``0`` differ: an explicit ``0`` asks for a capture started after the request
+    arrived, which is how a host says "after the motion I just commanded".
+    """
+    bounds: dict[str, Any] = {}
+    min_sequence = optional_int(params, "min_sequence", upper=MAX_FRAME_SEQUENCE)
+    if min_sequence:
+        bounds["min_sequence"] = min_sequence
+    if params.get("max_age_ms") is not None:
+        max_age_ms = optional_float(params, "max_age_ms", upper=MAX_FRAME_AGE_MS)
+        bounds["after_monotonic"] = time.monotonic() - max_age_ms / 1000.0
+    return bounds
+
+
 __all__ = [
+    "freshness_bounds",
     "optional_float",
     "optional_int",
     "optional_mapping",

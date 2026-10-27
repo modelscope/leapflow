@@ -1645,6 +1645,12 @@ robot = [
     { name = "torch" },
     { name = "torchvision" },
 ]
+vision = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "opencv-python" },
+]
 web = [
     { name = "trafilatura" },
 ]
@@ -1667,8 +1673,10 @@ requires-dist = [
     { name = "msgpack", specifier = ">=1.0.8" },
     { name = "numpy", marker = "extra == 'benchmark'", specifier = ">=1.24" },
     { name = "numpy", marker = "extra == 'robot'", specifier = ">=1.24" },
+    { name = "numpy", marker = "extra == 'vision'", specifier = ">=1.24" },
     { name = "openai", specifier = ">=1.40" },
     { name = "opencv-python", marker = "extra == 'robot'", specifier = ">=4.8" },
+    { name = "opencv-python", marker = "extra == 'vision'", specifier = ">=4.8" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "pillow", marker = "extra == 'robot'", specifier = ">=10.0" },
     { name = "prompt-toolkit", specifier = ">=3.0.40" },
@@ -1693,7 +1701,7 @@ requires-dist = [
     { name = "trafilatura", marker = "extra == 'web'", specifier = ">=2.2" },
     { name = "watchdog", specifier = ">=3.0" },
 ]
-provides-extras = ["dev", "hub", "huggingface", "anthropic", "web", "leapspace", "robot", "benchmark"]
+provides-extras = ["dev", "hub", "huggingface", "anthropic", "web", "leapspace", "vision", "robot", "benchmark"]
 
 [[package]]
 name = "lxml"
@@ -4067,7 +4075,7 @@ name = "pyobjc-framework-cocoa"
 version = "12.2.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core" },
+    { name = "pyobjc-core", marker = "(python_full_version >= '3.11' and python_full_version < '3.14') or sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/51/34/fbe38a204643aa4e1b91391cdce07a34da565a69171ebcad08de7438a556/pyobjc_framework_cocoa-12.2.1.tar.gz", hash = "sha256:b94b37fe5730e5ae1fb0052912cd174e6ec329b0bfba4a012ae5db1014b5864b", size = 3125751, upload-time = "2026-06-19T16:20:05.159Z" }
 wheels = [
@@ -5762,8 +5770,8 @@ name = "pyobjc-framework-quartz"
 version = "12.2.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pyobjc-core" },
-    { name = "pyobjc-framework-cocoa" },
+    { name = "pyobjc-core", marker = "(python_full_version >= '3.11' and python_full_version < '3.14') or sys_platform != 'win32'" },
+    { name = "pyobjc-framework-cocoa", marker = "(python_full_version >= '3.11' and python_full_version < '3.14') or sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/3b/f6/2a8b84dbf1fe7c04dd96ea73d991678d4e09a909f51971ecc51629bb2ab4/pyobjc_framework_quartz-12.2.1.tar.gz", hash = "sha256:b3b8b6f71e66147f8ff9e6213864cc8527e3a0b1ee90835b93ce221f4802d9b0", size = 3215521, upload-time = "2026-06-19T16:21:30.199Z" }
 wheels = [

@@ -42,6 +42,7 @@ as adapted, next to what the shield let through.
 from __future__ import annotations
 
 import asyncio
+import functools
 import math
 from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Mapping
@@ -84,8 +85,10 @@ from leapflow.hardware.skills.protocol import (
     SkillError,
 )
 from leapflow.hardware.skills.shield import SafetyShield, contact_violation
+from leapflow.hardware.skills.tuning import DEFAULT_VISION
 from leapflow.hardware.skills.workcell import ROLE_ARM, SPEED_CHANNEL, WorkcellSpec
 from leapflow.hardware.transport import TransportError
+from leapflow.hardware.vision.group import CaptureGroup, bounded_capture
 
 DEADLINE_MARGIN_S = 0.5  # end the stream before the run deadline turns into a halt
 ENDED_DURATION = "duration"
@@ -418,24 +421,55 @@ class WorkcellPolicies:
         await self._check_contact(binding)
         quality = int(self._settings.jpeg_quality)
         fitted = binding.spaces.observation.images
-        images: dict[str, bytes] = {}
-        for name, device_id in binding.cameras.items():
-            try:
-                # Resolved under the device lock so a preview release cannot close the
-                # camera between the lookup and the capture.
-                async with self._registry.device_io(device_id):
-                    source = await self._transport(
-                        device_id, FrameSource, "an RGB-D camera", FAILURE_SKILL_UNAVAILABLE
-                    )
-                    frame = await source.capture_rgbd()
-            except TransportError as exc:
-                raise SkillError(
-                    FAILURE_DEVICE_FAULT, f"camera {device_id!r} capture failed: {exc}"
-                ) from exc
-            images[name] = await asyncio.to_thread(
-                encode_image, frame, fitted.get(name), quality=quality
+        frames = await self._capture_cameras(binding.cameras)
+        names = list(frames)
+        encoded = await asyncio.gather(
+            *(
+                asyncio.to_thread(encode_image, frames[name], fitted.get(name), quality=quality)
+                for name in names
             )
-        return Observation(state, observed_at, images)
+        )
+        return Observation(state, observed_at, dict(zip(names, encoded)))
+
+    async def _capture_cameras(self, cameras: Mapping[str, str]) -> dict[str, Any]:
+        """One soft-synchronised frame per policy camera, in binding order.
+
+        Captured as a group against one shared bound, so an overhead and a wrist
+        view describe the same instant within the workcell's declared tolerance
+        instead of drifting apart by one camera's capture latency. A spread the
+        group could not close is recorded on the episode, not refused: without a
+        trigger cable it is the honest best this cell can do.
+        """
+        if not cameras:
+            return {}
+        vision = getattr(self._spec, "vision", None) or DEFAULT_VISION
+        members = {name: functools.partial(self._capture, cam) for name, cam in cameras.items()}
+        group = CaptureGroup(
+            members,
+            tolerance_ms=float(vision["sync_tolerance_ms"]),
+            attempts=int(vision["sync_attempts"]),
+        )
+        captured = await group.capture()
+        for name in cameras:
+            if name in captured.errors:
+                raise captured.errors[name]
+        if not captured.within_tolerance:
+            self._motion.tap.event("camera_sync", **captured.summary())
+        return {name: captured.frames[name] for name in cameras}
+
+    async def _capture(self, device_id: str, after_monotonic: float) -> Any:
+        try:
+            # Resolved under the device lock so a preview release cannot close the
+            # camera between the lookup and the capture.
+            async with self._registry.device_io(device_id):
+                source = await self._transport(
+                    device_id, FrameSource, "an RGB-D camera", FAILURE_SKILL_UNAVAILABLE
+                )
+                return await bounded_capture(source.capture_rgbd)(after_monotonic)
+        except TransportError as exc:
+            raise SkillError(
+                FAILURE_DEVICE_FAULT, f"camera {device_id!r} capture failed: {exc}"
+            ) from exc
 
     async def _check_contact(self, binding: PolicyBinding) -> None:
         """Stop on an untrustworthy or out-of-envelope contact reading."""

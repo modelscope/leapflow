@@ -106,6 +106,15 @@ DEFAULT_GRASP_VERIFY: Mapping[str, float] = {
     "warmup_timeout_s": 5.0,
 }
 
+# How a multi-camera observation is soft-synchronised (see ``vision.group``): the
+# widest spread of capture stamps one observation may carry, and how many capture
+# rounds may pull a lagging camera back into it. Without a trigger cable this is
+# the only synchronisation the cell has, so it is declared, not assumed.
+DEFAULT_VISION: Mapping[str, float] = {
+    "sync_tolerance_ms": 50.0,
+    "sync_attempts": 3.0,
+}
+
 GRIPPER_SPEC_KEYS = frozenset({"max_width_mm", "min_hold_width_mm"})
 DEFAULT_MIN_HOLD_WIDTH_MM = 3.0
 
@@ -152,6 +161,7 @@ __all__ = [
     "DEFAULT_GRASP_VERIFY",
     "DEFAULT_LIMITS",
     "DEFAULT_MIN_HOLD_WIDTH_MM",
+    "DEFAULT_VISION",
     "GRIPPER_SPEC_KEYS",
     "gripper_spec",
     "positive",

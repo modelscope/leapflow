@@ -243,6 +243,7 @@ def _provider_rows(
         "media": {
             "include_screens": bool(getattr(settings, "hardware_media_screens", False)),
             "include_microphones": bool(getattr(settings, "hardware_media_microphones", True)),
+            "exclude_usb": str(getattr(settings, "hardware_media_exclude_usb", "") or ""),
             "max_fps": float(getattr(settings, "hardware_preview_max_fps", 0.0) or 0.0),
         },
     }

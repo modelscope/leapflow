@@ -5,6 +5,8 @@ Aggregates health signals from multiple sources:
 - HardwareStreamSource / BatchStreamCoordinator: comm_loss, sensor_loss events
 - HighFrequencyControlBus: overrun, safety_violation stats
 - HardwareRegistry: device probe results
+- FrameHub stats in a camera's probe: stale / recovered / frame-loss transitions,
+  published on the registry's signal path as ordinary ``HardwareEvent`` kinds
 - FleetManager: node heartbeat status
 
 Executes DegradationPolicy actions based on aggregated health:
@@ -30,9 +32,10 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from leapflow.hardware.degradation import DegradationCoordinator
+from leapflow.hardware.vision.health import FrameHealthTracker
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +128,7 @@ class HardwareHealthMonitor:
 
         # Per-device health tracking.
         self._records: dict[str, DeviceHealthRecord] = {}
+        self._frames = FrameHealthTracker()
         self._poll_task: asyncio.Task[None] | None = None
         self._stopped = asyncio.Event()
         self._started = False
@@ -546,8 +550,25 @@ class HardwareHealthMonitor:
         except Exception:  # noqa: BLE001 — probe failure is a data point, not an error
             record.last_probe_ok = False
             record.consecutive_probe_failures += 1
+            probe_result = None
 
         record.last_probe_time = time.monotonic()
+        self._observe_frames(device_id, probe_result)
+
+    def _observe_frames(self, device_id: str, status: Any) -> None:
+        """Publish the frame-pump transitions a camera's probe reveals as signals."""
+        metadata = getattr(status, "metadata", None)
+        stats = metadata.get("frame_hub") if isinstance(metadata, Mapping) else None
+        events = self._frames.observe(device_id, stats)
+        publish = getattr(self._registry, "publish_event", None)
+        for event in events:
+            logger.info("HealthMonitor: %s", event.to_detail())
+            if publish is None:
+                continue
+            try:
+                publish(event)
+            except Exception:  # noqa: BLE001 — telemetry must not break monitoring
+                logger.warning("HealthMonitor: frame event publish failed", exc_info=True)
 
     async def _poll_fleet_nodes(self) -> None:
         """Check fleet node health and update device records accordingly.

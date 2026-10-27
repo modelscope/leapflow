@@ -342,6 +342,16 @@ class FrameTransport(Protocol):
     discoverable degradation rather than a silent assumption: a device declaring a
     frame channel whose transport does not satisfy this Protocol has that channel
     refused at admission, with a reason, instead of failing on first preview.
+
+    Two optional extensions are discovered the same way, never required:
+
+    - ``min_sequence`` / ``after_monotonic`` keywords on ``read_frame`` -- freshness
+      bounds: wait for a capture newer than the given sequence or monotonic instant,
+      raising ``TransportError(failure_code="frame_timeout")`` when none arrives. A
+      caller asking for freshness from a transport without them is refused, not
+      served a stale frame.
+    - ``frame_reads_concurrent = True`` -- the transport serves concurrent readers
+      from one producer, so a node may read frames outside the device's I/O lock.
     """
 
     async def read_frame(

@@ -28,7 +28,6 @@ same device.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import math
 import time
@@ -37,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from leapflow.hardware.transport import FrameReading, FrameTransport, TransportError
+from leapflow.hardware.vision.frames import accepts_keyword as _accepts_keyword
 
 logger = logging.getLogger(__name__)
 
@@ -66,25 +66,8 @@ class _Lease:
     # lie for up to one capture interval, so profile is part of cache identity too.
     last_profile: tuple[float, int, int] | None = None
     viewers: dict[str, float] = field(default_factory=dict)
+    stream_stops: dict[str, set[asyncio.Event]] = field(default_factory=dict)
     last_capture_age_ms: float = 0.0
-
-
-def _accepts_keyword(callable_: Any, name: str) -> bool:
-    """Return whether a callable accepts *name* without executing it.
-
-    The FrameTransport Protocol is structural and third-party implementations predate the
-    optional cadence request. A missing optional keyword means "native cadence", not
-    "cannot make frames". If reflection is unavailable, stay conservative and omit it;
-    the broker's cached-frame interval still caps device work.
-    """
-    try:
-        parameters = inspect.signature(callable_).parameters.values()
-    except (TypeError, ValueError):
-        return False
-    return any(
-        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters
-    )
 
 
 class PreviewBroker:
@@ -124,6 +107,25 @@ class PreviewBroker:
         so the caller can report a reason rather than a blank panel: an unknown device,
         a channel that carries no frames, or a transport that cannot produce them.
         """
+        reading = await self._frame(
+            device_id, channel_id, max_width=max_width, quality=quality, fps=fps,
+            viewer_id=viewer_id,
+        )
+        assert reading is not None, "a one-shot preview cannot be stopped as a stream"
+        return reading
+
+    async def _frame(
+        self,
+        device_id: str,
+        channel_id: str,
+        *,
+        max_width: int,
+        quality: int,
+        fps: float,
+        viewer_id: str,
+        stop: asyncio.Event | None = None,
+    ) -> FrameReading | None:
+        """Check stream lifetime under the same lock that releases its viewer."""
         context = self._registry.context(device_id)
         if context is None:
             raise TransportError(f"unknown device {device_id!r}", failure_code="unknown_device")
@@ -140,10 +142,14 @@ class PreviewBroker:
         key = (device_id, channel_id)
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
+            if stop is not None and stop.is_set():
+                return None
             lease = self._leases.get(key)
             if lease is None:
                 lease = self._open_lease(device_id, channel_id)
                 logger.info("Preview opened: %s.%s", device_id, channel_id)
+            if stop is not None:
+                lease.stream_stops.setdefault(self._viewer(viewer_id), set()).add(stop)
             self._touch(lease, viewer_id)
             self._ensure_sweeper()
 
@@ -168,48 +174,54 @@ class PreviewBroker:
                 lease.frames_served += 1
                 return lease.last_frame
 
-            transport = await self._registry.transport(device_id)
-            if not isinstance(transport, FrameTransport):
-                # The capability check the admission rules cannot make: building a
-                # transport is what reveals whether it implements the frame protocol,
-                # and admission must not build one.
-                raise TransportError(
-                    f"the transport for {device_id!r} ({context.transport.kind!r}) cannot "
-                    "produce frames, although the declaration says the channel carries them",
-                    failure_code="transport_not_frame_capable",
-                )
-            kwargs = {
-                "max_width": profile[1],
-                "quality": profile[2],
-            }
-            # ``fps`` was added as an optional FrameTransport capability after the original
-            # side protocol shipped. Existing third-party transports remain frame-capable:
-            # they simply receive the already rate-limited call and keep their own native
-            # cadence. Introspection is deliberate here -- catching TypeError would also
-            # hide a TypeError *inside* a driver and call it compatibility.
-            if _accepts_keyword(transport.read_frame, "fps"):
-                kwargs["fps"] = effective_fps
-            # Serialised on the device's own I/O lock, exactly as a scalar read, a write and
-            # the sampling loop are. ``MediaTransport`` happens to hold an internal lock of
-            # its own, which is why the absence of this was invisible in tree -- but a
-            # third-party ``FrameTransport`` sharing a bus with a scalar channel had no such
-            # protection, and a shared bus is a single conversation: two coroutines
-            # interleaving request and response frames yields a plausible reading carrying
-            # the wrong channel's value.
-            #
-            # Lock order is the same one ``_release`` uses -- this per-channel lock first,
-            # then ``device_io`` -- so the two cannot deadlock against each other. No path
-            # takes them the other way round: every caller that holds ``device_io``
-            # (hw_read, the sampling loop, request_hardware_reading) reaches a transport
-            # directly and never asks the broker for anything.
-            async with self._registry.device_io(device_id):
-                reading = await transport.read_frame(channel_id, **kwargs)
+            reading = await self._read_frame(device_id, channel_id, context, profile)
             lease.last_frame = reading
             lease.last_capture_at = time.monotonic()
             lease.last_capture_age_ms = max(0.0, (time.time() - reading.observed_at) * 1000.0)
             lease.last_profile = profile
             lease.frames_served += 1
             return reading
+
+    async def _read_frame(
+        self, device_id: str, channel_id: str, context: Any, profile: tuple[float, int, int]
+    ) -> FrameReading:
+        """Execute a bounded frame read while the caller holds the channel lease lock."""
+        transport = await self._registry.transport(device_id)
+        if not isinstance(transport, FrameTransport):
+            # The capability check the admission rules cannot make: building a
+            # transport is what reveals whether it implements the frame protocol,
+            # and admission must not build one.
+            raise TransportError(
+                f"the transport for {device_id!r} ({context.transport.kind!r}) cannot "
+                "produce frames, although the declaration says the channel carries them",
+                failure_code="transport_not_frame_capable",
+            )
+        kwargs = {
+            "max_width": profile[1],
+            "quality": profile[2],
+        }
+        # ``fps`` was added as an optional FrameTransport capability after the original
+        # side protocol shipped. Existing third-party transports remain frame-capable:
+        # they simply receive the already rate-limited call and keep their own native
+        # cadence. Introspection is deliberate here -- catching TypeError would also
+        # hide a TypeError *inside* a driver and call it compatibility.
+        if _accepts_keyword(transport.read_frame, "fps"):
+            kwargs["fps"] = profile[0]
+        # Serialised on the device's own I/O lock, exactly as a scalar read, a write and
+        # the sampling loop are. ``MediaTransport`` happens to hold an internal lock of
+        # its own, which is why the absence of this was invisible in tree -- but a
+        # third-party ``FrameTransport`` sharing a bus with a scalar channel had no such
+        # protection, and a shared bus is a single conversation: two coroutines
+        # interleaving request and response frames yields a plausible reading carrying
+        # the wrong channel's value.
+        #
+        # Lock order is the same one ``_release`` uses -- this per-channel lock first,
+        # then ``device_io`` -- so the two cannot deadlock against each other. No path
+        # takes them the other way round: every caller that holds ``device_io``
+        # (hw_read, the sampling loop, request_hardware_reading) reaches a transport
+        # directly and never asks the broker for anything.
+        async with self._registry.device_io(device_id):
+            return await transport.read_frame(channel_id, **kwargs)
 
     async def stream(
         self,
@@ -231,19 +243,30 @@ class PreviewBroker:
         channel = context.channel(channel_id) if context is not None else None
         effective_fps = self._effective_fps(channel, fps) if channel is not None else 0.0
         interval = 1.0 / effective_fps if effective_fps > 0 else 0.1
+        stop = asyncio.Event()
         try:
-            while True:
-                yield await self.frame(
+            while not stop.is_set():
+                frame = await self._frame(
                     device_id,
                     channel_id,
                     max_width=max_width,
                     quality=quality,
                     fps=fps,
                     viewer_id=viewer_id,
+                    stop=stop,
                 )
-                await asyncio.sleep(interval)
+                if frame is None:
+                    return
+                yield frame
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=interval)
+                except TimeoutError:
+                    pass
         finally:
-            await self.release(device_id, channel_id, viewer_id=viewer_id, reason="stream_closed")
+            # An explicit release may already have retired this viewer. Its old stream
+            # must not remove a freshly reopened viewer that happens to reuse the id.
+            if not stop.is_set():
+                await self.release(device_id, channel_id, viewer_id=viewer_id, reason="stream_closed")
 
     async def observe(self, device_id: str, channel_id: str, *, viewer_id: str = "") -> None:
         """Register a scalar preview owner without opening/reading its transport."""
@@ -271,7 +294,10 @@ class PreviewBroker:
             lease = self._leases.get(key)
             if lease is None:
                 return {"released": False, "active_viewers": 0}
-            lease.viewers.pop(self._viewer(viewer_id), None)
+            viewer = self._viewer(viewer_id)
+            for stop in lease.stream_stops.pop(viewer, ()):
+                stop.set()
+            lease.viewers.pop(viewer, None)
             if lease.viewers:
                 lease.last_request_at = max(lease.viewers.values())
                 return {"released": False, "active_viewers": len(lease.viewers)}
@@ -358,6 +384,8 @@ class PreviewBroker:
                         viewer for viewer, seen_at in lease.viewers.items() if seen_at <= cutoff
                     ]
                     for viewer in stale:
+                        for stop in lease.stream_stops.pop(viewer, ()):
+                            stop.set()
                         lease.viewers.pop(viewer, None)
                     if not lease.viewers:
                         await self._release(key, reason="idle_timeout")
@@ -372,6 +400,9 @@ class PreviewBroker:
         lease = self._leases.pop(key, None)
         if lease is None:
             return
+        for stops in lease.stream_stops.values():
+            for stop in stops:
+                stop.set()
         logger.info(
             "Preview released (%s): %s.%s (%d frame(s) served)",
             reason,

@@ -41,7 +41,6 @@ import asyncio
 import base64
 import hashlib
 import hmac
-import inspect
 import json
 import logging
 import uuid
@@ -60,6 +59,7 @@ from leapflow.hardware.lhp.authority import (
 )
 from leapflow.hardware.lhp.control_sessions import NodeSessions
 from leapflow.hardware.lhp.params import (
+    freshness_bounds,
     optional_float,
     optional_int,
     require_channel_ids,
@@ -68,6 +68,7 @@ from leapflow.hardware.lhp.params import (
 )
 from leapflow.hardware.lhp.protocol import (
     CAP_CONTROL_V1,
+    CAP_FRAME_FRESHNESS_V1,
     CAP_PERMIT_V1,
     CAP_SKILL_V1,
     ERR_BAD_REQUEST,
@@ -109,6 +110,7 @@ from leapflow.hardware.transport import (
     WriteOutcome,
 )
 from leapflow.hardware.attestation import declaration_payload
+from leapflow.hardware.vision.frames import accepts_keyword as _accepts_keyword
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +283,8 @@ class LhpNodeServer:
         if verifier is not None:
             caps.append(CAP_PERMIT_V1)
         caps.append(CAP_CONTROL_V1)
+        if protocol >= 2:
+            caps.append(CAP_FRAME_FRESHNESS_V1)
         if self._skill_runtime is not None:
             caps.append(CAP_SKILL_V1)
         result: dict[str, Any] = {
@@ -363,24 +367,13 @@ class LhpNodeServer:
         max_width = optional_int(params, "max_width", upper=MAX_FRAME_WIDTH)
         quality = optional_int(params, "quality", upper=100)
         fps = optional_float(params, "fps", upper=MAX_FRAME_RATE_HZ)
-        async with self._registry.device_io(device_id):
-            transport = await self._registry.transport(device_id)
-            if not isinstance(transport, FrameTransport):
-                raise LhpProtocolError(
-                    f"transport for {device_id!r} cannot produce frames",
-                    code=ERR_UNSUPPORTED_CAPABILITY,
-                )
-            frame_kwargs: dict[str, Any] = {
-                "max_width": max_width,
-                "quality": quality,
-            }
-            # ``fps`` postdates the original FrameTransport side protocol. Preserve
-            # structural compatibility with third-party transports while keeping a
-            # TypeError raised inside a driver visible as a real internal defect.
-            if _accepts_keyword(transport.read_frame, "fps"):
-                frame_kwargs["fps"] = fps
-            frame = await transport.read_frame(channel_id, **frame_kwargs)
-            self._hold_frame(device_id, channel_id)
+        freshness = freshness_bounds(params)
+        frame = await self._read_held_frame(
+            device_id,
+            channel_id,
+            {"max_width": max_width, "quality": quality, "fps": fps},
+            freshness,
+        )
         verify_reading_identity(frame, device_id, channel_id)
         data = getattr(frame, "data", None)
         if not isinstance(data, (bytes, bytearray)) or not data:
@@ -407,6 +400,43 @@ class LhpNodeServer:
         payload = frame.to_metadata()
         payload["data_b64"] = base64.b64encode(bytes(data)).decode("ascii")
         return payload
+
+    async def _read_held_frame(
+        self,
+        device_id: str,
+        channel_id: str,
+        request: Mapping[str, Any],
+        freshness: Mapping[str, Any],
+    ) -> Any:
+        """Read one frame for this connection, holding the device for it.
+
+        A transport declaring ``frame_reads_concurrent`` serves many readers from one
+        producer (a frame hub, a latest-frame pump), so only resolving the transport
+        and recording the hold need the device's I/O lock: the read itself runs
+        outside it. Otherwise a preview poll waiting on a fresh frame would stall a
+        node-local skill's grasp capture on the same camera for a whole frame period,
+        which is exactly the serialisation the hub exists to remove. The hold comes
+        first so the transport cannot be released between lock and read; it stays
+        even if the read fails, because the connection still consumes the channel
+        and ``release_frame`` or disconnect ends it.
+        """
+        async with self._registry.device_io(device_id):
+            transport = await self._registry.transport(device_id)
+            if not isinstance(transport, FrameTransport):
+                raise LhpProtocolError(
+                    f"transport for {device_id!r} cannot produce frames",
+                    code=ERR_UNSUPPORTED_CAPABILITY,
+                )
+            kwargs = _frame_kwargs(transport, request, freshness)
+            concurrent = bool(getattr(transport, "frame_reads_concurrent", False)) and callable(
+                getattr(self._registry, "hold", None)
+            )
+            if not concurrent:
+                frame = await transport.read_frame(channel_id, **kwargs)
+                self._hold_frame(device_id, channel_id)
+                return frame
+            self._hold_frame(device_id, channel_id)
+        return await transport.read_frame(channel_id, **kwargs)
 
     async def _handle_release_frame(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Release this connection's claim on a node-local frame channel.
@@ -519,7 +549,11 @@ class LhpNodeServer:
             status = await transport.probe()
         except TransportError as exc:
             return TransportStatus(connected=False, halt_supported=False, detail=str(exc)).to_dict()
-        return status.to_dict()
+        payload = status.to_dict()
+        hub = (status.metadata or {}).get("frame_hub")
+        if isinstance(hub, Mapping) and hub:
+            payload["frame_hub"] = dict(hub)  # pump health for the host's monitor; JSON-safe
+        return payload
 
     async def _handle_halt(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Stop a device now, over the link that is already open.
@@ -815,16 +849,27 @@ def _wire_context(context: HardwareContext) -> dict[str, Any]:
     return payload
 
 
-def _accepts_keyword(callable_: Any, name: str) -> bool:
-    """Return whether a frame callable accepts an optional keyword."""
-    try:
-        parameters = inspect.signature(callable_).parameters.values()
-    except (TypeError, ValueError):
-        return False
-    return any(
-        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters
-    )
+def _frame_kwargs(
+    transport: Any, request: Mapping[str, Any], freshness: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Build the keywords one transport's ``read_frame`` can honour.
+
+    ``fps`` postdates the original ``FrameTransport`` side protocol and is dropped
+    for a transport that cannot take it, preserving structural compatibility while
+    a ``TypeError`` raised inside a driver stays visible as a real defect. A
+    freshness bound is different: silently dropping it would return a stale frame
+    to a caller that asked for a fresh one, so it is refused instead.
+    """
+    kwargs: dict[str, Any] = {"max_width": request["max_width"], "quality": request["quality"]}
+    if _accepts_keyword(transport.read_frame, "fps"):
+        kwargs["fps"] = request["fps"]
+    for name, value in freshness.items():
+        if not _accepts_keyword(transport.read_frame, name):
+            raise LhpProtocolError(
+                f"frame transport cannot honour {name!r}", code=ERR_UNSUPPORTED_CAPABILITY
+            )
+        kwargs[name] = value
+    return kwargs
 
 
 async def _send_frame(

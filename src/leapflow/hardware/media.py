@@ -118,6 +118,7 @@ class _LinuxVideoCandidate:
     spec: str
     parent_key: str
     driver: str
+    usb_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,7 @@ class MediaDevice:
     ``spec`` is the platform's own input identifier (an AVFoundation index, a V4L2
     path, a DirectShow name). It is carried verbatim rather than reformatted so the
     capture backend hands the platform exactly what the platform named.
+    ``usb_id`` is ``vid:pid`` (lowercase hex) when the platform publishes it.
     """
 
     kind: str
@@ -135,6 +137,7 @@ class MediaDevice:
     spec: str
     input_format: str
     device_class: str = ""
+    usb_id: str = ""
 
     @property
     def device_id(self) -> str:
@@ -168,6 +171,11 @@ def enumerate_devices(config: Mapping[str, Any] | None = None) -> tuple[MediaDev
     screen" on the board beside the webcam, at one click. It remains available
     (``include_screens``) because it is a legitimate capability -- it is the default
     that should not make the decision for anyone.
+
+    ``exclude_usb`` lists USB identities (``vid`` or ``vid:pid``) whose video nodes a
+    dedicated driver owns -- a depth camera's UVC endpoints, say. Listing those as
+    generic cameras would put a second, competing opener of the same hardware on the
+    board.
     """
     config = config or {}
     enumerator = _ENUMERATORS.get(sys.platform) or _ENUMERATORS.get("linux")
@@ -181,14 +189,25 @@ def enumerate_devices(config: Mapping[str, Any] | None = None) -> tuple[MediaDev
 
     include_screens = bool(config.get("include_screens", False))
     include_microphones = bool(config.get("include_microphones", True))
+    excluded = usb_exclusions(config.get("exclude_usb"))
     selected = []
     for device in devices:
         if device.kind == SCREEN and not include_screens:
             continue
         if device.kind == MICROPHONE and not include_microphones:
             continue
+        if device.usb_id and any(
+            device.usb_id == item or device.usb_id.startswith(f"{item}:") for item in excluded
+        ):
+            continue
         selected.append(device)
     return tuple(selected)
+
+
+def usb_exclusions(raw: Any) -> tuple[str, ...]:
+    """Normalise ``exclude_usb`` (comma string or list) to lowercase ``vid[:pid]`` items."""
+    items = raw.split(",") if isinstance(raw, str) else list(raw or ())
+    return tuple(str(item).strip().lower() for item in items if str(item).strip())
 
 
 def _enumerate_darwin() -> tuple[MediaDevice, ...]:
@@ -305,9 +324,19 @@ def _linux_video_devices(v4l: Path, dev_root: Path) -> tuple[MediaDevice, ...]:
                 spec=str(node),
                 parent_key=str(resolved.parent),
                 driver=(resolved / "device" / "driver").resolve().name,
+                usb_id=_usb_id(resolved),
             )
         )
     return _select_linux_video_candidates(tuple(candidates))
+
+
+def _usb_id(node: Path) -> str:
+    """``vid:pid`` of the USB device a sysfs video node hangs off, or ``""``."""
+    for ancestor in list(node.parents)[:5]:
+        vendor = _read_text(ancestor / "idVendor")
+        if vendor:
+            return f"{vendor}:{_read_text(ancestor / 'idProduct')}".lower()
+    return ""
 
 
 def _select_linux_video_candidates(
@@ -349,6 +378,7 @@ def _select_linux_video_candidates(
                 spec=candidate.spec,
                 input_format="v4l2",
                 device_class=CAMERA,
+                usb_id=candidate.usb_id,
             )
         )
     return tuple(devices)

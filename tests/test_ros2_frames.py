@@ -216,13 +216,73 @@ def test_read_frame_returns_the_latest_image_with_its_topic_and_age() -> None:
     assert frame.metadata["age_s"] < 1.0
 
 
-def test_an_old_image_is_reported_stale_rather_than_live() -> None:
+def test_an_old_image_is_reported_stale_rather_than_live(monkeypatch: pytest.MonkeyPatch) -> None:
     transport = _open_transport(**{_COLOR: _compressed(_jpeg(8, 8))})
-    transport._msg_timestamps[_COLOR] -= 10.0  # noqa: SLF001 - the publisher stopped
+    monkeypatch.setattr(ros2_module, "_STALE_THRESHOLD_S", 0.0)  # every image is now "old"
 
     frame = asyncio.run(transport.read_frame(_COLOR))
 
     assert frame.quality == "stale"
+
+
+def test_frame_sequence_counts_messages_and_each_size_is_encoded_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two viewers of one message see one sequence number and share one encode."""
+    calls: list[int] = []
+    real_encode = ros2_module.ros2_image.encode_preview
+
+    def counting_encode(msg: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs["max_width"])
+        return real_encode(msg, **kwargs)
+
+    monkeypatch.setattr(ros2_module.ros2_image, "encode_preview", counting_encode)
+    transport = _open_transport(**{_COLOR: _compressed(_jpeg(64, 48))})
+
+    async def scenario() -> list[Any]:
+        return [await transport.read_frame(_COLOR, max_width=32) for _ in range(3)]
+
+    frames = asyncio.run(scenario())
+
+    assert {frame.sequence for frame in frames} == {1}
+    assert calls == [32]
+    asyncio.run(transport.close())
+
+
+def test_min_sequence_waits_for_the_next_message_on_the_topic() -> None:
+    transport = _open_transport(**{_COLOR: _compressed(_jpeg(8, 8))})
+
+    async def scenario() -> tuple[Any, Any]:
+        first = await transport.read_frame(_COLOR)
+        asyncio.get_running_loop().call_later(
+            0.05, transport._msg_callback, _COLOR, _compressed(_jpeg(8, 8))  # noqa: SLF001
+        )
+        second = await transport.read_frame(_COLOR, min_sequence=first.sequence + 1)
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert second.sequence == first.sequence + 1
+    assert second.monotonic_at > first.monotonic_at
+    asyncio.run(transport.close())
+
+
+def test_probe_reports_image_topic_pump_health_until_close() -> None:
+    transport = _open_transport(**{_COLOR: _compressed(_jpeg(8, 8))})
+    asyncio.run(transport.read_frame(_COLOR))
+
+    status = asyncio.run(transport.probe())
+    pump = status.metadata["frame_hub"]
+
+    assert pump["running"] is True and pump["pumps"] == 1
+    assert pump["sequence"] == 1 and pump["frame_age_ms"] is not None
+    asyncio.run(transport.close())
+    transport._node, transport._connected = object(), True  # noqa: SLF001 - probe a reopen
+    assert asyncio.run(transport.probe()).metadata["frame_hub"] == {}
+
+
+def test_the_ros2_transport_reads_frames_outside_the_device_lock() -> None:
+    assert ROS2Transport.frame_reads_concurrent is True
 
 
 def test_a_silent_topic_is_a_typed_unavailable_failure(monkeypatch: pytest.MonkeyPatch) -> None:

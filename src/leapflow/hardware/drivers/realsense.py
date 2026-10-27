@@ -62,6 +62,7 @@ from leapflow.hardware.transport import (
     WriteOutcome,
 )
 from leapflow.hardware.vision import FrameHub, Frameset
+from leapflow.hardware.vision.encoding import PlaneEncoder, build_encoder
 
 async def _worker(function: Any, *args: Any, **kwargs: Any) -> Any:
     """Cancellation cannot release pipeline ownership while a worker is running."""
@@ -113,11 +114,25 @@ class RealSenseTransport:
     """
 
     kind = "realsense"
+    frame_reads_concurrent = True
+    """Every reader is served by the one frame hub, so reads need no device I/O lock."""
 
     def __init__(self, config: Mapping[str, Any] | None = None, *,
                  processor: RgbdProcessor | None = None,
-                 geometry_processor: GeometryProcessor | None = None) -> None:
+                 geometry_processor: GeometryProcessor | None = None,
+                 preview_encoder: PlaneEncoder | None = None) -> None:
         config = dict(config or {})
+        if preview_encoder is not None and not isinstance(preview_encoder, PlaneEncoder):
+            raise TransportError("preview encoder must implement PlaneEncoder",
+                                 failure_code="preview_encoder_invalid")
+        self._preview_encoder = preview_encoder
+        self._preview_encoder_kind = str(config.get(
+            "preview_encoder", "injected" if preview_encoder is not None else "pillow"
+        ))
+        self._preview_depth = str(config.get("preview_depth", "aligned"))
+        if self._preview_depth not in {"aligned", "native"}:
+            raise TransportError("preview_depth must be 'aligned' or 'native'",
+                                 failure_code="preview_config_invalid")
         self._session_id = uuid.uuid4().hex
         self._frame_timeout_ms = max(1, int(config.get("frame_timeout_ms", 5000)))
         self._frame_buffer = max(1, int(config.get("frame_buffer", 2)))
@@ -178,6 +193,8 @@ class RealSenseTransport:
         self._session_id = uuid.uuid4().hex
         try:
             self._sdk = _load_sdk()
+            if self._preview_encoder is None and self._preview_encoder_kind != "pillow":
+                self._preview_encoder = await _worker(build_encoder, self._preview_encoder_kind)
             await _worker(self._start_pipeline)
         except asyncio.CancelledError:
             # _worker has drained startup. Release any completed pipeline while
@@ -305,11 +322,14 @@ class RealSenseTransport:
         quality: int = 0,
         fps: float = 0.0,
         min_sequence: int = 0,
+        after_monotonic: float | None = None,
     ) -> FrameReading:
-        """Encode one preview of the newest frameset (at least ``min_sequence``).
+        """Encode one preview of the newest frameset satisfying the freshness bounds.
 
-        ``fps`` is accepted for the frame contract; the camera streams at its
-        declared rate whatever a viewer asks, and callers pace their own reads.
+        ``min_sequence`` and ``after_monotonic`` (this process's monotonic clock)
+        wait for a frameset at least that new. ``fps`` is accepted for the frame
+        contract; the camera streams at its declared rate whatever a viewer asks,
+        and callers pace their own reads.
         """
         self._require_open(channel_id)
         plane = _PLANES.get(channel_id)
@@ -317,15 +337,19 @@ class RealSenseTransport:
             raise TransportError(
                 f"channel {channel_id!r} is not a preview channel", failure_code="unknown_channel"
             )
-        hub, frames, frameset = await self._frameset(channel_id, min_sequence=min_sequence)
+        hub, frames, frameset = await self._frameset(
+            channel_id, min_sequence=min_sequence, after_monotonic=after_monotonic
+        )
         try:
             source = frameset.native
-            if plane == PLANE_DEPTH:
+            if plane == PLANE_DEPTH and self._preview_depth == "aligned":
                 source = await self._aligned(hub, frames, frameset)
             encoded, frame_number, timestamp_ms = await hub.view(
                 frameset,
                 ("jpeg", plane, int(max_width or 0), int(quality or 0)),
-                lambda _: _encode(frames, source, plane, max_width, quality),
+                lambda _: _encode(frames, source, plane, max_width, quality,
+                                  encoder=self._preview_encoder,
+                                  native_depth=self._preview_depth == "native"),
             )
         except TransportError:
             raise
@@ -339,8 +363,12 @@ class RealSenseTransport:
             "sdk_timestamp_ms": timestamp_ms,
             "session_id": self._session_id,
             "depth_scale_m": self._depth_scale,
-            "aligned_to_color": bool(plane == PLANE_DEPTH and frames.aligns),
+            "aligned_to_color": bool(plane == PLANE_DEPTH and frames.aligns
+                                     and self._preview_depth == "aligned"),
+            "preview_depth": self._preview_depth,
+            "preview_encoder": self._preview_encoder_kind,
             "active_profile": dict(self._active_profile),
+            **dict(encoded.metadata),
         }
         self._last_frame_metadata = metadata
         return FrameReading(
@@ -357,12 +385,14 @@ class RealSenseTransport:
             metadata=metadata,
         )
 
-    async def capture_rgbd(self) -> RgbdFrame:
-        """Colour with depth aligned to it, from a frameset that arrived after this call.
+    async def capture_rgbd(self, *, after_monotonic: float | None = None) -> RgbdFrame:
+        """Colour with depth aligned to it, from a frameset newer than *after_monotonic*.
 
         Freshness is a condition on the shared stream, not a capture of its own: a
         caller asking "after my arm stopped" waits for the next frameset instead of
-        taking one from a concurrent preview.
+        taking one from a concurrent preview. The default bound is the call itself;
+        a capture group passes one shared instant so every camera answers the same
+        question.
         """
         self._require_open("rgbd")
         if self._align is None:
@@ -370,7 +400,8 @@ class RealSenseTransport:
                 "RGB-D capture needs align_depth_to_color: true in the declaration",
                 failure_code="realsense_not_aligned",
             )
-        hub, frames, frameset = await self._frameset("rgbd", after_monotonic=time.monotonic())
+        bound = time.monotonic() if after_monotonic is None else float(after_monotonic)
+        hub, frames, frameset = await self._frameset("rgbd", after_monotonic=bound)
         try:
             aligned = await self._aligned(hub, frames, frameset)
             return await hub.view(frameset, "rgbd", lambda fs: self._capture_rgbd(fs, aligned))
@@ -666,11 +697,13 @@ class RealSenseTransport:
 
 
 def _encode(
-    frames: RealSenseFrames, source: Any, plane: str, max_width: int, quality: int
+    frames: RealSenseFrames, source: Any, plane: str, max_width: int, quality: int,
+    *, encoder: PlaneEncoder | None = None, native_depth: bool = False,
 ) -> tuple[EncodedPreview, int, float]:
     """One plane as a bounded JPEG, with the SDK identity of the frame it came from."""
-    image = frames.plane(source, plane)
-    encoded = encode_preview(image, max_width=int(max_width or 0), quality=int(quality or 0))
+    image = frames.plane(source, plane, colorize_depth=not native_depth)
+    encode = encoder.encode if encoder is not None else encode_preview
+    encoded = encode(image, max_width=int(max_width or 0), quality=int(quality or 0))
     return encoded, image.frame_number, image.timestamp_ms
 
 

@@ -371,10 +371,11 @@ the same `hardware.write_request` path described above.
 | `hardware.host_include` / `_exclude` | empty | channel-id **prefixes**, because mounts and interfaces are discovered |
 | `hardware.media_screens` | `false` | enumerate displays as previewable devices |
 | `hardware.media_microphones` | `true` | level only, never audio |
-| `hardware.preview_max_fps` | `12.0` | hard ceiling; the page defaults to Balanced at 8fps |
+| `hardware.media_exclude_usb` | empty | USB `vid` / `vid:pid` list whose video nodes a dedicated driver owns (e.g. `8086` for RealSense UVC endpoints); Linux only |
+| `hardware.preview_max_fps` | `30.0` | hard ceiling; the page defaults to Balanced at 8fps |
 | `hardware.preview_max_width` | `1280` | hard ceiling; Balanced requests 960px, height follows aspect ratio |
 | `hardware.preview_quality` | `85` | hard JPEG-quality ceiling; Balanced requests 75 |
-| `hardware.preview_idle_timeout_s` | `15.0` | silence after which the device is released |
+| `hardware.preview_idle_timeout_s` | `5.0` | silence after which the device is released |
 | `hardware.rediscover_interval_s` | `0` (off) | automatic rediscovery; runs on the monitor cadence, never on a turn |
 
 All of `hardware.*` is restart-required: providers run at startup and the preview broker
@@ -410,7 +411,93 @@ never reaches anything.
 
 ---
 
-## 9. Out of scope
+## 9. Shared vision and optional ROS distribution
+
+### One opener, multiple consumers
+
+`FrameHub` retains the latest framesets from a `FrameProducer` (a runtime-checkable
+Protocol: `grab(timeout_s)` and `capabilities()`). RealSense and media transports use
+one pump per open source. Acquisition is independent of JPEG viewers; derived views
+are computed once per frameset/key on a bounded worker pool outside lifecycle locks.
+The registry's holds govern lifetime; its device I/O locks govern serialization.
+LHP disconnects release only that connection's holds. The last hold releases the source.
+
+`read_frame` optionally accepts `min_sequence` and `after_monotonic`. The latter is
+valid only in the source process. Across LHP use `max_age_ms`, evaluated against the
+node's own clock, and `min_sequence`; an impossible bound returns `frame_timeout`.
+`capture_rgbd` retains aligned raw depth, calibration and intrinsics and waits for a
+post-call frameset by default. Frame timestamps are process receipt timestamps, not
+proof of simultaneous exposure. `CaptureGroup` shares one freshness bound, captures
+members concurrently and reports timestamp skew; it does not manufacture hardware sync.
+
+Pump snapshots feed `FrameHealthTracker` through `HardwareHealthMonitor` into the
+existing typed hardware signal pipeline. Stale delivery, settled recovery and sample
+loss are metadata signals; image payloads are not added to LLM context or scalar history.
+
+### Optional display encoder
+
+Pillow and aligned SDK-colorized depth remain the defaults. To reduce display work
+competing with aligned task observations, install `leapflow[vision]` (or the existing
+`robot` extra) and opt in per RealSense declaration:
+
+```yaml
+transport:
+  kind: realsense
+  config:
+    serial_number: "<SDK serial>"
+    align_depth_to_color: true
+    preview_encoder: opencv
+    preview_depth: native
+```
+
+These options affect **JPEG previews only**, never task RGB-D. Native depth retains its
+own image geometry and reports `aligned_to_color: false`; it must not be overlaid onto
+color for measurement. OpenCV renders 16-bit depth with a per-frame cumulative-histogram
+JET map: near blue, far red, missing depth black. Colors indicate rank, not metric range.
+Pillow/native is also supported, using the existing grayscale depth visualization.
+A missing selected encoder is a typed `preview_encoder_unavailable` error before the
+SDK pipeline starts; selecting `pillow` restores the portable path.
+
+Third-party thread-safe encoders implement `PlaneEncoder.encode(plane, *, max_width,
+quality)` and register a zero-argument factory in `leapflow.hardware.vision_encoders`.
+Built-in names take precedence. The input buffer is borrowed only for that synchronous
+call; returned JPEG bytes are owned by the result.
+
+### ROS 2 is an adapter, not a second camera owner
+
+With **LeapFlow ownership**, an explicit LHP sidecar publishes bounded
+`sensor_msgs/CompressedImage` previews without opening the camera itself. Run it in
+an interpreter that has both LeapFlow's base dependencies and that ROS distribution's
+`rclpy`/`sensor_msgs`; merely adding `src` to `PYTHONPATH` does not install dependencies.
+There is no pip `rclpy` extra and no dependency on one ROS release in the vision core.
+For example, in a ROS-compatible environment:
+
+```bash
+source /opt/ros/<distro>/setup.bash
+export ROS_LOCALHOST_ONLY=1
+python -m leapflow.hardware.vision.ros_bridge \
+  --endpoint tcp://127.0.0.1:8767 --device camera_front \
+  --channel camera.color.preview --token-file /path/to/private-token \
+  --max-width 640 --quality 70 --fps 8
+```
+
+The default topic is `/leapflow/<device>/<channel/path>/compressed`. Authorization
+uses the ordinary node boundary; stop/disconnect releases the sidecar's holds. Topic
+subscribers cannot independently be gated by LeapFlow, so operator-approved ROS egress
+must remain local or be protected by deployment-level DDS/SROS2 controls. Do not use
+this preview bridge as raw metric depth or `CameraInfo` delivery: those are not implemented.
+
+With **ROS-driver ownership**, keep the camera closed in LeapFlow's SDK transport and
+use `ROS2Transport`/`RosImageProducer` to consume image topics into per-topic hubs.
+This ingress supports previews, not calibrated raw `capture_rgbd` for robot skills.
+Never run both openers for one camera. Humble integration has been exercised; a future
+Lyrical migration still requires a supported OS/interpreter and deployment verification.
+No OS/JetPack upgrade, middleware switch, hardware trigger synchronization, shared-memory
+transport or GPU codec is implied by these adapters.
+
+---
+
+## 10. Out of scope
 
 - **Audio playback.** A microphone exposes an input level scalar. A recording is a
   different capability with a different consequence, and this must not quietly become

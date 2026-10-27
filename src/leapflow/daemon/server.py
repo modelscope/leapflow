@@ -79,6 +79,8 @@ class UnixRpcServer:
         self._on_shutdown = on_shutdown
         self._server: asyncio.AbstractServer | None = None
         self._active_connections = 0
+        self._connections: dict[asyncio.Task[Any], asyncio.StreamWriter] = {}
+        self._stopping = False
         if hasattr(service, "set_client_count_provider"):
             service.set_client_count_provider(lambda: self._active_connections)
         if hasattr(service, "set_client_lease_provider"):
@@ -119,17 +121,29 @@ class UnixRpcServer:
         )
         write_pid_file(self._runtime_dir)
         try:
-            async with self._server:
-                await self._server.serve_forever()
+            await self._server.serve_forever()
         except asyncio.CancelledError:
             raise
         finally:
             transport.cleanup(self._runtime_dir)
 
     async def stop(self) -> None:
-        """Stop accepting clients and close the listening socket."""
+        """Close client lifetimes before waiting for the listening server to drain."""
+        self._stopping = True
         if self._server is not None:
             self._server.close()
+        # Python 3.12+ wait_closed also waits for accepted connections. Closing
+        # only the listener leaves an idle TUI subscription holding shutdown open.
+        current = asyncio.current_task()
+        tasks = []
+        for task, writer in list(self._connections.items()):
+            writer.close()
+            if task is not current:
+                task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if self._server is not None:
             await self._server.wait_closed()
         get_transport().cleanup(self._runtime_dir)
 
@@ -138,8 +152,13 @@ class UnixRpcServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self._connections[task] = writer
         self._active_connections += 1
         try:
+            if self._stopping:
+                return
             while not reader.at_eof():
                 raw = await reader.readline()
                 if not raw:
@@ -147,6 +166,7 @@ class UnixRpcServer:
                 await self._handle_line(raw, writer)
         finally:
             self._active_connections -= 1
+            self._connections.pop(task, None)
             await _close_writer(writer)
 
     async def _handle_line(self, raw: bytes, writer: asyncio.StreamWriter) -> None:
@@ -255,51 +275,41 @@ class UnixRpcServer:
         """
         task = asyncio.ensure_future(coro)
         approval_get: asyncio.Task[Any] | None = None
-        while True:
-            wait_set: set[asyncio.Task[Any]] = {task}
-            if approval_queue is not None:
-                if approval_get is None or approval_get.done():
-                    approval_get = asyncio.create_task(approval_queue.get())
-                wait_set.add(approval_get)
-            done, _ = await asyncio.wait(
-                wait_set,
-                timeout=self._stream_heartbeat_s,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if approval_get is not None and approval_get in done:
-                chunk = approval_get.result()
-                approval_get = None
-                try:
+        try:
+            while True:
+                wait_set: set[asyncio.Task[Any]] = {task}
+                if approval_queue is not None:
+                    if approval_get is None or approval_get.done():
+                        approval_get = asyncio.create_task(approval_queue.get())
+                    wait_set.add(approval_get)
+                done, _ = await asyncio.wait(
+                    wait_set,
+                    timeout=self._stream_heartbeat_s,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if approval_get is not None and approval_get in done:
+                    chunk = approval_get.result()
+                    approval_get = None
                     await _write_json(writer, chunk.to_notification().to_json())
-                except (ConnectionResetError, BrokenPipeError):
-                    task.cancel()
-                    try:
-                        await task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    raise
-                continue
-            if task in done:
-                if approval_get is not None and not approval_get.done():
-                    approval_get.cancel()
-                return task.result()
-            # Send heartbeat to keep client connection alive
-            heartbeat = StreamChunk(
-                request_id=request_id,
-                content="",
-                event_type="status",
-                metadata={"heartbeat": True},
-            ).to_notification()
-            try:
+                    continue
+                if task in done:
+                    return task.result()
+                # Send heartbeat to keep client connection alive
+                heartbeat = StreamChunk(
+                    request_id=request_id,
+                    content="",
+                    event_type="status",
+                    metadata={"heartbeat": True},
+                ).to_notification()
                 await _write_json(writer, heartbeat.to_json())
-            except (ConnectionResetError, BrokenPipeError):
-                # Client disconnected; cancel the handler and re-raise
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                raise
+        finally:
+            # The request owns both children, including when shutdown cancels
+            # the connection while a handler is awaiting consent or external I/O.
+            children = [child for child in (task, approval_get) if child is not None]
+            for child in children:
+                if not child.done():
+                    child.cancel()
+            await asyncio.gather(*children, return_exceptions=True)
 
     async def _dispatch_stream(
         self,
@@ -474,12 +484,14 @@ async def serve_daemon(settings: Any, *, mock_host: bool = False) -> int:
             await idle_task
         except asyncio.CancelledError:
             pass
+        # serve_forever itself awaits wait_closed when cancelled on Python
+        # 3.12+, so accepted clients must be closed before cancelling that task.
+        await server.stop()
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
-        await server.stop()
         await service.shutdown()
         cleanup_runtime_dir(runtime_dir)
     return 0

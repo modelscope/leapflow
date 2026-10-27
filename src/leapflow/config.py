@@ -257,6 +257,10 @@ class Settings:
     hardware_media_screens: bool = False
     # Enumerate microphones alongside cameras.
     hardware_media_microphones: bool = True
+    # Comma-separated USB identities ("vid" or "vid:pid", hex) whose video nodes a
+    # dedicated driver owns (e.g. "8086" for RealSense UVC endpoints); they are not
+    # listed as generic cameras, so the board never offers a second opener.
+    hardware_media_exclude_usb: str = ""
     # The broker enforces hard ceilings. The board's default is a balanced profile below
     # these limits (960px / 8fps / JPEG 75); Detail is 1280px / 30fps / JPEG 85. A viewer
     # can choose a profile for its own live preview but never exceed these caps, and no
@@ -1483,6 +1487,7 @@ def _build_settings_from_env(
     hardware_media_microphones = os.getenv(
         "LEAPFLOW_HARDWARE_MEDIA_MICROPHONES", "1"
     ).strip().lower() in ("1", "true", "yes")
+    hardware_media_exclude_usb = os.getenv("LEAPFLOW_HARDWARE_MEDIA_EXCLUDE_USB", "").strip()
     hardware_preview_max_fps = float(os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_FPS", "30") or 30.0)
     hardware_preview_max_width = int(
         os.getenv("LEAPFLOW_HARDWARE_PREVIEW_MAX_WIDTH", "1280") or 1280
@@ -2031,6 +2036,7 @@ def _build_settings_from_env(
         hardware_rediscover_interval_s=hardware_rediscover_interval_s,
         hardware_media_screens=hardware_media_screens,
         hardware_media_microphones=hardware_media_microphones,
+        hardware_media_exclude_usb=hardware_media_exclude_usb,
         hardware_preview_max_fps=hardware_preview_max_fps,
         hardware_preview_max_width=hardware_preview_max_width,
         hardware_preview_quality=hardware_preview_quality,

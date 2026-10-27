@@ -44,8 +44,26 @@ from leapflow.hardware.transport import (
     TransportStatus,
     WriteOutcome,
 )
+from leapflow.hardware.vision.frames import (
+    ACQUIRE_STREAMING,
+    ALIGN_NONE,
+    SYNC_NONE,
+    FrameCapabilities,
+)
+from leapflow.hardware.vision.hub import FAILURE_FRAME_TIMEOUT
 
 logger = logging.getLogger(__name__)
+
+_FRAME_CAPABILITIES = FrameCapabilities(
+    planes=("color",), alignment=ALIGN_NONE, sync=SYNC_NONE, acquisition=ACQUIRE_STREAMING
+)
+"""A media device delivers one compressed colour plane per capture cycle."""
+
+_FRESH_TIMEOUT_S = 3.0
+"""Floor on how long a freshness-bounded read waits for a newer capture."""
+
+_FRESH_POLL_S = 0.01
+"""Re-check interval while waiting; the grabber keeps only its newest frame."""
 
 _LEVEL_FLOOR_DBFS = -90.0
 """Reported level when a frame carries no signal, matching the declared envelope floor.
@@ -74,6 +92,8 @@ class MediaTransport:
     """Reads frames or levels from one local media device."""
 
     kind = "media"
+    frame_reads_concurrent = True
+    """Readers share one latest-frame grabber behind the transport's own lock."""
 
     def __init__(self, config: Mapping[str, Any] | None = None) -> None:
         config = config or {}
@@ -93,6 +113,10 @@ class MediaTransport:
         self._grabber: Any = None
         self._level_reader: Any = None
         self._sequence = 0
+        # Frame sequence counts *captures*, not reads: two viewers reading the same
+        # grabber frame see the same number, so ``min_sequence`` means "newer".
+        self._frame_sequence = 0
+        self._frame_mark: tuple[int, float] | None = None
         self._last_frame: FrameReading | None = None
         # One capture per transport, so two concurrent viewers of the same device share
         # the process rather than each claiming it -- a camera can only be opened once.
@@ -135,8 +159,28 @@ class MediaTransport:
                 "measuring": self._level_reader is not None,
                 "device_kind": self._device.kind,
                 "input_format": self._device.input_format,
+                "frame_sequence": self._frame_sequence,
+                "frame_capabilities": _FRAME_CAPABILITIES.to_dict(),
+                "frame_hub": self._pump_stats(),
             },
         )
+
+    def _pump_stats(self) -> dict[str, Any]:
+        """The grabber's health in ``FrameHub.stats()`` shape, so one tracker judges both.
+
+        Only a streaming grabber (one that stamps its newest frame) has a pump to
+        judge; a grab-on-demand backend reports nothing rather than a false stall.
+        """
+        grabber = self._grabber
+        if grabber is None or not hasattr(grabber, "captured_monotonic"):
+            return {}
+        captured = float(grabber.captured_monotonic or 0.0)
+        return {
+            "running": True,
+            "sequence": self._frame_sequence,
+            "fps": self._fps,
+            "frame_age_ms": round((time.monotonic() - captured) * 1000.0, 1) if captured else None,
+        }
 
     async def halt(self) -> TransportStatus:
         """Stop capture and report that there is nothing to emergency-stop.
@@ -190,7 +234,14 @@ class MediaTransport:
         )
 
     async def read_frame(
-        self, channel_id: str, *, max_width: int = 0, quality: int = 0, fps: float = 0.0
+        self,
+        channel_id: str,
+        *,
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        min_sequence: int = 0,
+        after_monotonic: float | None = None,
     ) -> FrameReading:
         """Capture one frame, starting the backend on first use and leaving it running.
 
@@ -198,6 +249,10 @@ class MediaTransport:
         honoured by restarting the backend when they change, because FFmpeg fixes all
         three at start: silently returning the prior encoder's output would make the page
         report a selected profile while spending a different profile's compute budget.
+
+        ``min_sequence`` / ``after_monotonic`` are the same freshness bounds a frame hub
+        honours: the read waits for a capture at least that new instead of returning
+        the frame a concurrent viewer already saw.
 
         The capture deliberately outlives the call, because this is the preview path and
         ``PreviewBroker`` owns that claim: its lease is what eventually releases the
@@ -207,7 +262,12 @@ class MediaTransport:
         self._require_open(channel_id)
         async with self._lock:
             return await self._capture_locked(
-                channel_id, max_width=max_width, quality=quality, fps=fps
+                channel_id,
+                max_width=max_width,
+                quality=quality,
+                fps=fps,
+                min_sequence=min_sequence,
+                after_monotonic=after_monotonic,
             )
 
     async def _read_frame_metadata(self, channel_id: str) -> FrameReading:
@@ -234,26 +294,47 @@ class MediaTransport:
                     await self._stop_grabber()
 
     async def _capture_locked(
-        self, channel_id: str, *, max_width: int, quality: int, fps: float
+        self,
+        channel_id: str,
+        *,
+        max_width: int,
+        quality: int,
+        fps: float,
+        min_sequence: int = 0,
+        after_monotonic: float | None = None,
     ) -> FrameReading:
-        """Grab the newest frame. The caller must hold ``self._lock``.
+        """Grab the newest frame satisfying the freshness bounds. Caller holds ``_lock``.
 
         The sequence number and the reading are produced inside the same hold as the
         capture, so two concurrent readers cannot label their frames out of order.
         """
         await self._ensure_grabber(max_width=max_width, quality=quality, fps=fps)
-        grabber = self._grabber
-        if grabber is None:  # pragma: no cover - _ensure_grabber raises instead
-            raise TransportError("capture unavailable", failure_code="capture_unavailable")
-        try:
-            data, width, height = await grabber.grab()
-        except MediaCaptureError as exc:
-            # The process is gone or unusable; drop it so the next attempt restarts
-            # rather than grabbing from a dead pipe forever.
-            await self._stop_grabber()
-            raise TransportError(str(exc), failure_code=exc.failure_code) from exc
+        deadline = time.monotonic() + max(_FRESH_TIMEOUT_S, 3.0 / max(0.1, self._fps))
+        while True:
+            grabber = self._grabber
+            if grabber is None:  # pragma: no cover - _ensure_grabber raises instead
+                raise TransportError("capture unavailable", failure_code="capture_unavailable")
+            try:
+                data, width, height = await grabber.grab()
+            except MediaCaptureError as exc:
+                # The process is gone or unusable; drop it so the next attempt restarts
+                # rather than grabbing from a dead pipe forever.
+                await self._stop_grabber()
+                raise TransportError(str(exc), failure_code=exc.failure_code) from exc
+            captured = float(getattr(grabber, "captured_monotonic", 0.0) or time.monotonic())
+            sequence = self._capture_sequence(grabber, captured)
+            fresh = sequence >= int(min_sequence) and (
+                after_monotonic is None or captured > float(after_monotonic)
+            )
+            if fresh:
+                break
+            if time.monotonic() >= deadline:
+                raise TransportError(
+                    f"no capture newer than the requested bound from {self._device.name!r}",
+                    failure_code=FAILURE_FRAME_TIMEOUT,
+                )
+            await asyncio.sleep(_FRESH_POLL_S)
 
-        self._sequence += 1
         reading = FrameReading(
             device_id=self._context.device_id if self._context is not None else "",
             channel_id=channel_id,
@@ -262,12 +343,25 @@ class MediaTransport:
             width=width,
             height=height,
             observed_at=float(getattr(grabber, "captured_at", 0.0) or time.time()),
-            monotonic_at=float(getattr(grabber, "captured_monotonic", 0.0) or time.monotonic()),
-            sequence=self._sequence,
+            monotonic_at=captured,
+            sequence=sequence,
             quality=Quality.OK.value,
         )
         self._last_frame = reading
         return reading
+
+    def _capture_sequence(self, grabber: Any, captured_monotonic: float) -> int:
+        """The sequence of the capture just grabbed, advancing only for a new one.
+
+        A grabber that keeps its newest frame hands the same one to every reader
+        until the next arrives; its capture stamp tells them apart. A grabber that
+        reports no stamp captures on every call, so each grab is new.
+        """
+        mark = (id(grabber), captured_monotonic)
+        if mark != self._frame_mark or not getattr(grabber, "captured_monotonic", 0.0):
+            self._frame_mark = mark
+            self._frame_sequence += 1
+        return self._frame_sequence
 
     async def write(self, channel_id: str, value: Any) -> WriteOutcome:
         """Refuse every write, proving no effect landed.

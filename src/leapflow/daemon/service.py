@@ -15,6 +15,7 @@ import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -1442,24 +1443,27 @@ class RuntimeLeapService:
 
         owner = viewer_id or uuid.uuid4().hex
         try:
-            async for frame in registry.preview_broker.stream(
+            # The relay owns the nested generator: closing at a yield must release now,
+            # not when async-generator finalization or the idle sweeper eventually runs.
+            async with aclosing(registry.preview_broker.stream(
                 device,
                 channel,
                 max_width=int(max_width or 0),
                 quality=int(quality or 0),
                 fps=float(fps or 0.0),
                 viewer_id=owner,
-            ):
-                yield StreamChunk(
-                    request_id="",
-                    content="",
-                    event_type="frame",
-                    metadata={
-                        **frame.to_metadata(),
-                        "data_b64": base64.b64encode(frame.data).decode("ascii"),
-                        "viewer_id": owner,
-                    },
-                )
+            )) as stream:
+                async for frame in stream:
+                    yield StreamChunk(
+                        request_id="",
+                        content="",
+                        event_type="frame",
+                        metadata={
+                            **frame.to_metadata(),
+                            "data_b64": base64.b64encode(frame.data).decode("ascii"),
+                            "viewer_id": owner,
+                        },
+                    )
         except Exception as exc:  # noqa: BLE001 - a broken preview must become a structured stream error
             logger.warning("daemon: preview stream failed: %s", exc, exc_info=True)
             yield _preview_stream_error({

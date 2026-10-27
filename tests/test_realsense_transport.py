@@ -680,3 +680,92 @@ def test_close_stops_the_frame_pump_and_reports_its_health(monkeypatch) -> None:
 
     assert sdk.framesets == pulled, "no frameset may be pulled after close"
     assert sdk.stopped
+
+
+@pytest.mark.parametrize("encoder_kind", ["pillow", "opencv"])
+def test_native_depth_preview_skips_sdk_blocks_but_task_capture_stays_aligned(
+    monkeypatch, encoder_kind
+) -> None:
+    if encoder_kind == "opencv":
+        pytest.importorskip("cv2")
+        pytest.importorskip("numpy")
+    sdk = _hub_sdk()
+    transport = _open_with(monkeypatch, sdk, preview_depth="native", preview_encoder=encoder_kind)
+    preview = asyncio.run(transport.read_frame("camera.depth.preview"))
+    assert preview.data.startswith(b"\xff\xd8")
+    assert preview.metadata["aligned_to_color"] is False
+    assert preview.metadata["preview_depth"] == "native"
+    assert preview.metadata["preview_encoder"] == encoder_kind
+    assert preview.metadata["encoding"] == "16UC1"
+    assert sdk.aligned == sdk.colorizer_instance.calls == 0
+    raw = asyncio.run(transport.capture_rgbd())
+    assert sdk.aligned == 1
+    assert raw.depth_mm(0, 0) == pytest.approx(500)
+    assert raw.color == bytes((0, 0, 255, 0, 255, 0))
+    assert raw.intrinsics.fx == 600
+    assert sdk.colorizer_instance.calls == 0
+
+
+def test_default_preview_mode_remains_aligned_pillow(monkeypatch) -> None:
+    sdk = _hub_sdk()
+    transport = _open_with(monkeypatch, sdk)
+    preview = asyncio.run(transport.read_frame("camera.depth.preview"))
+    assert preview.metadata["aligned_to_color"] is True
+    assert preview.metadata["preview_depth"] == "aligned"
+    assert preview.metadata["preview_encoder"] == "pillow"
+    assert sdk.aligned == sdk.colorizer_instance.calls == 1
+
+
+def test_injected_encoder_shares_views_and_receives_native_depth(monkeypatch) -> None:
+    from leapflow.hardware.ros2_image import encode_preview
+
+    class Encoder:
+        def __init__(self):
+            self.planes = []
+
+        def encode(self, plane, *, max_width, quality):
+            self.planes.append(plane)
+            return encode_preview(plane, max_width=max_width, quality=quality)
+
+    encoder = Encoder()
+    sdk = _hub_sdk()
+    sdk.frame_interval_s = 0.1
+    monkeypatch.setattr(realsense_module, "_load_sdk", lambda: sdk)
+    transport = RealSenseTransport(
+        {"serial_number": "123456789", "preview_depth": "native"}, preview_encoder=encoder
+    )
+    _OPENED.append(transport)
+    asyncio.run(transport.open(_context()))
+
+    async def reads():
+        return await asyncio.gather(*(transport.read_frame("camera.depth.preview") for _ in range(6)))
+
+    results = asyncio.run(reads())
+    assert len({r.sequence for r in results}) == 1
+    assert len(encoder.planes) == 1
+    assert encoder.planes[0].encoding == "16UC1"
+    assert all(r.metadata["preview_encoder"] == "injected" for r in results)
+    assert sdk.aligned == sdk.colorizer_instance.calls == 0
+
+
+def test_invalid_preview_configuration_fails_before_open() -> None:
+    with pytest.raises(TransportError) as error:
+        RealSenseTransport({"preview_depth": "unknown"})
+    assert error.value.failure_code == "preview_config_invalid"
+    with pytest.raises(TransportError) as error:
+        RealSenseTransport({}, preview_encoder=object())
+    assert error.value.failure_code == "preview_encoder_invalid"
+
+
+def test_unavailable_encoder_fails_before_camera_pipeline_start(monkeypatch) -> None:
+    sdk = _hub_sdk()
+    monkeypatch.setattr(realsense_module, "_load_sdk", lambda: sdk)
+    def unavailable(kind):
+        raise TransportError("encoder unavailable", failure_code="preview_encoder_unavailable")
+    monkeypatch.setattr(realsense_module, "build_encoder", unavailable)
+    transport = RealSenseTransport({"serial_number": "123456789", "preview_encoder": "custom"})
+    with pytest.raises(TransportError) as error:
+        asyncio.run(transport.open(_context()))
+    assert error.value.failure_code == "preview_encoder_unavailable"
+    assert not asyncio.run(transport.probe()).connected
+    assert sdk.framesets == 0

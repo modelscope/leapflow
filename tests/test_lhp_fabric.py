@@ -69,6 +69,7 @@ from leapflow.hardware.lhp import (
     make_request,
     ok_response,
 )
+from leapflow.hardware.lhp.protocol import CAP_FRAME_FRESHNESS_V1, ERR_UNSUPPORTED_CAPABILITY
 from leapflow.hardware.transport import (
     SIDE_EFFECT_NONE,
     SIDE_EFFECT_UNKNOWN,
@@ -780,6 +781,188 @@ async def test_node_preserves_legacy_frame_transport_without_fps_keyword() -> No
 
     assert response["ok"] is True
     assert source.requests == [("frame", 640, 70)]
+
+
+class _FreshFrameNodeTransport(_FrameNodeTransport):
+    """Hub-backed frame source: honours freshness and serves concurrent readers."""
+
+    frame_reads_concurrent = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bounds: list[tuple[int, float | None]] = []
+        self.gate: asyncio.Event | None = None
+        self.lock_seen_free: list[bool] = []
+        self.registry: Any = None
+
+    async def read_frame(
+        self,
+        channel_id: str,
+        *,
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        min_sequence: int = 0,
+        after_monotonic: float | None = None,
+    ) -> FrameReading:
+        self.bounds.append((min_sequence, after_monotonic))
+        if self.registry is not None:
+            self.lock_seen_free.append(not self.registry.device_io("camera").locked())
+        if self.gate is not None:
+            await self.gate.wait()
+        return await super().read_frame(
+            channel_id, max_width=max_width, quality=quality, fps=fps
+        )
+
+    async def probe(self) -> TransportStatus:
+        hub = {"running": True, "sequence": 9, "fps": 30.0, "frame_age_ms": 12.5}
+        return TransportStatus(connected=True, metadata={"frame_hub": hub, "serial": "x"})
+
+
+async def test_probe_carries_the_node_frame_pump_health_to_the_host() -> None:
+    server = LhpNodeServer(
+        _FrameNodeRegistry(_FreshFrameNodeTransport()), node_id="jetson", write_mode="trusted_v1"
+    )
+    socket_host, port = await server.start(host="127.0.0.1", port=0)
+    config = {
+        "endpoint": f"tcp://{socket_host}:{port}",
+        "node_id": "jetson",
+        "remote_device_id": "camera",
+        "timeout_s": 2.0,
+    }
+    transport = build_transport(config)
+    try:
+        await transport.open(_frame_host_context(config))
+        status = await transport.probe()
+        assert status.connected
+        # Only the pump stats cross the wire; the rest of the node metadata stays local.
+        assert status.metadata == {
+            "frame_hub": {"running": True, "sequence": 9, "fps": 30.0, "frame_age_ms": 12.5}
+        }
+    finally:
+        await transport.close()
+        await server.stop()
+
+
+class _HoldingFrameNodeRegistry(_FrameNodeRegistry):
+    """Frame registry with the holder ledger the production registry keeps."""
+
+    def __init__(self, source: Any | None = None) -> None:
+        super().__init__(source)
+        self.holds: list[tuple[str, str]] = []
+
+    def hold(self, device_id: str, holder: str) -> None:
+        self.holds.append((device_id, holder))
+
+    async def release_hold(self, device_id: str, holder: str) -> bool:
+        return True
+
+
+def _read_frame_request(**params: Any) -> dict[str, Any]:
+    return {
+        "id": 1,
+        "method": "read_frame",
+        "params": {"device_id": "camera", "channel_id": "frame", **params},
+    }
+
+
+async def test_hello_advertises_frame_freshness_on_v2() -> None:
+    server = LhpNodeServer(_FrameNodeRegistry(), node_id="jetson", write_mode="trusted_v1")
+    response = await server.handle_request(
+        {"id": 1, "method": "hello", "params": {"protocol": LHP_PROTOCOL_VERSION}}
+    )
+    assert CAP_FRAME_FRESHNESS_V1 in response["result"]["capabilities"]
+
+
+async def test_freshness_bounds_cross_the_wire_as_sequence_and_age() -> None:
+    source = _FreshFrameNodeTransport()
+    registry = _HoldingFrameNodeRegistry(source)
+    server = LhpNodeServer(registry, node_id="jetson", write_mode="trusted_v1")
+    socket_host, port = await server.start(host="127.0.0.1", port=0)
+    config = {
+        "endpoint": f"tcp://{socket_host}:{port}",
+        "node_id": "jetson",
+        "remote_device_id": "camera",
+        "timeout_s": 2.0,
+    }
+    transport = build_transport(config)
+    try:
+        await transport.open(_frame_host_context(config))
+        host_after = time.monotonic() - 0.2
+        await transport.read_frame("frame", min_sequence=5, after_monotonic=host_after)
+        await transport.read_frame("frame")
+        (sequence, node_after), unbounded = source.bounds
+        assert sequence == 5
+        # Re-anchored on the node's clock: stricter by the link latency, never looser.
+        assert host_after <= node_after <= time.monotonic()
+        assert unbounded == (0, None), "no bound requested means none sent"
+    finally:
+        await transport.close()
+        await server.stop()
+
+
+async def test_node_refuses_freshness_for_a_transport_that_cannot_honour_it() -> None:
+    source = _LegacyFrameNodeTransport()
+    server = LhpNodeServer(_FrameNodeRegistry(source), node_id="jetson", write_mode="trusted_v1")
+    response = await server.handle_request(_read_frame_request(min_sequence=3))
+    assert response["ok"] is False
+    assert response["error"]["code"] == ERR_UNSUPPORTED_CAPABILITY
+    assert source.requests == [], "a stale frame is never served for a fresh request"
+
+
+async def test_node_rejects_out_of_range_freshness_bounds() -> None:
+    server = LhpNodeServer(
+        _FrameNodeRegistry(_FreshFrameNodeTransport()), node_id="jetson", write_mode="trusted_v1"
+    )
+    for params in ({"min_sequence": -1}, {"max_age_ms": -5}, {"max_age_ms": 1e9}):
+        response = await server.handle_request(_read_frame_request(**params))
+        assert response["error"]["code"] == ERR_BAD_REQUEST, params
+
+
+async def test_host_refuses_freshness_against_a_node_without_the_capability() -> None:
+    def respond(request: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no cover - never sent
+        raise AssertionError("a freshness request must not reach an old node")
+
+    server = _ScriptedServer(respond, capabilities=("read_frame", "release_frame"))
+    config = {"server": server, "remote_device_id": "camera"}
+    transport = build_transport(config)
+    await transport.open(_frame_host_context(config))
+    with pytest.raises(TransportError) as caught:
+        await transport.read_frame("frame", min_sequence=2)
+    assert caught.value.failure_code == ERR_UNSUPPORTED_CAPABILITY
+    await transport.close()
+
+
+async def test_concurrent_frame_transport_reads_outside_the_device_lock() -> None:
+    source = _FreshFrameNodeTransport()
+    registry = _HoldingFrameNodeRegistry(source)
+    source.registry = registry
+    source.gate = asyncio.Event()
+    server = LhpNodeServer(registry, node_id="jetson", write_mode="trusted_v1")
+    pending = asyncio.create_task(server.handle_request(_read_frame_request()))
+    for _ in range(50):
+        if source.bounds:
+            break
+        await asyncio.sleep(0.01)
+    # The read is parked waiting for a frame, yet another caller can take the lock.
+    assert source.lock_seen_free == [True]
+    async with registry.device_io("camera"):
+        pass
+    assert registry.holds == [("camera", "lhp:direct:frame")], "held before the read"
+    source.gate.set()
+    response = await pending
+    assert response["ok"] is True
+
+
+async def test_serial_frame_transport_still_reads_under_the_device_lock() -> None:
+    source = _FreshFrameNodeTransport()
+    source.frame_reads_concurrent = False
+    registry = _HoldingFrameNodeRegistry(source)
+    source.registry = registry
+    server = LhpNodeServer(registry, node_id="jetson", write_mode="trusted_v1")
+    response = await server.handle_request(_read_frame_request())
+    assert response["ok"] is True
+    assert source.lock_seen_free == [False]
 
 
 async def test_malformed_remote_frame_payload_is_refused() -> None:
