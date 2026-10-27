@@ -36,6 +36,7 @@ reads the newest label per episode back for a converter.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import re
@@ -52,6 +53,7 @@ from leapflow.hardware.skills.protocol import (
     SkillOutcome,
     SkillPlan,
 )
+from leapflow.hardware.skills.tuning import DEFAULT_VISION
 from leapflow.hardware.skills.workcell import (
     GRIPPER_POSITION,
     POSE_CHANNELS,
@@ -61,6 +63,7 @@ from leapflow.hardware.skills.workcell import (
     joint_channels,
 )
 from leapflow.hardware.transport import TransportError
+from leapflow.hardware.vision.group import CaptureGroup, bounded_capture
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +86,7 @@ _FEATURES = {
     "gripper_state": "float64 mm, or null",
     "action": "map channel -> float (the latest commanded target)",
     "camera_frames": "map camera -> jpeg path relative to the dataset root",
+    "camera_skew_ms": "float64 ms between the group's capture stamps, or null without cameras",
 }
 
 Sleep = Callable[[float], Awaitable[None]]
@@ -271,11 +275,7 @@ class EpisodeRecorder:
         except _SAMPLE_ERRORS as exc:
             self._drop("arm", exc)
             return
-        frames: dict[str, str] = {}
-        for device_id, name in self._cameras.items():
-            path = await self._capture(device_id, name, sequence)
-            if path:
-                frames[name] = path
+        frames, skew_ms = await self._capture_cameras(sequence)
         joints = joint_channels(self._registry.context(self._spec.role(ROLE_ARM)))
         self._rows.append(
             {
@@ -288,6 +288,7 @@ class EpisodeRecorder:
                 "gripper_state": state.get(GRIPPER_POSITION),
                 "action": dict(self._action),
                 "camera_frames": frames,
+                "camera_skew_ms": skew_ms,
             }
         )
 
@@ -313,19 +314,50 @@ class EpisodeRecorder:
                 values[reading.channel_id] = float(number)
         return values
 
-    async def _capture(self, device_id: str, name: str, sequence: int) -> str:
+    async def _capture_cameras(self, sequence: int) -> tuple[dict[str, str], float | None]:
+        """Grab every camera as one soft-synchronised group and write the JPEGs.
+
+        Returns the written paths by camera name and the group's capture skew, so a
+        converter can tell a row whose views describe one instant from one whose
+        cameras drifted apart. A camera that fails drops its frame, never the row.
+        """
+        if not self._cameras:
+            return {}, None
+        vision = getattr(self._spec, "vision", None) or DEFAULT_VISION
+        group = CaptureGroup(
+            {device_id: functools.partial(self._grab, device_id) for device_id in self._cameras},
+            tolerance_ms=float(vision["sync_tolerance_ms"]),
+            attempts=int(vision["sync_attempts"]),
+        )
+        captured = await group.capture()
+        for device_id, exc in captured.errors.items():
+            if not isinstance(exc, _SAMPLE_ERRORS):
+                raise exc
+            self._drop(self._cameras[device_id], exc)
+        written = await asyncio.gather(
+            *(
+                self._write_frame(frame, self._cameras[device_id], sequence)
+                for device_id, frame in captured.frames.items()
+            )
+        )
+        frames = {name: path for name, path in written if path}
+        return frames, (round(captured.skew_ms, 3) if captured.frames else None)
+
+    async def _grab(self, device_id: str, after_monotonic: float) -> RgbdFrame:
+        async with self._registry.device_io(device_id):
+            source = await self._registry.transport(device_id)
+            return await bounded_capture(source.capture_rgbd)(after_monotonic)
+
+    async def _write_frame(self, frame: RgbdFrame, name: str, sequence: int) -> tuple[str, str]:
         relative = self._frames_rel / name / f"{sequence:06d}.jpg"
         try:
-            async with self._registry.device_io(device_id):
-                source = await self._registry.transport(device_id)
-                frame = await source.capture_rgbd()
             await asyncio.to_thread(
                 _write_jpeg, frame, self._root / relative, self._settings.jpeg_quality
             )
         except _SAMPLE_ERRORS as exc:
             self._drop(name, exc)
-            return ""
-        return relative.as_posix()
+            return name, ""
+        return name, relative.as_posix()
 
     async def _find_cameras(self) -> None:
         for device_id in self._spec.device_ids:

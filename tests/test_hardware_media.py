@@ -576,6 +576,71 @@ def test_a_preview_stream_releases_its_own_viewer_when_closed() -> None:
     assert dropped == ["cam"]
 
 
+@pytest.mark.parametrize("other_viewer", [False, True])
+def test_releasing_a_stream_prevents_it_reopening_a_retired_lease(other_viewer: bool) -> None:
+    """The RPC release must stop future capture, even before the old socket notices EOF."""
+    registry = _registry(_camera_context(fps=60.0), _FakeFrameSource())
+
+    async def run() -> None:
+        broker = registry.preview_broker
+        stream = broker.stream("cam", FRAME_CHANNEL, viewer_id="board")
+        await anext(stream)
+        if other_viewer:
+            await broker.frame("cam", FRAME_CHANNEL, viewer_id="other")
+        released = await broker.release("cam", FRAME_CHANNEL, viewer_id="board")
+        assert released["active_viewers"] == int(other_viewer)
+        # A new viewer can reuse the id before the old stream reaches its finally block.
+        reopened = broker.stream("cam", FRAME_CHANNEL, viewer_id="board")
+        await anext(reopened)
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        assert broker.active()[0]["viewers"] == 1 + int(other_viewer)
+        await stream.aclose()
+        await reopened.aclose()
+        if other_viewer:
+            assert broker.active()[0]["viewers"] == 1
+            await broker.release("cam", FRAME_CHANNEL, viewer_id="other")
+        assert not broker.active()
+        await broker.close()
+
+    asyncio.run(run())
+
+
+def test_stream_waiting_on_the_channel_lock_cannot_reopen_after_release(monkeypatch) -> None:
+    """A queued frame must recheck its stop event after acquiring the release lock."""
+    registry = _registry(_camera_context(fps=60.0), _FakeFrameSource())
+
+    async def run() -> None:
+        broker = registry.preview_broker
+        stream = broker.stream("cam", FRAME_CHANNEL, viewer_id="board")
+        await anext(stream)
+        entering = asyncio.Event()
+        original = broker._frame  # noqa: SLF001 - synchronize the real lock boundary
+
+        async def tracked(*args: Any, **kwargs: Any) -> FrameReading | None:
+            entering.set()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(broker, "_frame", tracked)
+        lock = broker._locks[("cam", FRAME_CHANNEL)]  # noqa: SLF001
+        await lock.acquire()
+        try:
+            releasing = asyncio.create_task(broker.release("cam", FRAME_CHANNEL, viewer_id="board"))
+            await asyncio.sleep(0)
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.wait_for(entering.wait(), timeout=1.0)
+        finally:
+            lock.release()
+        assert (await releasing)["released"] is True
+        with pytest.raises(StopAsyncIteration):
+            await pending
+        assert not broker.active()
+        await stream.aclose()
+        await broker.close()
+
+    asyncio.run(run())
+
+
 def test_a_transport_without_read_frame_is_refused_with_a_reason() -> None:
     """The capability check admission cannot make, made at the only honest moment.
 
@@ -650,6 +715,58 @@ def test_daemon_preview_stream_reports_latest_metadata_and_release_status() -> N
     asyncio.run(_run())
 
 
+@pytest.mark.parametrize("other_viewer", [False, True])
+@pytest.mark.parametrize("cancel_pending", [False, True])
+def test_daemon_preview_stream_closes_broker_before_returning(
+    other_viewer: bool, cancel_pending: bool
+) -> None:
+    """Closing the relay owns its nested generator, without waiting for GC or idle sweep."""
+    from types import SimpleNamespace
+
+    from leapflow.daemon.service import RuntimeLeapService
+
+    source = _FakeFrameSource()
+    registry = _registry(_camera_context(), source)
+    service = RuntimeLeapService(SimpleNamespace(llm_context_length=100))
+    service._ctx = SimpleNamespace(  # noqa: SLF001 - inject the real runtime boundary
+        _hardware_registry=registry, _approval_orchestrator=_AllowingGate()
+    )
+    dropped: list[str] = []
+
+    async def drop(device_id: str) -> None:
+        dropped.append(device_id)
+        await source.close()
+
+    registry.drop_transport = drop  # type: ignore[method-assign]
+
+    async def run() -> None:
+        broker = registry.preview_broker
+        if other_viewer:
+            await broker.frame("cam", FRAME_CHANNEL, viewer_id="other")
+        stream = service.hardware_preview_stream("cam", FRAME_CHANNEL, viewer_id="board")
+        await anext(stream)
+        if cancel_pending:
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        await stream.aclose()
+        # Assert before giving deferred async-generator finalizers an event-loop turn.
+        active = broker.active()
+        assert len(active) == int(other_viewer)
+        if other_viewer:
+            assert active[0]["viewers"] == 1
+            assert not dropped
+            assert (await broker.frame("cam", FRAME_CHANNEL, viewer_id="other")).data == _JPEG
+            await broker.release("cam", FRAME_CHANNEL, viewer_id="other")
+        assert dropped == ["cam"]
+        assert not broker.active()
+        await broker.close()
+
+    asyncio.run(run())
+
+
 # ════════════════════════════════════════════════════════════════
 # Transport contracts the conformance suite cannot cover
 # ════════════════════════════════════════════════════════════════
@@ -717,6 +834,136 @@ class _CountingGrabber:
 
     async def stop(self) -> None:
         self.stopped += 1
+
+
+class _StampedGrabber:
+    """A latest-frame grabber whose capture stamp advances every *every* grabs."""
+
+    backend = "fake"
+
+    def __init__(self, every: int = 1_000_000) -> None:
+        self.every = every
+        self.grabs = 0
+        self.captured_monotonic = 100.0
+        self.captured_at = 1.0
+
+    async def start(self) -> None:
+        return None
+
+    async def grab(self) -> tuple[bytes, int, int]:
+        self.grabs += 1
+        if self.grabs % self.every == 0:
+            self.captured_monotonic += 0.1
+        return _JPEG, 4, 2
+
+    async def stop(self) -> None:
+        return None
+
+
+def _media_transport() -> MediaTransport:
+    return MediaTransport(
+        {"kind": "camera", "index": 0, "spec": "0:none", "input_format": "avfoundation"}
+    )
+
+
+def test_frame_sequence_counts_captures_not_reads(monkeypatch) -> None:
+    """Two viewers reading the same grabber frame must see the same sequence.
+
+    Counting reads made ``min_sequence`` meaningless: a second viewer's read of the
+    frame the first already saw looked "newer" by number while carrying old pixels.
+    """
+    grabber = _StampedGrabber()
+    monkeypatch.setattr("leapflow.hardware.transports.media.build_grabber", lambda *a, **k: grabber)
+    transport = _media_transport()
+
+    async def _run() -> None:
+        await transport.open(_camera_context())
+        first = await transport.read_frame(FRAME_CHANNEL)
+        again = await transport.read_frame(FRAME_CHANNEL)
+        assert first.sequence == again.sequence == 1
+        grabber.captured_monotonic += 0.1
+        newer = await transport.read_frame(FRAME_CHANNEL)
+        assert newer.sequence == 2
+        assert newer.monotonic_at == grabber.captured_monotonic
+        status = await transport.probe()
+        assert status.metadata["frame_capabilities"]["planes"] == ["color"]
+        assert status.metadata["frame_sequence"] == 2
+        pump = status.metadata["frame_hub"]
+        assert pump["running"] is True and pump["sequence"] == 2
+        assert pump["frame_age_ms"] is not None, "the health tracker judges a UVC pump too"
+        await transport.close()
+        assert (await transport.probe()).metadata["frame_hub"] == {}, "closed: nothing to judge"
+
+    asyncio.run(_run())
+
+
+def test_freshness_bounds_wait_for_a_newer_capture(monkeypatch) -> None:
+    """``min_sequence`` / ``after_monotonic`` wait for the next capture, not the cached one."""
+    grabber = _StampedGrabber(every=3)
+    monkeypatch.setattr("leapflow.hardware.transports.media.build_grabber", lambda *a, **k: grabber)
+    transport = _media_transport()
+
+    async def _run() -> None:
+        await transport.open(_camera_context())
+        first = await transport.read_frame(FRAME_CHANNEL)
+        fresh = await transport.read_frame(FRAME_CHANNEL, min_sequence=first.sequence + 1)
+        assert fresh.sequence == first.sequence + 1
+        after = await transport.read_frame(FRAME_CHANNEL, after_monotonic=fresh.monotonic_at)
+        assert after.monotonic_at > fresh.monotonic_at
+        await transport.close()
+
+    asyncio.run(_run())
+
+
+def test_an_unsatisfiable_freshness_bound_times_out_typed(monkeypatch) -> None:
+    grabber = _StampedGrabber()
+    monkeypatch.setattr("leapflow.hardware.transports.media.build_grabber", lambda *a, **k: grabber)
+    monkeypatch.setattr("leapflow.hardware.transports.media._FRESH_TIMEOUT_S", 0.05)
+    transport = MediaTransport(
+        {"kind": "camera", "spec": "0:none", "input_format": "avfoundation", "fps": 100}
+    )
+
+    async def _run() -> None:
+        await transport.open(_camera_context())
+        with pytest.raises(TransportError) as excinfo:
+            await transport.read_frame(FRAME_CHANNEL, min_sequence=5)
+        assert excinfo.value.failure_code == "frame_timeout"
+        await transport.close()
+
+    asyncio.run(_run())
+
+
+def test_usb_exclusion_drops_driver_owned_video_nodes(monkeypatch, tmp_path: Path) -> None:
+    """A depth camera's UVC endpoints are not offered as generic cameras when excluded."""
+    from leapflow.hardware import media as media_module
+
+    usb = tmp_path / "devices" / "usb2" / "2-1.1"
+    node = usb / "2-1.1:1.0" / "video4linux" / "video0"
+    node.mkdir(parents=True)
+    (usb / "idVendor").write_text("8086\n")
+    (usb / "idProduct").write_text("0B3A\n")
+    (node / "name").write_text("Intel RealSense\n")
+    (node / "index").write_text("0\n")
+    v4l = tmp_path / "class"
+    v4l.mkdir()
+    (v4l / "video0").symlink_to(node)
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    (dev / "video0").write_text("")
+
+    found = media_module._linux_video_devices(v4l, dev)  # noqa: SLF001
+    assert [device.usb_id for device in found] == ["8086:0b3a"]
+
+    webcam = MediaDevice(
+        kind="camera", index=2, name="Webcam", spec="/dev/video2", input_format="v4l2",
+        usb_id="046d:0825",
+    )
+    monkeypatch.setitem(media_module._ENUMERATORS, "linux", lambda: (*found, webcam))
+    monkeypatch.setattr("sys.platform", "linux")
+    assert len(enumerate_devices()) == 2
+    assert [d.name for d in enumerate_devices({"exclude_usb": "8086"})] == ["Webcam"]
+    assert [d.name for d in enumerate_devices({"exclude_usb": ["8086:0b3a"]})] == ["Webcam"]
+    assert len(enumerate_devices({"exclude_usb": "8086:0b5b, 1234"})) == 2
 
 
 def test_a_frame_read_is_serialised_on_the_devices_io_lock() -> None:

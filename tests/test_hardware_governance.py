@@ -1858,6 +1858,7 @@ def test_hardware_config_keys_are_discoverable() -> None:
         "hardware.rediscover_interval_s",
         "hardware.media_screens",
         "hardware.media_microphones",
+        "hardware.media_exclude_usb",
         "hardware.preview_max_fps",
         "hardware.preview_max_width",
         "hardware.preview_quality",

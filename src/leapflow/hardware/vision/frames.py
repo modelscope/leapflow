@@ -15,6 +15,7 @@ names (``rgb8``, ``bgr8``, ``mono8``, ``16UC1``): one plane is directly encodabl
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -108,6 +109,24 @@ class FrameProducer(Protocol):
     def grab(self, timeout_s: float) -> Any: ...
 
 
+def accepts_keyword(callable_: Any, name: str) -> bool:
+    """Whether *callable_* accepts keyword *name*, decided without calling it.
+
+    Frame protocols are structural, and third-party implementations predate the
+    optional keywords (cadence, freshness bounds). A missing optional keyword means
+    "the producer's default", not "cannot make frames"; when reflection is
+    unavailable the answer is conservatively no.
+    """
+    try:
+        parameters = inspect.signature(callable_).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 __all__ = [
     "ACQUIRE_STREAMING",
     "ACQUIRE_TRIGGERED",
@@ -121,4 +140,5 @@ __all__ = [
     "FrameProducer",
     "Frameset",
     "ImagePlane",
+    "accepts_keyword",
 ]

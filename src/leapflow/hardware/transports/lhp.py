@@ -46,11 +46,14 @@ from leapflow.hardware.lhp.client import (
 )
 from leapflow.hardware.lhp.permit import PERMIT_PARAM, request_digest
 from leapflow.hardware.lhp.protocol import (
+    CAP_FRAME_FRESHNESS_V1,
     CAP_PERMIT_V1,
     ERR_UNSUPPORTED_CAPABILITY,
     FAILURE_PERMIT_REQUIRED,
+    MAX_FRAME_AGE_MS,
     MAX_FRAME_DATA_BYTES,
     MAX_FRAME_RATE_HZ,
+    MAX_FRAME_SEQUENCE,
     MAX_FRAME_WIDTH,
     SAFE_FRAME_MEDIA_TYPES,
     WRITE_EFFECT_UNKNOWN_CODES,
@@ -195,9 +198,22 @@ class LhpTransport:
         return self._localize_reading(result, channel_id)
 
     async def read_frame(
-        self, channel_id: str, *, max_width: int = 0, quality: int = 0, fps: float = 0.0
+        self,
+        channel_id: str,
+        *,
+        max_width: int = 0,
+        quality: int = 0,
+        fps: float = 0.0,
+        min_sequence: int = 0,
+        after_monotonic: float | None = None,
     ) -> FrameReading:
-        """Fetch one bounded frame while preserving host-side identity and timebase."""
+        """Fetch one bounded frame while preserving host-side identity and timebase.
+
+        Freshness bounds cross the wire as the node's own sequence and an *age*:
+        ``after_monotonic`` is this host's clock, meaningless on the node, so it is
+        sent as "no older than now minus the bound" and the node re-anchors it to its
+        own clock -- stricter by the link latency, never looser.
+        """
         client = self._require_client()
         required = {"read_frame", "release_frame"}
         if not required.issubset(self._capabilities):
@@ -217,22 +233,49 @@ class LhpTransport:
             raise TransportError(
                 "frame rate is outside protocol bounds", failure_code="bad_request"
             )
+        params: dict[str, Any] = {
+            "device_id": self._remote_device_id,
+            "channel_id": channel_id,
+            "max_width": int(max_width),
+            "quality": int(quality),
+            "fps": float(fps),
+        }
+        params.update(self._freshness_params(min_sequence, after_monotonic))
         try:
-            result = await client.request(
-                "read_frame",
-                {
-                    "device_id": self._remote_device_id,
-                    "channel_id": channel_id,
-                    "max_width": int(max_width),
-                    "quality": int(quality),
-                    "fps": float(fps),
-                },
-            )
+            result = await client.request("read_frame", params)
         except LhpRemoteError as exc:
             raise TransportError(str(exc) or exc.code, failure_code=exc.code) from exc
         frame = self._frame_from_payload(result, channel_id)
         self._frame_channels.add(channel_id)
         return frame
+
+    def _freshness_params(
+        self, min_sequence: int, after_monotonic: float | None
+    ) -> dict[str, Any]:
+        """Translate host freshness bounds to wire parameters, or refuse them."""
+        if not min_sequence and after_monotonic is None:
+            return {}
+        if CAP_FRAME_FRESHNESS_V1 not in self._capabilities:
+            raise TransportError(
+                "LHP node cannot honour frame freshness bounds; upgrade the node",
+                failure_code=ERR_UNSUPPORTED_CAPABILITY,
+            )
+        if isinstance(min_sequence, bool) or not 0 <= int(min_sequence) <= MAX_FRAME_SEQUENCE:
+            raise TransportError(
+                "frame sequence bound is outside protocol bounds", failure_code="bad_request"
+            )
+        params: dict[str, Any] = {}
+        if min_sequence:
+            params["min_sequence"] = int(min_sequence)
+        if after_monotonic is not None:
+            age_ms = (time.monotonic() - float(after_monotonic)) * 1000.0
+            if not math.isfinite(age_ms):
+                raise TransportError(
+                    "frame freshness bound is not a finite instant", failure_code="bad_request"
+                )
+            # A future bound means "after now"; an ancient one is clamped, which is stricter.
+            params["max_age_ms"] = min(max(0.0, age_ms), MAX_FRAME_AGE_MS)
+        return params
 
     async def write(self, channel_id: str, value: Any) -> WriteOutcome:
         client = self._require_client()
@@ -294,11 +337,13 @@ class LhpTransport:
             )
         if not isinstance(result, Mapping):
             return TransportStatus(connected=False, detail="malformed probe result")
+        hub = result.get("frame_hub")
         return TransportStatus(
             connected=bool(result.get("connected", False)),
             halt_supported=bool(result.get("halt_supported", False)),
             detail=str(result.get("detail") or ""),
             latency_ms=float(result.get("latency_ms") or 0.0),
+            metadata={"frame_hub": dict(hub)} if isinstance(hub, Mapping) else {},
         )
 
     async def halt(self) -> TransportStatus:

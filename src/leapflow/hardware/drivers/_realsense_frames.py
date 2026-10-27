@@ -84,18 +84,20 @@ class RealSenseFrames:
         with self._align_lock:
             return self._align.process(frames)
 
-    def plane(self, frames: Any, name: str) -> ImagePlane:
+    def plane(self, frames: Any, name: str, *, colorize_depth: bool = True) -> ImagePlane:
         """One displayable plane of ``frames``; depth is colourised for viewing."""
         if name == PLANE_COLOR:
             frame, fallback = frames.get_color_frame(), "bgr8"
         elif name == PLANE_DEPTH:
             depth = frames.get_depth_frame()
-            if not depth or self._colorizer is None:
+            if not colorize_depth:
+                frame = depth
+            elif not depth or self._colorizer is None:
                 frame = None
             else:
                 with self._colorize_lock:
                     frame = self._colorizer.colorize(depth)
-            fallback = "rgb8"
+            fallback = "rgb8" if colorize_depth else "16UC1"
         elif name in (PLANE_IR_LEFT, PLANE_IR_RIGHT):
             frame, fallback = frames.get_infrared_frame(1 if name == PLANE_IR_LEFT else 2), "mono8"
         else:

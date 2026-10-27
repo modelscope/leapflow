@@ -42,6 +42,13 @@ def test_shipped_shape_parses_and_reports_its_devices() -> None:
     assert spec.calibration["max_pivot_residual_mm"] == 1.0
     assert spec.calibration["max_verify_p95_mm"] == 5.0
     assert spec.bootstrap_box is not None and spec.bootstrap_box.z_min == 120
+    assert spec.vision == {"sync_tolerance_ms": 50.0, "sync_attempts": 3.0}
+
+
+def test_vision_sync_tuning_overrides_and_is_reported() -> None:
+    spec = WorkcellSpec.from_mapping(_with(vision={"sync_tolerance_ms": 20, "sync_attempts": 2}))
+    assert spec.vision == {"sync_tolerance_ms": 20.0, "sync_attempts": 2.0}
+    assert spec.to_dict()["vision"] == spec.vision
 
 
 @pytest.mark.parametrize(
@@ -64,6 +71,10 @@ def test_shipped_shape_parses_and_reports_its_devices() -> None:
         (_with(roles={"arm": ARM_ID, "Camera Wrist": "cam"}), "role name"),
         (_with(roles={"arm": ARM_ID, "camera.wrist": ""}), "device id"),
         (_with(roles=[ARM_ID]), "needs 'roles'"),
+        (_with(vision={"sync_attempts": 1.5}), "sync_attempts"),
+        (_with(vision={"sync_attempts": 11}), "sync_attempts"),
+        (_with(vision={"sync_tolerance_ms": 0}), "positive finite"),
+        (_with(vision={"hardware_sync": True}), "vision does not understand"),
     ],
 )
 def test_malformed_declarations_are_refused(data: dict[str, Any], match: str) -> None:

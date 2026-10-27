@@ -162,6 +162,7 @@ async def test_a_motion_run_writes_rows_commands_and_frames(tmp_path: Path) -> N
     assert rows[0]["gripper_state"] is not None
     assert rows[-1]["ee_pose"]["ee.z"] > rows[0]["ee_pose"]["ee.z"]  # the arm went up
     assert rows[-1]["action"]["ee.z"] == rows[-1]["ee_pose"]["ee.z"]
+    assert all(row["camera_skew_ms"] == 0.0 for row in rows)  # one camera: no skew
 
     recorded = _load(root / entry["commands"])["commands"]
     sent = [dict(batch) for batch in _sim(runtime).batches]
@@ -349,6 +350,7 @@ async def test_a_dead_camera_drops_frames_without_failing_the_run(tmp_path: Path
     assert entry["dropped"][CAMERA_ID] == entry["step_count"] >= 1
     rows = _load(tmp_path / "episodes" / entry["data"])
     assert all(row["camera_frames"] == {} for row in rows)
+    assert all(row["camera_skew_ms"] is None for row in rows)
 
 
 async def test_recording_is_off_without_a_directory(tmp_path: Path) -> None:

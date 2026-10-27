@@ -38,6 +38,10 @@ MAX_FRAME_DATA_BYTES = 700 * 1024
 
 MAX_FRAME_WIDTH = 4096
 MAX_FRAME_RATE_HZ = 60.0
+MAX_FRAME_SEQUENCE = 2**53 - 1
+"""Largest ``min_sequence`` a request may carry: exact in every JSON number decoder."""
+MAX_FRAME_AGE_MS = 60_000.0
+"""Largest ``max_age_ms`` a request may carry; an older bound is not a freshness request."""
 SAFE_FRAME_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 
 _DEVICE_ID_CHARSET = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
@@ -115,6 +119,13 @@ CAP_PERMIT_V1 = "permit.v1"
 CAP_CONTROL_V1 = "control.v1"
 CAP_SKILL_V1 = "skill.v1"
 """Node-local skills: the node plans and executes whole tasks under one run permit."""
+CAP_FRAME_FRESHNESS_V1 = "frame.freshness.v1"
+"""``read_frame`` honours ``min_sequence`` and ``max_age_ms``.
+
+The bound travels as a node sequence and an age, never as a monotonic instant: two
+hosts' monotonic clocks share no epoch. The node converts the age back against its
+own clock, which can only make the bound stricter by the link latency.
+"""
 
 SKILL_METHODS: tuple[str, ...] = (
     "skill.list",
@@ -237,6 +248,7 @@ def response_error(response: Mapping[str, Any]) -> tuple[str, str] | None:
 
 __all__ = [
     "CAP_CONTROL_V1",
+    "CAP_FRAME_FRESHNESS_V1",
     "CAP_SKILL_V1",
     "CAP_PERMIT_V1",
     "ERR_BAD_REQUEST",
@@ -272,9 +284,11 @@ __all__ = [
     "LHP_SUPPORTED_VERSIONS",
     "LHP_V1_CAPABILITIES",
     "LHP_V2_CAPABILITIES",
+    "MAX_FRAME_AGE_MS",
     "MAX_FRAME_BYTES",
     "MAX_FRAME_DATA_BYTES",
     "MAX_FRAME_RATE_HZ",
+    "MAX_FRAME_SEQUENCE",
     "MAX_FRAME_WIDTH",
     "SAFE_FRAME_MEDIA_TYPES",
     "SKILL_METHODS",

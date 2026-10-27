@@ -2461,3 +2461,113 @@ async def test_oversized_frame_is_a_typed_actionable_error_not_a_bare_value_erro
     client = DaemonClient(Path(_short_tempdir()) / "leapd.sock")
     with pytest.raises(DaemonUnavailableError, match="larger than"):
         await client._read_payload(_OverLimitReader())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", [None, "engine.chat", "daemon.status", "hardware.read"])
+async def test_server_stop_drains_connected_clients(method: str | None) -> None:
+    """Idle sockets and suspended generators must not keep wait_closed pending."""
+    entered = asyncio.Event()
+    closed = asyncio.Event()
+
+    class Service(_FakeService):
+        async def status(self) -> dict[str, Any]:
+            try:
+                entered.set()
+                await asyncio.Event().wait()
+                return {}
+            finally:
+                closed.set()
+
+        async def hardware_read(self) -> dict[str, Any]:
+            return await self.status()
+
+        async def engine_chat(self, message: str, **kwargs: Any) -> AsyncIterator[StreamChunk]:
+            try:
+                entered.set()
+                await asyncio.Event().wait()
+                yield StreamChunk(request_id="", content="unreachable")
+            finally:
+                closed.set()
+
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        runtime_dir = Path(root) / "runtime"
+        server = UnixRpcServer(
+            Service(), sock_path=get_transport().readiness_path(runtime_dir),
+            runtime_dir=runtime_dir,
+        )
+        serving = asyncio.create_task(server.serve_forever())
+        client = DaemonClient(get_transport().readiness_path(runtime_dir))
+        writer = None
+        try:
+            while server._server is None:
+                await asyncio.sleep(0.01)
+            reader, writer = await client._open()
+            if method is not None:
+                params = {"message": "test"} if method == "engine.chat" else {}
+                request = RpcRequest(method=method, params=params)
+                writer.write((request.to_json() + "\n").encode())
+                await writer.drain()
+                await asyncio.wait_for(entered.wait(), timeout=1.0)
+            while server.active_connections == 0:
+                await asyncio.sleep(0)
+            await asyncio.wait_for(server.stop(), timeout=1.0)
+            assert server.active_connections == 0
+            assert method is None or closed.is_set()
+            assert not server._connections
+            assert await asyncio.wait_for(reader.read(), timeout=1.0) == b""
+            await server.stop()
+        finally:
+            if writer is not None:
+                writer.close()
+                await writer.wait_closed()
+            serving.cancel()
+            try:
+                await serving
+            except asyncio.CancelledError:
+                pass
+
+
+@pytest.mark.asyncio
+async def test_serve_daemon_shutdown_with_an_idle_connected_client(monkeypatch) -> None:
+    """The orchestrator must drain clients before cancelling serve_forever."""
+    from types import SimpleNamespace
+
+    from leapflow.daemon import server as server_module
+    from leapflow.daemon import service as service_module
+
+    class Service(_FakeService):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__()
+
+        async def start(self) -> None:
+            pass
+
+        def start_deferred_init(self) -> None:
+            pass
+
+        async def shutdown(self) -> None:
+            pass
+
+    monkeypatch.setattr(service_module, "RuntimeLeapService", Service)
+    monkeypatch.setattr(server_module, "_daemon_idle_timeout", lambda: 0.0)
+    with tempfile.TemporaryDirectory(prefix="lfd-", dir=_short_tempdir()) as root:
+        runtime_dir = Path(root) / "runtime"
+        readiness = get_transport().readiness_path(runtime_dir)
+        serving = asyncio.create_task(server_module.serve_daemon(SimpleNamespace(runtime_dir=runtime_dir)))
+        writer = None
+        try:
+            while not readiness.exists():
+                await asyncio.sleep(0.01)
+            client = DaemonClient(readiness)
+            reader, writer = await client._open()
+            await client.shutdown()
+            assert await asyncio.wait_for(asyncio.shield(serving), timeout=1.0) == 0
+            assert await asyncio.wait_for(reader.read(), timeout=1.0) == b""
+        finally:
+            if writer is not None:
+                writer.close()
+                await writer.wait_closed()
+            if not serving.done():
+                serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)

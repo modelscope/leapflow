@@ -32,6 +32,7 @@ live registry:
     grasp: {planner: top_down}            # planner name plus its own settings
     perception: {min_points: 40}          # optional perception tuning
     policy: {tick_hz: 50}                 # optional policy streaming tuning
+    vision: {sync_tolerance_ms: 50, sync_attempts: 3}  # multi-camera soft sync (see tuning)
     policies:                             # how each served policy embodies here (adapt.spec)
       cube: {actions: {arm: [joint.j1.position, ...], gripper: [gripper.position]}}
     calibration_target:                   # the ChArUco board calib.handeye observes
@@ -80,6 +81,7 @@ from leapflow.hardware.skills.tuning import (
     DEFAULT_FRESHNESS,
     DEFAULT_GRASP_VERIFY,
     DEFAULT_LIMITS,
+    DEFAULT_VISION,
     gripper_spec,
     tuned,
 )
@@ -111,6 +113,7 @@ WORKCELL_FIELDS = frozenset(
         "calibration_target",
         "skills",
         "share_frames",
+        "vision",
     }
 )
 WORKSPACE_FIELDS = frozenset({"procedure", "tool_cone_deg", "bootstrap_box"})
@@ -173,6 +176,7 @@ class WorkcellSpec:
     policy: Mapping[str, float] = field(default_factory=dict)
     policies: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     calibration_target: Mapping[str, Any] = field(default_factory=dict)
+    vision: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_VISION))
     skills: tuple[str, ...] = ()
     # Whether camera frames may leave the node for the model to look at
     # (``perceive.snapshot``); off unless the operator declares it.
@@ -234,6 +238,7 @@ class WorkcellSpec:
             "policy": dict(self.policy),
             "policies": {name: dict(decl) for name, decl in self.policies.items()},
             "calibration_target": dict(self.calibration_target),
+            "vision": dict(self.vision),
             "share_frames": self.share_frames,
         }
 
@@ -289,6 +294,7 @@ class WorkcellSpec:
                 calibration_target=_mapping(
                     data.get("calibration_target") or {}, "calibration_target"
                 ),
+                vision=_parse_vision(data.get("vision") or {}),
                 skills=tuple(str(item) for item in data.get("skills") or ()),
                 share_frames=_flag(data.get("share_frames", False), "share_frames"),
                 source=source,
@@ -634,6 +640,14 @@ def _parse_grasp_verify(raw: Any) -> dict[str, float]:
     budget = values["cycle_max_waypoints"]
     if budget != int(budget) or not 7 <= budget <= 4096:
         raise WorkcellError("grasp_verify.cycle_max_waypoints must be a whole number in [7, 4096]")
+    return values
+
+
+def _parse_vision(raw: Any) -> dict[str, float]:
+    values = tuned(raw, "vision", DEFAULT_VISION)
+    attempts = values["sync_attempts"]
+    if attempts != int(attempts) or not 1 <= attempts <= 10:
+        raise WorkcellError("vision.sync_attempts must be a whole number in [1, 10]")
     return values
 
 

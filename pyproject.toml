@@ -84,6 +84,8 @@ leapspace = [
     "cua-sandbox; python_version >= '3.11' and python_version < '3.14'",
     "pydantic>=2",
 ]
+# Lightweight opt-in preview encoder; no policy-learning or ROS dependencies.
+vision = ["numpy>=1.24", "opencv-python>=4.8"]
 robot = [
     "torch>=2.0",
     "torchvision>=0.15",

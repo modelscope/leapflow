@@ -190,6 +190,12 @@ _FIELD_DESCRIPTIONS = {
         "Enumerate microphones alongside cameras. Only an input level is exposed, never "
         "audio. Applied at discovery, so a change needs a daemon restart."
     ),
+    "hardware.media_exclude_usb": (
+        "Comma-separated USB identities ('vid' or 'vid:pid', hex) whose video nodes a "
+        "dedicated driver owns, e.g. '8086' for RealSense UVC endpoints. They are not "
+        "listed as generic cameras, so nothing offers a second opener of that hardware. "
+        "Linux only; applied at discovery, so a change needs a daemon restart."
+    ),
     "hardware.preview_max_fps": (
         "Hard capture ceiling for page-selected economy/balanced/detail profiles. The "
         "default balanced profile is 8fps; this 12fps ceiling is also declared at media "
